@@ -1,7 +1,8 @@
-"""Strict shared wrapper-turn lifecycle observation.
+"""Strict wrapper-turn health observation.
 
 ``wrapper-runtime.json`` is written only by the wrapper process and consumed by
-supervisor health (#72) and commit-vs-park (#73).  It is a consistency record,
+supervisor health (#72).  It does not authorize bus commit/cursor decisions;
+#73 independently validates the bus for those.  This is a consistency record,
 not an authentication boundary.  The codec is intentionally closed and
 fail-closed: a reader either receives one complete validated record or no
 usable observation.

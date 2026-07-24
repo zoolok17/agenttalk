@@ -290,9 +290,12 @@ two parallel ownership concepts.
   handler** — the wrapper owns the loop and loop-exit, so a resumed session
   re-enters listening regardless of the model (principle #7).
   The wrapper is also the single writer for the closed, atomic
-  `wrapper-runtime.json` turn-lifecycle record shared by supervisor health
-  (#72) and commit-vs-park (#73). `progress_sequence` advances only for real
-  accepted adapter events; heartbeat timer ticks are not progress.
+  `wrapper-runtime.json` health record used by supervisor health/restart
+  (#72). `progress_sequence` advances only for real accepted adapter events;
+  heartbeat timer ticks are not progress. Commit-vs-park (#73) independently
+  trusts the validated bus, not this wrapper self-report. The two authorities
+  are coherent: a #72 restart preserves the already-advanced bus cursor and
+  cannot re-drive work #73 committed.
   Wrapper waiting markers carry unique generation tokens and teardown clears
   only a matching token, so an old loop cannot erase a replacement marker.
   The Windows per-turn watchdog kills a verified target with

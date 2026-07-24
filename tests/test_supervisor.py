@@ -5038,6 +5038,81 @@ def test_wrapped_child_dead_respects_backoff_and_readiness_cap() -> None:
     assert capped["kill_targets"] == []
 
 
+def test_child_health_restart_does_not_redrive_bus_committed_inbound(
+    tmp_path: Path,
+) -> None:
+    from agenttalk.wrapper import loop as wrapper_loop
+
+    store = _team(tmp_path)
+    committed = store.send(
+        sender="lead",
+        recipient="worker",
+        body="publish durable work",
+    )
+    initial_seen: list[str] = []
+
+    def initial_drive(record: dict) -> bool:
+        initial_seen.append(record["id"])
+        return True
+
+    assert wrapper_loop.run_loop(
+        store,
+        "worker",
+        initial_drive,
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_turns=1,
+    ) == 1
+    assert initial_seen == [committed.id]
+    assert store.cursor("worker") == committed.id
+
+    # The wrapper can crash after the validated bus commits while its health
+    # self-report still says the now-absent child was active. Two confirming
+    # polls correctly authorize #72 recovery without touching the bus cursor.
+    dead_report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=60.0,
+            progress_age=60.0,
+            progress_sequence=2,
+        ),
+    )
+    first = _plan_wrap(
+        dead_report,
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+    recovered = _plan_wrap(
+        dead_report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=_wrap_snap()[:1],
+    )
+    assert recovered["action"] == sup.STUCK_RECOVER
+    assert recovered["state"] == "CLI_CHILD_DEAD"
+    assert store.cursor("worker") == committed.id
+
+    later = store.send(sender="lead", recipient="worker", body="later work")
+    restarted_seen: list[str] = []
+
+    def restarted_drive(record: dict) -> bool:
+        restarted_seen.append(record["id"])
+        return True
+
+    assert wrapper_loop.run_loop(
+        store,
+        "worker",
+        restarted_drive,
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_turns=1,
+    ) == 1
+    assert restarted_seen == [later.id]
+    assert committed.id not in restarted_seen
+    assert store.cursor("worker") == later.id
+
+
 def test_wrapped_dead_letter_is_turn_failed_not_success() -> None:
     plan = _plan_wrap(
         _report(

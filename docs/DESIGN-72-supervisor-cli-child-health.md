@@ -225,20 +225,26 @@ managed wrapper instance. They are consistency controls, not authentication.
 The supervisor independently validates the wrapper row before using the
 record.
 
-#### Shared authority with #73
+#### Coherence with #73
 
-`wrapper-runtime.json` is the single shared authority for wrapper and turn
-lifecycle observations. The wrapper is its sole writer. #72 supervisor health
-and #73 commit-vs-park are read-only consumers of the same strictly parsed
-record; #73 reads `last_outcome`, `phase`, and `progress_sequence` from that
-record rather than creating a second observation file.
+`wrapper-runtime.json` is the #72 health authority for wrapper/CLI liveness,
+progress, and restart decisions. The wrapper is its sole writer. It is a
+self-report and never authorizes a bus commit, cursor advance, or thread-seen
+decision.
 
-The schema, parser, validation rules, and atomic writer should live behind one
-shared wrapper-runtime module owned by the wrapper-turn lifecycle boundary,
-not by either consumer. #72 introduces that shared schema; the coordinated #73
-work consumes it and must not fork it. Changes to phase or outcome transitions
-therefore require joint #72/#73 contract tests. Supervisor health may add
-local debounce state, but that cache is not another lifecycle authority.
+#73 owns commit-vs-park independently through the validated bus. It does not
+read `last_outcome`, `phase`, or `progress_sequence` from this health record.
+The two authorities must be coherent rather than unified: a #72 recovery may
+replace a dead child or wrapper, but it must not rewind bus cursor/thread-seen
+state or re-drive work that #73 already committed. A replacement wrapper
+starts from the already-advanced cursor and receives only later inbound work.
+A post-publish child crash can therefore be both work-landed under #73 and
+child-dead under #72; restart is correct only when it preserves that committed
+bus boundary.
+
+The schema, parser, validation rules, and atomic writer live behind the #72
+wrapper-health boundary. Supervisor debounce state is a cache of health
+observations, not another authority and not a commit ledger.
 
 ### 2. CLI-brain observation
 
@@ -422,9 +428,9 @@ The implementation includes deterministic synthetic-snapshot tests for:
 - restart backoff and readiness caps still prevent relaunch storms;
 - dead-letter is visible as a terminal outcome and is not reported as a
   successful turn; and
-- #72 and #73 consume the same strictly parsed runtime record, including
-  `phase`, `progress_sequence`, and `last_outcome`, with no second lifecycle
-  observation file; and
+- after the validated bus commits and advances an inbound, a subsequent #72
+  child-health restart begins at that advanced cursor and does not reprocess
+  the committed inbound; and
 - the availability view cannot return `AVAILABLE` for child dead, unknown, or
   stalled states even with a fresh heartbeat.
 
