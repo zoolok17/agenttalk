@@ -2473,11 +2473,27 @@ def _resolve_dod_assurance_gate(store, spec: dict, record: dict) -> dict:
     }
 
 
+def _coverage_percent_from_gate(g: dict):
+    """Extract the coverage percentage the producer stored on this gate. The producer writes it
+    into the gate's latest EVIDENCE entry (``gates.set_gate(..., evidence_details={"coverage_
+    percent": <float>})`` → ``gate["evidence"][-1]["coverage_percent"]``), NOT top-level. Read the
+    most recent evidence entry that carries it; return ``None`` if absent (the pure evaluator then
+    fails closed). This is the producer↔consumer contract seam for #60 inc-3."""
+    entries = g.get("evidence")
+    if not isinstance(entries, list):
+        return None
+    for entry in reversed(entries):
+        if isinstance(entry, dict) and "coverage_percent" in entry:
+            return entry.get("coverage_percent")
+    return None
+
+
 def _resolve_dod_coverage_gate(store, spec: dict, record: dict) -> dict:
     """Read ``coverage:<close-scope>`` from the gate record itself.
 
     This deliberately does not read a coverage artifact: the gate's own attestation fields,
-    revision, timestamp, scope, and numeric ``coverage_percent`` form the entire binding.
+    revision, timestamp, scope, and numeric ``coverage_percent`` (from its latest evidence entry)
+    form the entire binding.
     """
     from datetime import datetime, timezone
 
@@ -2514,7 +2530,7 @@ def _resolve_dod_coverage_gate(store, spec: dict, record: dict) -> dict:
         "waiver_active": waiver_active,
         "gate_scope": g.get("scope"),
         "close_gate_scope": close_scope,
-        "coverage_percent": g.get("coverage_percent"),
+        "coverage_percent": _coverage_percent_from_gate(g),
         "min_percent": spec.get("min_percent"),
         "age_days": _iso_age_days(g.get("updated_at"), now),
         "max_age_days": spec.get("max_age_days"),

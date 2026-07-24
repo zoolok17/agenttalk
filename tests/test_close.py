@@ -1493,8 +1493,33 @@ def _set_coverage_gate(root: Path, *, percent: object, revision: str = SHA,
         revision=revision,
     )
     state = gates.load_gate_state(root)
-    state["gates"]["coverage:release"]["coverage_percent"] = percent
+    # The producer stores coverage_percent in the gate's latest EVIDENCE entry (via
+    # set_gate evidence_details), NOT top-level. Inject it there directly so this helper can
+    # still exercise invalid values for the fail-closed tests (real set_gate would reject them).
+    g = state["gates"]["coverage:release"]
+    entries = g.get("evidence")
+    if not isinstance(entries, list) or not entries:
+        entries = [{"source": "automation_ci", "refs": ["run:coverage-123"]}]
+    entries[-1]["coverage_percent"] = percent
+    g["evidence"] = entries
     gates.write_gate_state(root, state)
+
+
+def test_resolve_dod_coverage_gate_reads_producer_evidence_seam(tmp_path: Path) -> None:
+    # Producer↔consumer contract (#60 inc-3 integration): the producer writes the percent via the
+    # REAL gates.set_gate(evidence_details={"coverage_percent": ...}) path (→ latest evidence
+    # entry). Prove the floor resolver reads it from there, not top-level.
+    root = _init(tmp_path)
+    gates.set_gate(
+        root, name="coverage:release", status="green", severity="blocker", scope="release",
+        actor="ci", evidence_source="automation_ci", evidence=["run:cov-1"], revision=SHA,
+        evidence_details={"coverage_percent": 91.0})
+    resolved = cli._resolve_dod_coverage_gate(
+        Store(root), {"min_percent": 80.0, "max_age_days": 14}, _satisfied())
+    assert resolved["present"] is True
+    assert resolved["coverage_percent"] == 91.0          # read from the evidence entry
+    assert resolved["evidence_source"] == "automation_ci" and resolved["revision"] == SHA
+    assert resolved["min_percent"] == 80.0 and isinstance(resolved["age_days"], float)
 
 
 def test_resolve_dod_coverage_gate_reads_own_fields(tmp_path: Path) -> None:
