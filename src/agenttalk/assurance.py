@@ -24,7 +24,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agenttalk import __version__
+from agenttalk import __version__, gates
+from agenttalk._atomic import write_text as _atomic_write_text
+from agenttalk.coverage_parse import parse_coverage_percent
 
 
 SCHEMA_VERSION = 1
@@ -160,6 +162,15 @@ GENERATED_KIND_ALIASES = {
     "sh": "shell",
 }
 EXECUTED_STATUSES = {"pass", "fail-blocking", "fail-advisory"}
+_COVERAGE_ARTIFACTS = ("coverage.xml", "coverage.json")
+_COVERAGE_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
+_COVERAGE_RECOVERY_DIR = Path(".agenttalk") / "assurance" / "coverage-recovery"
+_COVERAGE_RECOVERY_MARKER = "transaction.json"
+_COVERAGE_RECOVERY_SCHEMA = 1
+_GIT_SHA_RE = re.compile(r"\A[0-9a-fA-F]{40}\Z")
+_GITHUB_REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_ASCII_DIGITS_RE = re.compile(r"\A[0-9]+\Z")
+_COMMAND_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class AssuranceUsageError(ValueError):
@@ -216,6 +227,14 @@ class ScanResult:
     native_suppressions: dict[str, Any] = field(default_factory=lambda: {"count_by_tool": {}, "examples": []})
     raw_logs: dict[str, str] = field(default_factory=dict)
     artifact: dict[str, Any] | None = None
+
+
+@dataclass
+class _CoverageArtifactState:
+    eligible: set[str]
+    backups: dict[str, Path]
+    quarantine: Path | None
+    preparation_error: str | None = None
 
 
 def _default_manifest(path: Path | None = None) -> dict[str, Any]:
@@ -318,7 +337,8 @@ def collect_provenance(
     manifest_path = _resolve_under_root(root_path, manifest.get("_path") or DEFAULT_MANIFEST)
     baseline_path = _resolve_under_root(root_path, baseline.get("_path") or DEFAULT_BASELINE)
     git_sha = _git_output(root_path, ["rev-parse", "HEAD"])
-    git_dirty = bool(_git_output(root_path, ["status", "--porcelain"]))
+    git_status = _git_output(root_path, ["status", "--porcelain"])
+    git_dirty = None if git_status is None else bool(git_status)
     changed_files = _changed_files(root_path, changed_from=changed_from, changed_to=changed_to)
     manifest_rel = _slash(_rel(root_path, manifest_path))
     baseline_rel = _slash(_rel(root_path, baseline_path))
@@ -522,6 +542,23 @@ def build_plan(
 
 
 def run_plan(plan: ScanPlan) -> ScanResult:
+    fresh_coverage_attestations: set[tuple[str, str]] = set()
+    try:
+        return _run_plan(plan, fresh_coverage_attestations)
+    finally:
+        _invalidate_stale_coverage_gate(
+            root=plan.root,
+            profile=plan.profile,
+            revision=plan.provenance.get("git_sha"),
+            run_id=plan.run_id,
+            fresh_coverage_attestations=fresh_coverage_attestations,
+        )
+
+
+def _run_plan(
+    plan: ScanPlan,
+    fresh_coverage_attestations: set[tuple[str, str]],
+) -> ScanResult:
     tools_run: list[dict[str, Any]] = []
     tools_skipped: list[dict[str, Any]] = []
     required_missing: list[dict[str, Any]] = []
@@ -558,7 +595,37 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             else:
                 residual.append(_risk(spec["dimension"], reason, "medium", tool_id=tool_id))
             continue
-        run, ext_findings, raw = _run_external(plan.root, spec, command)
+        coverage_state = _prepare_coverage_artifacts(plan.root) if tool_id == "coverage" else None
+        try:
+            run, ext_findings, raw, stdout = _run_external(plan.root, spec, command)
+        except BaseException as exc:
+            if coverage_state is not None:
+                coverage_outputs, coverage_cleanup_ok, coverage_artifact_error = _finish_coverage_artifacts(
+                    plan.root, coverage_state
+                )
+                if coverage_artifact_error is not None:
+                    plan.runner_errors.append(coverage_artifact_error)
+                failure_status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+                _emit_coverage_gate(
+                    plan,
+                    {"status": failure_status, "exit_code": None},
+                    "",
+                    coverage_outputs,
+                    artifacts_clean=coverage_cleanup_ok,
+                    artifact_error=coverage_artifact_error,
+                    failure_reason=f"coverage runner failed with {type(exc).__name__}",
+                )
+                fresh_coverage_attestations.add(_coverage_attestation_key(plan.profile, plan.provenance.get("git_sha")))
+            raise
+        coverage_outputs: dict[str, str | None] = {}
+        coverage_cleanup_ok = True
+        coverage_artifact_error: str | None = None
+        if coverage_state is not None:
+            coverage_outputs, coverage_cleanup_ok, coverage_artifact_error = _finish_coverage_artifacts(
+                plan.root, coverage_state
+            )
+            if coverage_artifact_error is not None:
+                plan.runner_errors.append(coverage_artifact_error)
         tools_run.append(run)
         if raw:
             raw_logs[tool_id] = raw
@@ -567,6 +634,16 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             required_missing.append({"tool_id": tool_id, "reason": run["status"]})
         elif run["status"] in {"error-optional-tool", "timeout-optional"}:
             residual.append(_risk(spec["dimension"], f"{tool_id} {run['status']}", "medium", tool_id=tool_id))
+        if coverage_state is not None:
+            _emit_coverage_gate(
+                plan,
+                run,
+                stdout,
+                coverage_outputs,
+                artifacts_clean=coverage_cleanup_ok,
+                artifact_error=coverage_artifact_error,
+            )
+            fresh_coverage_attestations.add(_coverage_attestation_key(plan.profile, plan.provenance.get("git_sha")))
 
     considered = [spec["tool_id"] for spec in plan.tools]
     result = ScanResult(
@@ -739,50 +816,65 @@ def main(argv: list[str] | None = None) -> int:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
     root = Path(args.root).resolve()
+    fresh_coverage_attestations: set[tuple[str, str]] = set()
+    run_id = _new_run_id()
+    revision: str | None = None
     runner_errors: list[str] = []
     try:
-        manifest = load_manifest(root, args.manifest)
-    except AssuranceUsageError as exc:
-        manifest = _default_manifest(_resolve_under_root(root, args.manifest))
-        manifest["_validation_errors"] = [str(exc)]
-    try:
-        baseline = load_baseline(root, args.baseline)
-    except AssuranceUsageError as exc:
-        baseline = _default_baseline(_resolve_under_root(root, args.baseline))
-        baseline["_validation_errors"] = [str(exc)]
-    try:
-        detection = detect_project(root, manifest)
-        provenance = collect_provenance(
-            root,
-            manifest,
-            args.profile,
-            baseline,
-            changed_from=args.changed_from,
-            changed_to=args.changed_to,
+        revision = _git_output(root, ["rev-parse", "HEAD"])
+        try:
+            manifest = load_manifest(root, args.manifest)
+        except AssuranceUsageError as exc:
+            manifest = _default_manifest(_resolve_under_root(root, args.manifest))
+            manifest["_validation_errors"] = [str(exc)]
+        try:
+            baseline = load_baseline(root, args.baseline)
+        except AssuranceUsageError as exc:
+            baseline = _default_baseline(_resolve_under_root(root, args.baseline))
+            baseline["_validation_errors"] = [str(exc)]
+        try:
+            detection = detect_project(root, manifest)
+            provenance = collect_provenance(
+                root,
+                manifest,
+                args.profile,
+                baseline,
+                changed_from=args.changed_from,
+                changed_to=args.changed_to,
+            )
+            revision = str(provenance.get("git_sha") or "") or revision
+            plan = build_plan(root, args.profile, manifest, detection, baseline, provenance)
+            plan.run_id = run_id
+            plan.runner_errors.extend(runner_errors)
+            result = _run_plan(plan, fresh_coverage_attestations)
+            result = apply_baseline(result, baseline, manifest, provenance.get("changed_files") or [])
+            paths = write_artifact(result, args.out, summary=args.summary)
+        except AssuranceUsageError as exc:
+            sys.stderr.write(f"agenttalk assurance: {exc}\n")
+            return 2
+        except Exception as exc:  # noqa: BLE001 - fail-safe is no artifact, bounded stderr
+            sys.stderr.write(f"agenttalk assurance: could not produce artifact: {exc}\n")
+            return 1
+        if args.json_only:
+            print(str(paths.artifact))
+        else:
+            artifact = result.artifact or {}
+            summary = artifact.get("verdict_summary", {})
+            print(
+                "assurance artifact: "
+                f"{paths.artifact} "
+                f"(blocking={summary.get('blocking_findings_count', 0)}, "
+                f"required_skipped={summary.get('skipped_required_count', 0)})"
+            )
+        return 0
+    finally:
+        _invalidate_stale_coverage_gate(
+            root=root,
+            profile=args.profile,
+            revision=revision,
+            run_id=run_id,
+            fresh_coverage_attestations=fresh_coverage_attestations,
         )
-        plan = build_plan(root, args.profile, manifest, detection, baseline, provenance)
-        plan.runner_errors.extend(runner_errors)
-        result = run_plan(plan)
-        result = apply_baseline(result, baseline, manifest, provenance.get("changed_files") or [])
-        paths = write_artifact(result, args.out, summary=args.summary)
-    except AssuranceUsageError as exc:
-        sys.stderr.write(f"agenttalk assurance: {exc}\n")
-        return 2
-    except Exception as exc:  # noqa: BLE001 - fail-safe is no artifact, bounded stderr
-        sys.stderr.write(f"agenttalk assurance: could not produce artifact: {exc}\n")
-        return 1
-    if args.json_only:
-        print(str(paths.artifact))
-    else:
-        artifact = result.artifact or {}
-        summary = artifact.get("verdict_summary", {})
-        print(
-            "assurance artifact: "
-            f"{paths.artifact} "
-            f"(blocking={summary.get('blocking_findings_count', 0)}, "
-            f"required_skipped={summary.get('skipped_required_count', 0)})"
-        )
-    return 0
 
 
 # --------------------------------------------------------------------------- validation
@@ -803,6 +895,7 @@ def _normalize_manifest(data: Any, path: Path) -> dict[str, Any]:
                 raise AssuranceUsageError(f"manifest {key} must be an object")
             manifest[key] = data[key]
     _validate_profiles(manifest["profiles"])
+    _validate_manifest_commands(manifest)
     for key in ("accepted_findings", "generated_artifacts"):
         if key in data:
             if not isinstance(data[key], list):
@@ -845,6 +938,26 @@ def _validate_profiles(profiles: dict[str, Any]) -> None:
         unknown = sorted(set(cfg) - PROFILE_KEYS)
         if unknown:
             raise AssuranceUsageError(f"manifest profiles.{name} has unknown key(s): {', '.join(unknown)}")
+
+
+def _validate_manifest_commands(manifest: dict[str, Any]) -> None:
+    for name, command in manifest["custom_commands"].items():
+        _validate_command_argv(command, f"custom_commands.{name}")
+    for tool_id, config in manifest["tools"].items():
+        if isinstance(config, dict) and "command" in config:
+            _validate_command_argv(config["command"], f"tools.{tool_id}.command")
+
+
+def _validate_command_argv(command: Any, location: str) -> None:
+    if not isinstance(command, list) or not command:
+        raise AssuranceUsageError(f"manifest {location} must be a non-empty argv list")
+    for index, part in enumerate(command):
+        if not isinstance(part, str) or not part:
+            raise AssuranceUsageError(f"manifest {location}[{index}] must be a non-empty string")
+        if index == 0 and not part.strip():
+            raise AssuranceUsageError(f"manifest {location}[0] must name an executable")
+        if _COMMAND_CONTROL_RE.search(part):
+            raise AssuranceUsageError(f"manifest {location}[{index}] contains a control character")
 
 
 def _validate_accepted_findings(items: list[Any]) -> None:
@@ -1193,7 +1306,7 @@ def _run_external(
     root: Path,
     spec: dict[str, Any],
     command: list[str],
-) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, str]:
     start = time.monotonic()
     timeout = int(spec.get("timeout_seconds") or 60)
     raw = ""
@@ -1206,9 +1319,23 @@ def _run_external(
             timeout=timeout,
             check=False,
         )
+    except OSError as exc:
+        status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+        raw = f"{type(exc).__name__}: {exc}"
+        run = _run_record(
+            spec,
+            status,
+            start,
+            command=command,
+            exit_code=None,
+            raw_log_pending=True,
+        )
+        return run, [], raw, ""
     except subprocess.TimeoutExpired as exc:
         status = "timeout-required" if spec.get("required") else "timeout-optional"
-        raw = (exc.stdout or "") + (exc.stderr or "")
+        stdout = _process_output_text(exc.stdout)
+        stderr = _process_output_text(exc.stderr)
+        raw = stdout + stderr
         run = _run_record(
             spec,
             status,
@@ -1217,9 +1344,11 @@ def _run_external(
             exit_code=None,
             raw_log_pending=bool(raw),
         )
-        return run, [], raw
-    raw = (completed.stdout or "") + ("\n" if completed.stdout and completed.stderr else "") + (completed.stderr or "")
-    findings = _parse_tool_findings(spec, completed.stdout or "", completed.stderr or "")
+        return run, [], raw, stdout
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    raw = stdout + ("\n" if stdout and stderr else "") + stderr
+    findings = _parse_tool_findings(spec, stdout, stderr)
     if findings:
         status = _pre_baseline_status(
             findings,
@@ -1238,7 +1367,438 @@ def _run_external(
         exit_code=completed.returncode,
         raw_log_pending=bool(raw),
     )
-    return run, findings, raw
+    return run, findings, raw, stdout
+
+
+def _process_output_text(output: str | bytes | None) -> str:
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output or ""
+
+
+def _coverage_recovery_reference(root: Path, transaction: Path) -> str:
+    marker = transaction / _COVERAGE_RECOVERY_MARKER
+    try:
+        return _slash(str(marker.relative_to(root)))
+    except ValueError:
+        return _slash(str(marker))
+
+
+def _coverage_recovery_directory_reference(root: Path, transaction: Path) -> str:
+    try:
+        return _slash(str(transaction.relative_to(root)))
+    except ValueError:
+        return _slash(str(transaction))
+
+
+def _load_coverage_transaction(marker: Path) -> list[str]:
+    try:
+        is_regular = not marker.is_symlink() and marker.is_file()
+    except OSError as exc:
+        raise ValueError(f"unreadable transaction marker: {type(exc).__name__}") from exc
+    if not is_regular:
+        raise ValueError("transaction marker is not a regular file")
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unreadable transaction marker: {type(exc).__name__}") from exc
+    if not isinstance(value, dict) or set(value) != {"schema_version", "artifacts"}:
+        raise ValueError("transaction marker has an invalid shape")
+    if value["schema_version"] != _COVERAGE_RECOVERY_SCHEMA:
+        raise ValueError("transaction marker has an unsupported schema")
+    artifacts = value["artifacts"]
+    if (
+        not isinstance(artifacts, list)
+        or not artifacts
+        or not all(isinstance(name, str) for name in artifacts)
+        or len(artifacts) != len(set(artifacts))
+        or any(name not in _COVERAGE_ARTIFACTS for name in artifacts)
+    ):
+        raise ValueError("transaction marker has invalid artifacts")
+    return list(artifacts)
+
+
+def _recover_coverage_transaction(root: Path, transaction: Path, artifacts: list[str]) -> str | None:
+    marker = transaction / _COVERAGE_RECOVERY_MARKER
+    for name in artifacts:
+        target = root / name
+        backup = transaction / name
+        try:
+            backup_exists = backup.exists() or backup.is_symlink()
+            target_exists = target.exists() or target.is_symlink()
+            backup_is_regular = not backup.is_symlink() and backup.is_file()
+            target_is_regular = not target.is_symlink() and target.is_file()
+        except OSError as exc:
+            return f"could not inspect {name}: {type(exc).__name__}"
+        if backup_exists:
+            if not backup_is_regular:
+                return f"quarantined {name} is not a regular file"
+            if target_exists and not _remove_generated_coverage_artifact(target):
+                return f"could not remove generated {name}"
+            try:
+                os.replace(backup, target)
+            except OSError as exc:
+                return f"could not restore {name}: {type(exc).__name__}"
+        elif not target_exists or not target_is_regular:
+            return f"both original and quarantined {name} are missing or invalid"
+    try:
+        leftovers = sorted(path.name for path in transaction.iterdir() if path != marker)
+    except OSError as exc:
+        return f"could not inspect recovered transaction: {type(exc).__name__}"
+    if leftovers:
+        return f"recovered transaction has unexpected files: {', '.join(leftovers)}"
+    try:
+        marker.unlink()
+        transaction.rmdir()
+    except OSError as exc:
+        return f"could not remove recovered transaction: {type(exc).__name__}"
+    return None
+
+
+def _recover_coverage_transactions(root: Path) -> str | None:
+    recovery_root = root / _COVERAGE_RECOVERY_DIR
+    try:
+        if not recovery_root.exists():
+            return None
+        if recovery_root.is_symlink() or not recovery_root.is_dir():
+            return "coverage recovery path is not a regular directory"
+        entries = list(recovery_root.iterdir())
+        invalid_entries = [path.name for path in entries if path.is_symlink() or not path.is_dir()]
+        if invalid_entries:
+            return f"coverage recovery directory has invalid entries: {', '.join(sorted(invalid_entries))}"
+        transactions = sorted(entries)
+    except OSError as exc:
+        return f"could not inspect recovery directory: {type(exc).__name__}"
+    for transaction in transactions:
+        marker = transaction / _COVERAGE_RECOVERY_MARKER
+        try:
+            marker_exists = marker.exists() or marker.is_symlink()
+        except OSError as exc:
+            return (
+                f"could not inspect recovery marker: {type(exc).__name__}; "
+                f"recovery directory: {_coverage_recovery_directory_reference(root, transaction)}"
+            )
+        if not marker_exists:
+            try:
+                if any(transaction.iterdir()):
+                    return (
+                        "markerless recovery transaction is not empty; "
+                        f"recovery directory: {_coverage_recovery_directory_reference(root, transaction)}"
+                    )
+                transaction.rmdir()
+            except OSError as exc:
+                return (
+                    f"could not remove empty recovery transaction: {type(exc).__name__}; "
+                    f"recovery directory: {_coverage_recovery_directory_reference(root, transaction)}"
+                )
+            continue
+        try:
+            artifacts = _load_coverage_transaction(marker)
+        except ValueError as exc:
+            return f"{exc}; recovery marker: {_coverage_recovery_reference(root, transaction)}"
+        error = _recover_coverage_transaction(root, transaction, artifacts)
+        if error is not None:
+            return f"{error}; recovery marker: {_coverage_recovery_reference(root, transaction)}"
+    try:
+        recovery_root.rmdir()
+    except OSError:
+        pass
+    return None
+
+
+def _prepare_coverage_artifacts(root: Path) -> _CoverageArtifactState:
+    """Quarantine prior reports so only artifacts created by this run are parsed."""
+    recovery_error = _recover_coverage_transactions(root)
+    if recovery_error is not None:
+        return _CoverageArtifactState(set(), {}, None, recovery_error)
+
+    eligible: set[str] = set()
+    candidates: list[str] = []
+    preparation_errors: list[str] = []
+    for name in _COVERAGE_ARTIFACTS:
+        path = root / name
+        try:
+            exists = path.exists() or path.is_symlink()
+            is_regular = not path.is_symlink() and path.is_file()
+        except OSError as exc:
+            preparation_errors.append(f"could not inspect {name}: {type(exc).__name__}")
+            continue
+        if not exists:
+            eligible.add(name)
+        elif not is_regular:
+            preparation_errors.append(f"pre-run {name} is not a regular file")
+        else:
+            candidates.append(name)
+
+    backups: dict[str, Path] = {}
+    quarantine: Path | None = None
+    if candidates:
+        recovery_root = root / _COVERAGE_RECOVERY_DIR
+        try:
+            recovery_root.mkdir(parents=True, exist_ok=True)
+            quarantine = Path(tempfile.mkdtemp(prefix="transaction-", dir=recovery_root))
+            marker = quarantine / _COVERAGE_RECOVERY_MARKER
+            _atomic_write_text(
+                marker,
+                json.dumps(
+                    {
+                        "schema_version": _COVERAGE_RECOVERY_SCHEMA,
+                        "artifacts": candidates,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+        except OSError as exc:
+            if quarantine is not None:
+                try:
+                    quarantine.rmdir()
+                except OSError:
+                    pass
+            preparation_errors.append(f"could not create recovery transaction: {type(exc).__name__}")
+            quarantine = None
+        if quarantine is not None:
+            for name in candidates:
+                path = root / name
+                backup = quarantine / name
+                try:
+                    os.replace(path, backup)
+                except OSError as exc:
+                    preparation_errors.append(f"could not quarantine {name}: {type(exc).__name__}")
+                    continue
+                backups[name] = backup
+                eligible.add(name)
+
+    return _CoverageArtifactState(
+        eligible=eligible,
+        backups=backups,
+        quarantine=quarantine,
+        preparation_error="; ".join(preparation_errors) or None,
+    )
+
+
+def _read_coverage_artifact(path: Path) -> str | None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with path.open("rb") as handle:
+            data = handle.read(_COVERAGE_ARTIFACT_MAX_BYTES + 1)
+        if len(data) > _COVERAGE_ARTIFACT_MAX_BYTES:
+            return None
+        return data.decode("utf-8-sig")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError):
+        return None
+
+
+def _remove_generated_coverage_artifact(path: Path) -> bool:
+    try:
+        if not path.exists() and not path.is_symlink():
+            return True
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _finish_coverage_artifacts(
+    root: Path,
+    state: _CoverageArtifactState,
+) -> tuple[dict[str, str | None], bool, str | None]:
+    """Capture fresh reports, then restore the pre-run worktree before attestation."""
+    outputs: dict[str, str | None] = {}
+    cleanup_errors = [state.preparation_error] if state.preparation_error is not None else []
+    transaction_complete = True
+    for name in _COVERAGE_ARTIFACTS:
+        path = root / name
+        if name in state.eligible:
+            outputs[name] = _read_coverage_artifact(path)
+            if not _remove_generated_coverage_artifact(path):
+                cleanup_errors.append(f"could not remove generated {name}")
+        backup = state.backups.get(name)
+        if backup is None:
+            continue
+        try:
+            if path.exists() or path.is_symlink():
+                cleanup_errors.append(f"generated {name} still blocks restore")
+                transaction_complete = False
+                continue
+            os.replace(backup, path)
+        except OSError as exc:
+            cleanup_errors.append(f"could not restore {name}: {type(exc).__name__}")
+            transaction_complete = False
+    if state.quarantine is not None and transaction_complete:
+        marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
+        try:
+            leftovers = [path for path in state.quarantine.iterdir() if path != marker]
+        except OSError as exc:
+            cleanup_errors.append(f"could not inspect recovery transaction: {type(exc).__name__}")
+        else:
+            if leftovers:
+                cleanup_errors.append("recovery transaction still contains quarantined files")
+            else:
+                try:
+                    marker.unlink()
+                except OSError as exc:
+                    cleanup_errors.append(f"could not remove recovery marker: {type(exc).__name__}")
+                else:
+                    try:
+                        state.quarantine.rmdir()
+                    except OSError as exc:
+                        cleanup_errors.append(f"could not remove empty recovery transaction: {type(exc).__name__}")
+    if not cleanup_errors:
+        return outputs, True, None
+    detail = f"coverage artifact cleanup failed ({'; '.join(cleanup_errors)})"
+    if state.quarantine is not None:
+        marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
+        try:
+            marker_exists = marker.exists() or marker.is_symlink()
+            quarantine_exists = state.quarantine.exists()
+        except OSError:
+            quarantine_exists = True
+            marker_exists = False
+        if marker_exists:
+            detail += f"; recovery marker: {_coverage_recovery_reference(root, state.quarantine)}"
+        elif quarantine_exists:
+            detail += f"; recovery directory: {_coverage_recovery_directory_reference(root, state.quarantine)}"
+    return outputs, False, detail
+
+
+def _github_actions_evidence(
+    root: Path,
+    provenance: dict[str, Any],
+    *,
+    artifacts_clean: bool,
+) -> str | None:
+    """Return a revision-bound CI reference only for a clean pre/post Git state."""
+    revision = str(provenance.get("git_sha") or "")
+    github_sha = os.environ.get("GITHUB_SHA", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if os.environ.get("CI", "").lower() != "true" or os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+        return None
+    if not artifacts_clean or provenance.get("git_dirty") is not False:
+        return None
+    if not _GIT_SHA_RE.fullmatch(revision) or github_sha.lower() != revision.lower():
+        return None
+    if (
+        not _ASCII_DIGITS_RE.fullmatch(run_id)
+        or not _ASCII_DIGITS_RE.fullmatch(run_attempt)
+        or not _GITHUB_REPOSITORY_RE.fullmatch(repository)
+    ):
+        return None
+    current_revision = _git_output(root, ["rev-parse", "HEAD"])
+    current_status = _git_output(root, ["status", "--porcelain"])
+    if current_revision is None or current_status is None or current_status:
+        return None
+    if current_revision.lower() != revision.lower():
+        return None
+    return f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run_attempt}"
+
+
+def _coverage_attestation_key(profile: str, revision: str | None) -> tuple[str, str]:
+    return profile, str(revision or "").lower()
+
+
+def _invalidate_stale_coverage_gate(
+    *,
+    root: Path,
+    profile: str,
+    revision: str | None,
+    run_id: str,
+    fresh_coverage_attestations: set[tuple[str, str]],
+) -> None:
+    if _coverage_attestation_key(profile, revision) in fresh_coverage_attestations:
+        return
+
+    from agenttalk.store import Store
+
+    name = f"coverage:{profile}"
+    revision_value = str(revision or "") or None
+    reason = "no fresh coverage measurement this run"
+    with Store(root).config_lock():
+        state = gates.load_gate_state(root)
+        existing = state.get("gates", {}).get(name)
+        if not isinstance(existing, dict) or existing.get("status") == "waived":
+            return
+        if (
+            existing.get("status") == "red"
+            and existing.get("reason") == reason
+            and existing.get("revision") == revision_value
+        ):
+            return
+        gates.set_gate(
+            root,
+            name=name,
+            status="red",
+            severity="blocker",
+            scope=profile,
+            actor="assurance-finalizer",
+            evidence_source="local_command",
+            evidence=[f"assurance-run:{run_id}"],
+            reason=reason,
+            revision=revision_value,
+        )
+
+
+def _emit_coverage_gate(
+    plan: ScanPlan,
+    run: dict[str, Any],
+    stdout: str,
+    artifact_outputs: dict[str, str | None],
+    *,
+    artifacts_clean: bool,
+    artifact_error: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    from agenttalk.store import Store
+
+    xml_text = artifact_outputs.get("coverage.xml")
+    json_text = artifact_outputs.get("coverage.json")
+    percent = parse_coverage_percent(stdout, xml_text=xml_text, json_text=json_text)
+    command_succeeded = run.get("status") == "pass" and run.get("exit_code") == 0
+    evidence_details = {"coverage_percent": float(percent)} if percent is not None else None
+    with Store(plan.root).config_lock():
+        # This is a point-in-time revision + clean-worktree attestation. A
+        # mutation racing the check-to-persist gap is the accepted #66/#31
+        # residual and is detected by close provenance/verify, not serialized here.
+        ci_evidence = _github_actions_evidence(
+            plan.root,
+            plan.provenance,
+            artifacts_clean=artifacts_clean,
+        )
+        is_green = command_succeeded and percent is not None and ci_evidence is not None
+        evidence_source = "automation_ci" if ci_evidence is not None else "local_command"
+        if failure_reason is not None:
+            reason = failure_reason
+        elif not command_succeeded:
+            reason = "coverage command did not complete successfully"
+        elif percent is None:
+            reason = "coverage command succeeded but no overall percentage could be parsed"
+        elif ci_evidence is None:
+            reason = "coverage percentage is not bound to an attested clean CI revision"
+        else:
+            reason = "coverage command succeeded with a parsed, revision-bound CI measurement"
+        if artifact_error is not None:
+            reason = f"{reason}; {artifact_error}"
+        evidence = [ci_evidence] if ci_evidence is not None else [f"assurance-run:{plan.run_id}"]
+        gates.set_gate(
+            plan.root,
+            name=f"coverage:{plan.profile}",
+            status="green" if is_green else "red",
+            severity="blocker",
+            scope=plan.profile,
+            actor="assurance-ci" if ci_evidence is not None else "assurance-local",
+            evidence_source=evidence_source,
+            evidence=evidence,
+            evidence_details=evidence_details,
+            reason=reason,
+            revision=str(plan.provenance.get("git_sha") or "") or None,
+        )
 
 
 def _run_record(

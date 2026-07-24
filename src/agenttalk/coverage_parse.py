@@ -15,11 +15,14 @@ import xml.etree.ElementTree as ET  # noqa: N817  # nosec B405 - parsing our own
 
 __all__ = ["parse_coverage_percent"]
 
-# coverage.py / pytest-cov terminal summary: a "TOTAL" row whose last token is an integer percent.
+# coverage.py / pytest-cov terminal summary: a "TOTAL" row whose last token is a percent.
 #   TOTAL                        1234    56    96%
-_TOTAL_LINE = re.compile(r"^TOTAL\b.*?(\d{1,3})%\s*$", re.MULTILINE)
+_TOTAL_LINE = re.compile(r"^TOTAL\b.*?(?<!\S)([0-9]+(?:\.[0-9]+)?)%\s*$", re.MULTILINE)
 # pytest-cov "Total coverage: 87.34%" (fractional) form.
-_TOTAL_COVERAGE = re.compile(r"\bTotal coverage:\s*(\d{1,3}(?:\.\d+)?)%", re.IGNORECASE)
+_TOTAL_COVERAGE = re.compile(
+    r"\bTotal coverage:\s*([0-9]+(?:\.[0-9]+)?)%(?=\s|$)",
+    re.IGNORECASE,
+)
 
 
 def _valid(pct: float | None) -> float | None:
@@ -75,9 +78,9 @@ def _from_stdout(stdout: str) -> float | None:
     if matches:
         frac = matches[-1]
     else:
-        ints = _TOTAL_LINE.findall(stdout)
-        if ints:
-            frac = ints[-1]
+        totals = _TOTAL_LINE.findall(stdout)
+        if totals:
+            frac = totals[-1]
     if frac is None:
         return None
     return _valid(frac)
