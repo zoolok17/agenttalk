@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from agenttalk.store import validate_agent_name
+
 SCHEMA_VERSION = 1
 MAX_RECORD_BYTES = 16 * 1024
 # The generated supervisor captures integer ``--now`` before starting Python,
@@ -72,7 +74,6 @@ RECORD_KEYS = frozenset({
     "updated_at",
 })
 
-_SAFE_AGENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SAFE_GENERATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _UNSET = object()
 
@@ -138,9 +139,13 @@ def _positive_pid(value: object, *, field: str, optional: bool = False) -> int |
 
 
 def runtime_path(state_dir: str | os.PathLike[str], agent: str) -> Path:
-    if not isinstance(agent, str) or _SAFE_AGENT.fullmatch(agent) is None:
-        raise RuntimeRecordError("agent is not a safe identity")
-    return Path(state_dir) / f"{agent}.wrapper-runtime.json"
+    try:
+        return (
+            Path(state_dir)
+            / f"{validate_agent_name(agent)}.wrapper-runtime.json"
+        )
+    except ValueError as exc:
+        raise RuntimeRecordError("agent is not a safe identity") from exc
 
 
 def validate_record(
@@ -165,9 +170,10 @@ def validate_record(
     if raw.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeRecordError("unsupported schema_version")
 
-    agent = raw.get("agent")
-    if not isinstance(agent, str) or _SAFE_AGENT.fullmatch(agent) is None:
-        raise RuntimeRecordError("agent is not a safe identity")
+    try:
+        agent = validate_agent_name(raw.get("agent"))
+    except ValueError as exc:
+        raise RuntimeRecordError("agent is not a safe identity") from exc
     if expected_agent is not None and agent != expected_agent:
         raise RuntimeRecordError("record agent does not match the requested identity")
 

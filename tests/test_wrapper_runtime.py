@@ -27,6 +27,22 @@ def _writer(tmp_path: Path, *, clock=lambda: NOW) -> wr.WrapperRuntimeWriter:
     )
 
 
+@pytest.mark.parametrize(
+    "agent",
+    [
+        "../worker",
+        "worker\n",
+        "w" * 65,
+    ],
+)
+def test_runtime_path_uses_sanctioned_agent_name_validation(
+    tmp_path: Path,
+    agent: str,
+) -> None:
+    with pytest.raises(wr.RuntimeRecordError):
+        wr.runtime_path(tmp_path, agent)
+
+
 def test_runtime_writer_publishes_closed_lifecycle_and_monotonic_progress(
     tmp_path: Path,
 ) -> None:
