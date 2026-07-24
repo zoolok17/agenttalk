@@ -542,6 +542,17 @@ def build_plan(
 
 
 def run_plan(plan: ScanPlan) -> ScanResult:
+    fresh_coverage_attestations: set[tuple[str, str]] = set()
+    try:
+        return _run_plan(plan, fresh_coverage_attestations)
+    finally:
+        _invalidate_stale_coverage_gate(plan, fresh_coverage_attestations)
+
+
+def _run_plan(
+    plan: ScanPlan,
+    fresh_coverage_attestations: set[tuple[str, str]],
+) -> ScanResult:
     tools_run: list[dict[str, Any]] = []
     tools_skipped: list[dict[str, Any]] = []
     required_missing: list[dict[str, Any]] = []
@@ -598,6 +609,7 @@ def run_plan(plan: ScanPlan) -> ScanResult:
                     artifact_error=coverage_artifact_error,
                     failure_reason=f"coverage runner failed with {type(exc).__name__}",
                 )
+                fresh_coverage_attestations.add(_coverage_attestation_key(plan))
             raise
         coverage_outputs: dict[str, str | None] = {}
         coverage_cleanup_ok = True
@@ -625,6 +637,7 @@ def run_plan(plan: ScanPlan) -> ScanResult:
                 artifacts_clean=coverage_cleanup_ok,
                 artifact_error=coverage_artifact_error,
             )
+            fresh_coverage_attestations.add(_coverage_attestation_key(plan))
 
     considered = [spec["tool_id"] for spec in plan.tools]
     result = ScanResult(
@@ -1350,6 +1363,13 @@ def _coverage_recovery_reference(root: Path, transaction: Path) -> str:
         return _slash(str(marker))
 
 
+def _coverage_recovery_directory_reference(root: Path, transaction: Path) -> str:
+    try:
+        return _slash(str(transaction.relative_to(root)))
+    except ValueError:
+        return _slash(str(transaction))
+
+
 def _load_coverage_transaction(marker: Path) -> list[str]:
     try:
         is_regular = not marker.is_symlink() and marker.is_file()
@@ -1430,6 +1450,27 @@ def _recover_coverage_transactions(root: Path) -> str | None:
         return f"could not inspect recovery directory: {type(exc).__name__}"
     for transaction in transactions:
         marker = transaction / _COVERAGE_RECOVERY_MARKER
+        try:
+            marker_exists = marker.exists() or marker.is_symlink()
+        except OSError as exc:
+            return (
+                f"could not inspect recovery marker: {type(exc).__name__}; "
+                f"recovery directory: {_coverage_recovery_directory_reference(root, transaction)}"
+            )
+        if not marker_exists:
+            try:
+                if any(transaction.iterdir()):
+                    return (
+                        "markerless recovery transaction is not empty; "
+                        f"recovery directory: {_coverage_recovery_directory_reference(root, transaction)}"
+                    )
+                transaction.rmdir()
+            except OSError as exc:
+                return (
+                    f"could not remove empty recovery transaction: {type(exc).__name__}; "
+                    f"recovery directory: {_coverage_recovery_directory_reference(root, transaction)}"
+                )
+            continue
         try:
             artifacts = _load_coverage_transaction(marker)
         except ValueError as exc:
@@ -1572,17 +1613,36 @@ def _finish_coverage_artifacts(
         marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
         try:
             leftovers = [path for path in state.quarantine.iterdir() if path != marker]
-            if leftovers:
-                raise OSError("transaction still contains quarantined files")
-            marker.unlink()
-            state.quarantine.rmdir()
         except OSError as exc:
-            cleanup_errors.append(f"could not finalize recovery transaction: {type(exc).__name__}")
+            cleanup_errors.append(f"could not inspect recovery transaction: {type(exc).__name__}")
+        else:
+            if leftovers:
+                cleanup_errors.append("recovery transaction still contains quarantined files")
+            else:
+                try:
+                    marker.unlink()
+                except OSError as exc:
+                    cleanup_errors.append(f"could not remove recovery marker: {type(exc).__name__}")
+                else:
+                    try:
+                        state.quarantine.rmdir()
+                    except OSError as exc:
+                        cleanup_errors.append(f"could not remove empty recovery transaction: {type(exc).__name__}")
     if not cleanup_errors:
         return outputs, True, None
     detail = f"coverage artifact cleanup failed ({'; '.join(cleanup_errors)})"
     if state.quarantine is not None:
-        detail += f"; recovery marker: {_coverage_recovery_reference(root, state.quarantine)}"
+        marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
+        try:
+            marker_exists = marker.exists() or marker.is_symlink()
+            quarantine_exists = state.quarantine.exists()
+        except OSError:
+            quarantine_exists = True
+            marker_exists = False
+        if marker_exists:
+            detail += f"; recovery marker: {_coverage_recovery_reference(root, state.quarantine)}"
+        elif quarantine_exists:
+            detail += f"; recovery directory: {_coverage_recovery_directory_reference(root, state.quarantine)}"
     return outputs, False, detail
 
 
@@ -1617,6 +1677,48 @@ def _github_actions_evidence(
     if current_revision.lower() != revision.lower():
         return None
     return f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run_attempt}"
+
+
+def _coverage_attestation_key(plan: ScanPlan) -> tuple[str, str]:
+    revision = str(plan.provenance.get("git_sha") or "").lower()
+    return plan.profile, revision
+
+
+def _invalidate_stale_coverage_gate(
+    plan: ScanPlan,
+    fresh_coverage_attestations: set[tuple[str, str]],
+) -> None:
+    if _coverage_attestation_key(plan) in fresh_coverage_attestations:
+        return
+
+    from agenttalk.store import Store
+
+    name = f"coverage:{plan.profile}"
+    revision = str(plan.provenance.get("git_sha") or "") or None
+    reason = "no fresh coverage measurement this run"
+    with Store(plan.root).config_lock():
+        state = gates.load_gate_state(plan.root)
+        existing = state.get("gates", {}).get(name)
+        if not isinstance(existing, dict) or existing.get("status") == "waived":
+            return
+        if (
+            existing.get("status") == "red"
+            and existing.get("reason") == reason
+            and existing.get("revision") == revision
+        ):
+            return
+        gates.set_gate(
+            plan.root,
+            name=name,
+            status="red",
+            severity="blocker",
+            scope=plan.profile,
+            actor="assurance-finalizer",
+            evidence_source="local_command",
+            evidence=[f"assurance-run:{plan.run_id}"],
+            reason=reason,
+            revision=revision,
+        )
 
 
 def _emit_coverage_gate(

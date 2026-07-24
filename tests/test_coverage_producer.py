@@ -113,14 +113,19 @@ def _coverage_gate(root: Path, scope: str = "release") -> dict:
     return state["gates"][f"coverage:{scope}"]
 
 
-def _set_green_coverage_gate(root: Path, revision: str) -> None:
+def _set_green_coverage_gate(
+    root: Path,
+    revision: str,
+    *,
+    scope: str = "release",
+) -> None:
     with Store(root).config_lock():
         gates.set_gate(
             root,
-            name="coverage:release",
+            name=f"coverage:{scope}",
             status="green",
             severity="blocker",
-            scope="release",
+            scope=scope,
             actor="assurance-ci",
             evidence_source="automation_ci",
             evidence=["https://github.com/example/agenttalk/actions/runs/1/attempts/1"],
@@ -256,6 +261,52 @@ def test_manifest_rejects_non_executable_or_control_character_commands(
 
     with pytest.raises(assurance.AssuranceUsageError, match="custom_commands.coverage"):
         assurance.load_manifest(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "coverage_command",
+    [
+        None,
+        [sys.executable, "-c", "\x00"],
+    ],
+    ids=["absent", "invalid"],
+)
+def test_cli_without_fresh_coverage_measurement_invalidates_existing_green_gate(
+    tmp_path: Path,
+    monkeypatch,
+    coverage_command: list[str] | None,
+) -> None:
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {
+            "pyproject.toml": "[project]\nname = 'coverage-producer-fixture'\nversion = '1.0'\n",
+            "src/fixture/__init__.py": "VALUE = 1\n",
+        },
+    )
+    _set_green_coverage_gate(tmp_path, revision, scope="change")
+    manifest: dict = {"schema_version": 1}
+    if coverage_command is not None:
+        manifest["custom_commands"] = {"coverage": coverage_command}
+    manifest_path = tmp_path / ".agenttalk" / "assurance.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    rc = assurance.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--profile",
+            "change",
+            "--out",
+            str(tmp_path / ".agenttalk" / "assurance" / "runs"),
+            "--json-only",
+        ]
+    )
+
+    assert rc == 0
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "red"
+    assert gate["reason"] == "no fresh coverage measurement this run"
 
 
 @pytest.mark.parametrize(
@@ -454,6 +505,52 @@ def test_failed_report_restore_is_marked_and_recovered_by_next_run(
 
     assert (tmp_path / "coverage.xml").read_text(encoding="utf-8") == original_report
     assert not list((tmp_path / ".agenttalk" / "assurance" / "coverage-recovery").glob("*/transaction.json"))
+
+
+def test_empty_transaction_left_after_marker_unlink_is_recovered_next_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_report = '<coverage line-rate="0.25"/>'
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {"coverage.xml": original_report},
+    )
+    real_rmdir = Path.rmdir
+
+    def fail_empty_transaction_rmdir(path: Path) -> None:
+        if (
+            path.parent.name == "coverage-recovery"
+            and path.name.startswith("transaction-")
+            and not (path / "transaction.json").exists()
+        ):
+            raise PermissionError("simulated transaction rmdir failure")
+        real_rmdir(path)
+
+    monkeypatch.setattr(Path, "rmdir", fail_empty_transaction_rmdir)
+
+    assurance.run_plan(_plan(tmp_path, "print('TOTAL 100 12 88%')", revision=revision))
+
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "recovery directory" in gate["reason"]
+    recovery_root = tmp_path / ".agenttalk" / "assurance" / "coverage-recovery"
+    transactions = [path for path in recovery_root.iterdir() if path.is_dir()]
+    assert len(transactions) == 1
+    assert not list(transactions[0].iterdir())
+
+    monkeypatch.setattr(Path, "rmdir", real_rmdir)
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('coverage completed without a total')",
+            revision=revision,
+        )
+    )
+
+    assert (tmp_path / "coverage.xml").read_text(encoding="utf-8") == original_report
+    assert not list(recovery_root.iterdir())
 
 
 @pytest.mark.parametrize(
