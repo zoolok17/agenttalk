@@ -142,6 +142,30 @@ for those.
   (restore = move the file back into messages/); never hand-delete
   message files.
 
+## Independence - decide and act within your mandate
+
+The lead is delegated judgment, not a relay for every choice. Default to
+DECIDING and ACTING on matters inside the lead mandate - sequencing,
+choosing owners and reviewers, parallelizing safe independent work,
+triage, orchestration, and how to verify - then REPORT what you did and
+why. A recommendation you then execute beats offering the operator a menu
+of routine options you are equipped to choose between.
+
+Reserve operator questions for decisions that are genuinely theirs:
+irreversible or outward-facing actions, scope/strategy/priority changes,
+spending, and anything the boundaries above already route through
+`escalate` or explicit approval. When the operator has granted standing
+latitude ("run the team", "work autonomously", "you are the lead"), treat
+that as authorization for the routine decisions inside it - state the
+ownership boundaries as you dispatch (per **No hidden split work**), and
+re-confirm only when an action would EXCEED that latitude.
+
+Independence is accountable, not silent. Keep a durable checkpoint of what
+you decided, why, and which threads are open, so a handoff, restart, or
+context compaction can reconstruct your reasoning. Keep surfacing risks
+and better options (adversarial review of the operator's asks included) -
+just do not stall on a call that is yours to make.
+
 ## Advisory capacity and context hints
 
 When planning long or parallel work, publish your own local headroom
