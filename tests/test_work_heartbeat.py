@@ -97,6 +97,14 @@ def test_resolve_explicit_invalid_values_are_errors_never_coerced() -> None:
     cfg = whb.resolve_work_heartbeat(
         {}, {"work_heartbeat": {"interval_seconds": 0}}, cli="claude", mode="wrapper-loop")
     assert cfg.config_errors and whb.work_heartbeat_effectively_live(cfg) is False
+    cfg = whb.resolve_work_heartbeat(
+        {},
+        {"work_heartbeat": {"max_turn_seconds": float("inf")}},
+        cli="claude",
+        mode="wrapper-loop",
+    )
+    assert any("max_turn_seconds" in e for e in cfg.config_errors)
+    assert whb.work_heartbeat_effectively_live(cfg) is False
 
 
 def test_low_max_turn_is_allowed_not_rejected() -> None:
