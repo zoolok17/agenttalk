@@ -6526,6 +6526,15 @@ def _fallback_activity_hook_agent(settings: dict) -> str | None:
     return None
 
 
+def _fallback_checkpoint_hook_agent(settings: dict) -> str | None:
+    for event, _action, _matcher in _CHECKPOINT_HOOK_SPECS:
+        for command in _iter_hook_commands(settings, event):
+            parsed = _parse_checkpoint_hook_command(command)
+            if parsed is not None and parsed[1] == "fallback":
+                return parsed[2]
+    return None
+
+
 def _has_fallback_activity_hook(settings: dict) -> bool:
     return _fallback_activity_hook_agent(settings) is not None
 
@@ -6662,8 +6671,6 @@ def _merge_checkpoint_event_hook(
     action: str,
     matcher: str,
     target_agent: str | None = None,
-    fallback_agent: str | None = None,
-    preserve_existing_fallback: bool = False,
 ) -> str:
     """Canonicalize one managed checkpoint hook without touching unrelated hooks."""
     groups, skipped = _hook_event_groups(settings, event)
@@ -6671,7 +6678,6 @@ def _merge_checkpoint_event_hook(
         return skipped or f"skipped (malformed hooks.{event})"
 
     owned: list[tuple[dict, dict]] = []
-    existing_fallback: str | None = None
     for group in groups:
         if not isinstance(group, dict):
             continue
@@ -6685,19 +6691,8 @@ def _merge_checkpoint_event_hook(
             if parsed is None:
                 continue
             owned.append((group, item))
-            if (
-                preserve_existing_fallback
-                and existing_fallback is None
-                and parsed[1] == "fallback"
-            ):
-                existing_fallback = parsed[2]
 
-    agent = target_agent
-    if agent is None and preserve_existing_fallback:
-        agent = existing_fallback
-    if agent is None:
-        agent = fallback_agent
-    target_command = checkpoint_hook_command(action, agent)
+    target_command = checkpoint_hook_command(action, target_agent)
 
     if (
         len(owned) == 1
@@ -6754,8 +6749,6 @@ def _merge_checkpoint_hooks(
     settings: dict,
     *,
     target_agent: str | None = None,
-    fallback_agent: str | None = None,
-    preserve_existing_fallback: bool = False,
 ) -> dict[str, str]:
     statuses: dict[str, str] = {}
     for event, action, matcher in _CHECKPOINT_HOOK_SPECS:
@@ -6765,8 +6758,6 @@ def _merge_checkpoint_hooks(
             action=action,
             matcher=matcher,
             target_agent=target_agent,
-            fallback_agent=fallback_agent,
-            preserve_existing_fallback=preserve_existing_fallback,
         )
     return statuses
 
@@ -6842,6 +6833,13 @@ def install_activity_hook(store: Store, *, claude: bool = True,
                 "skipped (malformed settings root)",
             )
         else:
+            # Resolve once from the original file so a partial install cannot
+            # bind save and resume differently after the heartbeat merge.
+            checkpoint_agent = (
+                _fallback_checkpoint_hook_agent(settings)
+                or _fallback_activity_hook_agent(settings)
+                or interactive_for
+            )
             statuses = {"PostToolUse": _merge_post_tool_use_hook(
                 settings,
                 target_command=target_command,
@@ -6849,9 +6847,7 @@ def install_activity_hook(store: Store, *, claude: bool = True,
             )}
             statuses.update(_merge_checkpoint_hooks(
                 settings,
-                target_agent=interactive_for,
-                fallback_agent=_fallback_activity_hook_agent(settings),
-                preserve_existing_fallback=interactive_for is None,
+                target_agent=checkpoint_agent,
             ))
             if "installed" in statuses.values():
                 p.parent.mkdir(parents=True, exist_ok=True)

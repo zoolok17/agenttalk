@@ -7,6 +7,7 @@ fixtures. The generated PS/bash scripts are thin executors (documented-manual).
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shlex
@@ -19,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, ephemeral as eph, health as hm, supervisor as sup
+from agenttalk import checkpoint, cli, ephemeral as eph, health as hm, supervisor as sup
 from agenttalk.store import Store
 
 
@@ -3169,6 +3170,103 @@ def test_install_activity_hook_neutral_does_not_downgrade_existing_fallback(
 
     assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
     assert "already:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_statuses"),
+    [
+        (
+            "only-precompact-bound",
+            {"PostToolUse": "already", "PreCompact": "already", "SessionStart": "installed"},
+        ),
+        (
+            "only-sessionstart-bound",
+            {"PostToolUse": "already", "PreCompact": "installed", "SessionStart": "already"},
+        ),
+        (
+            "both-neutral",
+            {"PostToolUse": "already", "PreCompact": "installed", "SessionStart": "installed"},
+        ),
+    ],
+)
+def test_install_activity_hook_uses_one_checkpoint_fallback_for_partial_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    shape: str,
+    expected_statuses: dict[str, str],
+) -> None:
+    store = _team(tmp_path)
+    settings = store.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+
+    def group(matcher: str, command: str) -> list[dict]:
+        return [{
+            "matcher": matcher,
+            "hooks": [{"type": "command", "command": command}],
+        }]
+
+    if shape == "only-precompact-bound":
+        hooks = {
+            "PostToolUse": group(
+                "*", sup.fallback_activity_hook_command("worker"),
+            ),
+            "PreCompact": group(
+                "*", sup.checkpoint_hook_command("save", "lead"),
+            ),
+        }
+    elif shape == "only-sessionstart-bound":
+        hooks = {
+            "PostToolUse": group(
+                "*", sup.fallback_activity_hook_command("worker"),
+            ),
+            "SessionStart": group(
+                "compact", sup.checkpoint_hook_command("resume", "lead"),
+            ),
+        }
+    else:
+        hooks = {
+            "PostToolUse": group(
+                "*", sup.fallback_activity_hook_command("lead"),
+            ),
+            "PreCompact": group(
+                "*", sup.checkpoint_hook_command("save"),
+            ),
+            "SessionStart": group(
+                "compact", sup.checkpoint_hook_command("resume"),
+            ),
+        }
+    settings.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    for event, status in expected_statuses.items():
+        assert f"{status}: {settings} [{event}]" in output
+    save_command = sup.checkpoint_hook_command("save", "lead")
+    resume_command = sup.checkpoint_hook_command("resume", "lead")
+    assert _hook_commands(settings, "PreCompact") == [save_command]
+    assert _hook_commands(settings, "SessionStart") == [resume_command]
+
+    monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(b"{}"), encoding="utf-8"),
+    )
+    save_argv = shlex.split(save_command.split(" || ", 1)[0])[1:]
+    assert _run(save_argv, tmp_path) == 0
+    assert capsys.readouterr() == ("", "")
+    saved = checkpoint.read_checkpoint(store, "lead")
+    assert saved is not None
+    assert saved["agent"] == "lead"
+    assert checkpoint.read_checkpoint(store, "worker") is None
+
+    resume_argv = shlex.split(resume_command.split(" || ", 1)[0])[1:]
+    assert _run(resume_argv, tmp_path) == 0
+    envelope = json.loads(capsys.readouterr().out)
+    context = envelope["hookSpecificOutput"]["additionalContext"]
+    assert context.startswith("Checkpoint reload for lead:")
 
 
 def test_install_activity_hook_neutral_dedupes_mixed_fallback_and_neutral(
