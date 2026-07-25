@@ -83,6 +83,7 @@ def test_write_path_heals_orphans_instead_of_wedging(
     order = _read_order(store)
     # 2 orphans folded + 1 new message
     assert order["append_sequence"] == n_before + 3
+    assert order["order_reconstructed"] is True
     # the anchored prefix is byte-for-byte preserved
     for mid, seq in prefix.items():
         assert order["messages"][mid] == seq
@@ -117,6 +118,51 @@ def test_read_path_heals_in_memory_without_writing(store: Store) -> None:
     assert _anchor_path(store).read_bytes() == anchor_before
 
 
+def test_order_durability_distinguishes_intact_orphan_and_legacy(
+    store: Store,
+) -> None:
+    _send(store, 3)
+    expected = [message.id for message in store.valid_messages()]
+
+    ordered, durable = store.publication_ordered_messages_with_durability()
+    assert [message.id for message in ordered] == expected
+    assert durable is True
+
+    _freeze_sidecar_behind(store, drop=1)
+    ordered, durable = store.publication_ordered_messages_with_durability()
+    assert [message.id for message in ordered] == expected
+    assert durable is False
+
+    _order_path(store).unlink()
+    _anchor_path(store).unlink()
+    ordered, durable = store.publication_ordered_messages_with_durability()
+    assert [message.id for message in ordered] == expected
+    assert durable is False
+
+    store.send(sender="alpha", recipient="beta", body="persist legacy bootstrap")
+    ordered, durable = store.publication_ordered_messages_with_durability()
+    assert len(ordered) == 4
+    assert durable is False
+
+
+def test_unmarked_complete_sidecar_fails_closed_across_upgrade(
+    store: Store,
+) -> None:
+    _send(store, 2)
+    order = _read_order(store)
+    del order["order_reconstructed"]
+    _order_path(store).write_text(json.dumps(order), encoding="utf-8")
+
+    ordered, durable = store.publication_ordered_messages_with_durability()
+    assert len(ordered) == 2
+    assert durable is False
+
+    store.send(sender="alpha", recipient="beta", body="upgrade through new writer")
+    assert _read_order(store)["order_reconstructed"] is True
+    _, durable = store.publication_ordered_messages_with_durability()
+    assert durable is False
+
+
 def test_read_and_write_folds_agree(store: Store) -> None:
     _send(store, 5)
     _freeze_sidecar_behind(store, drop=2)
@@ -147,6 +193,16 @@ def test_tamper_below_anchor_fails_loud_and_does_not_heal(store: Store) -> None:
         store.publication_ordered_messages()
 
 
+def test_invalid_reconstruction_provenance_fails_loud(store: Store) -> None:
+    _send(store, 2)
+    order = _read_order(store)
+    order["order_reconstructed"] = "unknown"
+    _order_path(store).write_text(json.dumps(order), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sidecar is invalid"):
+        store.publication_ordered_messages()
+
+
 def test_durable_anchor_ahead_of_sidecar_fails_loud(store: Store) -> None:
     _send(store, 3)
     anchor = _read_anchor(store)
@@ -171,6 +227,8 @@ def test_anchor_absent_serves_reads_and_reanchors_on_write(store: Store) -> None
     _anchor_path(store).unlink()   # crash-during-bootstrap or removed anchor
     # a read still works (must not wedge a benign crash-recovery)
     assert len(store.publication_ordered_messages()) == 3
+    _, durable = store.publication_ordered_messages_with_durability()
+    assert durable is True
     # the next write re-anchors
     store.send(sender="alpha", recipient="beta", body="x")
     assert _anchor_path(store).exists()
@@ -207,6 +265,7 @@ def test_extend_order_with_orphans_preserves_prefix_and_is_pure() -> None:
     assert healed["messages"]["c"] == 3
     assert healed["messages"]["y"] == 4 and healed["messages"]["z"] == 5
     assert healed["append_sequence"] == 5
+    assert healed["order_reconstructed"] is True
 
 
 def test_doctor_reports_module_path_and_capabilities(store_root: Path) -> None:

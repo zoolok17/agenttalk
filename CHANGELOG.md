@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report a finished turn for work that had been called off. `_resolve_replay` already treated such a
   rescind as superseded, but it early-outs for any opener that is not a `question`, which left
   `review-request` and `proposal` openers with no rescind protection at all. (#73)
+- **Legacy and orphaned-order stores no longer prove landed responses from reconstructed order.**
+  When the publication-order sidecar is absent, unmarked by an older writer, does not cover every message,
+  or records a persisted reconstruction, response-versus-rescind order cannot be verified. The wrapper now
+  withholds that proof and uses the recoverable residual/re-drive path instead of crediting work that may
+  have landed after cancellation. (#73)
 
 ### Changed
 
