@@ -8,9 +8,9 @@ It is a **read-first monitoring UI** with a few operator actions (dismiss/defer 
 ## About the Design Files
 The single file in this bundle — `Team Console.dc.html` — is a **design reference created in HTML**. It is a working, self-contained prototype that shows the intended look, layout, and interaction behavior with realistic **sample data**. It is **not production code to copy directly**, and it is **not wired to a real `.agenttalk/` bus**.
 
-Your task is to **recreate this design in agenttalk's own environment**. agenttalk has no existing web frontend and keeps runtime dependencies narrow, so there is no established frontend framework to conform to — **choose the most appropriate stack** for a small, local, read-mostly dashboard that a developer runs alongside the CLI. Two natural options:
+Your task is to **recreate this design in agenttalk's own environment**. agenttalk is a stdlib-only Python package with no existing web frontend, so there is no established frontend framework to conform to — **choose the most appropriate stack** for a small, local, read-mostly dashboard that a developer runs alongside the CLI. Two natural options:
 
-- **Zero-frontend-dependency static + polling** (recommended to match agenttalk's "just files, no daemon" ethos): a small `agenttalk serve` command using Python stdlib (`http.server`) that reads `.agenttalk/` and serves JSON; a static HTML/JS frontend that polls. This avoids adding a frontend dependency stack.
+- **Zero-dependency static + polling** (recommended to match agenttalk's "just files, no daemon" ethos): a small `agenttalk serve` command using only Python stdlib (`http.server`) that reads `.agenttalk/` and serves JSON; a static HTML/JS frontend that polls. Keeps the "no third-party runtime deps" promise.
 - **A small SPA** (React/Vue/Svelte) if the team is comfortable adding a dev toolchain for the frontend only.
 
 Either way, treat the HTML as the **visual + behavioral spec**, and read the data from the real bus (see **Data Sources** below).

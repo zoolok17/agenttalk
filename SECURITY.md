@@ -490,7 +490,7 @@ CI, not at runtime):
 | **ruff check (S rules)** | Bandit-derived patterns: hardcoded secrets, weak crypto, shell injection. | Fast, single linter we likely want anyway. Tune false-positive budget. |
 | **bandit** | Python-specific AST security patterns. | Overlaps with ruff `S`; voting in CI as of 0.5.1 (local baseline is clean — 0 issues at all severities). |
 | **semgrep (registry + 1-3 custom rules)** | General insecure patterns + **agenttalk-specific invariants** (e.g. "agent names from config/argparse must pass `validate_agent_name`", "raw agent names must not feed state filenames"). | Custom rules are the highest-leverage scanner here. |
-| **pip-audit** or **OSV-Scanner** | Known CVEs in dependencies. | The voting gate audits the frozen wheel dependency snapshot, including `defusedxml`. |
+| **pip-audit** or **OSV-Scanner** | Known CVEs in dependencies. | Only checks dev deps (we have no runtime deps); still worth running. |
 | **gitleaks** | Leaked secrets in git history. | Single secret scanner; TruffleHog is fine if you need verified-secret behavior. |
 | **GitHub CodeQL** (`security-extended`) | Deep semantic analysis (path injection, taint flows). May or may not catch agenttalk-specific patterns without custom queries. | Free for public repos. Worth enabling; do not over-claim it would have caught any specific past bug without testing. |
 | **zizmor** | GitHub Actions workflow security. | Shipped in 0.5.1 as non-voting; default `unpinned-uses` audit is stricter than our tag-pinning baseline. Tightening planned for 0.6.x. |

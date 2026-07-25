@@ -25,6 +25,12 @@ Optional top-level fields:
 - `python.package` or `python.packages`: package imports to resolve for
   provenance.
 
+A custom `coverage` command must either print a recognized coverage.py or
+pytest-cov terminal summary, or create root-level `coverage.json` with a numeric
+`totals.percent_covered` value. Coverage XML is deliberately ignored as evidence.
+The conventional `coverage.xml` path is still transactionally protected so a
+custom command cannot overwrite an operator's pre-existing report.
+
 Unknown top-level manifest keys are validation errors. Unknown keys inside
 `profiles.<profile>` are also validation errors; the profile namespace is limited
 to `required_tools`, `network_allowed`, and `severity_floor`. Use top-level

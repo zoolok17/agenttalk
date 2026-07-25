@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Coverage XML evidence is now parsed as untrusted producer input.** The parser uses
-  `defusedxml`, rejects DTDs, entities, and external references, and enforces the existing
-  16 MiB artifact ceiling before parsing instead of suppressing Bandit/Semgrep findings.
+- **Coverage evidence now preserves the zero-runtime-dependency boundary.** Attestation
+  accepts bounded `coverage.json` totals or recognized coverage.py/pytest-cov terminal
+  summaries and deliberately never parses XML. Concurrent scans serialize the full
+  report transaction, and a report that cannot be quarantined aborts before the coverage
+  command runs. Conventional XML and JSON report paths remain protected and restored.
 
 ## [0.79.0] - 2026-07-24
 

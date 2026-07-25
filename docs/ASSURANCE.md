@@ -149,14 +149,13 @@ lead). Re-run on demand and refreshed as the codebase changes.
 | **bandit** 1.9.4 | Python SAST | **0 issues** (28,553 LOC) |
 | **semgrep** (317 rules: `p/python`, `p/security-audit`, `p/secrets`, `p/javascript`) | multi-language SAST | **0 findings** (79 files) |
 | **detect-secrets** | committed credentials | **0 real** (2 hits, both intentional test-probe strings) |
-| **pip-audit** | dependency CVEs | audits the frozen wheel dependency snapshot, including `defusedxml` |
+| **pip-audit** | dependency CVEs | **no runtime dependencies** — agenttalk is stdlib-only |
 | **vulture** | dead code | **0** (confidence ≥ 80) |
 | **ruff** | lint / bug-prone patterns | clean on the enforced ruleset; expanded rulesets surface only style/robustness (e.g. message-in-`raise`), no security findings — the 3 partial-path-subprocess sites are already `# nosec`-reviewed |
 
 **Structural security properties**
-- **Narrow runtime dependency surface** — `defusedxml` parses producer-controlled coverage
-  XML with DTDs, entities, and external references disabled; the wheel dependency snapshot
-  is checked by `pip check` and `pip-audit`.
+- **No third-party runtime dependency attack surface** — the package imports only the
+  Python standard library; builds with `hatchling`; `dependencies = []`.
 - **Authority model** — the supervised executor is the only write boundary; identities
   are resolved server-side; the bus is HMAC-signable; `.agenttalk/` state is gitignored
   and HMAC keys are generated at runtime (never committed).

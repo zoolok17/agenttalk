@@ -8,14 +8,11 @@ security checks. It has no skip flags. A missing interpreter, tool, result, or e
 ## Prerequisites
 
 Run the command from a clean Git worktree. The local profile invokes both direct interpreters, so provision the
-gate tools and the package's declared runtime dependencies in **both** CPython 3.10 and CPython 3.14 (a CI leg
-needs them only in that leg's interpreter):
+gate dependencies in **both** CPython 3.10 and CPython 3.14 (a CI leg needs them only in that leg's interpreter):
 
 ```text
 python3.10 -I -m pip install -r dev-gate-requirements.txt
-python3.10 -I -m pip install --no-build-isolation .
 python3.14 -I -m pip install -r dev-gate-requirements.txt
-python3.14 -I -m pip install --no-build-isolation .
 ```
 
 Install `gitleaks` on `PATH` before a local run or the canonical `linux/3.12` CI leg. The gate resolves the
@@ -65,9 +62,8 @@ uncommitted working-tree copy, and records both its Git blob ID and SHA-256 dige
 logical plan digest, the candidate commit/tree, and the committed runner blob ID/digest. Before executing the plan,
 the CLI re-enters a temporary committed Git export through isolated Python, so index flags and candidate-root
 module shadows cannot make mutable checkout code masquerade as the attested runner. Every Python-backed tool is
-resolved before the candidate import root is exposed. [`dev-gate-requirements.txt`](../dev-gate-requirements.txt)
-provisions tools only; installing the project resolves runtime dependencies declared in `pyproject.toml`. Neither
-installation command owns check selection or argv.
+resolved before the candidate import root is exposed. [`dev-gate-requirements.txt`](../dev-gate-requirements.txt) provisions tools only; it
+does not own check selection or argv.
 
 Every local run checks:
 

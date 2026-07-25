@@ -1,8 +1,8 @@
 """Assurance scan evidence producer.
 
-This module detects project shape, runs a bounded set of installed tools and
-built-in checks, compares findings to a reviewed baseline, and writes a
-normalized artifact. It never decides GO/HOLD.
+This module is intentionally stdlib-only. It detects project shape, runs a
+bounded set of installed tools and built-in checks, compares findings to a
+reviewed baseline, and writes a normalized artifact. It never decides GO/HOLD.
 """
 
 from __future__ import annotations
@@ -165,7 +165,8 @@ EXECUTED_STATUSES = {"pass", "fail-blocking", "fail-advisory"}
 _COVERAGE_ARTIFACTS = ("coverage.xml", "coverage.json")
 _COVERAGE_RECOVERY_DIR = Path(".agenttalk") / "assurance" / "coverage-recovery"
 _COVERAGE_RECOVERY_MARKER = "transaction.json"
-_COVERAGE_RECOVERY_SCHEMA = 1
+_COVERAGE_RECOVERY_SCHEMA = 2
+_COVERAGE_RECOVERY_PHASES = {"preparing", "running"}
 _GIT_SHA_RE = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 _GITHUB_REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _ASCII_DIGITS_RE = re.compile(r"\A[0-9]+\Z")
@@ -594,37 +595,15 @@ def _run_plan(
             else:
                 residual.append(_risk(spec["dimension"], reason, "medium", tool_id=tool_id))
             continue
-        coverage_state = _prepare_coverage_artifacts(plan.root) if tool_id == "coverage" else None
-        try:
-            run, ext_findings, raw, stdout = _run_external(plan.root, spec, command)
-        except BaseException as exc:
-            if coverage_state is not None:
-                coverage_outputs, coverage_cleanup_ok, coverage_artifact_error = _finish_coverage_artifacts(
-                    plan.root, coverage_state
-                )
-                if coverage_artifact_error is not None:
-                    plan.runner_errors.append(coverage_artifact_error)
-                failure_status = "error-required-tool" if spec.get("required") else "error-optional-tool"
-                _emit_coverage_gate(
-                    plan,
-                    {"status": failure_status, "exit_code": None},
-                    "",
-                    coverage_outputs,
-                    artifacts_clean=coverage_cleanup_ok,
-                    artifact_error=coverage_artifact_error,
-                    failure_reason=f"coverage runner failed with {type(exc).__name__}",
-                )
-                fresh_coverage_attestations.add(_coverage_attestation_key(plan.profile, plan.provenance.get("git_sha")))
-            raise
-        coverage_outputs: dict[str, str | None] = {}
-        coverage_cleanup_ok = True
-        coverage_artifact_error: str | None = None
-        if coverage_state is not None:
-            coverage_outputs, coverage_cleanup_ok, coverage_artifact_error = _finish_coverage_artifacts(
-                plan.root, coverage_state
+        if tool_id == "coverage":
+            run, ext_findings, raw, stdout = _run_coverage_external(
+                plan,
+                spec,
+                command,
+                fresh_coverage_attestations,
             )
-            if coverage_artifact_error is not None:
-                plan.runner_errors.append(coverage_artifact_error)
+        else:
+            run, ext_findings, raw, stdout = _run_external(plan.root, spec, command)
         tools_run.append(run)
         if raw:
             raw_logs[tool_id] = raw
@@ -633,16 +612,6 @@ def _run_plan(
             required_missing.append({"tool_id": tool_id, "reason": run["status"]})
         elif run["status"] in {"error-optional-tool", "timeout-optional"}:
             residual.append(_risk(spec["dimension"], f"{tool_id} {run['status']}", "medium", tool_id=tool_id))
-        if coverage_state is not None:
-            _emit_coverage_gate(
-                plan,
-                run,
-                stdout,
-                coverage_outputs,
-                artifacts_clean=coverage_cleanup_ok,
-                artifact_error=coverage_artifact_error,
-            )
-            fresh_coverage_attestations.add(_coverage_attestation_key(plan.profile, plan.provenance.get("git_sha")))
 
     considered = [spec["tool_id"] for spec in plan.tools]
     result = ScanResult(
@@ -1375,6 +1344,171 @@ def _process_output_text(output: str | bytes | None) -> str:
     return output or ""
 
 
+def _run_coverage_external(
+    plan: ScanPlan,
+    spec: dict[str, Any],
+    command: list[str],
+    fresh_coverage_attestations: set[tuple[str, str]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, str]:
+    """Run one fail-closed, root-serialized coverage-artifact transaction."""
+    from agenttalk.store import Store
+
+    lock_timeout = max(10.0, float(spec.get("timeout_seconds") or 60) + 10.0)
+    command_started = False
+    runner_exception: tuple[BaseException, Any] | None = None
+    stage = "acquiring"
+    outcome: tuple[dict[str, Any], list[dict[str, Any]], str, str] | None = None
+    attestation_key = _coverage_attestation_key(
+        plan.profile,
+        plan.provenance.get("git_sha"),
+    )
+    try:
+        with Store(plan.root).coverage_transaction_lock(timeout=lock_timeout):
+            stage = "preparing"
+            coverage_state = _prepare_coverage_artifacts(plan.root)
+            if coverage_state.preparation_error is None:
+                phase_error = _mark_coverage_transaction_running(coverage_state)
+                if phase_error is not None:
+                    coverage_state.preparation_error = phase_error
+            if coverage_state.preparation_error is not None:
+                rollback_ok, artifact_error = _rollback_coverage_preparation(
+                    plan.root,
+                    coverage_state,
+                )
+                plan.runner_errors.append(artifact_error)
+                failure_status = (
+                    "error-required-tool" if spec.get("required") else "error-optional-tool"
+                )
+                run = _run_record(
+                    spec,
+                    failure_status,
+                    time.monotonic(),
+                    command=command,
+                    exit_code=None,
+                )
+                stage = "emitting"
+                _emit_coverage_gate(
+                    plan,
+                    run,
+                    "",
+                    {},
+                    artifacts_clean=False,
+                    artifact_error=artifact_error,
+                    failure_reason=(
+                        "coverage artifact preparation failed; "
+                        "coverage command was not run"
+                    ),
+                )
+                if not rollback_ok:
+                    plan.runner_errors.append(
+                        "coverage preparation rollback requires manual recovery"
+                    )
+                outcome = (run, [], "", "")
+            else:
+                try:
+                    stage = "running"
+                    command_started = True
+                    run, findings, raw, stdout = _run_external(
+                        plan.root,
+                        spec,
+                        command,
+                    )
+                except BaseException as exc:
+                    runner_exception = (exc, exc.__traceback__)
+                    stage = "finishing"
+                    outputs, cleanup_ok, artifact_error = _finish_coverage_artifacts(
+                        plan.root,
+                        coverage_state,
+                    )
+                    if artifact_error is not None:
+                        plan.runner_errors.append(artifact_error)
+                    failure_status = (
+                        "error-required-tool"
+                        if spec.get("required")
+                        else "error-optional-tool"
+                    )
+                    stage = "emitting"
+                    _emit_coverage_gate(
+                        plan,
+                        {"status": failure_status, "exit_code": None},
+                        "",
+                        outputs,
+                        artifacts_clean=cleanup_ok,
+                        artifact_error=artifact_error,
+                        failure_reason=f"coverage runner failed with {type(exc).__name__}",
+                    )
+                else:
+                    stage = "finishing"
+                    outputs, cleanup_ok, artifact_error = _finish_coverage_artifacts(
+                        plan.root,
+                        coverage_state,
+                    )
+                    if artifact_error is not None:
+                        plan.runner_errors.append(artifact_error)
+                    stage = "emitting"
+                    _emit_coverage_gate(
+                        plan,
+                        run,
+                        stdout,
+                        outputs,
+                        artifacts_clean=cleanup_ok,
+                        artifact_error=artifact_error,
+                    )
+                    outcome = (run, findings, raw, stdout)
+            stage = "releasing"
+    except BaseException as exc:
+        if runner_exception is not None:
+            original, traceback = runner_exception
+            plan.runner_errors.append(
+                f"coverage transaction secondary failure during {stage} "
+                f"({type(exc).__name__}: {exc})"
+            )
+            raise original.with_traceback(traceback) from exc
+        if stage not in {"acquiring", "releasing"} or not isinstance(
+            exc,
+            (OSError, TimeoutError),
+        ):
+            raise
+
+        detail = f"coverage transaction failed ({type(exc).__name__}: {exc})"
+        plan.runner_errors.append(detail)
+        failure_status = (
+            "error-required-tool" if spec.get("required") else "error-optional-tool"
+        )
+        run = _run_record(
+            spec,
+            failure_status,
+            time.monotonic(),
+            command=command,
+            exit_code=None,
+        )
+        command_disposition = (
+            "coverage result was discarded"
+            if command_started
+            else "coverage command was not run"
+        )
+        _emit_coverage_gate(
+            plan,
+            run,
+            "",
+            {},
+            artifacts_clean=False,
+            artifact_error=detail,
+            failure_reason=f"coverage transaction failed; {command_disposition}",
+        )
+        fresh_coverage_attestations.add(attestation_key)
+        return run, [], "", ""
+
+    if runner_exception is not None:
+        fresh_coverage_attestations.add(attestation_key)
+        original, traceback = runner_exception
+        raise original.with_traceback(traceback)
+    if outcome is None:  # defensive: every non-exception path assigns an outcome
+        raise RuntimeError("coverage transaction completed without a result")
+    fresh_coverage_attestations.add(attestation_key)
+    return outcome
+
+
 def _coverage_recovery_reference(root: Path, transaction: Path) -> str:
     marker = transaction / _COVERAGE_RECOVERY_MARKER
     try:
@@ -1390,7 +1524,7 @@ def _coverage_recovery_directory_reference(root: Path, transaction: Path) -> str
         return _slash(str(transaction))
 
 
-def _load_coverage_transaction(marker: Path) -> list[str]:
+def _load_coverage_transaction(marker: Path) -> tuple[list[str], str]:
     try:
         is_regular = not marker.is_symlink() and marker.is_file()
     except OSError as exc:
@@ -1401,10 +1535,23 @@ def _load_coverage_transaction(marker: Path) -> list[str]:
         value = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"unreadable transaction marker: {type(exc).__name__}") from exc
-    if not isinstance(value, dict) or set(value) != {"schema_version", "artifacts"}:
+    if not isinstance(value, dict):
         raise ValueError("transaction marker has an invalid shape")
-    if value["schema_version"] != _COVERAGE_RECOVERY_SCHEMA:
-        raise ValueError("transaction marker has an unsupported schema")
+    schema = value.get("schema_version")
+    if schema == 1 and set(value) == {"schema_version", "artifacts"}:
+        # Legacy branch-only markers did not persist whether the command had
+        # started. Recover them conservatively without deleting a target.
+        phase = "preparing"
+    else:
+        phase_value = value.get("phase")
+        if not (
+            schema == _COVERAGE_RECOVERY_SCHEMA
+            and set(value) == {"schema_version", "artifacts", "phase"}
+            and isinstance(phase_value, str)
+            and phase_value in _COVERAGE_RECOVERY_PHASES
+        ):
+            raise ValueError("transaction marker has an unsupported schema")
+        phase = phase_value
     artifacts = value["artifacts"]
     if (
         not isinstance(artifacts, list)
@@ -1414,10 +1561,16 @@ def _load_coverage_transaction(marker: Path) -> list[str]:
         or any(name not in _COVERAGE_ARTIFACTS for name in artifacts)
     ):
         raise ValueError("transaction marker has invalid artifacts")
-    return list(artifacts)
+    return list(artifacts), phase
 
 
-def _recover_coverage_transaction(root: Path, transaction: Path, artifacts: list[str]) -> str | None:
+def _recover_coverage_transaction(
+    root: Path,
+    transaction: Path,
+    artifacts: list[str],
+    *,
+    phase: str,
+) -> str | None:
     marker = transaction / _COVERAGE_RECOVERY_MARKER
     for name in artifacts:
         target = root / name
@@ -1432,8 +1585,14 @@ def _recover_coverage_transaction(root: Path, transaction: Path, artifacts: list
         if backup_exists:
             if not backup_is_regular:
                 return f"quarantined {name} is not a regular file"
-            if target_exists and not _remove_generated_coverage_artifact(target):
-                return f"could not remove generated {name}"
+            if target_exists:
+                if phase != "running":
+                    return (
+                        f"{name} reappeared before the coverage command started; "
+                        "both files were preserved for manual recovery"
+                    )
+                if not _remove_generated_coverage_artifact(target):
+                    return f"could not remove generated {name}"
             try:
                 os.replace(backup, target)
             except OSError as exc:
@@ -1492,10 +1651,15 @@ def _recover_coverage_transactions(root: Path) -> str | None:
                 )
             continue
         try:
-            artifacts = _load_coverage_transaction(marker)
+            artifacts, phase = _load_coverage_transaction(marker)
         except ValueError as exc:
             return f"{exc}; recovery marker: {_coverage_recovery_reference(root, transaction)}"
-        error = _recover_coverage_transaction(root, transaction, artifacts)
+        error = _recover_coverage_transaction(
+            root,
+            transaction,
+            artifacts,
+            phase=phase,
+        )
         if error is not None:
             return f"{error}; recovery marker: {_coverage_recovery_reference(root, transaction)}"
     try:
@@ -1506,7 +1670,7 @@ def _recover_coverage_transactions(root: Path) -> str | None:
 
 
 def _prepare_coverage_artifacts(root: Path) -> _CoverageArtifactState:
-    """Quarantine prior reports so only artifacts created by this run are parsed."""
+    """Quarantine conventional report paths before a coverage command can reuse them."""
     recovery_error = _recover_coverage_transactions(root)
     if recovery_error is not None:
         return _CoverageArtifactState(set(), {}, None, recovery_error)
@@ -1529,6 +1693,14 @@ def _prepare_coverage_artifacts(root: Path) -> _CoverageArtifactState:
         else:
             candidates.append(name)
 
+    if preparation_errors:
+        return _CoverageArtifactState(
+            eligible=eligible,
+            backups={},
+            quarantine=None,
+            preparation_error="; ".join(preparation_errors),
+        )
+
     backups: dict[str, Path] = {}
     quarantine: Path | None = None
     if candidates:
@@ -1543,6 +1715,7 @@ def _prepare_coverage_artifacts(root: Path) -> _CoverageArtifactState:
                     {
                         "schema_version": _COVERAGE_RECOVERY_SCHEMA,
                         "artifacts": candidates,
+                        "phase": "preparing",
                     },
                     indent=2,
                     sort_keys=True,
@@ -1564,7 +1737,7 @@ def _prepare_coverage_artifacts(root: Path) -> _CoverageArtifactState:
                     os.replace(path, backup)
                 except OSError as exc:
                     preparation_errors.append(f"could not quarantine {name}: {type(exc).__name__}")
-                    continue
+                    break
                 backups[name] = backup
                 eligible.add(name)
 
@@ -1573,6 +1746,68 @@ def _prepare_coverage_artifacts(root: Path) -> _CoverageArtifactState:
         backups=backups,
         quarantine=quarantine,
         preparation_error="; ".join(preparation_errors) or None,
+    )
+
+
+def _mark_coverage_transaction_running(
+    state: _CoverageArtifactState,
+) -> str | None:
+    """Durably commit a prepared transaction before its command may start."""
+    if state.quarantine is None:
+        return None
+    marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
+    try:
+        artifacts, phase = _load_coverage_transaction(marker)
+        if phase != "preparing":
+            return "coverage recovery transaction is not in the preparing phase"
+        _atomic_write_text(
+            marker,
+            json.dumps(
+                {
+                    "schema_version": _COVERAGE_RECOVERY_SCHEMA,
+                    "artifacts": artifacts,
+                    "phase": "running",
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+        )
+    except (OSError, ValueError) as exc:
+        return f"could not commit coverage recovery transaction: {type(exc).__name__}"
+    return None
+
+
+def _rollback_coverage_preparation(
+    root: Path,
+    state: _CoverageArtifactState,
+) -> tuple[bool, str]:
+    """Undo an aborted preparation without deleting any path that reappeared."""
+    preparation_error = state.preparation_error or "unknown preparation failure"
+    detail = f"coverage artifact preparation failed ({preparation_error})"
+    if state.quarantine is None:
+        return True, detail
+
+    marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
+    try:
+        artifacts, _phase = _load_coverage_transaction(marker)
+    except ValueError as exc:
+        return (
+            False,
+            f"{detail}; {exc}; recovery marker: "
+            f"{_coverage_recovery_reference(root, state.quarantine)}",
+        )
+    rollback_error = _recover_coverage_transaction(
+        root,
+        state.quarantine,
+        artifacts,
+        phase="preparing",
+    )
+    if rollback_error is None:
+        return True, detail
+    return (
+        False,
+        f"{detail}; preparation rollback failed ({rollback_error}); "
+        f"recovery marker: {_coverage_recovery_reference(root, state.quarantine)}",
     )
 
 
@@ -1756,9 +1991,8 @@ def _emit_coverage_gate(
 ) -> None:
     from agenttalk.store import Store
 
-    xml_text = artifact_outputs.get("coverage.xml")
     json_text = artifact_outputs.get("coverage.json")
-    percent = parse_coverage_percent(stdout, xml_text=xml_text, json_text=json_text)
+    percent = parse_coverage_percent(stdout, json_text=json_text)
     command_succeeded = run.get("status") == "pass" and run.get("exit_code") == 0
     evidence_details = {"coverage_percent": float(percent)} if percent is not None else None
     with Store(plan.root).config_lock():

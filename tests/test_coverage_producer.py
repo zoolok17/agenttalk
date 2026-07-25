@@ -4,6 +4,8 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,13 @@ from agenttalk.store import Store
 
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
 
 
 def _plan(
@@ -247,6 +256,89 @@ def test_coverage_runner_exception_downgrades_preexisting_green_gate(
     assert "runner failed" in gate["reason"]
 
 
+def test_coverage_lock_acquisition_failure_aborts_before_command(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original = '{"totals": {"percent_covered": 17.0}, "owner": "operator"}'
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {"coverage.json": original},
+    )
+
+    class DeniedLock:
+        def __enter__(self):
+            raise TimeoutError("simulated coverage lock contention")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        Store,
+        "coverage_transaction_lock",
+        lambda self, **_kwargs: DeniedLock(),
+    )
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "from pathlib import Path; Path('coverage-command-ran').touch()",
+            revision=revision,
+        )
+    )
+
+    assert not (tmp_path / "coverage-command-ran").exists()
+    assert (tmp_path / "coverage.json").read_text(encoding="utf-8") == original
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    assert _coverage_gate(tmp_path)["status"] == "red"
+    assert "coverage command was not run" in _coverage_gate(tmp_path)["reason"]
+
+
+def test_coverage_lock_release_failure_discards_provisional_green(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original = '{"totals": {"percent_covered": 17.0}, "owner": "operator"}'
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {"coverage.json": original},
+    )
+
+    class FailingReleaseLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            raise OSError("simulated coverage lock release failure")
+
+    monkeypatch.setattr(
+        Store,
+        "coverage_transaction_lock",
+        lambda self, **_kwargs: FailingReleaseLock(),
+    )
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            (
+                "from pathlib import Path; "
+                "Path('coverage.json').write_text("
+                "'{\"totals\": {\"percent_covered\": 99.0}}', encoding='utf-8')"
+            ),
+            revision=revision,
+        )
+    )
+
+    assert (tmp_path / "coverage.json").read_text(encoding="utf-8") == original
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    assert any("release failure" in error for error in result.runner_errors)
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "coverage result was discarded" in gate["reason"]
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -447,43 +539,391 @@ def test_cli_fresh_ci_coverage_measurement_stays_green(
     assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(88.0)
 
 
-@pytest.mark.parametrize(
-    ("artifact_name", "payload", "expected"),
-    [
-        ("coverage.xml", '<coverage line-rate="0.8734"/>', 87.34),
-        ("coverage.json", '{"totals": {"percent_covered": 92.5}}', 92.5),
-    ],
-)
-def test_coverage_artifact_created_by_command_is_parsed(
+def test_coverage_json_created_by_command_is_parsed(
     tmp_path: Path,
     monkeypatch,
-    artifact_name: str,
-    payload: str,
-    expected: float,
 ) -> None:
     revision = _ci_revision(tmp_path, monkeypatch)
-    script = f"from pathlib import Path; Path({artifact_name!r}).write_text({payload!r}, encoding='utf-8')"
+    payload = '{"totals": {"percent_covered": 92.5}}'
+    script = (
+        "from pathlib import Path; "
+        f"Path('coverage.json').write_text({payload!r}, encoding='utf-8')"
+    )
 
     assurance.run_plan(_plan(tmp_path, script, revision=revision))
 
     gate = _coverage_gate(tmp_path)
     assert gate["status"] == "green"
-    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(expected)
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(92.5)
 
 
-def test_dtd_bearing_coverage_artifact_cannot_emit_green_gate(
+@pytest.mark.parametrize("artifact_name", ["coverage.xml", "coverage.json"])
+def test_symlinked_pre_run_report_aborts_before_command_and_preserves_target(
+    tmp_path: Path,
+    monkeypatch,
+    artifact_name: str,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    external_dir = tmp_path.parent / f"{tmp_path.name}-external"
+    external_dir.mkdir()
+    target = external_dir / "operator-report"
+    original = b"operator-owned coverage bytes"
+    target.write_bytes(original)
+    report = tmp_path / artifact_name
+    _symlink_or_skip(report, target)
+    command_marker = tmp_path / "coverage-command-ran"
+    script = (
+        "from pathlib import Path; "
+        "Path('coverage-command-ran').write_text('ran', encoding='utf-8'); "
+        f"Path({artifact_name!r}).write_bytes(b'attacker-controlled replacement')"
+    )
+
+    result = assurance.run_plan(_plan(tmp_path, script, revision=revision))
+
+    assert not command_marker.exists()
+    assert target.read_bytes() == original
+    assert report.is_symlink()
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    assert "coverage command was not run" in _coverage_gate(tmp_path)["reason"]
+
+
+def test_directory_pre_run_report_aborts_before_command_and_preserves_contents(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     revision = _ci_revision(tmp_path, monkeypatch)
-    payload = '<!DOCTYPE coverage><coverage line-rate="0.5"/>'
-    script = f"from pathlib import Path; Path('coverage.xml').write_text({payload!r}, encoding='utf-8')"
+    report = tmp_path / "coverage.json"
+    report.mkdir()
+    sentinel = report / "operator-report"
+    original = b"operator-owned directory contents"
+    sentinel.write_bytes(original)
+    script = (
+        "from pathlib import Path; "
+        "Path('coverage-command-ran').write_text('ran', encoding='utf-8'); "
+        "Path('coverage.json').write_bytes(b'attacker-controlled replacement')"
+    )
+
+    result = assurance.run_plan(_plan(tmp_path, script, revision=revision))
+
+    assert not (tmp_path / "coverage-command-ran").exists()
+    assert sentinel.read_bytes() == original
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    assert "coverage command was not run" in _coverage_gate(tmp_path)["reason"]
+
+
+def test_unmovable_pre_run_report_aborts_before_command_and_preserves_bytes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original = b'{"totals": {"percent_covered": 17.0}, "owner": "operator"}'
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {"coverage.json": original.decode("utf-8")},
+    )
+    report = tmp_path / "coverage.json"
+    real_replace = assurance.os.replace
+
+    def fail_quarantine(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            source_path == report
+            and destination_path.parent.name.startswith("transaction-")
+            and destination_path.parent.parent.name == "coverage-recovery"
+        ):
+            raise PermissionError("simulated quarantine denial")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(assurance.os, "replace", fail_quarantine)
+    script = (
+        "from pathlib import Path; "
+        "Path('coverage-command-ran').write_text('ran', encoding='utf-8'); "
+        "Path('coverage.json').write_bytes(b'attacker-controlled replacement')"
+    )
+
+    result = assurance.run_plan(_plan(tmp_path, script, revision=revision))
+
+    assert not (tmp_path / "coverage-command-ran").exists()
+    assert report.read_bytes() == original
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    assert "coverage command was not run" in _coverage_gate(tmp_path)["reason"]
+
+
+def test_preparation_abort_preserves_report_created_after_inspection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    (tmp_path / "coverage.xml").mkdir()
+    created = b'{"totals": {"percent_covered": 33.0}, "owner": "operator"}'
+    real_prepare = assurance._prepare_coverage_artifacts
+
+    def prepare_then_external_write(root: Path):
+        state = real_prepare(root)
+        assert state.preparation_error is not None
+        (root / "coverage.json").write_bytes(created)
+        return state
+
+    monkeypatch.setattr(
+        assurance,
+        "_prepare_coverage_artifacts",
+        prepare_then_external_write,
+    )
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "from pathlib import Path; Path('coverage-command-ran').touch()",
+            revision=revision,
+        )
+    )
+
+    assert not (tmp_path / "coverage-command-ran").exists()
+    assert (tmp_path / "coverage.json").read_bytes() == created
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+
+
+def test_aborted_partial_quarantine_never_deletes_reappeared_report_on_recovery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_xml = b"<operator-owned-xml/>"
+    original_json = b'{"totals": {"percent_covered": 17.0}, "owner": "operator"}'
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {
+            "coverage.xml": original_xml.decode("utf-8"),
+            "coverage.json": original_json.decode("utf-8"),
+        },
+    )
+    xml_report = tmp_path / "coverage.xml"
+    json_report = tmp_path / "coverage.json"
+    reappeared = b"<new-operator-owned-xml/>"
+    real_prepare = assurance._prepare_coverage_artifacts
+    real_replace = assurance.os.replace
+
+    def fail_second_quarantine(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            source_path == json_report
+            and destination_path.parent.name.startswith("transaction-")
+            and destination_path.parent.parent.name == "coverage-recovery"
+        ):
+            raise PermissionError("simulated second quarantine denial")
+        return real_replace(source, destination)
+
+    def prepare_then_reappear(root: Path):
+        state = real_prepare(root)
+        assert state.preparation_error is not None
+        xml_report.write_bytes(reappeared)
+        return state
+
+    monkeypatch.setattr(assurance.os, "replace", fail_second_quarantine)
+    monkeypatch.setattr(
+        assurance,
+        "_prepare_coverage_artifacts",
+        prepare_then_reappear,
+    )
+
+    first = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "from pathlib import Path; Path('first-command-ran').touch()",
+            revision=revision,
+        )
+    )
+
+    assert not (tmp_path / "first-command-ran").exists()
+    assert xml_report.read_bytes() == reappeared
+    assert json_report.read_bytes() == original_json
+    assert any("manual recovery" in error for error in first.runner_errors)
+    markers = list(
+        (tmp_path / ".agenttalk" / "assurance" / "coverage-recovery").glob(
+            "*/transaction.json"
+        )
+    )
+    assert len(markers) == 1
+    transaction = markers[0].parent
+    assert (transaction / "coverage.xml").read_bytes() == original_xml
+    assert json.loads(markers[0].read_text(encoding="utf-8"))["phase"] == "preparing"
+
+    monkeypatch.setattr(assurance.os, "replace", real_replace)
+    monkeypatch.setattr(assurance, "_prepare_coverage_artifacts", real_prepare)
+    second = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "from pathlib import Path; Path('second-command-ran').touch()",
+            revision=revision,
+        )
+    )
+
+    assert not (tmp_path / "second-command-ran").exists()
+    assert xml_report.read_bytes() == reappeared
+    assert (transaction / "coverage.xml").read_bytes() == original_xml
+    assert any("manual recovery" in error for error in second.runner_errors)
+
+
+def test_coverage_phase_transition_failure_aborts_and_restores_before_command(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original = '{"totals": {"percent_covered": 17.0}, "owner": "operator"}'
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {"coverage.json": original},
+    )
+    real_atomic_write = assurance._atomic_write_text
+
+    def fail_running_marker(path: Path, text: str, *args, **kwargs):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = {}
+        if Path(path).name == "transaction.json" and payload.get("phase") == "running":
+            raise OSError("simulated phase transition failure")
+        return real_atomic_write(path, text, *args, **kwargs)
+
+    monkeypatch.setattr(assurance, "_atomic_write_text", fail_running_marker)
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "from pathlib import Path; Path('coverage-command-ran').touch()",
+            revision=revision,
+        )
+    )
+
+    assert not (tmp_path / "coverage-command-ran").exists()
+    assert (tmp_path / "coverage.json").read_text(encoding="utf-8") == original
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    assert any("could not commit" in error for error in result.runner_errors)
+    assert not list(
+        (tmp_path / ".agenttalk" / "assurance" / "coverage-recovery").glob(
+            "*/transaction.json"
+        )
+    )
+
+
+def test_concurrent_coverage_transactions_do_not_cross_claim_or_lose_report(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    report = tmp_path / "coverage.json"
+    original = b'{"totals": {"percent_covered": 12.0}, "owner": "operator"}'
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {"coverage.json": original.decode("utf-8")},
+    )
+    a_output_ready = threading.Event()
+    b_finished = threading.Event()
+
+    def fake_run_external(root: Path, spec: dict, command: list[str]):
+        scan = command[-1]
+        if scan == "scan-a":
+            (root / "coverage.json").write_text(
+                '{"totals": {"percent_covered": 81.0}, "owner": "scan-a"}',
+                encoding="utf-8",
+            )
+            a_output_ready.set()
+            b_finished.wait(timeout=2.0)
+        else:
+            (root / "coverage.json").write_text(
+                '{"totals": {"percent_covered": 92.0}, "owner": "scan-b"}',
+                encoding="utf-8",
+            )
+        run = assurance._run_record(
+            spec,
+            "pass",
+            time.monotonic(),
+            command=command,
+            exit_code=0,
+        )
+        return run, [], "", ""
+
+    monkeypatch.setattr(assurance, "_run_external", fake_run_external)
+    results: dict[str, assurance.ScanResult] = {}
+    errors: list[BaseException] = []
+
+    def scan(name: str, profile: str) -> None:
+        try:
+            results[name] = assurance.run_plan(
+                _plan(
+                    tmp_path,
+                    name,
+                    profile=profile,
+                    revision=revision,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            if name == "scan-b":
+                b_finished.set()
+
+    first = threading.Thread(
+        target=scan,
+        args=("scan-a", "release"),
+        name="coverage-scan-a",
+    )
+    second = threading.Thread(
+        target=scan,
+        args=("scan-b", "change"),
+        name="coverage-scan-b",
+    )
+    first.start()
+    assert a_output_ready.wait(timeout=5.0)
+    second.start()
+    first.join(timeout=5.0)
+    assert not first.is_alive()
+    second.join(timeout=5.0)
+    assert not second.is_alive()
+    assert errors == []
+    assert set(results) == {"scan-a", "scan-b"}
+    assert results["scan-a"].runner_errors == []
+    assert results["scan-b"].runner_errors == []
+    assert report.read_bytes() == original
+    assert _coverage_gate(tmp_path, "release")["evidence"][-1][
+        "coverage_percent"
+    ] == pytest.approx(81.0)
+    assert _coverage_gate(tmp_path, "change")["evidence"][-1][
+        "coverage_percent"
+    ] == pytest.approx(92.0)
+
+
+@pytest.mark.parametrize(
+    "payload_expression",
+    [
+        repr('<coverage line-rate="0.5"/>'),
+        repr(
+            '<!DOCTYPE coverage [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+            '<coverage line-rate="&xxe;"/>'
+        ),
+        f"'<coverage>' + (' ' * {MAX_COVERAGE_ARTIFACT_BYTES + 1}) + '</coverage>'",
+    ],
+    ids=["valid", "doctype-external-entity", "oversized"],
+)
+def test_coverage_xml_is_never_accepted_as_evidence(
+    tmp_path: Path,
+    monkeypatch,
+    payload_expression: str,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    script = (
+        "from pathlib import Path; "
+        f"Path('coverage.xml').write_text({payload_expression}, encoding='utf-8')"
+    )
 
     assurance.run_plan(_plan(tmp_path, script, revision=revision))
 
     gate = _coverage_gate(tmp_path)
     assert gate["status"] == "red"
     assert "coverage_percent" not in gate["evidence"][-1]
+    assert not (tmp_path / "coverage.xml").exists()
 
 
 def test_stale_coverage_artifact_cannot_override_current_stdout(
@@ -507,12 +947,12 @@ def test_identical_artifact_replaced_by_command_counts_as_current(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    payload = '<coverage line-rate="0.75"/>'
-    revision = _ci_revision(tmp_path, monkeypatch, {"coverage.xml": payload})
+    payload = '{"totals": {"percent_covered": 75.0}}'
+    revision = _ci_revision(tmp_path, monkeypatch, {"coverage.json": payload})
     script = (
         "import os; from pathlib import Path; "
         f"Path('coverage.next').write_text({payload!r}, encoding='utf-8'); "
-        "os.replace('coverage.next', 'coverage.xml')"
+        "os.replace('coverage.next', 'coverage.json')"
     )
 
     assurance.run_plan(_plan(tmp_path, script, revision=revision))
@@ -728,22 +1168,21 @@ def test_stdout_percent_parser_consumes_the_full_token(
         assert actual == pytest.approx(expected)
 
 
-@pytest.mark.parametrize(
-    "xml_text",
-    [
-        '<!DOCTYPE coverage><coverage line-rate="0.5"/>',
-        '<!DOCTYPE coverage [<!ENTITY rate "0.5">]><coverage line-rate="&rate;"/>',
-        '<!DOCTYPE coverage [<!ENTITY rate SYSTEM "file:///etc/passwd">]><coverage line-rate="&rate;"/>',
-    ],
-)
-def test_coverage_xml_with_dtd_or_entities_is_rejected(xml_text: str) -> None:
-    assert parse_coverage_percent("", xml_text=xml_text) is None
+def test_oversized_coverage_json_is_rejected_before_parsing() -> None:
+    json_text = (
+        '{"totals": {"percent_covered": 50.0}, "padding": "'
+        + (" " * MAX_COVERAGE_ARTIFACT_BYTES)
+        + '"}'
+    )
+
+    assert parse_coverage_percent("", json_text=json_text) is None
 
 
-def test_oversized_coverage_xml_is_rejected_before_parsing() -> None:
-    xml_text = '<coverage line-rate="0.5">' + (" " * MAX_COVERAGE_ARTIFACT_BYTES) + "</coverage>"
+@pytest.mark.parametrize("value", ["99.0", True, None, [], {}])
+def test_coverage_json_requires_a_numeric_percent(value) -> None:
+    json_text = json.dumps({"totals": {"percent_covered": value}})
 
-    assert parse_coverage_percent("", xml_text=xml_text) is None
+    assert parse_coverage_percent("", json_text=json_text) is None
 
 
 @pytest.mark.parametrize(

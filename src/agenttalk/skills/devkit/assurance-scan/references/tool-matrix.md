@@ -22,7 +22,10 @@ Python v1:
 - ruff check and ruff format when configured or required.
 - test command from the manifest, or the safe inferred pytest command.
 - mypy or pyright only when configured or required.
-- coverage only when configured.
+- coverage only when configured. Evidence is accepted from a bounded root
+  `coverage.json` (`totals.percent_covered`) or a recognized coverage.py/pytest-cov
+  terminal summary. XML is not parsed; conventional `coverage.xml` and
+  `coverage.json` paths are still protected for the command transaction.
 - bandit, semgrep local rules, gitleaks, osv-scanner, and pip-audit when
   installed and applicable. Network-dependent dependency tools are skipped by
   default unless the manifest permits them.

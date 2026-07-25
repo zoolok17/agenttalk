@@ -42,14 +42,14 @@ Recommended later scope:
    it. Without that anchor, no signature scheme proves that every
    relevant message is still present.
 
-Important constraint: the Python standard library does not provide an asymmetric
+Important constraint: stdlib-only Python does not provide an asymmetric
 signature primitive. HMAC can authenticate bytes to holders of a shared
 secret, but it cannot prove "agent A, not agent B" if both agents can
-read the verification secret. Agenttalk currently has no asymmetric-crypto
-runtime dependency, so it must not claim strong per-agent cryptographic identity
-among mutually untrusted local participants. It can still make identity history,
-rename safety, epoch barriers, and policy decisions machine-checkable for a
-trusted local team.
+read the verification secret. Under the current no-runtime-dependencies
+constraint, agenttalk must not claim strong per-agent cryptographic
+identity among mutually untrusted local participants. It can still make
+identity history, rename safety, epoch barriers, and policy decisions
+machine-checkable for a trusted local team.
 
 ## Current Model
 
@@ -100,8 +100,8 @@ trusted local team tool unless stronger identity is deliberately added.
   validate messages and warn; it cannot control external UI behavior.
 - Do not silently forward messages from old identities to new ones.
 - Do not claim malicious-peer security from shared-secret HMAC.
-- Do not add an asymmetric-crypto runtime dependency only to get signatures
-  unless the project explicitly revisits that dependency decision.
+- Do not add a runtime dependency only to get signatures unless the
+  project explicitly relaxes the stdlib-only constraint.
 - Do not use message body prose as authorization input.
 
 ## Threat Model

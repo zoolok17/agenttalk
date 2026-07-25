@@ -1530,6 +1530,24 @@ class Store:
         """
         return self._config_lock(timeout=timeout, poll=poll)
 
+    def coverage_transaction_lock(self, *, timeout: float = 70.0,
+                                  poll: float = 0.05):
+        """Serialize one assurance coverage-artifact transaction per root.
+
+        Coverage commands temporarily quarantine conventional report paths.
+        Holding this lock across prepare, command execution, restore, and gate
+        emission prevents concurrent scans from consuming or deleting each
+        other's reports.  The underlying store lock supplies the same
+        cross-platform ownership and stale-holder recovery as other store
+        transactions.
+        """
+        return self._exclusive_lock(
+            self.dir / "assurance" / "coverage.lock",
+            timeout=timeout,
+            poll=poll,
+            what="assurance coverage transaction lock",
+        )
+
     def _supervisor_lifecycle_lock(self, *, timeout: float = 10.0,
                                    poll: float = 0.05):
         """Serialize supervisor claim/release, host selection, and refresh.
