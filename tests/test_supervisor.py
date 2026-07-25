@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2516,14 +2517,18 @@ def test_heartbeat_hook_fallback_obeys_throttle(
 # ---------------------------------------- WP-3: install-activity-hook (merge-safe)
 
 
-def _post_tool_commands(path: Path) -> list[str]:
+def _hook_commands(path: Path, event: str) -> list[str]:
     data = json.loads(path.read_text(encoding="utf-8"))
     return [
         h["command"]
-        for group in data["hooks"]["PostToolUse"]
+        for group in data["hooks"][event]
         for h in group.get("hooks", [])
         if isinstance(h, dict) and "command" in h
     ]
+
+
+def _post_tool_commands(path: Path) -> list[str]:
+    return _hook_commands(path, "PostToolUse")
 
 
 def _recognized_heartbeat_commands(commands: list[str]) -> list[str]:
@@ -2553,11 +2558,288 @@ def test_install_activity_hook_merges_and_is_idempotent(tmp_path: Path) -> None:
     assert data["hooks"]["PreToolUse"]                   # preserved
     cmds = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
     assert "agenttalk heartbeat --hook" in cmds            # 0.31.1: soft hook command
+    assert data["hooks"]["PreCompact"] == [{
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": "agenttalk checkpoint save --hook || agenttalk heartbeat --hook",
+        }],
+    }]
+    assert data["hooks"]["SessionStart"] == [{
+        "matcher": "compact",
+        "hooks": [{
+            "type": "command",
+            "command": "agenttalk checkpoint resume --hook || agenttalk heartbeat --hook",
+        }],
+    }]
     # idempotent: second install adds nothing
+    first_install = settings.read_text(encoding="utf-8")
     assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+    assert settings.read_text(encoding="utf-8") == first_install
     data2 = json.loads(settings.read_text(encoding="utf-8"))
     post = [h["command"] for g in data2["hooks"]["PostToolUse"] for h in g["hooks"]]
     assert post.count("agenttalk heartbeat --hook") == 1
+
+
+def test_install_activity_hook_adds_checkpoint_hooks_to_existing_heartbeat(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {"PostToolUse": [{
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": "agenttalk heartbeat --hook"}],
+    }]}}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    assert _hook_commands(settings, "PreCompact") == [
+        "agenttalk checkpoint save --hook || agenttalk heartbeat --hook",
+    ]
+    assert _hook_commands(settings, "SessionStart") == [
+        "agenttalk checkpoint resume --hook || agenttalk heartbeat --hook",
+    ]
+
+
+def test_install_activity_hook_reports_partial_malformed_event(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    malformed = {"matcher": "*"}
+    settings.write_text(
+        json.dumps({"hooks": {"PreCompact": malformed}}),
+        encoding="utf-8",
+    )
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    assert f"installed: {settings} [PostToolUse]" in output
+    assert (
+        f"skipped (malformed hooks.PreCompact): {settings} [PreCompact]"
+        in output
+    )
+    assert f"installed: {settings} [SessionStart]" in output
+    assert "already:" not in output
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data["hooks"]["PreCompact"] == malformed
+    assert _hook_commands(settings, "SessionStart") == [
+        "agenttalk checkpoint resume --hook || agenttalk heartbeat --hook",
+    ]
+
+
+def test_install_activity_hook_reports_malformed_hooks_container(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    original = json.dumps({"hooks": []})
+    settings.write_text(original, encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    for event in ("PostToolUse", "PreCompact", "SessionStart"):
+        assert f"skipped (malformed hooks): {settings} [{event}]" in output
+    assert "already:" not in output
+    assert settings.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("entry_type", "first_status"),
+    [
+        (None, "installed"),
+        ("prompt", "installed"),
+        ("command", "already"),
+    ],
+    ids=["missing-type", "wrong-type", "correct-type"],
+)
+@pytest.mark.parametrize(
+    "fallback_agent",
+    [None, "lead"],
+    ids=["neutral", "preserved-fallback"],
+)
+def test_install_activity_hook_repairs_managed_hook_types(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    entry_type: str | None,
+    first_status: str,
+    fallback_agent: str | None,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+
+    def managed(command: str) -> dict:
+        item = {"command": command}
+        if entry_type is not None:
+            item["type"] = entry_type
+        return item
+
+    expected = {
+        "PostToolUse": (
+            sup.fallback_activity_hook_command(fallback_agent)
+            if fallback_agent is not None
+            else sup.ACTIVITY_HOOK_COMMAND
+        ),
+        "PreCompact": sup.checkpoint_hook_command("save", fallback_agent),
+        "SessionStart": sup.checkpoint_hook_command("resume", fallback_agent),
+    }
+    original = json.dumps({"hooks": {
+        "PostToolUse": [
+            {"matcher": "*", "hooks": [managed(expected["PostToolUse"])]},
+        ],
+        "PreCompact": [
+            {"matcher": "*", "hooks": [managed(expected["PreCompact"])]},
+        ],
+        "SessionStart": [
+            {
+                "matcher": "compact",
+                "hooks": [managed(expected["SessionStart"])],
+            },
+        ],
+    }}, indent=2)
+    settings.write_text(original, encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    for event in ("PostToolUse", "PreCompact", "SessionStart"):
+        assert f"{first_status}: {settings} [{event}]" in output
+    repaired = settings.read_text(encoding="utf-8")
+    if entry_type == "command":
+        assert repaired == original
+
+    hooks = json.loads(repaired)["hooks"]
+    for event, command in expected.items():
+        items = [
+            item
+            for group in hooks[event]
+            for item in group["hooks"]
+            if item.get("command") == command
+        ]
+        assert items == [{"type": "command", "command": command}]
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+    second_output = capsys.readouterr().out
+    for event in ("PostToolUse", "PreCompact", "SessionStart"):
+        assert f"already: {settings} [{event}]" in second_output
+    assert settings.read_text(encoding="utf-8") == repaired
+
+
+def test_claude_hook_snippet_includes_all_managed_hooks() -> None:
+    hooks = json.loads(sup.claude_hook_snippet())["hooks"]
+
+    assert hooks["PostToolUse"] == [{
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": "agenttalk heartbeat --hook"}],
+    }]
+    assert hooks["PreCompact"] == [{
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": "agenttalk checkpoint save --hook || agenttalk heartbeat --hook",
+        }],
+    }]
+    assert hooks["SessionStart"] == [{
+        "matcher": "compact",
+        "hooks": [{
+            "type": "command",
+            "command": "agenttalk checkpoint resume --hook || agenttalk heartbeat --hook",
+        }],
+    }]
+
+
+def test_install_activity_hook_upgrades_and_dedupes_checkpoint_hooks(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {
+        "PreCompact": [
+            {"matcher": "Edit", "hooks": [
+                {"type": "command", "command": "agenttalk checkpoint save --hook"},
+                {"type": "command", "command": "echo preserve-pre"},
+            ]},
+            {"matcher": "*", "hooks": [
+                {"type": "command", "command": "agenttalk checkpoint save --hook"},
+            ]},
+        ],
+        "SessionStart": [
+            {"matcher": "startup", "hooks": [
+                {"type": "command", "command": "agenttalk checkpoint resume --hook"},
+                {"type": "command", "command": "echo preserve-start"},
+            ]},
+        ],
+    }}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    precompact = [
+        (group["matcher"], hook["command"])
+        for group in data["hooks"]["PreCompact"]
+        for hook in group.get("hooks", [])
+        if hook.get("command", "").startswith("agenttalk checkpoint")
+    ]
+    session_start = [
+        (group["matcher"], hook["command"])
+        for group in data["hooks"]["SessionStart"]
+        for hook in group.get("hooks", [])
+        if hook.get("command", "").startswith("agenttalk checkpoint")
+    ]
+    assert precompact == [
+        ("*", "agenttalk checkpoint save --hook || agenttalk heartbeat --hook"),
+    ]
+    assert session_start == [
+        (
+            "compact",
+            "agenttalk checkpoint resume --hook || agenttalk heartbeat --hook",
+        ),
+    ]
+    assert "echo preserve-pre" in _hook_commands(settings, "PreCompact")
+    assert "echo preserve-start" in _hook_commands(settings, "SessionStart")
+
+
+def test_install_activity_hook_prunes_only_groups_emptied_by_relocation(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {
+        "PreCompact": [
+            {"matcher": "manual", "hooks": [
+                {"type": "command", "command": "agenttalk checkpoint save --hook"},
+            ]},
+            {"matcher": "operator-empty", "hooks": []},
+        ],
+        "SessionStart": [
+            {"matcher": "startup", "hooks": [
+                {"type": "command", "command": "agenttalk checkpoint resume --hook"},
+            ]},
+            {"matcher": "operator-empty", "hooks": []},
+        ],
+    }}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    hooks = json.loads(settings.read_text(encoding="utf-8"))["hooks"]
+    assert [group["matcher"] for group in hooks["PreCompact"]] == [
+        "operator-empty",
+        "*",
+    ]
+    assert [group["matcher"] for group in hooks["SessionStart"]] == [
+        "operator-empty",
+        "compact",
+    ]
 
 
 def test_install_activity_hook_codex_uses_group_shape(tmp_path: Path) -> None:
@@ -2569,7 +2851,9 @@ def test_install_activity_hook_codex_uses_group_shape(tmp_path: Path) -> None:
     hooks_file = s.root / ".codex" / "hooks.json"
     assert hooks_file.exists()
     assert not (s.root / ".claude" / "settings.json").exists()  # codex-only
-    groups = json.loads(hooks_file.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
+    hooks = json.loads(hooks_file.read_text(encoding="utf-8"))["hooks"]
+    assert set(hooks) == {"PostToolUse"}  # checkpoint hooks are Claude-only in B1
+    groups = hooks["PostToolUse"]
     # matcher-group shape: each group has a NESTED hooks list
     assert groups[0]["matcher"] == "*"
     assert groups[0]["hooks"][0]["command"] == "agenttalk heartbeat --hook"
@@ -2578,6 +2862,32 @@ def test_install_activity_hook_codex_uses_group_shape(tmp_path: Path) -> None:
     groups2 = json.loads(hooks_file.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
     cmds = [h["command"] for g in groups2 for h in g["hooks"]]
     assert cmds.count("agenttalk heartbeat --hook") == 1
+
+
+def test_install_activity_hook_codex_keeps_checkpoint_hooks_claude_only(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+
+    assert _run(["supervise", "--install-activity-hook", "--codex"], tmp_path) == 0
+
+    claude_settings = s.root / ".claude" / "settings.json"
+    assert _hook_commands(claude_settings, "PreCompact") == [
+        "agenttalk checkpoint save --hook || agenttalk heartbeat --hook",
+    ]
+    assert _hook_commands(claude_settings, "SessionStart") == [
+        "agenttalk checkpoint resume --hook || agenttalk heartbeat --hook",
+    ]
+
+    codex_hooks = json.loads(
+        (s.root / ".codex" / "hooks.json").read_text(encoding="utf-8"),
+    )["hooks"]
+    assert set(codex_hooks) == {"PostToolUse"}
+    assert [
+        hook["command"]
+        for group in codex_hooks["PostToolUse"]
+        for hook in group["hooks"]
+    ] == ["agenttalk heartbeat --hook"]
 
 
 def test_install_activity_hook_upgrades_and_dedupes_legacy_bare(tmp_path: Path) -> None:
@@ -2623,10 +2933,189 @@ def test_install_activity_hook_interactive_writes_fallback_and_preserves(
     assert data["hooks"]["PreToolUse"]
     cmds = _post_tool_commands(settings)
     assert cmds == ["agenttalk heartbeat --hook --fallback-for lead"]
+    assert _hook_commands(settings, "PreCompact") == [
+        "agenttalk checkpoint save --hook --fallback-for lead"
+        " || agenttalk heartbeat --hook --fallback-for lead",
+    ]
+    assert _hook_commands(settings, "SessionStart") == [
+        "agenttalk checkpoint resume --hook --fallback-for lead"
+        " || agenttalk heartbeat --hook --fallback-for lead",
+    ]
     assert not (s.root / ".codex" / "hooks.json").exists()
 
     assert _run(["supervise", "--install-activity-hook", "--interactive-for", "lead"], tmp_path) == 0
     assert _post_tool_commands(settings).count("agenttalk heartbeat --hook --fallback-for lead") == 1
+    assert _hook_commands(settings, "PreCompact").count(
+        "agenttalk checkpoint save --hook --fallback-for lead"
+        " || agenttalk heartbeat --hook --fallback-for lead",
+    ) == 1
+    assert _hook_commands(settings, "SessionStart").count(
+        "agenttalk checkpoint resume --hook --fallback-for lead"
+        " || agenttalk heartbeat --hook --fallback-for lead",
+    ) == 1
+
+
+def _legacy_agenttalk_env(tmp_path: Path) -> dict[str, str]:
+    fake_bin = tmp_path / "legacy-bin"
+    fake_bin.mkdir()
+    if os.name == "nt":
+        (fake_bin / "agenttalk.cmd").write_text(
+            "@echo off\r\n"
+            "if /i \"%~1\"==\"checkpoint\" exit /b 2\r\n"
+            "if /i \"%~1\"==\"heartbeat\" exit /b 0\r\n"
+            "exit /b 9\r\n",
+            encoding="ascii",
+        )
+    else:
+        executable = fake_bin / "agenttalk"
+        executable.write_text(
+            "#!/bin/sh\n"
+            "[ \"$1\" = checkpoint ] && exit 2\n"
+            "[ \"$1\" = heartbeat ] && exit 0\n"
+            "exit 9\n",
+            encoding="ascii",
+        )
+        executable.chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+    }
+
+
+def _real_argparse_failure_agenttalk_env(tmp_path: Path) -> dict[str, str]:
+    fake_bin = tmp_path / "real-argparse-bin"
+    fake_bin.mkdir()
+    if os.name == "nt":
+        (fake_bin / "agenttalk.cmd").write_text(
+            "@echo off\r\n"
+            'if /i "%~1"=="checkpoint" goto checkpoint\r\n'
+            'if /i "%~1"=="heartbeat" exit /b 0\r\n'
+            "exit /b 9\r\n"
+            ":checkpoint\r\n"
+            f'"{sys.executable}" -m agenttalk checkpoint --definitely-invalid\r\n'
+            "exit /b %errorlevel%\r\n",
+            encoding="ascii",
+        )
+    else:
+        executable = fake_bin / "agenttalk"
+        executable.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = checkpoint ]; then\n'
+            f"  exec {shlex.quote(sys.executable)} -m agenttalk "
+            "checkpoint --definitely-invalid\n"
+            "fi\n"
+            '[ "$1" = heartbeat ] && exit 0\n'
+            "exit 9\n",
+            encoding="ascii",
+        )
+        executable.chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+    }
+
+
+_GUARDED_CHECKPOINT_COMMANDS = [
+    "agenttalk checkpoint save --hook --fallback-for lead"
+    " || agenttalk heartbeat --hook --fallback-for lead",
+    "agenttalk checkpoint resume --hook --fallback-for lead"
+    " || agenttalk heartbeat --hook --fallback-for lead",
+]
+
+
+def test_checkpoint_hook_guard_keeps_real_argparse_usage_off_stdout(
+    tmp_path: Path,
+) -> None:
+    command = sup.CHECKPOINT_SAVE_HOOK_COMMAND
+    shell = (
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command]
+        if os.name == "nt"
+        else ["/bin/sh", "-c", command]
+    )
+
+    result = subprocess.run(
+        shell,
+        env=_real_argparse_failure_agenttalk_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert "usage:" in result.stderr.lower()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX sh contract")
+@pytest.mark.parametrize("command", _GUARDED_CHECKPOINT_COMMANDS)
+def test_checkpoint_hook_guard_masks_legacy_exit_two_in_posix_sh(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        env=_legacy_agenttalk_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows cmd contract")
+@pytest.mark.parametrize("command", _GUARDED_CHECKPOINT_COMMANDS)
+def test_checkpoint_hook_guard_masks_legacy_exit_two_in_cmd(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    result = subprocess.run(
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command],
+        env=_legacy_agenttalk_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("pwsh") is None,
+    reason="Windows PowerShell Core contract",
+)
+@pytest.mark.parametrize("command", _GUARDED_CHECKPOINT_COMMANDS)
+def test_checkpoint_hook_guard_masks_legacy_exit_two_in_pwsh(
+    command: str,
+) -> None:
+    legacy_agenttalk = (
+        "function agenttalk { "
+        "param([Parameter(ValueFromRemainingArguments=$true)][string[]] $Rest); "
+        "if ($Rest[0] -eq 'checkpoint') { cmd.exe /d /c exit 2 } "
+        "elseif ($Rest[0] -eq 'heartbeat') { cmd.exe /d /c exit 0 } "
+        "else { cmd.exe /d /c exit 9 }"
+        "}; "
+    )
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            legacy_agenttalk + command,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
 
 
 @pytest.mark.parametrize("existing", [
@@ -2690,10 +3179,21 @@ def test_install_activity_hook_neutral_does_not_downgrade_existing_fallback(
 
     assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
 
-    assert "already:" in capsys.readouterr().out
+    assert "installed:" in capsys.readouterr().out
     cmds = _post_tool_commands(settings)
     assert cmds == [fallback]
     assert _recognized_heartbeat_commands(cmds) == [fallback]
+    assert _hook_commands(settings, "PreCompact") == [
+        "agenttalk checkpoint save --hook --fallback-for lead"
+        " || agenttalk heartbeat --hook --fallback-for lead",
+    ]
+    assert _hook_commands(settings, "SessionStart") == [
+        "agenttalk checkpoint resume --hook --fallback-for lead"
+        " || agenttalk heartbeat --hook --fallback-for lead",
+    ]
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+    assert "already:" in capsys.readouterr().out
 
 
 def test_install_activity_hook_neutral_dedupes_mixed_fallback_and_neutral(
@@ -7853,9 +8353,9 @@ def test_install_activity_hook_preserves_bom_prefixed_operator_settings(tmp_path
     settings.parent.mkdir(parents=True, exist_ok=True)
     settings.write_bytes(b"\xef\xbb\xbf" + b'{"customOperatorKey": 42}')
     out = sup.install_activity_hook(s, claude=True, codex=False)
-    st = out[str(settings)]
-    assert "unreadable" not in st                      # was "skipped (unreadable...)" before the fix
-    assert st in ("installed", "already")
+    statuses = out[str(settings)]
+    assert all("unreadable" not in status for status in statuses.values())
+    assert set(statuses.values()) <= {"installed", "already"}
     data = json.loads(settings.read_text(encoding="utf-8-sig"))
     assert data.get("customOperatorKey") == 42         # operator key preserved through the merge
 
@@ -7930,7 +8430,7 @@ def test_install_activity_hook_preserves_bom_prefixed_codex_hooks(tmp_path: Path
     hooks.parent.mkdir(parents=True, exist_ok=True)
     hooks.write_bytes(b"\xef\xbb\xbf" + b'{"customOperatorKey": 7}')
     out = sup.install_activity_hook(s, claude=False, codex=True)
-    st = out[str(hooks)]
-    assert "unreadable" not in st
+    statuses = out[str(hooks)]
+    assert all("unreadable" not in status for status in statuses.values())
     data = json.loads(hooks.read_text(encoding="utf-8-sig"))
     assert data.get("customOperatorKey") == 7

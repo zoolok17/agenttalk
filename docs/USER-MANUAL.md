@@ -59,7 +59,7 @@ decisions are what make a GO credible.
 Install once per machine. Pin the version in repeatable setups.
 
 ```powershell
-python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.78.0
+python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.79.0
 agenttalk --version
 agenttalk --help
 agenttalk install-skills
@@ -565,10 +565,63 @@ agenttalk supervise --install-activity-hook --codex
 agenttalk supervise --install-activity-hook --interactive-for claude-lead
 ```
 
-Use the neutral hook for supervised/manual agents launched with
-`AGENTTALK_SELF`. Use `--interactive-for <lead>` only for the current
-operator-facing human Claude liaison window. It writes a Claude-only fallback
-hook. Non-liaison windows should set `AGENTTALK_SELF` instead.
+The Claude installer writes three project hooks to `.claude/settings.json`:
+heartbeat on `PostToolUse`, checkpoint save on `PreCompact`, and checkpoint
+resume on `SessionStart` with matcher `compact`. `--codex` additionally writes
+only the heartbeat hook to `.codex/hooks.json`; it does not install Codex
+checkpoint hooks. Use the neutral hooks for supervised/manual agents launched
+with `AGENTTALK_SELF`. Use `--interactive-for <lead>` only for the current
+operator-facing human Claude liaison window. It gives all three Claude hooks a
+fallback identity for a window without `AGENTTALK_SELF`; the environment
+identity still takes precedence. Non-liaison windows should set
+`AGENTTALK_SELF` instead.
+
+### Checkpoint-before-compact reference
+
+Automatic context compaction can omit working state. Checkpoint-before-compact
+captures deterministic external anchors immediately before compaction and
+re-injects a summary when the compacted session starts. It records current
+context capacity, Git state, and bounded bus obligations; it cannot capture
+model reasoning that exists only in the conversation.
+
+| Command | Behavior |
+| --- | --- |
+| `agenttalk checkpoint save [--for A] [--trigger auto\|manual]` | Save a checkpoint directly. Non-hook saves default to trigger `manual`. |
+| `agenttalk checkpoint resume [--for A]` | Render the latest checkpoint as human-readable resume context. Missing checkpoints are not errors. |
+| `agenttalk checkpoint show [--for A] [--json]` | Inspect the latest checkpoint; `--json` emits its stored payload. |
+
+The installed Claude hooks use these hook modes:
+
+- `PreCompact` runs `checkpoint save --hook`. It reads the bounded hook payload
+  from stdin, stays silent, swallows every internal failure, and **always exits
+  0**, so the command cannot block a compaction.
+- `SessionStart` with matcher `compact` runs `checkpoint resume --hook`. It
+  always emits exactly one JSON envelope on stdout:
+
+  ```json
+  {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"..."}}
+  ```
+
+  Claude injects `additionalContext` into the resumed session. When no valid
+  checkpoint exists, the same envelope contains an empty context.
+
+The latest checkpoint is
+`.agenttalk/checkpoints/<agent>.json`. Each save replaces that file and keeps
+up to ten prior snapshots under
+`.agenttalk/checkpoints/history/<agent>/`. `agenttalk reset` deletes checkpoint
+state; `agenttalk reset --archive` moves it with the prior session.
+
+Hook identity resolves from an explicit `--for`, then `AGENTTALK_SELF`, then
+the installer's `--fallback-for`. A wrapped Claude agent therefore checkpoints
+as itself through `AGENTTALK_SELF`; the fallback binds only an interactive
+window that lacks that environment variable.
+
+For rollout safety, each installed checkpoint command falls back to the silent
+heartbeat hook when the `checkpoint` subcommand is unavailable. A bounded
+legacy-PATH residual remains: the neutral heartbeat fallback requires roughly
+agenttalk v0.31.1, and the `--fallback-for` form requires v0.69.6. An older
+executable selected first on `PATH` can still return exit 2; upgrade or correct
+`PATH` before installing these hooks.
 
 Recommended unattended path:
 
@@ -983,7 +1036,8 @@ Common cases:
 
 - Heartbeat-stale lead. The lead-chat panel says unavailable when the
   operator-facing lead has no fresh heartbeat. Start `wait`, run the lead under
-  `wrap --loop`, or install the interactive hook with
+  `wrap --loop`, or install the interactive Claude heartbeat and checkpoint
+  hooks with
   `agenttalk supervise --install-activity-hook --interactive-for <lead>`.
 - No operator-facing lead. Set one with
   `agenttalk roster set-operator-facing <agent>`, or set exactly one active
@@ -1038,7 +1092,7 @@ This is a compact operator map, not a full argparse dump. Use
 | Onboarding | `onboarding create`, `onboarding record`, `onboarding show`, `onboarding state`, `onboarding list` | Track codebase-analysis segments, claims, drift, and blocking unknowns before implementation. |
 | Knowledge | `knowledge publish`, `knowledge curate`, `knowledge pull`, `knowledge search`, `knowledge onboard` | Capture, verify, retrieve, and search durable project notes and lessons. |
 | Supervision | `supervise --bootstrap-check`, `supervise`, `wrap`, `heartbeat`, `request-restart`, `request-launch`, `managed-lead-loop`, `deadman` | Verify the roster is a live team, run unattended agents, maintain liveness, request restarts, and monitor stale work. |
-| Recovery | `dead-letter list`, `dead-letter show`, `dead-letter requeue`, `dead-letter resolve`, `dead-letter purge --resolved`, `prune`, `compact`, `reset` | Inspect poison messages, archive resolved poison evidence, quarantine invalid files, archive old messages, or clear active state. |
+| Recovery | `checkpoint save`, `checkpoint resume`, `checkpoint show`, `dead-letter list`, `dead-letter show`, `dead-letter requeue`, `dead-letter resolve`, `dead-letter purge --resolved`, `prune`, `compact`, `reset` | Preserve compact-resume anchors, inspect poison messages, archive resolved poison evidence, quarantine invalid files, archive old messages, or clear active state. |
 | Web | `dashboard`, `serve`, `start` | Open local loopback UI surfaces and optional browser intent enqueueing. |
 
 ## 14. Glossary
