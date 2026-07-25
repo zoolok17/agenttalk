@@ -473,6 +473,10 @@ health cannot be falsely degraded by rendered payload.
 | Yes, configured claim retention/finalization failed | any | Do not advance; preserve the claim and retry its guarded finalization. |
 | Same request but no exact `in_reply_to`, and drive failed | failed | Do not use as override evidence. |
 
+The `No | ok` compatibility row is a deliberate residual, not proof that work
+landed: an exit-zero-but-not-durably-landed turn advances the cursor, so any
+intended work that failed to land is silently dropped.
+
 ## Failing-first regression
 
 Added:

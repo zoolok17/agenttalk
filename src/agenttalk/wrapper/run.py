@@ -1137,14 +1137,6 @@ def classify_bus_execution(
     )
 
 
-def _tool_config_blocked_summary(tool: object, output: object) -> str | None:
-    command = _command_text(tool)
-    classification = classify_bus_execution(command, output)
-    if classification["kind"] == BUS_KIND_CONFIG_BLOCKED:
-        return classification["summary"]
-    return None
-
-
 def _looks_like_infra(text: str | None) -> bool:
     """Low-confidence legacy text marker; never authoritative for known infra."""
     t = (text or "").lower()
