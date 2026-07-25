@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk import assurance, gates
-from agenttalk.coverage_parse import parse_coverage_percent
+from agenttalk.coverage_parse import MAX_COVERAGE_ARTIFACT_BYTES, parse_coverage_percent
 from agenttalk.store import Store
 
 
@@ -471,6 +471,21 @@ def test_coverage_artifact_created_by_command_is_parsed(
     assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(expected)
 
 
+def test_dtd_bearing_coverage_artifact_cannot_emit_green_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    payload = '<!DOCTYPE coverage><coverage line-rate="0.5"/>'
+    script = f"from pathlib import Path; Path('coverage.xml').write_text({payload!r}, encoding='utf-8')"
+
+    assurance.run_plan(_plan(tmp_path, script, revision=revision))
+
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "coverage_percent" not in gate["evidence"][-1]
+
+
 def test_stale_coverage_artifact_cannot_override_current_stdout(
     tmp_path: Path,
     monkeypatch,
@@ -711,6 +726,24 @@ def test_stdout_percent_parser_consumes_the_full_token(
         assert actual is None
     else:
         assert actual == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "xml_text",
+    [
+        '<!DOCTYPE coverage><coverage line-rate="0.5"/>',
+        '<!DOCTYPE coverage [<!ENTITY rate "0.5">]><coverage line-rate="&rate;"/>',
+        '<!DOCTYPE coverage [<!ENTITY rate SYSTEM "file:///etc/passwd">]><coverage line-rate="&rate;"/>',
+    ],
+)
+def test_coverage_xml_with_dtd_or_entities_is_rejected(xml_text: str) -> None:
+    assert parse_coverage_percent("", xml_text=xml_text) is None
+
+
+def test_oversized_coverage_xml_is_rejected_before_parsing() -> None:
+    xml_text = '<coverage line-rate="0.5">' + (" " * MAX_COVERAGE_ARTIFACT_BYTES) + "</coverage>"
+
+    assert parse_coverage_percent("", xml_text=xml_text) is None
 
 
 @pytest.mark.parametrize(

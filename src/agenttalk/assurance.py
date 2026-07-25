@@ -1,8 +1,8 @@
 """Assurance scan evidence producer.
 
-This module is intentionally stdlib-only. It detects project shape, runs a
-bounded set of installed tools and built-in checks, compares findings to a
-reviewed baseline, and writes a normalized artifact. It never decides GO/HOLD.
+This module detects project shape, runs a bounded set of installed tools and
+built-in checks, compares findings to a reviewed baseline, and writes a
+normalized artifact. It never decides GO/HOLD.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from typing import Any
 
 from agenttalk import __version__, gates
 from agenttalk._atomic import write_text as _atomic_write_text
-from agenttalk.coverage_parse import parse_coverage_percent
+from agenttalk.coverage_parse import MAX_COVERAGE_ARTIFACT_BYTES, parse_coverage_percent
 
 
 SCHEMA_VERSION = 1
@@ -163,7 +163,6 @@ GENERATED_KIND_ALIASES = {
 }
 EXECUTED_STATUSES = {"pass", "fail-blocking", "fail-advisory"}
 _COVERAGE_ARTIFACTS = ("coverage.xml", "coverage.json")
-_COVERAGE_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
 _COVERAGE_RECOVERY_DIR = Path(".agenttalk") / "assurance" / "coverage-recovery"
 _COVERAGE_RECOVERY_MARKER = "transaction.json"
 _COVERAGE_RECOVERY_SCHEMA = 1
@@ -1582,8 +1581,8 @@ def _read_coverage_artifact(path: Path) -> str | None:
         if path.is_symlink() or not path.is_file():
             return None
         with path.open("rb") as handle:
-            data = handle.read(_COVERAGE_ARTIFACT_MAX_BYTES + 1)
-        if len(data) > _COVERAGE_ARTIFACT_MAX_BYTES:
+            data = handle.read(MAX_COVERAGE_ARTIFACT_BYTES + 1)
+        if len(data) > MAX_COVERAGE_ARTIFACT_BYTES:
             return None
         return data.decode("utf-8-sig")
     except FileNotFoundError:

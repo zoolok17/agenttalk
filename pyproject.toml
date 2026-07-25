@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "agenttalk contributors" }]
 license = { text = "MIT" }
-dependencies = []
+dependencies = ["defusedxml>=0.7.1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "build>=1.2"]

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Coverage XML evidence is now parsed as untrusted producer input.** The parser uses
+  `defusedxml`, rejects DTDs, entities, and external references, and enforces the existing
+  16 MiB artifact ceiling before parsing instead of suppressing Bandit/Semgrep findings.
+
 ## [0.79.0] - 2026-07-24
 
 ### Added

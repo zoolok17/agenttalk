@@ -2,8 +2,9 @@
 
 The DoD ``coverage`` dimension needs a NUMBER, but the ``coverage`` assurance tool today only
 yields pass/fail. This module turns tool output into a single ``float`` percentage (0-100) or
-``None``. It is PURE (no I/O) and FAIL-CLOSED: any ambiguity or parse failure returns ``None``,
-which the caller treats as "coverage unknown" so the gate HOLDs. It never raises.
+``None``. Coverage artifacts are producer-controlled evidence, so XML and JSON are treated as
+untrusted input. The module is PURE (no I/O) and FAIL-CLOSED: any ambiguity or parse failure
+returns ``None``, which the caller treats as "coverage unknown" so the gate HOLDs. It never raises.
 """
 
 from __future__ import annotations
@@ -11,10 +12,13 @@ from __future__ import annotations
 import json
 import math
 import re
-import xml.etree.ElementTree as ET  # noqa: N817  # nosec B405 - parsing our own tool output, bounded
 
-__all__ = ["parse_coverage_percent"]
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
+__all__ = ["MAX_COVERAGE_ARTIFACT_BYTES", "parse_coverage_percent"]
+
+MAX_COVERAGE_ARTIFACT_BYTES = 16 * 1024 * 1024
 # coverage.py / pytest-cov terminal summary: a "TOTAL" row whose last token is a percent.
 #   TOTAL                        1234    56    96%
 _TOTAL_LINE = re.compile(r"^TOTAL\b.*?(?<!\S)([0-9]+(?:\.[0-9]+)?)%\s*$", re.MULTILINE)
@@ -38,11 +42,27 @@ def _valid(pct: float | None) -> float | None:
     return f
 
 
+def _artifact_within_limit(text: str) -> bool:
+    if len(text) > MAX_COVERAGE_ARTIFACT_BYTES:
+        return False
+    try:
+        return len(text.encode("utf-8")) <= MAX_COVERAGE_ARTIFACT_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
 def _from_xml(xml_text: str) -> float | None:
     """Cobertura ``<coverage line-rate="0.8734" ...>`` (a 0-1 fraction) -> 87.34."""
+    if not _artifact_within_limit(xml_text):
+        return None
     try:
-        root = ET.fromstring(xml_text)  # noqa: S314 - our own coverage.xml, not untrusted input
-    except (ET.ParseError, ValueError):
+        root = ET.fromstring(
+            xml_text,
+            forbid_dtd=True,
+            forbid_entities=True,
+            forbid_external=True,
+        )
+    except (DefusedXmlException, ET.ParseError, ValueError):
         return None
     rate = root.get("line-rate")
     if rate is None:
@@ -59,9 +79,11 @@ def _from_xml(xml_text: str) -> float | None:
 
 def _from_json(json_text: str) -> float | None:
     """coverage.py JSON: ``["totals"]["percent_covered"]`` (already 0-100)."""
+    if not _artifact_within_limit(json_text):
+        return None
     try:
         data = json.loads(json_text)
-    except (ValueError, TypeError):
+    except (RecursionError, TypeError, ValueError):
         return None
     if not isinstance(data, dict):
         return None
@@ -105,7 +127,7 @@ def parse_coverage_percent(
         (_from_stdout, stdout),
     ):
         fn, text = source
-        if isinstance(text, str) and text.strip():
+        if isinstance(text, str) and text:
             pct = fn(text)
             if pct is not None:
                 return pct
