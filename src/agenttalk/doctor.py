@@ -375,18 +375,17 @@ def _check_external_worker_commit_gate(store: Store) -> Check | None:
             process_path,
             supervisor_agents,
         )
-        if policy.status in {ResolverState.NOT_OWED, ResolverState.INACTIVE}:
+        if policy.status != ResolverState.ACTIVE:
             ungated.append(agent)
-            missing_or_disabled.append(agent)
-        elif policy.status == ResolverState.BLOCKED_POLICY:
-            if agent in roster_agents:
-                stronger_errors.append(agent)
+            if policy.status in {ResolverState.NOT_OWED, ResolverState.INACTIVE}:
+                missing_or_disabled.append(agent)
             else:
-                ungated.append(agent)
                 unusable.append(agent)
-        elif policy.status != ResolverState.ACTIVE:
-            ungated.append(agent)
-            unusable.append(agent)
+            if (
+                policy.status == ResolverState.BLOCKED_POLICY
+                and agent in roster_agents
+            ):
+                stronger_errors.append(agent)
         rows.append({
             "agent": agent,
             "policy_path": configured,
@@ -396,20 +395,13 @@ def _check_external_worker_commit_gate(store: Store) -> Check | None:
         })
 
     if not ungated:
-        if stronger_errors:
-            details = (
-                "external-worker unusable policy already reported by "
-                "wrapped_commit_gate ERROR: " + ", ".join(stronger_errors)
-            )
-        else:
-            details = (
-                "external-worker commit-gate policy configured: "
-                + ", ".join(external_workers)
-            )
         return Check(
             name="external_worker_commit_gate",
             status="ok",
-            details=details,
+            details=(
+                "external-worker commit-gate policy configured: "
+                + ", ".join(external_workers)
+            ),
             data={
                 "external_workers": external_workers,
                 "ungated_agents": [],
@@ -418,16 +410,28 @@ def _check_external_worker_commit_gate(store: Store) -> Check | None:
                 "policies": rows,
             },
         )
+
+    policy_statuses = {
+        str(row["agent"]): str(row["policy_status"])
+        for row in rows
+    }
+
+    def describe(agents: list[str]) -> str:
+        return ", ".join(
+            f"{agent} (policy_status={policy_statuses[agent]})"
+            for agent in agents
+        )
+
     detail_parts = []
     if missing_or_disabled:
         detail_parts.append(
             "external-worker agent(s) without enabled commit-gate policy: "
-            + ", ".join(missing_or_disabled)
+            + describe(missing_or_disabled)
         )
     if unusable:
         detail_parts.append(
             "external-worker agent(s) with present but unusable commit-gate policy: "
-            + ", ".join(unusable)
+            + describe(unusable)
         )
     return Check(
         name="external_worker_commit_gate",

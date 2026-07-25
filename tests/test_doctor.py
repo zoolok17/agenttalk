@@ -255,6 +255,7 @@ def test_doctor_supervisor_only_external_worker_blocked_policy_warns(
 
     assert check.status == "warn"
     assert "present but unusable" in check.details
+    assert "policy_status=blocked_policy" in check.details
     assert check.data["ungated_agents"] == ["remote-dev"]
     assert check.data["unusable_policy_agents"] == ["remote-dev"]
 
@@ -291,7 +292,7 @@ def test_doctor_malformed_external_worker_policy_path_warns_without_crash(
     assert check.data["unusable_policy_agents"] == ["remote-dev"]
 
 
-def test_doctor_unresolvable_roster_policy_is_not_double_reported(
+def test_doctor_unresolvable_roster_policy_keeps_both_checks_non_green(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -314,8 +315,10 @@ def test_doctor_unresolvable_roster_policy_is_not_double_reported(
     external = _external_worker_commit_gate_check(report)
 
     assert wrapped.status == "error"
-    assert external.status == "ok"
-    assert external.data["ungated_agents"] == []
+    assert external.status == "warn"
+    assert "policy_status=blocked_policy" in external.details
+    assert external.data["ungated_agents"] == ["qwen-dev-1"]
+    assert external.data["unusable_policy_agents"] == ["qwen-dev-1"]
     assert external.data["stronger_error_agents"] == ["qwen-dev-1"]
 
 
@@ -442,9 +445,38 @@ def test_doctor_supervisor_external_worker_blocked_security_policy_warns(
     policy_row = check.data["policies"][0]
 
     assert check.status == "warn"
+    assert "policy_status=blocked" in check.details
     assert check.data["ungated_agents"] == ["remote-dev"]
     assert check.data["unusable_policy_agents"] == ["remote-dev"]
     assert policy_row["policy_status"] == "blocked"
+
+
+def test_doctor_supervisor_external_worker_disabled_policy_reports_inactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    policy = tmp_path / "disabled-policy.json"
+    _write_doctor_commit_gate_policy(
+        policy,
+        {"remote-dev": {"grade": "detection", "enabled": False}},
+    )
+    _write_doctor_supervisor(store, {
+        "remote-dev": {
+            "trust_class": "external-worker",
+            "env": {POLICY_ENV: str(policy)},
+        },
+    })
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+    policy_row = check.data["policies"][0]
+
+    assert check.status == "warn"
+    assert "policy_status=inactive" in check.details
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert policy_row["policy_status"] == "inactive"
 
 
 # ----- hmac check status mapping (review C*: doctor must NOT report a
