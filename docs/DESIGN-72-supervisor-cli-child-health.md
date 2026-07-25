@@ -418,7 +418,7 @@ underlying child verdict.
 | G2 | deliberate lead-loop stand-down | exit marker | `LEAD_LOOP_STOOD_DOWN`; none | `test_lead_loop_stood_down_marker_suppresses_relaunch` |
 | G3 | lead-loop blocked and incumbent lease still armed | exit marker plus live lease | `LEAD_LOOP_BLOCKED`; none | `test_lead_loop_blocked_marker_holds_only_while_owner_live` |
 | G4 | protected agent without manual override | protected role | same failure state; `WARN_ONLY` | `test_stuck_protected_is_warn_only` |
-| G5 | heartbeat-only candidate but `can_confirm_stuck` false | activity/work-heartbeat/low-threshold guards | `ACTIVE_OR_BUSY`; warn or none | `test_wrapped_codex_stuck_after_below_watchdog_deadline_refuses_restart` |
+| G5 | stale-heartbeat path but `can_confirm_stuck` false | activity/work-heartbeat/low-threshold guards | `ACTIVE_OR_BUSY`; warn or none | `test_wrapped_codex_stuck_after_below_watchdog_deadline_refuses_restart` |
 | G6 | readiness retry cap reached | launch/readiness generation and count | `READINESS_GAVE_UP`; no relaunch | `test_readiness_cap_relaunches_below_cap_then_gives_up` |
 | G7 | backoff deadline not reached | `backoff_next_epoch` | failure verdict; `BACKOFF_WAIT` | `test_wrapped_child_dead_respects_backoff_and_readiness_cap` |
 | G8 | no barrier, backoff due | readiness cap, backoff, start-guarded targets | failure verdict; `STUCK_RECOVER` | `test_wrapped_stalled_forked_brain_is_an_attributed_kill_target` |
@@ -458,7 +458,7 @@ the following idle write does not erase `last_outcome`.
 | Loop path | Cursor / work state | Runtime transition | `on_runtime_idle` | Regression |
 | --- | --- | --- | --- | --- |
 | startup or empty inbox with no cadence turn | no owned turn | `idle` at loop startup; unchanged on later empty polls | startup only | `test_continuous_loop_runtime_boundary_matrix[normal_success]` |
-| normal inbound success | cursor commits | `starting -> active/progress -> terminal(success) -> idle` | yes, after commit | `test_continuous_loop_runtime_boundary_matrix[normal_success]` |
+| normal inbound success | cursor commits | `starting -> ... -> terminal(success) -> idle` | yes, after commit | `test_continuous_loop_runtime_boundary_matrix[normal_success]` |
 | retryable drive failure below a disposition cap | head remains pending | `starting -> ... -> terminal(failed)` | no | `test_continuous_loop_runtime_boundary_matrix[drive_failure]` |
 | config-blocked park | head remains parked and non-idle | preflight leaves prior idle, or a begun turn ends `terminal(failed)` | no after a begun failed turn | `test_continuous_loop_runtime_boundary_matrix[config_blocked_park]`, `test_config_blocked_head_parks_with_visible_health_not_frozen_idle` |
 | transient gateway hold | head remains pending and is re-driven | begun attempt ends `terminal(failed)` | no | `test_continuous_loop_runtime_boundary_matrix[gateway_hold]` |
