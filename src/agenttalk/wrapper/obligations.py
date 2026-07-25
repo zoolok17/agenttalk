@@ -24,7 +24,13 @@ from typing import Callable
 
 from agenttalk import threads
 from agenttalk._atomic import write_text as _atomic_write_text
-from agenttalk.store import CONTROL_KINDS, PROC_DEAD, Message, _process_liveness
+from agenttalk.store import (
+    CONTROL_KINDS,
+    OPENER_KINDS,
+    PROC_DEAD,
+    Message,
+    _process_liveness,
+)
 from agenttalk.wrapper import recv_api
 
 POLICY_ENV = "AGENTTALK_COMMIT_GATE_POLICY"
@@ -273,6 +279,7 @@ class Resolution:
     compliance_success: bool = False
     activation_generation: str | None = None
     readiness_generation: str | None = None
+    landed_evidence_id: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -285,6 +292,27 @@ class Resolution:
             ResolverState.CLASSIFICATION_UNKNOWN,
             ResolverState.INACTIVE,
         }
+
+
+@dataclass(frozen=True)
+class LandedResponseProof:
+    """Immutable authority that an exact terminal response is durable."""
+
+    inbound_id: str
+    evidence_id: str
+    inbound_sequence: int
+    evidence_sequence: int
+    correlation_id: str | None
+    opener_kind: str
+    response_kind: str
+
+
+@dataclass(frozen=True)
+class LandedResponseResult:
+    """Tri-state landed-work lookup: proof, no proof, or unavailable replay."""
+
+    proof: LandedResponseProof | None = None
+    unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -777,6 +805,17 @@ class DetectionCommitGate:
             prefix_ledger,
             admission=None,
         )
+        strict = self._exact_landed_response(record, prefix_messages)
+        if (
+            strict.proof is not None
+            and strict.proof.evidence_id == authority.get("source_id")
+        ):
+            replayed = Resolution(
+                ResolverState.SATISFIED,
+                "exact landed response",
+                evidence_id=strict.proof.evidence_id,
+                landed_evidence_id=strict.proof.evidence_id,
+            )
         if (
             replayed.state != state
             or not isinstance(replayed.evidence_id, str)
@@ -1040,6 +1079,17 @@ class DetectionCommitGate:
                 "authorized legacy drive policy authority is torn",
             )
         replayed = self._resolve_replay(record, messages, ledger, admission=None)
+        strict = self._exact_landed_response(record, messages)
+        if strict.proof is not None and (
+            replayed.state not in TERMINAL_STATES
+            or replayed.evidence_id == strict.proof.evidence_id
+        ):
+            replayed = Resolution(
+                ResolverState.SATISFIED,
+                "exact landed response",
+                evidence_id=strict.proof.evidence_id,
+                landed_evidence_id=strict.proof.evidence_id,
+            )
         if replayed.state not in TERMINAL_STATES:
             return None
         if not self._claim_matches_policy(claim, policy):
@@ -1162,6 +1212,7 @@ class DetectionCommitGate:
             ledger_revision=revision,
             activation_generation=observed_policy.generation,
             readiness_generation=observed_policy.generation,
+            landed_evidence_id=replayed.landed_evidence_id,
         )
 
     def _recognized_same_generation_legacy_terminal(
@@ -1327,6 +1378,7 @@ class DetectionCommitGate:
                 ledger_revision=revision,
                 activation_generation=current_policy.generation,
                 readiness_generation=current_policy.generation,
+                landed_evidence_id=current_authority.landed_evidence_id,
             )
         authorized_terminal = self._authorized_legacy_terminal_replay(
             record,
@@ -1427,6 +1479,7 @@ class DetectionCommitGate:
                 ledger_revision=revision,
                 activation_generation=current_policy.generation,
                 readiness_generation=current_policy.generation,
+                landed_evidence_id=current_terminal.landed_evidence_id,
             )
         if not isinstance(claim, dict) or claim.get("state") != "finalized":
             return None
@@ -2125,6 +2178,211 @@ class DetectionCommitGate:
         mid = record.get("id")
         return next((message for message in messages if message.id == mid), None)
 
+    def _exact_landed_response(
+        self,
+        record: dict,
+        messages: list[Message],
+    ) -> LandedResponseResult:
+        """Resolve an exact terminal response from a validated publication snapshot."""
+        inbound_id = record.get("id")
+        if not isinstance(inbound_id, str):
+            return LandedResponseResult(unavailable_reason="delivered inbound id is invalid")
+        inbound_index = next(
+            (index for index, message in enumerate(messages) if message.id == inbound_id),
+            None,
+        )
+        if inbound_index is None:
+            return LandedResponseResult(
+                unavailable_reason="delivered inbound is absent from validated replay"
+            )
+        inbound = messages[inbound_index]
+        correlation_id = _correlation(inbound.meta)
+        if any(
+            (
+                inbound.sender != record.get("from"),
+                inbound.recipient != self.agent,
+                inbound.recipient != record.get("to"),
+                inbound.kind != record.get("kind"),
+                correlation_id != record.get("correlation_id"),
+            )
+        ):
+            return LandedResponseResult(
+                unavailable_reason="delivered inbound disagrees with validated replay"
+            )
+
+        def exact_anchor(message: Message) -> bool:
+            meta = message.meta if isinstance(message.meta, dict) else {}
+            return (
+                message.sender == self.agent
+                and message.recipient == inbound.sender
+                and meta.get("in_reply_to") == inbound.id
+                and _correlation(meta) == correlation_id
+            )
+
+        def proof(message: Message, evidence_index: int, opener_kind: str):
+            return LandedResponseResult(
+                proof=LandedResponseProof(
+                    inbound_id=inbound.id,
+                    evidence_id=message.id,
+                    inbound_sequence=inbound_index + 1,
+                    evidence_sequence=evidence_index + 1,
+                    correlation_id=correlation_id,
+                    opener_kind=opener_kind,
+                    response_kind=message.kind,
+                )
+            )
+
+        requester = inbound.sender
+        responder = self.agent
+        opener_kind = inbound.kind
+        ball = responder
+        replay_start = inbound_index + 1
+
+        if opener_kind not in OPENER_KINDS:
+            # A needs-info answer is itself a delivered message.  Recover its
+            # original review opener only when publication-order replay proves
+            # that this exact inbound handed the obligation back to this agent.
+            continuation_contexts: list[Message] = []
+            if correlation_id is not None:
+                for opener_index, opener in enumerate(messages[:inbound_index]):
+                    if (
+                        opener.kind != "review-request"
+                        or _correlation(opener.meta) != correlation_id
+                        or opener.recipient != self.agent
+                        or opener.sender != inbound.sender
+                    ):
+                        continue
+                    candidate_ball = opener.recipient
+                    valid = True
+                    inbound_transition = None
+                    for event in messages[opener_index + 1 : inbound_index + 1]:
+                        if _correlation(event.meta) != correlation_id:
+                            continue
+                        if event.kind == "rescind":
+                            valid = False
+                            break
+                        transition = threads._classify_event(
+                            opener.kind,
+                            event,
+                            opener.sender,
+                            opener.recipient,
+                            candidate_ball,
+                        )
+                        if transition is None:
+                            continue
+                        event_kind, who = transition
+                        if event_kind == "terminal":
+                            valid = False
+                            break
+                        candidate_ball = str(who)
+                        if event.id == inbound.id:
+                            inbound_transition = transition
+                    if (
+                        valid
+                        and candidate_ball == self.agent
+                        and inbound_transition == ("ball", self.agent)
+                    ):
+                        continuation_contexts.append(opener)
+            if len(continuation_contexts) == 1:
+                opener = continuation_contexts[0]
+                requester = opener.sender
+                responder = opener.recipient
+                opener_kind = opener.kind
+                ball = self.agent
+            elif continuation_contexts:
+                return LandedResponseResult(
+                    unavailable_reason="multiple opener generations match delivered inbound"
+                )
+            else:
+                # No protocol opener means there is no terminal thread
+                # transition to prove. Out-of-band work and no-reply notes stay
+                # on the documented residual path.
+                return LandedResponseResult()
+
+        for evidence_index, message in enumerate(
+            messages[replay_start:],
+            start=replay_start,
+        ):
+            if _correlation(message.meta) != correlation_id:
+                continue
+            if message.kind == "rescind":
+                if message.sender == requester:
+                    # A requester rescind cancels the obligation, so there is no terminal
+                    # transition left to prove and a later exact-anchored response is NOT
+                    # landed work. `_resolve_replay` already calls this SUPERSEDED, but it
+                    # early-outs as CLASSIFICATION_UNKNOWN for any opener that is not a
+                    # `question` -- so review-request/proposal openers reach here with no
+                    # rescind protection at all. Decline the proof instead of reporting a
+                    # completed turn for work the requester called off.
+                    #
+                    # Residual (deliberate): an exact-key `supersedes` rescind is scoped to
+                    # one generation, and the admission key that would identify it is not
+                    # available in this function. We decline the proof either way -- a
+                    # missed proof degrades to the documented residual path, whereas a
+                    # wrong proof commits an inbound as complete, so this errs toward the
+                    # recoverable failure.
+                    meta = message.meta if isinstance(message.meta, dict) else {}
+                    if meta.get("supersedes") is None:
+                        return LandedResponseResult()
+                    return LandedResponseResult(
+                        unavailable_reason=(
+                            "requester superseded an exact generation; "
+                            "landed-response proof is not decidable here"
+                        )
+                    )
+                continue
+            if message.kind in {"release", "end", "wake"}:
+                continue
+            transition = threads._classify_event(
+                opener_kind,
+                message,
+                requester,
+                responder,
+                ball,
+            )
+            if transition is None:
+                continue
+            event_kind, who = transition
+            if event_kind == "terminal":
+                if exact_anchor(message):
+                    return proof(message, evidence_index, opener_kind)
+                continue
+            ball = str(who)
+        return LandedResponseResult()
+
+    def resolve_landed_response(self, record: dict) -> LandedResponseResult:
+        """Return strict bus proof without consulting policy or creating a claim."""
+        try:
+            with self.store._message_publication_lock():
+                messages = self.store.publication_ordered_messages()
+        except (OSError, ValueError, TimeoutError, RuntimeError):
+            return LandedResponseResult(
+                unavailable_reason="validated landed-response replay unavailable"
+            )
+        return self._exact_landed_response(record, messages)
+
+    def _landed_resolution(
+        self,
+        record: dict,
+        messages: list[Message],
+        proof: LandedResponseProof,
+        *,
+        scoped_revision: int = 0,
+    ) -> Resolution:
+        replayed = self._exact_landed_response(record, messages)
+        if replayed.proof != proof:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "landed-response evidence changed during retention",
+            )
+        return Resolution(
+            ResolverState.SATISFIED,
+            "exact landed response",
+            evidence_id=proof.evidence_id,
+            scoped_revision=scoped_revision,
+            landed_evidence_id=proof.evidence_id,
+        )
+
     def _key_from(self, raw: dict) -> ObligationKey:
         return ObligationKey(**raw)
 
@@ -2364,6 +2622,7 @@ class DetectionCommitGate:
                     message.id,
                     scope_revision,
                     compliance_success=True,
+                    landed_evidence_id=message.id,
                 )
         # A canonical terminal published for the exact assignment must never be
         # masked by a locally synthesized BLOCKED transition.  Internal BLOCKED
@@ -3076,6 +3335,7 @@ class DetectionCommitGate:
             ledger_revision=scoped_revision,
             activation_generation=observed_policy.generation,
             readiness_generation=observed_policy.generation,
+            landed_evidence_id=replayed.landed_evidence_id,
         )
 
     def admit_or_finalize(self, record: dict) -> Resolution:
@@ -5445,6 +5705,18 @@ class DetectionCommitGate:
                     ledger,
                     admission=None,
                 )
+                if replayed.state not in TERMINAL_STATES:
+                    strict = self._exact_landed_response(record, messages)
+                    if strict.proof is not None:
+                        replayed = Resolution(
+                            ResolverState.SATISFIED,
+                            "exact landed response",
+                            evidence_id=strict.proof.evidence_id,
+                            scoped_revision=int(
+                                ledger["scoped_revisions"].get(inbound_id, 0)
+                            ),
+                            landed_evidence_id=strict.proof.evidence_id,
+                        )
                 if replayed.state in TERMINAL_STATES:
                     terminal_replay = replayed
                     terminal_claim = ledger["no_admission_claims"].get(inbound_id)
@@ -5590,6 +5862,18 @@ class DetectionCommitGate:
                     ledger,
                     admission=None,
                 )
+                if replayed.state not in TERMINAL_STATES:
+                    strict = self._exact_landed_response(record, messages)
+                    if strict.proof is not None:
+                        replayed = Resolution(
+                            ResolverState.SATISFIED,
+                            "exact landed response",
+                            evidence_id=strict.proof.evidence_id,
+                            scoped_revision=int(
+                                ledger["scoped_revisions"].get(inbound_id, 0)
+                            ),
+                            landed_evidence_id=strict.proof.evidence_id,
+                        )
                 if replayed.state in TERMINAL_STATES:
                     terminal_replay = replayed
                     terminal_claim = ledger["no_admission_claims"].get(inbound_id)
@@ -5702,10 +5986,124 @@ class DetectionCommitGate:
             readiness_generation=current_policy.generation,
         )
 
+    def retain_landed_response(
+        self,
+        record: dict,
+        resolution: Resolution,
+        proof: LandedResponseProof,
+    ) -> Resolution:
+        """Retain strict bus evidence through a configured no-admission claim."""
+        if not resolution.allows_legacy_commit:
+            raise GateError("only no-admission resolutions can retain landed work")
+        if resolution.ledger_revision is None:
+            return Resolution(
+                ResolverState.SATISFIED,
+                "exact landed response",
+                evidence_id=proof.evidence_id,
+                landed_evidence_id=proof.evidence_id,
+            )
+        try:
+            with self.store._message_publication_lock():
+                messages, ledger = self._validated_messages()
+        except (OSError, ValueError, TimeoutError, RuntimeError):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "validated landed-response replay unavailable during retention",
+            )
+        retention_revision = int(
+            ledger["scoped_revisions"].get(record.get("id"), 0)
+        )
+        resolution = Resolution(
+            resolution.state,
+            resolution.reason,
+            scoped_revision=retention_revision,
+            ledger_revision=retention_revision,
+            activation_generation=resolution.activation_generation,
+            readiness_generation=resolution.readiness_generation,
+        )
+        replayed = self._landed_resolution(
+            record,
+            messages,
+            proof,
+            scoped_revision=retention_revision,
+        )
+        if not replayed.terminal:
+            return replayed
+        inbound = self._record_message(record, messages)
+        if inbound is None:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "landed-response inbound disappeared during retention",
+            )
+        current_policy = self._current_policy()
+        if current_policy.generation != resolution.activation_generation:
+            return self._policy_authority_failure(
+                current_policy,
+                reason="no-admission policy changed during landed-work retention",
+            )
+        try:
+            with self.store._exclusive_lock(
+                self.path.with_suffix(".lock"),
+                timeout=10.0,
+            ):
+                ledger = self._load()
+                claim = ledger["no_admission_claims"].get(inbound.id)
+                started = bool(
+                    isinstance(claim, dict) and claim.get("drive_started_at")
+                )
+        except (OSError, ValueError, TimeoutError, RuntimeError):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "no-admission claim unavailable during landed-work retention",
+            )
+        if not started:
+            return self._normalize_pre_admission_terminal(
+                record,
+                inbound,
+                replayed,
+                current_policy,
+            )
+        return self.record_no_admission_success(
+            record,
+            resolution,
+            landed_proof=proof,
+        )
+
+    def record_landed_work_override(
+        self,
+        record: dict,
+        proof: LandedResponseProof,
+        *,
+        failure_class: str,
+        summary: str,
+    ) -> None:
+        """Persist bounded classifier-disagreement telemetry after progress."""
+        with self.store._exclusive_lock(
+            self.path.with_suffix(".lock"),
+            timeout=10.0,
+        ):
+            ledger = self._load()
+            self._append(
+                ledger,
+                "LANDED_WORK_OVERRIDES_DRIVE_FAILURE",
+                source_id=proof.evidence_id,
+                data={
+                    "inbound_id": record.get("id"),
+                    "evidence_id": proof.evidence_id,
+                    "heuristic_class": str(failure_class)[:128],
+                    "heuristic_summary_digest": hashlib.sha256(
+                        str(summary).encode("utf-8", errors="replace")
+                    ).hexdigest(),
+                },
+            )
+            self._write(ledger)
+
     def record_no_admission_success(
         self,
         record: dict,
         resolution: Resolution,
+        *,
+        landed_proof: LandedResponseProof | None = None,
     ) -> Resolution:
         """Durably retain a successful legacy turn before its cursor CAS.
 
@@ -5790,12 +6188,19 @@ class DetectionCommitGate:
                     activation_generation=current_policy.generation,
                     readiness_generation=current_policy.generation,
                 )
-            replayed = self._resolve_replay(
-                record,
-                messages,
-                ledger,
-                admission=None,
-            )
+            if landed_proof is None:
+                replayed = self._resolve_replay(
+                    record,
+                    messages,
+                    ledger,
+                    admission=None,
+                )
+            else:
+                replayed = self._landed_resolution(
+                    record,
+                    messages,
+                    landed_proof,
+                )
             if replayed.terminal:
                 if claim.get("state") != "open" or claim.get("fence") != self.fence:
                     return Resolution(
@@ -5822,6 +6227,7 @@ class DetectionCommitGate:
                     ledger_revision=revision,
                     activation_generation=current_policy.generation,
                     readiness_generation=current_policy.generation,
+                    landed_evidence_id=replayed.landed_evidence_id,
                 )
             if claim.get("state") != "open" or claim.get("fence") != self.fence:
                 return Resolution(

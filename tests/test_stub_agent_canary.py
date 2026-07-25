@@ -247,70 +247,59 @@ def test_resume_missing_self_heals_and_recovers(
 
 def test_raw_tail_scan_excludes_json_wrapped_model_content_no_spoof() -> None:
     """PR #51 codex-agenttalk-reviewer-1 finding: model output must not be able to
-    spoof a session-failure. In stream-json mode model text is JSON-wrapped, so
-    _child_output_tail_text scans NON-JSON lines only; a bare CLI diagnostic line is
-    still captured. Proven both ways here."""
-    # (1) model merely QUOTES the diagnostic inside a JSON assistant event -> excluded,
-    # so an otherwise-ambiguous failure is NOT spuriously session-attributable.
-    spoof_tail = {"lines": [
-        {"stream": "stdout", "text": json.dumps({
-            "type": "assistant",
-            "message": {"content": [{"type": "text",
-                        "text": "No conversation found with session ID: abc123 — here is what that error means"}]},
-        })},
-        {"stream": "stdout", "text": json.dumps({"type": "result", "subtype": "success", "is_error": False})},
-    ]}
-    spoof_scanned = run._child_output_tail_text(spoof_tail)
+    spoof a session failure. Parse disposition is recorded at ingestion, so the
+    helper receives the discarded-only diagnostic tail rather than reparsing the
+    bounded forensic tail."""
+    # (1) JSON assistant/result events never enter the discarded-only tail.
+    # The full-stream ingestion boundary is covered by the wrapper profile tests;
+    # this canary pins the downstream helper's prefiltered-input contract.
+    spoof_discarded_tail = {"lines": []}
+    spoof_scanned = run._child_output_tail_text(spoof_discarded_tail)
     assert "no conversation found" not in spoof_scanned.casefold(), spoof_scanned
     assert not session.resume_failure_is_session_attributable(
         "ambiguous_or_unknown", "some ambiguous summary", raw_tail=spoof_scanned)
 
-    # (2) a REAL bare (non-JSON) CLI diagnostic line IS captured and attributable.
-    err_result = json.dumps(
-        {"type": "result", "subtype": "error_during_execution", "is_error": True})
-    real_tail = {"lines": [
+    # (2) A real bare non-JSON CLI diagnostic is present in that tail and remains
+    # attributable. The parsed result event belongs only to the forensic tail.
+    real_discarded_tail = {"lines": [
         {"stream": "stdout", "text": "No conversation found with session ID: 26c40e8a-c8ef-4c9b"},
-        {"stream": "stdout", "text": err_result},
     ]}
-    real_scanned = run._child_output_tail_text(real_tail)
+    real_scanned = run._child_output_tail_text(real_discarded_tail)
     assert "no conversation found with session id" in real_scanned.casefold()
     assert session.resume_failure_is_session_attributable(
         "ambiguous_or_unknown", "error_during_execution", raw_tail=real_scanned)
 
 
-def test_truncation_spoof_blocked_by_no_model_output_signal() -> None:
-    """codex-agenttalk-reviewer-1 re-review (PR #51): the non-JSON filter is not
-    spoof-proof on its own because the child-output tail is byte/line-BOUNDED. A model
-    JSON assistant line TRUNCATED at the tail boundary becomes invalid JSON, slips past
-    the non-JSON filter, and - if it quotes the diagnostic - spoofs a session failure on
-    a turn where the model ACTUALLY RAN. The content-independent ``produced_model_output``
-    guard closes it structurally: a turn that produced model output is never
-    session-attributable from tail text."""
+def test_truncated_parsed_json_is_never_reinterpreted_as_raw_diagnostic() -> None:
+    """Parse disposition precedes tail bounding, so truncation cannot turn a
+    validated assistant event into a discarded raw diagnostic."""
     from agenttalk.redaction import normalize_child_output_tail
 
-    # A long model assistant line (valid JSON on the live stream) whose stored tail copy
-    # gets LEFT-TRIMMED past the tail byte budget -> an invalid-JSON fragment that still
-    # carries "no conversation found with session ID" in its surviving suffix.
+    # The separate forensic copy can be left-trimmed into an invalid JSON fragment.
     payload = ("x" * 5000) + " No conversation found with session ID: 26c40e8a-c8ef"
     model_line = json.dumps(
         {"type": "assistant", "message": {"content": [{"type": "text", "text": payload}]}})
-    tail = normalize_child_output_tail({"lines": [{"stream": "stdout", "text": model_line}]})
-    assert tail["truncated"] is True
-    scanned = run._child_output_tail_text(tail)
-    # The fragment DID slip past the non-JSON filter (this is the raw vulnerability) ...
-    assert "no conversation found with session id" in scanned.casefold()
+    forensic_tail = normalize_child_output_tail({
+        "lines": [{"stream": "stdout", "text": model_line}],
+    })
+    assert forensic_tail["truncated"] is True
+    assert "no conversation found with session id" in (
+        forensic_tail["lines"][0]["text"].casefold()
+    )
 
-    # ... but a turn that PRODUCED MODEL OUTPUT (num_turns>=1) is NOT session-attributable,
-    # regardless of the spoofing tail -> no spurious fresh-session reset.
+    # Ingestion parsed the original full line, so the discarded-only tail stays empty.
+    scanned = run._child_output_tail_text({"lines": []})
+    assert "no conversation found with session id" not in scanned.casefold()
     assert not session.resume_failure_is_session_attributable(
         "ambiguous_or_unknown", "partial stream: started, never completed",
         raw_tail=scanned, produced_model_output=True)
 
-    # A REAL missing-session failure (num_turns==0, no model output, bare diagnostic) still
-    # self-heals: the same tail text IS attributable when no model output was produced.
+    # A real missing-session failure remains attributable when its bare diagnostic
+    # was actually rejected as non-JSON and no model output was produced.
+    real_scanned = "No conversation found with session ID: 26c40e8a-c8ef"
     assert session.resume_failure_is_session_attributable(
         "ambiguous_or_unknown", "error_during_execution",
-        raw_tail=scanned, produced_model_output=False)
+        raw_tail=real_scanned, produced_model_output=False)
 
 
 def test_num_turns_is_authoritative_ran_signal_over_event_type_inference() -> None:

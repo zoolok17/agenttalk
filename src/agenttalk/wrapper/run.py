@@ -105,8 +105,21 @@ _STRUCTURED_AUTH_MARKERS = (
 
 _AGENTTALK_COMMAND_TOKENS = frozenset({"agenttalk", "agenttalk.cmd", "agenttalk.exe"})
 _PYTHON_COMMAND_TOKENS = frozenset({"python", "python.exe", "python3", "python3.exe", "py", "py.exe"})
-_PYTHON_ENV_COMMAND_TOKENS = frozenset({"$env:agenttalk_py", "%agenttalk_py%"})
+_PYTHON_ENV_COMMAND_TOKENS = frozenset({
+    "$env:agenttalk_py",
+    "%agenttalk_py%",
+    "$agenttalk_py",
+    "${agenttalk_py}",
+    # PowerShell's braced env form. The bash `${agenttalk_py}` spelling was already
+    # here, so omitting this one left `& ${env:AGENTTALK_PY} -m agenttalk reply`
+    # unrecognized -- the same silent-loss class as the parenthesized form.
+    "${env:agenttalk_py}",
+})
 _PY_LAUNCHER_COMMAND_TOKENS = frozenset({"py", "py.exe"})
+_PYTHON_VERSIONED_BASENAME_RE = re.compile(
+    r"^python\d+(?:\.\d+)*(?:\.exe)?$",
+    re.IGNORECASE,
+)
 _POWERSHELL_COMMAND_TOKENS = frozenset({"pwsh", "pwsh.exe", "powershell", "powershell.exe"})
 _CMD_COMMAND_TOKENS = frozenset({"cmd", "cmd.exe"})
 _POSIX_SHELL_COMMAND_TOKENS = frozenset({"sh", "sh.exe", "bash", "bash.exe"})
@@ -133,9 +146,11 @@ _FAILED_TOOL_STATUSES = frozenset({
     "timeout", "timed_out",
 })
 _INTERPRETER_NOT_FOUND_RE = re.compile(
-    r"(python(?:3)?|py).*(not recognized|command not found|no such file|"
+    r"(?<![\w.])(?:python(?:3)?|py)(?:\.exe)?\b.*"
+    r"(not recognized|command not found|no such file|"
     r"filenotfounderror|winerror 2|createprocess error 2|could not be started)|"
-    r"(not recognized|command not found|no such file).*python(?:3)?",
+    r"(not recognized|command not found|no such file).*"
+    r"(?<![\w.])(?:python(?:3)?|py)(?:\.exe)?\b",
     re.IGNORECASE,
 )
 _AGENTTALK_ARGPARSE_RE = re.compile(
@@ -286,13 +301,18 @@ def _program_basename(token: str) -> str:
 
 
 def _python_program_kind(token: str) -> str | None:
-    clean = _clean_program_token(token).casefold()
+    env_token = _clean_argument_token(token).lstrip("&").casefold()
     base = _program_basename(token)
-    if clean in _PYTHON_ENV_COMMAND_TOKENS:
+    # A PowerShell call tail can parenthesize the interpreter (`& ($env:AGENTTALK_PY)`),
+    # leaving a leading paren that `_clean_argument_token()` does not strip -- so compare
+    # the fully cleaned program form too. Missing this makes `_bus_command_verb()` return
+    # None for a real `agenttalk reply`, and a failed bus write then goes unattributed:
+    # exactly the commit-without-a-durable-reply this module exists to prevent.
+    if env_token in _PYTHON_ENV_COMMAND_TOKENS or base in _PYTHON_ENV_COMMAND_TOKENS:
         return "python"
     if base in _PY_LAUNCHER_COMMAND_TOKENS:
         return "py"
-    if base in _PYTHON_COMMAND_TOKENS:
+    if base in _PYTHON_COMMAND_TOKENS or _PYTHON_VERSIONED_BASENAME_RE.fullmatch(base):
         return "python"
     return None
 
@@ -346,6 +366,13 @@ def _bus_command_verb_after_agenttalk(args: list[str]) -> str | None:
             idx += 2
             continue
         if low.startswith("-"):
+            return None
+        if any(
+            _clean_argument_token(arg).casefold() in {"-h", "--help"}
+            for arg in args[idx + 1:]
+        ):
+            # argparse treats either token as the help action even when it
+            # follows a write-shaped subcommand. Help never attempts a write.
             return None
         return low
     return None
@@ -402,7 +429,7 @@ def _launcher_payload_tokens(program: str, args: list[str]) -> list[str] | None:
     elif base in _CMD_COMMAND_TOKENS:
         switches = {"/c"}
     elif base in _POSIX_SHELL_COMMAND_TOKENS:
-        switches = {"-c"}
+        switches = {"-c", "-lc", "-cl"}
     else:
         return None
     for idx, arg in enumerate(args):
@@ -911,7 +938,7 @@ def _terminal_config_blocked_summary(text: str | None) -> str | None:
         if command is None:
             continue
         window = "\n".join(lines[max(0, idx - 1):idx + 2])
-        bus = classify_bus_execution(command, window)
+        bus = classify_bus_execution(command, window, "failed")
         if bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
             return bus["summary"]
         if _looks_like_exec_denied(window):
@@ -1063,6 +1090,10 @@ def classify_bus_execution(
     if verb not in _CLASSIFIED_BUS_VERBS:
         return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "out_of_scope", "")
     text = str(output or "")
+    exit_code = _bus_exit_code(exit_status, raw_event)
+    failed = _bus_execution_failed(exit_status, raw_event)
+    if not failed:
+        return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "no_failed_execution_signal", "")
     runtime_blocked = _runtime_config_blocked_summary(text)
     if runtime_blocked:
         return _bus_result(BUS_KIND_CONFIG_BLOCKED, "agenttalk_runtime", runtime_blocked)
@@ -1088,10 +1119,8 @@ def classify_bus_execution(
         )
     if verb in _BEST_EFFORT_BUS_VERBS:
         return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "best_effort", "")
-    exit_code = _bus_exit_code(exit_status, raw_event)
-    failed = _bus_execution_failed(exit_status, raw_event)
     semantic = _semantic_bus_failure_subtype(verb, text, exit_code)
-    if semantic is not None and failed:
+    if semantic is not None:
         return _bus_result(
             BUS_KIND_SEMANTIC_FAILURE,
             semantic,
@@ -1105,33 +1134,15 @@ def classify_bus_execution(
         return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "check_non_config", "")
     if verb not in _REQUIRED_BUS_WRITE_VERBS:
         return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "out_of_scope", "")
-    if failed:
-        return _bus_result(
-            BUS_KIND_UNKNOWN_FAILURE,
-            "required_write_unknown",
-            (
-                f"bus_write_failed_unknown; command={_compact_text(command_text)}; "
-                f"exit_status={exit_code if exit_code is not None else 'failed'}; "
-                f"error={_compact_text(output)}; remediation=inspect the bus command "
-                "output and retry with a corrected durable write"
-            ),
-        )
-    return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "no_failed_execution_signal", "")
-
-
-def _tool_config_blocked_summary(tool: object, output: object) -> str | None:
-    command = _command_text(tool)
-    classification = classify_bus_execution(command, output)
-    if classification["kind"] == BUS_KIND_CONFIG_BLOCKED:
-        return classification["summary"]
-    if _bus_command_verb(command) not in _CLASSIFIED_BUS_VERBS:
-        return None
-    if not _looks_like_exec_denied(str(output or "")):
-        return None
-    return (
-        f"command={_compact_text(command)}; "
-        f"error={_compact_text(output)}; "
-        "remediation=use $env:AGENTTALK_PY -m agenttalk for in-sandbox bus calls"
+    return _bus_result(
+        BUS_KIND_UNKNOWN_FAILURE,
+        "required_write_unknown",
+        (
+            f"bus_write_failed_unknown; command={_compact_text(command_text)}; "
+            f"exit_status={exit_code if exit_code is not None else 'failed'}; "
+            f"error={_compact_text(output)}; remediation=inspect the bus command "
+            "output and retry with a corrected durable write"
+        ),
     )
 
 
@@ -1597,8 +1608,11 @@ class _ProcStream:
 
 
 def _ovh_qwen_failure_text(sig: dict) -> str:
-    values = [sig.get("error"), sig.get("terminal_text"), sig.get("config_blocked_text")]
-    tail = sig.get("child_output_tail")
+    # ``config_blocked_text`` may contain the rendered stdout of a parsed
+    # TOOL_FINISHED event. It remains authoritative for the later deterministic
+    # config-blocked branch, but is not raw gateway diagnostic input.
+    values = [sig.get("error"), sig.get("terminal_text")]
+    tail = sig.get("discarded_output_tail")
     if isinstance(tail, dict):
         for row in tail.get("lines") or []:
             if isinstance(row, dict):
@@ -1744,23 +1758,12 @@ def _result_num_turns(raw: object) -> int | None:
 
 
 def _child_output_tail_text(tail: object) -> str:
-    """Flatten a captured child-output tail's NON-JSON lines into one scannable
-    string. Feeds the raw CLI diagnostic - e.g. a bare 'No conversation found with
-    session ID: ...' line the stream-json adapter DISCARDS during parsing - into the
-    resume-failure attributability decision (task #34 resume-continuity).
+    """Flatten lines rejected as non-JSON at ingestion time.
 
-    ONLY non-JSON lines are included: in stream-json mode the model's output is
-    always JSON-wrapped (assistant events), while the CLI's own diagnostics are bare
-    non-JSON lines, so a model quoting 'no conversation found' inside a well-formed
-    JSON event is excluded here. This filter is CORROBORATION only - it is NOT
-    spoof-proof on its own, because the child-output tail is byte/line-BOUNDED and a
-    model JSON line truncated at the tail boundary becomes invalid JSON and slips
-    through (codex-agenttalk-reviewer-1, PR #51). The LOAD-BEARING guard is the CLI's
-    authoritative ``num_turns`` signal (corroborated by the content-independent
-    ``produced_model_output`` activity flag) in
-    :func:`session.resume_failure_is_session_attributable`: this tail text is consulted
-    ONLY on a turn that did NOT run (num_turns == 0 with no activity), so a truncated
-    model fragment from a turn that ran can never reach the scan."""
+    Parse disposition is recorded before the forensic tail is byte-bounded, so
+    a valid but left-truncated assistant/tool event can never be reinterpreted
+    later as a raw CLI diagnostic.
+    """
     if not isinstance(tail, dict):
         return ""
     lines = tail.get("lines")
@@ -1770,14 +1773,8 @@ def _child_output_tail_text(tail: object) -> str:
     for line in lines:
         if not (isinstance(line, dict) and isinstance(line.get("text"), str)):
             continue
-        stripped = line["text"].strip()
-        if not stripped:
-            continue
-        try:
-            json.loads(stripped)
-        except (ValueError, TypeError):
-            parts.append(line["text"])   # non-JSON -> CLI's own diagnostic, never model content
-        # else: valid JSON (a structured event, possibly carrying model text) -> excluded
+        if line["text"].strip():
+            parts.append(line["text"])
     return "\n".join(parts)
 
 
@@ -2014,6 +2011,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "bus_action_attempted": False, "bus_action_infra": False,
                "bus_action_rejected": False,
                "structured_errors": [], "child_output_tail": None,
+               "discarded_output_tail": None,
                "produced_model_output": False, "result_num_turns": None,
                "lesson_exposure_error": None}
         child_output_lines: list[dict[str, str]] = []
@@ -2026,8 +2024,16 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     "success" if sig["ok"] else "failed"
                 )
 
-        def _capture_child_output(stream_name: str, text: object) -> None:
-            nonlocal child_output_truncated
+        discarded_output_lines: list[dict[str, str]] = []
+        discarded_output_truncated = False
+
+        def _capture_child_output(
+            stream_name: str,
+            text: object,
+            *,
+            discarded: bool = False,
+        ) -> None:
+            nonlocal child_output_truncated, discarded_output_truncated
             tail = normalize_child_output_tail({
                 "truncated": child_output_truncated,
                 "lines": [*child_output_lines, {"stream": stream_name, "text": text}],
@@ -2036,6 +2042,21 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 return
             child_output_lines[:] = tail["lines"]
             child_output_truncated = tail.get("truncated") is True
+            if not discarded:
+                return
+            diagnostic_tail = normalize_child_output_tail({
+                "truncated": discarded_output_truncated,
+                "lines": [
+                    *discarded_output_lines,
+                    {"stream": stream_name, "text": text},
+                ],
+            })
+            if diagnostic_tail is None:
+                return
+            discarded_output_lines[:] = diagnostic_tail["lines"]
+            discarded_output_truncated = (
+                diagnostic_tail.get("truncated") is True
+            )
 
         def _finalize_child_output() -> None:
             tail = normalize_child_output_tail({
@@ -2044,6 +2065,12 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             })
             if tail is not None:
                 sig["child_output_tail"] = tail
+            diagnostic_tail = normalize_child_output_tail({
+                "truncated": discarded_output_truncated,
+                "lines": discarded_output_lines,
+            })
+            if diagnostic_tail is not None:
+                sig["discarded_output_tail"] = diagnostic_tail
 
         nonlocal preflight_ok
         if preflight is not None and not preflight_ok:
@@ -2069,14 +2096,16 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     sig["lesson_exposure_error"] = (
                         f"{type(e).__name__}: {_compact_text(e, 160)}")
             for line in _iter_suppressing_benign_pipe_teardown(stream):
-                _capture_child_output("stdout", line)
                 s = line.strip()
                 if not s:
+                    _capture_child_output("stdout", line)
                     continue
                 try:
                     raw = json.loads(s)
                 except (ValueError, TypeError):
+                    _capture_child_output("stdout", line, discarded=True)
                     continue
+                _capture_child_output("stdout", line)
                 _session.observe_event(session_state, raw)   # capture codex thread_id
                 num_turns = _result_num_turns(raw)
                 if num_turns is not None:
@@ -2132,7 +2161,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     health_writer.event(ev)
                     engine.process(ev, clock())
         except _GatewayChildCapUnavailable as e:
-            _capture_child_output("stderr", f"{type(e).__name__}: {e}")
+            _capture_child_output(
+                "stderr",
+                f"{type(e).__name__}: {e}",
+                discarded=True,
+            )
             _finalize_child_output()
             if e.transient:
                 # Transient, operator-resolvable gateway hold: NO child spawned, NO spend.
@@ -2149,7 +2182,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             _finish_runtime()
             return sig
         except OSError as e:
-            _capture_child_output("stderr", f"{type(e).__name__}: {e}")
+            _capture_child_output(
+                "stderr",
+                f"{type(e).__name__}: {e}",
+                discarded=True,
+            )
             _finalize_child_output()
             # spawn/exec/transport OS error (missing binary, broken pipe, ...): a
             # GLOBAL/infra failure unless it is a deterministic local permission/config
@@ -2236,7 +2273,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 raise
             attributable = _session.resume_failure_is_session_attributable(
                 resume_failure_class, resume_summary,
-                raw_tail=_child_output_tail_text(sig.get("child_output_tail")),
+                raw_tail=_child_output_tail_text(sig.get("discarded_output_tail")),
                 produced_model_output=bool(sig.get("produced_model_output")),
                 result_num_turns=sig.get("result_num_turns"),
             )

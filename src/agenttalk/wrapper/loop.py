@@ -232,8 +232,10 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              commit_gate=None,
              now_iso: Callable[[], str] = _iso_now) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
-    Returns the number of turns driven. ``max_turns`` / ``max_polls`` / ``max_wall``
-    bound the loop (all None = run forever; tests inject clock/sleep).
+    Returns the number of completed inbound turns, including a redelivered turn whose
+    exact terminal work was already durable and therefore was not re-driven.
+    ``max_turns`` / ``max_polls`` / ``max_wall`` bound the loop (all None = run
+    forever; tests inject clock/sleep).
 
     Two modes:
       * CONTINUOUS (``only_request_id is None``): the long-running supervised loop.
@@ -385,6 +387,45 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             return committed
         recv_api.commit(store, agent, rec)
         _runtime_idle()
+        return True
+
+    def _commit_landed(
+        rec: dict,
+        gate_resolution,
+        landed,
+        *,
+        outcome: DriveOutcome | None = None,
+    ) -> bool:
+        proof = landed.proof
+        if proof is None:
+            return False
+        finalization_resolution = gate_resolution
+        if gate_resolution.ledger_revision is not None:
+            finalization_resolution = commit_gate.retain_landed_response(
+                rec,
+                gate_resolution,
+                proof,
+            )
+            if not (
+                finalization_resolution.allows_legacy_commit
+                or finalization_resolution.terminal
+            ):
+                return False
+        if not _commit(rec, finalization_resolution):
+            return False
+        store.clear_attempt(agent, rec.get("id"))
+        store.gc_attempts_below(agent, store.cursor(agent))
+        if outcome is not None and not outcome.ok:
+            try:
+                commit_gate.record_landed_work_override(
+                    rec,
+                    proof,
+                    failure_class=outcome.failure_class,
+                    summary=outcome.summary,
+                )
+            except Exception:  # noqa: BLE001, S110 - advisory telemetry  # nosec B110
+                # Progress is already durable; telemetry cannot revoke it.
+                pass
         return True
 
     polls = 0
@@ -675,10 +716,23 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     if resolution.key is not None and resolution.compliance_success:
                         commit_gate.mark_satisfied(resolution.key)
                     consumed = _runtime_idle_if_consumed(record)
+                    landed = (
+                        finalized.terminal
+                        and finalized.landed_evidence_id is not None
+                        and finalized.landed_evidence_id == finalized.evidence_id
+                    )
+                    if consumed and landed:
+                        store.clear_attempt(agent, record.get("id"))
+                        store.gc_attempts_below(agent, store.cursor(agent))
+                        if on_health_idle is not None:
+                            on_health_idle()
+                        turns += 1
                     stamp()
                     if consumed:
                         last_hb = clock()
                         fail_sleep = idle_interval
+                        if max_turns is not None and turns >= max_turns:
+                            return turns
                     else:
                         sleep(fail_sleep)
                         fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
@@ -1003,6 +1057,32 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
             continue
 
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            landed = commit_gate.resolve_landed_response(record)
+            if landed.unavailable_reason is not None:
+                stamp()
+                if on_health_idle is not None:
+                    on_health_idle()
+                last_hb = clock()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+            if landed.proof is not None:
+                if _commit_landed(record, legacy_gate_resolution, landed):
+                    stamp()
+                    if on_health_idle is not None:
+                        on_health_idle()
+                    last_hb = clock()
+                    fail_sleep = idle_interval
+                    turns += 1
+                    if max_turns is not None and turns >= max_turns:
+                        return turns
+                else:
+                    stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+
         # ---- dead-letter: bound the at-least-once retry of a POISON head message ----
         head_id = record.get("id")
         # A stale in_progress on this head means the process crashed mid-turn last run ->
@@ -1059,7 +1139,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             )
             if authorized.terminal:
                 _guard_advance()
-                commit_gate.finalize(
+                finalized = commit_gate.finalize(
                     record,
                     authorized,
                     expected_revision=authorized.ledger_revision,
@@ -1067,8 +1147,17 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 if _runtime_idle_if_consumed(record):
                     store.clear_attempt(agent, record.get("id"))
                     store.gc_attempts_below(agent, store.cursor(agent))
+                    if (
+                        finalized.landed_evidence_id is not None
+                        and finalized.landed_evidence_id == finalized.evidence_id
+                    ):
+                        if on_health_idle is not None:
+                            on_health_idle()
+                        turns += 1
                     stamp()
                     fail_sleep = idle_interval
+                    if max_turns is not None and turns >= max_turns:
+                        return turns
                     continue
                 stamp()
                 sleep(fail_sleep)
@@ -1086,6 +1175,29 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         store.record_attempt_start(agent, record, attempt_id=uuid.uuid4().hex[:12],
                                    at=now_iso())
         outcome = _as_outcome(drive(record))
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            landed = commit_gate.resolve_landed_response(record)
+            if landed.proof is not None:
+                if _commit_landed(
+                    record,
+                    legacy_gate_resolution,
+                    landed,
+                    outcome=outcome,
+                ):
+                    stamp()
+                    if on_health_idle is not None:
+                        on_health_idle()
+                    last_hb = clock()
+                    _maybe_refresh_capacity(last_hb)
+                    fail_sleep = idle_interval
+                    turns += 1
+                    if max_turns is not None and turns >= max_turns:
+                        return turns
+                else:
+                    stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
         if outcome.ok:
             finalization_resolution = legacy_gate_resolution
             retained_success = False
@@ -1234,6 +1346,48 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
         _runtime_idle_if_consumed(record)
         return settled
 
+    def _commit_scoped_landed(
+        rec: dict,
+        gate_resolution,
+        landed,
+        *,
+        outcome: DriveOutcome | None = None,
+    ) -> bool:
+        proof = landed.proof
+        if proof is None:
+            return False
+        if gate_resolution.ledger_revision is not None:
+            retained = commit_gate.retain_landed_response(
+                rec,
+                gate_resolution,
+                proof,
+            )
+            if not (retained.allows_legacy_commit or retained.terminal):
+                return False
+            finalized = commit_gate.finalize(
+                rec,
+                retained,
+                expected_revision=retained.ledger_revision,
+            )
+            if not (finalized.allows_legacy_commit or finalized.terminal):
+                return False
+        else:
+            recv_api.commit(store, agent, rec)
+        if not _runtime_idle_if_consumed(rec):
+            return False
+        if outcome is not None and not outcome.ok:
+            try:
+                commit_gate.record_landed_work_override(
+                    rec,
+                    proof,
+                    failure_class=outcome.failure_class,
+                    summary=outcome.summary,
+                )
+            except Exception:  # noqa: BLE001, S110 - advisory telemetry  # nosec B110
+                # Progress is already durable; telemetry cannot revoke it.
+                pass
+        return True
+
     while True:
         if max_polls is not None and polls >= max_polls:
             return turns                # bound hit: caller maps turns==0 -> nonzero
@@ -1284,7 +1438,17 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     if finalized.state != ResolverState.INDETERMINATE:
                         if resolution.key is not None and resolution.compliance_success:
                             commit_gate.mark_satisfied(resolution.key)
-                        if _runtime_idle_if_consumed(record):
+                        consumed = _runtime_idle_if_consumed(record)
+                        landed = (
+                            finalized.terminal
+                            and finalized.landed_evidence_id is not None
+                            and finalized.landed_evidence_id == finalized.evidence_id
+                        )
+                        if consumed and landed:
+                            if on_health_idle is not None:
+                                on_health_idle()
+                            turns += 1
+                        if consumed:
                             return turns
                     if (
                         resolution.key is not None
@@ -1496,6 +1660,37 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
             sleep(fail_sleep)
             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
             continue
+
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            landed = commit_gate.resolve_landed_response(record)
+            if landed.unavailable_reason is not None:
+                _stamp()
+                if on_health_idle is not None:
+                    on_health_idle()
+                last_hb = clock()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+            if landed.proof is not None:
+                if _commit_scoped_landed(
+                    record,
+                    legacy_gate_resolution,
+                    landed,
+                ):
+                    _stamp()
+                    if on_health_idle is not None:
+                        on_health_idle()
+                    last_hb = clock()
+                    fail_sleep = idle_interval
+                    turns += 1
+                    if max_turns is not None and turns >= max_turns:
+                        return turns
+                else:
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+
         # A scoped record carries ``rid`` by construction - it is the work this ephemeral
         # reviewer was spawned for. Normalize ONCE, then commit/thread-seen/turns++ ONLY when
         # ok - drive() returns a DriveOutcome (frozen dataclass, no __bool__ -> always truthy),
@@ -1507,12 +1702,23 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 legacy_gate_resolution,
             )
             if authorized.terminal:
-                commit_gate.finalize(
+                finalized = commit_gate.finalize(
                     record,
                     authorized,
                     expected_revision=authorized.ledger_revision,
                 )
-                if _runtime_idle_if_consumed(record):
+                consumed = _runtime_idle_if_consumed(record)
+                if consumed:
+                    landed = (
+                        finalized.terminal
+                        and finalized.landed_evidence_id is not None
+                        and finalized.landed_evidence_id == finalized.evidence_id
+                    )
+                    if landed:
+                        _stamp()
+                        if on_health_idle is not None:
+                            on_health_idle()
+                        turns += 1
                     return turns
                 _stamp()
                 sleep(fail_sleep)
@@ -1525,6 +1731,28 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 continue
             legacy_gate_resolution = authorized
         outcome = _as_outcome(drive(record))
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            landed = commit_gate.resolve_landed_response(record)
+            if landed.proof is not None:
+                if _commit_scoped_landed(
+                    record,
+                    legacy_gate_resolution,
+                    landed,
+                    outcome=outcome,
+                ):
+                    _stamp()
+                    if on_health_idle is not None:
+                        on_health_idle()
+                    last_hb = clock()
+                    fail_sleep = idle_interval
+                    turns += 1
+                    if max_turns is not None and turns >= max_turns:
+                        return turns
+                else:
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
         if outcome.ok:
             if legacy_gate_resolution is not None and legacy_gate_resolution.ledger_revision is not None:
                 retained = commit_gate.record_no_admission_success(

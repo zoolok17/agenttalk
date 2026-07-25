@@ -42,6 +42,50 @@ def _run_expect_exit(argv: list[str], root: Path, code: int) -> None:
     assert actual == code, f"expected exit code {code}, got {actual}"
 
 
+@pytest.mark.parametrize("command", ["send", "reply", "escalate"])
+def test_bus_write_command_exits_nonzero_when_publication_lock_fails(
+    command: str,
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(store_root)
+    inbound = store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="question",
+        body="answer?",
+        meta={"request_id": "q-durability-contract"},
+    )
+    argv = {
+        "send": [
+            "send", "--from", "beta", "--to", "alpha",
+            "-m", "payload", "--quiet",
+        ],
+        "reply": [
+            "reply", "--from", "beta", "--to-id", inbound.id,
+            "-m", "answer", "--quiet",
+        ],
+        "escalate": [
+            "escalate", "--from", "beta", "--to", "alpha",
+            "-m", "operator decision needed", "--quiet",
+        ],
+    }[command]
+    before = [message.id for message in store.valid_messages()]
+    lock_attempted = False
+
+    def fail_publication_lock(_self: Store, **_kwargs):
+        nonlocal lock_attempted
+        lock_attempted = True
+        raise TimeoutError("injected message-publication lock failure")
+
+    monkeypatch.setattr(Store, "_message_publication_lock", fail_publication_lock)
+
+    rc = _run(argv, store_root)
+    after = [message.id for message in store.valid_messages()]
+
+    assert (rc, lock_attempted, after) == (2, True, before)
+
+
 def _approval_meta_args() -> list[str]:
     return [
         "--meta", "status=approved",

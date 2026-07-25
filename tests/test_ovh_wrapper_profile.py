@@ -402,6 +402,165 @@ def test_ovh_policy_and_ledger_blocks_as_terminal_text_stay_config_blocked(code)
     assert "hold" in summary
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "review prose quotes ATGW_POLICY_BLOCKED",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "printf harmless",
+                "exit_code": 1,
+                "status": "failed",
+                "aggregated_output": "review mentions status code: 422",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": ("x" * 5000) + " ATGW_POLICY_BLOCKED",
+            },
+        },
+    ],
+    ids=["assistant-json", "tool-json", "long-json-before-tail-bound"],
+)
+def test_ovh_parsed_json_payload_cannot_become_raw_gateway_diagnostic(
+    tmp_path,
+    payload,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+    stream = [
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps(payload),
+    ]
+    drive = run.make_drive(
+        store,
+        "qwen-dev-1",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=lambda _argv, _stdin: stream,
+        clock=lambda: 0.0,
+        render=False,
+        backend_profile="ovh-qwen",
+    )
+
+    outcome = drive({
+        "id": "inbound",
+        "from": "lead",
+        "kind": "message",
+        "body": "work",
+        "meta": {},
+    })
+
+    assert outcome.ok is False
+    assert outcome.failure_class == CLASS_AMBIGUOUS
+
+
+@pytest.mark.parametrize("quoted_marker", ["status code: 422", "status code: 503"])
+def test_ovh_failed_bus_tool_output_cannot_become_gateway_diagnostic(
+    tmp_path,
+    quoted_marker,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+    tool_output = f"Access is denied; quoted finding says {quoted_marker}"
+    stream = [
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": (
+                    '& "$env:AGENTTALK_PY" -m agenttalk reply '
+                    "--to-id inbound -m answer"
+                ),
+                "exit_code": 1,
+                "status": "failed",
+                "aggregated_output": tool_output,
+            },
+        }),
+    ]
+    drive = run.make_drive(
+        store,
+        "qwen-dev-1",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=lambda _argv, _stdin: stream,
+        clock=lambda: 0.0,
+        render=False,
+        backend_profile="ovh-qwen",
+    )
+
+    outcome = drive({
+        "id": "inbound",
+        "from": "lead",
+        "kind": "message",
+        "body": "work",
+        "meta": {},
+    })
+
+    assert outcome.ok is False
+    assert outcome.failure_class == CLASS_CONFIG_BLOCKED
+    assert "Access is denied" in outcome.summary
+    assert "OVH gateway" not in outcome.summary
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "expected"),
+    [
+        ("ATGW_POLICY_BLOCKED", CLASS_CONFIG_BLOCKED),
+        ("API Error: status code: 503", CLASS_INFRA),
+    ],
+)
+def test_ovh_discarded_non_json_gateway_diagnostic_still_classifies(
+    tmp_path,
+    diagnostic,
+    expected,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+    stream = [
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        json.dumps({"type": "turn.started"}),
+        diagnostic,
+    ]
+    drive = run.make_drive(
+        store,
+        "qwen-dev-1",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=lambda _argv, _stdin: stream,
+        clock=lambda: 0.0,
+        render=False,
+        backend_profile="ovh-qwen",
+    )
+
+    outcome = drive({
+        "id": "inbound",
+        "from": "lead",
+        "kind": "message",
+        "body": "work",
+        "meta": {},
+    })
+
+    assert outcome.ok is False
+    assert outcome.failure_class == expected
+
+
 def test_gateway_transient_hold_signal_classifies_gateway_held() -> None:
     # The mint-time LedgerHold surfaces as an explicit sig flag, classified BEFORE any text
     # heuristic and independent of backend profile.
