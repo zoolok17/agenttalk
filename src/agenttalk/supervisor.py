@@ -6628,6 +6628,9 @@ def _merge_post_tool_use_hook(
                 if prefer_existing_fallback:
                     if parsed[0] == "fallback" and not seen:
                         seen = True
+                        if h.get("type") != "command":
+                            h["type"] = "command"
+                            changed = True
                     else:
                         changed = True      # drop neutral/legacy/duplicate hooks
                         continue
@@ -6638,6 +6641,9 @@ def _merge_post_tool_use_hook(
                     seen = True
                     if h.get("command") != target_command:
                         h["command"] = target_command
+                        changed = True
+                    if h.get("type") != "command":
+                        h["type"] = "command"
                         changed = True
             kept.append(h)
         if isinstance(g.get("hooks"), list) and len(kept) != len(g["hooks"]):
@@ -6696,6 +6702,7 @@ def _merge_checkpoint_event_hook(
     if (
         len(owned) == 1
         and owned[0][0].get("matcher") == matcher
+        and owned[0][1].get("type") == "command"
         and owned[0][1].get("command") == target_command
     ):
         return "already"

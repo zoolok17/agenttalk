@@ -2626,6 +2626,88 @@ def test_install_activity_hook_reports_malformed_hooks_container(
     assert settings.read_text(encoding="utf-8") == original
 
 
+@pytest.mark.parametrize(
+    ("entry_type", "first_status"),
+    [
+        (None, "installed"),
+        ("prompt", "installed"),
+        ("command", "already"),
+    ],
+    ids=["missing-type", "wrong-type", "correct-type"],
+)
+@pytest.mark.parametrize(
+    "fallback_agent",
+    [None, "lead"],
+    ids=["neutral", "preserved-fallback"],
+)
+def test_install_activity_hook_repairs_managed_hook_types(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    entry_type: str | None,
+    first_status: str,
+    fallback_agent: str | None,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+
+    def managed(command: str) -> dict:
+        item = {"command": command}
+        if entry_type is not None:
+            item["type"] = entry_type
+        return item
+
+    expected = {
+        "PostToolUse": (
+            sup.fallback_activity_hook_command(fallback_agent)
+            if fallback_agent is not None
+            else sup.ACTIVITY_HOOK_COMMAND
+        ),
+        "PreCompact": sup.checkpoint_hook_command("save", fallback_agent),
+        "SessionStart": sup.checkpoint_hook_command("resume", fallback_agent),
+    }
+    original = json.dumps({"hooks": {
+        "PostToolUse": [
+            {"matcher": "*", "hooks": [managed(expected["PostToolUse"])]},
+        ],
+        "PreCompact": [
+            {"matcher": "*", "hooks": [managed(expected["PreCompact"])]},
+        ],
+        "SessionStart": [
+            {
+                "matcher": "compact",
+                "hooks": [managed(expected["SessionStart"])],
+            },
+        ],
+    }}, indent=2)
+    settings.write_text(original, encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    for event in ("PostToolUse", "PreCompact", "SessionStart"):
+        assert f"{first_status}: {settings} [{event}]" in output
+    repaired = settings.read_text(encoding="utf-8")
+    if entry_type == "command":
+        assert repaired == original
+
+    hooks = json.loads(repaired)["hooks"]
+    for event, command in expected.items():
+        items = [
+            item
+            for group in hooks[event]
+            for item in group["hooks"]
+            if item.get("command") == command
+        ]
+        assert items == [{"type": "command", "command": command}]
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+    second_output = capsys.readouterr().out
+    for event in ("PostToolUse", "PreCompact", "SessionStart"):
+        assert f"already: {settings} [{event}]" in second_output
+    assert settings.read_text(encoding="utf-8") == repaired
+
+
 def test_claude_hook_snippet_includes_all_managed_hooks() -> None:
     hooks = json.loads(sup.claude_hook_snippet())["hooks"]
 
