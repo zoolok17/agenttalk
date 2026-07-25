@@ -6407,7 +6407,9 @@ _ACTIVITY_HOOK_COMMANDS = (ACTIVITY_HOOK_COMMAND, *_LEGACY_ACTIVITY_HOOK_COMMAND
 # ``||`` is supported by POSIX sh, cmd.exe, and pwsh 7. Falling back to the
 # established, silent heartbeat hook lets an older install that lacks the
 # checkpoint subcommand finish successfully without contaminating SessionStart
-# stdout or depending on a platform-specific no-op.
+# stdout or depending on a platform-specific no-op. Bounded rollout residual:
+# the neutral fallback needs agenttalk >=0.31.1 and ``--fallback-for`` needs
+# >=0.69.6; an older PATH install can still return 2 and block PreCompact.
 CHECKPOINT_HOOK_FAIL_SOFT_GUARD = f" || {ACTIVITY_HOOK_COMMAND}"
 CHECKPOINT_SAVE_HOOK_COMMAND = (
     "agenttalk checkpoint save --hook" + CHECKPOINT_HOOK_FAIL_SOFT_GUARD
@@ -6461,22 +6463,21 @@ def _parse_activity_hook_command(command: object) -> tuple[str, str | None] | No
 
 def _parse_checkpoint_hook_command(
     command: object,
-) -> tuple[str, str, str | None, bool] | None:
+) -> tuple[str, str, str | None] | None:
     if not isinstance(command, str):
         return None
     try:
         parts = shlex.split(command)
     except ValueError:
         return None
-    guarded = False
     if "||" in parts:
         separator = parts.index("||")
         guard_parts = parts[separator + 1:]
-        guarded = (
+        guard_is_managed = (
             guard_parts == ["cd", "."]
             or _parse_activity_hook_command(" ".join(guard_parts)) is not None
         )
-        if not guarded:
+        if not guard_is_managed:
             return None
         parts = parts[:separator]
     if len(parts) < 4 or parts[:2] != ["agenttalk", "checkpoint"]:
@@ -6485,13 +6486,13 @@ def _parse_checkpoint_hook_command(
     if action not in {"save", "resume"}:
         return None
     if parts[3:] == ["--hook"]:
-        return action, "neutral", None, guarded
+        return action, "neutral", None
     if parts[3:5] == ["--hook", "--fallback-for"] and len(parts) == 6:
         try:
             agent = validate_agent_name(parts[5])
         except ValueError:
             return None
-        return action, "fallback", agent, guarded
+        return action, "fallback", agent
     return None
 
 
@@ -6573,16 +6574,33 @@ def claude_hook_snippet() -> str:
     }}, indent=2)
 
 
+def _hook_event_groups(
+    settings: dict,
+    event: str,
+) -> tuple[list | None, str | None]:
+    if "hooks" not in settings:
+        settings["hooks"] = {}
+    hooks = settings["hooks"]
+    if not isinstance(hooks, dict):
+        return None, "skipped (malformed hooks)"
+    if event not in hooks:
+        hooks[event] = []
+    groups = hooks[event]
+    if not isinstance(groups, list):
+        return None, f"skipped (malformed hooks.{event})"
+    return groups, None
+
+
 def _merge_post_tool_use_hook(
     settings: dict,
     *,
     target_command: str = ACTIVITY_HOOK_COMMAND,
     preserve_existing_fallback: bool = False,
-) -> bool:
+) -> str:
     """Add (or UPGRADE) the heartbeat PostToolUse hook in a settings dict IN PLACE,
     in the matcher-GROUP shape both Claude and Codex use ({"matcher","hooks":[...]}),
-    preserving every existing key/group. Returns True if it changed anything
-    (False = already present + current, idempotent).
+    preserving every existing key/group. Returns an installed/already/skipped
+    status for truthful per-hook reporting.
 
     The presence-check scans the NESTED hooks of every group and matches BOTH the
     current ``agenttalk heartbeat --hook`` and the LEGACY bare ``agenttalk
@@ -6592,10 +6610,9 @@ def _merge_post_tool_use_hook(
     prefer_existing_fallback = (
         preserve_existing_fallback and _has_fallback_activity_hook(settings)
     )
-    hooks = settings.setdefault("hooks", {})
-    groups = hooks.setdefault("PostToolUse", [])
-    if not isinstance(groups, list):
-        return False  # malformed - refuse to touch
+    groups, skipped = _hook_event_groups(settings, "PostToolUse")
+    if groups is None:
+        return skipped or "skipped (malformed hooks.PostToolUse)"
     changed = False
     seen = False
     for g in groups:
@@ -6629,7 +6646,7 @@ def _merge_post_tool_use_hook(
         groups.append({"matcher": "*", "hooks": [
             {"type": "command", "command": target_command}]})
         changed = True
-    return changed
+    return "installed" if changed else "already"
 
 
 def _merge_checkpoint_event_hook(
@@ -6641,14 +6658,11 @@ def _merge_checkpoint_event_hook(
     target_agent: str | None = None,
     fallback_agent: str | None = None,
     preserve_existing_fallback: bool = False,
-) -> bool:
+) -> str:
     """Canonicalize one managed checkpoint hook without touching unrelated hooks."""
-    hooks = settings.setdefault("hooks", {})
-    if not isinstance(hooks, dict):
-        return False
-    groups = hooks.setdefault(event, [])
-    if not isinstance(groups, list):
-        return False
+    groups, skipped = _hook_event_groups(settings, event)
+    if groups is None:
+        return skipped or f"skipped (malformed hooks.{event})"
 
     owned: list[tuple[dict, dict]] = []
     existing_fallback: str | None = None
@@ -6684,15 +6698,18 @@ def _merge_checkpoint_event_hook(
         and owned[0][0].get("matcher") == matcher
         and owned[0][1].get("command") == target_command
     ):
-        return False
+        return "already"
 
+    kept_groups: list = []
     for group in groups:
         if not isinstance(group, dict):
+            kept_groups.append(group)
             continue
         items = group.get("hooks")
         if not isinstance(items, list):
+            kept_groups.append(group)
             continue
-        group["hooks"] = [
+        kept = [
             item
             for item in items
             if not (
@@ -6700,6 +6717,12 @@ def _merge_checkpoint_event_hook(
                 and _parse_checkpoint_hook_command(item.get("command")) is not None
             )
         ]
+        if len(kept) != len(items):
+            group["hooks"] = kept
+            if not kept:
+                continue
+        kept_groups.append(group)
+    groups[:] = kept_groups
 
     target_group = next(
         (
@@ -6717,7 +6740,7 @@ def _merge_checkpoint_event_hook(
         target_group = {"matcher": matcher, "hooks": []}
         groups.append(target_group)
     target_group["hooks"].append({"type": "command", "command": target_command})
-    return True
+    return "installed"
 
 
 def _merge_checkpoint_hooks(
@@ -6726,10 +6749,10 @@ def _merge_checkpoint_hooks(
     target_agent: str | None = None,
     fallback_agent: str | None = None,
     preserve_existing_fallback: bool = False,
-) -> bool:
-    changed = False
+) -> dict[str, str]:
+    statuses: dict[str, str] = {}
     for event, action, matcher in _CHECKPOINT_HOOK_SPECS:
-        if _merge_checkpoint_event_hook(
+        statuses[event] = _merge_checkpoint_event_hook(
             settings,
             event=event,
             action=action,
@@ -6737,9 +6760,8 @@ def _merge_checkpoint_hooks(
             target_agent=target_agent,
             fallback_agent=fallback_agent,
             preserve_existing_fallback=preserve_existing_fallback,
-        ):
-            changed = True
-    return changed
+        )
+    return statuses
 
 
 def resolve_interactive_activity_hook_target(store: Store, agent: str) -> str:
@@ -6785,60 +6807,78 @@ def install_activity_hook(store: Store, *, claude: bool = True,
     Claude receives the activity heartbeat and checkpoint hooks; Codex receives
     only the activity heartbeat until its wrapper integration lands. Global
     config is never touched and existing unrelated hooks/keys are preserved.
-    Returns ``{path: "installed"|"already"|"skipped"}``.
+    Returns ``{path: {event: "installed"|"already"|"skipped (...)"}}``.
     """
-    out: dict[str, str] = {}
+    out: dict[str, dict[str, str]] = {}
+    claude_events = ("PostToolUse", "PreCompact", "SessionStart")
     target_command = (
         fallback_activity_hook_command(interactive_for)
         if interactive_for is not None else ACTIVITY_HOOK_COMMAND
     )
     if claude:
         p = store.root / ".claude" / "settings.json"
-        settings = {}
+        settings: object = {}
+        unreadable = False
         if p.exists():
             try:
-                settings = json.loads(p.read_text(encoding="utf-8-sig")) or {}
+                settings = json.loads(p.read_text(encoding="utf-8-sig"))
             except (ValueError, OSError):
-                out[str(p)] = "skipped (unreadable - merge by hand)"
-                settings = None
-        if settings is not None:
-            activity_changed = _merge_post_tool_use_hook(
+                unreadable = True
+        if unreadable:
+            out[str(p)] = dict.fromkeys(
+                claude_events,
+                "skipped (unreadable - merge by hand)",
+            )
+        elif not isinstance(settings, dict):
+            out[str(p)] = dict.fromkeys(
+                claude_events,
+                "skipped (malformed settings root)",
+            )
+        else:
+            statuses = {"PostToolUse": _merge_post_tool_use_hook(
                 settings,
                 target_command=target_command,
                 preserve_existing_fallback=interactive_for is None,
-            )
-            checkpoint_changed = _merge_checkpoint_hooks(
+            )}
+            statuses.update(_merge_checkpoint_hooks(
                 settings,
                 target_agent=interactive_for,
                 fallback_agent=_fallback_activity_hook_agent(settings),
                 preserve_existing_fallback=interactive_for is None,
-            )
-            changed = activity_changed or checkpoint_changed
-            if changed:
+            ))
+            if "installed" in statuses.values():
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-            out[str(p)] = "installed" if changed else "already"
+            out[str(p)] = statuses
     if codex:
         # Codex uses the SAME matcher-group PostToolUse shape as Claude (a
         # flat {type,command} would mis-install and the presence-check would
         # duplicate a correctly-shaped existing hook -> a safety bug if
         # activity_hook is then trusted). .codex/hooks.json (JSON).
         p = store.root / ".codex" / "hooks.json"
-        cfg = {}
+        cfg: object = {}
+        unreadable = False
         if p.exists():
             try:
-                cfg = json.loads(p.read_text(encoding="utf-8-sig")) or {}
+                cfg = json.loads(p.read_text(encoding="utf-8-sig"))
             except (ValueError, OSError):
-                out[str(p)] = "skipped (unreadable - merge by hand)"
-                cfg = None
-        if cfg is not None:
-            changed = _merge_post_tool_use_hook(
+                unreadable = True
+        if unreadable:
+            out[str(p)] = {
+                "PostToolUse": "skipped (unreadable - merge by hand)",
+            }
+        elif not isinstance(cfg, dict):
+            out[str(p)] = {
+                "PostToolUse": "skipped (malformed settings root)",
+            }
+        else:
+            status = _merge_post_tool_use_hook(
                 cfg,
                 target_command=target_command,
                 preserve_existing_fallback=interactive_for is None,
             )
-            if changed:
+            if status == "installed":
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-            out[str(p)] = "installed" if changed else "already"
+            out[str(p)] = {"PostToolUse": status}
     return out

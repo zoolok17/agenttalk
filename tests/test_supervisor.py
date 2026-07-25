@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2576,6 +2577,55 @@ def test_install_activity_hook_adds_checkpoint_hooks_to_existing_heartbeat(
     ]
 
 
+def test_install_activity_hook_reports_partial_malformed_event(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    malformed = {"matcher": "*"}
+    settings.write_text(
+        json.dumps({"hooks": {"PreCompact": malformed}}),
+        encoding="utf-8",
+    )
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    assert f"installed: {settings} [PostToolUse]" in output
+    assert (
+        f"skipped (malformed hooks.PreCompact): {settings} [PreCompact]"
+        in output
+    )
+    assert f"installed: {settings} [SessionStart]" in output
+    assert "already:" not in output
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data["hooks"]["PreCompact"] == malformed
+    assert _hook_commands(settings, "SessionStart") == [
+        "agenttalk checkpoint resume --hook || agenttalk heartbeat --hook",
+    ]
+
+
+def test_install_activity_hook_reports_malformed_hooks_container(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    original = json.dumps({"hooks": []})
+    settings.write_text(original, encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    for event in ("PostToolUse", "PreCompact", "SessionStart"):
+        assert f"skipped (malformed hooks): {settings} [{event}]" in output
+    assert "already:" not in output
+    assert settings.read_text(encoding="utf-8") == original
+
+
 def test_claude_hook_snippet_includes_all_managed_hooks() -> None:
     hooks = json.loads(sup.claude_hook_snippet())["hooks"]
 
@@ -2649,6 +2699,40 @@ def test_install_activity_hook_upgrades_and_dedupes_checkpoint_hooks(
     ]
     assert "echo preserve-pre" in _hook_commands(settings, "PreCompact")
     assert "echo preserve-start" in _hook_commands(settings, "SessionStart")
+
+
+def test_install_activity_hook_prunes_only_groups_emptied_by_relocation(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {
+        "PreCompact": [
+            {"matcher": "manual", "hooks": [
+                {"type": "command", "command": "agenttalk checkpoint save --hook"},
+            ]},
+            {"matcher": "operator-empty", "hooks": []},
+        ],
+        "SessionStart": [
+            {"matcher": "startup", "hooks": [
+                {"type": "command", "command": "agenttalk checkpoint resume --hook"},
+            ]},
+            {"matcher": "operator-empty", "hooks": []},
+        ],
+    }}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    hooks = json.loads(settings.read_text(encoding="utf-8"))["hooks"]
+    assert [group["matcher"] for group in hooks["PreCompact"]] == [
+        "operator-empty",
+        "*",
+    ]
+    assert [group["matcher"] for group in hooks["SessionStart"]] == [
+        "operator-empty",
+        "compact",
+    ]
 
 
 def test_install_activity_hook_codex_uses_group_shape(tmp_path: Path) -> None:
@@ -2791,12 +2875,70 @@ def _legacy_agenttalk_env(tmp_path: Path) -> dict[str, str]:
     }
 
 
+def _real_argparse_failure_agenttalk_env(tmp_path: Path) -> dict[str, str]:
+    fake_bin = tmp_path / "real-argparse-bin"
+    fake_bin.mkdir()
+    if os.name == "nt":
+        (fake_bin / "agenttalk.cmd").write_text(
+            "@echo off\r\n"
+            'if /i "%~1"=="checkpoint" goto checkpoint\r\n'
+            'if /i "%~1"=="heartbeat" exit /b 0\r\n'
+            "exit /b 9\r\n"
+            ":checkpoint\r\n"
+            f'"{sys.executable}" -m agenttalk checkpoint --definitely-invalid\r\n'
+            "exit /b %errorlevel%\r\n",
+            encoding="ascii",
+        )
+    else:
+        executable = fake_bin / "agenttalk"
+        executable.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = checkpoint ]; then\n'
+            f"  exec {shlex.quote(sys.executable)} -m agenttalk "
+            "checkpoint --definitely-invalid\n"
+            "fi\n"
+            '[ "$1" = heartbeat ] && exit 0\n'
+            "exit 9\n",
+            encoding="ascii",
+        )
+        executable.chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+    }
+
+
 _GUARDED_CHECKPOINT_COMMANDS = [
     "agenttalk checkpoint save --hook --fallback-for lead"
     " || agenttalk heartbeat --hook --fallback-for lead",
     "agenttalk checkpoint resume --hook --fallback-for lead"
     " || agenttalk heartbeat --hook --fallback-for lead",
 ]
+
+
+def test_checkpoint_hook_guard_keeps_real_argparse_usage_off_stdout(
+    tmp_path: Path,
+) -> None:
+    command = sup.CHECKPOINT_SAVE_HOOK_COMMAND
+    shell = (
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command]
+        if os.name == "nt"
+        else ["/bin/sh", "-c", command]
+    )
+
+    result = subprocess.run(
+        shell,
+        env=_real_argparse_failure_agenttalk_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert "usage:" in result.stderr.lower()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX sh contract")
@@ -6287,9 +6429,9 @@ def test_install_activity_hook_preserves_bom_prefixed_operator_settings(tmp_path
     settings.parent.mkdir(parents=True, exist_ok=True)
     settings.write_bytes(b"\xef\xbb\xbf" + b'{"customOperatorKey": 42}')
     out = sup.install_activity_hook(s, claude=True, codex=False)
-    st = out[str(settings)]
-    assert "unreadable" not in st                      # was "skipped (unreadable...)" before the fix
-    assert st in ("installed", "already")
+    statuses = out[str(settings)]
+    assert all("unreadable" not in status for status in statuses.values())
+    assert set(statuses.values()) <= {"installed", "already"}
     data = json.loads(settings.read_text(encoding="utf-8-sig"))
     assert data.get("customOperatorKey") == 42         # operator key preserved through the merge
 
@@ -6364,7 +6506,7 @@ def test_install_activity_hook_preserves_bom_prefixed_codex_hooks(tmp_path: Path
     hooks.parent.mkdir(parents=True, exist_ok=True)
     hooks.write_bytes(b"\xef\xbb\xbf" + b'{"customOperatorKey": 7}')
     out = sup.install_activity_hook(s, claude=False, codex=True)
-    st = out[str(hooks)]
-    assert "unreadable" not in st
+    statuses = out[str(hooks)]
+    assert all("unreadable" not in status for status in statuses.values())
     data = json.loads(hooks.read_text(encoding="utf-8-sig"))
     assert data.get("customOperatorKey") == 7

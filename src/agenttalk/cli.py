@@ -11574,12 +11574,13 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             codex=False if interactive_for else args.codex or args.codex_only,
             interactive_for=interactive_for,
         )
-        for path, status in res.items():
-            print(f"  {status}: {path}")
-        print("install-activity-hook: merged into PROJECT config only (never "
-              "global, never clobbered). Claude installs include fail-soft "
-              "checkpoint hooks. Now set activity_hook=true for the instrumented "
-              "agents in supervisor.json to enable stuck-recovery.")
+        for path, event_statuses in res.items():
+            for event, status in event_statuses.items():
+                print(f"  {status}: {path} [{event}]")
+        print("install-activity-hook: PROJECT config only (never global, never "
+              "clobbered); the per-hook results above are authoritative. "
+              "Now set activity_hook=true for the instrumented agents in "
+              "supervisor.json to enable stuck-recovery.")
         return 0
     if args.seed_codex_config:
         # Overlay the unattended-auto-mode keys onto a (already-COPIED) config.toml
