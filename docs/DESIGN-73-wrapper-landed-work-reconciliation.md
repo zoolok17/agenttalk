@@ -1,10 +1,10 @@
 # DESIGN — #73 wrapper landed-work reconciliation
 
-**Status:** design and diagnosis only; one intentionally failing regression test,
-no production change
+**Status:** approved design implemented on the feature branch; pre-merge review
+and operator inspection still required
 
-**Audience:** wrapper, store, and owed-action maintainers reviewing the build
-before implementation
+**Audience:** wrapper, store, and owed-action maintainers reviewing the
+implemented feature branch before merge
 
 **Author:** `codex-2` · 2026-07-24
 
@@ -28,13 +28,23 @@ consume only lines rejected as non-JSON at ingestion time. These changes prevent
 the known false classification, while bus reconciliation covers the larger class
 of “write landed, child failed afterwards” races.
 
-The invariant is:
+The park-side invariant is:
 
-> Never advance past an inbound that did no work; never park an inbound whose
-> exact terminal work is already durable.
+> A failed turn without resolved exact landed-work proof remains uncommitted;
+> once validated replay proves an exact durable terminal response, that inbound
+> is never parked.
 
 Here, “landed” means a validated, protocol-correct bus record. Assistant prose,
 tool stdout, and a claimed successful command are never landing proof.
+Physical durability that cannot currently be validated is intentionally not
+treated as proof: replay unavailability remains fail-closed until authority can
+be recovered.
+
+This change deliberately does not strengthen the pre-existing success path.
+An exit-zero `DriveOutcome.ok` turn can still advance without a strict landed
+bus response, as it could before #73. The CLI durability contract below makes
+successful bus-write commands reliable evidence for that compatibility path,
+but it is not equivalent to the failed-turn override.
 
 ## Reproduced defect
 
@@ -99,11 +109,14 @@ July 8 result is a valid same-request review-result but predates consistent
 `in_reply_to` stamping, so it is strong operational evidence rather than a
 candidate for the new failed-turn override.
 
-## Current control flow
+## Base control flow before the fix
 
 ### Where the false failure is created
 
-| Stage | Current behavior | Consequence |
+The following diagnosis describes the `c70ee91` base named above, not the
+implemented feature branch.
+
+| Stage | Base behavior | Consequence |
 | --- | --- | --- |
 | `codex_adapter.py:41-60` | A parsed `command_execution` becomes `TOOL_FINISHED`; its `aggregated_output` includes the rendered reply body. | Valid assistant-authored review text reaches the tool classifier. |
 | `run.py:1052-1119` | Runtime, interpreter, and execution-denied regexes scan output at lines 1066-1088. Structured exit/status failure is computed only at 1091-1092. | Exit-zero output can become `config_blocked`. |
@@ -158,9 +171,9 @@ failure class—`config_blocked`, `ambiguous`, `infra`, `poison`, or
 
 ## Raw-tail trust-boundary overlap
 
-`_capture_child_output()` currently stores every child stdout line before JSON
-parsing (`run.py:2028-2036`). `_ovh_qwen_failure_text()` appends every captured
-line (`run.py:1591-1598`) and the OVH classifier scans that text first.
+At the base SHA, `_capture_child_output()` stores every child stdout line before
+JSON parsing (`run.py:2028-2036`). `_ovh_qwen_failure_text()` appends every
+captured line (`run.py:1591-1598`) and the OVH classifier scans that text first.
 
 At the base SHA:
 
@@ -298,12 +311,12 @@ following:
 - the response is terminal, not `composing`, a control record, a draft, or
   unrelated same-request chatter.
 
-For a non-opener or an uncorrelated ordinary inbound, the exact `in_reply_to`
-anchor supplies the thread identity. A validated response sent by the wrapped
-agent back to the inbound sender counts when it is non-control, non-`composing`,
-and does not itself open a new `review-request`, `proposal`, or `question`.
-Status-bearing response kinds must still carry a valid terminal status. This
-covers an exact reply to a plain `message` without broad request-id matching.
+For a needs-info continuation, publication-order replay must first prove that
+the delivered message handed the original review obligation back to this
+agent; only an exact final verdict that then closes that opener counts.
+Uncorrelated ordinary messages and no-reply notes have no protocol opener to
+close, so they deliberately remain outside this override. This avoids treating
+an acknowledgement as proof that unrelated file/Git work completed.
 
 The proof inherits the bus trust model: when signing is enforced, the evidence
 must pass HMAC validation; when signing is off, sender identity remains the same
@@ -325,6 +338,12 @@ An exact response from a previous crashed attempt also counts. That is desired:
 on redelivery, the work is already complete and the wrapper should finalize
 without invoking the model again.
 
+This proof covers bus-deliverable terminal work only. A turn whose intended
+deliverable is solely out of band—a Git push, a file write, or a note that owes
+no response—has no terminal bus record for the resolver to prove and can still
+false-park if child heuristics fail. Addressing that residual requires a
+separate durable completion contract for those deliverables.
+
 ### 3. Reconcile before drive and before recording failure
 
 Both legacy call sites must use the same order:
@@ -333,6 +352,8 @@ Both legacy call sites must use the same order:
 resolve exact landed work from an earlier attempt
 if proof:
     guarded commit; clear attempt; increment turns; do not drive
+else if replay authority is unavailable:
+    pause and retry without driving or advancing
 authorize legacy drive
 record attempt start
 drive
@@ -345,6 +366,8 @@ if proof:
     clear attempt
     increment turns
     record heuristic disagreement telemetry
+else if replay authority is unavailable and drive failed:
+    preserve existing fail-closed failure handling
 else if drive succeeded:
     existing success commit
 else:
@@ -365,16 +388,23 @@ pre-drive resolver finds the same immutable response and retries disposition
 without re-driving. This closes the crash window between append and cursor
 advance without adding per-message ledger I/O to default wrappers.
 
+Configured retention first repairs the canonical message index from the
+validated publication stream, so a missed best-effort append hook cannot place a
+claim transition before its evidence row. After validation, the exact evidence
+identity is carried through finalization; turn accounting does not require a
+second post-commit replay that could fail after cursor/thread disposition.
+
 ### 4. Preserve diagnostics without preserving the park
 
-When landed work overrides a non-ok outcome, emit bounded structured telemetry:
+When landed work overrides a non-ok outcome, make a best-effort attempt to emit
+bounded structured telemetry after disposition is already durable:
 
 ```text
 event=LANDED_WORK_OVERRIDES_DRIVE_FAILURE
 inbound_id=<id>
 evidence_id=<response id>
 heuristic_class=<class>
-heuristic_subtype=<subtype when known>
+heuristic_summary_digest=<sha256>
 ```
 
 Do not persist an attempt failure, latch config-blocked health, or route an
@@ -402,6 +432,15 @@ If a CLI ever prints a semantic failure and exits zero, that is a separate CLI
 contract defect. The wrapper must not infer command failure by scanning an
 authored reply body.
 
+The exit-zero assumption is load-bearing and is pinned by a CLI contract test:
+`agenttalk send`, `reply`, and `escalate` all exit nonzero when the canonical
+message-publication lock fails, and the validated bus remains unchanged. The
+test injects the failure after preparation but before durable publication.
+Classifier coverage includes Windows and POSIX pinned launch forms: direct
+console scripts, unversioned or versioned `python -m`, the platform
+`AGENTTALK_PY` environment syntax, and PowerShell/cmd/sh/bash command payloads
+(including POSIX login-shell `-lc`).
+
 ### Child and raw tails
 
 At ingestion, classify each line once as parsed JSON or discarded non-JSON.
@@ -427,12 +466,14 @@ health cannot be falsely degraded by rendered payload.
 | No | ok | Preserve current successful legacy commit behavior. |
 | No | config/spawn/setup failure | Park; cursor/thread-seen unchanged. |
 | No | ambiguous/infra/poison/gateway failure | Preserve current retry/disposition policy. |
-| Unknown because validated bus replay failed | any | Do not advance; report the proof failure through existing bounded mechanisms. |
+| Unknown because pre-drive validated replay failed | not run | Do not drive or advance; pause and retry replay. |
+| Unknown because post-drive validated replay failed | failed | Do not claim an override; preserve existing fail-closed failure handling. |
+| Unknown because post-drive validated replay failed | ok | Preserve the pre-existing successful legacy commit behavior (the M1 residual). |
 | Yes, but guarded cursor/thread-seen commit failed | any | Do not advance; retry proof and disposition before any re-drive. |
 | Yes, configured claim retention/finalization failed | any | Do not advance; preserve the claim and retry its guarded finalization. |
 | Same request but no exact `in_reply_to`, and drive failed | failed | Do not use as override evidence. |
 
-## Intentionally failing regression
+## Failing-first regression
 
 Added:
 
@@ -466,22 +507,24 @@ config escalation     (expected none)
 ```
 
 This test deliberately injects the false classification instead of depending on
-the current regex. Reordering the regex alone cannot make it pass; the landed
-work invariant must be implemented.
+the current regex. Reordering the regex alone could not make the initial test
+pass; the implemented landed-work reconciliation is what turns it green.
 
-## Build increments after approval
+## Implemented build increments
 
-1. Commit the shared exact-response resolver and inactive-policy continuous-loop
-   reconciliation; make the new production-shaped regression pass.
-2. Add scoped one-shot parity and crash/redelivery coverage.
-3. Reorder structured command classification and update the existing tests that
-   currently bless failure-looking text on successful command events.
-4. Capture parse disposition at ingestion; route OVH, terminal, and resume
-   classifiers to discarded-line diagnostics only.
-5. Add valid assistant/tool JSON spoof cases, exit-zero reply-body cases,
-   genuine nonzero spawn/config cases, duplicate/mismatched reply cases, and
-   unreadable-ledger fail-closed cases.
-6. Run the current hand gate, targeted wrapper/owed-action suites, and
-   cross-platform Windows/POSIX CI before merge.
+1. The strict resolver uses validated physical publication order and exact
+   inbound anchoring, then applies the normative thread transition classifier.
+2. Continuous and scoped loops reconcile before drive and immediately after
+   drive, including configured-claim retention and crash recovery.
+3. Command text is inspected only after structured failure; successful rendered
+   reply bodies cannot trip configuration heuristics.
+4. Ingestion records a separate discarded-non-JSON diagnostic tail. OVH
+   raw-tail and resume marker scans never reparse the bounded forensic tail.
+5. Tests cover inactive/configured paths, pre/post-drive recovery, wrong or
+   nonterminal evidence, publication order, CLI non-durable writes, successful
+   reply-body markers, and parsed-JSON gateway spoofing.
+6. Configured retention repairs a missed eager projection before normalizing the
+   terminal claim, and finalized turn accounting carries the validated evidence
+   identity without a second replay.
 
-No production code is included in this design commit.
+Cross-platform CI and operator review remain merge gates.
