@@ -338,17 +338,18 @@ Child death and child stall are different failures:
   short spawn/handoff grace. Then use the existing `STUCK_RECOVER` executor
   path, start-guarded kill targets, exponential backoff, and readiness cap.
 - **Wedged:** the brain is alive but `progress_sequence` has not advanced past
-  the per-CLI turn-progress threshold. The stall threshold has a hard
-  invariant: it must be greater than or equal to the resolved per-CLI
-  turn-progress watchdog deadline plus a safety margin. This prevents a
-  legitimate long tool call, which may emit `tool-start` and remain silent
+  the per-CLI turn-progress threshold. When a per-turn watchdog is effectively
+  live, the stall threshold has a hard invariant: it must be greater than or
+  equal to the resolved watchdog deadline plus a safety margin. This prevents
+  a legitimate long tool call, which may emit `tool-start` and remain silent
   until `tool-finish`, from being killed before the CLI watchdog can decide.
-  Configuration below that floor is invalid and disables autonomous
-  stall-based recovery for that observation; it resolves non-green/unknown
+  Configuration below that live-watchdog floor is invalid and disables
+  autonomous stall-based recovery for that observation; it resolves non-green
   and emits a configuration diagnostic rather than silently clamping or
-  killing early. If the watchdog deadline cannot be resolved, progress
-  staleness alone is not restart authority. After threshold and confirmation,
-  use the existing restart path with a distinct reason.
+  killing early. When no watchdog is effectively live, there is nothing to
+  preempt and the resolved per-agent/per-CLI stale threshold is the recovery
+  authority. After threshold and confirmation, use the existing restart path
+  with a distinct reason.
 - **Unknown:** the evidence cannot establish death or health. It is not green,
   but it must not authorize a kill or restart. Emit a rate-limited warning and
   retry observation.

@@ -292,10 +292,12 @@ two parallel ownership concepts.
   The wrapper is also the single writer for the closed, atomic
   `wrapper-runtime.json` health record used by supervisor health/restart
   (#72). `progress_sequence` advances only for real accepted adapter events;
-  heartbeat timer ticks are not progress. Commit-vs-park (#73) independently
-  trusts the validated bus, not this wrapper self-report. The two authorities
-  are coherent: a #72 restart preserves the already-advanced bus cursor and
-  cannot re-drive work #73 committed.
+  heartbeat timer ticks are not progress. Durable progress records are
+  interval-coalesced, while every accepted event advances the in-memory
+  sequence and every terminal boundary forces a durable high-water write.
+  Commit-vs-park (#73) independently trusts the validated bus, not this wrapper
+  self-report. The two authorities are coherent: a #72 restart preserves the
+  already-advanced bus cursor and cannot re-drive work #73 committed.
   Wrapper waiting markers carry unique generation tokens and teardown clears
   only a matching token, so an old loop cannot erase a replacement marker.
   The Windows per-turn watchdog kills a verified target with

@@ -3320,7 +3320,7 @@ def _wrapped_liveness(
         "brain_alive": False,
         "wait_alive": bool(attr.get("wait_alive")),
         "managed_pids": attr.get("managed_pids") or [],
-        "kill_targets": attr.get("targets") or [],
+        "kill_targets": list(attr.get("targets") or []),
         "diagnostics": attr.get("diagnostics") or _diag(),
         "discovered_brain": False,
         "runtime_status": runtime_obs.STATUS_ABSENT,
@@ -3449,12 +3449,30 @@ def _wrapped_liveness(
         turn_generation=record.get("turn_generation"),
     )
     if candidate is not None:
-        base["brain_pid"] = candidate.get("pid")
-        base["brain_start"] = _start_of(candidate)
+        candidate_pid = candidate.get("pid")
+        candidate_start = _start_of(candidate)
+        base["brain_pid"] = candidate_pid
+        base["brain_start"] = candidate_start
         base["brain_alive"] = True
         base["discovered_brain"] = True
         base["child_state"] = "alive"
         base["child_reason"] = "brain_discovered"
+        if (
+            isinstance(candidate_pid, int)
+            and isinstance(candidate_start, str)
+            and candidate_start
+            and not any(
+                target.get("pid") == candidate_pid
+                for target in base["kill_targets"]
+                if isinstance(target, dict)
+            )
+        ):
+            base["kill_targets"].append({
+                "pid": candidate_pid,
+                "start": candidate_start,
+                "reason": "runtime_brain",
+                "source": "wrapper_runtime",
+            })
         return base
 
     pattern = str(brain_pattern or "").casefold()
@@ -4569,32 +4587,35 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             )
         elif runtime_phase == runtime_obs.PHASE_TERMINAL:
             outcome = runtime_record.get("last_outcome")
-            if outcome in {
-                runtime_obs.OUTCOME_FAILED,
-                runtime_obs.OUTCOME_DEAD_LETTER,
-            }:
+            if not hb_stale:
+                if outcome in {
+                    runtime_obs.OUTCOME_FAILED,
+                    runtime_obs.OUTCOME_DEAD_LETTER,
+                }:
+                    return _result(
+                        NONE,
+                        state="TURN_FAILED",
+                        reason=f"wrapper recorded terminal outcome {outcome}",
+                    )
+                progress_age = liveness.get("runtime_progress_age_seconds")
+                progress_recent = bool(
+                    isinstance(progress_age, (int, float))
+                    and not isinstance(progress_age, bool)
+                    and math.isfinite(float(progress_age))
+                    and 0 <= float(progress_age) < stuck_after
+                )
+                if outcome == runtime_obs.OUTCOME_SUCCESS and progress_recent:
+                    return _healthy(
+                        "HEALTHY_WORKING",
+                        "CLI turn completed and is finalizing its consume boundary",
+                    )
                 return _result(
                     NONE,
-                    state="TURN_FAILED",
-                    reason=f"wrapper recorded terminal outcome {outcome}",
+                    state="CLI_CHILD_UNKNOWN",
+                    reason="terminal runtime tuple is stale or unclassified",
                 )
-            progress_age = liveness.get("runtime_progress_age_seconds")
-            progress_recent = bool(
-                isinstance(progress_age, (int, float))
-                and not isinstance(progress_age, bool)
-                and math.isfinite(float(progress_age))
-                and 0 <= float(progress_age) < stuck_after
-            )
-            if outcome == runtime_obs.OUTCOME_SUCCESS and progress_recent:
-                return _healthy(
-                    "HEALTHY_WORKING",
-                    "CLI turn completed and is finalizing its consume boundary",
-                )
-            return _result(
-                NONE,
-                state="CLI_CHILD_UNKNOWN",
-                reason="terminal runtime tuple is stale or unclassified",
-            )
+            # A stale heartbeat is the wrapper recovery signal. Terminal state
+            # describes the last turn; it must not suppress stale-wrapper recovery.
         elif runtime_phase == runtime_obs.PHASE_ACTIVE:
             child_state = liveness.get("child_state")
             if child_state == "unknown":
@@ -4692,8 +4713,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                         reason="adapter progress is stale on first confirming poll",
                     )
                 stall_floor_valid = bool(
-                    progress_stall_floor is not None
-                    and stuck_after >= progress_stall_floor
+                    not watchdog_live
+                    or (
+                        progress_stall_floor is not None
+                        and stuck_after >= progress_stall_floor
+                    )
                 )
                 if not stall_floor_valid:
                     floor_reason = (
@@ -4715,6 +4739,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 child_recovery_reason = (
                     "live CLI brain made no adapter progress past the hard "
                     "watchdog deadline plus margin"
+                    if watchdog_live
+                    else (
+                        "live CLI brain made no adapter progress past the "
+                        "per-agent stale threshold"
+                    )
                 )
             else:
                 return _result(

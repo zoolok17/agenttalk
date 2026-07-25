@@ -242,9 +242,10 @@ Key differences for a wrapped agent:
   CLI brain green.
 - A confirmed dead CLI brain requires two polls for the same wrapper and
   turn generation outside spawn/handoff grace. A stalled live brain also
-  requires two confirming polls, and its threshold must be at least the
-  resolved per-CLI turn-watchdog deadline plus a safety margin. Unknown
-  evidence never authorizes a kill.
+  requires two confirming polls. When the per-turn watchdog is live, the
+  stall threshold must be at least its resolved deadline plus a safety
+  margin; when it is disabled, the per-agent/per-CLI stale threshold governs.
+  Unknown evidence never authorizes a kill.
 - **`--disable hooks`** on the wrapped **codex** child (the safe default):
   the wrapper owns the heartbeat, so the codex activity hook is neither
   needed nor wanted, and disabling it sidesteps codex's hook-trust prompt
@@ -255,9 +256,10 @@ Key differences for a wrapped agent:
 > text, and tool deltas, so its default `stuck_after_seconds` is 180s. A
 > wrapped **Codex** is item-level and can remain silent during pure
 > reasoning, so its default is 2400s. Keep the value above both the
-> longest legitimate event gap and the resolved turn-watchdog deadline
-> plus its 300s margin. The value is never silently coerced; a threshold
-> below the hard floor cannot authorize autonomous stall recovery.
+> longest legitimate event gap and, when the turn watchdog is effectively
+> live, its resolved deadline plus the 300s margin. The value is never
+> silently coerced; a threshold below a live watchdog's hard floor cannot
+> authorize autonomous stall recovery.
 
 ---
 

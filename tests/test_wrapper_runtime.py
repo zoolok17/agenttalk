@@ -66,6 +66,51 @@ def test_runtime_writer_publishes_closed_lifecycle_and_monotonic_progress(
     assert wr.read_runtime(tmp_path, "worker", now_epoch=NOW)["status"] == wr.STATUS_VALID
 
 
+def test_runtime_writer_coalesces_progress_and_forces_terminal_high_water(
+    tmp_path: Path,
+) -> None:
+    now = [NOW]
+    writer = wr.WrapperRuntimeWriter(
+        tmp_path,
+        "worker",
+        "generation-1",
+        wrapper_pid=123,
+        wrapper_start="start-123",
+        clock=lambda: now[0],
+        progress_write_interval_seconds=5.0,
+    )
+    writer.starting(message_id="msg-1", turn_id="turn-1")
+    writer.active(456, "start-456")
+
+    first = writer.progress()
+    now[0] += 1.0
+    second = writer.progress()
+    now[0] += 1.0
+    third = writer.progress()
+    durable = wr.read_runtime(tmp_path, "worker", now_epoch=now[0])
+
+    assert [first["progress_sequence"], second["progress_sequence"],
+            third["progress_sequence"]] == [1, 2, 3]
+    assert durable["record"]["progress_sequence"] == 1
+
+    now[0] = NOW + 5.0
+    fourth = writer.progress()
+    durable = wr.read_runtime(tmp_path, "worker", now_epoch=now[0])
+
+    assert fourth["progress_sequence"] == 4
+    assert durable["record"]["progress_sequence"] == 4
+
+    now[0] += 1.0
+    fifth = writer.progress()
+    terminal = writer.terminal(wr.OUTCOME_SUCCESS)
+    durable = wr.read_runtime(tmp_path, "worker", now_epoch=now[0])
+
+    assert fifth["progress_sequence"] == 5
+    assert terminal["progress_sequence"] == 5
+    assert durable["record"]["phase"] == wr.PHASE_TERMINAL
+    assert durable["record"]["progress_sequence"] == 5
+
+
 def test_dead_letter_relabels_terminal_without_inventing_progress(
     tmp_path: Path,
 ) -> None:
@@ -236,6 +281,22 @@ def test_writer_constructor_rejects_non_scalar_identity_fields(
             wrapper_generation,
             wrapper_pid=wrapper_pid,
             wrapper_start="start",
+        )
+
+
+@pytest.mark.parametrize("interval", [-1.0, float("nan"), True])
+def test_writer_constructor_rejects_invalid_progress_write_interval(
+    tmp_path: Path,
+    interval: object,
+) -> None:
+    with pytest.raises(wr.RuntimeRecordError):
+        wr.WrapperRuntimeWriter(
+            tmp_path,
+            "worker",
+            "generation-1",
+            wrapper_pid=123,
+            wrapper_start="start",
+            progress_write_interval_seconds=interval,
         )
 
 

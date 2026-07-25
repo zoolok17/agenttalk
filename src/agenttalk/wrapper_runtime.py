@@ -408,6 +408,8 @@ def _atomic_write(path: Path, record: dict) -> None:
 class WrapperRuntimeWriter:
     """Single-process lifecycle writer with monotonic turn/progress generations."""
 
+    _DEFAULT_PROGRESS_WRITE_INTERVAL_SECONDS = 5.0
+
     def __init__(
         self,
         state_dir: str | os.PathLike[str],
@@ -417,6 +419,9 @@ class WrapperRuntimeWriter:
         wrapper_pid: int | None = None,
         wrapper_start: str | None | object = _UNSET,
         clock: Callable[[], float] = time.time,
+        progress_write_interval_seconds: float = (
+            _DEFAULT_PROGRESS_WRITE_INTERVAL_SECONDS
+        ),
     ) -> None:
         self.path = runtime_path(state_dir, agent)
         if (
@@ -440,7 +445,19 @@ class WrapperRuntimeWriter:
         )
         if self.wrapper_start is not None:
             _safe_optional_text(self.wrapper_start, field="wrapper_start")
+        if (
+            not isinstance(progress_write_interval_seconds, (int, float))
+            or isinstance(progress_write_interval_seconds, bool)
+            or not math.isfinite(float(progress_write_interval_seconds))
+            or float(progress_write_interval_seconds) < 0
+        ):
+            raise RuntimeRecordError(
+                "progress_write_interval_seconds must be a finite number >= 0"
+            )
         self._clock = clock
+        self._progress_write_interval_seconds = float(
+            progress_write_interval_seconds
+        )
         self._lock = threading.Lock()
         self._turn_generation = 0
         self._progress_sequence = 0
@@ -449,6 +466,7 @@ class WrapperRuntimeWriter:
         self._launcher_pid: int | None = None
         self._launcher_start: str | None = None
         self._last_progress_at: str | None = None
+        self._last_progress_write_epoch: float | None = None
         self._last_outcome: str | None = None
         self._phase = PHASE_IDLE
 
@@ -502,6 +520,7 @@ class WrapperRuntimeWriter:
             self._launcher_pid = None
             self._launcher_start = None
             self._last_progress_at = None
+            self._last_progress_write_epoch = None
             self._last_outcome = None
             self._phase = PHASE_STARTING
             return self._write(now)
@@ -534,7 +553,19 @@ class WrapperRuntimeWriter:
             now = float(self._clock())
             self._progress_sequence += 1
             self._last_progress_at = _utc_iso(now)
-            return self._write(now)
+            elapsed = (
+                None
+                if self._last_progress_write_epoch is None
+                else now - self._last_progress_write_epoch
+            )
+            if (
+                elapsed is not None
+                and 0 <= elapsed < self._progress_write_interval_seconds
+            ):
+                return self._record(now)
+            record = self._write(now)
+            self._last_progress_write_epoch = now
+            return record
 
     def _terminal_locked(self, outcome: str) -> dict:
         if outcome not in OUTCOMES:

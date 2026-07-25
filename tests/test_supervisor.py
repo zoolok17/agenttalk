@@ -4580,6 +4580,33 @@ def test_wrapped_terminal_stale_runtime_cannot_be_healthy_idle() -> None:
     assert plan["state"] == "CLI_CHILD_UNKNOWN"
 
 
+@pytest.mark.parametrize("outcome", ["failed", "dead_letter", "success"])
+def test_wrapped_stale_live_terminal_uses_existing_recovery_path(
+    outcome: str,
+) -> None:
+    terminal_runtime = _wrapper_runtime_view(
+        phase="terminal",
+        updated_age=3000.0,
+        progress_age=3000.0,
+        progress_sequence=4,
+        turn_generation=8,
+        outcome=outcome,
+    )
+
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=True,
+            heartbeat_age_seconds=3000.0,
+            wrapper_runtime=terminal_runtime,
+        ),
+        {"agents": {"worker": _wrap_ready(backoff_next_epoch=0.0)}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "STUCK_OR_DEAD"
+
+
 def test_wrapped_idle_without_cli_child_is_healthy_idle() -> None:
     plan = _plan_wrap(
         _report(heartbeat_stale=False),
@@ -4972,6 +4999,76 @@ def test_wrapped_live_brain_without_progress_stalls_after_confirmation() -> None
     )
     assert second["action"] == sup.STUCK_RECOVER
     assert second["state"] == "CLI_CHILD_STALLED"
+
+
+def test_wrapped_claude_stall_recovers_when_turn_watchdog_is_disabled() -> None:
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {"auto_restart": True, "cli": "claude", "wrapped": True}
+        },
+    }
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=300.0,
+            progress_age=300.0,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 300,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_wrap_snap(cli="claude"),
+        config=config,
+    )
+
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "CLI_CHILD_STALLED"
+    assert "per-agent stale threshold" in plan["reason"]
+
+
+def test_wrapped_stalled_forked_brain_is_an_attributed_kill_target() -> None:
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=2500.0,
+            progress_age=2500.0,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 2500,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "CLI_CHILD_STALLED"
+    assert {
+        "pid": WRAP_TUI_PID,
+        "start": _ps_iso(700000),
+        "reason": "runtime_brain",
+        "source": "wrapper_runtime",
+    } in plan["kill_targets"]
 
 
 def test_wrapped_invalid_watchdog_floor_never_authorizes_stall_recovery() -> None:
