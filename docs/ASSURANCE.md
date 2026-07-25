@@ -183,6 +183,44 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.79.1 - wrapper false-park fix (the hand-finishing bug) (2026-07-25)
+**GOOD / ROBUST** - release base `v0.79.0` - ship SHA `<SHIP>` - tag `v0.79.1`
+- **Scope:** one behavioural fix (#73) plus a docs/skill change (#79). The wrapper could do the
+  work, write a durable reply, and still park the inbound as unfinished, forcing the operator to
+  hand-finish completed work. The landed-response resolver now proves the terminal response from
+  the validated bus rather than from a parse of the child's command.
+- **Field evidence, not theory:** the defect was observed twice in production on 2026-07-24/25 --
+  `codex-2` (16:17) and `codex-agenttalk-developer-4` (03:04) both parked `config_blocked` while
+  their replies were present on the bus (message ids `20260724-161658-536356-DsPE` and
+  `20260725-030415-829351-eRgT` verified to exist). This release exists because the bug was
+  reproducing against real work, not because a test predicted it.
+- **Risk record:** base `v0.79.0` (`dcca323`); candidate refs `072f540` (both connector P2s) ->
+  `bdfc092` (braced env form) -> merge `e5a6c54`; `1cd96c3` (#79). Semantic dimensions matched:
+  wrapper commit/park behaviour (decides whether real work is recorded as done) and agent-facing
+  skill policy. Two P2s raised by the GitHub connector against the first fix were themselves
+  regressions of the class being fixed, and were closed before merge.
+- **Assurance evidence:**
+  - 15/15 dev-gate legs green on the merged head `bdfc092` (re-verified against the actual head,
+    not the SHA the CI monitor was armed on), zero fresh connector findings at merge time.
+  - Independent adversarial review by `claude-agenttalk-reviewer-fable`: **GO**, no blocking
+    findings, all five requested attack points addressed. It additionally found a third member of
+    the same defect family (the braced `${env:...}` interpreter form, fixed in `bdfc092`) and
+    corrected an overclaim: no rescind producer in `src/` emits `meta.supersedes`, so the residual
+    documented in `072f540` is theoretical rather than a live trade-off.
+  - Tests are **differential**: on the pre-fix source exactly 3 legs fail and the no-rescind
+    control still yields a proof, so the fixture is proven capable of producing a proof when
+    nothing cancels the request. 449 passed across the two touched suites locally.
+- **Known-not-fixed at ship (stated, not hidden):**
+  - The fix is **not live for already-running wrappers**. A wrapper is a long-lived process that
+    imported the old modules at launch; the editable install means master is the install, but
+    running agents keep the old behaviour until restarted. Restarting is itself subject to #78.
+  - `& (${env:AGENTTALK_PY})` (bare-parenthesized-braced) still returns `None`. Judged an
+    unrealistic spelling; the realistic member of the family is fixed.
+  - #72 (supervisor CLI-child health) is NOT in this release. PR #81 is green with a reviewer GO
+    but carries 3 fresh connector findings, including a crashed wrapper outside `idle` phase that
+    never auto-recovers. Shipping half of the operator's production report was the deliberate
+    choice over shipping a known false-DOWN.
+
 ### v0.79.0 - checkpoint-before-compact + DoD forcing-gate + OVH gateway fold (63-commit backlog) (2026-07-25)
 **GOOD / ROBUST** - release base `v0.78.1` - ship SHA `bf40925` - tag `v0.79.0`
 - **Scope:** the accumulated 63-commit master backlog, rolled into one release so it could be
