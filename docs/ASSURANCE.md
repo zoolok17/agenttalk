@@ -184,7 +184,7 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
 ### v0.79.1 - wrapper false-park fix (the hand-finishing bug) (2026-07-25)
-**HOLD (open gate; NOT yet attested)** - release base `v0.79.0` - gated candidate `a25dad0` - tag `v0.79.1` (unissued)
+**GOOD / ROBUST** - release base `v0.79.0` (`dcca3233`, the commit the tag actually points at) - gated candidate `354990d` - ship: the squash-merge of PR #88 on master, which tag `v0.79.1` marks (resolve with `git rev-parse 'v0.79.1^{commit}'`)
 - **Scope:** one behavioural fix (#73) plus a docs/skill change (#79). The wrapper could do the
   work, write a durable reply, and still park the inbound as unfinished, forcing the operator to
   hand-finish completed work. The landed-response resolver now proves the terminal response from
@@ -200,7 +200,10 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   skill policy. Two P2s raised by the GitHub connector against the first fix were themselves
   regressions of the class being fixed, and were closed before merge.
 - **Assurance evidence:**
-  - 15/15 dev-gate legs green on the POST-BUMP release candidate `a25dad0` (the version bump
+  - **15/15 dev-gate legs green on `354990d`, the exact release head.** An earlier revision of this
+    entry cited the gate for `a25dad0`; the connector correctly objected that `a25dad0` is a SIBLING
+    of the release commit, not its ancestor, and its tree differs -- the dev-gate is SHA-bound, so
+    that evidence could not validate this revision. Superseded rather than silently kept (the version bump
     must be committed before the gate runs; a gate bound to a pre-bump SHA cannot validate the
     package). Separately 15/15 on `bdfc092` for the #73 fix itself (re-verified against the actual head,
     not the SHA the CI monitor was armed on), zero fresh connector findings at merge time.
@@ -240,7 +243,7 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
       construction.
     - `review-docs` (independent; the lead wrote all the prose): `codex-agenttalk-developer-4`
       -- **APPROVED**.
-- **OPEN FINDING blocking the tag (P2, executed and reproduced, not asserted):**
+- **CLOSED FINDING (was the sole blocker; P2, executed and reproduced, not asserted):**
   reconstructed publication order can revive the post-rescind false commit. When the sidecar is
   absent or incomplete, `publication_ordered_messages()` falls back to MESSAGE-ID order
   (`store.py:4077-4087`) and ids are monotonic only per process (`store.py:7038-7051`), so a
@@ -255,19 +258,30 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   when the backing order is reconstructed -- cannot-verify-order is not green -- WITHOUT making
   the rescind scan position-independent, which would regress the false-park this release fixes.
 
-- **OPEN GATE -- why this entry says HOLD and not GOOD/ROBUST:**
-  - **Tier 3 applies and is unmet.** The union changes durability / persistent-state contract
-    behaviour (#73 decides whether completed work is committed) and a **normative operational
-    skill** (#79 lead policy). Both are §1a Tier-3 triggers. Tier 3 requires a hard floor of 3
-    eligible independent reviewers across >=2 model families, a proposed tier, a ratifier
-    verdict, panel lenses, and a drift result. Only ONE independent review exists
-    (`claude-agenttalk-reviewer-fable`, GO). The panel is not satisfied by the GitHub connector.
-  - **Docs-testing pass is unmet.** This release changes docs AND packaging/install behaviour
-    (version + install pins), which triggers the docs-testing requirement for BOTH `test-docs`
-    and an independent `review-docs`. Neither producer is recorded.
-  - Both gaps were raised by the GitHub connector against `a25dad0` and confirmed against the
-    §1 policy text before being accepted. The release stays unissued until they are recorded or
-    the operator explicitly accepts a lower assurance claim.
+- **Gate closure (2026-07-26):** `codex-agenttalk-reviewer-1` re-reviewed the fold on the same
+  durability lens and **APPROVED**, release_blocker=no, closing its own P2. Executed at `354990d`:
+  both orphan shapes (truncated sidecar; both order files absent) produced `durable=False`,
+  `proof=False`, `turns=0`, `cursor=''`, and the persisted `order_reconstructed` marker survived a
+  heal. **False-park control held** -- with an intact sidecar a response physically published BEFORE
+  a later rescind still produced `proof=True` and committed the cursor despite hostile lexical id
+  ordering, so declining did not become over-broad. 32 focused cases plus a real-Store/run-loop
+  differential replay. It found no state reachable through supported writers where reconstructed
+  order becomes durable.
+- **Final drift result: NO DRIFT.** Shipped behaviour matches `CHANGELOG.md:32-36`. The CHANGELOG's
+  original unconditional rescind claim was narrowed before ship after the connector showed it was
+  false for the legacy path; the residual is now stated inline rather than promised away.
+- **Bounded residual carried, not hidden (task #82):** `order_reconstructed` is NOT bound into the
+  publication-order tamper anchor (`store.py:1773`) -- `_message_publication_order_chain()` hashes
+  only ids and sequences, so flipping the flag `true -> false` while leaving the message map intact
+  passes validation and launders the taint. This requires direct mutation of a local store file,
+  which is already the documented honest-local trust residual, and reviewer-1 explicitly scoped it
+  out ("could not verify hostile direct mutation"). The connector then went and looked at exactly
+  that residual, which is why it is recorded here instead of discovered later.
+- **Record correction for v0.79.0:** that entry states `ship SHA bf40925`, but
+  `git rev-parse 'v0.79.0^{commit}'` resolves to `dcca3233`. The recorded ship SHA is not where the
+  tag landed, so an auditor would look for the release at a commit the tag never pointed to. That is
+  the failure this ledger exists to prevent; task #85 adds a per-release scoring pass so a claim like
+  it is checked at the NEXT release rather than by accident.
 
 - **Known-not-fixed at ship (stated, not hidden):**
   - The fix is **not live for already-running wrappers**. A wrapper is a long-lived process that
