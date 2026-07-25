@@ -10,6 +10,9 @@ from agenttalk import cli
 from agenttalk.store import Store
 
 
+_DISPOSITION_RACE_LOCK_TIMEOUT = 60.0
+
+
 def _team(tmp_path: Path) -> Store:
     s = Store(tmp_path)
     s.init(["beta", "claude"])
@@ -293,7 +296,9 @@ def test_resolved_dead_letter_absent_from_attention_queue(tmp_path: Path) -> Non
     assert not [i for i in q2["items"] if i["item_id"] == dl_item]
 
 
-def test_disposition_race_under_lock_preserves_all_lines(tmp_path: Path) -> None:
+def test_disposition_race_under_lock_preserves_all_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # concurrent disposition appends serialize under store._config_lock() - no torn lines,
     # no lost writes, and the fail-safe reader finds every event.
     import threading
@@ -301,20 +306,35 @@ def test_disposition_race_under_lock_preserves_all_lines(tmp_path: Path) -> None
     from agenttalk import attention as A
     s = _team(tmp_path)
     n = 24
+    start = threading.Barrier(n)
+    errors: list[Exception] = []
+    real_config_lock = s._config_lock
+
+    def _config_lock_with_test_budget(
+        *, timeout: float = _DISPOSITION_RACE_LOCK_TIMEOUT, poll: float = 0.05,
+    ):
+        return real_config_lock(timeout=timeout, poll=poll)
+
+    monkeypatch.setattr(s, "_config_lock", _config_lock_with_test_budget)
 
     def _append(i: int) -> None:
-        A.append_disposition(s, {
-            "schema_version": A.SCHEMA_VERSION, "event_id": f"att-race{i:04d}",
-            "item_id": f"needs_operator:rid-{i}", "source": A.SOURCE_NEEDS_OPERATOR,
-            "action": A.ACTION_DEFER, "actor": "claude", "reason": "race",
-            "at": "2026-07-02T00:00:00Z", "until": "2099-01-01T00:00:00Z",
-            "source_snapshot": {"source_hash": f"h{i}", "refs": []}})
+        try:
+            start.wait(timeout=_DISPOSITION_RACE_LOCK_TIMEOUT)
+            A.append_disposition(s, {
+                "schema_version": A.SCHEMA_VERSION, "event_id": f"att-race{i:04d}",
+                "item_id": f"needs_operator:rid-{i}", "source": A.SOURCE_NEEDS_OPERATOR,
+                "action": A.ACTION_DEFER, "actor": "claude", "reason": "race",
+                "at": "2026-07-02T00:00:00Z", "until": "2099-01-01T00:00:00Z",
+                "source_snapshot": {"source_hash": f"h{i}", "refs": []}})
+        except Exception as exc:
+            errors.append(exc)
 
     threads = [threading.Thread(target=_append, args=(i,)) for i in range(n)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    assert errors == []
     valid, problems = A.read_dispositions(s)
     assert problems == []                                  # no torn lines
     assert {e["event_id"] for e in valid} == {f"att-race{i:04d}" for i in range(n)}
