@@ -7,8 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.79.0] - 2026-07-24
+
 ### Added
 
+- **Checkpoint-before-compact (`agenttalk checkpoint save|resume|show`).** A native, fail-soft
+  hook command captures a durable per-agent checkpoint (git HEAD/branch/dirty, context-window fill,
+  and the agent's owed/in-flight bus state) before a manual or automatic context compaction, and
+  re-injects a reload pointer on resume. `save --hook` always exits 0 so it can never block a
+  compaction; `resume --hook` emits exactly one SessionStart envelope. (#71)
+- **`supervise --install-activity-hook` now wires the checkpoint hooks too.** The same operator
+  action that installs the Claude heartbeat `PostToolUse` hook also installs `PreCompact`
+  (checkpoint save) and `SessionStart`/`compact` (checkpoint resume), reporting per-hook
+  `installed` / `already` / `skipped (reason)` so a partial or malformed install can never be
+  presented as blanket success. A managed entry whose `type` is missing or wrong is repaired
+  rather than reported as already-installed. The installed commands carry a fail-soft fallback to
+  the silent heartbeat hook, so an `agenttalk` that predates the `checkpoint` subcommand but is
+  otherwise recent enough exits 0 instead of blocking a compaction. **Bounded legacy-PATH
+  residual:** the neutral fallback needs roughly v0.31.1 and the `--fallback-for` form needs
+  v0.69.6, so an OLDER executable selected first on `PATH` can still return exit 2 and block a
+  compact — upgrade or correct `PATH` before installing these hooks (documented at
+  `docs/USER-MANUAL.md`). `--codex` / `.codex/hooks.json` remains heartbeat-only. (#71)
+- **"Red-by-default until evidence exists" DoD forcing-gate.** `close` now supports pluggable
+  Definition-of-Done dimensions that HOLD until independent, revision-bound evidence exists — the
+  assurance dimension (inc-1) and the knowledge dimension (inc-2). (#60)
+- **First-class OVH-Qwen wrapped-worker gateway.** The gateway is folded onto master (ending the
+  committed-vs-live divergence), with a pinned model endpoint, ledger-preserving
+  `gateway reconfigure`, per-child turn caps, and fail-closed spend safety. (#38, #11)
+- **Detection-grade owed-action enforcement for wrapped workers.** A durable obligations engine
+  makes delivery failures requester-terminal and resists policy drift across commit boundaries.
+  (#32, #16)
+- **Read-side `request_id` / `broadcast_id` / correlation resolvers.** (#17)
+- **Store full-validation snapshot + ordered-but-absent detection.** (#44)
 - **A committed, SHA-bound `agenttalk dev-gate` replaces hand-run test and security rituals.** The release
   profile runs isolated source and built-wheel tests, packaging contracts, Ruff, Bandit, gitleaks, pip-audit,
   Semgrep, and zizmor; emits strict normalized JSON evidence; and fails closed on missing tools or fields.
@@ -23,6 +53,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output failure. Unbounded output to a positively identified pipe is refused;
   use the new `-n` / `--limit` option for bounded pages. Regular-file redirects
   remain allowed, and JSON receive now uses one snapshot for output and commits.
+- **A config-blocked wrapped-worker park now writes a visible health state** instead of a frozen
+  "idle", so a parked agent is diagnosable rather than silently stuck. (#58)
+- **A transient gateway hold re-drives the parked turn and self-heals when the hold clears** instead
+  of dead-lettering it; the gateway refuses to mint a child turn while held. (#62, #63)
+- **`deadman` config in `supervisor.json` is honored** (the reader previously used only
+  `.agenttalk/config.json`). (#41, GH#35)
+- **`domains.check_path` rejects a glob descriptor** instead of silently answering point-membership.
+  (#43, GH#36)
+- **The publication-order sidecar self-heals under writer skew** rather than wedging all bus writes.
+  (#37, GH#37)
+- **Supervisor hardening:** hot-added agents no longer crash a running supervisor; relaunch is
+  reserved before spawn; state-swap and atomic-write contention are tolerated. (#19, #21)
+- **Wrapped-Qwen child fixes:** the exact `agenttalk reply` invocation is provided, the child home
+  vars are scoped so `reply` resolves, and the reasoning-model output cap is raised. (#11, #38, #56)
+- **De-flaked the four timing/lock/socket Windows-CI tests** that taxed every merge, and widened
+  the Windows dev-gate leg timeout + the shared pytest wheel-leg cap. (#59, #67, #54)
+- **De-flaked the config-lock acquisition budgets that red-blocked merges under CI load.** A
+  concurrency property test was unintentionally inheriting the product `_config_lock()` default
+  instead of a test budget, and two marker-recovery tests used sub-second wall-clock ceilings.
+  Tests only — every assertion, the 24-writer concurrency, and the sub-second budgets on the
+  negative/timeout cases (where the budget *is* the property) are unchanged, and the product
+  default is untouched. (#59)
 
 ## [0.78.1] - 2026-07-15
 
