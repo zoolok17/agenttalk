@@ -3525,6 +3525,9 @@ def test_wrap_loop_mode_unknown_cli_returns_2(tmp_path) -> None:
         "$env:AGENTTALK_PY -m agenttalk reply --to alpha --body ok",
         "%AGENTTALK_PY% -m agenttalk reply --to alpha --body ok",
         "python -m agenttalk reply --to alpha --body ok",
+        "& ${env:AGENTTALK_PY} -m agenttalk reply --to alpha --body ok",
+        '& ("$env:AGENTTALK_PY") -m agenttalk reply --to alpha --body ok',
+        "&($env:AGENTTALK_PY) -m agenttalk reply --to alpha --body ok",
     ],
     ids=[
         "pwsh-parenthesized-env",
@@ -3532,6 +3535,9 @@ def test_wrap_loop_mode_unknown_cli_returns_2(tmp_path) -> None:
         "pwsh-bare-env",
         "cmd-env",
         "plain-python",
+        "pwsh-braced-env",
+        "pwsh-quoted-parenthesized-env",
+        "pwsh-parenthesized-env-no-space",
     ],
 )
 def test_bus_command_verb_recognizes_env_interpreter_forms(command: str) -> None:

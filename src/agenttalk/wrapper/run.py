@@ -110,6 +110,10 @@ _PYTHON_ENV_COMMAND_TOKENS = frozenset({
     "%agenttalk_py%",
     "$agenttalk_py",
     "${agenttalk_py}",
+    # PowerShell's braced env form. The bash `${agenttalk_py}` spelling was already
+    # here, so omitting this one left `& ${env:AGENTTALK_PY} -m agenttalk reply`
+    # unrecognized -- the same silent-loss class as the parenthesized form.
+    "${env:agenttalk_py}",
 })
 _PY_LAUNCHER_COMMAND_TOKENS = frozenset({"py", "py.exe"})
 _PYTHON_VERSIONED_BASENAME_RE = re.compile(
