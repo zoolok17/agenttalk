@@ -2507,6 +2507,13 @@ def _post_tool_commands(path: Path) -> list[str]:
     return _hook_commands(path, "PostToolUse")
 
 
+def _managed_hook_group(matcher: str, command: str) -> list[dict]:
+    return [{
+        "matcher": matcher,
+        "hooks": [{"type": "command", "command": command}],
+    }]
+
+
 def _recognized_heartbeat_commands(commands: list[str]) -> list[str]:
     return [
         command
@@ -3141,6 +3148,55 @@ def test_install_activity_hook_interactive_rebinds_wrong_fallback_without_dup(
     assert _post_tool_commands(settings) == ["agenttalk heartbeat --hook --fallback-for lead"]
 
 
+@pytest.mark.parametrize(
+    ("existing_agent", "expected_status"),
+    [
+        ("worker", "installed"),
+        ("lead", "already"),
+    ],
+    ids=["stale-fallback-rebound", "matching-fallback-unchanged"],
+)
+def test_install_activity_hook_explicit_identity_controls_all_managed_hooks(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    existing_agent: str,
+    expected_status: str,
+) -> None:
+    store = _team(tmp_path)
+    store.set_operator_facing("lead")
+    settings = store.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {
+        "PostToolUse": _managed_hook_group(
+            "*", sup.fallback_activity_hook_command(existing_agent),
+        ),
+        "PreCompact": _managed_hook_group(
+            "*", sup.checkpoint_hook_command("save", existing_agent),
+        ),
+        "SessionStart": _managed_hook_group(
+            "compact", sup.checkpoint_hook_command("resume", existing_agent),
+        ),
+    }}), encoding="utf-8")
+
+    assert _run(
+        ["supervise", "--install-activity-hook", "--interactive-for", "lead"],
+        tmp_path,
+    ) == 0
+
+    output = capsys.readouterr().out
+    for event in ("PostToolUse", "PreCompact", "SessionStart"):
+        assert f"{expected_status}: {settings} [{event}]" in output
+    assert _post_tool_commands(settings) == [
+        sup.fallback_activity_hook_command("lead"),
+    ]
+    assert _hook_commands(settings, "PreCompact") == [
+        sup.checkpoint_hook_command("save", "lead"),
+    ]
+    assert _hook_commands(settings, "SessionStart") == [
+        sup.checkpoint_hook_command("resume", "lead"),
+    ]
+
+
 def test_install_activity_hook_neutral_does_not_downgrade_existing_fallback(
     tmp_path: Path,
     capsys: pytest.CaptureFixture,
@@ -3267,6 +3323,74 @@ def test_install_activity_hook_uses_one_checkpoint_fallback_for_partial_config(
     envelope = json.loads(capsys.readouterr().out)
     context = envelope["hookSpecificOutput"]["additionalContext"]
     assert context.startswith("Checkpoint reload for lead:")
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_agent", "expected_agent", "precompact_status"),
+    [
+        ("retired", "worker", "installed"),
+        ("lead", "lead", "already"),
+    ],
+    ids=["retired-fallback-ignored", "active-fallback-preserved"],
+)
+def test_install_activity_hook_neutral_uses_only_rostered_checkpoint_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    checkpoint_agent: str,
+    expected_agent: str,
+    precompact_status: str,
+) -> None:
+    store = _team(tmp_path, "lead,worker,retired")
+    store.retire_agent("retired", reason="renamed")
+    settings = store.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {
+        "PostToolUse": _managed_hook_group(
+            "*", sup.fallback_activity_hook_command("worker"),
+        ),
+        "PreCompact": _managed_hook_group(
+            "*", sup.checkpoint_hook_command("save", checkpoint_agent),
+        ),
+    }}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    expected_statuses = {
+        "PostToolUse": "already",
+        "PreCompact": precompact_status,
+        "SessionStart": "installed",
+    }
+    for event, status in expected_statuses.items():
+        assert f"{status}: {settings} [{event}]" in output
+    assert _post_tool_commands(settings) == [
+        sup.fallback_activity_hook_command("worker"),
+    ]
+    save_command = sup.checkpoint_hook_command("save", expected_agent)
+    resume_command = sup.checkpoint_hook_command("resume", expected_agent)
+    assert _hook_commands(settings, "PreCompact") == [save_command]
+    assert _hook_commands(settings, "SessionStart") == [resume_command]
+
+    monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(b"{}"), encoding="utf-8"),
+    )
+    save_argv = shlex.split(save_command.split(" || ", 1)[0])[1:]
+    assert _run(save_argv, tmp_path) == 0
+    assert capsys.readouterr() == ("", "")
+    saved = checkpoint.read_checkpoint(store, expected_agent)
+    assert saved is not None
+    assert saved["agent"] == expected_agent
+    assert checkpoint.read_checkpoint(store, "retired") is None
+
+    resume_argv = shlex.split(resume_command.split(" || ", 1)[0])[1:]
+    assert _run(resume_argv, tmp_path) == 0
+    envelope = json.loads(capsys.readouterr().out)
+    context = envelope["hookSpecificOutput"]["additionalContext"]
+    assert context.startswith(f"Checkpoint reload for {expected_agent}:")
 
 
 def test_install_activity_hook_neutral_dedupes_mixed_fallback_and_neutral(
