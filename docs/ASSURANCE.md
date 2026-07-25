@@ -212,6 +212,49 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   - Tests are **differential**: on the pre-fix source exactly 3 legs fail and the no-rescind
     control still yields a proof, so the fixture is proven capable of producing a proof when
     nothing cancels the request. 449 passed across the two touched suites locally.
+- **Tier-3 gate RUN 2026-07-25 (composition + verdicts recorded per §1a):**
+  - **Proposed tier:** Tier 3, proposed by the change owner (`claude-agenttalk-lead`).
+    Triggers claimed: durability/atomicity/recovery + persistent-state contract (#73 decides
+    whether completed work is recorded as done); normative operational skill (#79, both CLI
+    surfaces).
+  - **Ratifier (anti-self-serve, cross-family, mandatory because owner == lead):**
+    `codex-agenttalk-developer-4` (codex family) -- **APPROVED**. The owner did not ratify
+    their own classification.
+  - **Panel (hard floor 3, >=2 model families, distinct predeclared lenses; no lead, no
+    builder counted -- `codex-2` excluded as #73's builder, the lead excluded as owner):**
+    1. `codex-agenttalk-reviewer-1` (codex) -- lens: durability / persistent-state contract of
+       the validated-bus landed-response proof. **HOLD / REVISE** (see open finding below).
+    2. `claude-agenttalk-reviewer-3` (claude) -- lens: release-union blast radius +
+       packaging/install correctness (both version sites, all three install pins, wheel
+       identity). **APPROVED**.
+    3. `claude-agenttalk-reviewer-fable` (claude) -- lens: #79 as an authority change (does the
+       Independence policy widen unapproved lead action against the escalate / waive /
+       authenticated-operator boundaries). **APPROVED**. Independent for this lens: its earlier
+       review covered the #73 resolver, not the skill.
+  - **Docs-testing pass (triggered by docs + packaging/install change):**
+    - `test-docs` EXECUTED green: `checkpoint show --json`; `supervise --bootstrap-check`;
+      `agenttalk.__version__ == 0.79.1`; plus package-build, wheel-install,
+      wheel-dependency-check and wheel-contract green in the `a25dad0` gate.
+    - `test-docs` RECORDED **referenced-not-executed** (never counted green): the documented
+      pinned install `@v0.79.1` cannot run before the tag exists -- chicken-and-egg by
+      construction.
+    - `review-docs` (independent; the lead wrote all the prose): `codex-agenttalk-developer-4`
+      -- **APPROVED**.
+- **OPEN FINDING blocking the tag (P2, executed and reproduced, not asserted):**
+  reconstructed publication order can revive the post-rescind false commit. When the sidecar is
+  absent or incomplete, `publication_ordered_messages()` falls back to MESSAGE-ID order
+  (`store.py:4077-4087`) and ids are monotonic only per process (`store.py:7038-7051`), so a
+  requester rescind can be reconstructed AFTER the response it should cancel;
+  `_exact_landed_response` returns the first exact terminal before reaching it and the pre-drive
+  path commits. Replay: same-timestamp `...000003-ZZZZ` (rescind) vs `...000003-AAAA`
+  (response) with the sidecar truncated to its inbound-only prefix -> `turns=1`, child invoked
+  zero times, cursor advanced. Bounded to legacy/order-orphan reconstruction; canonical writers
+  with an intact sidecar behaved correctly across 22 focused + 15 publication-order tests.
+  **Disposition:** fold + re-review on a new SHA (operator-directed 2026-07-25). The lead may
+  not erase an open REVISE. Fix shape: make order degradation observable and DECLINE the proof
+  when the backing order is reconstructed -- cannot-verify-order is not green -- WITHOUT making
+  the rescind scan position-independent, which would regress the false-park this release fixes.
+
 - **OPEN GATE -- why this entry says HOLD and not GOOD/ROBUST:**
   - **Tier 3 applies and is unmet.** The union changes durability / persistent-state contract
     behaviour (#73 decides whether completed work is committed) and a **normative operational
