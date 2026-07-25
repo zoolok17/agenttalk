@@ -1071,13 +1071,15 @@ class Store:
         this explicitly.
 
         Default behavior:
-        - **deletes** ``messages/`` and ``state/`` (active bus state)
+        - **deletes** ``messages/``, ``state/``, and ``checkpoints/``
+          (active bus and context-resume state)
         - **preserves** ``sessions/`` (historical transcript exports
           — those are user-visible artifacts, not active bus state)
         - bumps ``session_id``
 
         With ``archive=True``:
-        - **moves** ``messages/``, ``state/``, AND ``sessions/`` into
+        - **moves** ``messages/``, ``state/``, ``checkpoints/``, AND
+          ``sessions/`` into
           ``.agenttalk/archived/<old_session_id>/`` so the full prior
           session is recoverable.
 
@@ -1094,12 +1096,17 @@ class Store:
         if archive:
             # Archive everything including past transcripts
             archive_path = self._archive_session(
-                old_session_id, subdirs=("messages", "state", "sessions"),
+                old_session_id,
+                subdirs=("messages", "state", "checkpoints", "sessions"),
             )
         else:
-            # Default delete: messages + state only. sessions/ holds
+            # Default delete: active bus + resume state only. sessions/ holds
             # exported transcripts (a user-visible artifact) — keep them.
-            for sub in (self.messages_dir, self.state_dir):
+            for sub in (
+                self.messages_dir,
+                self.state_dir,
+                self.dir / "checkpoints",
+            ):
                 if sub.exists():
                     shutil.rmtree(sub)
 
