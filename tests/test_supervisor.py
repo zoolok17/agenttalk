@@ -4499,6 +4499,50 @@ def _plan_wrap(report, state, *, now=NOW, snapshot=None, config=_WRAP_CONFIG):
                             snapshot=snap)["agents"]["worker"]
 
 
+@pytest.mark.parametrize(
+    ("config", "report"),
+    [
+        (
+            {
+                "agents": {
+                    "worker": {
+                        "auto_restart": False,
+                        "cli": "codex",
+                        "wrapped": True,
+                    }
+                }
+            },
+            _report(),
+        ),
+        (
+            {
+                "agents": {
+                    "worker": {
+                        "auto_restart": True,
+                        "cli": "codex",
+                        "wrapped": True,
+                    }
+                }
+            },
+            {"agents": {}},
+        ),
+    ],
+    ids=["auto-restart-disabled", "report-missing"],
+)
+def test_plan_ignores_unsupervised_or_unreported_agents(
+    config: dict,
+    report: dict,
+) -> None:
+    plan = sup.plan_actions(
+        report,
+        {"agents": {}},
+        config,
+        now_epoch=NOW,
+        snapshot=[],
+    )
+    assert plan["agents"] == {}
+
+
 def test_wrapped_liveness_requires_runtime_before_discovering_brain() -> None:
     snap = _wrap_snap()
     lv = sup._liveness(snap, _wrap_ready(), {"cli": "codex", "wrapped": True},
@@ -4639,6 +4683,54 @@ def test_wrapped_idle_absent_wrapper_uses_existing_stale_recovery_path() -> None
 
     assert plan["action"] == sup.STUCK_RECOVER
     assert plan["state"] == "STUCK_OR_DEAD"
+
+
+@pytest.mark.parametrize(
+    ("phase", "updated_age", "progress_age", "outcome", "heartbeat_stale",
+     "expected_action", "expected_state"),
+    [
+        ("starting", 1.0, None, None, False, sup.NONE, "CLI_CHILD_STARTING"),
+        ("starting", 31.0, None, None, False, sup.NONE, "CLI_CHILD_UNKNOWN"),
+        ("terminal", 1.0, 1.0, "success", False, sup.NONE, "HEALTHY_WORKING"),
+        ("terminal", 1.0, 1.0, "failed", False, sup.NONE, "TURN_FAILED"),
+        ("idle", 3000.0, None, None, True, sup.STUCK_RECOVER, "STUCK_OR_DEAD"),
+    ],
+    ids=[
+        "starting-in-grace",
+        "starting-after-grace",
+        "terminal-success-finalizing",
+        "terminal-failure",
+        "idle-stale-heartbeat",
+    ],
+)
+def test_wrapped_non_active_runtime_recovery_matrix(
+    phase: str,
+    updated_age: float,
+    progress_age: float | None,
+    outcome: str | None,
+    heartbeat_stale: bool,
+    expected_action: str,
+    expected_state: str,
+) -> None:
+    runtime = _wrapper_runtime_view(
+        phase=phase,
+        updated_age=updated_age,
+        progress_age=progress_age,
+        progress_sequence=2,
+        outcome=outcome,
+    )
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=heartbeat_stale,
+            heartbeat_age_seconds=3000.0 if heartbeat_stale else 1.0,
+            wrapper_runtime=runtime,
+        ),
+        {"agents": {"worker": _wrap_ready(backoff_next_epoch=0.0)}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["action"] == expected_action
+    assert plan["state"] == expected_state
 
 
 def test_wrapped_claude_launcher_self_is_healthy_working() -> None:
@@ -5328,6 +5420,289 @@ def test_wrapped_stall_below_watchdog_floor_never_authorizes_recovery() -> None:
     assert "hard watchdog floor" in second["reason"]
 
 
+def test_wrapped_low_stuck_opt_in_stale_heartbeat_authorizes_active_recovery() -> None:
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "codex",
+                "wrapped": True,
+                "stuck_after_seconds": 120,
+                "allow_low_stuck_after": True,
+            }
+        },
+    }
+    report = _report(
+        heartbeat_stale=True,
+        heartbeat_age_seconds=130.0,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=130.0,
+            progress_age=130.0,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 130,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "CLI_CHILD_STALLED"
+    assert "heartbeat is stale" in plan["reason"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        {
+            "id": "recent-progress",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 100,
+            "heartbeat_stale": False,
+            "watchdog": {"enabled": False},
+            "stall_polls": 0,
+            "action": sup.NONE,
+            "state": "HEALTHY_WORKING",
+        },
+        {
+            "id": "first-stale-poll",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 190,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": False},
+            "stall_polls": 0,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALL_SUSPECT",
+        },
+        {
+            "id": "coalescing-allowance",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 183,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": False},
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "coalescing allowance",
+        },
+        {
+            "id": "heartbeat-authority-watchdog-off",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 190,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": False},
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is stale",
+        },
+        {
+            "id": "heartbeat-authority-low-opt-in",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 130,
+            "heartbeat_stale": True,
+            "allow_low": True,
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is stale",
+        },
+        {
+            "id": "heartbeat-authority-invalid-watchdog-floor",
+            "cli": "codex",
+            "stuck_after": 2400,
+            "elapsed": 2500,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": True, "turn_elapsed_seconds": 0},
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is stale",
+        },
+        {
+            "id": "heartbeat-authority-zero-watchdog-poll-fallback",
+            "cli": "codex",
+            "stuck_after": 1800,
+            "elapsed": 1900,
+            "heartbeat_stale": True,
+            "allow_low": True,
+            "watchdog": {"enabled": True, "poll_seconds": 0},
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is stale",
+        },
+        {
+            "id": "heartbeat-denied-low-no-opt-in",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 130,
+            "heartbeat_stale": True,
+            "allow_low": False,
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog floor",
+        },
+        {
+            "id": "heartbeat-denied-invalid-work-heartbeat",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 190,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": False},
+            "work_heartbeat": {"enabled": True, "interval_seconds": 0},
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "recovery guards are not authoritative",
+        },
+        {
+            "id": "fresh-heartbeat-watchdog-off",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 300,
+            "heartbeat_stale": False,
+            "watchdog": {"enabled": False},
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is fresh",
+        },
+        {
+            "id": "watchdog-authority-valid-floor",
+            "cli": "codex",
+            "stuck_after": 2400,
+            "elapsed": 2500,
+            "heartbeat_stale": False,
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog deadline",
+        },
+        {
+            "id": "watchdog-low-opt-in-before-floor",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 130,
+            "heartbeat_stale": False,
+            "allow_low": True,
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "opted-in low stale threshold",
+        },
+        {
+            "id": "watchdog-low-opt-in-after-floor",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 2110,
+            "heartbeat_stale": False,
+            "allow_low": True,
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog deadline",
+        },
+        {
+            "id": "watchdog-low-without-opt-in",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 130,
+            "heartbeat_stale": False,
+            "allow_low": False,
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog floor",
+        },
+        {
+            "id": "watchdog-invalid-floor",
+            "cli": "codex",
+            "stuck_after": 2400,
+            "elapsed": 2500,
+            "heartbeat_stale": False,
+            "watchdog": {"enabled": True, "turn_elapsed_seconds": 0},
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "turn_elapsed_seconds is invalid",
+        },
+    ],
+    ids=lambda case: case["id"],
+)
+def test_wrapped_active_stall_recovery_authority_matrix(case: dict) -> None:
+    cli_name = case["cli"]
+    agent_config = {
+        "auto_restart": True,
+        "cli": cli_name,
+        "wrapped": True,
+        "stuck_after_seconds": case["stuck_after"],
+    }
+    if "allow_low" in case:
+        agent_config["allow_low_stuck_after"] = case["allow_low"]
+    if "watchdog" in case:
+        agent_config["turn_watchdog"] = case["watchdog"]
+    if "work_heartbeat" in case:
+        agent_config["work_heartbeat"] = case["work_heartbeat"]
+    config = {**_WRAP_CONFIG, "agents": {"worker": agent_config}}
+    elapsed = float(case["elapsed"])
+    heartbeat_stale = bool(case["heartbeat_stale"])
+    report = _report(
+        heartbeat_stale=heartbeat_stale,
+        heartbeat_age_seconds=(
+            float(case["stuck_after"]) + 10 if heartbeat_stale else 1.0
+        ),
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=elapsed,
+            progress_age=elapsed,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - elapsed,
+        runtime_stall_polls=case["stall_polls"],
+    )
+    snapshot = (
+        _wrap_snap(cli="claude")
+        if cli_name == "claude"
+        else _codex_forked_brain_snap()
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=snapshot,
+        config=config,
+    )
+
+    assert plan["action"] == case["action"]
+    assert plan["state"] == case["state"]
+    if "reason" in case:
+        assert case["reason"] in plan["reason"]
+
+
 @pytest.mark.parametrize(
     ("runtime_overrides", "state_overrides"),
     [
@@ -5374,6 +5749,46 @@ def test_wrapped_generation_change_resets_dead_confirmation(
     assert second["action"] == sup.NONE
     assert second["state"] == "CLI_CHILD_MISSING"
     assert second["next_state"]["runtime_dead_polls"] == 1
+
+
+@pytest.mark.parametrize(
+    "runtime_overrides",
+    [
+        {"wrapper_generation": "wrapper-2"},
+        {"turn_generation": 2},
+    ],
+    ids=["wrapper-generation", "turn-generation"],
+)
+def test_wrapped_generation_change_resets_stall_confirmation(
+    runtime_overrides: dict,
+) -> None:
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=2500.0,
+            progress_age=2500.0,
+            progress_sequence=2,
+            **runtime_overrides,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 2500,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_STALL_SUSPECT"
+    assert plan["next_state"]["runtime_stall_polls"] == 1
 
 
 def test_wrapped_child_dead_respects_backoff_and_readiness_cap() -> None:

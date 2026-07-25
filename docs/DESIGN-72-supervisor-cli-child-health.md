@@ -345,18 +345,91 @@ Child death and child stall are different failures:
   produces a non-green stall observation, but progress staleness alone is not
   kill authority while heartbeat remains fresh. Recovery additionally requires
   either an authoritative stale heartbeat or an effectively-live per-turn
-  watchdog whose deadline plus safety margin is covered by the configured
-  threshold. This prevents a legitimate long tool call, which may emit
-  `tool-start` and remain silent until `tool-finish`, from being killed while
-  its bounded work-heartbeat still proves liveness. Configuration below a live
-  watchdog's floor disables autonomous watchdog-based recovery and emits a
-  diagnostic rather than silently clamping or killing early. Finally, recovery
-  requires the observed durable progress age to reach the threshold plus the
-  maximum writer-coalescing interval, so hidden in-memory progress cannot
-  consume the safety margin.
+  watchdog whose deadline plus safety margin has actually elapsed. This
+  prevents a legitimate long tool call, which may emit `tool-start` and remain
+  silent until `tool-finish`, from being killed while its bounded
+  work-heartbeat still proves liveness. A configured threshold below the live
+  watchdog floor disables watchdog authority unless
+  `allow_low_stuck_after=true`; with that explicit opt-in the low value becomes
+  the non-green observation threshold, while watchdog recovery still waits for
+  its own floor. A stale authoritative heartbeat remains an independent
+  recovery branch and is never gated by watchdog-floor validity. Finally,
+  recovery requires the observed durable progress age to include the maximum
+  writer-coalescing interval, so hidden in-memory progress cannot consume the
+  safety margin.
 - **Unknown:** the evidence cannot establish death or health. It is not green,
   but it must not authorize a kill or restart. Emit a rate-limited warning and
   retry observation.
+
+#### Recovery authority audit
+
+For the active-live-child rows, let:
+
+- `P` be the supervisor's same-turn durable progress age;
+- `S` be resolved `stuck_after_seconds`;
+- `C` be `MAX_PROGRESS_WRITE_INTERVAL_SECONDS`;
+- `F` be the valid live-watchdog deadline plus safety margin;
+- `H` be `heartbeat_stale && can_confirm_stuck`;
+- `W` be `watchdog_effectively_live`; and
+- `O` be `allow_low_stuck_after`.
+
+After the same-generation two-poll debounce, the complete stall recovery
+inequality is:
+
+`P >= S + C && (H || (W && F is valid && (S >= F || O) && P >= max(S, F) + C))`.
+
+The two terms inside the parentheses are independent. In particular, an
+invalid or unmet `F` makes only the watchdog term false; it cannot veto `H`.
+The post-authority policy barriers below still apply before an action is
+emitted.
+
+| Row | Condition | Authority branch | Inputs consulted | Verdict and action | Regression |
+| --- | --- | --- | --- | --- | --- |
+| A0 | `auto_restart` false or report missing | planner exclusion | configuration/report presence | no plan, no action | `test_plan_ignores_unsupervised_or_unreported_agents` |
+| A1 | manual restart marker is fully authorized (including protected acknowledgements when required) | manual override | marker authority, protected status, cooldown | `MANUAL_RESTART`; `RELAUNCH` bypasses autonomous backoff | `test_scenario_iii_manual_marker_relaunches_and_waits_for_readiness` |
+| A2 | runtime missing, invalid, torn, unbound, or same-turn sequence regression | none | strict record, wrapper generation, turn generation, sequence high-water | `CLI_CHILD_UNKNOWN`; none | `test_wrapped_missing_runtime_is_unknown_with_rollout_remediation`, `test_wrapped_same_turn_sequence_regression_is_sticky_unknown` |
+| A3 | wrapper positively absent, heartbeat fresh | none | guarded wrapper PID/start, snapshot availability, heartbeat | `WRAPPER_MISSING`; none | `test_wrapped_idle_absent_wrapper_is_non_green_before_heartbeat_stales` |
+| A4 | wrapper positively absent, heartbeat stale, any runtime phase | positive wrapper death | guarded wrapper identity, heartbeat; child tuple bypassed | recovery candidate | `test_wrapped_dead_wrapper_recovers_from_every_non_idle_runtime_phase` |
+| A5 | valid idle, live wrapper, fresh heartbeat | none | phase, wrapper identity, heartbeat | `HEALTHY_IDLE`; none | `test_wrapped_idle_without_cli_child_is_healthy_idle` |
+| A6 | valid idle, live wrapper, stale authoritative heartbeat | heartbeat branch A | heartbeat, `can_confirm_stuck` | recovery candidate | `test_wrapped_non_active_runtime_recovery_matrix[idle-stale-heartbeat]` |
+| A7 | starting inside grace / starting after grace | none | phase, updated age, launch generation/grace | `CLI_CHILD_STARTING` / `CLI_CHILD_UNKNOWN`; none | `test_wrapped_non_active_runtime_recovery_matrix[starting-in-grace]`, `[starting-after-grace]` |
+| A8 | terminal success with recent progress / terminal failure with fresh heartbeat | none | outcome, progress age, heartbeat | `HEALTHY_WORKING` / `TURN_FAILED`; none | `test_wrapped_non_active_runtime_recovery_matrix[terminal-success-finalizing]`, `[terminal-failure]` |
+| A9 | any terminal outcome with stale heartbeat | heartbeat branch A | heartbeat, ordinary stale-recovery guards | recovery candidate | `test_wrapped_stale_live_terminal_uses_existing_recovery_path` |
+| A10 | active child ancestry or start evidence unknown | none | current-turn launcher binding, guarded process snapshot | `CLI_CHILD_UNKNOWN`; none | `test_wrapped_ambiguous_brain_is_unknown_and_never_killed` |
+| A11 | active child absent in grace / first confirming poll / second same-generation poll | positive child death | grace, wrapper/turn generation, dead-poll debounce | `CLI_CHILD_STARTING` / `CLI_CHILD_MISSING` / recovery candidate as `CLI_CHILD_DEAD` | `test_wrapped_prior_turn_sequence_does_not_end_current_spawn_grace`, `test_wrapped_active_absent_brain_requires_two_same_generation_polls` |
+| A12 | active live child with recent progress | none | progress sequence and same-turn observation age | `HEALTHY_WORKING`; none | `test_wrapped_active_stall_recovery_authority_matrix[recent-progress]` |
+| A13 | active live child, first stale poll or `P < S + C` | none | generation, sequence, debounce, coalescing bound | `CLI_CHILD_STALL_SUSPECT` / `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[first-stale-poll]`, `[coalescing-allowance]` |
+| A14 | `P >= S + C` and `H` | heartbeat branch A | heartbeat, `can_confirm_stuck`, debounce; no watchdog floor | recovery candidate as `CLI_CHILD_STALLED` | `test_wrapped_active_stall_recovery_authority_matrix[heartbeat-authority-watchdog-off]`, `[heartbeat-authority-low-opt-in]`, `[heartbeat-authority-invalid-watchdog-floor]`, `[heartbeat-authority-zero-watchdog-poll-fallback]` |
+| A15 | heartbeat stale but not authoritative | denied branch A | low-Codex opt-in guard or Claude work-heartbeat validation | `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[heartbeat-denied-low-no-opt-in]`, `[heartbeat-denied-invalid-work-heartbeat]` |
+| A16 | heartbeat fresh and watchdog not live | no authority | heartbeat, watchdog-live predicate | `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[fresh-heartbeat-watchdog-off]` |
+| A17 | watchdog live, valid `F`, `S >= F`, and `P >= S + C` | watchdog branch B | watchdog live/floor, progress age, coalescing | recovery candidate as `CLI_CHILD_STALLED` | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-authority-valid-floor]` |
+| A18 | watchdog live, `S < F`, and explicit `O` | watchdog branch B | opt-in and `P >= F + C`; heartbeat irrelevant | stalled with none before floor; recovery candidate after floor | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-low-opt-in-before-floor]`, `[watchdog-low-opt-in-after-floor]` |
+| A19 | watchdog live with `S < F` and no `O`, or invalid/unresolved `F` | denied branch B only | floor validity and opt-in | `CLI_CHILD_STALLED`; none unless independent `H` is true | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-low-without-opt-in]`, `[watchdog-invalid-floor]`, `[heartbeat-authority-invalid-watchdog-floor]` |
+| A20 | wrapper/turn generation or sequence changes between polls | none yet | generation/sequence debounce | reset confirmation; none | `test_wrapped_generation_change_resets_dead_confirmation`, `test_wrapped_generation_change_resets_stall_confirmation` |
+
+Every recovery candidate then passes through this exhaustive policy barrier
+table. These barriers constrain action emission; they do not change the
+underlying child verdict.
+
+| Row | Barrier condition | Inputs consulted | Verdict and action | Regression |
+| --- | --- | --- | --- | --- |
+| G1 | durable config-blocked hold | hold marker | `CONFIG_BLOCKED`; none | `test_wrapped_config_blocked_hold_marker_holds_when_stale_until_restart` |
+| G2 | deliberate lead-loop stand-down | exit marker | `LEAD_LOOP_STOOD_DOWN`; none | `test_lead_loop_stood_down_marker_suppresses_relaunch` |
+| G3 | lead-loop blocked and incumbent lease still armed | exit marker plus live lease | `LEAD_LOOP_BLOCKED`; none | `test_lead_loop_blocked_marker_holds_only_while_owner_live` |
+| G4 | protected agent without manual override | protected role | same failure state; `WARN_ONLY` | `test_stuck_protected_is_warn_only` |
+| G5 | heartbeat-only candidate but `can_confirm_stuck` false | activity/work-heartbeat/low-threshold guards | `ACTIVE_OR_BUSY`; warn or none | `test_wrapped_codex_stuck_after_below_watchdog_deadline_refuses_restart` |
+| G6 | readiness retry cap reached | launch/readiness generation and count | `READINESS_GAVE_UP`; no relaunch | `test_readiness_cap_relaunches_below_cap_then_gives_up` |
+| G7 | backoff deadline not reached | `backoff_next_epoch` | failure verdict; `BACKOFF_WAIT` | `test_wrapped_child_dead_respects_backoff_and_readiness_cap` |
+| G8 | no barrier, backoff due | readiness cap, backoff, start-guarded targets | failure verdict; `STUCK_RECOVER` | `test_wrapped_stalled_forked_brain_is_an_attributed_kill_target` |
+
+Omitted watchdog settings resolve to bounded defaults. A zero or malformed
+explicit watchdog interval/deadline cannot grant branch-B kill authority; it
+also cannot veto a valid branch-A heartbeat decision. A zero or malformed
+Claude work-heartbeat setting is startup/config-invalid and therefore removes
+heartbeat authority rather than creating a false kill. Unknown evidence never
+kills. Conversely, positive wrapper/child death and the two independent active
+stall branches ensure a genuinely wedged, validly configured agent retains a
+recovery path.
 
 Debouncing on wrapper generation, turn generation, and two consecutive polls
 prevents restart thrash during spawn and Codex launcher handoff. Existing
@@ -372,6 +445,36 @@ sequence.
 Infrastructure child death or supervisor recovery must remain an
 infrastructure/ambiguous attempt outcome, not become low-threshold message
 poison. Otherwise recovery itself could accelerate dead-lettering.
+
+#### Wrapper turn-exit and idle audit
+
+`on_runtime_idle` means the loop has no unsettled ownership of the just-finished
+turn. A pending retry or park must retain its terminal record and must not emit
+idle. A consumed, reconciled, disposed, or successfully completed turn must
+emit idle exactly at that boundary. Terminal writes remain forced and durable;
+the following idle write does not erase `last_outcome`.
+
+| Loop path | Cursor / work state | Runtime transition | `on_runtime_idle` | Regression |
+| --- | --- | --- | --- | --- |
+| startup or empty inbox with no cadence turn | no owned turn | `idle` at loop startup; unchanged on later empty polls | startup only | `test_continuous_loop_runtime_boundary_matrix[normal_success]` |
+| normal inbound success | cursor commits | `starting -> active/progress -> terminal(success) -> idle` | yes, after commit | `test_continuous_loop_runtime_boundary_matrix[normal_success]` |
+| retryable drive failure below a disposition cap | head remains pending | `starting -> ... -> terminal(failed)` | no | `test_continuous_loop_runtime_boundary_matrix[drive_failure]` |
+| config-blocked park | head remains parked and non-idle | preflight leaves prior idle, or a begun turn ends `terminal(failed)` | no after a begun failed turn | `test_continuous_loop_runtime_boundary_matrix[config_blocked_park]`, `test_config_blocked_head_parks_with_visible_health_not_frozen_idle` |
+| transient gateway hold | head remains pending and is re-driven | begun attempt ends `terminal(failed)` | no | `test_continuous_loop_runtime_boundary_matrix[gateway_hold]` |
+| dead-letter / cap disposal | cursor advances to recoverable dead-letter sink | forced synthetic or real `terminal(dead_letter) -> idle` | yes, after the forced terminal write | `test_reconciled_attempt_cap_dead_letters_without_launching_a_child` |
+| valid release/end or scoped rescind/supersession control | control commits; no model turn | `idle` | yes, at commit/exit | `test_authorized_release_returns_runtime_to_idle`, `test_rescinded_terminal_control_returns_runtime_to_idle` |
+| validated-bus landed-work reconciliation (#73) | already-landed work finalizes and cursor/thread-seen advances; model is not re-driven | prior terminal -> `idle` | yes, on terminal finalization | `test_landed_work_reconciliation_returns_runtime_to_idle`, `test_child_health_restart_does_not_redrive_bus_committed_inbound` |
+| terminal delivery/disposition settlement | gate returns terminal and advances its consume boundary | prior terminal -> `idle` through `_runtime_idle_if_terminal` | yes | `test_delivery_exhaustion_settlement_returns_runtime_to_idle` |
+| CAS-exhaustion settlement | `settle_retry_exhaustion` may atomically become terminal and advance | prior terminal -> `idle` through the single settlement helper; nonterminal settlement stays non-idle | yes only for terminal result | `test_terminal_cas_exhaustion_settlement_returns_runtime_and_supervisor_to_idle` |
+| successful cadence drive | synthetic turn ends; no cursor involved and loop is again idle | `terminal(success) -> idle` | yes | `test_cadence_runtime_boundary_matrix[cadence_success]` |
+| failed cadence drive | controller failure remains actionable; heartbeat is deliberately withheld | `terminal(failed)` | no | `test_cadence_runtime_boundary_matrix[cadence_failure]` |
+| successful one-shot consume/finalization | scoped thread-seen/terminal gate boundary completes, then process exits | terminal -> `idle` | yes before exit | `test_one_shot_runtime_boundary_matrix[one_shot_success]` |
+| failed/bounded one-shot | scoped work remains pending and process exits nonzero | `terminal(failed)` | no | `test_one_shot_runtime_boundary_matrix[one_shot_failure]` |
+
+All calls to `settle_retry_exhaustion` in continuous and one-shot loops pass
+through one helper that applies the terminal-to-idle rule. This closes the bug
+class in which a terminal settlement advances the bus boundary but leaves a
+stale non-idle health record behind.
 
 ### 6. Rollout and compatibility
 
@@ -429,14 +532,15 @@ The implementation includes deterministic synthetic-snapshot tests for:
 - recovery based on a durable progress age reserves the writer's maximum
   coalescing interval, so a hidden event at `t=4.9s` cannot be killed before
   its true age reaches the configured threshold;
-- when a watchdog is live, the configured stall threshold cannot be less than
-  its resolved deadline plus margin, and a long silent tool call is not killed
-  before that floor;
+- when a watchdog is live, its recovery branch cannot fire before the resolved
+  deadline plus margin; a low threshold requires explicit opt-in and still
+  waits for that floor, while an authoritative stale heartbeat remains an
+  independent branch;
 - work-heartbeat ticks do not count as progress;
 - wrapper/turn generation changes reset the stall/death debounce;
 - restart backoff and readiness caps still prevent relaunch storms;
-- dead-letter is visible as a terminal outcome and is not reported as a
-  successful turn; and
+- dead-letter forces a durable terminal outcome before the consumed loop
+  boundary returns to idle; it is never reported as a successful turn; and
 - after the validated bus commits and advances an inbound, a subsequent #72
   child-health restart begins at that advanced cursor and does not reprocess
   the committed inbound; and

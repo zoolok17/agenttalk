@@ -362,6 +362,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         ):
             _runtime_idle()
 
+    def _settle_retry_exhaustion(*args, **kwargs):
+        settled = commit_gate.settle_retry_exhaustion(*args, **kwargs)
+        _runtime_idle_if_terminal(settled)
+        return settled
+
     def _commit(rec: dict, gate_resolution=None) -> bool:
         _guard_advance()
         if (
@@ -467,6 +472,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             )
         if on_runtime_dead_letter is not None:
             on_runtime_dead_letter(record)
+        _runtime_idle()
         stamp()                               # DL is progress (bypasses drive's stamp)
         if on_health_idle is not None:
             on_health_idle()
@@ -587,6 +593,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 sleep(cur_sleep)
                 cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
                 continue
+            if res is not None and res.ran:
+                _runtime_idle()
             # No cadence, not due, a no-op sweep, or a SUCCESSFUL sweep: keep the heartbeat
             # fresh (+ renew the lease for the managed lead-loop, via the injected stamp),
             # then back off while the bus is quiet.
@@ -650,7 +658,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             resolution.key is not None
                             and finalized.reason == "finalization CAS contention exhausted"
                         ):
-                            commit_gate.settle_retry_exhaustion(
+                            _settle_retry_exhaustion(
                                 record,
                                 resolution.key,
                                 category="finalization",
@@ -706,14 +714,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                             continue
                         _guard_advance()
-                        settled = commit_gate.settle_retry_exhaustion(
+                        _settle_retry_exhaustion(
                             record,
                             key,
                             category="operation_infra",
                             reason="captured bus operation exhausted its durable retry bound",
                             permit=captured,
                         )
-                        _runtime_idle_if_terminal(settled)
                         commit_gate.cleanup_permit(captured)
                         stamp()
                         continue
@@ -732,7 +739,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                 return turns
                         else:
                             if finalized.reason == "finalization CAS contention exhausted":
-                                commit_gate.settle_retry_exhaustion(
+                                _settle_retry_exhaustion(
                                     record,
                                     key,
                                     category="finalization",
@@ -823,7 +830,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             return turns
                         continue
                     if finalized.reason == "finalization CAS contention exhausted":
-                        commit_gate.settle_retry_exhaustion(
+                        _settle_retry_exhaustion(
                             record,
                             key,
                             category="finalization",
@@ -859,7 +866,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                     finalized.reason
                                     == "finalization CAS contention exhausted"
                                 ):
-                                    settled = commit_gate.settle_retry_exhaustion(
+                                    settled = _settle_retry_exhaustion(
                                         record,
                                         key,
                                         category="finalization",
@@ -867,7 +874,6 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                     )
                                     if settled.terminal:
                                         commit_gate.cleanup_permit(permit)
-                                        _runtime_idle()
                                 sleep(fail_sleep)
                                 fail_sleep = min(
                                     max_idle_interval,
@@ -893,14 +899,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                             continue
                         _guard_advance()
-                        settled = commit_gate.settle_retry_exhaustion(
+                        _settle_retry_exhaustion(
                             record,
                             key,
                             category="operation_infra",
                             reason="captured bus operation exhausted its durable retry bound",
                             permit=permit,
                         )
-                        _runtime_idle_if_terminal(settled)
                         commit_gate.cleanup_permit(permit)
                         stamp()
                         continue
@@ -1170,6 +1175,22 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
     fail_sleep = idle_interval
     start = clock()
     _stamp = stamp if stamp is not None else (lambda: store.write_heartbeat(agent))
+
+    def _runtime_idle() -> None:
+        if on_runtime_idle is not None:
+            on_runtime_idle()
+
+    def _runtime_idle_if_terminal(resolution) -> None:
+        if resolution is not None and (
+            resolution.terminal or resolution.allows_legacy_commit
+        ):
+            _runtime_idle()
+
+    def _settle_retry_exhaustion(*args, **kwargs):
+        settled = commit_gate.settle_retry_exhaustion(*args, **kwargs)
+        _runtime_idle_if_terminal(settled)
+        return settled
+
     while True:
         if max_polls is not None and polls >= max_polls:
             return turns                # bound hit: caller maps turns==0 -> nonzero
@@ -1201,6 +1222,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
         if is_terminal_control(record) and commit_gate is None:
             # scoped record on a rescinded/closed thread: consume + stop (terminal).
             recv_api.commit(store, agent, record)
+            _runtime_idle()
             return turns
         legacy_gate_resolution = None
         if commit_gate is not None:
@@ -1219,12 +1241,13 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     if finalized.state != ResolverState.INDETERMINATE:
                         if resolution.key is not None and resolution.compliance_success:
                             commit_gate.mark_satisfied(resolution.key)
+                        _runtime_idle_if_terminal(finalized)
                         return turns
                     if (
                         resolution.key is not None
                         and finalized.reason == "finalization CAS contention exhausted"
                     ):
-                        commit_gate.settle_retry_exhaustion(
+                        _settle_retry_exhaustion(
                             record,
                             resolution.key,
                             category="finalization",
@@ -1262,7 +1285,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                             sleep(fail_sleep)
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                             continue
-                        commit_gate.settle_retry_exhaustion(
+                        _settle_retry_exhaustion(
                             record,
                             key,
                             category="operation_infra",
@@ -1283,10 +1306,11 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                             if resolved.compliance_success:
                                 commit_gate.mark_satisfied(key)
                             commit_gate.cleanup_permit(captured)
+                            _runtime_idle_if_terminal(finalized)
                             turns += 1
                             return turns
                         if finalized.reason == "finalization CAS contention exhausted":
-                            commit_gate.settle_retry_exhaustion(
+                            _settle_retry_exhaustion(
                                 record,
                                 key,
                                 category="finalization",
@@ -1299,7 +1323,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 purpose = commit_gate.next_dispatch_purpose(key)
                 if purpose is None:
                     if commit_gate.dispatch_exhausted(key):
-                        commit_gate.fail_delivery_or_block(
+                        disposition = commit_gate.fail_delivery_or_block(
                             record,
                             key,
                             reason=(
@@ -1308,6 +1332,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                             ),
                             expected_revision=resolution.scoped_revision,
                         )
+                        _runtime_idle_if_terminal(disposition)
                         return turns
                     _stamp()
                     sleep(fail_sleep)
@@ -1360,10 +1385,11 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                         if resolved.compliance_success:
                             commit_gate.mark_satisfied(key)
                         commit_gate.cleanup_permit(permit)
+                        _runtime_idle_if_terminal(finalized)
                         turns += 1
                         return turns
                     if finalized.reason == "finalization CAS contention exhausted":
-                        commit_gate.settle_retry_exhaustion(
+                        _settle_retry_exhaustion(
                             record,
                             key,
                             category="finalization",
@@ -1379,7 +1405,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
                 if commit_gate.dispatch_exhausted(key) and not action_infra:
-                    commit_gate.fail_delivery_or_block(
+                    disposition = commit_gate.fail_delivery_or_block(
                         record,
                         key,
                         reason=(
@@ -1389,6 +1415,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                         expected_revision=resolved.scoped_revision,
                     )
                     commit_gate.cleanup_permit(permit)
+                    _runtime_idle_if_terminal(disposition)
                     return turns
                 sleep(fail_sleep)
                 fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
@@ -1407,6 +1434,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 expected_revision=legacy_gate_resolution.ledger_revision,
             )
             if finalized.allows_legacy_commit:
+                _runtime_idle()
                 turns += 1
                 return turns
             _stamp()
@@ -1430,6 +1458,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     expected_revision=authorized.ledger_revision,
                 )
                 if finalized.terminal:
+                    _runtime_idle_if_terminal(finalized)
                     return turns
                 _stamp()
                 sleep(fail_sleep)
@@ -1465,8 +1494,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     continue
             else:
                 recv_api.commit(store, agent, record)   # SCOPED: thread-seen only
-            if on_runtime_idle is not None:
-                on_runtime_idle()
+            _runtime_idle()
             last_hb = clock()
             fail_sleep = idle_interval
             turns += 1

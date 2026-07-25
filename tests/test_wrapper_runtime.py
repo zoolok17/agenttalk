@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 
 from agenttalk import wrapper_runtime as wr
+from agenttalk import supervisor as sup
 from agenttalk.store import Store
 from agenttalk.wrapper import loop, recv_api, run, session
+from agenttalk.wrapper.obligations import Resolution, ResolverState
 from agenttalk.wrapper.work_heartbeat import WorkHeartbeatConfig
 
 
@@ -167,9 +169,15 @@ def test_reconciled_attempt_cap_dead_letters_without_launching_a_child(
         )
 
     writer = _writer(store.state_dir)
+    terminal_records: list[dict] = []
 
     def should_not_drive(_record: dict) -> bool:
         raise AssertionError("attempt cap must dispose before drive")
+
+    def record_dead_letter(disposed: dict) -> None:
+        terminal_records.append(
+            writer.dead_letter(message_id=disposed.get("id"))
+        )
 
     loop.run_loop(
         store,
@@ -181,17 +189,520 @@ def test_reconciled_attempt_cap_dead_letters_without_launching_a_child(
         k_poison=3,
         now_iso=lambda: "t",
         on_runtime_idle=writer.idle,
-        on_runtime_dead_letter=(
-            lambda disposed: writer.dead_letter(message_id=disposed.get("id"))
-        ),
+        on_runtime_dead_letter=record_dead_letter,
     )
 
     view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
     assert store.dead_lettered_count("worker") == 1
+    assert len(terminal_records) == 1
+    assert terminal_records[0]["phase"] == wr.PHASE_TERMINAL
+    assert terminal_records[0]["message_id"] == sent.id
+    assert terminal_records[0]["last_outcome"] == wr.OUTCOME_DEAD_LETTER
     assert view["status"] == wr.STATUS_VALID
-    assert view["record"]["phase"] == wr.PHASE_TERMINAL
-    assert view["record"]["message_id"] == sent.id
+    assert view["record"]["phase"] == wr.PHASE_IDLE
+    assert view["record"]["message_id"] is None
     assert view["record"]["last_outcome"] == wr.OUTCOME_DEAD_LETTER
+
+
+@pytest.mark.parametrize(
+    ("case", "drive_outcome", "terminal_outcome", "expected_phases"),
+    [
+        (
+            "normal_success",
+            loop.DriveOutcome(ok=True),
+            wr.OUTCOME_SUCCESS,
+            [wr.PHASE_IDLE, wr.PHASE_TERMINAL, wr.PHASE_IDLE],
+        ),
+        (
+            "drive_failure",
+            loop.DriveOutcome(
+                ok=False,
+                failure_class=loop.CLASS_INFRA,
+                summary="retryable failure",
+            ),
+            wr.OUTCOME_FAILED,
+            [wr.PHASE_IDLE, wr.PHASE_TERMINAL],
+        ),
+        (
+            "config_blocked_park",
+            loop.DriveOutcome(
+                ok=False,
+                failure_class=loop.CLASS_CONFIG_BLOCKED,
+                summary="configuration is blocked",
+            ),
+            wr.OUTCOME_FAILED,
+            [wr.PHASE_IDLE, wr.PHASE_TERMINAL],
+        ),
+        (
+            "gateway_hold",
+            loop.DriveOutcome(
+                ok=False,
+                failure_class=loop.CLASS_GATEWAY_HELD,
+                summary="gateway is held",
+            ),
+            wr.OUTCOME_FAILED,
+            [wr.PHASE_IDLE, wr.PHASE_TERMINAL],
+        ),
+    ],
+    ids=[
+        "normal_success",
+        "drive_failure",
+        "config_blocked_park",
+        "gateway_hold",
+    ],
+)
+def test_continuous_loop_runtime_boundary_matrix(
+    tmp_path: Path,
+    case: str,
+    drive_outcome: loop.DriveOutcome,
+    terminal_outcome: str,
+    expected_phases: list[str],
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    sent = store.send(
+        sender="lead",
+        recipient="worker",
+        body=case,
+        kind="message",
+    )
+    writer = _writer(store.state_dir)
+    phases: list[str] = []
+
+    def idle() -> None:
+        phases.append(writer.idle()["phase"])
+
+    def drive(record: dict) -> loop.DriveOutcome:
+        writer.starting(message_id=record["id"], turn_id=f"turn-{case}")
+        phases.append(writer.terminal(terminal_outcome)["phase"])
+        return drive_outcome
+
+    loop.run_loop(
+        store,
+        "worker",
+        drive,
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        max_turns=1,
+        k_poison=0,
+        k_escalate=0,
+        on_runtime_idle=idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert phases == expected_phases
+    assert view["record"]["phase"] == expected_phases[-1]
+    if case == "normal_success":
+        assert store.cursor("worker") == sent.id
+    else:
+        assert store.cursor("worker") == ""
+
+
+@pytest.mark.parametrize(
+    ("ok", "expected_phase"),
+    [
+        (True, wr.PHASE_IDLE),
+        (False, wr.PHASE_TERMINAL),
+    ],
+    ids=["cadence_success", "cadence_failure"],
+)
+def test_cadence_runtime_boundary_matrix(
+    tmp_path: Path,
+    ok: bool,
+    expected_phase: str,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    writer = _writer(store.state_dir)
+
+    def cadence() -> loop.CadenceResult:
+        writer.starting(message_id=None, turn_id="turn-cadence")
+        writer.terminal(wr.OUTCOME_SUCCESS if ok else wr.OUTCOME_FAILED)
+        return loop.CadenceResult(ran=True, ok=ok, drove_turn=True)
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("cadence must not consume an inbound"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        cadence=cadence,
+        on_runtime_idle=writer.idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert view["record"]["phase"] == expected_phase
+
+
+def test_rescinded_terminal_control_returns_runtime_to_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    sent = store.send(
+        sender="lead",
+        recipient="worker",
+        body="rescind the pending turn",
+        kind="rescind",
+    )
+    record = recv_api.next_record(store, "worker")
+    assert record is not None
+    record = {**record, "scoped": {"closed": True, "superseded": False}}
+    records = iter([record])
+    monkeypatch.setattr(
+        loop.recv_api,
+        "next_record",
+        lambda *_args, **_kwargs: next(records, None),
+    )
+    writer = _writer(store.state_dir)
+    idle_records: list[dict] = []
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("rescinded control must not be driven"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        on_runtime_idle=lambda: idle_records.append(writer.idle()),
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == sent.id
+    assert len(idle_records) == 2
+    assert view["record"]["phase"] == wr.PHASE_IDLE
+
+
+def test_landed_work_reconciliation_returns_runtime_to_idle(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    sent = store.send(
+        sender="lead",
+        recipient="worker",
+        body="already landed",
+        kind="question",
+    )
+    writer = _writer(store.state_dir)
+    key = object()
+
+    class LandedGate:
+        fence = "generation-1"
+
+        def admit_or_finalize(self, record: dict) -> Resolution:
+            writer.starting(message_id=record["id"], turn_id="turn-landed")
+            writer.terminal(wr.OUTCOME_SUCCESS)
+            return Resolution(
+                ResolverState.SATISFIED,
+                "validated bus already landed the work",
+                key=key,
+                ledger_revision=1,
+            )
+
+        def finalize(self, record: dict, resolution: Resolution, **_kwargs) -> Resolution:
+            recv_api.commit(store, "worker", record)
+            return Resolution(
+                ResolverState.SATISFIED,
+                "landed work reconciled",
+                key=resolution.key,
+            )
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("landed work must not be redriven"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        commit_gate=LandedGate(),
+        on_runtime_idle=writer.idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == sent.id
+    assert view["record"]["phase"] == wr.PHASE_IDLE
+
+
+def test_terminal_cas_exhaustion_settlement_returns_runtime_and_supervisor_to_idle(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    sent = store.send(
+        sender="lead",
+        recipient="worker",
+        body="already landed",
+        kind="question",
+    )
+    writer = _writer(store.state_dir)
+    key = object()
+
+    class TerminalSettlementGate:
+        fence = "generation-1"
+
+        def admit_or_finalize(self, record: dict) -> Resolution:
+            writer.starting(message_id=record["id"], turn_id="turn-settle")
+            writer.terminal(wr.OUTCOME_SUCCESS)
+            return Resolution(
+                ResolverState.SATISFIED,
+                "validated bus already landed the work",
+                key=key,
+                ledger_revision=1,
+            )
+
+        def finalize(self, record: dict, resolution: Resolution, **_kwargs) -> Resolution:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "finalization CAS contention exhausted",
+                key=resolution.key,
+            )
+
+        def settle_retry_exhaustion(
+            self,
+            record: dict,
+            current_key: object,
+            **_kwargs,
+        ) -> Resolution:
+            assert current_key is key
+            recv_api.commit(store, "worker", record)
+            return Resolution(
+                ResolverState.SATISFIED,
+                "terminal settlement advanced the validated cursor",
+                key=key,
+            )
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("settlement must not redrive the model"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=2,
+        commit_gate=TerminalSettlementGate(),
+        on_runtime_idle=writer.idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == sent.id
+    assert view["status"] == wr.STATUS_VALID
+    assert view["record"]["phase"] == wr.PHASE_IDLE
+
+    config = {
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "codex",
+                "wrapped": True,
+            }
+        }
+    }
+    report = {
+        "protected": False,
+        "heartbeat_stale": False,
+        "heartbeat_age_seconds": 1.0,
+        "restart_request": None,
+    }
+    state = {
+        "readiness_seen": True,
+        "launching": False,
+        "backoff_next_epoch": 0.0,
+    }
+    liveness = {
+        "runtime_status": wr.STATUS_VALID,
+        "runtime_record": view["record"],
+        "runtime_updated_age_seconds": view["updated_age_seconds"],
+        "runtime_progress_age_seconds": view["progress_age_seconds"],
+        "wrapper_state": "alive",
+        "managed_pids": [],
+        "kill_targets": [],
+    }
+    plan = sup._plan_one(
+        "worker",
+        report,
+        state,
+        config,
+        config["agents"]["worker"],
+        liveness,
+        now_epoch=NOW,
+    )
+    assert plan["state"] == "HEALTHY_IDLE"
+
+
+def test_delivery_exhaustion_settlement_returns_runtime_to_idle(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    sent = store.send(
+        sender="lead",
+        recipient="worker",
+        body="delivery cannot be completed",
+        kind="question",
+    )
+    writer = _writer(store.state_dir)
+    key = object()
+
+    class DeliveryExhaustedGate:
+        fence = "generation-1"
+
+        def admit_or_finalize(self, record: dict) -> Resolution:
+            writer.starting(message_id=record["id"], turn_id="turn-delivery")
+            writer.terminal(wr.OUTCOME_FAILED)
+            return Resolution(
+                ResolverState.OWED_UNSATISFIED,
+                "delivery is still owed",
+                key=key,
+                scoped_revision=1,
+            )
+
+        def captured_operation(self, _key: object) -> None:
+            return None
+
+        def next_dispatch_purpose(self, _key: object) -> None:
+            return None
+
+        def dispatch_exhausted(self, _key: object) -> bool:
+            return True
+
+        def fail_delivery_or_block(
+            self,
+            record: dict,
+            current_key: object,
+            **_kwargs,
+        ) -> Resolution:
+            assert current_key is key
+            recv_api.commit(store, "worker", record)
+            return Resolution(
+                ResolverState.DELIVERY_EXHAUSTED,
+                "delivery exhausted and cursor advanced",
+                key=key,
+            )
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("delivery exhaustion must not redrive the model"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        commit_gate=DeliveryExhaustedGate(),
+        on_runtime_idle=writer.idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == sent.id
+    assert view["record"]["phase"] == wr.PHASE_IDLE
+    assert view["record"]["last_outcome"] == wr.OUTCOME_FAILED
+
+
+def test_authorized_release_returns_runtime_to_idle(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    store.set_operator_facing("lead")
+    released = store.send(
+        sender="lead",
+        recipient="worker",
+        body="stand down",
+        kind="release",
+        meta={
+            "release_authority": "human",
+            "operator_decision": "true",
+            "authority_reason": "operator requested stand-down",
+        },
+    )
+    writer = _writer(store.state_dir)
+    writer.starting(message_id="prior-turn", turn_id="turn-prior")
+    writer.terminal(wr.OUTCOME_FAILED)
+    idle_records: list[dict] = []
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("authorized release must not be driven"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        on_runtime_idle=lambda: idle_records.append(writer.idle()),
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == released.id
+    assert len(idle_records) == 2
+    assert view["record"]["phase"] == wr.PHASE_IDLE
+
+
+@pytest.mark.parametrize(
+    ("ok", "expected_phases"),
+    [
+        (True, [wr.PHASE_IDLE, wr.PHASE_TERMINAL, wr.PHASE_IDLE]),
+        (False, [wr.PHASE_IDLE, wr.PHASE_TERMINAL]),
+    ],
+    ids=["one_shot_success", "one_shot_failure"],
+)
+def test_one_shot_runtime_boundary_matrix(
+    tmp_path: Path,
+    ok: bool,
+    expected_phases: list[str],
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    request_id = "rq-one-shot"
+    sent = store.send(
+        sender="lead",
+        recipient="worker",
+        body="scoped work",
+        kind="question",
+        meta={"request_id": request_id},
+    )
+    writer = _writer(store.state_dir)
+    phases: list[str] = []
+
+    def idle() -> None:
+        phases.append(writer.idle()["phase"])
+
+    def drive(record: dict) -> loop.DriveOutcome:
+        writer.starting(message_id=record["id"], turn_id="turn-one-shot")
+        phases.append(
+            writer.terminal(
+                wr.OUTCOME_SUCCESS if ok else wr.OUTCOME_FAILED
+            )["phase"]
+        )
+        return loop.DriveOutcome(
+            ok=ok,
+            failure_class=None if ok else loop.CLASS_INFRA,
+            summary="" if ok else "retryable one-shot failure",
+        )
+
+    turns = loop.run_loop(
+        store,
+        "worker",
+        drive,
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        max_turns=1,
+        only_request_id=request_id,
+        on_runtime_idle=idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert turns == (1 if ok else 0)
+    assert phases == expected_phases
+    assert view["record"]["phase"] == expected_phases[-1]
+    if ok:
+        assert store.thread_seen("worker", request_id) == sent.id
+    else:
+        assert recv_api.poll(
+            store,
+            "worker",
+            scoped_request_id=request_id,
+        )["record"]["id"] == sent.id
 
 
 @pytest.mark.parametrize(

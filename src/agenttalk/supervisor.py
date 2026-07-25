@@ -4726,33 +4726,40 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                             "coalescing allowance; refusing recovery"
                         ),
                     )
-                stall_floor_valid = bool(
-                    not watchdog_live
-                    or (
-                        progress_stall_floor is not None
-                        and stuck_after >= progress_stall_floor
-                    )
-                )
-                if not stall_floor_valid:
-                    floor_reason = (
-                        progress_stall_floor_error
-                        or (
+                heartbeat_authorizes = hb_stale and can_confirm_stuck
+                watchdog_authorizes = False
+                watchdog_reason: str | None = None
+                if watchdog_live:
+                    if progress_stall_floor is None:
+                        watchdog_reason = (
+                            progress_stall_floor_error
+                            or "turn watchdog deadline is unresolved"
+                        )
+                    elif stuck_after >= progress_stall_floor:
+                        watchdog_authorizes = True
+                    elif allow_low_stuck_after:
+                        watchdog_cutoff = (
+                            progress_stall_floor
+                            + runtime_obs.MAX_PROGRESS_WRITE_INTERVAL_SECONDS
+                        )
+                        watchdog_authorizes = (
+                            progress_elapsed >= watchdog_cutoff
+                        )
+                        if not watchdog_authorizes:
+                            watchdog_reason = (
+                                "the opted-in low stale threshold has passed, "
+                                "but the hard watchdog floor plus coalescing "
+                                "allowance has not"
+                            )
+                    else:
+                        watchdog_reason = (
                             f"stuck_after_seconds={stuck_after:.0f} is below "
                             f"the hard watchdog floor {progress_stall_floor:.0f}"
                         )
-                    )
-                    return _result(
-                        NONE,
-                        state="CLI_CHILD_STALLED",
-                        reason=(
-                            f"adapter progress stalled, but {floor_reason}; "
-                            "refusing recovery"
-                        ),
-                    )
-                watchdog_authorizes = watchdog_live and stall_floor_valid
-                heartbeat_authorizes = hb_stale and can_confirm_stuck
                 if not watchdog_authorizes and not heartbeat_authorizes:
-                    if hb_stale:
+                    if watchdog_reason is not None:
+                        authority_reason = watchdog_reason
+                    elif hb_stale:
                         authority_reason = (
                             "heartbeat is stale but its recovery guards are "
                             "not authoritative"
