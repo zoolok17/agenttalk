@@ -4730,31 +4730,27 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 watchdog_authorizes = False
                 watchdog_reason: str | None = None
                 if watchdog_live:
+                    # Branch B owns the watchdog floor. Once F+C passes it is
+                    # authoritative regardless of the low-threshold opt-in;
+                    # that opt-in controls only the earlier heartbeat branch.
                     if progress_stall_floor is None:
                         watchdog_reason = (
                             progress_stall_floor_error
                             or "turn watchdog deadline is unresolved"
                         )
-                    elif stuck_after >= progress_stall_floor:
+                    elif progress_elapsed >= (
+                        max(stuck_after, progress_stall_floor)
+                        + runtime_obs.MAX_PROGRESS_WRITE_INTERVAL_SECONDS
+                    ):
                         watchdog_authorizes = True
-                    elif allow_low_stuck_after:
-                        watchdog_cutoff = (
-                            progress_stall_floor
-                            + runtime_obs.MAX_PROGRESS_WRITE_INTERVAL_SECONDS
-                        )
-                        watchdog_authorizes = (
-                            progress_elapsed >= watchdog_cutoff
-                        )
-                        if not watchdog_authorizes:
-                            watchdog_reason = (
-                                "the opted-in low stale threshold has passed, "
-                                "but the hard watchdog floor plus coalescing "
-                                "allowance has not"
-                            )
-                    else:
+                    elif stuck_after < progress_stall_floor:
                         watchdog_reason = (
-                            f"stuck_after_seconds={stuck_after:.0f} is below "
-                            f"the hard watchdog floor {progress_stall_floor:.0f}"
+                            "the opted-in low stale threshold has passed, but "
+                            if allow_low_stuck_after
+                            else f"stuck_after_seconds={stuck_after:.0f} is below "
+                        ) + (
+                            f"the hard watchdog floor {progress_stall_floor:.0f} "
+                            "plus coalescing allowance"
                         )
                 if not watchdog_authorizes and not heartbeat_authorizes:
                     if watchdog_reason is not None:

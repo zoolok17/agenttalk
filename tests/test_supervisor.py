@@ -5380,7 +5380,7 @@ def test_wrapped_stale_progress_requires_threshold_and_confirming_poll() -> None
     assert second["state"] == "CLI_CHILD_STALLED"
 
 
-def test_wrapped_stall_below_watchdog_floor_never_authorizes_recovery() -> None:
+def test_wrapped_stall_below_watchdog_floor_waits_for_floor_before_recovery() -> None:
     config = {
         **_WRAP_CONFIG,
         "agents": {
@@ -5397,13 +5397,20 @@ def test_wrapped_stall_below_watchdog_floor_never_authorizes_recovery() -> None:
         wrapper_runtime=_wrapper_runtime_view(
             phase="active",
             updated_age=1.0,
-            progress_age=2200.0,
+            progress_age=2103.0,
             progress_sequence=2,
         ),
     )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 2103,
+        runtime_stall_polls=1,
+    )
     first = _plan_wrap(
         report,
-        {"agents": {"worker": _wrap_ready()}},
+        {"agents": {"worker": state}},
         snapshot=_codex_forked_brain_snap(),
         config=config,
     )
@@ -5414,10 +5421,19 @@ def test_wrapped_stall_below_watchdog_floor_never_authorizes_recovery() -> None:
         snapshot=_codex_forked_brain_snap(),
         config=config,
     )
+    third = _plan_wrap(
+        report,
+        {"agents": {"worker": second["next_state"]}},
+        now=NOW + 3,
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
 
     assert second["action"] == sup.NONE
     assert second["state"] == "CLI_CHILD_STALLED"
     assert "hard watchdog floor" in second["reason"]
+    assert third["action"] == sup.STUCK_RECOVER
+    assert third["state"] == "CLI_CHILD_STALLED"
 
 
 def test_wrapped_low_stuck_opt_in_stale_heartbeat_authorizes_active_recovery() -> None:
@@ -5622,7 +5638,7 @@ def test_wrapped_low_stuck_opt_in_stale_heartbeat_authorizes_active_recovery() -
             "reason": "hard watchdog deadline",
         },
         {
-            "id": "watchdog-low-without-opt-in",
+            "id": "watchdog-low-without-opt-in-before-floor",
             "cli": "codex",
             "stuck_after": 120,
             "elapsed": 130,
@@ -5632,6 +5648,18 @@ def test_wrapped_low_stuck_opt_in_stale_heartbeat_authorizes_active_recovery() -
             "action": sup.NONE,
             "state": "CLI_CHILD_STALLED",
             "reason": "hard watchdog floor",
+        },
+        {
+            "id": "watchdog-low-without-opt-in-after-floor",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 2110,
+            "heartbeat_stale": False,
+            "allow_low": False,
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog deadline",
         },
         {
             "id": "watchdog-invalid-floor",

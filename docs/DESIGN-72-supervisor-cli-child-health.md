@@ -349,11 +349,11 @@ Child death and child stall are different failures:
   prevents a legitimate long tool call, which may emit `tool-start` and remain
   silent until `tool-finish`, from being killed while its bounded
   work-heartbeat still proves liveness. A configured threshold below the live
-  watchdog floor disables watchdog authority unless
-  `allow_low_stuck_after=true`; with that explicit opt-in the low value becomes
-  the non-green observation threshold, while watchdog recovery still waits for
-  its own floor. A stale authoritative heartbeat remains an independent
-  recovery branch and is never gated by watchdog-floor validity. Finally,
+  watchdog floor never disables watchdog authority: that branch waits for its
+  own floor regardless of opt-in. `allow_low_stuck_after=true` instead makes
+  the low value authoritative for the earlier stale-heartbeat branch. A stale
+  authoritative heartbeat remains independent and is never gated by
+  watchdog-floor validity. Finally,
   recovery requires the observed durable progress age to include the maximum
   writer-coalescing interval, so hidden in-memory progress cannot consume the
   safety margin.
@@ -371,12 +371,13 @@ For the active-live-child rows, let:
 - `F` be the valid live-watchdog deadline plus safety margin;
 - `H` be `heartbeat_stale && can_confirm_stuck`;
 - `W` be `watchdog_effectively_live`; and
-- `O` be `allow_low_stuck_after`.
+- `O` be `allow_low_stuck_after`, which participates in the low-threshold
+  safety part of `H`, not in watchdog branch B.
 
 After the same-generation two-poll debounce, the complete stall recovery
 inequality is:
 
-`P >= S + C && (H || (W && F is valid && (S >= F || O) && P >= max(S, F) + C))`.
+`P >= S + C && (H || (W && F is valid && P >= max(S, F) + C))`.
 
 The two terms inside the parentheses are independent. In particular, an
 invalid or unmet `F` makes only the watchdog term false; it cannot veto `H`.
@@ -403,8 +404,8 @@ emitted.
 | A15 | heartbeat stale but not authoritative | denied branch A | low-Codex opt-in guard or Claude work-heartbeat validation | `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[heartbeat-denied-low-no-opt-in]`, `[heartbeat-denied-invalid-work-heartbeat]` |
 | A16 | heartbeat fresh and watchdog not live | no authority | heartbeat, watchdog-live predicate | `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[fresh-heartbeat-watchdog-off]` |
 | A17 | watchdog live, valid `F`, `S >= F`, and `P >= S + C` | watchdog branch B | watchdog live/floor, progress age, coalescing | recovery candidate as `CLI_CHILD_STALLED` | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-authority-valid-floor]` |
-| A18 | watchdog live, `S < F`, and explicit `O` | watchdog branch B | opt-in and `P >= F + C`; heartbeat irrelevant | stalled with none before floor; recovery candidate after floor | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-low-opt-in-before-floor]`, `[watchdog-low-opt-in-after-floor]` |
-| A19 | watchdog live with `S < F` and no `O`, or invalid/unresolved `F` | denied branch B only | floor validity and opt-in | `CLI_CHILD_STALLED`; none unless independent `H` is true | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-low-without-opt-in]`, `[watchdog-invalid-floor]`, `[heartbeat-authority-invalid-watchdog-floor]` |
+| A18 | watchdog live and `S < F`, with or without `O` | watchdog branch B | `P >= F + C`; heartbeat and opt-in are irrelevant | stalled with none before floor; recovery candidate after floor | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-low-opt-in-before-floor]`, `[watchdog-low-opt-in-after-floor]`, `[watchdog-low-without-opt-in-before-floor]`, `[watchdog-low-without-opt-in-after-floor]` |
+| A19 | watchdog live but `F` invalid or unresolved | denied branch B only | strict floor validity | `CLI_CHILD_STALLED`; none unless independent `H` is true | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-invalid-floor]`, `[heartbeat-authority-invalid-watchdog-floor]` |
 | A20 | wrapper/turn generation or sequence changes between polls | none yet | generation/sequence debounce | reset confirmation; none | `test_wrapped_generation_change_resets_dead_confirmation`, `test_wrapped_generation_change_resets_stall_confirmation` |
 
 Every recovery candidate then passes through this exhaustive policy barrier
@@ -533,9 +534,9 @@ The implementation includes deterministic synthetic-snapshot tests for:
   coalescing interval, so a hidden event at `t=4.9s` cannot be killed before
   its true age reaches the configured threshold;
 - when a watchdog is live, its recovery branch cannot fire before the resolved
-  deadline plus margin; a low threshold requires explicit opt-in and still
-  waits for that floor, while an authoritative stale heartbeat remains an
-  independent branch;
+  deadline plus margin; a low threshold waits for that floor regardless of
+  opt-in, while opt-in can independently authorize the earlier stale-heartbeat
+  branch;
 - work-heartbeat ticks do not count as progress;
 - wrapper/turn generation changes reset the stall/death debounce;
 - restart backoff and readiness caps still prevent relaunch storms;
