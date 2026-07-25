@@ -4122,7 +4122,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # min threshold is too aggressive (item-level stream => likely false-kill
     # mid-reasoning). REFUSE restart authority (degrade to warn-only) + warn,
     # unless the operator explicitly opts in. We never silently coerce the value.
-    allow_low_stuck_after = bool(cfg_agent.get("allow_low_stuck_after", False))
+    # This grants kill authority, so JSON truthiness is not an opt-in.
+    allow_low_stuck_after = cfg_agent.get("allow_low_stuck_after") is True
     unsafe_low_codex = (wrapped and cli_name == "codex"
                         and stuck_after < _WRAPPED_CODEX_MIN_STUCK_AFTER
                         and not allow_low_stuck_after)

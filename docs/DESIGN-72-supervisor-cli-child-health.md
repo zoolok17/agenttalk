@@ -371,7 +371,8 @@ For the active-live-child rows, let:
 - `F` be the valid live-watchdog deadline plus safety margin;
 - `H` be `heartbeat_stale && can_confirm_stuck`;
 - `W` be `watchdog_effectively_live`; and
-- `O` be `allow_low_stuck_after`, which participates in the low-threshold
+- `O` be `allow_low_stuck_after is true` using a literal JSON boolean; strings,
+  numbers, null, and omission are false. It participates in the low-threshold
   safety part of `H`, not in watchdog branch B.
 
 After the same-generation two-poll debounce, the complete stall recovery
@@ -384,29 +385,42 @@ invalid or unmet `F` makes only the watchdog term false; it cannot veto `H`.
 The post-authority policy barriers below still apply before an action is
 emitted.
 
+**Exhaustiveness method.** An AST inventory of `_plan_one` yields 40 concrete
+`_result` / `_healthy` exits after excluding the `_healthy` helper's own return.
+Each exit from the manual-marker section through the final healthy fallback is
+mapped to one row below; equivalent exits that differ only in warning rate
+limiting share a row. The separate policy-barrier table maps every exit after
+recovery authority has been established. The inventory is rechecked with
+`rg "return _result|return _healthy"` whenever this planner changes.
+
 | Row | Condition | Authority branch | Inputs consulted | Verdict and action | Regression |
 | --- | --- | --- | --- | --- | --- |
 | A0 | `auto_restart` false or report missing | planner exclusion | configuration/report presence | no plan, no action | `test_plan_ignores_unsupervised_or_unreported_agents` |
-| A1 | manual restart marker is fully authorized (including protected acknowledgements when required) | manual override | marker authority, protected status, cooldown | `MANUAL_RESTART`; `RELAUNCH` bypasses autonomous backoff | `test_scenario_iii_manual_marker_relaunches_and_waits_for_readiness` |
-| A2 | runtime missing, invalid, torn, unbound, or same-turn sequence regression | none | strict record, wrapper generation, turn generation, sequence high-water | `CLI_CHILD_UNKNOWN`; none | `test_wrapped_missing_runtime_is_unknown_with_rollout_remediation`, `test_wrapped_same_turn_sequence_regression_is_sticky_unknown` |
-| A3 | wrapper positively absent, heartbeat fresh | none | guarded wrapper PID/start, snapshot availability, heartbeat | `WRAPPER_MISSING`; none | `test_wrapped_idle_absent_wrapper_is_non_green_before_heartbeat_stales` |
-| A4 | wrapper positively absent, heartbeat stale, any runtime phase | positive wrapper death | guarded wrapper identity, heartbeat; child tuple bypassed | recovery candidate | `test_wrapped_dead_wrapper_recovers_from_every_non_idle_runtime_phase` |
-| A5 | valid idle, live wrapper, fresh heartbeat | none | phase, wrapper identity, heartbeat | `HEALTHY_IDLE`; none | `test_wrapped_idle_without_cli_child_is_healthy_idle` |
-| A6 | valid idle, live wrapper, stale authoritative heartbeat | heartbeat branch A | heartbeat, `can_confirm_stuck` | recovery candidate | `test_wrapped_non_active_runtime_recovery_matrix[idle-stale-heartbeat]` |
-| A7 | starting inside grace / starting after grace | none | phase, updated age, launch generation/grace | `CLI_CHILD_STARTING` / `CLI_CHILD_UNKNOWN`; none | `test_wrapped_non_active_runtime_recovery_matrix[starting-in-grace]`, `[starting-after-grace]` |
-| A8 | terminal success with recent progress / terminal failure with fresh heartbeat | none | outcome, progress age, heartbeat | `HEALTHY_WORKING` / `TURN_FAILED`; none | `test_wrapped_non_active_runtime_recovery_matrix[terminal-success-finalizing]`, `[terminal-failure]` |
-| A9 | any terminal outcome with stale heartbeat | heartbeat branch A | heartbeat, ordinary stale-recovery guards | recovery candidate | `test_wrapped_stale_live_terminal_uses_existing_recovery_path` |
-| A10 | active child ancestry or start evidence unknown | none | current-turn launcher binding, guarded process snapshot | `CLI_CHILD_UNKNOWN`; none | `test_wrapped_ambiguous_brain_is_unknown_and_never_killed` |
-| A11 | active child absent in grace / first confirming poll / second same-generation poll | positive child death | grace, wrapper/turn generation, dead-poll debounce | `CLI_CHILD_STARTING` / `CLI_CHILD_MISSING` / recovery candidate as `CLI_CHILD_DEAD` | `test_wrapped_prior_turn_sequence_does_not_end_current_spawn_grace`, `test_wrapped_active_absent_brain_requires_two_same_generation_polls` |
-| A12 | active live child with recent progress | none | progress sequence and same-turn observation age | `HEALTHY_WORKING`; none | `test_wrapped_active_stall_recovery_authority_matrix[recent-progress]` |
-| A13 | active live child, first stale poll or `P < S + C` | none | generation, sequence, debounce, coalescing bound | `CLI_CHILD_STALL_SUSPECT` / `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[first-stale-poll]`, `[coalescing-allowance]` |
-| A14 | `P >= S + C` and `H` | heartbeat branch A | heartbeat, `can_confirm_stuck`, debounce; no watchdog floor | recovery candidate as `CLI_CHILD_STALLED` | `test_wrapped_active_stall_recovery_authority_matrix[heartbeat-authority-watchdog-off]`, `[heartbeat-authority-low-opt-in]`, `[heartbeat-authority-invalid-watchdog-floor]`, `[heartbeat-authority-zero-watchdog-poll-fallback]` |
-| A15 | heartbeat stale but not authoritative | denied branch A | low-Codex opt-in guard or Claude work-heartbeat validation | `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[heartbeat-denied-low-no-opt-in]`, `[heartbeat-denied-invalid-work-heartbeat]` |
-| A16 | heartbeat fresh and watchdog not live | no authority | heartbeat, watchdog-live predicate | `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[fresh-heartbeat-watchdog-off]` |
-| A17 | watchdog live, valid `F`, `S >= F`, and `P >= S + C` | watchdog branch B | watchdog live/floor, progress age, coalescing | recovery candidate as `CLI_CHILD_STALLED` | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-authority-valid-floor]` |
-| A18 | watchdog live and `S < F`, with or without `O` | watchdog branch B | `P >= F + C`; heartbeat and opt-in are irrelevant | stalled with none before floor; recovery candidate after floor | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-low-opt-in-before-floor]`, `[watchdog-low-opt-in-after-floor]`, `[watchdog-low-without-opt-in-before-floor]`, `[watchdog-low-without-opt-in-after-floor]` |
-| A19 | watchdog live but `F` invalid or unresolved | denied branch B only | strict floor validity | `CLI_CHILD_STALLED`; none unless independent `H` is true | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-invalid-floor]`, `[heartbeat-authority-invalid-watchdog-floor]` |
-| A20 | wrapper/turn generation or sequence changes between polls | none yet | generation/sequence debounce | reset confirmation; none | `test_wrapped_generation_change_resets_dead_confirmation`, `test_wrapped_generation_change_resets_stall_confirmation` |
+| A1 | restart marker lacks current authority | manual denial | marker authority and revalidation | `RESTART_UNAUTHORIZED`; none | `test_unauthorized_restart_marker_refuses_and_stays_visible` |
+| A2 | protected marker lacks force/live-kill acknowledgement, or marker is cooling down | manual denial | protected status, explicit acknowledgements, cooldown | `REFUSE_PROTECTED`, `LIVE_PROTECTED_REFUSED`, or `RESTART_COOLDOWN`; none | `test_protected_marker_without_force_is_refused_and_stays_visible`, `test_fresh_protected_force_requires_second_live_kill_ack`, `test_restart_cooldown_defers_without_consuming_marker` |
+| A3 | marker is fully authorized | manual override | marker authority, protected acknowledgements, cooldown | `MANUAL_RESTART`; `RELAUNCH` bypasses autonomous backoff | `test_scenario_iii_manual_marker_relaunches_and_waits_for_readiness` |
+| A4 | consumed marker reaches validated readiness | manual completion | marker id, fresh heartbeat, runtime idle/readiness | `HEALTHY_IDLE`; clear marker | `test_consumed_marker_now_alive_clears` |
+| A5 | runtime missing, invalid, torn, unbound, or same-turn sequence regression | none | strict record, wrapper generation, turn generation, sequence high-water | `CLI_CHILD_UNKNOWN`; none | `test_wrapped_missing_runtime_is_unknown_with_rollout_remediation`, `test_wrapped_same_turn_sequence_regression_is_sticky_unknown` |
+| A6 | wrapper positively absent with fresh heartbeat / stale heartbeat | none / positive wrapper death | guarded wrapper PID/start, snapshot availability, heartbeat | `WRAPPER_MISSING`; none / recovery candidate | `test_wrapped_idle_absent_wrapper_is_non_green_before_heartbeat_stales`, `test_wrapped_dead_wrapper_recovers_from_every_non_idle_runtime_phase` |
+| A7 | valid idle, live wrapper, fresh / stale authoritative heartbeat | none / heartbeat branch A | phase, wrapper identity, heartbeat, `can_confirm_stuck` | `HEALTHY_IDLE`; none / recovery candidate | `test_wrapped_idle_without_cli_child_is_healthy_idle`, `test_wrapped_non_active_runtime_recovery_matrix[idle-stale-heartbeat]` |
+| A8 | starting inside / beyond grace | none | phase, updated age, launch generation/grace | `CLI_CHILD_STARTING` / `CLI_CHILD_UNKNOWN`; none | `test_wrapped_non_active_runtime_recovery_matrix[starting-in-grace]`, `[starting-after-grace]` |
+| A9 | fresh-heartbeat terminal failure or dead-letter | none | outcome, heartbeat | `TURN_FAILED`; none | `test_wrapped_non_active_runtime_recovery_matrix[terminal-failure]` |
+| A10 | fresh-heartbeat terminal success with recent classified progress | none | outcome, `P < S`, heartbeat | `HEALTHY_WORKING`; none | `test_wrapped_non_active_runtime_recovery_matrix[terminal-success-finalizing]` |
+| A11 | fresh-heartbeat terminal success with stale or unclassified progress | none | outcome, progress age validity, heartbeat | `CLI_CHILD_UNKNOWN`; none | `test_wrapped_non_active_runtime_recovery_matrix[terminal-success-stale-progress]`, `[terminal-success-unclassified-progress]` |
+| A12 | any terminal outcome with stale heartbeat | heartbeat branch A | heartbeat, ordinary stale-recovery guards | recovery candidate | `test_wrapped_stale_live_terminal_uses_existing_recovery_path` |
+| A13 | active child ancestry/start evidence unknown, invalid progress sequence, or unmatched tuple | none | current-turn launcher binding, process snapshot, progress schema | `CLI_CHILD_UNKNOWN`; none | `test_wrapped_ambiguous_brain_is_unknown_and_never_killed`, `test_wrapped_active_live_brain_with_invalid_progress_sequence_is_unknown` |
+| A14 | active child absent in grace / first poll / second same-generation poll | positive child death | grace, wrapper/turn generation, dead-poll debounce | `CLI_CHILD_STARTING` / `CLI_CHILD_MISSING` / recovery candidate as `CLI_CHILD_DEAD` | `test_wrapped_prior_turn_sequence_does_not_end_current_spawn_grace`, `test_wrapped_active_absent_brain_requires_two_same_generation_polls` |
+| A15 | active live child has no real progress inside grace / after grace while `P < S` | none | real-progress timestamp, grace, progress age | `CLI_CHILD_STARTING` / `CLI_CHILD_NO_PROGRESS`; none | `test_wrapped_prior_turn_sequence_does_not_end_current_spawn_grace`, `test_wrapped_active_live_brain_without_progress_below_threshold_is_non_green` |
+| A16 | active live child has real progress and `P < S` | none | progress sequence and same-turn observation age | `HEALTHY_WORKING`; none | `test_wrapped_active_stall_recovery_authority_matrix[recent-progress]` |
+| A17 | `P >= S`, first confirming poll, or `P < S + C` on the second poll | none | generation, sequence, debounce, coalescing bound | `CLI_CHILD_STALL_SUSPECT` / `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[first-stale-poll]`, `[coalescing-allowance]` |
+| A18 | `P >= S + C` and `H` | heartbeat branch A | heartbeat, `can_confirm_stuck`, debounce; no watchdog floor | recovery candidate as `CLI_CHILD_STALLED` | `test_wrapped_active_stall_recovery_authority_matrix[heartbeat-authority-watchdog-off]`, `[heartbeat-authority-low-opt-in]`, `[heartbeat-authority-invalid-watchdog-floor]`, `[heartbeat-authority-zero-watchdog-poll-fallback]` |
+| A19 | heartbeat stale but branch A is not authoritative | denied branch A | literal-boolean low-Codex opt-in or Claude work-heartbeat validation | `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[heartbeat-denied-low-no-opt-in]`, `[heartbeat-denied-invalid-work-heartbeat]`, `test_wrapped_low_stuck_opt_in_requires_literal_boolean_true` |
+| A20 | heartbeat fresh and watchdog not live | no authority | heartbeat, watchdog-live predicate | `CLI_CHILD_STALLED`; none | `test_wrapped_active_stall_recovery_authority_matrix[fresh-heartbeat-watchdog-off]` |
+| A21 | watchdog live, valid `F`, and `P >= max(S, F) + C` | watchdog branch B | watchdog live/floor, progress age, coalescing; `O` cannot veto | recovery candidate as `CLI_CHILD_STALLED` | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-authority-valid-floor]`, `[watchdog-low-opt-in-after-floor]`, `[watchdog-low-without-opt-in-after-floor]` |
+| A22 | watchdog floor not yet reached, invalid, or unresolved | denied branch B only | strict live/floor validity; `O` affects wording only | `CLI_CHILD_STALLED`; none unless independent `H` is true | `test_wrapped_active_stall_recovery_authority_matrix[watchdog-low-opt-in-before-floor]`, `[watchdog-low-without-opt-in-before-floor]`, `[watchdog-invalid-floor]`, `[heartbeat-authority-invalid-watchdog-floor]` |
+| A23 | wrapper/turn generation or sequence changes between polls | none yet | generation/sequence debounce | reset confirmation; none | `test_wrapped_generation_change_resets_dead_confirmation`, `test_wrapped_generation_change_resets_stall_confirmation` |
+| A24 | launch is still inside grace and no child recovery is confirmed | none | launch generation/time, child recovery reason | `LAUNCHING`; none | `test_wrapped_in_grace_does_not_request_brain_discovery` |
+| A25 | non-wrapped agent reaches the fresh-heartbeat fallback | none | heartbeat and launch state | `HEALTHY_IDLE`; none | `test_scenario_i_fresh_heartbeat_ignores_missing_brain_snapshot` |
 
 Every recovery candidate then passes through this exhaustive policy barrier
 table. These barriers constrain action emission; they do not change the
@@ -450,32 +464,50 @@ poison. Otherwise recovery itself could accelerate dead-lettering.
 #### Wrapper turn-exit and idle audit
 
 `on_runtime_idle` means the loop has no unsettled ownership of the just-finished
-turn. A pending retry or park must retain its terminal record and must not emit
-idle. A consumed, reconciled, disposed, or successfully completed turn must
-emit idle exactly at that boundary. Terminal writes remain forced and durable;
-the following idle write does not erase `last_outcome`.
+turn. The entry callback establishes the new wrapper generation before it owns
+a record. Once a record is observed, a pending retry, semantic terminal, or
+park must retain its non-idle record and must not emit idle. A consumed,
+reconciled, disposed, or successfully completed synthetic turn emits idle
+exactly at that boundary. Terminal writes remain forced and durable; the
+following idle write does not erase `last_outcome`.
+
+**Exhaustiveness method.** The audit inventories both orchestration functions
+with an AST/call-site pass: seven continuous and six one-shot `finalize` calls,
+two continuous and two one-shot `fail_delivery_or_block` calls, all ten
+`_settle_retry_exhaustion` calls, every direct `recv_api.commit`, every
+`_commit`, and every `_dispose`. It then traces every `return` / `continue`
+reachable from those calls plus the entry, empty-poll, cadence, exception, and
+bounded-exit paths. Every commit-gate path below now uses the same
+`recv_api.consume_boundary_complete` predicate as the gate's own projection
+reconciliation: global cursor coverage for global records and
+`max(global cursor, thread_seen)` coverage for scoped records.
 
 | Loop path | Cursor / work state | Runtime transition | `on_runtime_idle` | Regression |
 | --- | --- | --- | --- | --- |
-| startup or empty inbox with no cadence turn | no owned turn | `idle` at loop startup; unchanged on later empty polls | startup only | `test_continuous_loop_runtime_boundary_matrix[normal_success]` |
-| normal inbound success | cursor commits | `starting -> ... -> terminal(success) -> idle` | yes, after commit | `test_continuous_loop_runtime_boundary_matrix[normal_success]` |
+| wrapper entry / later empty poll | no record owned | entry writes `idle`; later empty polls preserve it | entry only | `test_continuous_loop_runtime_boundary_matrix[normal_success]`, `test_one_shot_times_out_nonzero_when_request_never_arrives` |
+| normal global inbound success without a commit gate | global cursor commits | `starting -> ... -> terminal(success) -> idle` | yes, after commit | `test_continuous_loop_runtime_boundary_matrix[normal_success]` |
 | retryable drive failure below a disposition cap | head remains pending | `starting -> ... -> terminal(failed)` | no | `test_continuous_loop_runtime_boundary_matrix[drive_failure]` |
 | config-blocked park | head remains parked and non-idle | preflight leaves prior idle, or a begun turn ends `terminal(failed)` | no after a begun failed turn | `test_continuous_loop_runtime_boundary_matrix[config_blocked_park]`, `test_config_blocked_head_parks_with_visible_health_not_frozen_idle` |
 | transient gateway hold | head remains pending and is re-driven | begun attempt ends `terminal(failed)` | no | `test_continuous_loop_runtime_boundary_matrix[gateway_hold]` |
 | dead-letter / cap disposal | cursor advances to recoverable dead-letter sink | forced synthetic or real `terminal(dead_letter) -> idle` | yes, after the forced terminal write | `test_reconciled_attempt_cap_dead_letters_without_launching_a_child` |
 | valid release/end or scoped rescind/supersession control | control commits; no model turn | `idle` | yes, at commit/exit | `test_authorized_release_returns_runtime_to_idle`, `test_rescinded_terminal_control_returns_runtime_to_idle` |
 | validated-bus landed-work reconciliation (#73) | already-landed work finalizes and cursor/thread-seen advances; model is not re-driven | prior terminal -> `idle` | yes, on terminal finalization | `test_landed_work_reconciliation_returns_runtime_to_idle`, `test_child_health_restart_does_not_redrive_bus_committed_inbound` |
-| terminal delivery/disposition settlement | gate returns terminal and advances its consume boundary | prior terminal -> `idle` through `_runtime_idle_if_terminal` | yes | `test_delivery_exhaustion_settlement_returns_runtime_to_idle` |
-| CAS-exhaustion settlement | `settle_retry_exhaustion` may atomically become terminal and advance | prior terminal -> `idle` through the single settlement helper; nonterminal settlement stays non-idle | yes only for terminal result | `test_terminal_cas_exhaustion_settlement_returns_runtime_and_supervisor_to_idle` |
+| semantic terminal with global projection still pending | gate returns terminal but global cursor does not cover the record | prior terminal remains terminal; retry backs off | no | `test_terminal_cas_exhaustion_with_pending_cursor_stays_terminal`, `test_delivery_exhaustion_with_pending_cursor_stays_terminal` |
+| global delivery/disposition settlement with completed projection | gate returns terminal and global cursor covers the record | prior terminal -> `idle` | yes | `test_delivery_exhaustion_settlement_returns_runtime_to_idle` |
+| global CAS-exhaustion settlement with completed projection | terminal replay completes global cursor projection | prior terminal -> `idle` | yes | `test_terminal_cas_exhaustion_settlement_returns_runtime_and_supervisor_to_idle` |
 | successful cadence drive | synthetic turn ends; no cursor involved and loop is again idle | `terminal(success) -> idle` | yes | `test_cadence_runtime_boundary_matrix[cadence_success]` |
 | failed cadence drive | controller failure remains actionable; heartbeat is deliberately withheld | `terminal(failed)` | no | `test_cadence_runtime_boundary_matrix[cadence_failure]` |
-| successful one-shot consume/finalization | scoped thread-seen/terminal gate boundary completes, then process exits | terminal -> `idle` | yes before exit | `test_one_shot_runtime_boundary_matrix[one_shot_success]` |
-| failed/bounded one-shot | scoped work remains pending and process exits nonzero | `terminal(failed)` | no | `test_one_shot_runtime_boundary_matrix[one_shot_failure]` |
+| direct one-shot success / failed or bounded one-shot | success marks scoped `thread_seen`; failure/bound leaves it pending | success `terminal -> idle`; failure remains terminal | yes only after scoped commit | `test_one_shot_runtime_boundary_matrix[one_shot_success]`, `[one_shot_failure]` |
+| one-shot commit-gate finalization with completed projection | `thread_seen` or global cursor covers the scoped record | terminal -> `idle`, then process exits | yes | `test_one_shot_committed_terminal_finalization_returns_runtime_to_idle` |
+| one-shot semantic terminal with scoped projection pending | neither global cursor nor `thread_seen` covers the record | terminal remains terminal; bounded process exits nonzero or retries | no | `test_one_shot_terminal_cas_exhaustion_with_pending_thread_seen_stays_terminal` |
+| one-shot delivery terminal, committed / pending | scoped projection covers / does not cover the record | `idle` / terminal retained | yes only when committed | `test_one_shot_delivery_terminal_runtime_requires_committed_thread_seen[committed]`, `[pending]` |
+| unhandled wrapper exception after turn ownership begins | consume boundary remains pending | last `starting` / `active` / `terminal` record remains | no | `test_unhandled_drive_exception_does_not_publish_idle_after_turn_start` |
 
-All calls to `settle_retry_exhaustion` in continuous and one-shot loops pass
-through one helper that applies the terminal-to-idle rule. This closes the bug
-class in which a terminal settlement advances the bus boundary but leaves a
-stale non-idle health record behind.
+Semantic `Resolution.terminal` and `allows_legacy_commit` values select retry
+logic, but neither can publish runtime idle. A gate path requires the projection
+predicate; a direct `recv_api.commit` must return normally, and dead-letter is
+also projection-verified. Synthetic cadence success is the sole no-record
+exception.
 
 ### 6. Rollout and compatibility
 

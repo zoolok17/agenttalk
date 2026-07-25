@@ -356,15 +356,15 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if on_runtime_idle is not None:
             on_runtime_idle()
 
-    def _runtime_idle_if_terminal(resolution) -> None:
-        if resolution is not None and (
-            resolution.terminal or resolution.allows_legacy_commit
-        ):
+    def _runtime_idle_if_consumed(record: dict) -> bool:
+        consumed = recv_api.consume_boundary_complete(store, agent, record)
+        if consumed:
             _runtime_idle()
+        return consumed
 
-    def _settle_retry_exhaustion(*args, **kwargs):
-        settled = commit_gate.settle_retry_exhaustion(*args, **kwargs)
-        _runtime_idle_if_terminal(settled)
+    def _settle_retry_exhaustion(record: dict, *args, **kwargs):
+        settled = commit_gate.settle_retry_exhaustion(record, *args, **kwargs)
+        _runtime_idle_if_consumed(record)
         return settled
 
     def _commit(rec: dict, gate_resolution=None) -> bool:
@@ -374,12 +374,12 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             and gate_resolution is not None
             and gate_resolution.ledger_revision is not None
         ):
-            finalized = commit_gate.finalize(
+            commit_gate.finalize(
                 rec,
                 gate_resolution,
                 expected_revision=gate_resolution.ledger_revision,
             )
-            committed = finalized.allows_legacy_commit or finalized.terminal
+            committed = recv_api.consume_boundary_complete(store, agent, rec)
             if committed:
                 _runtime_idle()
             return committed
@@ -470,6 +470,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 at=now_iso(),
                 child_output_tail=child_output_tail,
             )
+        if not recv_api.consume_boundary_complete(store, agent, record):
+            stamp()
+            sleep(fail_sleep)
+            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+            return
         if on_runtime_dead_letter is not None:
             on_runtime_dead_letter(record)
         _runtime_idle()
@@ -669,10 +674,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         continue
                     if resolution.key is not None and resolution.compliance_success:
                         commit_gate.mark_satisfied(resolution.key)
-                    _runtime_idle_if_terminal(finalized)
+                    consumed = _runtime_idle_if_consumed(record)
                     stamp()
-                    last_hb = clock()
-                    fail_sleep = idle_interval
+                    if consumed:
+                        last_hb = clock()
+                        fail_sleep = idle_interval
+                    else:
+                        sleep(fail_sleep)
+                        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
                 if resolution.state != ResolverState.OWED_UNSATISFIED:
                     stamp()
@@ -723,6 +732,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         )
                         commit_gate.cleanup_permit(captured)
                         stamp()
+                        if not recv_api.consume_boundary_complete(store, agent, record):
+                            sleep(fail_sleep)
+                            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                         continue
                     resolution = commit_gate.resolve(record)
                     if resolution.terminal:
@@ -732,10 +744,17 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             if resolution.compliance_success:
                                 commit_gate.mark_satisfied(key)
                             commit_gate.cleanup_permit(captured)
-                            _runtime_idle_if_terminal(finalized)
+                            consumed = _runtime_idle_if_consumed(record)
                             stamp()
-                            turns += 1
-                            if max_turns is not None and turns >= max_turns:
+                            if consumed:
+                                turns += 1
+                            else:
+                                sleep(fail_sleep)
+                                fail_sleep = min(
+                                    max_idle_interval,
+                                    fail_sleep * 2.0,
+                                )
+                            if consumed and max_turns is not None and turns >= max_turns:
                                 return turns
                         else:
                             if finalized.reason == "finalization CAS contention exhausted":
@@ -754,7 +773,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 if purpose is None:
                     if commit_gate.dispatch_exhausted(key):
                         _guard_advance()
-                        disposition = commit_gate.fail_delivery_or_block(
+                        commit_gate.fail_delivery_or_block(
                             record,
                             key,
                             reason=(
@@ -763,9 +782,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             ),
                             expected_revision=resolution.scoped_revision,
                         )
-                        _runtime_idle_if_terminal(disposition)
+                        consumed = _runtime_idle_if_consumed(record)
                         stamp()
-                        fail_sleep = idle_interval
+                        if consumed:
+                            fail_sleep = idle_interval
+                        else:
+                            sleep(fail_sleep)
+                            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     else:
                         stamp()
                         sleep(fail_sleep)
@@ -821,12 +844,16 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         if resolution.compliance_success:
                             commit_gate.mark_satisfied(key)
                         commit_gate.cleanup_permit(permit)
-                        _runtime_idle_if_terminal(finalized)
+                        consumed = _runtime_idle_if_consumed(record)
                         stamp()
-                        last_hb = clock()
-                        fail_sleep = idle_interval
-                        turns += 1
-                        if max_turns is not None and turns >= max_turns:
+                        if consumed:
+                            last_hb = clock()
+                            fail_sleep = idle_interval
+                            turns += 1
+                        else:
+                            sleep(fail_sleep)
+                            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                        if consumed and max_turns is not None and turns >= max_turns:
                             return turns
                         continue
                     if finalized.reason == "finalization CAS contention exhausted":
@@ -856,10 +883,21 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                     if resolution.compliance_success:
                                         commit_gate.mark_satisfied(key)
                                     commit_gate.cleanup_permit(permit)
-                                    _runtime_idle_if_terminal(finalized)
+                                    consumed = _runtime_idle_if_consumed(record)
                                     stamp()
-                                    turns += 1
-                                    if max_turns is not None and turns >= max_turns:
+                                    if consumed:
+                                        turns += 1
+                                    else:
+                                        sleep(fail_sleep)
+                                        fail_sleep = min(
+                                            max_idle_interval,
+                                            fail_sleep * 2.0,
+                                        )
+                                    if (
+                                        consumed
+                                        and max_turns is not None
+                                        and turns >= max_turns
+                                    ):
                                         return turns
                                     continue
                                 if (
@@ -908,10 +946,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         )
                         commit_gate.cleanup_permit(permit)
                         stamp()
+                        if not recv_api.consume_boundary_complete(store, agent, record):
+                            sleep(fail_sleep)
+                            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                         continue
                 if commit_gate.dispatch_exhausted(key) and not action_infra:
                     _guard_advance()
-                    disposition = commit_gate.fail_delivery_or_block(
+                    commit_gate.fail_delivery_or_block(
                         record,
                         key,
                         reason=(
@@ -920,10 +961,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         ),
                         expected_revision=resolution.scoped_revision,
                     )
-                    _runtime_idle_if_terminal(disposition)
+                    consumed = _runtime_idle_if_consumed(record)
                     commit_gate.cleanup_permit(permit)
                     stamp()
-                    fail_sleep = idle_interval
+                    if consumed:
+                        fail_sleep = idle_interval
+                    else:
+                        sleep(fail_sleep)
+                        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
                 sleep(fail_sleep)
                 fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
@@ -938,15 +983,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             }
         ):
             _guard_advance()
-            finalized = commit_gate.finalize(
+            commit_gate.finalize(
                 record,
                 legacy_gate_resolution,
                 expected_revision=legacy_gate_resolution.ledger_revision,
             )
-            if finalized.allows_legacy_commit:
+            if _runtime_idle_if_consumed(record):
                 store.clear_attempt(agent, record.get("id"))
                 store.gc_attempts_below(agent, store.cursor(agent))
-                _runtime_idle()
                 stamp()
                 last_hb = clock()
                 fail_sleep = idle_interval
@@ -1015,15 +1059,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             )
             if authorized.terminal:
                 _guard_advance()
-                finalized = commit_gate.finalize(
+                commit_gate.finalize(
                     record,
                     authorized,
                     expected_revision=authorized.ledger_revision,
                 )
-                if finalized.terminal:
+                if _runtime_idle_if_consumed(record):
                     store.clear_attempt(agent, record.get("id"))
                     store.gc_attempts_below(agent, store.cursor(agent))
-                    _runtime_idle()
                     stamp()
                     fail_sleep = idle_interval
                     continue
@@ -1180,15 +1223,15 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
         if on_runtime_idle is not None:
             on_runtime_idle()
 
-    def _runtime_idle_if_terminal(resolution) -> None:
-        if resolution is not None and (
-            resolution.terminal or resolution.allows_legacy_commit
-        ):
+    def _runtime_idle_if_consumed(record: dict) -> bool:
+        consumed = recv_api.consume_boundary_complete(store, agent, record)
+        if consumed:
             _runtime_idle()
+        return consumed
 
-    def _settle_retry_exhaustion(*args, **kwargs):
-        settled = commit_gate.settle_retry_exhaustion(*args, **kwargs)
-        _runtime_idle_if_terminal(settled)
+    def _settle_retry_exhaustion(record: dict, *args, **kwargs):
+        settled = commit_gate.settle_retry_exhaustion(record, *args, **kwargs)
+        _runtime_idle_if_consumed(record)
         return settled
 
     while True:
@@ -1241,8 +1284,8 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     if finalized.state != ResolverState.INDETERMINATE:
                         if resolution.key is not None and resolution.compliance_success:
                             commit_gate.mark_satisfied(resolution.key)
-                        _runtime_idle_if_terminal(finalized)
-                        return turns
+                        if _runtime_idle_if_consumed(record):
+                            return turns
                     if (
                         resolution.key is not None
                         and finalized.reason == "finalization CAS contention exhausted"
@@ -1293,7 +1336,12 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                             permit=captured,
                         )
                         commit_gate.cleanup_permit(captured)
-                        return turns
+                        if recv_api.consume_boundary_complete(store, agent, record):
+                            return turns
+                        _stamp()
+                        sleep(fail_sleep)
+                        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                        continue
                     if commit_gate.retry_captured_operation(captured, record):
                         commit_gate.mark_captured_operation_succeeded(captured)
                     else:
@@ -1306,9 +1354,9 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                             if resolved.compliance_success:
                                 commit_gate.mark_satisfied(key)
                             commit_gate.cleanup_permit(captured)
-                            _runtime_idle_if_terminal(finalized)
-                            turns += 1
-                            return turns
+                            if _runtime_idle_if_consumed(record):
+                                turns += 1
+                                return turns
                         if finalized.reason == "finalization CAS contention exhausted":
                             _settle_retry_exhaustion(
                                 record,
@@ -1323,7 +1371,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 purpose = commit_gate.next_dispatch_purpose(key)
                 if purpose is None:
                     if commit_gate.dispatch_exhausted(key):
-                        disposition = commit_gate.fail_delivery_or_block(
+                        commit_gate.fail_delivery_or_block(
                             record,
                             key,
                             reason=(
@@ -1332,8 +1380,12 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                             ),
                             expected_revision=resolution.scoped_revision,
                         )
-                        _runtime_idle_if_terminal(disposition)
-                        return turns
+                        if _runtime_idle_if_consumed(record):
+                            return turns
+                        _stamp()
+                        sleep(fail_sleep)
+                        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                        continue
                     _stamp()
                     sleep(fail_sleep)
                     continue
@@ -1385,9 +1437,9 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                         if resolved.compliance_success:
                             commit_gate.mark_satisfied(key)
                         commit_gate.cleanup_permit(permit)
-                        _runtime_idle_if_terminal(finalized)
-                        turns += 1
-                        return turns
+                        if _runtime_idle_if_consumed(record):
+                            turns += 1
+                            return turns
                     if finalized.reason == "finalization CAS contention exhausted":
                         _settle_retry_exhaustion(
                             record,
@@ -1405,7 +1457,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
                 if commit_gate.dispatch_exhausted(key) and not action_infra:
-                    disposition = commit_gate.fail_delivery_or_block(
+                    commit_gate.fail_delivery_or_block(
                         record,
                         key,
                         reason=(
@@ -1415,8 +1467,12 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                         expected_revision=resolved.scoped_revision,
                     )
                     commit_gate.cleanup_permit(permit)
-                    _runtime_idle_if_terminal(disposition)
-                    return turns
+                    if _runtime_idle_if_consumed(record):
+                        return turns
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
                 sleep(fail_sleep)
                 fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                 continue
@@ -1428,13 +1484,12 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 "no_admission_disposition_pending",
             }
         ):
-            finalized = commit_gate.finalize(
+            commit_gate.finalize(
                 record,
                 legacy_gate_resolution,
                 expected_revision=legacy_gate_resolution.ledger_revision,
             )
-            if finalized.allows_legacy_commit:
-                _runtime_idle()
+            if _runtime_idle_if_consumed(record):
                 turns += 1
                 return turns
             _stamp()
@@ -1452,13 +1507,12 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 legacy_gate_resolution,
             )
             if authorized.terminal:
-                finalized = commit_gate.finalize(
+                commit_gate.finalize(
                     record,
                     authorized,
                     expected_revision=authorized.ledger_revision,
                 )
-                if finalized.terminal:
-                    _runtime_idle_if_terminal(finalized)
+                if _runtime_idle_if_consumed(record):
                     return turns
                 _stamp()
                 sleep(fail_sleep)
@@ -1482,12 +1536,12 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     sleep(fail_sleep)
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
-                finalized = commit_gate.finalize(
+                commit_gate.finalize(
                     record,
                     retained,
                     expected_revision=retained.ledger_revision,
                 )
-                if not (finalized.allows_legacy_commit or finalized.terminal):
+                if not recv_api.consume_boundary_complete(store, agent, record):
                     _stamp()
                     sleep(fail_sleep)
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)

@@ -299,6 +299,39 @@ def test_continuous_loop_runtime_boundary_matrix(
         assert store.cursor("worker") == ""
 
 
+def test_unhandled_drive_exception_does_not_publish_idle_after_turn_start(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    store.send(
+        sender="lead",
+        recipient="worker",
+        body="raise after ownership starts",
+        kind="message",
+    )
+    writer = _writer(store.state_dir)
+
+    def drive(record: dict) -> bool:
+        writer.starting(message_id=record["id"], turn_id="turn-crashed")
+        raise RuntimeError("simulated wrapper crash")
+
+    with pytest.raises(RuntimeError, match="simulated wrapper crash"):
+        loop.run_loop(
+            store,
+            "worker",
+            drive,
+            clock=lambda: 0.0,
+            sleep=lambda _seconds: None,
+            max_polls=1,
+            on_runtime_idle=writer.idle,
+        )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == ""
+    assert view["record"]["phase"] == wr.PHASE_STARTING
+
+
 @pytest.mark.parametrize(
     ("ok", "expected_phase"),
     [
@@ -532,6 +565,107 @@ def test_terminal_cas_exhaustion_settlement_returns_runtime_and_supervisor_to_id
     assert plan["state"] == "HEALTHY_IDLE"
 
 
+def test_terminal_cas_exhaustion_with_pending_cursor_stays_terminal(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    sent = store.send(
+        sender="lead",
+        recipient="worker",
+        body="terminal but not consumed",
+        kind="question",
+    )
+    writer = _writer(store.state_dir)
+    key = object()
+
+    class PendingTerminalSettlementGate:
+        fence = "generation-1"
+
+        def admit_or_finalize(self, record: dict) -> Resolution:
+            writer.starting(message_id=record["id"], turn_id="turn-pending")
+            writer.terminal(wr.OUTCOME_SUCCESS)
+            return Resolution(
+                ResolverState.SATISFIED,
+                "validated terminal is ready to finalize",
+                key=key,
+                ledger_revision=1,
+            )
+
+        def finalize(self, _record: dict, resolution: Resolution, **_kwargs) -> Resolution:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "finalization CAS contention exhausted",
+                key=resolution.key,
+            )
+
+        def settle_retry_exhaustion(
+            self,
+            _record: dict,
+            current_key: object,
+            **_kwargs,
+        ) -> Resolution:
+            assert current_key is key
+            return Resolution(
+                ResolverState.SATISFIED,
+                "canonical terminal replayed; cursor projection remains pending",
+                key=key,
+            )
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("terminal replay must not redrive the model"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        commit_gate=PendingTerminalSettlementGate(),
+        on_runtime_idle=writer.idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == ""
+    assert sent.id != store.cursor("worker")
+    assert view["record"]["phase"] == wr.PHASE_TERMINAL
+
+    config = {
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "codex",
+                "wrapped": True,
+            }
+        }
+    }
+    plan = sup._plan_one(
+        "worker",
+        {
+            "protected": False,
+            "heartbeat_stale": False,
+            "heartbeat_age_seconds": 1.0,
+            "restart_request": None,
+        },
+        {
+            "readiness_seen": True,
+            "launching": False,
+            "backoff_next_epoch": 0.0,
+        },
+        config,
+        config["agents"]["worker"],
+        {
+            "runtime_status": wr.STATUS_VALID,
+            "runtime_record": view["record"],
+            "runtime_updated_age_seconds": view["updated_age_seconds"],
+            "runtime_progress_age_seconds": view["progress_age_seconds"],
+            "wrapper_state": "alive",
+            "managed_pids": [],
+            "kill_targets": [],
+        },
+        now_epoch=NOW,
+    )
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+
+
 def test_delivery_exhaustion_settlement_returns_runtime_to_idle(
     tmp_path: Path,
 ) -> None:
@@ -597,6 +731,71 @@ def test_delivery_exhaustion_settlement_returns_runtime_to_idle(
     assert store.cursor("worker") == sent.id
     assert view["record"]["phase"] == wr.PHASE_IDLE
     assert view["record"]["last_outcome"] == wr.OUTCOME_FAILED
+
+
+def test_delivery_exhaustion_with_pending_cursor_stays_terminal(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    store.send(
+        sender="lead",
+        recipient="worker",
+        body="delivery terminal is not yet consumed",
+        kind="question",
+    )
+    writer = _writer(store.state_dir)
+    key = object()
+
+    class PendingDeliveryGate:
+        fence = "generation-1"
+
+        def admit_or_finalize(self, record: dict) -> Resolution:
+            writer.starting(message_id=record["id"], turn_id="turn-delivery-pending")
+            writer.terminal(wr.OUTCOME_FAILED)
+            return Resolution(
+                ResolverState.OWED_UNSATISFIED,
+                "delivery is still owed",
+                key=key,
+                scoped_revision=1,
+            )
+
+        def captured_operation(self, _key: object) -> None:
+            return None
+
+        def next_dispatch_purpose(self, _key: object) -> None:
+            return None
+
+        def dispatch_exhausted(self, _key: object) -> bool:
+            return True
+
+        def fail_delivery_or_block(
+            self,
+            _record: dict,
+            current_key: object,
+            **_kwargs,
+        ) -> Resolution:
+            assert current_key is key
+            return Resolution(
+                ResolverState.DELIVERY_EXHAUSTED,
+                "canonical delivery terminal; cursor projection remains pending",
+                key=key,
+            )
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("delivery exhaustion must not redrive the model"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        commit_gate=PendingDeliveryGate(),
+        on_runtime_idle=writer.idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == ""
+    assert view["record"]["phase"] == wr.PHASE_TERMINAL
 
 
 def test_authorized_release_returns_runtime_to_idle(
@@ -703,6 +902,211 @@ def test_one_shot_runtime_boundary_matrix(
             "worker",
             scoped_request_id=request_id,
         )["record"]["id"] == sent.id
+
+
+def test_one_shot_committed_terminal_finalization_returns_runtime_to_idle(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    request_id = "rq-one-shot-finalized"
+    sent = store.send(
+        sender="lead",
+        recipient="worker",
+        body="already landed scoped work",
+        kind="question",
+        meta={"request_id": request_id},
+    )
+    writer = _writer(store.state_dir)
+    key = object()
+
+    class CommittedOneShotGate:
+        fence = "generation-1"
+
+        def admit_or_finalize(self, record: dict) -> Resolution:
+            writer.starting(message_id=record["id"], turn_id="turn-one-shot-finalized")
+            writer.terminal(wr.OUTCOME_SUCCESS)
+            return Resolution(
+                ResolverState.SATISFIED,
+                "validated scoped terminal",
+                key=key,
+                ledger_revision=1,
+            )
+
+        def finalize(self, record: dict, resolution: Resolution, **_kwargs) -> Resolution:
+            recv_api.commit(store, "worker", record)
+            return Resolution(
+                ResolverState.SATISFIED,
+                "scoped consume boundary committed",
+                key=resolution.key,
+            )
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("committed scoped work must not be redriven"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        only_request_id=request_id,
+        commit_gate=CommittedOneShotGate(),
+        on_runtime_idle=writer.idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == ""
+    assert store.thread_seen("worker", request_id) == sent.id
+    assert view["record"]["phase"] == wr.PHASE_IDLE
+
+
+def test_one_shot_terminal_cas_exhaustion_with_pending_thread_seen_stays_terminal(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    request_id = "rq-one-shot-pending"
+    store.send(
+        sender="lead",
+        recipient="worker",
+        body="scoped terminal is pending",
+        kind="question",
+        meta={"request_id": request_id},
+    )
+    writer = _writer(store.state_dir)
+    key = object()
+
+    class PendingOneShotSettlementGate:
+        fence = "generation-1"
+
+        def admit_or_finalize(self, record: dict) -> Resolution:
+            writer.starting(message_id=record["id"], turn_id="turn-one-shot-pending")
+            writer.terminal(wr.OUTCOME_SUCCESS)
+            return Resolution(
+                ResolverState.SATISFIED,
+                "validated scoped terminal is ready to finalize",
+                key=key,
+                ledger_revision=1,
+            )
+
+        def finalize(self, _record: dict, resolution: Resolution, **_kwargs) -> Resolution:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "finalization CAS contention exhausted",
+                key=resolution.key,
+            )
+
+        def settle_retry_exhaustion(
+            self,
+            _record: dict,
+            current_key: object,
+            **_kwargs,
+        ) -> Resolution:
+            assert current_key is key
+            return Resolution(
+                ResolverState.SATISFIED,
+                "canonical scoped terminal replayed; thread-seen remains pending",
+                key=key,
+            )
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("terminal replay must not redrive scoped work"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        only_request_id=request_id,
+        commit_gate=PendingOneShotSettlementGate(),
+        on_runtime_idle=writer.idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == ""
+    assert store.thread_seen("worker", request_id) == ""
+    assert view["record"]["phase"] == wr.PHASE_TERMINAL
+
+
+@pytest.mark.parametrize(
+    ("commit_projection", "expected_phase"),
+    [
+        (True, wr.PHASE_IDLE),
+        (False, wr.PHASE_TERMINAL),
+    ],
+    ids=["committed", "pending"],
+)
+def test_one_shot_delivery_terminal_runtime_requires_committed_thread_seen(
+    tmp_path: Path,
+    commit_projection: bool,
+    expected_phase: str,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    request_id = "rq-one-shot-delivery"
+    sent = store.send(
+        sender="lead",
+        recipient="worker",
+        body="scoped delivery exhaustion",
+        kind="question",
+        meta={"request_id": request_id},
+    )
+    writer = _writer(store.state_dir)
+    key = object()
+
+    class OneShotDeliveryGate:
+        fence = "generation-1"
+
+        def admit_or_finalize(self, record: dict) -> Resolution:
+            writer.starting(message_id=record["id"], turn_id="turn-one-shot-delivery")
+            writer.terminal(wr.OUTCOME_FAILED)
+            return Resolution(
+                ResolverState.OWED_UNSATISFIED,
+                "delivery is still owed",
+                key=key,
+                scoped_revision=1,
+            )
+
+        def captured_operation(self, _key: object) -> None:
+            return None
+
+        def next_dispatch_purpose(self, _key: object) -> None:
+            return None
+
+        def dispatch_exhausted(self, _key: object) -> bool:
+            return True
+
+        def fail_delivery_or_block(
+            self,
+            record: dict,
+            current_key: object,
+            **_kwargs,
+        ) -> Resolution:
+            assert current_key is key
+            if commit_projection:
+                recv_api.commit(store, "worker", record)
+            return Resolution(
+                ResolverState.DELIVERY_EXHAUSTED,
+                "canonical scoped delivery terminal",
+                key=key,
+            )
+
+    loop.run_loop(
+        store,
+        "worker",
+        lambda _record: pytest.fail("delivery exhaustion must not redrive scoped work"),
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_polls=1,
+        only_request_id=request_id,
+        commit_gate=OneShotDeliveryGate(),
+        on_runtime_idle=writer.idle,
+    )
+
+    view = wr.read_runtime(store.state_dir, "worker", now_epoch=NOW)
+    assert store.cursor("worker") == ""
+    assert store.thread_seen("worker", request_id) == (
+        sent.id if commit_projection else ""
+    )
+    assert view["record"]["phase"] == expected_phase
 
 
 @pytest.mark.parametrize(

@@ -4692,6 +4692,8 @@ def test_wrapped_idle_absent_wrapper_uses_existing_stale_recovery_path() -> None
         ("starting", 1.0, None, None, False, sup.NONE, "CLI_CHILD_STARTING"),
         ("starting", 31.0, None, None, False, sup.NONE, "CLI_CHILD_UNKNOWN"),
         ("terminal", 1.0, 1.0, "success", False, sup.NONE, "HEALTHY_WORKING"),
+        ("terminal", 2500.0, 2500.0, "success", False, sup.NONE, "CLI_CHILD_UNKNOWN"),
+        ("terminal", 1.0, None, "success", False, sup.NONE, "CLI_CHILD_UNKNOWN"),
         ("terminal", 1.0, 1.0, "failed", False, sup.NONE, "TURN_FAILED"),
         ("idle", 3000.0, None, None, True, sup.STUCK_RECOVER, "STUCK_OR_DEAD"),
     ],
@@ -4699,6 +4701,8 @@ def test_wrapped_idle_absent_wrapper_uses_existing_stale_recovery_path() -> None
         "starting-in-grace",
         "starting-after-grace",
         "terminal-success-finalizing",
+        "terminal-success-stale-progress",
+        "terminal-success-unclassified-progress",
         "terminal-failure",
         "idle-stale-heartbeat",
     ],
@@ -5729,6 +5733,150 @@ def test_wrapped_active_stall_recovery_authority_matrix(case: dict) -> None:
     assert plan["state"] == case["state"]
     if "reason" in case:
         assert case["reason"] in plan["reason"]
+
+
+def test_wrapped_active_live_brain_without_progress_below_threshold_is_non_green(
+) -> None:
+    elapsed = 60.0
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=elapsed,
+            progress_age=None,
+            progress_sequence=0,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=0,
+        runtime_progress_seen_epoch=NOW - elapsed,
+    )
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "claude",
+                "wrapped": True,
+                "stuck_after_seconds": 180,
+            }
+        },
+    }
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_wrap_snap(cli="claude"),
+        config=config,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_NO_PROGRESS"
+
+
+def test_wrapped_active_live_brain_with_invalid_progress_sequence_is_unknown(
+) -> None:
+    runtime = _wrapper_runtime_view(
+        phase="active",
+        updated_age=60.0,
+        progress_age=1.0,
+        progress_sequence=2,
+    )
+    runtime["record"]["progress_sequence"] = "2"
+
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=runtime,
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap(cli="claude"),
+        config={
+            **_WRAP_CONFIG,
+            "agents": {
+                "worker": {
+                    "auto_restart": True,
+                    "cli": "claude",
+                    "wrapped": True,
+                }
+            },
+        },
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    ("include_value", "value", "expected_action"),
+    [
+        (True, True, sup.STUCK_RECOVER),
+        (True, False, sup.NONE),
+        (True, "true", sup.NONE),
+        (True, "false", sup.NONE),
+        (True, "", sup.NONE),
+        (True, 0, sup.NONE),
+        (True, 1, sup.NONE),
+        (True, None, sup.NONE),
+        (False, None, sup.NONE),
+    ],
+    ids=[
+        "boolean-true",
+        "boolean-false",
+        "string-true",
+        "string-false",
+        "empty-string",
+        "integer-zero",
+        "integer-one",
+        "null",
+        "absent",
+    ],
+)
+def test_wrapped_low_stuck_opt_in_requires_literal_boolean_true(
+    include_value: bool,
+    value: object,
+    expected_action: str,
+) -> None:
+    agent_config = {
+        "auto_restart": True,
+        "cli": "codex",
+        "wrapped": True,
+        "stuck_after_seconds": 120,
+        "turn_watchdog": {"enabled": False},
+    }
+    if include_value:
+        agent_config["allow_low_stuck_after"] = value
+    config = {**_WRAP_CONFIG, "agents": {"worker": agent_config}}
+    elapsed = 130.0
+    report = _report(
+        heartbeat_stale=True,
+        heartbeat_age_seconds=elapsed,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=elapsed,
+            progress_age=elapsed,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - elapsed,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert plan["action"] == expected_action
+    assert plan["state"] == "CLI_CHILD_STALLED"
 
 
 @pytest.mark.parametrize(
