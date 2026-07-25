@@ -3515,3 +3515,32 @@ def test_wrap_loop_mode_unknown_cli_returns_2(tmp_path) -> None:
     rc = cli.main(["--root", str(tmp_path), "wrap", "--for", "beta",
                    "--cli", "gemini", "--loop", "--", "gemini"])
     assert rc == 2
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "& ($env:AGENTTALK_PY) -m agenttalk reply --to alpha --body ok",
+        "& $env:AGENTTALK_PY -m agenttalk reply --to alpha --body ok",
+        "$env:AGENTTALK_PY -m agenttalk reply --to alpha --body ok",
+        "%AGENTTALK_PY% -m agenttalk reply --to alpha --body ok",
+        "python -m agenttalk reply --to alpha --body ok",
+    ],
+    ids=[
+        "pwsh-parenthesized-env",
+        "pwsh-call-env",
+        "pwsh-bare-env",
+        "cmd-env",
+        "plain-python",
+    ],
+)
+def test_bus_command_verb_recognizes_env_interpreter_forms(command: str) -> None:
+    """Every interpreter spelling of a real `agenttalk reply` must classify as a bus write.
+
+    A PowerShell call tail may parenthesize the interpreter (`& ($env:AGENTTALK_PY)`),
+    which leaves a leading paren on the program token. When that form is not recognized,
+    `_bus_command_verb()` returns None, a failed reply is never attributed to a bus
+    write, and the wrapper can commit the inbound with no durable reply -- the same
+    silent-loss class this module guards against.
+    """
+    assert run._bus_command_verb(command) == "reply"

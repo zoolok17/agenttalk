@@ -2304,7 +2304,33 @@ class DetectionCommitGate:
         ):
             if _correlation(message.meta) != correlation_id:
                 continue
-            if message.kind in {"rescind", "release", "end", "wake"}:
+            if message.kind == "rescind":
+                if message.sender == requester:
+                    # A requester rescind cancels the obligation, so there is no terminal
+                    # transition left to prove and a later exact-anchored response is NOT
+                    # landed work. `_resolve_replay` already calls this SUPERSEDED, but it
+                    # early-outs as CLASSIFICATION_UNKNOWN for any opener that is not a
+                    # `question` -- so review-request/proposal openers reach here with no
+                    # rescind protection at all. Decline the proof instead of reporting a
+                    # completed turn for work the requester called off.
+                    #
+                    # Residual (deliberate): an exact-key `supersedes` rescind is scoped to
+                    # one generation, and the admission key that would identify it is not
+                    # available in this function. We decline the proof either way -- a
+                    # missed proof degrades to the documented residual path, whereas a
+                    # wrong proof commits an inbound as complete, so this errs toward the
+                    # recoverable failure.
+                    meta = message.meta if isinstance(message.meta, dict) else {}
+                    if meta.get("supersedes") is None:
+                        return LandedResponseResult()
+                    return LandedResponseResult(
+                        unavailable_reason=(
+                            "requester superseded an exact generation; "
+                            "landed-response proof is not decidable here"
+                        )
+                    )
+                continue
+            if message.kind in {"release", "end", "wake"}:
                 continue
             transition = threads._classify_event(
                 opener_kind,

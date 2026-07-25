@@ -299,7 +299,12 @@ def _program_basename(token: str) -> str:
 def _python_program_kind(token: str) -> str | None:
     env_token = _clean_argument_token(token).lstrip("&").casefold()
     base = _program_basename(token)
-    if env_token in _PYTHON_ENV_COMMAND_TOKENS:
+    # A PowerShell call tail can parenthesize the interpreter (`& ($env:AGENTTALK_PY)`),
+    # leaving a leading paren that `_clean_argument_token()` does not strip -- so compare
+    # the fully cleaned program form too. Missing this makes `_bus_command_verb()` return
+    # None for a real `agenttalk reply`, and a failed bus write then goes unattributed:
+    # exactly the commit-without-a-durable-reply this module exists to prevent.
+    if env_token in _PYTHON_ENV_COMMAND_TOKENS or base in _PYTHON_ENV_COMMAND_TOKENS:
         return "python"
     if base in _PY_LAUNCHER_COMMAND_TOKENS:
         return "py"

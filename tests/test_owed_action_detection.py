@@ -10908,3 +10908,76 @@ def test_reassignment_after_failed_delivery_gets_fresh_generation_and_budget(
         admitted.key.delivery_generation + 1
     )
     assert source.delivery_status("q-reassigned-recovery", "alpha") is None
+
+
+@pytest.mark.parametrize(
+    "rescind_meta, expect_proof",
+    [
+        (None, True),
+        ({}, False),
+        ({"supersedes": "exact-generation"}, False),
+    ],
+    ids=[
+        "no-rescind-proof-stands",
+        "unscoped-rescind-declines",
+        "scoped-supersession-declines",
+    ],
+)
+def test_requester_rescind_blocks_landed_response_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rescind_meta: dict | None,
+    expect_proof: bool,
+) -> None:
+    """A response landing AFTER a requester rescind is not landed terminal work.
+
+    `_resolve_replay` already calls such a rescind SUPERSEDED, but it early-outs as
+    CLASSIFICATION_UNKNOWN for any opener that is not a `question` -- so a
+    `review-request` opener reaches the landed-response resolver with no rescind
+    protection, and an exact-anchored later reply was accepted as proof of completed
+    work for a request the requester had called off.
+
+    The no-rescind leg is the differential control: it proves this fixture really does
+    yield a proof when nothing cancels the request, so the two declining legs are
+    evidence about the rescind and not about a fixture that never proved anything.
+    """
+    store = _store(tmp_path)
+    monkeypatch.delenv("AGENTTALK_COMMIT_GATE_POLICY", raising=False)
+    gate = DetectionCommitGate.from_environment(store, "beta", fence="wrapper-1")
+    request_id = "rq-rescind-then-answer"
+    inbound = store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="review-request",
+        body="Review.",
+        meta={"request_id": request_id},
+    )
+    # Capture the delivered record BEFORE the rescind, exactly as production does: the
+    # inbound is handed to the wrapper and only then does the requester call it off.
+    record = recv_api.next_record(store, "beta")
+    assert record is not None
+    assert record["id"] == inbound.id
+
+    if rescind_meta is not None:
+        store.send(
+            sender="alpha",
+            recipient="beta",
+            kind="rescind",
+            body="withdrawn before the answer landed",
+            meta={"request_id": request_id, **rescind_meta},
+        )
+
+    store.send(
+        sender="beta",
+        recipient="alpha",
+        kind="review-result",
+        body="HOLD",
+        meta={
+            "status": "rejected",
+            "request_id": request_id,
+            "in_reply_to": inbound.id,
+        },
+    )
+
+    result = gate.resolve_landed_response(record)
+    assert (result.proof is not None) is expect_proof
