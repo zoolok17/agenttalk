@@ -20,10 +20,9 @@ updates:
       - dependencies
       - ci
 
-  # We have no runtime deps and only a small `[dev]` / `[security]`
-  # extras set. Dependabot will surface security-only updates here
-  # (so anyone using `pip install -e ".[dev]"` for contributing
-  # picks up patched pytest / ruff / bandit / pip-audit).
+  # We keep one narrow runtime dependency plus small `[dev]` / `[security]`
+  # extras. Dependabot surfaces security updates for the runtime package and
+  # for contributors using `pip install -e ".[dev]"`.
   - package-ecosystem: pip
     directory: /
     schedule:

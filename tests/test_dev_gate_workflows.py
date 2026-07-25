@@ -12,7 +12,8 @@ def test_ci_voting_jobs_invoke_only_the_committed_gate_plan() -> None:
     assert workflow.count("python -I -m agenttalk dev-gate") == 2
     assert "python -m agenttalk dev-gate" not in workflow
     assert workflow.count("python -I -m pip install -r dev-gate-requirements.txt") == 2
-    assert workflow.count("python -I -m pip install --no-deps --no-build-isolation .") == 2
+    assert workflow.count("python -I -m pip install --no-build-isolation .") == 2
+    assert "--no-deps" not in workflow
     assert "pip install -e" not in workflow
     for escaped_tool_argv in (
         "python -m pytest",

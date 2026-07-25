@@ -86,8 +86,8 @@ Record:
 ### Phase 3 — "trust": per-agent identity / authz RFC (#19)
 RFC committed (`docs/rfc-identity-authz.md`); **Phase A delivered as
 `0.16.0`** (see below). Phases B/C/D remain: B is the operator-gated
-stdlib-crypto fork (stay stdlib-only / external signer / relax), C is
-real authz, D is replay/deletion hardening.
+crypto fork (no crypto runtime dependency / external signer / add one),
+C is real authz, and D is replay/deletion hardening.
 
 #### ✅ Phase 3a (RFC Phase A) — `0.16.0` "trusted-team safety" — DELIVERED 2026-06-05
 Mission `trusted-team-safety-0160` (spec-kitty, 4 WPs, single serial
