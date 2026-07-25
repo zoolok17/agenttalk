@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the agent's owed/in-flight bus state) before a manual or automatic context compaction, and
   re-injects a reload pointer on resume. `save --hook` always exits 0 so it can never block a
   compaction; `resume --hook` emits exactly one SessionStart envelope. (#71)
+- **`supervise --install-activity-hook` now wires the checkpoint hooks too.** The same operator
+  action that installs the Claude heartbeat `PostToolUse` hook also installs `PreCompact`
+  (checkpoint save) and `SessionStart`/`compact` (checkpoint resume), reporting per-hook
+  `installed` / `already` / `skipped (reason)` so a partial or malformed install can never be
+  presented as blanket success. A managed entry whose `type` is missing or wrong is repaired
+  rather than reported as already-installed. The installed commands carry a fail-soft fallback so
+  an `agenttalk` predating the `checkpoint` subcommand can never exit non-zero and block a
+  compaction, and `--codex` / `.codex/hooks.json` remains heartbeat-only. (#71)
 - **"Red-by-default until evidence exists" DoD forcing-gate.** `close` now supports pluggable
   Definition-of-Done dimensions that HOLD until independent, revision-bound evidence exists — the
   assurance dimension (inc-1) and the knowledge dimension (inc-2). (#60)
@@ -57,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vars are scoped so `reply` resolves, and the reasoning-model output cap is raised. (#11, #38, #56)
 - **De-flaked the four timing/lock/socket Windows-CI tests** that taxed every merge, and widened
   the Windows dev-gate leg timeout + the shared pytest wheel-leg cap. (#59, #67, #54)
+- **De-flaked the config-lock acquisition budgets that red-blocked merges under CI load.** A
+  concurrency property test was unintentionally inheriting the product `_config_lock()` default
+  instead of a test budget, and two marker-recovery tests used sub-second wall-clock ceilings.
+  Tests only — every assertion, the 24-writer concurrency, and the sub-second budgets on the
+  negative/timeout cases (where the budget *is* the property) are unchanged, and the product
+  default is untouched. (#59)
 
 ## [0.78.1] - 2026-07-15
 
