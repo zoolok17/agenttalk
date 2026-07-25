@@ -425,13 +425,37 @@ def test_make_cadence_drive_bus_config_blocked_output_false_no_heartbeat(
             "codex",
             st,
             ["codex"],
-            spawn=lambda _a, _i, o=output: _codex_cadence_bus_output_lines(o),
+            spawn=lambda _a, _i, o=output: _codex_cadence_bus_output_lines(
+                o,
+                exit_code=1,
+            ),
             clock=lambda: 0.0,
             render=False,
         )
         assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
         assert s.read_heartbeat("beta") is None
         assert s.dead_letter_attempts("beta")["messages"] == {}
+
+
+def test_make_cadence_drive_successful_reply_body_marker_is_not_failure(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cd = run.make_cadence_drive(
+        s,
+        "beta",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=lambda _a, _i: _codex_cadence_bus_output_lines(
+            "checkpoint.py raised FileNotFoundError",
+            exit_code=0,
+        ),
+        clock=lambda: 0.0,
+        render=False,
+    )
+
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is True
 
 
 def test_make_cadence_drive_required_bus_unknown_nonzero_false_no_heartbeat(
