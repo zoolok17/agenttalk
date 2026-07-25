@@ -10236,6 +10236,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     from .wrapper import run as wrapper_run
     from .wrapper.health import WrapperHealthWriter
     from .wrapper import session as wsession
+    from .wrapper_runtime import WrapperRuntimeWriter
 
     # One observational generation spans this wrapper process.  It is safe to
     # expose to the child (unlike the lead-loop lease id): it grants no mailbox
@@ -10322,6 +10323,11 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     )
     health_writer = WrapperHealthWriter(
         store, agent, cli, mode=health_mode, min_interval=min_interval)
+    runtime_writer = WrapperRuntimeWriter(
+        store.state_dir,
+        agent,
+        wrapper_generation,
+    )
     try:
         drive = wrapper_run.make_drive(
             store, agent, cli, state, base_argv, sender=sender,
@@ -10329,6 +10335,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             persist=lambda st: wsession.save_session(store, agent, st),
             turn_watchdog=turn_watchdog,
             health_writer=health_writer,
+            runtime_writer=runtime_writer,
             work_heartbeat=work_heartbeat,
             wrapper_generation=wrapper_generation,
             backend_profile=backend_profile,
@@ -10401,6 +10408,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             store, agent, cli, state, base_argv, sender=sender,
             min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
+            runtime_writer=runtime_writer,
             work_heartbeat=work_heartbeat,
             lease_lost_exceptions=(_LeadLoopLeaseLost,))
         cadence_health = _cadence_health_notifier(store, agent)
@@ -10463,6 +10471,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             store.write_lead_loop_cadence(agent, _cad.apply_tick_success(
                 cstate, now_epoch=now_epoch, reminded_keys=reminded_keys,
                 escalation_keys=escalation_keys))
+            runtime_writer.idle()
             return wloop.CadenceResult(ran=True, ok=True, drove_turn=True)
 
         cadence_hook = _cadence
@@ -10491,6 +10500,12 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             cadence=cadence_hook,  # WP3 proactive sweep (lead-loop only)
             on_health_idle=health_writer.idle,
             on_health_parked=health_writer.parked,  # #58: config-blocked park is visible, not a frozen 'idle'
+            on_runtime_idle=runtime_writer.idle,
+            on_runtime_dead_letter=(
+                lambda record: runtime_writer.dead_letter(
+                    message_id=record.get("id")
+                )
+            ),
             capacity_refresh=capacity_refresh,
             wrapper_generation=wrapper_generation,
             commit_gate=commit_gate,

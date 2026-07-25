@@ -236,6 +236,9 @@ def test_heartbeat_time_evidence_controls_coordination_availability(
     expects_stall: bool,
 ) -> None:
     store, config = _team(tmp_path)
+    # This test isolates heartbeat timestamp policy. Wrapped agents require the
+    # separate strict runtime/CLI-child evidence exercised in test_supervisor.
+    config["agents"]["dev-2"].update({"wrapped": False, "activity_hook": True})
     _open_wait(store)
     _heartbeat(store, "dev-2", at=NOW + heartbeat_offset)
 

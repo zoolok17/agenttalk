@@ -7,7 +7,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agenttalk import cli, health as hm, supervisor as sup, web
+from agenttalk import (
+    cli,
+    health as hm,
+    supervisor as sup,
+    web,
+    wrapper_runtime as wrt,
+)
 from agenttalk.store import Store
 from agenttalk.wrapper import run, session
 
@@ -45,6 +51,39 @@ def _ready_state(**overrides) -> dict:
     st = {"readiness_seen": True, "resume_available": True, "launching": False}
     st.update(overrides)
     return {"agents": {"beta": st}}
+
+
+def _bound_idle_runtime(store: Store, *, now_epoch: float = NOW) -> tuple[dict, list]:
+    wrapper_pid = 555
+    wrapper_start = _iso(now_epoch - 100)
+    nonce = "A" * 32
+    wrt.WrapperRuntimeWriter(
+        store.state_dir,
+        "beta",
+        "health-test-wrapper",
+        wrapper_pid=wrapper_pid,
+        wrapper_start=wrapper_start,
+        clock=lambda: now_epoch,
+    ).idle()
+    state = _ready_state(
+        launcher_pid=wrapper_pid,
+        launcher_start=wrapper_start,
+        launcher_nonce=nonce,
+        launcher_nonce_injected=True,
+        launcher_nonce_source="agenttalk_global_arg",
+    )
+    snapshot = [{
+        "pid": wrapper_pid,
+        "parent_pid": 1,
+        "name": "python.exe",
+        "command_line": (
+            "python -m agenttalk "
+            f"--supervisor-launch-nonce {nonce} "
+            f"--root {store.root} wrap --for beta --cli claude --loop"
+        ),
+        "start_time": wrapper_start,
+    }]
+    return state, snapshot
 
 
 def _rec(body: str = "body") -> dict:
@@ -100,12 +139,13 @@ def test_health_write_read_schema_is_stable_and_atomic(tmp_path: Path) -> None:
 def test_corrupt_health_degrades_unknown_and_supervisor_does_not_crash(tmp_path: Path) -> None:
     s = _store(tmp_path)
     s.health_path("beta").write_text('{"schema_version":', encoding="utf-8")
+    state, snapshot = _bound_idle_runtime(s)
 
     report = sup.build_report(s, now_epoch=NOW, supervisor_config=_wrapped_cfg())
     assert report["agents"]["beta"]["health"]["state"] == hm.STATE_UNKNOWN
 
-    plan = sup.plan_actions(report, _ready_state(), _wrapped_cfg(), now_epoch=NOW,
-                            snapshot=[])["agents"]["beta"]
+    plan = sup.plan_actions(report, state, _wrapped_cfg(), now_epoch=NOW,
+                            snapshot=snapshot)["agents"]["beta"]
     assert plan["action"] == sup.STUCK_RECOVER
     assert plan["health"]["state"] == hm.STATE_UNKNOWN
 
@@ -113,6 +153,7 @@ def test_corrupt_health_degrades_unknown_and_supervisor_does_not_crash(tmp_path:
 def test_stale_health_with_fresh_heartbeat_is_ignored_with_warning(tmp_path: Path) -> None:
     s = _store(tmp_path)
     _set_hb(s, "beta", NOW - 5)
+    state, snapshot = _bound_idle_runtime(s)
     s.write_health("beta", hm.build_snapshot(
         agent="beta",
         cli="claude",
@@ -129,8 +170,8 @@ def test_stale_health_with_fresh_heartbeat_is_ignored_with_warning(tmp_path: Pat
     assert h["state"] == hm.STATE_UNKNOWN
     assert "health_older_than_heartbeat" in h["warnings"]
 
-    plan = sup.plan_actions(report, _ready_state(), _wrapped_cfg(), now_epoch=NOW,
-                            snapshot=[])["agents"]["beta"]
+    plan = sup.plan_actions(report, state, _wrapped_cfg(), now_epoch=NOW,
+                            snapshot=snapshot)["agents"]["beta"]
     assert plan["action"] == sup.NONE
     assert plan["state"] == "HEALTHY_IDLE"
 
@@ -140,6 +181,7 @@ def test_future_dated_working_health_degrades_unknown_and_does_not_delay_recover
 ) -> None:
     s = _store(tmp_path)
     _set_hb(s, "beta", NOW - 1000)
+    state, snapshot = _bound_idle_runtime(s)
     s.write_health("beta", hm.build_snapshot(
         agent="beta",
         cli="claude",
@@ -157,8 +199,8 @@ def test_future_dated_working_health_degrades_unknown_and_does_not_delay_recover
     assert h["state"] == hm.STATE_UNKNOWN
     assert "health_future_timestamp" in h["warnings"]
 
-    plan = sup.plan_actions(report, _ready_state(), cfg, now_epoch=NOW,
-                            snapshot=[])["agents"]["beta"]
+    plan = sup.plan_actions(report, state, cfg, now_epoch=NOW,
+                            snapshot=snapshot)["agents"]["beta"]
     assert plan["action"] == sup.STUCK_RECOVER
     assert plan["state"] == "STUCK_OR_DEAD"
 
@@ -189,6 +231,7 @@ def test_working_health_with_stale_heartbeat_does_not_delay_recovery_or_restart(
 ) -> None:
     s = _store(tmp_path)
     _set_hb(s, "beta", NOW - 1000)
+    state, snapshot = _bound_idle_runtime(s)
     s.write_health("beta", hm.build_snapshot(
         agent="beta",
         cli="claude",
@@ -202,8 +245,8 @@ def test_working_health_with_stale_heartbeat_does_not_delay_recovery_or_restart(
 
     cfg = _wrapped_cfg()
     report = sup.build_report(s, now_epoch=NOW, supervisor_config=cfg)
-    plan = sup.plan_actions(report, _ready_state(), cfg, now_epoch=NOW,
-                            snapshot=[])["agents"]["beta"]
+    plan = sup.plan_actions(report, state, cfg, now_epoch=NOW,
+                            snapshot=snapshot)["agents"]["beta"]
     assert plan["action"] == sup.STUCK_RECOVER
     assert plan["state"] == "STUCK_OR_DEAD"
     assert plan["health"]["state"] == hm.STATE_WORKING_SILENT
@@ -219,8 +262,8 @@ def test_working_health_with_stale_heartbeat_does_not_delay_recovery_or_restart(
         "force_protected_authorized": False,
     })
     report2 = sup.build_report(s, now_epoch=NOW, supervisor_config=cfg)
-    plan2 = sup.plan_actions(report2, _ready_state(), cfg, now_epoch=NOW,
-                             snapshot=[])["agents"]["beta"]
+    plan2 = sup.plan_actions(report2, state, cfg, now_epoch=NOW,
+                             snapshot=snapshot)["agents"]["beta"]
     assert plan2["action"] == sup.RELAUNCH
     assert plan2["clear_marker"] is None
     assert plan2["next_state"]["restart_request_state"] == "applied_pending_readiness"
@@ -418,7 +461,9 @@ def test_status_report_plan_and_web_surface_health_as_advisory(
     capsys,
 ) -> None:
     s = _store(tmp_path)
-    _set_hb(s, "beta", time.time())
+    now = time.time()
+    _set_hb(s, "beta", now)
+    state, snapshot = _bound_idle_runtime(s, now_epoch=now)
     s.write_health("beta", hm.build_snapshot(
         agent="beta",
         cli="codex",
@@ -427,10 +472,10 @@ def test_status_report_plan_and_web_surface_health_as_advisory(
         reason_code="idle_waiting",
     ))
 
-    report = sup.build_report(s, now_epoch=time.time(), supervisor_config=_wrapped_cfg())
+    report = sup.build_report(s, now_epoch=now, supervisor_config=_wrapped_cfg())
     assert report["agents"]["beta"]["health"]["state"] == hm.STATE_IDLE_WAITING
-    plan = sup.plan_actions(report, _ready_state(), _wrapped_cfg(), now_epoch=time.time(),
-                            snapshot=[])["agents"]["beta"]
+    plan = sup.plan_actions(report, state, _wrapped_cfg(), now_epoch=now,
+                            snapshot=snapshot)["agents"]["beta"]
     assert plan["health"] == {
         "state": hm.STATE_IDLE_WAITING,
         "age_seconds": plan["health"]["age_seconds"],

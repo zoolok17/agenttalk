@@ -859,14 +859,30 @@ resolved
 
 ```text
 HEALTHY_IDLE
+HEALTHY_WORKING
+CLI_CHILD_MISSING
+CLI_CHILD_DEAD
+CLI_CHILD_STALLED
+CLI_CHILD_UNKNOWN
+TURN_FAILED
 MANUAL_RESTART
 STUCK_RECOVER
 LAUNCH_BLOCKED
 CONFIG_BLOCKED
 ```
 
-The exact supervisor tokens are planner diagnostics. Treat heartbeat freshness
-and the generated plan as the operational source.
+The exact supervisor tokens are planner diagnostics. Manual listeners use
+heartbeat freshness. Wrapped listeners also publish a strict turn-lifecycle
+record: only validated `idle` is `HEALTHY_IDLE`, while active work requires a
+live discovered CLI brain and real adapter progress. Missing, malformed, or
+ambiguous runtime evidence is `CLI_CHILD_UNKNOWN` and never automatic kill
+authority. After upgrading generated supervisor artifacts, restart existing
+wrappers so they publish the record:
+
+```powershell
+agenttalk supervise --refresh-scripts
+agenttalk request-restart --for AGENT_NAME
+```
 
 ## 17. Command map
 

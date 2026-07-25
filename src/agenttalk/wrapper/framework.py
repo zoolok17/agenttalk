@@ -22,6 +22,7 @@ class WrapperEngine:
         *,
         detector: DegradedDetector,
         on_heartbeat: Callable[[Event, float], None],
+        on_progress: Callable[[Event, float], None] | None = None,
         on_render: Callable[[Event], None] | None = None,
         on_escalate: Callable[[object], None] | None = None,
         on_info: Callable[[object], None] | None = None,
@@ -29,6 +30,7 @@ class WrapperEngine:
     ) -> None:
         self.detector = detector
         self.on_heartbeat = on_heartbeat
+        self.on_progress = on_progress
         self.on_render = on_render
         self.on_escalate = on_escalate
         self.on_info = on_info
@@ -54,9 +56,12 @@ class WrapperEngine:
         # also mark it healthy). Then stamp only a real, non-suppressed progress
         # event, throttled. ADAPTER_ERROR / DEGRADED_OUTPUT are not progress at all.
         result = self.detector.feed(event, now)
-        if event.is_progress and not result.suppress_heartbeat and self._should_stamp(now):
-            self._last_stamp = now
-            self.on_heartbeat(event, now)
+        if event.is_progress and not result.suppress_heartbeat:
+            if self.on_progress is not None:
+                self.on_progress(event, now)
+            if self._should_stamp(now):
+                self._last_stamp = now
+                self.on_heartbeat(event, now)
         sig = result.signal
         if sig is None:
             return
