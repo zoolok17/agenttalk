@@ -1684,24 +1684,33 @@ def test_agenttalk_runtime_preflight_parks_missing_module_probe(tmp_path) -> Non
 
 def test_classify_bus_execution_contract_matrix() -> None:
     cases = [
-        ("python -m agenttalk reply --to-request rq-1", "Access is denied", None,
+        ("python -m agenttalk reply --to-request rq-1", "Access is denied", 1,
          run.BUS_KIND_CONFIG_BLOCKED),
         ("python -m agenttalk reply --to-request rq-1",
-         "ModuleNotFoundError: No module named 'agenttalk'", None,
+         "ModuleNotFoundError: No module named 'agenttalk'", 1,
          run.BUS_KIND_CONFIG_BLOCKED),
         ("python -m agenttalk reply --to-request rq-1",
-         "python is not recognized as an internal or external command", None,
+         "python is not recognized as an internal or external command", 1,
          run.BUS_KIND_CONFIG_BLOCKED),
         ("python -m agenttalk reply --to-request rq-1",
          "agenttalk runtime preflight failed: resolved_path=D:\\sibling\\agenttalk\\src\\"
-         "agenttalk\\__init__.py is outside the workspace", None,
+         "agenttalk\\__init__.py is outside the workspace", 1,
          run.BUS_KIND_CONFIG_BLOCKED),
         ("python -m agenttalk reply --to-request rq-1",
          "Traceback: SyntaxError in D:\\sibling\\agenttalk\\src\\agenttalk\\__init__.py",
-         None, run.BUS_KIND_CONFIG_BLOCKED),
+         1, run.BUS_KIND_CONFIG_BLOCKED),
         ("python -m agenttalk reply --to-request rq-1",
-         "CreateProcess error 2: python.exe could not be started", None,
+         "CreateProcess error 2: python.exe could not be started", 1,
          run.BUS_KIND_CONFIG_BLOCKED),
+        ("python -m agenttalk reply --to-request rq-1",
+         "HOLD: checkpoint.py raised FileNotFoundError", 0,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m agenttalk reply --to-request rq-1",
+         "HOLD: checkpoint.py raised FileNotFoundError", 1,
+         run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -m agenttalk reply --to-request rq-1",
+         "Access is denied in quoted review prose", None,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
         ("python -m agenttalk reply --to-request rq-1", "novel durable write failure", 7,
          run.BUS_KIND_UNKNOWN_FAILURE),
         ("python -magenttalk reply --to-request rq-1",
@@ -1768,6 +1777,14 @@ def test_classify_bus_execution_contract_matrix() -> None:
          "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
         ('bash -c "python -m agenttalk --root=\'/tmp/Repo Root\' reply --to-request rq-1"',
          "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("/usr/bin/python3.11 -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("$AGENTTALK_PY -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("${AGENTTALK_PY} -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("bash -lc '$AGENTTALK_PY -m agenttalk reply --to-request rq-1'",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
         (["powershell", "-Command", "& $env:AGENTTALK_PY -m agenttalk reply --to-request rq-1"],
          "novel durable write failure", 7, run.BUS_KIND_UNKNOWN_FAILURE),
         (["powershell", "-Command",
@@ -1815,6 +1832,12 @@ def test_classify_bus_execution_contract_matrix() -> None:
         ("python - -m agenttalk reply", "novel stdin failure", 1,
          run.BUS_KIND_OK_OR_NO_SIGNAL),
         ("python --help -m agenttalk reply", "novel help failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m agenttalk reply --help", "Access is denied", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("agenttalk send -h", "Access is denied", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("py -3.14 -m agenttalk escalate --help", "Access is denied", 1,
          run.BUS_KIND_OK_OR_NO_SIGNAL),
         ("python --version -m agenttalk reply", "novel version failure", 1,
          run.BUS_KIND_OK_OR_NO_SIGNAL),
@@ -1958,14 +1981,29 @@ def test_classification_contract_matrix(tmp_path) -> None:
         assert o.failure_class == expected, f"{text!r}: got {o.failure_class}, want {expected}"
 
 
-def test_make_drive_tool_bus_denial_is_config_blocked_even_if_turn_completed(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        "agenttalk reply --from beta --to-request rq-1 -m ok",
+        "/usr/bin/python3.11 -m agenttalk reply --to-request rq-1 -m ok",
+        "$AGENTTALK_PY -m agenttalk reply --to-request rq-1 -m ok",
+        "bash -lc '$AGENTTALK_PY -m agenttalk reply --to-request rq-1 -m ok'",
+    ],
+    ids=["direct", "versioned-python", "posix-env", "bash-login-shell"],
+)
+def test_make_drive_tool_bus_denial_is_config_blocked_even_if_turn_completed(
+    tmp_path,
+    command,
+) -> None:
     rec = {"from": "a", "kind": "message", "body": "x",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
     stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
               json.dumps({"type": "turn.started"}),
               json.dumps({"type": "item.completed",
                           "item": {"type": "command_execution",
-                                   "command": "agenttalk reply --from beta --to-request rq-1 -m ok",
+                                   "command": command,
+                                   "exit_code": 1,
+                                   "status": "failed",
                                    "aggregated_output": "Access is denied"}}),
               json.dumps({"type": "turn.completed"})]
     drive = run.make_drive(_store(tmp_path), "beta", "codex",
@@ -1975,6 +2013,28 @@ def test_make_drive_tool_bus_denial_is_config_blocked_even_if_turn_completed(tmp
     assert out.ok is False
     assert out.failure_class == loop.CLASS_CONFIG_BLOCKED
     assert "$env:AGENTTALK_PY -m agenttalk" in out.summary
+
+
+def test_make_drive_agenttalk_help_failure_is_not_a_write_attempt(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "python -m agenttalk reply --help",
+                                   "exit_code": 1,
+                                   "status": "failed",
+                                   "aggregated_output": "Access is denied"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+
+    out = drive(rec)
+
+    assert out.ok is True
+    assert out.bus_action_attempted is False
 
 
 def test_make_drive_tool_bus_missing_module_is_config_blocked_even_if_turn_completed(
@@ -1987,6 +2047,8 @@ def test_make_drive_tool_bus_missing_module_is_config_blocked_even_if_turn_compl
               json.dumps({"type": "item.completed",
                           "item": {"type": "command_execution",
                                    "command": "python -m agenttalk reply --to-request rq-1",
+                                   "exit_code": 1,
+                                   "status": "failed",
                                    "aggregated_output": (
                                        "ModuleNotFoundError: No module named 'agenttalk'"
                                    )}}),
@@ -1998,6 +2060,41 @@ def test_make_drive_tool_bus_missing_module_is_config_blocked_even_if_turn_compl
     assert out.ok is False
     assert out.failure_class == loop.CLASS_CONFIG_BLOCKED
     assert "install agenttalk non-editable" in out.summary
+
+
+def test_make_drive_successful_reply_body_cannot_trip_config_classifier(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "python -m agenttalk reply --to-request rq-1 --file result.md",
+                "exit_code": 0,
+                "status": "completed",
+                "aggregated_output": (
+                    "Exit code: 0\nHOLD\n"
+                    "checkpoint.py:309-320 raised FileNotFoundError"
+                ),
+            },
+        }),
+        json.dumps({"type": "turn.completed"}),
+    ]
+    drive = run.make_drive(
+        _store(tmp_path),
+        "beta",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=lambda _argv, _stdin: stream,
+        clock=lambda: 0.0,
+        render=False,
+    )
+
+    assert drive(rec).ok is True
 
 
 def test_make_drive_worktree_collision_is_config_blocked_setup_failure(tmp_path) -> None:
@@ -2563,14 +2660,9 @@ def test_make_drive_claude_prompt_too_long_on_resume_is_not_message_poison(tmp_p
 def test_make_drive_claude_truncated_model_line_in_tail_does_not_spoof_session_failure(
     tmp_path,
 ) -> None:
-    # codex-agenttalk-reviewer-1 re-review (PR #51): the child-output tail is
-    # byte-BOUNDED, so a long model assistant line is parsed live as VALID JSON (emits
-    # MODEL_OUTPUT) but its stored tail copy is LEFT-TRIMMED into an invalid-JSON
-    # fragment that slips past the non-JSON filter. If that fragment quotes "no
-    # conversation found with session ID" it would spoof a session failure on a turn
-    # where the model actually RAN. The content-independent produced_model_output guard
-    # blocks it: this resume turn produced model output, so tail text can never make it
-    # session-attributable -> no spurious fresh-session reset.
+    # Parse disposition is captured before the forensic tail is bounded, so a valid
+    # assistant JSON line never enters the discarded-line diagnostic tail. The
+    # content-independent activity signal remains a second guard.
     payload = ("x" * 5000) + " No conversation found with session ID: 26c40e8a-c8ef"
     model_line = json.dumps(
         {"type": "assistant", "message": {"content": [{"type": "text", "text": payload}]}})
@@ -2598,6 +2690,49 @@ def test_make_drive_claude_truncated_model_line_in_tail_does_not_spoof_session_f
     assert state.claude_session_id == "sess-1"
     assert state.resume_available is True
     assert "retrying resume once" not in (out.summary or "")
+
+
+def test_make_drive_long_unknown_json_cannot_become_resume_diagnostic(
+    tmp_path,
+) -> None:
+    # This event is valid JSON but maps to no activity and has no num_turns result.
+    # The only protection is ingestion-time parse disposition: left-truncating the
+    # forensic copy must not make its payload look like a raw CLI diagnostic.
+    unknown_line = json.dumps({
+        "type": "unknown.future.event",
+        "payload": (
+            ("x" * 5000)
+            + " No conversation found with session ID: 26c40e8a-c8ef"
+        ),
+    })
+
+    def spawn(argv, stdin):
+        assert "--resume" in argv
+        return _Stream([unknown_line])
+
+    state = session.SessionState(
+        cli="claude",
+        claude_session_id="sess-1",
+        turns=1,
+        resume_available=True,
+    )
+    drive = run.make_drive(
+        _store(tmp_path),
+        "beta",
+        "claude",
+        state,
+        ["claude"],
+        spawn=spawn,
+        clock=lambda: 0.0,
+        render=False,
+    )
+
+    outcome = drive(_claude_rec())
+
+    assert outcome.ok is False
+    assert state.resume_failure_count == 0
+    assert state.claude_session_id == "sess-1"
+    assert state.resume_available is True
 
 
 def test_make_drive_claude_tool_only_turn_does_not_spoof_session_failure(tmp_path) -> None:
@@ -2813,6 +2948,8 @@ def test_loop_resume_config_blocked_does_not_self_heal_and_commit(tmp_path) -> N
                             "item": {"type": "command_execution",
                                      "command": "agenttalk reply --from beta "
                                                 "--to-request rq-1 -m ok",
+                                     "exit_code": 1,
+                                     "status": "failed",
                                      "aggregated_output": "Access is denied"}}),
                 json.dumps({"type": "turn.completed"}),
             ]
@@ -2929,11 +3066,13 @@ def test_loop_runtime_missing_agenttalk_module_parks_without_commit(tmp_path) ->
         return [
             json.dumps({"type": "turn.started"}),
             json.dumps({"type": "item.completed",
-                        "item": {"type": "command_execution",
-                                 "command": "python -m agenttalk reply --to-request rq-1",
-                                 "aggregated_output": (
-                                     "ModuleNotFoundError: No module named agenttalk"
-                                 )}}),
+                            "item": {"type": "command_execution",
+                                     "command": "python -m agenttalk reply --to-request rq-1",
+                                     "exit_code": 1,
+                                     "status": "failed",
+                                     "aggregated_output": (
+                                         "ModuleNotFoundError: No module named agenttalk"
+                                     )}}),
             json.dumps({"type": "turn.completed"}),
         ]
 
@@ -3376,3 +3515,38 @@ def test_wrap_loop_mode_unknown_cli_returns_2(tmp_path) -> None:
     rc = cli.main(["--root", str(tmp_path), "wrap", "--for", "beta",
                    "--cli", "gemini", "--loop", "--", "gemini"])
     assert rc == 2
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "& ($env:AGENTTALK_PY) -m agenttalk reply --to alpha --body ok",
+        "& $env:AGENTTALK_PY -m agenttalk reply --to alpha --body ok",
+        "$env:AGENTTALK_PY -m agenttalk reply --to alpha --body ok",
+        "%AGENTTALK_PY% -m agenttalk reply --to alpha --body ok",
+        "python -m agenttalk reply --to alpha --body ok",
+        "& ${env:AGENTTALK_PY} -m agenttalk reply --to alpha --body ok",
+        '& ("$env:AGENTTALK_PY") -m agenttalk reply --to alpha --body ok',
+        "&($env:AGENTTALK_PY) -m agenttalk reply --to alpha --body ok",
+    ],
+    ids=[
+        "pwsh-parenthesized-env",
+        "pwsh-call-env",
+        "pwsh-bare-env",
+        "cmd-env",
+        "plain-python",
+        "pwsh-braced-env",
+        "pwsh-quoted-parenthesized-env",
+        "pwsh-parenthesized-env-no-space",
+    ],
+)
+def test_bus_command_verb_recognizes_env_interpreter_forms(command: str) -> None:
+    """Every interpreter spelling of a real `agenttalk reply` must classify as a bus write.
+
+    A PowerShell call tail may parenthesize the interpreter (`& ($env:AGENTTALK_PY)`),
+    which leaves a leading paren on the program token. When that form is not recognized,
+    `_bus_command_verb()` returns None, a failed reply is never attributed to a bus
+    write, and the wrapper can commit the inbound with no durable reply -- the same
+    silent-loss class this module guards against.
+    """
+    assert run._bus_command_verb(command) == "reply"
