@@ -184,7 +184,7 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
 ### v0.79.1 - wrapper false-park fix (the hand-finishing bug) (2026-07-25)
-**GOOD / ROBUST** - release base `v0.79.0` - ship SHA `<SHIP>` - tag `v0.79.1`
+**HOLD (open gate; NOT yet attested)** - release base `v0.79.0` - gated candidate `a25dad0` - tag `v0.79.1` (unissued)
 - **Scope:** one behavioural fix (#73) plus a docs/skill change (#79). The wrapper could do the
   work, write a durable reply, and still park the inbound as unfinished, forcing the operator to
   hand-finish completed work. The landed-response resolver now proves the terminal response from
@@ -200,7 +200,9 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   skill policy. Two P2s raised by the GitHub connector against the first fix were themselves
   regressions of the class being fixed, and were closed before merge.
 - **Assurance evidence:**
-  - 15/15 dev-gate legs green on the merged head `bdfc092` (re-verified against the actual head,
+  - 15/15 dev-gate legs green on the POST-BUMP release candidate `a25dad0` (the version bump
+    must be committed before the gate runs; a gate bound to a pre-bump SHA cannot validate the
+    package). Separately 15/15 on `bdfc092` for the #73 fix itself (re-verified against the actual head,
     not the SHA the CI monitor was armed on), zero fresh connector findings at merge time.
   - Independent adversarial review by `claude-agenttalk-reviewer-fable`: **GO**, no blocking
     findings, all five requested attack points addressed. It additionally found a third member of
@@ -210,6 +212,20 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   - Tests are **differential**: on the pre-fix source exactly 3 legs fail and the no-rescind
     control still yields a proof, so the fixture is proven capable of producing a proof when
     nothing cancels the request. 449 passed across the two touched suites locally.
+- **OPEN GATE -- why this entry says HOLD and not GOOD/ROBUST:**
+  - **Tier 3 applies and is unmet.** The union changes durability / persistent-state contract
+    behaviour (#73 decides whether completed work is committed) and a **normative operational
+    skill** (#79 lead policy). Both are §1a Tier-3 triggers. Tier 3 requires a hard floor of 3
+    eligible independent reviewers across >=2 model families, a proposed tier, a ratifier
+    verdict, panel lenses, and a drift result. Only ONE independent review exists
+    (`claude-agenttalk-reviewer-fable`, GO). The panel is not satisfied by the GitHub connector.
+  - **Docs-testing pass is unmet.** This release changes docs AND packaging/install behaviour
+    (version + install pins), which triggers the docs-testing requirement for BOTH `test-docs`
+    and an independent `review-docs`. Neither producer is recorded.
+  - Both gaps were raised by the GitHub connector against `a25dad0` and confirmed against the
+    §1 policy text before being accepted. The release stays unissued until they are recorded or
+    the operator explicitly accepts a lower assurance claim.
+
 - **Known-not-fixed at ship (stated, not hidden):**
   - The fix is **not live for already-running wrappers**. A wrapper is a long-lived process that
     imported the old modules at launch; the editable install means master is the install, but

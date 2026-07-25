@@ -17,10 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the validated bus itself rather than from a parse of the child's command, so a reply that
   demonstrably landed can no longer be parked. Observed twice in production on 2026-07-24/25, with
   the replies present on the bus while both agents sat parked as `config_blocked`. (#73)
-- **Recognize every interpreter spelling of a real `agenttalk reply`.** `_bus_command_verb()`
+- **Recognize the parenthesized and braced PowerShell interpreter forms of a real `agenttalk reply`.** `_bus_command_verb()`
   returned `None` for a PowerShell call tail that parenthesizes or braces the interpreter
   (`& ($env:AGENTTALK_PY)`, `& ${env:AGENTTALK_PY}`), so a failed bus write went unattributed and
   the wrapper could commit an inbound with no durable reply -- the same silent-loss class. (#73)
+  Still NOT recognized: the bare-parenthesized-braced form `& (${env:AGENTTALK_PY})`,
+  which continues to return `None`. Judged an unrealistic spelling; the realistic member of
+  that family is fixed here.
 - **A requester rescind now stops a landed-response proof.** An exact-anchored response that landed
   *after* the requester rescinded was accepted as completed terminal work, so the wrapper could
   report a finished turn for work that had been called off. `_resolve_replay` already treated such a
