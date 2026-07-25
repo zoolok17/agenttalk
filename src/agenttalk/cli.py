@@ -11403,11 +11403,11 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                   "then launch supervisor.ps1 with the returned absolute host. "
                   "(PowerShell Core 7+ is required; a POSIX bash supervisor "
                   "is a follow-up — the Python core is already cross-platform.)")
-        print("\nActivity hook (UNLOCKS stuck-recovery — set activity_hook=true "
-              "per agent after installing it):\n"
+        print("\nManaged hooks (the activity hook unlocks stuck-recovery after "
+              "activity_hook=true; Claude also gets fail-soft checkpoint hooks):\n"
               "  agenttalk supervise --install-activity-hook   # merges project "
               ".claude/settings.json (add --codex for .codex/hooks.json)\n"
-              "Or paste this PostToolUse hook into your project .claude/settings.json:\n"
+              "Or paste these hooks into your project .claude/settings.json:\n"
               f"{sup.claude_hook_snippet()}")
         return 0
     if args.refresh_scripts:
@@ -11574,11 +11574,13 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             codex=False if interactive_for else args.codex or args.codex_only,
             interactive_for=interactive_for,
         )
-        for path, status in res.items():
-            print(f"  {status}: {path}")
-        print("install-activity-hook: merged into PROJECT config only (never "
-              "global, never clobbered). Now set activity_hook=true for the "
-              "instrumented agents in supervisor.json to enable stuck-recovery.")
+        for path, event_statuses in res.items():
+            for event, status in event_statuses.items():
+                print(f"  {status}: {path} [{event}]")
+        print("install-activity-hook: PROJECT config only (never global, never "
+              "clobbered); the per-hook results above are authoritative. "
+              "Now set activity_hook=true for the instrumented agents in "
+              "supervisor.json to enable stuck-recovery.")
         return 0
     if args.seed_codex_config:
         # Overlay the unattended-auto-mode keys onto a (already-COPIED) config.toml
@@ -13773,10 +13775,11 @@ def build_parser() -> argparse.ArgumentParser:
                       dest="launcher_nonce_missing_reason", help=argparse.SUPPRESS)
     gsup.add_argument("--install-activity-hook", dest="install_activity_hook",
                       action="store_true",
-                      help="MERGE the activity heartbeat hook into the project "
-                           ".claude/settings.json (and .codex/hooks.json with "
-                           "--codex). Never global, never clobbers. Unlocks "
-                           "stuck-recovery once you set activity_hook=true.")
+                      help="MERGE the activity heartbeat hook and Claude checkpoint "
+                           "hooks into project config (plus the heartbeat in "
+                           ".codex/hooks.json with --codex). Never global, never "
+                           "clobbers. Unlocks stuck-recovery once you set "
+                           "activity_hook=true.")
     psup.add_argument("--codex", action="store_true",
                       help="(--install-activity-hook) ALSO install the Codex hook.")
     psup.add_argument("--codex-only", dest="codex_only", action="store_true",
