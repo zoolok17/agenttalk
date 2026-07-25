@@ -1,7 +1,7 @@
 # Bootstrap-only tooling. The committed dev-gate.json owns every voting argv.
 pytest>=8.0
 build>=1.2
-hatchling>=1.25
+hatchling>=1.31.0
 ruff>=0.6
 bandit>=1.7
 pip-audit>=2.7
