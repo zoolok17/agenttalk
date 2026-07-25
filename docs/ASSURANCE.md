@@ -183,6 +183,45 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.79.0 - checkpoint-before-compact + DoD forcing-gate + OVH gateway fold (63-commit backlog) (2026-07-25)
+**GOOD / ROBUST** - release base `v0.78.1` - ship SHA `bf40925` - tag `v0.79.0`
+- **Scope:** the accumulated 63-commit master backlog, rolled into one release so it could be
+  installed and exercised. Headline: checkpoint-before-compact (`agenttalk checkpoint
+  save|resume|show` + the `PreCompact`/`SessionStart` hook installer), the red-by-default DoD
+  forcing-gate (assurance + knowledge dimensions), the OVH-Qwen gateway fold onto master,
+  detection-grade owed-action enforcement, the hermetic `dev-gate`, store durability
+  (publication-order self-heal + validation snapshot), and the Windows-CI de-flakes.
+- **Risk record:** base SHA `v0.78.1`; candidate refs `9a1d367` (#84 de-flake) → `64e1669`
+  (#83 B1 hook installer) → ship `bf40925` (version + CHANGELOG only). Semantic dimensions
+  matched: operator-facing workflow + config-write behaviour (the installer mutates a user's
+  `.claude/settings.json`), packaging/install pins, and docs. Proposed tier: standard release
+  ritual with per-PR adversarial review; ratifier `claude-agenttalk-lead` (operator holds standing
+  release authorization). Final drift result: NONE at ship SHA — 15/15 dev-gate legs + CodeQL green
+  on the post-bump commit (the mandatory re-gate), after one rerun of a `windows/3.12` leg whose
+  two failures were artifact-classified as pre-existing wall-clock flakes in tests untouched by the
+  release diff (`test_wait_post_timeout_grace_returns_late_message`, `test_wait_duplicate_composing_counted_only_once`).
+- **Review panel + lenses:** `codex-agenttalk-reviewer-1` (adversarial correctness/security, the
+  bulk of the rounds), `claude-agenttalk-reviewer-3` (cross-family independent lens, incl. verifying
+  the PreCompact contract against the Claude Code binary itself and running a base-vs-head
+  classifier differential), and the GitHub Codex connector as a third independent signal — which
+  caught findings BOTH bus reviewers missed on three separate PRs, including the release-ritual
+  gaps fixed in `fix/release-0790-ritual` (stale canonical install pins, an overclaimed
+  compatibility guarantee, and this missing ledger entry).
+- **Docs-testing trigger:** TRIGGERED (installer writes to a user's config; new user-facing command;
+  install pins changed). Evidence: the B1 review required and verified a new `docs/USER-MANUAL.md`
+  reference section for checkpoint-before-compact plus corrections at six installer-reference sites;
+  `test_dev_gate_docs` + `test_skill_lint` green in the gate. Windows/PowerShell examples remain
+  *referenced-not-executed* per policy.
+- **Accepted residuals (documented, not hidden):** (a) a partial identity-bound settings file could
+  resolve different fallback identities for save vs resume, making `resume` inject empty context —
+  NOT reachable on a first install (needs pre-existing checkpoint entries), fixed in PR #86 for
+  v0.79.1; (b) the bounded legacy-PATH residual where an `agenttalk` older than ~v0.31.1/v0.69.6
+  first on `PATH` can still exit 2 from the fallback leg; (c) the v0.78.0/v0.78.1 ledger entries are
+  themselves missing and want a backfill.
+- **NOT in this release (parked for the operator):** #72 supervisor CLI-child health (PR #81) and
+  #73 wrapper landed-work reconciliation (PR #85) — both behavioural changes to supervisor/wrapper
+  lifecycle, held for an attended merge.
+
 ### v0.77.0 - Loud coordination-stall warnings (advisory, false-positive-disciplined) (2026-07-15)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `39bc1e9` - tag `v0.77.0`
 - **Origin:** during this session `codex` idle-waited ~10 minutes on a design-critique reply from a

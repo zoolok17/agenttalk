@@ -17,6 +17,8 @@ paths, token bodies, file paths, prompts, or session contents.
 Sources (verified 2026-06-09):
 - Claude Code: ``~/.claude/statusline-last-input.json`` →
   ``rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}``.
+- Claude session context: ``%TEMP%/cc-ctx-<session_id>.json`` emitted by the
+  status line, which alone sees the authoritative model context limit.
 - Codex: newest ``$CODEX_HOME/sessions/**/rollout-*.jsonl`` record (falling
   back to ``~/.codex/sessions`` when the caller has not supplied an isolated
   home) whose
@@ -27,8 +29,11 @@ Sources (verified 2026-06-09):
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import stat
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from heapq import heappop, heappush
@@ -43,6 +48,8 @@ WEEKLY_MINUTES = 10080
 DEFAULT_STALE_AFTER_SECONDS = 600.0
 CODEX_ROLLOUT_MAX_FILES = 8
 CODEX_ROLLOUT_SCAN_LIMIT = 256
+CLAUDE_CONTEXT_SIDECAR_MAX_BYTES = 64 * 1024
+_CLAUDE_SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,200}")
 
 
 def _now_iso() -> str:
@@ -64,6 +71,16 @@ def _as_int(v: object) -> int | None:
     if isinstance(v, bool):
         return None
     return int(v) if isinstance(v, (int, float)) else None
+
+
+def _as_exact_int(v: object) -> int | None:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and math.isfinite(v) and v.is_integer():
+        return int(v)
+    return None
 
 
 def _as_str(v: object) -> str | None:
@@ -157,6 +174,95 @@ def read_claude_statusline(
         context_used_percent=ctx_pct,
         context_window_size=ctx_size,
         context_tokens=ctx_tokens,
+        confidence="observed",
+    )
+
+
+def read_claude_context_sidecar(
+    source_agent: str,
+    *,
+    session_id: str,
+    temp_dir: str | os.PathLike | None = None,
+) -> CapacitySnapshot | None:
+    """Read the session-scoped context signal emitted by the status line.
+
+    The status-line process alone sees the model's authoritative context limit,
+    including 1M-tier model ids. It tees that derived value to
+    ``%TEMP%/cc-ctx-<session>.json``. Keep the path derivation and schema parser
+    here so checkpoint hooks and later wrapper integration share one authority.
+    """
+    if not isinstance(session_id, str) or _CLAUDE_SESSION_ID_RE.fullmatch(session_id) is None:
+        return None
+    base = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
+    path = base / f"cc-ctx-{session_id}.json"
+    descriptor = -1
+    try:
+        before = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > CLAUDE_CONTEXT_SIDECAR_MAX_BYTES
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size > CLAUDE_CONTEXT_SIDECAR_MAX_BYTES
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = CLAUDE_CONTEXT_SIDECAR_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        observed_mtime = opened.st_mtime
+        if len(raw) > CLAUDE_CONTEXT_SIDECAR_MAX_BYTES:
+            return None
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if not isinstance(payload, dict):
+        return None
+    pct = _as_float(payload.get("context_pct"))
+    limit = _as_exact_int(payload.get("context_limit"))
+    used = _as_exact_int(payload.get("context_used"))
+    if (
+        pct is None
+        or not math.isfinite(pct)
+        or not 0 <= pct <= 100
+        or limit is None
+        or limit <= 0
+        or used is None
+        or used < 0
+    ):
+        return None
+    observed_at = _as_str(payload.get("updated_at")) or _epoch_iso(observed_mtime)
+    return CapacitySnapshot(
+        source_agent=source_agent,
+        observed_at=observed_at,
+        source="claude_context_sidecar",
+        primary_used_percent=None,
+        primary_resets_at=None,
+        primary_window_minutes=None,
+        secondary_used_percent=None,
+        secondary_resets_at=None,
+        secondary_window_minutes=None,
+        context_used_percent=pct,
+        context_window_size=limit,
+        context_tokens=used,
         confidence="observed",
     )
 
