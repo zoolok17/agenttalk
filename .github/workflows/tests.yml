@@ -20,17 +20,27 @@ jobs:
     env:
       PYTHONPATH: ${{ github.workspace }}/src
       PYTHONDONTWRITEBYTECODE: '1'
-    timeout-minutes: 90
+    # Per-OS ceiling: the two pytest runs (source + wheel) are each capped at
+    # 2700s in dev-gate.json, so a single leg's pytest budget alone is 90 min.
+    # The Windows runner's slow filesystem + costly process/venv creation push
+    # its wall time up to that ceiling, leaving no headroom for setup and the
+    # other per-leg checks — the leg is then killed by duration, not by a test
+    # failure. Windows gets a wider ceiling; the fast Linux/macOS legs keep a
+    # tight cap so a genuine hang there still fails quickly.
+    timeout-minutes: ${{ matrix.os.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
         os:
           - id: linux
             runner: ubuntu-latest
+            timeout_minutes: 90
           - id: windows
             runner: windows-latest
+            timeout_minutes: 120
           - id: macos
             runner: macos-latest
+            timeout_minutes: 90
         python-version: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3

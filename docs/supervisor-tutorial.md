@@ -259,33 +259,38 @@ Key differences for a wrapped agent:
 
 ---
 
-## 5. (Manual agents only) install the activity hook
+## 5. Install the project hooks
 
 A manual-listen agent only becomes stuck-recoverable once it can prove
-it is working. Install the heartbeat hook, then flip `activity_hook`:
+it is working. Install the project hooks, then flip `activity_hook` for
+manual-listen agents:
 
 ```powershell
-agenttalk supervise --install-activity-hook          # Claude PostToolUse hook
-agenttalk supervise --install-activity-hook --codex  # also the Codex hook
+agenttalk supervise --install-activity-hook          # Claude heartbeat + checkpoint hooks
+agenttalk supervise --install-activity-hook --codex  # also the Codex heartbeat hook
 agenttalk supervise --install-activity-hook --interactive-for claude-dev
 ```
 
-This **merges** the identity-neutral `agenttalk heartbeat --hook` hook
-into the project `.claude/settings.json` (and `.codex/hooks.json` with
-`--codex`) — never global, never clobbering your existing settings. It
-uses `AGENTTALK_SELF`, so it is correct for supervised/manual agents
-launched with that environment. Then set `"activity_hook": true` on that
-agent's block.
+For Claude, this **merges** three identity-neutral hooks into the project
+`.claude/settings.json`: the heartbeat `PostToolUse` hook, a `PreCompact`
+checkpoint save hook, and a `SessionStart` hook with matcher `compact` that
+resumes the checkpoint. The `--codex` and `--codex-only` paths add only the
+heartbeat `PostToolUse` hook to `.codex/hooks.json`; wrapped Codex checkpoint
+integration is separate. The installer is never global and never clobbers
+unrelated settings. The hooks use `AGENTTALK_SELF`, so supervised/manual
+agents launched with that environment act as themselves. Then set
+`"activity_hook": true` on a manual-listen agent's block to enable
+stuck-recovery.
 
 Use `--interactive-for <lead>` only for the human's current
-operator-facing Claude liaison window. It writes a Claude-only hook with
-an explicit fallback identity for windows that do not have
-`AGENTTALK_SELF`. Non-liaison interactive windows should set
-`AGENTTALK_SELF` instead. This is still honest liveness: if the
-heartbeat is stale or missing, lead-chat remains unavailable and the
-dashboard shows the lead as away.
-
-Wrapped agents skip this entirely.
+operator-facing Claude liaison window. It writes the three Claude hooks with
+an explicit fallback identity for a window that does not have
+`AGENTTALK_SELF`; `AGENTTALK_SELF` still wins when present. Non-liaison
+interactive windows should set `AGENTTALK_SELF` instead. This is still honest
+liveness: if the heartbeat is stale or missing, lead-chat remains unavailable
+and the dashboard shows the lead as away. Wrapped Claude agents inherit the
+project checkpoint hooks and identify themselves through `AGENTTALK_SELF`;
+their working-turn heartbeat still comes from the wrapper.
 
 ---
 
@@ -576,8 +581,8 @@ without ever rebuilding state.
 | `agenttalk supervise --repair-instance-marker --quarantine --acknowledge-no-live-supervisor` | Explicitly quarantine an invalid singleton marker after the operator confirms no supervisor is live. |
 | `agenttalk supervise --report` | Read-only per-agent liveness JSON (fresh/stale + threshold). |
 | `agenttalk supervise --plan` | The action plan (decision table) the monitor executes. |
-| `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the identity-neutral heartbeat PostToolUse hook into the **project** `.claude/settings.json` (and/or `.codex/hooks.json`). Never global, never clobbers. |
-| `agenttalk supervise --install-activity-hook --interactive-for <lead>` | Merge a Claude-only heartbeat hook bound to the current operator-facing human liaison. Refuses Codex hook modes. |
+| `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` hooks into the **project** `.claude/settings.json`. Codex modes write only the heartbeat hook to `.codex/hooks.json`. Never global, never clobbers unrelated settings. |
+| `agenttalk supervise --install-activity-hook --interactive-for <lead>` | Merge the three Claude hooks with a fallback identity for the current operator-facing human liaison; `AGENTTALK_SELF` still takes precedence. Refuses Codex hook modes. |
 | `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] -- <real exe> <base args>` | Run an agent through the progress wrapper: visibility + working-turn heartbeat + degraded detection. `--loop` = long-running supervised wrapper, one turn per inbound message. |
 | `agenttalk request-restart --for A [--reason ...] [--force-protected] [--acknowledge-live-protected-kill]` | Queue a manual restart (resumes the session - mechanism per section 1). Healthy idle agents are restarted at the next supervisor poll. `--force-protected` restarts a protected agent; add `--acknowledge-live-protected-kill` when that protected agent still has a fresh heartbeat. |
 | `agenttalk heartbeat [--for A] [--min-interval 5]` | Stamp the activity heartbeat (wired as a hook for manual agents; the wrapper does this for you). Hook identity comes from `--for`, then `AGENTTALK_SELF`; the interactive installer uses a hook-only fallback for the liaison window. Throttled, so the per-tool-call hook is nearly free. |

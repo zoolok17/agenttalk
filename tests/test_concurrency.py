@@ -25,6 +25,9 @@ from agenttalk import store as store_mod
 from agenttalk.store import Store
 
 
+_SUCCESSFUL_CONFIG_LOCK_TIMEOUT = 5.0
+
+
 def test_concurrent_threads_send_no_loss(tmp_path: Path) -> None:
     """N threads each sending in a tight loop: every send lands on its own
     file and is delivered exactly once (exercises the within-process lock)."""
@@ -92,7 +95,7 @@ def test_config_lock_times_out_while_another_holder_is_active(tmp_path: Path) ->
 
     def hold() -> None:
         try:
-            with s._config_lock(timeout=1.0, poll=0.01):
+            with s._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.01):
                 entered.set()
                 if not release.wait(5.0):
                     raise TimeoutError("test did not release lock holder")
@@ -101,7 +104,7 @@ def test_config_lock_times_out_while_another_holder_is_active(tmp_path: Path) ->
 
     holder = threading.Thread(target=hold)
     holder.start()
-    assert entered.wait(2.0)
+    assert entered.wait(_SUCCESSFUL_CONFIG_LOCK_TIMEOUT)
     try:
         with pytest.raises(TimeoutError, match="config lock"):
             with s._config_lock(timeout=0.05, poll=0.005):
@@ -164,7 +167,7 @@ except FileExistsError:
 os.close(fd)
 lock.unlink()
 """
-    with store._config_lock(timeout=0.2, poll=0.005):
+    with store._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005):
         blocked = subprocess.run(
             [sys.executable, "-c", legacy_probe, str(lock_path)],
             check=False,
@@ -241,7 +244,7 @@ def test_current_config_lock_publishes_complete_marker_without_replace(
         real_link(source, destination, follow_symlinks=follow_symlinks)
 
     monkeypatch.setattr(store_mod.os, "link", observed_link)
-    with store._config_lock(timeout=0.2, poll=0.005):
+    with store._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005):
         record = json.loads(lock_path.read_text(encoding="utf-8"))
         assert record["protocol"] == "o_excl_v2"
         assert record["pid"] == os.getpid()
@@ -283,7 +286,7 @@ os._exit(91)
     assert os.path.samefile(lock_path, prepared)
     assert os.lstat(lock_path).st_nlink == 2
 
-    with store._config_lock(timeout=0.5, poll=0.005):
+    with store._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005):
         pass
 
     assert not lock_path.exists()
@@ -303,7 +306,7 @@ def test_config_lock_safely_migrates_persistent_os_lock_marker(
     }).encode("utf-8")
     lock_path.write_bytes(legacy_record.ljust(store_mod._LOCK_METADATA_BYTES, b" "))
 
-    with store._config_lock(timeout=0.2, poll=0.005):
+    with store._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005):
         pass
 
     assert not lock_path.exists()
@@ -377,7 +380,7 @@ os.close(fd)
         release_path.write_text("release", encoding="utf-8")
         assert holder.wait(timeout=5.0) == 0
 
-    with store._config_lock(timeout=0.2, poll=0.005):
+    with store._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005):
         pass
     assert not lock_path.exists()
 
@@ -537,7 +540,7 @@ def test_config_lock_recovers_ownerless_or_zero_byte_marker(
     stale_mtime = time.time() - store_mod._LOCK_OWNERLESS_STALE_SECONDS - 1.0
     os.utime(lockf, (stale_mtime, stale_mtime))
 
-    with s._config_lock(timeout=0.5, poll=0.005):
+    with s._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005):
         pass
 
     assert not lockf.exists()
@@ -575,10 +578,8 @@ def test_config_lock_recovery_never_path_replaces_stale_generation(
         real_replace(source, destination)
 
     monkeypatch.setattr(store_mod.os, "replace", forbid_path_overwrite)
-    # timeout is incidental to this test (it asserts recovery never overwrites the
-    # lock pathname, not any deadline); 0.2s is below loaded-Windows-FS lock
-    # latency and flaked in CI. Generous bounded value, same assertion.
-    with s._config_lock(timeout=5.0, poll=0.005):
+    # The timeout is incidental to this test: it asserts path identity, not latency.
+    with s._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005):
         pass
 
 
@@ -621,7 +622,7 @@ def test_config_lock_release_failure_is_surfaced(
 
     monkeypatch.setattr(store_mod, "_release_file_lock", fail_release)
     with pytest.raises(OSError, match="release.*config lock"):
-        with s._config_lock(timeout=0.2):
+        with s._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT):
             pass
     assert not (s.dir / "config.lock").exists()
 
@@ -833,5 +834,5 @@ def test_concurrent_add_agent_no_lost_update(tmp_path: Path) -> None:
     assert "c" in agents and "d" in agents  # neither add lost
     # Compatible O_EXCL ownership clears the marker on release.
     assert not (s.dir / "config.lock").exists()
-    with s._config_lock(timeout=0.2):
+    with s._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT):
         pass

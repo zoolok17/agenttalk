@@ -103,6 +103,60 @@ def test_ovh_qwen_child_environment_starts_from_allowlist(tmp_path, monkeypatch)
     assert "stale-must-not-pass" not in env.values()
 
 
+@pytest.mark.parametrize(
+    "operator_home_env",
+    [
+        pytest.param(
+            {"HOME": "/home/operator", "XDG_CONFIG_HOME": "/home/operator/.config"},
+            id="posix-style-input",
+        ),
+        pytest.param(
+            {
+                "HOME": "C:\\Users\\operator",
+                "USERPROFILE": "C:\\Users\\operator",
+                "LOCALAPPDATA": "C:\\Users\\operator\\AppData\\Local",
+                "APPDATA": "C:\\Users\\operator\\AppData\\Roaming",
+            },
+            id="windows-style-input",
+        ),
+    ],
+)
+def test_ovh_qwen_child_env_scopes_all_home_vars_on_both_platforms(
+    tmp_path, monkeypatch, operator_home_env
+) -> None:
+    # #56: the allowlist strips the child's home vars, so `agenttalk` run INSIDE the
+    # model's own turn cannot resolve its config/state home and crashes. The scoped
+    # env must supply the full home set (HOME + Windows USERPROFILE/LOCALAPPDATA/APPDATA)
+    # pointed at the disposable workspace clone, for both POSIX-style and Windows-style
+    # operator environments, and must never echo the operator's real home to the paid
+    # external worker. (_child_env sets these unconditionally, so no os.name branch to
+    # patch here; monkeypatching os.name on a Windows host also breaks pytest's Path
+    # repr on failure.)
+    ambient = {"PATH": "safe-path", "AGENTTALK_SELF": "qwen-dev-1"}
+    ambient.update(operator_home_env)
+    monkeypatch.setattr(os, "environ", ambient)
+
+    env = run._child_env(
+        tmp_path,
+        backend_profile="ovh-qwen",
+        profile_env={
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+            "ANTHROPIC_AUTH_TOKEN": "front-token",
+        },
+    )
+
+    workspace = str(tmp_path.resolve())
+    # Every home var the child (and the tools it shells out to) may consult is present
+    # and scoped to the workspace clone.
+    assert env["HOME"] == workspace
+    assert env["USERPROFILE"] == workspace
+    assert env["LOCALAPPDATA"] == str((tmp_path / "AppData" / "Local").resolve())
+    assert env["APPDATA"] == str((tmp_path / "AppData" / "Roaming").resolve())
+    # The operator's real home never leaks into the paid worker's environment.
+    for leaked in operator_home_env.values():
+        assert leaked not in env.values()
+
+
 def test_ovh_qwen_child_env_lets_signing_resolve_home_without_crash(
     tmp_path, monkeypatch
 ) -> None:

@@ -41,6 +41,7 @@ from agenttalk.store import (
     validate_rescind,
 )
 from agenttalk import capacity as capmod
+from agenttalk import checkpoint as checkpoint_mod
 from agenttalk import deadman as deadman_mod
 from agenttalk import ephemeral as eph
 from agenttalk import domains as dom
@@ -9564,6 +9565,158 @@ def _resolve_heartbeat_agent(args: argparse.Namespace, *, roster: list[str]) -> 
     return _resolve_self(args.agent, roster=roster)
 
 
+def _checkpoint_root_hint(args: argparse.Namespace) -> Path | None:
+    raw = getattr(args, "root", None) or os.environ.get("AGENTTALK_ROOT")
+    if raw:
+        try:
+            return Path(raw).resolve()
+        except BaseException:  # called only from a fail-soft hook error path
+            return None
+    try:
+        return find_root()
+    except BaseException:  # called only from a fail-soft hook error path
+        return None
+
+
+def _resolve_checkpoint_agent(args: argparse.Namespace, *, roster: list[str]) -> str:
+    if not getattr(args, "hook", False):
+        return _resolve_self(args.agent, roster=roster)
+    explicit = getattr(args, "agent", None)
+    name = explicit or os.environ.get("AGENTTALK_SELF")
+    if not name:
+        name = getattr(args, "fallback_for", None)
+    if not name:
+        raise ValueError(
+            "no agent identity: pass --for or set AGENTTALK_SELF"
+        )
+    validate_agent_name(name)
+    if roster and name not in roster:
+        raise ValueError(
+            f"agent {name!r} is not in the project roster {sorted(roster)}"
+        )
+    return name
+
+
+def _checkpoint_fallback_requires_hook(args: argparse.Namespace) -> int | None:
+    if getattr(args, "fallback_for", None) and not getattr(args, "hook", False):
+        sys.stderr.write(
+            "agenttalk checkpoint: --fallback-for requires --hook\n"
+        )
+        return 2
+    return None
+
+
+def _do_checkpoint_save(args: argparse.Namespace) -> Path:
+    store = _get_store(args)
+    config = (
+        checkpoint_mod.read_checkpoint_config(store)
+        if getattr(args, "hook", False)
+        else store.load_config()
+    )
+    roster = config.get("agents") or []
+    agent = _resolve_checkpoint_agent(args, roster=roster)
+    hook_payload = checkpoint_mod.read_hook_payload() if args.hook else {}
+    payload = checkpoint_mod.build_checkpoint(
+        store,
+        agent,
+        hook_payload=hook_payload,
+        trigger=args.trigger,
+        capacity_source="claude" if args.hook else "auto",
+        session_scoped_context=args.hook,
+    )
+    return checkpoint_mod.save_checkpoint(store, agent, payload)
+
+
+def _run_checkpoint_hook(
+    args: argparse.Namespace,
+    action: str,
+    callback,
+):
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            value, error = callback(), None
+    except BaseException as exc:
+        value, error = None, exc
+    if error is not None:
+        try:
+            checkpoint_mod.log_hook_error(
+                _checkpoint_root_hint(args),
+                action,
+                error,
+            )
+        except BaseException:
+            return value
+    return value
+
+
+def cmd_checkpoint_save(args: argparse.Namespace) -> int:
+    invalid = _checkpoint_fallback_requires_hook(args)
+    if invalid is not None:
+        return invalid
+    if args.hook:
+        _run_checkpoint_hook(args, "save", lambda: _do_checkpoint_save(args))
+        return 0
+    path = _do_checkpoint_save(args)
+    print(f"checkpoint saved: {path}")
+    return 0
+
+
+def _read_checkpoint_for_args(args: argparse.Namespace) -> tuple[str, dict | None]:
+    store = _get_store(args)
+    config = (
+        checkpoint_mod.read_checkpoint_config(store)
+        if getattr(args, "hook", False)
+        else store.load_config()
+    )
+    roster = config.get("agents") or []
+    agent = _resolve_checkpoint_agent(args, roster=roster)
+    return agent, checkpoint_mod.read_checkpoint(store, agent)
+
+
+def cmd_checkpoint_resume(args: argparse.Namespace) -> int:
+    invalid = _checkpoint_fallback_requires_hook(args)
+    if invalid is not None:
+        return invalid
+    if args.hook:
+        result = _run_checkpoint_hook(
+            args,
+            "resume",
+            lambda: _read_checkpoint_for_args(args),
+        )
+        payload = result[1] if isinstance(result, tuple) and len(result) == 2 else None
+        try:
+            output = checkpoint_mod.session_start_output(payload)
+        except BaseException:
+            output = checkpoint_mod.EMPTY_SESSION_START_OUTPUT
+        try:
+            sys.stdout.write(output + "\n")
+            sys.stdout.flush()
+        except BaseException:
+            return 0
+        return 0
+    agent, payload = _read_checkpoint_for_args(args)
+    if payload is None:
+        print(f"checkpoint resume: no checkpoint found for {agent}")
+        return 0
+    print(checkpoint_mod.render_resume_context(payload))
+    return 0
+
+
+def cmd_checkpoint_show(args: argparse.Namespace) -> int:
+    agent, payload = _read_checkpoint_for_args(args)
+    if payload is None:
+        sys.stderr.write(
+            f"agenttalk checkpoint show: no checkpoint found for {agent}\n"
+        )
+        return 1
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(checkpoint_mod.render_resume_context(payload))
+    return 0
+
+
 def cmd_request_restart(args: argparse.Namespace) -> int:
     """Queue a MANUAL restart of an agent (the supervisor relaunches + clears).
 
@@ -11320,11 +11473,11 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                   "then launch supervisor.ps1 with the returned absolute host. "
                   "(PowerShell Core 7+ is required; a POSIX bash supervisor "
                   "is a follow-up — the Python core is already cross-platform.)")
-        print("\nActivity hook (UNLOCKS stuck-recovery — set activity_hook=true "
-              "per agent after installing it):\n"
+        print("\nManaged hooks (the activity hook unlocks stuck-recovery after "
+              "activity_hook=true; Claude also gets fail-soft checkpoint hooks):\n"
               "  agenttalk supervise --install-activity-hook   # merges project "
               ".claude/settings.json (add --codex for .codex/hooks.json)\n"
-              "Or paste this PostToolUse hook into your project .claude/settings.json:\n"
+              "Or paste these hooks into your project .claude/settings.json:\n"
               f"{sup.claude_hook_snippet()}")
         return 0
     if args.refresh_scripts:
@@ -11491,11 +11644,13 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             codex=False if interactive_for else args.codex or args.codex_only,
             interactive_for=interactive_for,
         )
-        for path, status in res.items():
-            print(f"  {status}: {path}")
-        print("install-activity-hook: merged into PROJECT config only (never "
-              "global, never clobbered). Now set activity_hook=true for the "
-              "instrumented agents in supervisor.json to enable stuck-recovery.")
+        for path, event_statuses in res.items():
+            for event, status in event_statuses.items():
+                print(f"  {status}: {path} [{event}]")
+        print("install-activity-hook: PROJECT config only (never global, never "
+              "clobbered); the per-hook results above are authoritative. "
+              "Now set activity_hook=true for the instrumented agents in "
+              "supervisor.json to enable stuck-recovery.")
         return 0
     if args.seed_codex_config:
         # Overlay the unattended-auto-mode keys onto a (already-COPIED) config.toml
@@ -13280,6 +13435,75 @@ def build_parser() -> argparse.ArgumentParser:
                           "Manual use stays strict (exit 2 on a bad identity).")
     phb.set_defaults(func=cmd_heartbeat)
 
+    pcheckpoint = sub.add_parser(
+        "checkpoint",
+        help="Save, resume, or inspect deterministic external state around "
+             "context compaction.",
+    )
+    checkpoint_sub = pcheckpoint.add_subparsers(dest="checkpoint_mode", required=True)
+
+    checkpoint_save = checkpoint_sub.add_parser(
+        "save",
+        help="Capture context headroom, Git state, and actionable bus threads.",
+    )
+    checkpoint_save.add_argument(
+        "--for",
+        dest="agent",
+        help="Agent name (default: $AGENTTALK_SELF).",
+    )
+    checkpoint_save.add_argument(
+        "--fallback-for",
+        dest="fallback_for",
+        help="Hook-only fallback identity when --for and AGENTTALK_SELF are absent.",
+    )
+    checkpoint_save.add_argument(
+        "--trigger",
+        choices=["auto", "manual"],
+        default="manual",
+        help="Compaction trigger for non-hook saves (default: manual).",
+    )
+    checkpoint_save.add_argument(
+        "--hook",
+        action="store_true",
+        help="PreCompact hook mode: read bounded JSON from stdin, stay silent, "
+             "swallow every error, and always exit 0.",
+    )
+    checkpoint_save.set_defaults(func=cmd_checkpoint_save)
+
+    checkpoint_resume = checkpoint_sub.add_parser(
+        "resume",
+        help="Render the latest checkpoint for a resumed compacted session.",
+    )
+    checkpoint_resume.add_argument(
+        "--for",
+        dest="agent",
+        help="Agent name (default: $AGENTTALK_SELF).",
+    )
+    checkpoint_resume.add_argument(
+        "--fallback-for",
+        dest="fallback_for",
+        help="Hook-only fallback identity when --for and AGENTTALK_SELF are absent.",
+    )
+    checkpoint_resume.add_argument(
+        "--hook",
+        action="store_true",
+        help="SessionStart hook mode: emit only the additionalContext JSON "
+             "envelope and always exit 0.",
+    )
+    checkpoint_resume.set_defaults(func=cmd_checkpoint_resume)
+
+    checkpoint_show = checkpoint_sub.add_parser(
+        "show",
+        help="Inspect the latest saved checkpoint.",
+    )
+    checkpoint_show.add_argument(
+        "--for",
+        dest="agent",
+        help="Agent name (default: $AGENTTALK_SELF).",
+    )
+    checkpoint_show.add_argument("--json", action="store_true")
+    checkpoint_show.set_defaults(func=cmd_checkpoint_show)
+
     prr = sub.add_parser(
         "request-restart",
         help="Queue a MANUAL restart of an agent (the external supervisor "
@@ -13621,10 +13845,11 @@ def build_parser() -> argparse.ArgumentParser:
                       dest="launcher_nonce_missing_reason", help=argparse.SUPPRESS)
     gsup.add_argument("--install-activity-hook", dest="install_activity_hook",
                       action="store_true",
-                      help="MERGE the activity heartbeat hook into the project "
-                           ".claude/settings.json (and .codex/hooks.json with "
-                           "--codex). Never global, never clobbers. Unlocks "
-                           "stuck-recovery once you set activity_hook=true.")
+                      help="MERGE the activity heartbeat hook and Claude checkpoint "
+                           "hooks into project config (plus the heartbeat in "
+                           ".codex/hooks.json with --codex). Never global, never "
+                           "clobbers. Unlocks stuck-recovery once you set "
+                           "activity_hook=true.")
     psup.add_argument("--codex", action="store_true",
                       help="(--install-activity-hook) ALSO install the Codex hook.")
     psup.add_argument("--codex-only", dest="codex_only", action="store_true",
