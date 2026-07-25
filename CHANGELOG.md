@@ -21,9 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (checkpoint save) and `SessionStart`/`compact` (checkpoint resume), reporting per-hook
   `installed` / `already` / `skipped (reason)` so a partial or malformed install can never be
   presented as blanket success. A managed entry whose `type` is missing or wrong is repaired
-  rather than reported as already-installed. The installed commands carry a fail-soft fallback so
-  an `agenttalk` predating the `checkpoint` subcommand can never exit non-zero and block a
-  compaction, and `--codex` / `.codex/hooks.json` remains heartbeat-only. (#71)
+  rather than reported as already-installed. The installed commands carry a fail-soft fallback to
+  the silent heartbeat hook, so an `agenttalk` that predates the `checkpoint` subcommand but is
+  otherwise recent enough exits 0 instead of blocking a compaction. **Bounded legacy-PATH
+  residual:** the neutral fallback needs roughly v0.31.1 and the `--fallback-for` form needs
+  v0.69.6, so an OLDER executable selected first on `PATH` can still return exit 2 and block a
+  compact — upgrade or correct `PATH` before installing these hooks (documented at
+  `docs/USER-MANUAL.md`). `--codex` / `.codex/hooks.json` remains heartbeat-only. (#71)
 - **"Red-by-default until evidence exists" DoD forcing-gate.** `close` now supports pluggable
   Definition-of-Done dimensions that HOLD until independent, revision-bound evidence exists — the
   assurance dimension (inc-1) and the knowledge dimension (inc-2). (#60)
