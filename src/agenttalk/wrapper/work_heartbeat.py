@@ -40,6 +40,7 @@ The diagnostics status record is NOT a supervisor input in v1.
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -112,9 +113,16 @@ def resolve_work_heartbeat(config: dict, cfg_agent: dict, *, cli: str = "claude"
             if key not in src:
                 continue
             v = src.get(key)
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            if (
+                isinstance(v, (int, float))
+                and not isinstance(v, bool)
+                and math.isfinite(float(v))
+                and v > 0
+            ):
                 return float(v)
-            errors.append(f"work_heartbeat.{key} must be a number > 0 (got {v!r})")
+            errors.append(
+                f"work_heartbeat.{key} must be a finite number > 0 (got {v!r})"
+            )
             return default
         return default
 

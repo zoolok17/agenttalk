@@ -31,6 +31,11 @@ MAX_RECORD_BYTES = 16 * 1024
 # while the wrapper can publish concurrently.  Bound that observation race
 # without letting a genuinely future-dated record authorize health.
 MAX_FUTURE_SKEW_SECONDS = 30.0
+# The supervisor reserves this entire interval before a durable progress
+# timestamp can authorize recovery. Keep the writer's configurable interval
+# bounded by the same public constant so hidden in-memory progress can never
+# consume that safety allowance.
+MAX_PROGRESS_WRITE_INTERVAL_SECONDS = 5.0
 
 PHASE_IDLE = "idle"
 PHASE_STARTING = "starting"
@@ -408,8 +413,6 @@ def _atomic_write(path: Path, record: dict) -> None:
 class WrapperRuntimeWriter:
     """Single-process lifecycle writer with monotonic turn/progress generations."""
 
-    _DEFAULT_PROGRESS_WRITE_INTERVAL_SECONDS = 5.0
-
     def __init__(
         self,
         state_dir: str | os.PathLike[str],
@@ -420,7 +423,7 @@ class WrapperRuntimeWriter:
         wrapper_start: str | None | object = _UNSET,
         clock: Callable[[], float] = time.time,
         progress_write_interval_seconds: float = (
-            _DEFAULT_PROGRESS_WRITE_INTERVAL_SECONDS
+            MAX_PROGRESS_WRITE_INTERVAL_SECONDS
         ),
     ) -> None:
         self.path = runtime_path(state_dir, agent)
@@ -450,9 +453,14 @@ class WrapperRuntimeWriter:
             or isinstance(progress_write_interval_seconds, bool)
             or not math.isfinite(float(progress_write_interval_seconds))
             or float(progress_write_interval_seconds) < 0
+            or (
+                float(progress_write_interval_seconds)
+                > MAX_PROGRESS_WRITE_INTERVAL_SECONDS
+            )
         ):
             raise RuntimeRecordError(
-                "progress_write_interval_seconds must be a finite number >= 0"
+                "progress_write_interval_seconds must be a finite number "
+                f"between 0 and {MAX_PROGRESS_WRITE_INTERVAL_SECONDS:g}"
             )
         self._clock = clock
         self._progress_write_interval_seconds = float(

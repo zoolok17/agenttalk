@@ -294,7 +294,11 @@ two parallel ownership concepts.
   (#72). `progress_sequence` advances only for real accepted adapter events;
   heartbeat timer ticks are not progress. Durable progress records are
   interval-coalesced, while every accepted event advances the in-memory
-  sequence and every terminal boundary forces a durable high-water write.
+  sequence and every terminal boundary forces a durable high-water write. The
+  supervisor reserves the maximum coalescing interval before durable progress
+  age can authorize recovery; progress staleness remains non-green immediately
+  but cannot kill while heartbeat is fresh unless the per-turn watchdog is
+  effectively live and its deadline-plus-margin floor is satisfied.
   Commit-vs-park (#73) independently trusts the validated bus, not this wrapper
   self-report. The two authorities are coherent: a #72 restart preserves the
   already-advanced bus cursor and cannot re-drive work #73 committed.

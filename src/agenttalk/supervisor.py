@@ -4712,6 +4712,20 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                         state="CLI_CHILD_STALL_SUSPECT",
                         reason="adapter progress is stale on first confirming poll",
                     )
+                recovery_progress_cutoff = (
+                    stuck_after
+                    + runtime_obs.MAX_PROGRESS_WRITE_INTERVAL_SECONDS
+                )
+                if progress_elapsed < recovery_progress_cutoff:
+                    return _result(
+                        NONE,
+                        state="CLI_CHILD_STALLED",
+                        reason=(
+                            "adapter progress is stale, but the durable "
+                            "observation is still inside the bounded progress "
+                            "coalescing allowance; refusing recovery"
+                        ),
+                    )
                 stall_floor_valid = bool(
                     not watchdog_live
                     or (
@@ -4735,14 +4749,36 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                             "refusing recovery"
                         ),
                     )
+                watchdog_authorizes = watchdog_live and stall_floor_valid
+                heartbeat_authorizes = hb_stale and can_confirm_stuck
+                if not watchdog_authorizes and not heartbeat_authorizes:
+                    if hb_stale:
+                        authority_reason = (
+                            "heartbeat is stale but its recovery guards are "
+                            "not authoritative"
+                        )
+                    else:
+                        authority_reason = (
+                            "heartbeat is fresh and no per-turn watchdog is "
+                            "effectively live"
+                        )
+                    return _result(
+                        NONE,
+                        state="CLI_CHILD_STALLED",
+                        reason=(
+                            f"adapter progress is stalled, but {authority_reason}; "
+                            "refusing recovery"
+                        ),
+                    )
                 child_recovery_state = "CLI_CHILD_STALLED"
                 child_recovery_reason = (
                     "live CLI brain made no adapter progress past the hard "
-                    "watchdog deadline plus margin"
-                    if watchdog_live
+                    "watchdog deadline plus margin and coalescing allowance"
+                    if watchdog_authorizes
                     else (
                         "live CLI brain made no adapter progress past the "
-                        "per-agent stale threshold"
+                        "per-agent stale threshold plus coalescing allowance "
+                        "and its heartbeat is stale"
                     )
                 )
             else:

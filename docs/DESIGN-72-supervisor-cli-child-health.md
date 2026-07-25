@@ -301,10 +301,13 @@ legacy fresh-heartbeat classifier. It is deliberately total:
 | active | dead, first observation | n/a | `CLI_CHILD_MISSING` | none |
 | active | dead, confirmed | n/a | `CLI_CHILD_DEAD` | existing restart path |
 | active | unknown | any | `CLI_CHILD_UNKNOWN` | warn, no kill |
-| active | alive | stale | `CLI_CHILD_STALLED` | existing stuck path after threshold |
-| terminal success/finalizing | not required | recent | `HEALTHY_WORKING` | none |
-| terminal failure/dead-letter | not required | n/a | `TURN_FAILED` | wrapper policy/notify |
-| terminal | any | stale or unclassified | `CLI_CHILD_UNKNOWN` | warn, no kill |
+| active | alive | stale, first observation | `CLI_CHILD_STALL_SUSPECT` | none |
+| active | alive | stale, fresh heartbeat, no live watchdog | `CLI_CHILD_STALLED` | none |
+| active | alive | stale past coalescing allowance, stale authoritative heartbeat or live-watchdog floor | `CLI_CHILD_STALLED` | existing stuck path |
+| terminal success/finalizing, fresh heartbeat | not required | recent | `HEALTHY_WORKING` | none |
+| terminal failure/dead-letter, fresh heartbeat | not required | n/a | `TURN_FAILED` | wrapper policy/notify |
+| terminal, fresh heartbeat | any | stale or unclassified | `CLI_CHILD_UNKNOWN` | warn, no kill |
+| terminal, stale heartbeat | any | any | existing non-green wrapper verdict | existing wrapper path |
 | any valid starting/active/terminal combination not matched above | any | any | `CLI_CHILD_UNKNOWN` | warn, no kill |
 | missing/invalid/torn/partial/parse-failed runtime record | any | any | `CLI_CHILD_UNKNOWN` | warn, no kill |
 
@@ -338,18 +341,19 @@ Child death and child stall are different failures:
   short spawn/handoff grace. Then use the existing `STUCK_RECOVER` executor
   path, start-guarded kill targets, exponential backoff, and readiness cap.
 - **Wedged:** the brain is alive but `progress_sequence` has not advanced past
-  the per-CLI turn-progress threshold. When a per-turn watchdog is effectively
-  live, the stall threshold has a hard invariant: it must be greater than or
-  equal to the resolved watchdog deadline plus a safety margin. This prevents
-  a legitimate long tool call, which may emit `tool-start` and remain silent
-  until `tool-finish`, from being killed before the CLI watchdog can decide.
-  Configuration below that live-watchdog floor is invalid and disables
-  autonomous stall-based recovery for that observation; it resolves non-green
-  and emits a configuration diagnostic rather than silently clamping or
-  killing early. When no watchdog is effectively live, there is nothing to
-  preempt and the resolved per-agent/per-CLI stale threshold is the recovery
-  authority. After threshold and confirmation, use the existing restart path
-  with a distinct reason.
+  the per-CLI turn-progress threshold. Crossing that threshold immediately
+  produces a non-green stall observation, but progress staleness alone is not
+  kill authority while heartbeat remains fresh. Recovery additionally requires
+  either an authoritative stale heartbeat or an effectively-live per-turn
+  watchdog whose deadline plus safety margin is covered by the configured
+  threshold. This prevents a legitimate long tool call, which may emit
+  `tool-start` and remain silent until `tool-finish`, from being killed while
+  its bounded work-heartbeat still proves liveness. Configuration below a live
+  watchdog's floor disables autonomous watchdog-based recovery and emits a
+  diagnostic rather than silently clamping or killing early. Finally, recovery
+  requires the observed durable progress age to reach the threshold plus the
+  maximum writer-coalescing interval, so hidden in-memory progress cannot
+  consume the safety margin.
 - **Unknown:** the evidence cannot establish death or health. It is not green,
   but it must not authorize a kill or restart. Emit a rate-limited warning and
   retry observation.
@@ -420,9 +424,13 @@ The implementation includes deterministic synthetic-snapshot tests for:
   cannot trigger death, stall, or restart;
 - a progressing child stays working;
 - a live child with an unchanged progress sequence becomes stalled only after
-  the configured threshold and confirmation poll;
-- the configured stall threshold cannot be less than the resolved per-CLI
-  watchdog deadline plus margin, and a long silent tool call is not killed
+  the configured threshold and confirmation poll, but fresh heartbeat plus no
+  live watchdog remains non-killing;
+- recovery based on a durable progress age reserves the writer's maximum
+  coalescing interval, so a hidden event at `t=4.9s` cannot be killed before
+  its true age reaches the configured threshold;
+- when a watchdog is live, the configured stall threshold cannot be less than
+  its resolved deadline plus margin, and a long silent tool call is not killed
   before that floor;
 - work-heartbeat ticks do not count as progress;
 - wrapper/turn generation changes reset the stall/death debounce;

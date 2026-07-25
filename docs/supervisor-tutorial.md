@@ -242,10 +242,11 @@ Key differences for a wrapped agent:
   CLI brain green.
 - A confirmed dead CLI brain requires two polls for the same wrapper and
   turn generation outside spawn/handoff grace. A stalled live brain also
-  requires two confirming polls. When the per-turn watchdog is live, the
-  stall threshold must be at least its resolved deadline plus a safety
-  margin; when it is disabled, the per-agent/per-CLI stale threshold governs.
-  Unknown evidence never authorizes a kill.
+  requires two confirming polls. Progress staleness becomes non-green at the
+  configured threshold, but recovery also requires the full durable-write
+  coalescing allowance and either a stale authoritative heartbeat or a live
+  per-turn watchdog whose deadline-plus-margin floor is satisfied. Unknown
+  evidence and fresh-heartbeat progress staleness alone never authorize a kill.
 - **`--disable hooks`** on the wrapped **codex** child (the safe default):
   the wrapper owns the heartbeat, so the codex activity hook is neither
   needed nor wanted, and disabling it sidesteps codex's hook-trust prompt

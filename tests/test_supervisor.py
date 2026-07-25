@@ -5001,7 +5001,7 @@ def test_wrapped_live_brain_without_progress_stalls_after_confirmation() -> None
     assert second["state"] == "CLI_CHILD_STALLED"
 
 
-def test_wrapped_claude_stall_recovers_when_turn_watchdog_is_disabled() -> None:
+def test_wrapped_claude_stall_waits_for_stale_heartbeat_without_watchdog() -> None:
     config = {
         **_WRAP_CONFIG,
         "agents": {
@@ -5032,9 +5032,100 @@ def test_wrapped_claude_stall_recovers_when_turn_watchdog_is_disabled() -> None:
         config=config,
     )
 
-    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["action"] == sup.NONE
     assert plan["state"] == "CLI_CHILD_STALLED"
-    assert "per-agent stale threshold" in plan["reason"]
+    assert "heartbeat is fresh" in plan["reason"]
+
+    # The default 900-second ticker cap is finite. At turn age 1081 its final
+    # stamp is 181 seconds old, so the ordinary stale-heartbeat path takes over.
+    stale_now = NOW + 781
+    stale = _plan_wrap(
+        _report(
+            heartbeat_stale=True,
+            heartbeat_age_seconds=181.0,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=stale_now,
+                updated_age=1081.0,
+                progress_age=1081.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": plan["next_state"]}},
+        now=stale_now,
+        snapshot=_wrap_snap(cli="claude"),
+        config=config,
+    )
+
+    assert stale["action"] == sup.STUCK_RECOVER
+    assert stale["state"] == "CLI_CHILD_STALLED"
+    assert "heartbeat is stale" in stale["reason"]
+
+
+def test_wrapped_watchdog_recovery_reserves_progress_coalescing_margin(
+    tmp_path: Path,
+) -> None:
+    config = {**_WRAP_CONFIG, "poll_seconds": 1}
+    now = [NOW]
+    writer = wrt.WrapperRuntimeWriter(
+        tmp_path,
+        "worker",
+        "wrapper-1",
+        wrapper_pid=WRAP_LAUNCHER_PID,
+        wrapper_start=WRAP_START,
+        clock=lambda: now[0],
+    )
+    writer.starting(message_id="msg-runtime", turn_id="turn-1")
+    writer.active(WRAP_CHILD_PID, WRAP_CHILD_START)
+    durable = writer.progress()
+    now[0] += 4.9
+    hidden = writer.progress()
+    runtime = wrt.read_runtime(tmp_path, "worker", now_epoch=NOW + 2400.1)
+    report = _report(heartbeat_stale=False, wrapper_runtime=runtime)
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=1,
+        runtime_progress_seen_epoch=NOW,
+    )
+
+    assert durable["progress_sequence"] == 1
+    assert hidden["progress_sequence"] == 2
+    assert runtime["record"]["progress_sequence"] == 1
+
+    # Polling every second must not recover until hidden event #2's true age
+    # reaches the 2400-second threshold.
+    first = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        now=NOW + 2400.1,
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+    second = _plan_wrap(
+        report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 2401.1,
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert first["action"] == sup.NONE
+    assert first["state"] == "CLI_CHILD_STALL_SUSPECT"
+    assert second["action"] == sup.NONE
+    assert second["state"] == "CLI_CHILD_STALLED"
+    assert "coalescing allowance" in second["reason"]
+
+    safe = _plan_wrap(
+        report,
+        {"agents": {"worker": second["next_state"]}},
+        now=NOW + 2405.0,
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert safe["action"] == sup.STUCK_RECOVER
+    assert safe["state"] == "CLI_CHILD_STALLED"
 
 
 def test_wrapped_stalled_forked_brain_is_an_attributed_kill_target() -> None:

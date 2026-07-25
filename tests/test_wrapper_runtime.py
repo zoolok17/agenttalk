@@ -284,7 +284,7 @@ def test_writer_constructor_rejects_non_scalar_identity_fields(
         )
 
 
-@pytest.mark.parametrize("interval", [-1.0, float("nan"), True])
+@pytest.mark.parametrize("interval", [-1.0, 5.001, float("nan"), True])
 def test_writer_constructor_rejects_invalid_progress_write_interval(
     tmp_path: Path,
     interval: object,
