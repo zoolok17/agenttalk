@@ -200,7 +200,13 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   skill policy. Two P2s raised by the GitHub connector against the first fix were themselves
   regressions of the class being fixed, and were closed before merge.
 - **Assurance evidence:**
-  - **15/15 dev-gate legs green on `354990d`, the exact release head.** An earlier revision of this
+  - **15/15 dev-gate legs green on `354990d`, the last CODE-BEARING revision of this release.**
+    Note the unavoidable regress, stated once here so future entries inherit it: a gate result can
+    never be recorded INSIDE the commit it describes, because writing it changes the tree. So the
+    code gate binds to the last code-bearing revision, and the attestation commit carrying this
+    ledger is documentation-only by construction and separately green in CI. What is NOT acceptable
+    -- and is what the connector caught -- is citing a gate for a commit that is neither the head nor
+    an ancestor of it An earlier revision of this
     entry cited the gate for `a25dad0`; the connector correctly objected that `a25dad0` is a SIBLING
     of the release commit, not its ancestor, and its tree differs -- the dev-gate is SHA-bound, so
     that evidence could not validate this revision. Superseded rather than silently kept (the version bump
