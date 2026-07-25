@@ -2017,6 +2017,23 @@ def _start_tokens_match(observed, expected) -> bool:
     return abs(observed_epoch - expected_epoch) <= 0.001
 
 
+def _start_order_key(value: object) -> tuple[str, int | float] | None:
+    """Comparable process-start key for known snapshot/token schemes."""
+    epoch = _iso_epoch(value)
+    if epoch is not None:
+        return ("iso", epoch)
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(
+        r"linux:([0-9a-fA-F-]{32,64}):([0-9]+)",
+        value.strip(),
+    )
+    if match is None:
+        return None
+    boot_id, ticks = match.groups()
+    return (f"linux:{boot_id.casefold()}", int(ticks))
+
+
 def _diag() -> dict[str, int]:
     return dict.fromkeys(_DIAGNOSTIC_COUNTERS, 0)
 
@@ -2995,9 +3012,13 @@ def _wait_row_for(idx: dict[int, dict], agent: str) -> dict | None:
     """The agent's `agenttalk wait --for <agent>` process row, matched by command
     line (degrades to None when command lines are unavailable - we never guess)."""
     for row in idx.values():
-        cl = row.get("command_line") or ""
-        if "agenttalk" in cl and "wait" in cl and (
-                f"--for {agent}" in cl or f"--for={agent}" in cl):
+        inv = _agenttalk_invocation(row.get("command_line"), None)
+        if not inv or inv.get("subcommand") != "wait":
+            continue
+        args = inv.get("args") or []
+        if _has_option_token(args, _SUPERVISOR_LAUNCH_NONCE_ARG):
+            continue
+        if _agent_option(args, "--for") == agent:
             return row
     return None
 
@@ -3028,7 +3049,10 @@ def _depth_to_launcher(idx: dict[int, dict], row: dict, launcher_pid: int) -> in
 
 def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
                     brain_pattern: str, launch_epoch: float | None = None,
-                    allow_launcher_self: bool = False) -> dict | None:
+                    allow_launcher_self: bool = False, *,
+                    launcher_start: str | None = None,
+                    require_launcher_bound: bool = False,
+                    turn_generation: int | None = None) -> dict | None:
     """Find the long-lived brain process - NEVER the forking LAUNCHER (test #4).
 
     ``allow_launcher_self`` FALSE (codex): the launcher (codex.exe) spawns the real
@@ -3039,7 +3063,8 @@ def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
     THREE signals, in order:
     1. up from the agent's live ``wait`` process to the HIGHEST ELIGIBLE
        brain-named ancestor (the TUI ABOVE command-runner/wait but BELOW the
-       launcher; needs command lines; survives launcher exit);
+       launcher; needs command lines; survives launcher exit). This is a
+       legacy/manual discovery aid only, never wrapped-turn authority;
     2. name + ancestry to the RECORDED ``launcher_pid`` - an eligible brain-named
        row whose parent chain reaches the launcher, preferring the one CLOSEST to
        the launcher (the TUI is its direct child = depth 0; codex-command-runner.exe
@@ -3048,7 +3073,18 @@ def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
        deterministic (start, pid). Null-command-line safe.
     3. the degenerate non-forking case (ONLY when allow_launcher_self): the
        launcher row itself matches the name (claude.exe is its own brain).
+
+    Wrapped callers set ``require_launcher_bound`` and provide the launcher
+    identity from one validated runtime turn. Then only comparable start evidence
+    plus ancestry to that locator (or the exact live launcher-self identity) can
+    authorize green health; an unrelated/prior wait tree remains unknown.
     Returns the brain row or None."""
+    if require_launcher_bound and (
+        not isinstance(turn_generation, int)
+        or isinstance(turn_generation, bool)
+        or turn_generation <= 0
+    ):
+        return None
     pat = (brain_pattern or "").lower()
 
     def _name_matches(row):
@@ -3062,14 +3098,23 @@ def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
         # NOT be the launcher itself.
         return _name_matches(row) and (allow_launcher_self or not _is_launcher(row))
 
+    launch_key = _start_order_key(launcher_start)
+    if (
+        launch_key is None
+        and isinstance(launch_epoch, (int, float))
+        and not isinstance(launch_epoch, bool)
+        and math.isfinite(float(launch_epoch))
+    ):
+        launch_key = ("iso", float(launch_epoch))
+
     def _started_after_launch(row) -> bool:
-        # soft guard: if both the candidate start and the launch epoch parse,
-        # require the candidate to have started at/after the launch (small slack);
-        # otherwise (non-ISO test sentinels / unknown) do NOT reject.
-        if launch_epoch is None:
-            return True
-        se = _iso_epoch(_start_of(row))
-        return se is None or se >= float(launch_epoch) - 5.0
+        if launch_key is None:
+            return not require_launcher_bound
+        candidate_key = _start_order_key(_start_of(row))
+        if candidate_key is None or candidate_key[0] != launch_key[0]:
+            return not require_launcher_bound
+        slack = 0.001 if launch_key[0] == "iso" else 0.0
+        return float(candidate_key[1]) >= float(launch_key[1]) - slack
 
     # pids on the wait-ancestor chain (strategy-1 climb + strategy-2 tie-break).
     wait = _wait_row_for(idx, agent)
@@ -3086,7 +3131,7 @@ def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
             cur = idx.get(ppid) if isinstance(ppid, int) else None
 
     # (1) up from the wait process to the highest ELIGIBLE brain-named ancestor.
-    if wait is not None:
+    if wait is not None and not require_launcher_bound:
         best, seen, cur = None, set(), wait
         while isinstance(cur, dict):
             cpid = cur.get("pid")
@@ -3118,9 +3163,14 @@ def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
             cands.sort(key=lambda c: c[:4])
             return cands[0][4]
     # (3) degenerate non-forking: the launcher row itself is the brain.
-    if (allow_launcher_self and isinstance(launcher_pid, int)
-            and launcher_pid in idx and _name_matches(idx[launcher_pid])):
-        return idx[launcher_pid]
+    if allow_launcher_self and isinstance(launcher_pid, int) and launcher_pid in idx:
+        launcher_row = idx[launcher_pid]
+        identity_bound = (
+            not require_launcher_bound
+            or _start_tokens_match(_start_of(launcher_row), launcher_start)
+        )
+        if identity_bound and _name_matches(launcher_row):
+            return launcher_row
     return None
 
 
@@ -3393,8 +3443,10 @@ def _wrapped_liveness(
         agent,
         launcher_pid,
         brain_pattern,
-        launch_epoch=_iso_epoch(launcher_start),
         allow_launcher_self=bool(lcfg.get("allow_launcher_self", False)),
+        launcher_start=launcher_start,
+        require_launcher_bound=True,
+        turn_generation=record.get("turn_generation"),
     )
     if candidate is not None:
         base["brain_pid"] = candidate.get("pid")
@@ -4308,6 +4360,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 kill_targets=None, clear_marker=None, bypass_backoff=False,
                 notify=False, discover_brain=False, reason="",
                 barrier_state=None):
+        if wrapped and (
+            state.startswith("CLI_CHILD_")
+            or state in {"TURN_FAILED", "WRAPPER_MISSING", "STUCK_OR_DEAD"}
+        ):
+            nxt["healthy_since"] = None
         res = {"agent": name, "action": action, "state": state,
                "clear_marker": clear_marker, "kill_first": bool(kill_first),
                "kill_orphans": bool(kill_orphans), "kill_targets": kill_targets or [],
@@ -4441,19 +4498,22 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 ),
             )
         wrapper_state = liveness.get("wrapper_state")
-        if runtime_phase == runtime_obs.PHASE_IDLE and wrapper_state == "dead":
+        wrapper_dead = wrapper_state == "dead"
+        if wrapper_dead:
             if not hb_stale:
                 return _result(
                     NONE,
                     state="WRAPPER_MISSING",
                     reason=(
-                        "validated idle wrapper is absent, but its heartbeat is "
+                        "validated wrapper is absent, but its heartbeat is "
                         "still inside the stale threshold"
                     ),
                 )
-            # Preserve the existing stale-wrapper recovery path below. The
-            # strict idle record identifies the launch mode, while the
-            # available snapshot positively establishes wrapper absence.
+            child_recovery_state = "STUCK_OR_DEAD"
+            child_recovery_reason = (
+                "managed wrapper is absent from an available process snapshot"
+            )
+            nxt["healthy_since"] = None
         elif wrapper_state != "alive":
             return _result(
                 NONE,
@@ -4486,7 +4546,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 )
             )
         )
-        if runtime_phase == runtime_obs.PHASE_IDLE:
+        if wrapper_dead:
+            # Positive wrapper-death evidence bypasses child classification and
+            # enters the existing stale-wrapper recovery table below.
+            pass
+        elif runtime_phase == runtime_obs.PHASE_IDLE:
             if wrapper_state == "alive" and not hb_stale:
                 return _healthy("HEALTHY_IDLE", "validated wrapper idle")
             # A validated idle record with a stale wrapper heartbeat uses the
@@ -4667,7 +4731,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
 
     # 1) LAUNCHING: still in grace with readiness unresolved. Launcher death and
     # missing/incorrect brain discovery are irrelevant during startup.
-    if in_grace:
+    if in_grace and child_recovery_reason is None:
         return _result(NONE, state="LAUNCHING", discover_brain=not wrapped,
                        reason="in launch grace; awaiting first fresh heartbeat")
 

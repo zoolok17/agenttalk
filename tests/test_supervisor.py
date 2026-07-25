@@ -4661,6 +4661,123 @@ def test_wrapped_codex_forked_launcher_discovers_live_tui_grandchild() -> None:
     assert plan["next_state"]["brain_pid"] == WRAP_TUI_PID
 
 
+@pytest.mark.parametrize("wait_agent", ["worker-2", "worker"])
+def test_wrapped_unbound_wait_tree_cannot_certify_current_turn_brain(
+    wait_agent: str,
+) -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        {
+            "pid": 910,
+            "parent_pid": 1,
+            "name": "codex.exe",
+            "command_line": "codex prior-generation tui",
+            "start_time": _ps_iso(900000),
+        },
+        {
+            "pid": 911,
+            "parent_pid": 910,
+            "name": "python.exe",
+            "command_line": (
+                f"python -m agenttalk --root {TEST_ROOT} "
+                f"wait --for {wait_agent}"
+            ),
+            "start_time": _ps_iso(910000),
+        },
+    ]
+    wait = sup._wait_row_for(sup._snap_index(snapshot), "worker")
+    assert (wait is not None) is (wait_agent == "worker")
+
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=2,
+                turn_generation=7,
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=snapshot,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+    assert plan["next_state"]["brain_pid"] is None
+    assert plan["kill_targets"] == []
+
+
+@pytest.mark.parametrize(
+    "candidate_start",
+    [None, "opaque-start", _ps_iso(500000)],
+)
+def test_wrapped_launcher_edge_without_current_turn_start_evidence_is_unknown(
+    candidate_start: str | None,
+) -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        {
+            "pid": 920,
+            "parent_pid": WRAP_CHILD_PID,
+            "name": "codex.exe",
+            "command_line": "codex historical child",
+            "start_time": candidate_start,
+        },
+    ]
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=snapshot,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+    assert plan["next_state"]["brain_pid"] is None
+    assert plan["kill_targets"] == []
+
+
+def test_wrapped_comparable_linux_start_tokens_bind_current_turn_brain() -> None:
+    boot_id = "12345678-1234-1234-1234-123456789abc"
+    snapshot = [
+        _wrap_snap()[0],
+        {
+            "pid": 920,
+            "parent_pid": WRAP_CHILD_PID,
+            "name": "codex.exe",
+            "command_line": "codex current child",
+            "start_time": f"linux:{boot_id}:101",
+        },
+    ]
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=2,
+                launcher_start=f"linux:{boot_id}:100",
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=snapshot,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "HEALTHY_WORKING"
+    assert plan["next_state"]["brain_pid"] == 920
+
+
 def test_wrapped_active_absent_brain_requires_two_same_generation_polls() -> None:
     report = _report(
         heartbeat_stale=False,
@@ -4690,6 +4807,88 @@ def test_wrapped_active_absent_brain_requires_two_same_generation_polls() -> Non
     assert second["action"] == sup.STUCK_RECOVER
     assert second["state"] == "CLI_CHILD_DEAD"
     assert second["next_state"]["consecutive_fails"] == 3
+
+
+@pytest.mark.parametrize("phase", ["starting", "active", "terminal"])
+def test_wrapped_dead_wrapper_recovers_from_every_non_idle_runtime_phase(
+    phase: str,
+) -> None:
+    runtime = _wrapper_runtime_view(
+        phase=phase,
+        updated_age=3000.0,
+        progress_age=3000.0 if phase != "starting" else None,
+        progress_sequence=2,
+        outcome="success" if phase == "terminal" else None,
+    )
+    report = _report(
+        heartbeat_stale=True,
+        heartbeat_age_seconds=3000.0,
+        wrapper_runtime=runtime,
+    )
+    first = _plan_wrap(
+        report,
+        {"agents": {"worker": _wrap_ready(backoff_next_epoch=0.0)}},
+        snapshot=[],
+    )
+
+    assert first["action"] == sup.STUCK_RECOVER
+    assert first["state"] == "STUCK_OR_DEAD"
+
+    second = _plan_wrap(
+        report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=[],
+    )
+    assert second["action"] == sup.BACKOFF_WAIT
+    assert second["state"] == "STUCK_OR_DEAD"
+
+
+def test_wrapped_non_green_child_breaks_continuous_health_window() -> None:
+    state = _wrap_ready(
+        consecutive_fails=4,
+        backoff_next_epoch=NOW + 100,
+        healthy_since=NOW - 179,
+    )
+    missing = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=60.0,
+                progress_age=60.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": state}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert missing["state"] == "CLI_CHILD_MISSING"
+    assert missing["next_state"]["healthy_since"] is None
+    assert missing["next_state"]["consecutive_fails"] == 4
+    assert missing["next_state"]["backoff_next_epoch"] == NOW + 100
+
+    healthy = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 2,
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=3,
+            ),
+        ),
+        {"agents": {"worker": missing["next_state"]}},
+        now=NOW + 2,
+        snapshot=_codex_forked_brain_snap(),
+    )
+
+    assert healthy["state"] == "HEALTHY_WORKING"
+    assert healthy["next_state"]["healthy_since"] == NOW + 2
+    assert healthy["next_state"]["consecutive_fails"] == 4
+    assert healthy["next_state"]["backoff_next_epoch"] == NOW + 100
 
 
 def test_wrapped_real_progress_ends_spawn_grace_before_child_death() -> None:
