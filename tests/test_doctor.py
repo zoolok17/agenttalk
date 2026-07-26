@@ -10,6 +10,7 @@ import pytest
 
 from agenttalk import cli, doctor, install_skills as iskl, ovh_gateway_service, signing
 from agenttalk.store import Store
+from agenttalk.wrapper.obligations import POLICY_ENV
 
 
 def test_doctor_on_uninitialized_project_reports_error(tmp_path: Path) -> None:
@@ -132,6 +133,377 @@ def test_doctor_ovh_qwen_gateway_is_allowlisted_and_checks_ambient_keys(
     assert anthropic_secret not in rendered
     assert "OVH_KEY" not in rendered
     assert "ANTHROPIC_API_KEY" not in rendered
+
+
+def _external_worker_commit_gate_check(report: doctor.Report) -> doctor.Check:
+    return next(c for c in report.checks if c.name == "external_worker_commit_gate")
+
+
+def _write_doctor_commit_gate_policy(
+    path: Path,
+    agents: dict[str, dict],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "agents": agents,
+    }), encoding="utf-8")
+
+
+def _write_doctor_supervisor(store: Store, agents: dict[str, dict]) -> None:
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"agents": agents}),
+        encoding="utf-8",
+    )
+
+
+def test_doctor_warns_external_worker_without_commit_gate_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1", "remote-dev-2"])
+    store.set_trust_class("qwen-dev-1", "external-worker")
+    store.set_trust_class("remote-dev-2", "external-worker")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "warn"
+    assert "qwen-dev-1" in check.details
+    assert "remote-dev-2" in check.details
+    assert check.data["ungated_agents"] == ["qwen-dev-1", "remote-dev-2"]
+
+
+def test_doctor_gated_supervisor_external_worker_and_normal_agent_do_not_warn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1", "native-dev"])
+    policy = tmp_path / "commit-gate-policy.json"
+    policy.write_text(json.dumps({
+        "schema_version": 1,
+        "agents": {"qwen-dev-1": {"grade": "detection", "enabled": True}},
+    }), encoding="utf-8")
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "agents": {
+            "qwen-dev-1": {
+                "trust_class": "external-worker",
+                "env": {POLICY_ENV: str(policy)},
+            },
+            "native-dev": {},
+        },
+    }), encoding="utf-8")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "ok"
+    assert check.data["external_workers"] == ["qwen-dev-1"]
+    assert check.data["ungated_agents"] == []
+    assert "native-dev" not in check.details
+
+
+def test_doctor_external_worker_commit_gate_absent_configs_do_not_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Store(tmp_path).init(["lead", "native-dev"])
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    report = doctor.run(tmp_path)
+
+    assert all(c.name != "external_worker_commit_gate" for c in report.checks)
+
+
+def test_doctor_external_worker_commit_gate_unreadable_supervisor_does_not_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+    store.set_trust_class("qwen-dev-1", "external-worker")
+    (store.dir / "supervisor.json").write_text("{", encoding="utf-8")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "warn"
+    assert check.data["ungated_agents"] == ["qwen-dev-1"]
+
+
+def test_doctor_supervisor_only_external_worker_blocked_policy_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    policy = tmp_path / "commit-gate-policy.json"
+    policy.write_text("{", encoding="utf-8")
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "agents": {
+            "remote-dev": {
+                "trust_class": "external-worker",
+                "env": {POLICY_ENV: str(policy)},
+            },
+        },
+    }), encoding="utf-8")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "warn"
+    assert "present but unusable" in check.details
+    assert "policy_status=blocked_policy" in check.details
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert check.data["unusable_policy_agents"] == ["remote-dev"]
+
+
+def test_doctor_malformed_external_worker_policy_path_warns_without_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "agents": {
+            "remote-dev": {
+                "trust_class": "external-worker",
+                "env": {POLICY_ENV: "\0"},
+            },
+        },
+    }), encoding="utf-8")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if "\0" in str(path):
+            raise OSError("unresolvable policy path")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    report = doctor.run(tmp_path)
+    check = _external_worker_commit_gate_check(report)
+
+    assert check.status == "warn"
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert check.data["unusable_policy_agents"] == ["remote-dev"]
+
+
+def test_doctor_unresolvable_roster_policy_keeps_both_checks_non_green(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+    store.set_trust_class("qwen-dev-1", "external-worker")
+    policy = tmp_path / "commit-gate-policy.json"
+    monkeypatch.setenv(POLICY_ENV, str(policy))
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == policy:
+            raise OSError("unresolvable policy path")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    report = doctor.run(tmp_path)
+    wrapped = next(c for c in report.checks if c.name == "wrapped_commit_gate")
+    external = _external_worker_commit_gate_check(report)
+
+    assert wrapped.status == "error"
+    assert external.status == "warn"
+    assert "policy_status=blocked_policy" in external.details
+    assert external.data["ungated_agents"] == ["qwen-dev-1"]
+    assert external.data["unusable_policy_agents"] == ["qwen-dev-1"]
+    assert external.data["stronger_error_agents"] == ["qwen-dev-1"]
+
+
+def test_doctor_supervisor_relative_policy_uses_each_worker_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    relative_policy = Path("policies") / "commit-gate.json"
+    ready_cwd = tmp_path / "ready-worker"
+    missing_cwd = tmp_path / "missing-worker"
+    _write_doctor_commit_gate_policy(
+        ready_cwd / relative_policy,
+        {"remote-ready": {"grade": "detection", "enabled": True}},
+    )
+    _write_doctor_commit_gate_policy(
+        tmp_path / relative_policy,
+        {"remote-root": {"grade": "detection", "enabled": True}},
+    )
+    _write_doctor_supervisor(store, {
+        "remote-ready": {
+            "trust_class": "external-worker",
+            "cwd": str(ready_cwd),
+            "env": {POLICY_ENV: str(relative_policy)},
+        },
+        "remote-root": {
+            "trust_class": "external-worker",
+            "env": {POLICY_ENV: str(relative_policy)},
+        },
+        "remote-missing": {
+            "trust_class": "external-worker",
+            "cwd": str(missing_cwd),
+            "env": {POLICY_ENV: str(relative_policy)},
+        },
+    })
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+    policies = {row["agent"]: row for row in check.data["policies"]}
+
+    assert check.status == "warn"
+    assert check.data["ungated_agents"] == ["remote-missing"]
+    assert policies["remote-ready"]["policy_status"] == "active"
+    assert policies["remote-root"]["policy_status"] == "active"
+    assert policies["remote-missing"]["policy_status"] == "blocked_policy"
+
+
+def test_doctor_supervisor_policy_override_beats_stale_ambient_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    worker_cwd = tmp_path / "worker"
+    relative_policy = Path("config") / "commit-gate.json"
+    _write_doctor_commit_gate_policy(
+        worker_cwd / relative_policy,
+        {"remote-dev": {"grade": "detection", "enabled": True}},
+    )
+    _write_doctor_supervisor(store, {
+        "remote-dev": {
+            "trust_class": "external-worker",
+            "cwd": str(worker_cwd),
+            "env": {POLICY_ENV: str(relative_policy)},
+        },
+    })
+    monkeypatch.setenv(POLICY_ENV, str(tmp_path / "stale-policy.json"))
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "ok"
+    assert check.data["ungated_agents"] == []
+    assert check.data["policies"][0]["policy_path"] == str(relative_policy)
+
+
+def test_doctor_lowercase_supervisor_policy_override_disables_ambient_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    ambient_policy = tmp_path / "ambient-policy.json"
+    _write_doctor_commit_gate_policy(
+        ambient_policy,
+        {"remote-dev": {"grade": "detection", "enabled": True}},
+    )
+    _write_doctor_supervisor(store, {
+        "remote-dev": {
+            "trust_class": "external-worker",
+            "env": {POLICY_ENV.lower(): ""},
+        },
+    })
+    monkeypatch.setenv(POLICY_ENV, str(ambient_policy))
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "warn"
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert check.data["policies"][0]["policy_path"] == ""
+    assert check.data["policies"][0]["policy_status"] == "not_owed"
+
+
+def test_doctor_supervisor_missing_override_is_not_masked_by_valid_ambient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    ambient_policy = tmp_path / "ambient-policy.json"
+    _write_doctor_commit_gate_policy(
+        ambient_policy,
+        {"remote-dev": {"grade": "detection", "enabled": True}},
+    )
+    _write_doctor_supervisor(store, {
+        "remote-dev": {
+            "trust_class": "external-worker",
+            "cwd": str(tmp_path / "worker"),
+            "env": {POLICY_ENV: str(Path("config") / "missing-policy.json")},
+        },
+    })
+    monkeypatch.setenv(POLICY_ENV, str(ambient_policy))
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "warn"
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert check.data["unusable_policy_agents"] == ["remote-dev"]
+
+
+def test_doctor_supervisor_external_worker_blocked_security_policy_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    policy = tmp_path / "security-policy.json"
+    _write_doctor_commit_gate_policy(
+        policy,
+        {"remote-dev": {"grade": "security", "enabled": True}},
+    )
+    _write_doctor_supervisor(store, {
+        "remote-dev": {
+            "trust_class": "external-worker",
+            "env": {POLICY_ENV: str(policy)},
+        },
+    })
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+    policy_row = check.data["policies"][0]
+
+    assert check.status == "warn"
+    assert "policy_status=blocked" in check.details
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert check.data["unusable_policy_agents"] == ["remote-dev"]
+    assert policy_row["policy_status"] == "blocked"
+
+
+def test_doctor_supervisor_external_worker_disabled_policy_reports_inactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    policy = tmp_path / "disabled-policy.json"
+    _write_doctor_commit_gate_policy(
+        policy,
+        {"remote-dev": {"grade": "detection", "enabled": False}},
+    )
+    _write_doctor_supervisor(store, {
+        "remote-dev": {
+            "trust_class": "external-worker",
+            "env": {POLICY_ENV: str(policy)},
+        },
+    })
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+    policy_row = check.data["policies"][0]
+
+    assert check.status == "warn"
+    assert "policy_status=inactive" in check.details
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert policy_row["policy_status"] == "inactive"
 
 
 # ----- hmac check status mapping (review C*: doctor must NOT report a

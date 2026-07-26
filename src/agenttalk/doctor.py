@@ -175,6 +175,9 @@ def run(project_root: Path | None = None) -> Report:
         if holds is not None:  # additive: absent unless a valid config-blocked hold exists
             report.checks.append(holds)
         report.checks.append(_check_detection_commit_gate(store))
+        external_gate = _check_external_worker_commit_gate(store)
+        if external_gate is not None:
+            report.checks.append(external_gate)
         report.checks.append(_check_publication_order(store))
         kn_check = _check_knowledge(store)
         if kn_check is not None:  # additive: absent unless a knowledge store exists
@@ -234,17 +237,34 @@ def _check_publication_order(store: Store) -> Check:
     return Check(name=name, status="ok", details="durable order and anchor present")
 
 
-def _check_detection_commit_gate(store: Store) -> Check:
-    """Report the operator launch-policy snapshot and durable breaker state."""
-    from agenttalk.wrapper.obligations import (
-        POLICY_ENV,
-        DetectionCommitGate,
-        PolicySnapshot,
-        ResolverState,
-    )
+@dataclass(frozen=True)
+class _SupervisorCommitGateAgent:
+    launch_cwd: object
+    policy_override: object
+    has_policy_override: bool
 
-    roster = store.load_config().get("agents", []) or []
-    supervisor_paths: dict[str, str] = {}
+
+def _supervisor_env_override(env: object, key: str) -> tuple[bool, object]:
+    """Read a supervisor env override with Windows environment semantics."""
+    if not isinstance(env, dict):
+        return False, None
+    wanted = key.casefold()
+    found = False
+    value: object = None
+    for candidate, candidate_value in env.items():
+        if isinstance(candidate, str) and candidate.casefold() == wanted:
+            found = True
+            value = candidate_value
+    return found, value
+
+
+def _supervisor_commit_gate_facts(
+    store: Store,
+    policy_env: str,
+) -> tuple[set[str], dict[str, _SupervisorCommitGateAgent]]:
+    """Best-effort external-worker identities and supervisor launch inputs."""
+    external_workers: set[str] = set()
+    supervisor_agents: dict[str, _SupervisorCommitGateAgent] = {}
     supervisor_path = store.dir / "supervisor.json"
     if supervisor_path.exists():
         try:
@@ -254,21 +274,221 @@ def _check_detection_commit_gate(store: Store) -> Check:
         entries = supervisor.get("agents") if isinstance(supervisor, dict) else None
         if isinstance(entries, dict):
             for name, entry in entries.items():
-                env = entry.get("env") if isinstance(entry, dict) else None
-                value = env.get(POLICY_ENV) if isinstance(env, dict) else None
-                if isinstance(value, str) and value:
-                    supervisor_paths[str(name)] = value
+                if not isinstance(entry, dict):
+                    continue
+                agent = str(name)
+                if entry.get("trust_class") == "external-worker":
+                    external_workers.add(agent)
+                env = entry.get("env")
+                has_policy_override, policy_override = _supervisor_env_override(
+                    env,
+                    policy_env,
+                )
+                supervisor_agents[agent] = _SupervisorCommitGateAgent(
+                    launch_cwd=entry.get("cwd"),
+                    policy_override=policy_override,
+                    has_policy_override=has_policy_override,
+                )
+    return external_workers, supervisor_agents
+
+
+def _commit_gate_policy_snapshot(
+    configured: object,
+    agent: str,
+    *,
+    project_root: Path | None = None,
+    launch_cwd: object = None,
+):
+    """Resolve one operator policy path without letting diagnostics crash."""
+    from agenttalk.wrapper.obligations import PolicySnapshot, ResolverState
+
+    if configured is None or configured == "":
+        return PolicySnapshot.inactive(agent=agent)
+    try:
+        if not isinstance(configured, str):
+            raise TypeError("policy path must be a string")
+        path = Path(configured).expanduser()
+        if not path.is_absolute() and project_root is not None:
+            if launch_cwd is None or launch_cwd == "":
+                worker_cwd = project_root
+            elif isinstance(launch_cwd, str):
+                worker_cwd = Path(launch_cwd).expanduser()
+                if not worker_cwd.is_absolute():
+                    worker_cwd = project_root / worker_cwd
+            else:
+                raise TypeError("launch cwd must be a string")
+            path = worker_cwd / path
+        path = path.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return PolicySnapshot(
+            ResolverState.BLOCKED_POLICY,
+            "unreadable",
+            reason=f"operator policy path invalid: {type(exc).__name__}",
+            agent=agent,
+        )
+    return PolicySnapshot.from_path(path, agent)
+
+
+def _effective_commit_gate_policy(
+    store: Store,
+    agent: str,
+    ambient_path: str | None,
+    supervisor_agents: dict[str, _SupervisorCommitGateAgent],
+):
+    """Resolve the policy path from the environment the worker actually receives."""
+    supervisor_agent = supervisor_agents.get(agent)
+    if supervisor_agent is None:
+        configured = ambient_path
+        return configured, _commit_gate_policy_snapshot(configured, agent)
+    configured = (
+        supervisor_agent.policy_override
+        if supervisor_agent.has_policy_override
+        else ambient_path
+    )
+    return configured, _commit_gate_policy_snapshot(
+        configured,
+        agent,
+        project_root=store.root,
+        launch_cwd=supervisor_agent.launch_cwd,
+    )
+
+
+def _check_external_worker_commit_gate(store: Store) -> Check | None:
+    """Warn when an external worker can use the legacy ungated commit path."""
+    from agenttalk.wrapper.obligations import POLICY_ENV, ResolverState
+
+    try:
+        roster = store.load_config()
+        roster_agents = {str(agent) for agent in roster.get("agents", []) or []}
+        trust_classes = roster.get("trust_classes")
+        if not isinstance(trust_classes, dict):
+            trust_classes = {}
+        roster_external = {
+            str(agent)
+            for agent, trust_class in trust_classes.items()
+            if trust_class == "external-worker"
+        }
+    except (OSError, TypeError, ValueError):
+        roster_agents = set()
+        roster_external = set()
+    supervisor_external, supervisor_agents = _supervisor_commit_gate_facts(
+        store,
+        POLICY_ENV,
+    )
+    external_workers = sorted(roster_external | supervisor_external)
+    if not external_workers:
+        return None
+
+    process_path = os.environ.get(POLICY_ENV)
+    ungated: list[str] = []
+    missing_or_disabled: list[str] = []
+    unusable: list[str] = []
+    stronger_errors: list[str] = []
+    rows: list[dict] = []
+    for agent in external_workers:
+        configured, policy = _effective_commit_gate_policy(
+            store,
+            agent,
+            process_path,
+            supervisor_agents,
+        )
+        if policy.status != ResolverState.ACTIVE:
+            ungated.append(agent)
+            if policy.status in {ResolverState.NOT_OWED, ResolverState.INACTIVE}:
+                missing_or_disabled.append(agent)
+            else:
+                unusable.append(agent)
+            if (
+                policy.status == ResolverState.BLOCKED_POLICY
+                and agent in roster_agents
+            ):
+                stronger_errors.append(agent)
+        rows.append({
+            "agent": agent,
+            "policy_path": configured,
+            "policy_status": policy.status.value,
+            "grade": policy.grade,
+            "reason": policy.reason,
+        })
+
+    if not ungated:
+        return Check(
+            name="external_worker_commit_gate",
+            status="ok",
+            details=(
+                "external-worker commit-gate policy configured: "
+                + ", ".join(external_workers)
+            ),
+            data={
+                "external_workers": external_workers,
+                "ungated_agents": [],
+                "unusable_policy_agents": [],
+                "stronger_error_agents": stronger_errors,
+                "policies": rows,
+            },
+        )
+
+    policy_statuses = {
+        str(row["agent"]): str(row["policy_status"])
+        for row in rows
+    }
+
+    def describe(agents: list[str]) -> str:
+        return ", ".join(
+            f"{agent} (policy_status={policy_statuses[agent]})"
+            for agent in agents
+        )
+
+    detail_parts = []
+    if missing_or_disabled:
+        detail_parts.append(
+            "external-worker agent(s) without enabled commit-gate policy: "
+            + describe(missing_or_disabled)
+        )
+    if unusable:
+        detail_parts.append(
+            "external-worker agent(s) with present but unusable commit-gate policy: "
+            + describe(unusable)
+        )
+    return Check(
+        name="external_worker_commit_gate",
+        status="warn",
+        details="; ".join(detail_parts),
+        fix=(
+            f"configure or repair an operator-owned {POLICY_ENV} policy with "
+            "an enabled detection-grade entry for each listed agent"
+        ),
+        data={
+            "external_workers": external_workers,
+            "ungated_agents": ungated,
+            "unusable_policy_agents": unusable,
+            "stronger_error_agents": stronger_errors,
+            "policies": rows,
+        },
+    )
+
+
+def _check_detection_commit_gate(store: Store) -> Check:
+    """Report the operator launch-policy snapshot and durable breaker state."""
+    from agenttalk.wrapper.obligations import (
+        POLICY_ENV,
+        DetectionCommitGate,
+        ResolverState,
+    )
+
+    roster = store.load_config().get("agents", []) or []
+    _, supervisor_agents = _supervisor_commit_gate_facts(store, POLICY_ENV)
     process_path = os.environ.get(POLICY_ENV)
     rows: list[dict] = []
     has_error = False
     has_warn = False
     has_legacy_broadcast = False
     for agent in roster:
-        configured = process_path or supervisor_paths.get(agent)
-        policy = (
-            PolicySnapshot.from_path(Path(configured).expanduser().resolve(), agent)
-            if configured
-            else PolicySnapshot.inactive()
+        configured, policy = _effective_commit_gate_policy(
+            store,
+            agent,
+            process_path,
+            supervisor_agents,
         )
         gate = DetectionCommitGate(store, agent, policy, fence="doctor-read-only")
         status = gate.status()
