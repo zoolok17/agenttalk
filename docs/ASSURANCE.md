@@ -183,6 +183,123 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.79.1 - wrapper false-park fix (the hand-finishing bug) (2026-07-25)
+**GOOD / ROBUST** - release base `v0.79.0` (`dcca3233`, the commit the tag actually points at) - gated candidate `354990d` - ship: the squash-merge of PR #88 on master, which tag `v0.79.1` marks (resolve with `git rev-parse 'v0.79.1^{commit}'`)
+- **Scope:** one behavioural fix (#73) plus a docs/skill change (#79). The wrapper could do the
+  work, write a durable reply, and still park the inbound as unfinished, forcing the operator to
+  hand-finish completed work. The landed-response resolver now proves the terminal response from
+  the validated bus rather than from a parse of the child's command.
+- **Field evidence, not theory:** the defect was observed twice in production on 2026-07-24/25 --
+  `codex-2` (16:17) and `codex-agenttalk-developer-4` (03:04) both parked `config_blocked` while
+  their replies were present on the bus (message ids `20260724-161658-536356-DsPE` and
+  `20260725-030415-829351-eRgT` verified to exist). This release exists because the bug was
+  reproducing against real work, not because a test predicted it.
+- **Risk record:** base `v0.79.0` (`dcca323`); candidate refs `072f540` (both connector P2s) ->
+  `bdfc092` (braced env form) -> merge `e5a6c54`; `1cd96c3` (#79). Semantic dimensions matched:
+  wrapper commit/park behaviour (decides whether real work is recorded as done) and agent-facing
+  skill policy. Two P2s raised by the GitHub connector against the first fix were themselves
+  regressions of the class being fixed, and were closed before merge.
+- **Assurance evidence:**
+  - **15/15 dev-gate legs green on `354990d`, the last CODE-BEARING revision of this release.**
+    Note the unavoidable regress, stated once here so future entries inherit it: a gate result can
+    never be recorded INSIDE the commit it describes, because writing it changes the tree. So the
+    code gate binds to the last code-bearing revision, and the attestation commit carrying this
+    ledger is documentation-only by construction and separately green in CI. What is NOT acceptable
+    -- and is what the connector caught -- is citing a gate for a commit that is neither the head nor
+    an ancestor of it An earlier revision of this
+    entry cited the gate for `a25dad0`; the connector correctly objected that `a25dad0` is a SIBLING
+    of the release commit, not its ancestor, and its tree differs -- the dev-gate is SHA-bound, so
+    that evidence could not validate this revision. Superseded rather than silently kept (the version bump
+    must be committed before the gate runs; a gate bound to a pre-bump SHA cannot validate the
+    package). Separately 15/15 on `bdfc092` for the #73 fix itself (re-verified against the actual head,
+    not the SHA the CI monitor was armed on), zero fresh connector findings at merge time.
+  - Independent adversarial review by `claude-agenttalk-reviewer-fable`: **GO**, no blocking
+    findings, all five requested attack points addressed. It additionally found a third member of
+    the same defect family (the braced `${env:...}` interpreter form, fixed in `bdfc092`) and
+    corrected an overclaim: no rescind producer in `src/` emits `meta.supersedes`, so the residual
+    documented in `072f540` is theoretical rather than a live trade-off.
+  - Tests are **differential**: on the pre-fix source exactly 3 legs fail and the no-rescind
+    control still yields a proof, so the fixture is proven capable of producing a proof when
+    nothing cancels the request. 449 passed across the two touched suites locally.
+- **Tier-3 gate RUN 2026-07-25 (composition + verdicts recorded per §1a):**
+  - **Proposed tier:** Tier 3, proposed by the change owner (`claude-agenttalk-lead`).
+    Triggers claimed: durability/atomicity/recovery + persistent-state contract (#73 decides
+    whether completed work is recorded as done); normative operational skill (#79, both CLI
+    surfaces).
+  - **Ratifier (anti-self-serve, cross-family, mandatory because owner == lead):**
+    `codex-agenttalk-developer-4` (codex family) -- **APPROVED**. The owner did not ratify
+    their own classification.
+  - **Panel (hard floor 3, >=2 model families, distinct predeclared lenses; no lead, no
+    builder counted -- `codex-2` excluded as #73's builder, the lead excluded as owner):**
+    1. `codex-agenttalk-reviewer-1` (codex) -- lens: durability / persistent-state contract of
+       the validated-bus landed-response proof. **HOLD / REVISE** (see open finding below).
+    2. `claude-agenttalk-reviewer-3` (claude) -- lens: release-union blast radius +
+       packaging/install correctness (both version sites, all three install pins, wheel
+       identity). **APPROVED**.
+    3. `claude-agenttalk-reviewer-fable` (claude) -- lens: #79 as an authority change (does the
+       Independence policy widen unapproved lead action against the escalate / waive /
+       authenticated-operator boundaries). **APPROVED**. Independent for this lens: its earlier
+       review covered the #73 resolver, not the skill.
+  - **Docs-testing pass (triggered by docs + packaging/install change):**
+    - `test-docs` EXECUTED green: `checkpoint show --json`; `supervise --bootstrap-check`;
+      `agenttalk.__version__ == 0.79.1`; plus package-build, wheel-install,
+      wheel-dependency-check and wheel-contract green in the `a25dad0` gate.
+    - `test-docs` RECORDED **referenced-not-executed** (never counted green): the documented
+      pinned install `@v0.79.1` cannot run before the tag exists -- chicken-and-egg by
+      construction.
+    - `review-docs` (independent; the lead wrote all the prose): `codex-agenttalk-developer-4`
+      -- **APPROVED**.
+- **CLOSED FINDING (was the sole blocker; P2, executed and reproduced, not asserted):**
+  reconstructed publication order can revive the post-rescind false commit. When the sidecar is
+  absent or incomplete, `publication_ordered_messages()` falls back to MESSAGE-ID order
+  (`store.py:4077-4087`) and ids are monotonic only per process (`store.py:7038-7051`), so a
+  requester rescind can be reconstructed AFTER the response it should cancel;
+  `_exact_landed_response` returns the first exact terminal before reaching it and the pre-drive
+  path commits. Replay: same-timestamp `...000003-ZZZZ` (rescind) vs `...000003-AAAA`
+  (response) with the sidecar truncated to its inbound-only prefix -> `turns=1`, child invoked
+  zero times, cursor advanced. Bounded to legacy/order-orphan reconstruction; canonical writers
+  with an intact sidecar behaved correctly across 22 focused + 15 publication-order tests.
+  **Disposition:** fold + re-review on a new SHA (operator-directed 2026-07-25). The lead may
+  not erase an open REVISE. Fix shape: make order degradation observable and DECLINE the proof
+  when the backing order is reconstructed -- cannot-verify-order is not green -- WITHOUT making
+  the rescind scan position-independent, which would regress the false-park this release fixes.
+
+- **Gate closure (2026-07-26):** `codex-agenttalk-reviewer-1` re-reviewed the fold on the same
+  durability lens and **APPROVED**, release_blocker=no, closing its own P2. Executed at `354990d`:
+  both orphan shapes (truncated sidecar; both order files absent) produced `durable=False`,
+  `proof=False`, `turns=0`, `cursor=''`, and the persisted `order_reconstructed` marker survived a
+  heal. **False-park control held** -- with an intact sidecar a response physically published BEFORE
+  a later rescind still produced `proof=True` and committed the cursor despite hostile lexical id
+  ordering, so declining did not become over-broad. 32 focused cases plus a real-Store/run-loop
+  differential replay. It found no state reachable through supported writers where reconstructed
+  order becomes durable.
+- **Final drift result: NO DRIFT.** Shipped behaviour matches `CHANGELOG.md:32-36`. The CHANGELOG's
+  original unconditional rescind claim was narrowed before ship after the connector showed it was
+  false for the legacy path; the residual is now stated inline rather than promised away.
+- **Bounded residual carried, not hidden (task #82):** `order_reconstructed` is NOT bound into the
+  publication-order tamper anchor (`store.py:1773`) -- `_message_publication_order_chain()` hashes
+  only ids and sequences, so flipping the flag `true -> false` while leaving the message map intact
+  passes validation and launders the taint. This requires direct mutation of a local store file,
+  which is already the documented honest-local trust residual, and reviewer-1 explicitly scoped it
+  out ("could not verify hostile direct mutation"). The connector then went and looked at exactly
+  that residual, which is why it is recorded here instead of discovered later.
+- **Record correction for v0.79.0:** that entry states `ship SHA bf40925`, but
+  `git rev-parse 'v0.79.0^{commit}'` resolves to `dcca3233`. The recorded ship SHA is not where the
+  tag landed, so an auditor would look for the release at a commit the tag never pointed to. That is
+  the failure this ledger exists to prevent; task #85 adds a per-release scoring pass so a claim like
+  it is checked at the NEXT release rather than by accident.
+
+- **Known-not-fixed at ship (stated, not hidden):**
+  - The fix is **not live for already-running wrappers**. A wrapper is a long-lived process that
+    imported the old modules at launch; the editable install means master is the install, but
+    running agents keep the old behaviour until restarted. Restarting is itself subject to #78.
+  - `& (${env:AGENTTALK_PY})` (bare-parenthesized-braced) still returns `None`. Judged an
+    unrealistic spelling; the realistic member of the family is fixed.
+  - #72 (supervisor CLI-child health) is NOT in this release. PR #81 is green with a reviewer GO
+    but carries 3 fresh connector findings, including a crashed wrapper outside `idle` phase that
+    never auto-recovers. Shipping half of the operator's production report was the deliberate
+    choice over shipping a known false-DOWN.
+
 ### v0.79.0 - checkpoint-before-compact + DoD forcing-gate + OVH gateway fold (63-commit backlog) (2026-07-25)
 **GOOD / ROBUST** - release base `v0.78.1` - ship SHA `bf40925` - tag `v0.79.0`
 - **Scope:** the accumulated 63-commit master backlog, rolled into one release so it could be

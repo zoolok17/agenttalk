@@ -1618,6 +1618,10 @@ class Store:
             or isinstance(raw.get("append_sequence"), bool)
             or int(raw["append_sequence"]) < 0
             or not isinstance(raw.get("messages"), dict)
+            or (
+                "order_reconstructed" in raw
+                and not isinstance(raw.get("order_reconstructed"), bool)
+            )
         ):
             raise ValueError("message publication order sidecar is invalid")
         append_sequence = int(raw["append_sequence"])
@@ -1762,6 +1766,11 @@ class Store:
             "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
             "append_sequence": sequence,
             "messages": messages,
+            # Once any tail was reconstructed from message ids, the sidecar can
+            # preserve that canonical order but can never recover its original
+            # physical publication order. Keep the provenance fail-closed across
+            # every later write.
+            "order_reconstructed": True,
         }
 
     def _reserve_message_publication_sequence(
@@ -1787,6 +1796,7 @@ class Store:
                 "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
                 "append_sequence": len(messages),
                 "messages": messages,
+                "order_reconstructed": bool(messages),
             }
         else:
             messages = dict(order["messages"])
@@ -1814,6 +1824,10 @@ class Store:
             "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
             "append_sequence": sequence,
             "messages": messages,
+            # Missing provenance is a pre-fix/older-writer shape. It cannot prove
+            # that this complete sidecar was never reconstructed, so upgrade it to
+            # the permanent fail-closed state rather than silently blessing it.
+            "order_reconstructed": order.get("order_reconstructed") is not False,
         }
         self.state_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(
@@ -4066,25 +4080,46 @@ class Store:
         self,
         messages: list[Message] | None = None,
     ) -> list[Message]:
-        """Return validated messages in the durable physical publication order.
+        """Return validated messages in the best available publication order.
+
+        Use ``publication_ordered_messages_with_durability`` when correctness
+        depends on whether every returned position is backed by the sidecar.
+        """
+        ordered, _ = self.publication_ordered_messages_with_durability(messages)
+        return ordered
+
+    def publication_ordered_messages_with_durability(
+        self,
+        messages: list[Message] | None = None,
+    ) -> tuple[list[Message], bool]:
+        """Return ``(messages, durable_order)`` for one sidecar read.
 
         Legacy stores have no sidecar, so their established id order is the only
         available bootstrap authority. The first subsequent send freezes that
-        order under the publication lock before reserving its own sequence.
+        order under the publication lock before reserving its own sequence. A
+        partial sidecar similarly folds orphan messages onto its tail in id order.
+        ``durable_order`` is false for both reconstructed shapes, remains false
+        after that reconstruction is persisted, and is true only when the
+        sidecar covers every returned message and explicitly records that its
+        history was not reconstructed. Older unmarked sidecars fail closed.
         """
         messages = self.valid_messages() if messages is None else list(messages)
         order = self._read_message_publication_order()
         if order is None:
-            return messages
+            return messages, False
         sequences = order["messages"]
         missing = [message.id for message in messages if message.id not in sequences]
+        durable_order = not missing and order.get("order_reconstructed") is False
         if missing:
             # Read-time heal, IN-MEMORY only (a read path must not write): fold the
             # orphans onto the tail in id-order — identical to what the next write
             # will persist, so a read before and after the write agree — instead of
             # wedging every ordered read under version skew (#37).
             sequences = self._extend_order_with_orphans(order, missing)["messages"]
-        return sorted(messages, key=lambda message: sequences[message.id])
+        return (
+            sorted(messages, key=lambda message: sequences[message.id]),
+            durable_order,
+        )
 
     @staticmethod
     def _stable_scan_problem_reason(reason: str) -> str:

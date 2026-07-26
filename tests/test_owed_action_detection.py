@@ -8349,6 +8349,172 @@ def test_landed_response_uses_publication_order_not_lexical_message_id(
     assert result.proof.inbound_sequence < result.proof.evidence_sequence
 
 
+@pytest.mark.parametrize(
+    "order_shape",
+    ["orphaned-tail", "legacy-sidecarless"],
+)
+@pytest.mark.parametrize(
+    "heal_before_replay",
+    [False, True],
+    ids=["degraded-read", "persisted-reconstruction"],
+)
+def test_reconstructed_order_cannot_commit_post_rescind_landed_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    order_shape: str,
+    heal_before_replay: bool,
+) -> None:
+    store = _store(tmp_path)
+    monkeypatch.delenv("AGENTTALK_COMMIT_GATE_POLICY", raising=False)
+    gate = DetectionCommitGate.from_environment(store, "beta", fence="wrapper-1")
+    request_id = "rq-reconstructed-order-rescind"
+    message_ids = iter([
+        "20990101-000000-000001-AAAA",
+        "20990101-000000-000003-ZZZZ",
+        "20990101-000000-000003-AAAA",
+        "20990101-000000-000004-HHHH",
+    ])
+    monkeypatch.setattr("agenttalk.store._new_id", lambda: next(message_ids))
+    inbound = store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="review-request",
+        body="Review.",
+        meta={"request_id": request_id},
+    )
+    record = recv_api.next_record(store, "beta")
+    assert record is not None
+    assert record["id"] == inbound.id
+    store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="rescind",
+        body="withdrawn before the answer landed",
+        meta={"request_id": request_id},
+    )
+    store.send(
+        sender="beta",
+        recipient="alpha",
+        kind="review-result",
+        body="HOLD",
+        meta={
+            "status": "rejected",
+            "request_id": request_id,
+            "in_reply_to": inbound.id,
+        },
+    )
+
+    order_path = store.state_dir / "message-publication-order.json"
+    anchor_path = store.state_dir / "message-publication-order.anchor.json"
+    if order_shape == "orphaned-tail":
+        order = json.loads(order_path.read_text(encoding="utf-8"))
+        kept = {inbound.id: order["messages"][inbound.id]}
+        truncated_order = {
+            "schema_version": order["schema_version"],
+            "append_sequence": 1,
+            "messages": kept,
+        }
+        if "order_reconstructed" in order:
+            truncated_order["order_reconstructed"] = order["order_reconstructed"]
+        order_path.write_text(
+            json.dumps(truncated_order, indent=2),
+            encoding="utf-8",
+        )
+        anchor_path.write_text(
+            json.dumps({
+                "schema_version": order["schema_version"],
+                "append_sequence": 1,
+                "chain_digest": Store._message_publication_order_chain(kept),
+            }, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        order_path.unlink()
+        anchor_path.unlink()
+
+    if heal_before_replay:
+        store.send(
+            sender="gamma",
+            recipient="lead",
+            kind="note",
+            body="unrelated write persists reconstructed history",
+        )
+
+    child_calls: list[str] = []
+
+    def drive(current: dict) -> loop.DriveOutcome:
+        child_calls.append(current["id"])
+        return loop.DriveOutcome(
+            ok=False,
+            failure_class=loop.CLASS_INFRA,
+            summary="injected recoverable child failure",
+        )
+
+    turns = loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=1,
+        on_escalate=lambda _info: True,
+    )
+
+    assert turns == 0
+    assert child_calls == [inbound.id]
+    assert store.cursor("beta") == ""
+
+
+def test_intact_order_proves_response_before_later_rescind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    monkeypatch.delenv("AGENTTALK_COMMIT_GATE_POLICY", raising=False)
+    request_id = "rq-response-before-rescind"
+    message_ids = iter([
+        "20990101-000000-000001-AAAA",
+        "20990101-000000-000003-ZZZZ",
+        "20990101-000000-000003-AAAA",
+    ])
+    monkeypatch.setattr("agenttalk.store._new_id", lambda: next(message_ids))
+    inbound = store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="review-request",
+        body="Review.",
+        meta={"request_id": request_id},
+    )
+    record = recv_api.next_record(store, "beta")
+    assert record is not None
+    response = store.send(
+        sender="beta",
+        recipient="alpha",
+        kind="review-result",
+        body="HOLD",
+        meta={
+            "status": "rejected",
+            "request_id": request_id,
+            "in_reply_to": inbound.id,
+        },
+    )
+    rescind = store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="rescind",
+        body="withdrawn after the answer landed",
+        meta={"request_id": request_id},
+    )
+    gate = DetectionCommitGate.from_environment(store, "beta", fence="wrapper-1")
+
+    result = gate.resolve_landed_response(record)
+
+    assert response.id > rescind.id
+    assert result.proof is not None
+    assert result.proof.evidence_id == response.id
+
+
 def test_landed_response_skips_wrong_anchor_before_later_exact_terminal(
     tmp_path: Path,
 ) -> None:
