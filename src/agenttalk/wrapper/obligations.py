@@ -2184,6 +2184,20 @@ class DetectionCommitGate:
         messages: list[Message],
     ) -> LandedResponseResult:
         """Resolve an exact terminal response from a validated publication snapshot."""
+        try:
+            messages, durable_order = (
+                self.store.publication_ordered_messages_with_durability(messages)
+            )
+        except (OSError, ValueError, TimeoutError, RuntimeError):
+            return LandedResponseResult(
+                unavailable_reason="validated landed-response replay unavailable"
+            )
+        if not durable_order:
+            # Reconstructed id order cannot prove whether a response preceded a
+            # requester rescind. Withhold the proof so the wrapper takes its
+            # recoverable residual/re-drive path; crediting possibly cancelled work
+            # would instead persist a false completion.
+            return LandedResponseResult()
         inbound_id = record.get("id")
         if not isinstance(inbound_id, str):
             return LandedResponseResult(unavailable_reason="delivered inbound id is invalid")
