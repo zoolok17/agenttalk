@@ -244,6 +244,20 @@ class _SupervisorCommitGateAgent:
     has_policy_override: bool
 
 
+def _supervisor_env_override(env: object, key: str) -> tuple[bool, object]:
+    """Read a supervisor env override with Windows environment semantics."""
+    if not isinstance(env, dict):
+        return False, None
+    wanted = key.casefold()
+    found = False
+    value: object = None
+    for candidate, candidate_value in env.items():
+        if isinstance(candidate, str) and candidate.casefold() == wanted:
+            found = True
+            value = candidate_value
+    return found, value
+
+
 def _supervisor_commit_gate_facts(
     store: Store,
     policy_env: str,
@@ -266,10 +280,13 @@ def _supervisor_commit_gate_facts(
                 if entry.get("trust_class") == "external-worker":
                     external_workers.add(agent)
                 env = entry.get("env")
-                has_policy_override = isinstance(env, dict) and policy_env in env
+                has_policy_override, policy_override = _supervisor_env_override(
+                    env,
+                    policy_env,
+                )
                 supervisor_agents[agent] = _SupervisorCommitGateAgent(
                     launch_cwd=entry.get("cwd"),
-                    policy_override=env.get(policy_env) if has_policy_override else None,
+                    policy_override=policy_override,
                     has_policy_override=has_policy_override,
                 )
     return external_workers, supervisor_agents

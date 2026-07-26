@@ -395,6 +395,33 @@ def test_doctor_supervisor_policy_override_beats_stale_ambient_path(
     assert check.data["policies"][0]["policy_path"] == str(relative_policy)
 
 
+def test_doctor_lowercase_supervisor_policy_override_disables_ambient_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    ambient_policy = tmp_path / "ambient-policy.json"
+    _write_doctor_commit_gate_policy(
+        ambient_policy,
+        {"remote-dev": {"grade": "detection", "enabled": True}},
+    )
+    _write_doctor_supervisor(store, {
+        "remote-dev": {
+            "trust_class": "external-worker",
+            "env": {POLICY_ENV.lower(): ""},
+        },
+    })
+    monkeypatch.setenv(POLICY_ENV, str(ambient_policy))
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "warn"
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert check.data["policies"][0]["policy_path"] == ""
+    assert check.data["policies"][0]["policy_status"] == "not_owed"
+
+
 def test_doctor_supervisor_missing_override_is_not_masked_by_valid_ambient(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
