@@ -37,6 +37,7 @@ import re
 import uuid
 from typing import Any
 
+from agenttalk.coverage_contract import COVERAGE_GATE_NAMES, coverage_profile_from_gate
 from agenttalk.gates import CORE_RISK_CLASSES, is_valid_risk_class
 
 SCHEMA_VERSION = 1
@@ -114,7 +115,7 @@ _DOD_KNOWLEDGE_ALLOWED_TYPES = frozenset({"decision", "gotcha", "lesson"})
 _DOD_KNOWLEDGE_KEYS = frozenset({"when", "min_notes", "types", "min_body_chars"})
 _DOD_ALLOWED_TOP_KEYS = frozenset({"schema_version", "scopes"})
 _DOD_ASSURANCE_KEYS = frozenset({"gate", "max_age_days"})
-_DOD_COVERAGE_KEYS = frozenset({"min_percent", "max_age_days"})
+_DOD_COVERAGE_KEYS = frozenset({"gate", "min_percent", "max_age_days"})
 _DOD_SCHEMA_VERSION = 1
 # Fail-closed bounds on the policy file itself: reject an oversized dod.json before decode, so a
 # pathological deeply-nested document cannot exhaust the parser (RecursionError) or memory.
@@ -842,13 +843,19 @@ def _is_percent(value: object) -> bool:
 
 
 def _validate_dod_coverage_spec(spec: object, scope_name: str) -> dict:
-    """Normalize a scope's numeric coverage floor without accepting typo'd requirements."""
+    """Normalize a scope's coverage producer and floor without accepting impossible gates."""
     if not isinstance(spec, dict):
         raise CloseError(f"dod scope {scope_name!r} coverage must be an object")
     unknown = set(spec) - set(_DOD_COVERAGE_KEYS)
     if unknown:
         raise CloseError(
             f"dod scope {scope_name!r} coverage has unknown key(s): {sorted(unknown)}")
+    gate = spec.get("gate")
+    if not isinstance(gate, str) or gate not in COVERAGE_GATE_NAMES:
+        raise CloseError(
+            f"dod scope {scope_name!r} coverage.gate must be one of "
+            f"{sorted(COVERAGE_GATE_NAMES)}"
+        )
     min_percent = spec.get("min_percent")
     if not _is_percent(min_percent):
         raise CloseError(
@@ -859,7 +866,7 @@ def _validate_dod_coverage_spec(spec: object, scope_name: str) -> dict:
     ):
         raise CloseError(
             f"dod scope {scope_name!r} coverage.max_age_days must be a non-negative integer")
-    return {"min_percent": min_percent, "max_age_days": max_age}
+    return {"gate": gate, "min_percent": min_percent, "max_age_days": max_age}
 
 
 def _validate_dod_knowledge_spec(spec: object, scope_name: str) -> dict:
@@ -939,7 +946,7 @@ def evaluate_dod(record: dict, dod_eval: dict | None) -> list[tuple[str, str]]:
       "coverage": {                             # present iff "coverage" in required_dimensions
         "gate": str, "present": bool, "status": str|None, "severity": str|None,
         "evidence_source": str|None, "revision": str|None, "waiver_active": bool,
-        "gate_scope": str|None, "close_gate_scope": str|None,
+        "gate_scope": str|None,                 # must match the selected producer profile/global
         "coverage_percent": float|None, "min_percent": float,
         "age_days": float|None, "max_age_days": int|None,
       } | None,
@@ -958,7 +965,13 @@ def evaluate_dod(record: dict, dod_eval: dict | None) -> list[tuple[str, str]]:
     if "assurance" in required:
         out.extend(_evaluate_dod_assurance(record, dod_eval.get("assurance")))
     if "coverage" in required:
-        out.extend(_evaluate_dod_coverage(record, dod_eval.get("coverage")))
+        out.extend(
+            _evaluate_dod_coverage(
+                record,
+                dod_eval.get("coverage"),
+                required.get("coverage"),
+            )
+        )
     if "knowledge" in required:
         out.extend(_evaluate_dod_knowledge(record, dod_eval.get("knowledge")))
     return out
@@ -1041,26 +1054,50 @@ def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str
     return out
 
 
-def _evaluate_dod_coverage(record: dict, cov: dict | None) -> list[tuple[str, str]]:
-    """PURE: enforce the CI-attested, revision-bound ``coverage:<scope>`` gate.
+def _evaluate_dod_coverage(
+    record: dict,
+    cov: dict | None,
+    required: dict | None,
+) -> list[tuple[str, str]]:
+    """PURE: enforce the policy-selected, CI-attested, revision-bound coverage gate.
 
-    The gate is unusable unless it is present, applicable, green, blocker severity, produced by
-    automation_ci, and bound to this close's revision. A waiver never clears the dimension.
-    Freshness is checked before the numeric floor so stale evidence cannot be reported as merely
-    low. Missing or malformed percentages fail closed as missing evidence.
+    Close scope and assurance scan profile are separate axes: policy explicitly selects a
+    producible ``coverage:<profile>`` gate, whose own scope must match that producer profile (or
+    be global). The gate is otherwise unusable unless it is present, green, blocker severity,
+    produced by automation_ci, and bound to this close's revision. A waiver never clears the
+    dimension. Freshness is checked before the numeric floor so stale evidence cannot be reported
+    as merely low. Missing or malformed percentages fail closed as missing evidence.
     """
-    gate = (cov.get("gate") if isinstance(cov, dict) else None)
-    gate = gate or f"coverage:{record.get('scope') or ''}"
-    if not isinstance(cov, dict) or cov.get("present") is not True:
+    gate = required.get("gate") if isinstance(required, dict) else None
+    if not isinstance(gate, str):
+        return [(
+            HOLD_MISSING_COVERAGE,
+            "required coverage policy gate identity is missing or malformed",
+        )]
+    try:
+        producer_scope = coverage_profile_from_gate(gate)
+    except ValueError:
+        return [(
+            HOLD_MISSING_COVERAGE,
+            f"required coverage gate {gate!r} has no supported assurance producer",
+        )]
+    if not isinstance(cov, dict):
+        return [(HOLD_MISSING_COVERAGE, f"required coverage gate {gate!r} is not present")]
+    if cov.get("gate") != gate:
+        return [(
+            HOLD_MISSING_COVERAGE,
+            f"resolved coverage gate {cov.get('gate')!r} does not match required gate {gate!r}",
+        )]
+    if cov.get("present") is not True:
         return [(HOLD_MISSING_COVERAGE, f"required coverage gate {gate!r} is not present")]
 
     gate_scope = cov.get("gate_scope")
-    close_scope = cov.get("close_gate_scope")
-    if close_scope and gate_scope not in (close_scope, "global"):
+    if gate_scope not in (producer_scope, "global"):
         return [(
             HOLD_MISSING_COVERAGE,
             f"coverage gate {gate!r} is recorded under scope {gate_scope!r}, not applicable "
-            f"to this close's scope {close_scope!r} (needs that scope or 'global')",
+            f"to the selected producer profile {producer_scope!r} "
+            f"(needs that profile or 'global')",
         )]
 
     status = cov.get("status")
@@ -1087,7 +1124,7 @@ def _evaluate_dod_coverage(record: dict, cov: dict | None) -> list[tuple[str, st
             f"({cov.get('revision')!r} != {record.get('revision')!r})",
         )]
 
-    max_age = cov.get("max_age_days")
+    max_age = required.get("max_age_days")
     if max_age is not None:
         if not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0:
             return [(
@@ -1113,7 +1150,7 @@ def _evaluate_dod_coverage(record: dict, cov: dict | None) -> list[tuple[str, st
                 f"coverage gate {gate!r} evidence is older than max_age_days={max_age}",
             )]
 
-    min_percent = cov.get("min_percent")
+    min_percent = required.get("min_percent")
     coverage_percent = cov.get("coverage_percent")
     if not _is_percent(min_percent) or not _is_percent(coverage_percent):
         return [(

@@ -26,6 +26,7 @@ from typing import Any
 
 from agenttalk import __version__, gates
 from agenttalk._atomic import write_text as _atomic_write_text
+from agenttalk.coverage_contract import ASSURANCE_PROFILES, coverage_gate_name
 from agenttalk.coverage_parse import MAX_COVERAGE_ARTIFACT_BYTES, parse_coverage_percent
 
 
@@ -37,7 +38,7 @@ DEFAULT_MANIFEST = Path(".agenttalk") / "assurance.json"
 DEFAULT_BASELINE = Path(".agenttalk") / "assurance" / "baseline.json"
 DEFAULT_RUNS_DIR = Path(".agenttalk") / "assurance" / "runs"
 
-PROFILES = ("change", "release", "deep")
+PROFILES = ASSURANCE_PROFILES
 STATUS_VOCAB = (
     "pass",
     "fail-blocking",
@@ -544,8 +545,20 @@ def build_plan(
 def run_plan(plan: ScanPlan) -> ScanResult:
     fresh_coverage_attestations: set[tuple[str, str]] = set()
     try:
-        return _run_plan(plan, fresh_coverage_attestations)
-    finally:
+        result = _run_plan(plan, fresh_coverage_attestations)
+    except BaseException as scan_exc:
+        try:
+            _invalidate_stale_coverage_gate(
+                root=plan.root,
+                profile=plan.profile,
+                revision=plan.provenance.get("git_sha"),
+                run_id=plan.run_id,
+                fresh_coverage_attestations=fresh_coverage_attestations,
+            )
+        except Exception as finalization_exc:
+            raise scan_exc from finalization_exc
+        raise
+    else:
         _invalidate_stale_coverage_gate(
             root=plan.root,
             profile=plan.profile,
@@ -553,6 +566,7 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             run_id=plan.run_id,
             fresh_coverage_attestations=fresh_coverage_attestations,
         )
+        return result
 
 
 def _run_plan(
@@ -788,6 +802,9 @@ def main(argv: list[str] | None = None) -> int:
     run_id = _new_run_id()
     revision: str | None = None
     runner_errors: list[str] = []
+    status = 1
+    result: ScanResult | None = None
+    paths: ArtifactPaths | None = None
     try:
         revision = _git_output(root, ["rev-parse", "HEAD"])
         try:
@@ -800,49 +817,63 @@ def main(argv: list[str] | None = None) -> int:
         except AssuranceUsageError as exc:
             baseline = _default_baseline(_resolve_under_root(root, args.baseline))
             baseline["_validation_errors"] = [str(exc)]
-        try:
-            detection = detect_project(root, manifest)
-            provenance = collect_provenance(
-                root,
-                manifest,
-                args.profile,
-                baseline,
-                changed_from=args.changed_from,
-                changed_to=args.changed_to,
-            )
-            revision = str(provenance.get("git_sha") or "") or revision
-            plan = build_plan(root, args.profile, manifest, detection, baseline, provenance)
-            plan.run_id = run_id
-            plan.runner_errors.extend(runner_errors)
-            result = _run_plan(plan, fresh_coverage_attestations)
-            result = apply_baseline(result, baseline, manifest, provenance.get("changed_files") or [])
-            paths = write_artifact(result, args.out, summary=args.summary)
-        except AssuranceUsageError as exc:
-            sys.stderr.write(f"agenttalk assurance: {exc}\n")
-            return 2
-        except Exception as exc:  # noqa: BLE001 - fail-safe is no artifact, bounded stderr
-            sys.stderr.write(f"agenttalk assurance: could not produce artifact: {exc}\n")
-            return 1
-        if args.json_only:
-            print(str(paths.artifact))
-        else:
-            artifact = result.artifact or {}
-            summary = artifact.get("verdict_summary", {})
-            print(
-                "assurance artifact: "
-                f"{paths.artifact} "
-                f"(blocking={summary.get('blocking_findings_count', 0)}, "
-                f"required_skipped={summary.get('skipped_required_count', 0)})"
-            )
-        return 0
-    finally:
-        _invalidate_stale_coverage_gate(
-            root=root,
-            profile=args.profile,
-            revision=revision,
-            run_id=run_id,
-            fresh_coverage_attestations=fresh_coverage_attestations,
+        detection = detect_project(root, manifest)
+        provenance = collect_provenance(
+            root,
+            manifest,
+            args.profile,
+            baseline,
+            changed_from=args.changed_from,
+            changed_to=args.changed_to,
         )
+        revision = str(provenance.get("git_sha") or "") or revision
+        plan = build_plan(root, args.profile, manifest, detection, baseline, provenance)
+        plan.run_id = run_id
+        plan.runner_errors.extend(runner_errors)
+        result = _run_plan(plan, fresh_coverage_attestations)
+        result = apply_baseline(result, baseline, manifest, provenance.get("changed_files") or [])
+        paths = write_artifact(result, args.out, summary=args.summary)
+    except AssuranceUsageError as exc:
+        sys.stderr.write(f"agenttalk assurance: {exc}\n")
+        status = 2
+    except Exception as exc:  # noqa: BLE001 - fail-safe is no artifact, bounded stderr
+        sys.stderr.write(f"agenttalk assurance: could not produce artifact: {exc}\n")
+        status = 1
+    else:
+        status = 0
+    finally:
+        try:
+            _invalidate_stale_coverage_gate(
+                root=root,
+                profile=args.profile,
+                revision=revision,
+                run_id=run_id,
+                fresh_coverage_attestations=fresh_coverage_attestations,
+            )
+        except Exception as exc:  # noqa: BLE001 - finalization is a bounded CLI failure
+            sys.stderr.write(
+                f"agenttalk assurance: could not finalize coverage gate: {exc}\n"
+            )
+            if status == 0:
+                status = 1
+
+    if status != 0:
+        return status
+    if paths is None or result is None:
+        sys.stderr.write("agenttalk assurance: could not produce artifact: missing result\n")
+        return 1
+    if args.json_only:
+        print(str(paths.artifact))
+    else:
+        artifact = result.artifact or {}
+        summary = artifact.get("verdict_summary", {})
+        print(
+            "assurance artifact: "
+            f"{paths.artifact} "
+            f"(blocking={summary.get('blocking_findings_count', 0)}, "
+            f"required_skipped={summary.get('skipped_required_count', 0)})"
+        )
+    return 0
 
 
 # --------------------------------------------------------------------------- validation
@@ -1951,7 +1982,7 @@ def _invalidate_stale_coverage_gate(
 
     from agenttalk.store import Store
 
-    name = f"coverage:{profile}"
+    name = coverage_gate_name(profile)
     revision_value = str(revision or "") or None
     reason = "no fresh coverage measurement this run"
     with Store(root).config_lock():
@@ -2021,7 +2052,7 @@ def _emit_coverage_gate(
         evidence = [ci_evidence] if ci_evidence is not None else [f"assurance-run:{plan.run_id}"]
         gates.set_gate(
             plan.root,
-            name=f"coverage:{plan.profile}",
+            name=coverage_gate_name(plan.profile),
             status="green" if is_green else "red",
             severity="blocker",
             scope=plan.profile,

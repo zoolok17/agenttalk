@@ -25,7 +25,9 @@ Python v1:
 - coverage only when configured. Evidence is accepted from a bounded root
   `coverage.json` (`totals.percent_covered`) or a recognized coverage.py/pytest-cov
   terminal summary. XML is not parsed; conventional `coverage.xml` and
-  `coverage.json` paths are still protected for the command transaction.
+  `coverage.json` paths are still protected for the command transaction. Fresh
+  CI-attested evidence updates `coverage:<profile>`; a close policy must explicitly
+  select that producer gate rather than infer one from its close scope.
 - bandit, semgrep local rules, gitleaks, osv-scanner, and pip-audit when
   installed and applicable. Network-dependent dependency tools are skipped by
   default unless the manifest permits them.

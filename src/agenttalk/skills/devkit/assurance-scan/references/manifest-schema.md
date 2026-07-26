@@ -31,6 +31,28 @@ pytest-cov terminal summary, or create root-level `coverage.json` with a numeric
 The conventional `coverage.xml` path is still transactionally protected so a
 custom command cannot overwrite an operator's pre-existing report.
 
+Fresh coverage evidence is published under the scan profile's finite producer gate:
+`coverage:change`, `coverage:release`, or `coverage:deep`. In the separate `dod.json`
+close policy, `coverage.gate` is required and must name one of those gates. It is not
+derived from the close scope.
+
+Example `.agenttalk/dod.json`:
+
+```json
+{
+  "schema_version": 1,
+  "scopes": {
+    "feature": {
+      "coverage": {
+        "gate": "coverage:release",
+        "min_percent": 80,
+        "max_age_days": 14
+      }
+    }
+  }
+}
+```
+
 Unknown top-level manifest keys are validation errors. Unknown keys inside
 `profiles.<profile>` are also validation errors; the profile namespace is limited
 to `required_tools`, `network_allowed`, and `severity_floor`. Use top-level

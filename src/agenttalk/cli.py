@@ -2494,26 +2494,24 @@ def _coverage_percent_from_gate(g: dict):
 
 
 def _resolve_dod_coverage_gate(store, spec: dict, record: dict) -> dict:
-    """Read ``coverage:<close-scope>`` from the gate record itself.
+    """Read the policy-selected ``coverage:<profile>`` gate from the gate record itself.
 
-    This deliberately does not read a coverage artifact: the gate's own attestation fields,
-    revision, timestamp, scope, and numeric ``coverage_percent`` (from its latest evidence entry)
-    form the entire binding.
+    Close scope and assurance scan profile are deliberately independent. Policy selects one of
+    the finite producer gates validated by ``close.validate_dod_policy``; the gate's own
+    attestation fields, revision, timestamp, producer-profile scope, and numeric
+    ``coverage_percent`` (from its latest evidence entry) form the entire binding.
     """
     from datetime import datetime, timezone
 
     from agenttalk import gates as gate_mod
 
-    scope = str(record.get("scope") or "").strip().lower()
-    gate_name = f"coverage:{scope}"
+    gate_name = spec["gate"]
     state = gate_mod.load_gate_state(store.root)
     g = (state.get("gates") or {}).get(gate_name)
-    close_scope = record.get("gate_scope")
     if not isinstance(g, dict):
         return {
             "gate": gate_name,
             "present": False,
-            "close_gate_scope": close_scope,
             "min_percent": spec.get("min_percent"),
             "max_age_days": spec.get("max_age_days"),
         }
@@ -2534,7 +2532,6 @@ def _resolve_dod_coverage_gate(store, spec: dict, record: dict) -> dict:
         "revision": g.get("revision"),
         "waiver_active": waiver_active,
         "gate_scope": g.get("scope"),
-        "close_gate_scope": close_scope,
         "coverage_percent": _coverage_percent_from_gate(g),
         "min_percent": spec.get("min_percent"),
         "age_days": _iso_age_days(g.get("updated_at"), now),

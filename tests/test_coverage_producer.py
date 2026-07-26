@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import assurance, gates
+from agenttalk import assurance, cli, close, gates
 from agenttalk.coverage_parse import MAX_COVERAGE_ARTIFACT_BYTES, parse_coverage_percent
 from agenttalk.store import Store
 
@@ -173,6 +173,70 @@ def test_successful_ci_coverage_run_emits_revision_bound_green_gate(
     assert gate["revision"] == revision
     assert gate["evidence"][-1]["coverage_percent"] == 88.0
     assert isinstance(gate["evidence"][-1]["coverage_percent"], float)
+
+
+@pytest.mark.parametrize(
+    "close_scope",
+    [*sorted(close.RELEASE_CLASS_SCOPES), "custom"],
+)
+@pytest.mark.parametrize("profile", assurance.PROFILES)
+def test_each_supported_close_scope_can_select_each_producible_coverage_gate(
+    tmp_path: Path,
+    monkeypatch,
+    close_scope: str,
+    profile: str,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 100 12 88%')",
+            profile=profile,
+            revision=revision,
+        )
+    )
+
+    state = gates.load_gate_state(tmp_path)
+    gate_name = f"coverage:{profile}"
+    assert set(state["gates"]) == {gate_name}
+
+    policy = close.validate_dod_policy(
+        {
+            "schema_version": 1,
+            "scopes": {
+                close_scope: {
+                    "coverage": {
+                        "gate": gate_name,
+                        "min_percent": 80.0,
+                        "max_age_days": 14,
+                    }
+                }
+            },
+        }
+    )
+    required = close.derive_required_dod(policy, close_scope)["dimensions"]
+    record = {
+        "scope": close_scope,
+        "gate_scope": close_scope,
+        "revision": revision,
+    }
+    resolved = cli._resolve_dod_coverage_gate(
+        Store(tmp_path),
+        required["coverage"],
+        record,
+    )
+
+    assert resolved["gate"] == gate_name
+    assert resolved["gate_scope"] == profile
+    assert close.evaluate_dod(
+        record,
+        {
+            "policy_present": True,
+            "policy_error": None,
+            "required_dimensions": required,
+            "coverage": resolved,
+        },
+    ) == []
 
 
 def test_unparseable_ci_coverage_run_never_emits_green_gate(
@@ -498,6 +562,118 @@ def test_cli_pre_plan_failure_preserves_coverage_waiver(
 
     assert rc == 1
     assert _coverage_gate(tmp_path, "change")["status"] == "waived"
+
+
+def test_cli_finalization_lock_failure_returns_one_after_artifact_write(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _ci_revision(tmp_path, monkeypatch)
+
+    class FailingLock:
+        def __enter__(self):
+            raise TimeoutError("simulated coverage finalization lock timeout")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        Store,
+        "config_lock",
+        lambda _self, **_kwargs: FailingLock(),
+    )
+
+    rc = _run_assurance_cli(tmp_path)
+
+    captured = capsys.readouterr()
+    artifacts = list(
+        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
+    )
+    assert rc == 1
+    assert len(artifacts) == 1
+    assert captured.out == ""
+    assert "could not finalize coverage gate" in captured.err
+    assert "simulated coverage finalization lock timeout" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_finalization_persist_failure_returns_one_after_artifact_write(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    _set_green_coverage_gate(tmp_path, revision, scope="change")
+
+    def fail_gate_write(*_args, **_kwargs):
+        raise OSError("simulated full disk during coverage finalization")
+
+    monkeypatch.setattr(gates, "set_gate", fail_gate_write)
+
+    rc = _run_assurance_cli(tmp_path)
+
+    captured = capsys.readouterr()
+    artifacts = list(
+        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
+    )
+    assert rc == 1
+    assert len(artifacts) == 1
+    assert _coverage_gate(tmp_path, "change")["status"] == "green"
+    assert captured.out == ""
+    assert "could not finalize coverage gate" in captured.err
+    assert "simulated full disk during coverage finalization" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_finalization_failure_does_not_mask_scan_failure(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    _set_green_coverage_gate(tmp_path, revision, scope="change")
+
+    def fail_detection(*_args, **_kwargs):
+        raise PermissionError("simulated scan failure")
+
+    def fail_gate_write(*_args, **_kwargs):
+        raise OSError("simulated finalization failure")
+
+    monkeypatch.setattr(assurance, "detect_project", fail_detection)
+    monkeypatch.setattr(gates, "set_gate", fail_gate_write)
+
+    rc = _run_assurance_cli(tmp_path)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "could not produce artifact: simulated scan failure" in captured.err
+    assert "could not finalize coverage gate: simulated finalization failure" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_run_plan_finalization_failure_does_not_mask_scan_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    plan = _plan(tmp_path, "print('unused')")
+
+    def fail_scan(*_args, **_kwargs):
+        raise PermissionError("simulated library scan failure")
+
+    def fail_finalization(*_args, **_kwargs):
+        raise OSError("simulated library finalization failure")
+
+    monkeypatch.setattr(assurance, "_run_plan", fail_scan)
+    monkeypatch.setattr(assurance, "_invalidate_stale_coverage_gate", fail_finalization)
+
+    with pytest.raises(PermissionError) as exc_info:
+        assurance.run_plan(plan)
+
+    assert str(exc_info.value) == "simulated library scan failure"
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(exc_info.value.__cause__) == "simulated library finalization failure"
 
 
 def test_cli_fresh_ci_coverage_measurement_stays_green(

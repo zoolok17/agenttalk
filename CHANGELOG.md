@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   summaries and deliberately never parses XML. Concurrent scans serialize the full
   report transaction, and a report that cannot be quarantined aborts before the coverage
   command runs. Conventional XML and JSON report paths remain protected and restored.
+  DoD coverage policy now explicitly selects one of the finite `coverage:change`,
+  `coverage:release`, or `coverage:deep` producer gates, so every supported close scope has a
+  satisfiable evidence path. Coverage-gate finalization failures are bounded CLI failures
+  and no longer escape, mask an earlier scan failure, or print a false success.
 
 ## [0.79.1] - 2026-07-25
 
