@@ -20,7 +20,14 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import checkpoint, cli, ephemeral as eph, health as hm, supervisor as sup
+from agenttalk import (
+    checkpoint,
+    cli,
+    ephemeral as eph,
+    health as hm,
+    supervisor as sup,
+    wrapper_runtime as wrt,
+)
 from agenttalk.store import Store
 
 
@@ -92,6 +99,25 @@ def _write_supervisor_config(store: Store, agents: dict) -> None:
         json.dumps({"schema_version": 2, "agents": agents}, indent=2),
         encoding="utf-8",
     )
+
+
+def _write_idle_wrapper_runtime(
+    store: Store,
+    *,
+    agent: str = "worker",
+    at: float = NOW,
+    wrapper_pid: int = 300,
+    wrapper_start: str | None = WRAP_START,
+) -> None:
+    writer = wrt.WrapperRuntimeWriter(
+        store.state_dir,
+        agent,
+        "test-wrapper-1",
+        wrapper_pid=wrapper_pid,
+        wrapper_start=wrapper_start,
+        clock=lambda: at,
+    )
+    writer.idle()
 
 
 def _auth_marker(rid: str = "rr-1", *, force_protected: bool = False,
@@ -993,11 +1019,11 @@ def test_supervisor_hosting_doc_covers_degraded_mode_and_services() -> None:
     assert "sc.exe" not in text.lower()
 
 
-def test_supervisor_tutorial_documents_disabled_work_heartbeat_recovery_limit() -> None:
+def test_supervisor_tutorial_documents_work_heartbeat_is_not_cli_progress() -> None:
     text = Path("docs/supervisor-tutorial.md").read_text(encoding="utf-8")
-    assert "work_heartbeat.enabled=false" in text
-    assert "disables automatic stale recovery" in text
-    assert "warning-only" in text
+    assert "work-heartbeat timer is coordination visibility" in text
+    assert "never advances `progress_sequence`" in text
+    assert "never automatic kill authority" in text
 
 
 def test_ps_template_console_action_log_and_quiet() -> None:
@@ -1010,9 +1036,9 @@ def test_ps_template_console_action_log_and_quiet() -> None:
     assert "$p.action -ne 'none'" in ps                 # always-print a real action
     assert "$lastLogged" in ps                          # change-detection memory
     assert "agents healthy" in ps                       # periodic liveness summary
-    # the healthy count is HEALTHY_IDLE ONLY, not every action=='none' state
-    # (LAUNCHING / rate-limited ACTIVE_OR_BUSY also have no action) - codex r1.
-    assert "$p.state -eq 'HEALTHY_IDLE'" in ps
+    # Only the two green wrapped states count as healthy, not every
+    # action=='none' state (CLI_CHILD_UNKNOWN and LAUNCHING are non-green).
+    assert "$p.state -in 'HEALTHY_IDLE','HEALTHY_WORKING'" in ps
     assert "if ($DryRun)" in ps                         # DryRun keeps its own print
     # reviewer-1 r1/r2: -Quiet must silence ALL warnings - including the ones in the
     # helper functions on the relaunch path - so it sets $WarningPreference once
@@ -5070,16 +5096,14 @@ def test_seed_codex_home_provisions_and_fails_closed(tmp_path: Path) -> None:
 
 # ---------------------------------------- Phase C: wrapped:true (wrap --loop)
 #
-# A wrapped agent is supervised THROUGH `agenttalk wrap --loop`: the wrapper
-# (python) IS the long-lived root, so brain discovery is retired (brain_pid
-# stays None) but the per-turn child (codex exec / claude -p) is still reaped
-# via the start-guarded managed_pids tree-kill. Because the wrapper is
-# instrumented by construction (heartbeat on idle-wait + streaming progress), a
-# wrapped agent treats a stale heartbeat as confirm-stuck and RECOVERS without
-# the activity hook installed. Session continuity is owned by the wrapper, so
-# the supervisor injects NO session args (launch_mode "wrap", session_args []).
+# A wrapped agent is supervised THROUGH `agenttalk wrap --loop`: the Python
+# wrapper is the long-lived root, while wrapper-runtime.json identifies each
+# per-turn CLI launcher. The supervisor independently discovers the real CLI
+# brain (including a Codex TUI after its launcher exits) and retains the
+# start-guarded managed tree for recovery. Session continuity is owned by the
+# wrapper, so the supervisor injects no session args.
 
-WRAP_LAUNCHER_PID, WRAP_CHILD_PID = 300, 301
+WRAP_LAUNCHER_PID, WRAP_CHILD_PID, WRAP_TUI_PID = 300, 301, 302
 
 _WRAP_CONFIG = {
     "root": TEST_ROOT,
@@ -5112,6 +5136,20 @@ def _wrap_snap(*, cli="codex", launcher_pid=WRAP_LAUNCHER_PID,
     ]
 
 
+def _codex_forked_brain_snap() -> list[dict]:
+    wrapper = _wrap_snap()[0]
+    return [
+        wrapper,
+        {
+            "pid": WRAP_TUI_PID,
+            "parent_pid": WRAP_CHILD_PID,
+            "name": "codex.exe",
+            "command_line": "codex tui",
+            "start_time": _ps_iso(700000),
+        },
+    ]
+
+
 def _wrap_ready(**over) -> dict:
     st = {"launcher_pid": WRAP_LAUNCHER_PID, "launcher_start": WRAP_START,
           "launcher_nonce": SUPERVISOR_NONCE,
@@ -5123,18 +5161,118 @@ def _wrap_ready(**over) -> dict:
     return st
 
 
+def _wrapper_runtime_view(
+    *,
+    phase: str = "idle",
+    now: float = NOW,
+    updated_age: float = 1.0,
+    progress_age: float | None = None,
+    outcome: str | None = None,
+    wrapper_generation: str = "wrapper-1",
+    turn_generation: int = 1,
+    progress_sequence: int = 0,
+    launcher_pid: int | None = None,
+    launcher_start: str | None = None,
+) -> dict:
+    active_turn = phase != "idle"
+    if phase == "active":
+        launcher_pid = WRAP_CHILD_PID if launcher_pid is None else launcher_pid
+        launcher_start = WRAP_CHILD_START if launcher_start is None else launcher_start
+    if phase == "terminal" and launcher_pid is None:
+        launcher_pid = WRAP_CHILD_PID
+        launcher_start = WRAP_CHILD_START
+    if progress_age is not None:
+        progress_sequence = max(1, progress_sequence)
+    record = {
+        "schema_version": 1,
+        "agent": "worker",
+        "wrapper_pid": WRAP_LAUNCHER_PID,
+        "wrapper_start": WRAP_START,
+        "wrapper_generation": wrapper_generation,
+        "phase": phase,
+        "turn_generation": turn_generation,
+        "turn_id": f"turn-{turn_generation}" if active_turn else None,
+        "message_id": "msg-runtime" if active_turn else None,
+        "cli_launcher_pid": launcher_pid if active_turn else None,
+        "cli_launcher_start": launcher_start if active_turn else None,
+        "progress_sequence": progress_sequence,
+        "last_progress_at": (
+            _iso(now - progress_age) if progress_age is not None else None
+        ),
+        "last_outcome": outcome,
+        "updated_at": _iso(now - updated_age),
+    }
+    return {
+        "status": "valid",
+        "record": record,
+        "updated_age_seconds": updated_age,
+        "progress_age_seconds": progress_age,
+    }
+
+
 def _plan_wrap(report, state, *, now=NOW, snapshot=None, config=_WRAP_CONFIG):
+    report = dict(report)
+    agents = dict(report.get("agents") or {})
+    worker = dict(agents.get("worker") or {})
+    worker.setdefault("wrapper_runtime", _wrapper_runtime_view(now=now))
+    agents["worker"] = worker
+    report["agents"] = agents
     snap = [] if snapshot is None else snapshot
     return sup.plan_actions(report, state, config, now_epoch=now,
                             snapshot=snap)["agents"]["worker"]
 
 
-def test_wrapped_liveness_retires_brain_keeps_managed() -> None:
+@pytest.mark.parametrize(
+    ("config", "report"),
+    [
+        (
+            {
+                "agents": {
+                    "worker": {
+                        "auto_restart": False,
+                        "cli": "codex",
+                        "wrapped": True,
+                    }
+                }
+            },
+            _report(),
+        ),
+        (
+            {
+                "agents": {
+                    "worker": {
+                        "auto_restart": True,
+                        "cli": "codex",
+                        "wrapped": True,
+                    }
+                }
+            },
+            {"agents": {}},
+        ),
+    ],
+    ids=["auto-restart-disabled", "report-missing"],
+)
+def test_plan_ignores_unsupervised_or_unreported_agents(
+    config: dict,
+    report: dict,
+) -> None:
+    plan = sup.plan_actions(
+        report,
+        {"agents": {}},
+        config,
+        now_epoch=NOW,
+        snapshot=[],
+    )
+    assert plan["agents"] == {}
+
+
+def test_wrapped_liveness_requires_runtime_before_discovering_brain() -> None:
     snap = _wrap_snap()
     lv = sup._liveness(snap, _wrap_ready(), {"cli": "codex", "wrapped": True},
                        "worker", NOW, root_key=sup._root_key(TEST_ROOT))
     assert lv["brain_pid"] is None and lv["brain_start"] is None
     assert lv["discovered_brain"] is False
+    assert lv["runtime_status"] == wrt.STATUS_ABSENT
     # the per-turn child is still tracked for the start-guarded tree-kill
     pids = [m["pid"] for m in lv["managed_pids"]]
     assert WRAP_CHILD_PID in pids
@@ -5142,6 +5280,1703 @@ def test_wrapped_liveness_retires_brain_keeps_managed() -> None:
     # the brain - proving the wrapped path is what suppresses it.
     lv2 = sup._liveness(snap, _wrap_ready(), {"cli": "codex"}, "worker", NOW)
     assert lv2["brain_pid"] == WRAP_CHILD_PID and lv2["discovered_brain"] is True
+
+
+def test_wrapped_idle_accepts_bounded_concurrent_runtime_write_lead() -> None:
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(updated_age=-1.0),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["state"] == "HEALTHY_IDLE"
+
+
+def test_wrapped_active_turn_with_dead_cli_brain_is_not_healthy_idle() -> None:
+    active_health = hm.build_snapshot(
+        agent="worker",
+        cli="codex",
+        mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=_iso(NOW - 1),
+        since=_iso(NOW - 60),
+        last_progress_at=_iso(NOW - 1),
+        request_id="q-active",
+        msg_id="20990101-000000-000000-ACTIVE",
+        reason_code="progress_event",
+    )
+    active_health.update({"age_seconds": 1.0, "stale": False, "advisory": True})
+
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            health=active_health,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=60.0,
+                progress_age=60.0,
+                progress_sequence=3,
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],  # live wrapper only; the active CLI brain is gone
+    )
+
+    assert plan["state"] != "HEALTHY_IDLE"
+
+
+def test_wrapped_terminal_stale_runtime_cannot_be_healthy_idle() -> None:
+    terminal_runtime = _wrapper_runtime_view(
+        phase="terminal",
+        updated_age=1.0,
+        progress_age=3600.0,
+        progress_sequence=4,
+        turn_generation=8,
+        outcome="success",
+    )
+
+    plan = _plan_wrap(
+        _report(heartbeat_stale=False, wrapper_runtime=terminal_runtime),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+
+
+@pytest.mark.parametrize("outcome", ["failed", "dead_letter", "success"])
+def test_wrapped_stale_live_terminal_uses_existing_recovery_path(
+    outcome: str,
+) -> None:
+    terminal_runtime = _wrapper_runtime_view(
+        phase="terminal",
+        updated_age=3000.0,
+        progress_age=3000.0,
+        progress_sequence=4,
+        turn_generation=8,
+        outcome=outcome,
+    )
+
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=True,
+            heartbeat_age_seconds=3000.0,
+            wrapper_runtime=terminal_runtime,
+        ),
+        {"agents": {"worker": _wrap_ready(backoff_next_epoch=0.0)}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "STUCK_OR_DEAD"
+
+
+def test_wrapped_idle_without_cli_child_is_healthy_idle() -> None:
+    plan = _plan_wrap(
+        _report(heartbeat_stale=False),
+        {"agents": {"worker": _wrap_ready(readiness_seen=False)}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "HEALTHY_IDLE"
+    assert plan["next_state"]["readiness_seen"] is True
+
+
+def test_wrapped_idle_absent_wrapper_is_non_green_before_heartbeat_stales() -> None:
+    plan = _plan_wrap(
+        _report(heartbeat_stale=False),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=[],
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "WRAPPER_MISSING"
+
+
+def test_wrapped_idle_absent_wrapper_uses_existing_stale_recovery_path() -> None:
+    plan = _plan_wrap(
+        _report(heartbeat_stale=True, heartbeat_age_seconds=3000.0),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=[],
+    )
+
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "STUCK_OR_DEAD"
+
+
+@pytest.mark.parametrize(
+    ("phase", "updated_age", "progress_age", "outcome", "heartbeat_stale",
+     "expected_action", "expected_state"),
+    [
+        ("starting", 1.0, None, None, False, sup.NONE, "CLI_CHILD_STARTING"),
+        ("starting", 31.0, None, None, False, sup.NONE, "CLI_CHILD_UNKNOWN"),
+        ("terminal", 1.0, 1.0, "success", False, sup.NONE, "HEALTHY_WORKING"),
+        ("terminal", 2500.0, 2500.0, "success", False, sup.NONE, "CLI_CHILD_UNKNOWN"),
+        ("terminal", 1.0, None, "success", False, sup.NONE, "CLI_CHILD_UNKNOWN"),
+        ("terminal", 1.0, 1.0, "failed", False, sup.NONE, "TURN_FAILED"),
+        ("idle", 3000.0, None, None, True, sup.STUCK_RECOVER, "STUCK_OR_DEAD"),
+    ],
+    ids=[
+        "starting-in-grace",
+        "starting-after-grace",
+        "terminal-success-finalizing",
+        "terminal-success-stale-progress",
+        "terminal-success-unclassified-progress",
+        "terminal-failure",
+        "idle-stale-heartbeat",
+    ],
+)
+def test_wrapped_non_active_runtime_recovery_matrix(
+    phase: str,
+    updated_age: float,
+    progress_age: float | None,
+    outcome: str | None,
+    heartbeat_stale: bool,
+    expected_action: str,
+    expected_state: str,
+) -> None:
+    runtime = _wrapper_runtime_view(
+        phase=phase,
+        updated_age=updated_age,
+        progress_age=progress_age,
+        progress_sequence=2,
+        outcome=outcome,
+    )
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=heartbeat_stale,
+            heartbeat_age_seconds=3000.0 if heartbeat_stale else 1.0,
+            wrapper_runtime=runtime,
+        ),
+        {"agents": {"worker": _wrap_ready(backoff_next_epoch=0.0)}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["action"] == expected_action
+    assert plan["state"] == expected_state
+
+
+def test_wrapped_claude_launcher_self_is_healthy_working() -> None:
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {"auto_restart": True, "cli": "claude", "wrapped": True}
+        },
+    }
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap(cli="claude"),
+        config=config,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "HEALTHY_WORKING"
+    assert plan["next_state"]["brain_pid"] == WRAP_CHILD_PID
+
+
+def test_wrapped_codex_forked_launcher_discovers_live_tui_grandchild() -> None:
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "HEALTHY_WORKING"
+    assert plan["next_state"]["brain_pid"] == WRAP_TUI_PID
+
+
+@pytest.mark.parametrize("wait_agent", ["worker-2", "worker"])
+def test_wrapped_unbound_wait_tree_cannot_certify_current_turn_brain(
+    wait_agent: str,
+) -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        {
+            "pid": 910,
+            "parent_pid": 1,
+            "name": "codex.exe",
+            "command_line": "codex prior-generation tui",
+            "start_time": _ps_iso(900000),
+        },
+        {
+            "pid": 911,
+            "parent_pid": 910,
+            "name": "python.exe",
+            "command_line": (
+                f"python -m agenttalk --root {TEST_ROOT} "
+                f"wait --for {wait_agent}"
+            ),
+            "start_time": _ps_iso(910000),
+        },
+    ]
+    wait = sup._wait_row_for(sup._snap_index(snapshot), "worker")
+    assert (wait is not None) is (wait_agent == "worker")
+
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=2,
+                turn_generation=7,
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=snapshot,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+    assert plan["next_state"]["brain_pid"] is None
+    assert plan["kill_targets"] == []
+
+
+@pytest.mark.parametrize(
+    "candidate_start",
+    [None, "opaque-start", _ps_iso(500000)],
+)
+def test_wrapped_launcher_edge_without_current_turn_start_evidence_is_unknown(
+    candidate_start: str | None,
+) -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        {
+            "pid": 920,
+            "parent_pid": WRAP_CHILD_PID,
+            "name": "codex.exe",
+            "command_line": "codex historical child",
+            "start_time": candidate_start,
+        },
+    ]
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=snapshot,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+    assert plan["next_state"]["brain_pid"] is None
+    assert plan["kill_targets"] == []
+
+
+def test_wrapped_comparable_linux_start_tokens_bind_current_turn_brain() -> None:
+    boot_id = "12345678-1234-1234-1234-123456789abc"
+    snapshot = [
+        _wrap_snap()[0],
+        {
+            "pid": 920,
+            "parent_pid": WRAP_CHILD_PID,
+            "name": "codex.exe",
+            "command_line": "codex current child",
+            "start_time": f"linux:{boot_id}:101",
+        },
+    ]
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=2,
+                launcher_start=f"linux:{boot_id}:100",
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=snapshot,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "HEALTHY_WORKING"
+    assert plan["next_state"]["brain_pid"] == 920
+
+
+def test_wrapped_active_absent_brain_requires_two_same_generation_polls() -> None:
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=60.0,
+            progress_age=60.0,
+            progress_sequence=2,
+        ),
+    )
+    first = _plan_wrap(
+        report,
+        {"agents": {"worker": _wrap_ready(consecutive_fails=2)}},
+        snapshot=_wrap_snap()[:1],
+    )
+    assert first["action"] == sup.NONE
+    assert first["state"] == "CLI_CHILD_MISSING"
+    assert first["next_state"]["runtime_dead_polls"] == 1
+    assert first["next_state"]["consecutive_fails"] == 2
+
+    second = _plan_wrap(
+        report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=_wrap_snap()[:1],
+    )
+    assert second["action"] == sup.STUCK_RECOVER
+    assert second["state"] == "CLI_CHILD_DEAD"
+    assert second["next_state"]["consecutive_fails"] == 3
+
+
+@pytest.mark.parametrize("phase", ["starting", "active", "terminal"])
+def test_wrapped_dead_wrapper_recovers_from_every_non_idle_runtime_phase(
+    phase: str,
+) -> None:
+    runtime = _wrapper_runtime_view(
+        phase=phase,
+        updated_age=3000.0,
+        progress_age=3000.0 if phase != "starting" else None,
+        progress_sequence=2,
+        outcome="success" if phase == "terminal" else None,
+    )
+    report = _report(
+        heartbeat_stale=True,
+        heartbeat_age_seconds=3000.0,
+        wrapper_runtime=runtime,
+    )
+    first = _plan_wrap(
+        report,
+        {"agents": {"worker": _wrap_ready(backoff_next_epoch=0.0)}},
+        snapshot=[],
+    )
+
+    assert first["action"] == sup.STUCK_RECOVER
+    assert first["state"] == "STUCK_OR_DEAD"
+
+    second = _plan_wrap(
+        report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=[],
+    )
+    assert second["action"] == sup.BACKOFF_WAIT
+    assert second["state"] == "STUCK_OR_DEAD"
+
+
+def test_wrapped_non_green_child_breaks_continuous_health_window() -> None:
+    state = _wrap_ready(
+        consecutive_fails=4,
+        backoff_next_epoch=NOW + 100,
+        healthy_since=NOW - 179,
+    )
+    missing = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=60.0,
+                progress_age=60.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": state}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert missing["state"] == "CLI_CHILD_MISSING"
+    assert missing["next_state"]["healthy_since"] is None
+    assert missing["next_state"]["consecutive_fails"] == 4
+    assert missing["next_state"]["backoff_next_epoch"] == NOW + 100
+
+    healthy = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 2,
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=3,
+            ),
+        ),
+        {"agents": {"worker": missing["next_state"]}},
+        now=NOW + 2,
+        snapshot=_codex_forked_brain_snap(),
+    )
+
+    assert healthy["state"] == "HEALTHY_WORKING"
+    assert healthy["next_state"]["healthy_since"] == NOW + 2
+    assert healthy["next_state"]["consecutive_fails"] == 4
+    assert healthy["next_state"]["backoff_next_epoch"] == NOW + 100
+
+
+def test_wrapped_real_progress_ends_spawn_grace_before_child_death() -> None:
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=1,
+            ),
+        ),
+        {
+            "agents": {
+                "worker": _wrap_ready(
+                    launching=True,
+                    readiness_seen=False,
+                    launch_grace_until=NOW + 100,
+                )
+            }
+        },
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["state"] == "CLI_CHILD_MISSING"
+    assert plan["next_state"]["runtime_dead_polls"] == 1
+
+
+def test_wrapped_prior_turn_sequence_does_not_end_current_spawn_grace() -> None:
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=None,
+                progress_sequence=5,
+                turn_generation=2,
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_STARTING"
+    assert plan["next_state"]["runtime_dead_polls"] == 0
+
+
+def test_wrapped_live_brain_without_progress_stalls_after_confirmation() -> None:
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=2500.0,
+            progress_age=None,
+            progress_sequence=0,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=0,
+        runtime_progress_seen_epoch=NOW - 2500,
+    )
+
+    first = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+    assert first["action"] == sup.NONE
+    assert first["state"] == "CLI_CHILD_STALL_SUSPECT"
+
+    second = _plan_wrap(
+        report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=_codex_forked_brain_snap(),
+    )
+    assert second["action"] == sup.STUCK_RECOVER
+    assert second["state"] == "CLI_CHILD_STALLED"
+
+
+def test_wrapped_claude_stall_waits_for_stale_heartbeat_without_watchdog() -> None:
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {"auto_restart": True, "cli": "claude", "wrapped": True}
+        },
+    }
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=300.0,
+            progress_age=300.0,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 300,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_wrap_snap(cli="claude"),
+        config=config,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_STALLED"
+    assert "heartbeat is fresh" in plan["reason"]
+
+    # The default 900-second ticker cap is finite. At turn age 1081 its final
+    # stamp is 181 seconds old, so the ordinary stale-heartbeat path takes over.
+    stale_now = NOW + 781
+    stale = _plan_wrap(
+        _report(
+            heartbeat_stale=True,
+            heartbeat_age_seconds=181.0,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=stale_now,
+                updated_age=1081.0,
+                progress_age=1081.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": plan["next_state"]}},
+        now=stale_now,
+        snapshot=_wrap_snap(cli="claude"),
+        config=config,
+    )
+
+    assert stale["action"] == sup.STUCK_RECOVER
+    assert stale["state"] == "CLI_CHILD_STALLED"
+    assert "heartbeat is stale" in stale["reason"]
+
+
+def test_wrapped_watchdog_recovery_reserves_progress_coalescing_margin(
+    tmp_path: Path,
+) -> None:
+    config = {**_WRAP_CONFIG, "poll_seconds": 1}
+    now = [NOW]
+    writer = wrt.WrapperRuntimeWriter(
+        tmp_path,
+        "worker",
+        "wrapper-1",
+        wrapper_pid=WRAP_LAUNCHER_PID,
+        wrapper_start=WRAP_START,
+        clock=lambda: now[0],
+    )
+    writer.starting(message_id="msg-runtime", turn_id="turn-1")
+    writer.active(WRAP_CHILD_PID, WRAP_CHILD_START)
+    durable = writer.progress()
+    now[0] += 4.9
+    hidden = writer.progress()
+    runtime = wrt.read_runtime(tmp_path, "worker", now_epoch=NOW + 2400.1)
+    report = _report(heartbeat_stale=False, wrapper_runtime=runtime)
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=1,
+        runtime_progress_seen_epoch=NOW,
+    )
+
+    assert durable["progress_sequence"] == 1
+    assert hidden["progress_sequence"] == 2
+    assert runtime["record"]["progress_sequence"] == 1
+
+    # Polling every second must not recover until hidden event #2's true age
+    # reaches the 2400-second threshold.
+    first = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        now=NOW + 2400.1,
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+    second = _plan_wrap(
+        report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 2401.1,
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert first["action"] == sup.NONE
+    assert first["state"] == "CLI_CHILD_STALL_SUSPECT"
+    assert second["action"] == sup.NONE
+    assert second["state"] == "CLI_CHILD_STALLED"
+    assert "coalescing allowance" in second["reason"]
+
+    safe = _plan_wrap(
+        report,
+        {"agents": {"worker": second["next_state"]}},
+        now=NOW + 2405.0,
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert safe["action"] == sup.STUCK_RECOVER
+    assert safe["state"] == "CLI_CHILD_STALLED"
+
+
+def test_wrapped_stalled_forked_brain_is_an_attributed_kill_target() -> None:
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=2500.0,
+            progress_age=2500.0,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 2500,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "CLI_CHILD_STALLED"
+    assert {
+        "pid": WRAP_TUI_PID,
+        "start": _ps_iso(700000),
+        "reason": "runtime_brain",
+        "source": "wrapper_runtime",
+    } in plan["kill_targets"]
+
+
+def test_wrapped_invalid_watchdog_floor_never_authorizes_stall_recovery() -> None:
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "codex",
+                "wrapped": True,
+                "turn_watchdog": {"turn_elapsed_seconds": "invalid"},
+            }
+        },
+    }
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=2500.0,
+            progress_age=None,
+            progress_sequence=0,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=0,
+        runtime_progress_seen_epoch=NOW - 2500,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_STALLED"
+    assert "turn_elapsed_seconds is invalid" in plan["reason"]
+
+
+def test_wrapped_ambiguous_brain_is_unknown_and_never_killed() -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        {
+            "pid": WRAP_TUI_PID,
+            "parent_pid": 999,
+            "name": "codex.exe",
+            "command_line": "codex unrelated",
+            "start_time": _ps_iso(700000),
+        },
+    ]
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=snapshot,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+    assert plan["kill_targets"] == []
+
+
+def test_wrapped_progress_sequence_advance_stays_healthy_working() -> None:
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=1,
+        runtime_progress_seen_epoch=NOW - 2500,
+        runtime_stall_polls=1,
+    )
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=2500.0,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+
+    assert plan["state"] == "HEALTHY_WORKING"
+    assert plan["next_state"]["runtime_progress_seen_epoch"] == NOW
+    assert plan["next_state"]["runtime_stall_polls"] == 0
+
+
+def test_wrapped_stale_progress_requires_threshold_and_confirming_poll() -> None:
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=1.0,
+            progress_age=2500.0,
+            progress_sequence=2,
+        ),
+    )
+    first = _plan_wrap(
+        report,
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+    assert first["action"] == sup.NONE
+    assert first["state"] == "CLI_CHILD_STALL_SUSPECT"
+
+    second = _plan_wrap(
+        report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=_codex_forked_brain_snap(),
+    )
+    assert second["action"] == sup.STUCK_RECOVER
+    assert second["state"] == "CLI_CHILD_STALLED"
+
+
+def test_wrapped_stall_below_watchdog_floor_waits_for_floor_before_recovery() -> None:
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "codex",
+                "wrapped": True,
+                "stuck_after_seconds": 2000,
+            }
+        },
+    }
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=1.0,
+            progress_age=2103.0,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 2103,
+        runtime_stall_polls=1,
+    )
+    first = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+    second = _plan_wrap(
+        report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+    third = _plan_wrap(
+        report,
+        {"agents": {"worker": second["next_state"]}},
+        now=NOW + 3,
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert second["action"] == sup.NONE
+    assert second["state"] == "CLI_CHILD_STALLED"
+    assert "hard watchdog floor" in second["reason"]
+    assert third["action"] == sup.STUCK_RECOVER
+    assert third["state"] == "CLI_CHILD_STALLED"
+
+
+def test_wrapped_low_stuck_opt_in_stale_heartbeat_authorizes_active_recovery() -> None:
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "codex",
+                "wrapped": True,
+                "stuck_after_seconds": 120,
+                "allow_low_stuck_after": True,
+            }
+        },
+    }
+    report = _report(
+        heartbeat_stale=True,
+        heartbeat_age_seconds=130.0,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=130.0,
+            progress_age=130.0,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 130,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "CLI_CHILD_STALLED"
+    assert "heartbeat is stale" in plan["reason"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        {
+            "id": "recent-progress",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 100,
+            "heartbeat_stale": False,
+            "watchdog": {"enabled": False},
+            "stall_polls": 0,
+            "action": sup.NONE,
+            "state": "HEALTHY_WORKING",
+        },
+        {
+            "id": "first-stale-poll",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 190,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": False},
+            "stall_polls": 0,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALL_SUSPECT",
+        },
+        {
+            "id": "coalescing-allowance",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 183,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": False},
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "coalescing allowance",
+        },
+        {
+            "id": "heartbeat-authority-watchdog-off",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 190,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": False},
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is stale",
+        },
+        {
+            "id": "heartbeat-authority-low-opt-in",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 130,
+            "heartbeat_stale": True,
+            "allow_low": True,
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is stale",
+        },
+        {
+            "id": "heartbeat-authority-invalid-watchdog-floor",
+            "cli": "codex",
+            "stuck_after": 2400,
+            "elapsed": 2500,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": True, "turn_elapsed_seconds": 0},
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is stale",
+        },
+        {
+            "id": "heartbeat-authority-zero-watchdog-poll-fallback",
+            "cli": "codex",
+            "stuck_after": 1800,
+            "elapsed": 1900,
+            "heartbeat_stale": True,
+            "allow_low": True,
+            "watchdog": {"enabled": True, "poll_seconds": 0},
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is stale",
+        },
+        {
+            "id": "heartbeat-denied-low-no-opt-in",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 130,
+            "heartbeat_stale": True,
+            "allow_low": False,
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog floor",
+        },
+        {
+            "id": "heartbeat-denied-invalid-work-heartbeat",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 190,
+            "heartbeat_stale": True,
+            "watchdog": {"enabled": False},
+            "work_heartbeat": {"enabled": True, "interval_seconds": 0},
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "recovery guards are not authoritative",
+        },
+        {
+            "id": "fresh-heartbeat-watchdog-off",
+            "cli": "claude",
+            "stuck_after": 180,
+            "elapsed": 300,
+            "heartbeat_stale": False,
+            "watchdog": {"enabled": False},
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "heartbeat is fresh",
+        },
+        {
+            "id": "watchdog-authority-valid-floor",
+            "cli": "codex",
+            "stuck_after": 2400,
+            "elapsed": 2500,
+            "heartbeat_stale": False,
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog deadline",
+        },
+        {
+            "id": "watchdog-low-opt-in-before-floor",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 130,
+            "heartbeat_stale": False,
+            "allow_low": True,
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "opted-in low stale threshold",
+        },
+        {
+            "id": "watchdog-low-opt-in-after-floor",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 2110,
+            "heartbeat_stale": False,
+            "allow_low": True,
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog deadline",
+        },
+        {
+            "id": "watchdog-low-without-opt-in-before-floor",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 130,
+            "heartbeat_stale": False,
+            "allow_low": False,
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog floor",
+        },
+        {
+            "id": "watchdog-low-without-opt-in-after-floor",
+            "cli": "codex",
+            "stuck_after": 120,
+            "elapsed": 2110,
+            "heartbeat_stale": False,
+            "allow_low": False,
+            "stall_polls": 1,
+            "action": sup.STUCK_RECOVER,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "hard watchdog deadline",
+        },
+        {
+            "id": "watchdog-invalid-floor",
+            "cli": "codex",
+            "stuck_after": 2400,
+            "elapsed": 2500,
+            "heartbeat_stale": False,
+            "watchdog": {"enabled": True, "turn_elapsed_seconds": 0},
+            "stall_polls": 1,
+            "action": sup.NONE,
+            "state": "CLI_CHILD_STALLED",
+            "reason": "turn_elapsed_seconds is invalid",
+        },
+    ],
+    ids=lambda case: case["id"],
+)
+def test_wrapped_active_stall_recovery_authority_matrix(case: dict) -> None:
+    cli_name = case["cli"]
+    agent_config = {
+        "auto_restart": True,
+        "cli": cli_name,
+        "wrapped": True,
+        "stuck_after_seconds": case["stuck_after"],
+    }
+    if "allow_low" in case:
+        agent_config["allow_low_stuck_after"] = case["allow_low"]
+    if "watchdog" in case:
+        agent_config["turn_watchdog"] = case["watchdog"]
+    if "work_heartbeat" in case:
+        agent_config["work_heartbeat"] = case["work_heartbeat"]
+    config = {**_WRAP_CONFIG, "agents": {"worker": agent_config}}
+    elapsed = float(case["elapsed"])
+    heartbeat_stale = bool(case["heartbeat_stale"])
+    report = _report(
+        heartbeat_stale=heartbeat_stale,
+        heartbeat_age_seconds=(
+            float(case["stuck_after"]) + 10 if heartbeat_stale else 1.0
+        ),
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=elapsed,
+            progress_age=elapsed,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - elapsed,
+        runtime_stall_polls=case["stall_polls"],
+    )
+    snapshot = (
+        _wrap_snap(cli="claude")
+        if cli_name == "claude"
+        else _codex_forked_brain_snap()
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=snapshot,
+        config=config,
+    )
+
+    assert plan["action"] == case["action"]
+    assert plan["state"] == case["state"]
+    if "reason" in case:
+        assert case["reason"] in plan["reason"]
+
+
+def test_wrapped_active_live_brain_without_progress_below_threshold_is_non_green(
+) -> None:
+    elapsed = 60.0
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=elapsed,
+            progress_age=None,
+            progress_sequence=0,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=0,
+        runtime_progress_seen_epoch=NOW - elapsed,
+    )
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "claude",
+                "wrapped": True,
+                "stuck_after_seconds": 180,
+            }
+        },
+    }
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_wrap_snap(cli="claude"),
+        config=config,
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_NO_PROGRESS"
+
+
+def test_wrapped_active_live_brain_with_invalid_progress_sequence_is_unknown(
+) -> None:
+    runtime = _wrapper_runtime_view(
+        phase="active",
+        updated_age=60.0,
+        progress_age=1.0,
+        progress_sequence=2,
+    )
+    runtime["record"]["progress_sequence"] = "2"
+
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=runtime,
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap(cli="claude"),
+        config={
+            **_WRAP_CONFIG,
+            "agents": {
+                "worker": {
+                    "auto_restart": True,
+                    "cli": "claude",
+                    "wrapped": True,
+                }
+            },
+        },
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    ("include_value", "value", "expected_action"),
+    [
+        (True, True, sup.STUCK_RECOVER),
+        (True, False, sup.NONE),
+        (True, "true", sup.NONE),
+        (True, "false", sup.NONE),
+        (True, "", sup.NONE),
+        (True, 0, sup.NONE),
+        (True, 1, sup.NONE),
+        (True, None, sup.NONE),
+        (False, None, sup.NONE),
+    ],
+    ids=[
+        "boolean-true",
+        "boolean-false",
+        "string-true",
+        "string-false",
+        "empty-string",
+        "integer-zero",
+        "integer-one",
+        "null",
+        "absent",
+    ],
+)
+def test_wrapped_low_stuck_opt_in_requires_literal_boolean_true(
+    include_value: bool,
+    value: object,
+    expected_action: str,
+) -> None:
+    agent_config = {
+        "auto_restart": True,
+        "cli": "codex",
+        "wrapped": True,
+        "stuck_after_seconds": 120,
+        "turn_watchdog": {"enabled": False},
+    }
+    if include_value:
+        agent_config["allow_low_stuck_after"] = value
+    config = {**_WRAP_CONFIG, "agents": {"worker": agent_config}}
+    elapsed = 130.0
+    report = _report(
+        heartbeat_stale=True,
+        heartbeat_age_seconds=elapsed,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=elapsed,
+            progress_age=elapsed,
+            progress_sequence=2,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - elapsed,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+        config=config,
+    )
+
+    assert plan["action"] == expected_action
+    assert plan["state"] == "CLI_CHILD_STALLED"
+
+
+@pytest.mark.parametrize(
+    ("runtime_overrides", "state_overrides"),
+    [
+        ({"wrapper_generation": "wrapper-2"}, {}),
+        ({"turn_generation": 2}, {}),
+    ],
+)
+def test_wrapped_generation_change_resets_dead_confirmation(
+    runtime_overrides: dict,
+    state_overrides: dict,
+) -> None:
+    first_report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=60.0,
+            progress_age=60.0,
+            progress_sequence=2,
+        ),
+    )
+    first = _plan_wrap(
+        first_report,
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+    second_report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=60.0,
+            progress_age=60.0,
+            progress_sequence=2,
+            **runtime_overrides,
+        ),
+    )
+    state = {**first["next_state"], **state_overrides}
+    second = _plan_wrap(
+        second_report,
+        {"agents": {"worker": state}},
+        now=NOW + 1,
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert second["action"] == sup.NONE
+    assert second["state"] == "CLI_CHILD_MISSING"
+    assert second["next_state"]["runtime_dead_polls"] == 1
+
+
+@pytest.mark.parametrize(
+    "runtime_overrides",
+    [
+        {"wrapper_generation": "wrapper-2"},
+        {"turn_generation": 2},
+    ],
+    ids=["wrapper-generation", "turn-generation"],
+)
+def test_wrapped_generation_change_resets_stall_confirmation(
+    runtime_overrides: dict,
+) -> None:
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=2500.0,
+            progress_age=2500.0,
+            progress_sequence=2,
+            **runtime_overrides,
+        ),
+    )
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 2500,
+        runtime_stall_polls=1,
+    )
+
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_STALL_SUSPECT"
+    assert plan["next_state"]["runtime_stall_polls"] == 1
+
+
+def test_wrapped_child_dead_respects_backoff_and_readiness_cap() -> None:
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=60.0,
+            progress_age=60.0,
+            progress_sequence=2,
+        ),
+    )
+    first = _plan_wrap(
+        report,
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    backoff_state = {
+        **first["next_state"],
+        "backoff_next_epoch": NOW + 100,
+        "consecutive_fails": 4,
+    }
+    waiting = _plan_wrap(
+        report,
+        {"agents": {"worker": backoff_state}},
+        now=NOW + 1,
+        snapshot=_wrap_snap()[:1],
+    )
+    assert waiting["action"] == sup.BACKOFF_WAIT
+    assert waiting["state"] == "CLI_CHILD_DEAD"
+    assert waiting["next_state"]["consecutive_fails"] == 4
+
+    capped_state = {
+        **first["next_state"],
+        "launching": True,
+        "readiness_seen": False,
+        "launch_grace_until": NOW - 1,
+        "readiness_fails": 3,
+    }
+    capped = _plan_wrap(
+        report,
+        {"agents": {"worker": capped_state}},
+        now=NOW + 1,
+        snapshot=_wrap_snap()[:1],
+    )
+    assert capped["action"] == sup.READINESS_GAVE_UP
+    assert capped["state"] == "READINESS_GAVE_UP"
+    assert capped["kill_targets"] == []
+
+
+def test_child_health_restart_does_not_redrive_bus_committed_inbound(
+    tmp_path: Path,
+) -> None:
+    from agenttalk.wrapper import loop as wrapper_loop
+
+    store = _team(tmp_path)
+    committed = store.send(
+        sender="lead",
+        recipient="worker",
+        body="publish durable work",
+    )
+    initial_seen: list[str] = []
+
+    def initial_drive(record: dict) -> bool:
+        initial_seen.append(record["id"])
+        return True
+
+    assert wrapper_loop.run_loop(
+        store,
+        "worker",
+        initial_drive,
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_turns=1,
+    ) == 1
+    assert initial_seen == [committed.id]
+    assert store.cursor("worker") == committed.id
+
+    # The wrapper can crash after the validated bus commits while its health
+    # self-report still says the now-absent child was active. Two confirming
+    # polls correctly authorize #72 recovery without touching the bus cursor.
+    dead_report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=60.0,
+            progress_age=60.0,
+            progress_sequence=2,
+        ),
+    )
+    first = _plan_wrap(
+        dead_report,
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+    recovered = _plan_wrap(
+        dead_report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=_wrap_snap()[:1],
+    )
+    assert recovered["action"] == sup.STUCK_RECOVER
+    assert recovered["state"] == "CLI_CHILD_DEAD"
+    assert store.cursor("worker") == committed.id
+
+    later = store.send(sender="lead", recipient="worker", body="later work")
+    restarted_seen: list[str] = []
+
+    def restarted_drive(record: dict) -> bool:
+        restarted_seen.append(record["id"])
+        return True
+
+    assert wrapper_loop.run_loop(
+        store,
+        "worker",
+        restarted_drive,
+        clock=lambda: 0.0,
+        sleep=lambda _seconds: None,
+        max_turns=1,
+    ) == 1
+    assert restarted_seen == [later.id]
+    assert committed.id not in restarted_seen
+    assert store.cursor("worker") == later.id
+
+
+def test_wrapped_dead_letter_is_turn_failed_not_success() -> None:
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="terminal",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=3,
+                outcome="dead_letter",
+            ),
+        ),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "TURN_FAILED"
+
+
+def test_wrapped_missing_runtime_is_unknown_with_rollout_remediation() -> None:
+    plan = sup.plan_actions(
+        _report(heartbeat_stale=False),
+        {"agents": {"worker": _wrap_ready()}},
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=_wrap_snap()[:1],
+    )["agents"]["worker"]
+
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+    assert "supervise --refresh-scripts" in plan["reason"]
+    assert "request-restart --for worker" in plan["reason"]
+
+
+def test_wrapped_torn_runtime_read_is_unknown_without_partial_fields(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    (store.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
+    wrt.runtime_path(store.state_dir, "worker").write_bytes(b'{"phase":"idle"')
+
+    report = sup.build_report(
+        store,
+        now_epoch=NOW,
+        supervisor_config=_WRAP_CONFIG,
+    )
+    view = report["agents"]["worker"]["wrapper_runtime"]
+    assert view == {"status": wrt.STATUS_INVALID, "error": "malformed"}
+
+    plan = sup.plan_actions(
+        report,
+        {"agents": {"worker": _wrap_ready()}},
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=_wrap_snap(root=str(tmp_path))[:1],
+    )["agents"]["worker"]
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+    assert plan["action"] == sup.NONE
+
+
+def test_wrapped_torn_read_cannot_erase_sequence_high_water_mark() -> None:
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=5,
+        runtime_progress_seen_epoch=NOW - 10,
+    )
+    torn = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime={"status": "invalid", "error": "malformed"},
+        ),
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+    assert torn["state"] == "CLI_CHILD_UNKNOWN"
+    assert torn["next_state"]["runtime_progress_sequence"] == 5
+
+    lower = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=4,
+            ),
+        ),
+        {"agents": {"worker": torn["next_state"]}},
+        now=NOW + 1,
+        snapshot=_codex_forked_brain_snap(),
+    )
+    assert lower["state"] == "CLI_CHILD_UNKNOWN"
+    assert lower["next_state"]["runtime_sequence_regressed"] is True
+    assert lower["next_state"]["runtime_progress_sequence"] == 5
+
+
+def test_wrapped_same_turn_sequence_regression_is_sticky_unknown() -> None:
+    state = _wrap_ready(
+        runtime_wrapper_generation="wrapper-1",
+        runtime_turn_generation=1,
+        runtime_progress_sequence=5,
+        runtime_progress_seen_epoch=NOW - 10,
+    )
+    regressed_report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=1.0,
+            progress_age=1.0,
+            progress_sequence=4,
+        ),
+    )
+    first = _plan_wrap(
+        regressed_report,
+        {"agents": {"worker": state}},
+        snapshot=_codex_forked_brain_snap(),
+    )
+    assert first["state"] == "CLI_CHILD_UNKNOWN"
+    assert first["next_state"]["runtime_sequence_regressed"] is True
+    assert first["next_state"]["runtime_progress_sequence"] == 5
+
+    newer_report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=1.0,
+            progress_age=1.0,
+            progress_sequence=6,
+        ),
+    )
+    second = _plan_wrap(
+        newer_report,
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=_codex_forked_brain_snap(),
+    )
+    assert second["state"] == "CLI_CHILD_UNKNOWN"
+    assert second["action"] == sup.NONE
+
+
+@pytest.mark.parametrize(
+    ("plan_state", "expected"),
+    [
+        ("CLI_CHILD_DEAD", sup.AVAILABILITY_UNAVAILABLE),
+        ("CLI_CHILD_STALLED", sup.AVAILABILITY_UNAVAILABLE),
+        ("CLI_CHILD_UNKNOWN", sup.AVAILABILITY_UNKNOWN),
+    ],
+)
+def test_wrapped_child_state_blocks_fresh_heartbeat_availability(
+    plan_state: str,
+    expected: str,
+) -> None:
+    availability = sup.project_coordination_availability(
+        "worker",
+        {"heartbeat_stale": False},
+        {"state": plan_state},
+        {"wrapped": True},
+    )
+
+    assert availability["state"] == expected
+    assert availability["state"] != sup.AVAILABILITY_AVAILABLE
 
 
 def test_wrapped_launch_detail_has_no_session_args() -> None:
@@ -5215,6 +7050,7 @@ def test_config_blocked_hold_marker_survives_health_ttl_end_to_end(tmp_path: Pat
     (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
     _write_config_blocked_health(s, "worker", NOW)
     s.write_config_blocked_hold("worker", summary="command=codex; error=shim")
+    _write_idle_wrapper_runtime(s)
 
     report = sup.build_report(s, now_epoch=NOW + 2500, supervisor_config=_WRAP_CONFIG)
     worker = report["agents"]["worker"]
@@ -5250,6 +7086,7 @@ def test_malformed_config_blocked_hold_marker_does_not_suppress_recovery(
     (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
     _write_config_blocked_health(s, "worker", NOW)
     _write_raw_config_blocked_hold(s, "worker", payload)
+    _write_idle_wrapper_runtime(s)
 
     report = sup.build_report(s, now_epoch=NOW + 2500, supervisor_config=_WRAP_CONFIG)
     assert report["agents"]["worker"].get("config_blocked_hold") is None
@@ -5291,6 +7128,7 @@ def test_wrapped_codex_without_config_blocked_marker_still_recovers_end_to_end(
     s = _team(tmp_path)
     (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
     _write_config_blocked_health(s, "worker", NOW)
+    _write_idle_wrapper_runtime(s)
 
     report = sup.build_report(s, now_epoch=NOW + 2500, supervisor_config=_WRAP_CONFIG)
     assert report["agents"]["worker"].get("config_blocked_hold") is None
@@ -5516,7 +7354,10 @@ def test_config_template_documents_watchdog_and_provenance() -> None:
 
 
 def _ownership_report(stale: bool = True) -> dict:
-    rpt = _report(heartbeat_stale=stale)
+    fields: dict = {"heartbeat_stale": stale}
+    if stale:
+        fields["restart_request"] = _auth_marker("rr-ownership")
+    rpt = _report(**fields)
     rpt["root_key"] = sup._root_key(TEST_ROOT)
     return rpt
 
@@ -5655,6 +7496,7 @@ def test_process_ownership_launch_time_same_tick_child_absent_from_baseline_is_p
     assert managed[0]["source"] == "launch_child_provenance"
     assert managed[0]["pid"] == 11
     assert managed[0]["seed_descendants"] is True
+    state["agents"]["worker"]["last_launch_epoch"] = NOW - 100
 
     p = sup.plan_actions(_ownership_report(), state, _WRAP_CONFIG,
                          now_epoch=NOW + 1, snapshot=post)["agents"]["worker"]
@@ -5686,6 +7528,7 @@ def test_process_ownership_launch_time_same_tick_child_present_in_baseline_is_no
         launcher_nonce_source="agenttalk_global_arg",
     )
     assert state["agents"]["worker"]["managed_pids"] == []
+    state["agents"]["worker"]["last_launch_epoch"] = NOW - 100
     p = sup.plan_actions(_ownership_report(), state, _WRAP_CONFIG,
                          now_epoch=NOW + 1, snapshot=pre)["agents"]["worker"]
     assert {t["pid"] for t in p["kill_targets"]} == {10}

@@ -95,7 +95,7 @@ a prerequisite.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.79.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.79.1"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -205,7 +205,7 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.79.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.79.1"
 ```
 
 Pin to a specific tag so you control upgrades. Replace the tag with
@@ -1184,11 +1184,11 @@ through.
 
 Three ideas carry it:
 
-- **Heartbeat freshness is the liveness authority.** Each agent stamps a
-  `heartbeat` as it works and idles; a fresh heartbeat is healthy even if
-  the process can't be found, and only a *stale* one (older than
-  `stuck_after_seconds`) triggers recovery. No fragile find-the-PID dance
-  decides life-or-death.
+- **Health authority follows the launch mode.** Manual listeners use the
+  activity `heartbeat`. Wrapped listeners also publish a strict lifecycle
+  record: only validated idle is `HEALTHY_IDLE`, and active work requires
+  an independently discovered real CLI brain plus adapter progress.
+  Unknown child evidence is non-green and never automatic kill authority.
 - **The supervisor is an external monitor, not a daemon.** `agenttalk
   supervise --report`/`--plan` are read-only derivations; a generated
   `supervisor.ps1` polls the plan and does the launching/relaunching/
@@ -1285,30 +1285,27 @@ agenttalk wrap --for codex-dev --cli codex --loop -- `
 
 A wrapped agent is instrumented by construction (no activity hook
 needed) and owns session continuity end-to-end, so a supervisor relaunch
-re-runs the identical command and reload-resumes the session. For
-hands-off durable listening, wrapping is the documented default. Manual
+re-runs the identical command and reload-resumes the session. It also
+publishes one strict `wrapper-runtime.json` turn-lifecycle record. Only a
+validated idle record can be `HEALTHY_IDLE`; an active turn must have an
+independently discovered CLI brain and recent real adapter progress.
+Missing, malformed, or ambiguous evidence is `CLI_CHILD_UNKNOWN`, never a
+fresh-heartbeat green or automatic kill authority. For hands-off durable
+listening, wrapping is the documented default. Manual
 `/agenttalk.listen` remains supported for interactive work, and a Codex
 chat window is a tolerable supervised-by-human stopgap, but it is not a
-daemon. Per-CLI stale thresholds differ on purpose (wrapped Claude
-streams through reasoning → 180s; wrapped Codex is item-level and silent
-during pure reasoning → 900s+); see the tutorial for the threshold
-guidance and the guardrails.
+daemon.
 
-**Bounded work heartbeat (wrapped Claude).** Streaming progress is not
-the only legitimate quiet: a long non-streaming stretch (a big tool call,
-a slow API turn) stamps nothing, and a wrapped Claude could be falsely
-stuck-recovered mid-turn at its tight 180s threshold. The wrapper
-therefore runs a small **bounded ticker** during each turn: it stamps the
-same supervisor heartbeat every `interval_seconds` (default 30) while the
-per-turn child process is alive, but only up to `max_turn_seconds`
-(default 900) — past that cap only real progress refreshes liveness, so a
-genuinely hung silent turn is still recovered at
-`max_turn_seconds + stuck_after_seconds`, never masked forever. A failed
-turn still ends with **no** fresh heartbeat (the ticker is stopped, with
-in-flight stamps synchronized, before the failure-path clear). Default-ON
-for wrapped Claude (`wrap --loop`, `--lead-loop`); default-OFF for
-wrapped Codex (its long thresholds and turn-watchdog math are unchanged)
-and for `--one-shot`. Configure per agent (or globally) in
+**Bounded work heartbeat (wrapped Claude).** The wrapper still runs a
+bounded ticker during each turn for coordination visibility. Those timer
+ticks do not advance `progress_sequence` and therefore cannot make a
+dead or wedged CLI child healthy. Only accepted CLI adapter events count
+as turn progress. Autonomous stall recovery also requires two confirming
+polls and a configured threshold at or above the resolved per-CLI turn
+watchdog deadline plus its safety margin; an invalid or unresolved floor
+cannot authorize recovery. The ticker is default-ON for wrapped Claude
+(`wrap --loop`, `--lead-loop`) and default-OFF for wrapped Codex and
+`--one-shot`. Configure it per agent (or globally) in
 `supervisor.json`: `"work_heartbeat": {"enabled": true,
 "interval_seconds": 30, "max_turn_seconds": 900}`. Guards fail visibly
 at launch (config-blocked hold) — a non-positive/non-numeric value, or an
@@ -1382,7 +1379,7 @@ still has a fresh heartbeat, the operator-facing requester must also pass
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
 | `agenttalk release --from A (--to B \| --to-group G \| --all) [-m reason]` | Signal an agent (or team) to **stand down and exit its listen loop** — distinct from `end`: no transcript export, and the agent may be restarted later. A listener exits ONLY on `kind=release` or `kind=end`; a prose "done for now" never stops it. A single `--to` opens no thread (no `request_id`/`broadcast_id`); `--to-group`/`--all` fan out the same signal (re-run to retry any missed — no `--resume`). Authoritative only from the `operator_facing`/sole-`lead` sender; the command warns otherwise and the listen skill reports-and-ignores an unauthorized release. |
 | `agenttalk reset [--archive]` | Clear **active bus and compact-resume state** (messages + cursors + heartbeats + checkpoints); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + checkpoints + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
-| `agenttalk supervise (--init \| --refresh-scripts \| --select-pwsh \| --repair-instance-marker \| --report \| --plan \| --bootstrap-check \| --install-activity-hook \| --clear-restart)` | Thin support for the **external agent supervisor** (24/7 outage auto-restart + stuck-recovery). `--init` scaffolds the operator config plus four generated Windows artifacts; `--refresh-scripts` regenerates only those artifacts and preserves config/runtime state. `--select-pwsh [--pwsh ABSOLUTE_PATH]` records the validated PowerShell Core 7+ host used by start/task/watchdog boundaries. `--repair-instance-marker --quarantine --acknowledge-no-live-supervisor` is the explicit invalid-marker recovery. `--report`/`--plan` emit the read-only liveness JSON and shared action plan; `--bootstrap-check` verifies the roster, operator-facing lead, supervisor config, wrapped launch invariants, explicit wrapped `--root`, and fresh heartbeats. Heartbeat freshness remains the liveness authority. `--install-activity-hook` merges Claude's identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` project hooks; Codex modes write only the heartbeat hook to `.codex/hooks.json`. Protected agents are never auto-killed. |
+| `agenttalk supervise (--init \| --refresh-scripts \| --select-pwsh \| --repair-instance-marker \| --report \| --plan \| --bootstrap-check \| --install-activity-hook \| --clear-restart)` | Thin support for the **external agent supervisor** (24/7 outage auto-restart + stuck-recovery). `--init` scaffolds the operator config plus four generated Windows artifacts; `--refresh-scripts` regenerates only those artifacts and preserves config/runtime state. `--select-pwsh [--pwsh ABSOLUTE_PATH]` records the validated PowerShell Core 7+ host used by start/task/watchdog boundaries. `--repair-instance-marker --quarantine --acknowledge-no-live-supervisor` is the explicit invalid-marker recovery. `--report`/`--plan` emit the read-only liveness JSON and shared action plan; `--bootstrap-check` verifies the roster, operator-facing lead, supervisor config, wrapped launch invariants, explicit wrapped `--root`, and fresh heartbeats. Manual listeners use heartbeat freshness; wrapped listeners additionally require a strict runtime phase plus an independently discovered CLI brain and real adapter progress. `--install-activity-hook` merges Claude's identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` project hooks; Codex modes write only the heartbeat hook to `.codex/hooks.json`. Protected agents are never auto-killed. |
 | `agenttalk checkpoint (save\|resume) [--for A]` / `checkpoint show [--for A] [--json]` | Preserve, reload, or inspect deterministic external state around context compaction. Claude hook installation saves on `PreCompact` and injects the latest summary on `SessionStart/compact`; latest state is under `.agenttalk/checkpoints/` and `reset` clears it. See the user manual for hook and identity contracts. |
 | `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] [--from S] [--min-interval N] -- <real-exe> <base-args>` | Run agent `A` through the **progress wrapper** (0.30.0): a per-CLI structured-stream adapter giving **visibility** (echoes the agent's stream — token/thinking deltas for Claude, item-level events for Codex; `--no-render` to silence), a **working-turn heartbeat** (stays fresh while the agent works, not just idles), and **degraded-output detection** (confirmed garble-then-silence can request a self-restart, recorded as `--from`). `--loop` makes it the long-running **supervised** wrapper: it owns the idle bus-wait + heartbeat and drives the CLI **one turn per inbound message**, persisting+reloading the Codex `thread_id`/Claude `session-id` so a relaunch reload-resumes. Each inbound wrapped turn also receives matching accepted lessons as advisory prompt context and records pointer-only exposure telemetry after prompt handoff. The real CLI exe + its base args go after `--`; the wrapper appends the per-turn session/stream args. For durable unattended listening, this is the documented default; manual `/agenttalk.listen` is best-effort for interactive use. |
 | `agenttalk request-restart --for A [--from L] [--reason ...] [--force-protected] [--acknowledge-live-protected-kill]` | Queue a **manual** restart of agent `A`: writes an atomic, request-id-scoped `state/<A>.restart-request` marker the supervisor relaunches (resuming the session) from and clears. Healthy idle agents are eligible for manual restart at the next supervisor poll. Restarting a protected agent requires `--force-protected`; if that protected agent still has a fresh heartbeat, the operator-facing requester must also pass `--acknowledge-live-protected-kill`. |

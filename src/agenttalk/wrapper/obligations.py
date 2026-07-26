@@ -31,6 +31,7 @@ from agenttalk.store import (
     Message,
     _process_liveness,
 )
+from agenttalk.wrapper import recv_api
 
 POLICY_ENV = "AGENTTALK_COMMIT_GATE_POLICY"
 POLICY_SCHEMA_VERSION = 1
@@ -2183,6 +2184,20 @@ class DetectionCommitGate:
         messages: list[Message],
     ) -> LandedResponseResult:
         """Resolve an exact terminal response from a validated publication snapshot."""
+        try:
+            messages, durable_order = (
+                self.store.publication_ordered_messages_with_durability(messages)
+            )
+        except (OSError, ValueError, TimeoutError, RuntimeError):
+            return LandedResponseResult(
+                unavailable_reason="validated landed-response replay unavailable"
+            )
+        if not durable_order:
+            # Reconstructed id order cannot prove whether a response preceded a
+            # requester rescind. Withhold the proof so the wrapper takes its
+            # recoverable residual/re-drive path; crediting possibly cancelled work
+            # would instead persist a false completion.
+            return LandedResponseResult()
         inbound_id = record.get("id")
         if not isinstance(inbound_id, str):
             return LandedResponseResult(unavailable_reason="delivered inbound id is invalid")
@@ -5480,20 +5495,7 @@ class DetectionCommitGate:
             self.store.advance_cursor(self.agent, record["id"])
 
     def _cursor_projection_is_complete(self, record: dict) -> bool:
-        inbound_id = record.get("id")
-        if not isinstance(inbound_id, str):
-            return False
-        if record.get("mode") == "scoped":
-            scoped = record.get("scoped")
-            if not isinstance(scoped, dict) or not isinstance(
-                scoped.get("request_id"), str,
-            ):
-                return False
-            return max(
-                self.store.cursor(self.agent),
-                self.store.thread_seen(self.agent, scoped["request_id"]),
-            ) >= inbound_id
-        return self.store.cursor(self.agent) >= inbound_id
+        return recv_api.consume_boundary_complete(self.store, self.agent, record)
 
     def _cursor_projection_exhausted(self, owner: dict) -> tuple[bool, float]:
         first = _epoch(owner.get("cursor_projection_first_at"))

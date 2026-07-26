@@ -180,6 +180,25 @@ def next_record(store, agent: str, *, scoped_request_id: str | None = None) -> d
     return recs[0] if recs else None
 
 
+def consume_boundary_complete(store, agent: str, record: dict) -> bool:
+    """Whether the authoritative cursor projection already covers ``record``."""
+    inbound_id = record.get("id")
+    if not isinstance(inbound_id, str) or not inbound_id:
+        return False
+    if record.get("mode") == SCOPED:
+        scoped = record.get("scoped")
+        if not isinstance(scoped, dict):
+            return False
+        request_id = scoped.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return False
+        return max(
+            store.cursor(agent),
+            store.thread_seen(agent, request_id),
+        ) >= inbound_id
+    return store.cursor(agent) >= inbound_id
+
+
 def commit(store, agent: str, record: dict) -> None:
     """Consume a record: GLOBAL advances the global cursor; SCOPED advances ONLY
     the per-thread seen pointer (never the global cursor, never closes the thread).
