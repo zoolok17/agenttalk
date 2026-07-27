@@ -378,13 +378,36 @@ first two are silent.
 
 3. **Verify the result, not the push output.** Pushing the base branch onto a
    pull request's head makes the head equal the base, and hosts such as GitHub
-   read that as already-merged and **auto-close the PR**. The push output looks
-   like an ordinary fast-forward, so only an explicit check reveals it:
+   then **auto-close the request** (often displaying it as *merged*). The push
+   output looks like an ordinary fast-forward, so only an explicit check
+   reveals it:
    ```powershell
    gh pr view <n> --json headRefOid,state,mergeable
    ```
-   Recovery, if it happens: the objects are still local, so re-push the correct
-   explicit SHA and reopen the request. Confirm the head afterwards.
+
+   **Recovery is conditional — read this before you need it.** The objects are
+   still local, so nothing is lost, but re-pushing the correct SHA and
+   reopening only works *directly* when that SHA is a **descendant of whatever
+   became the erroneous head**. GitHub refuses a reopen when the current head
+   is not a descendant of the head SHA recorded at close time. A worker's
+   branch frequently forks from an earlier base commit than the base has since
+   advanced to, so the refusal is the common case, not the rare one.
+
+   If the reopen is refused:
+   ```powershell
+   # 1. put back the SHA the host recorded as head at close time
+   git push origin <closed-time-head-sha>:refs/heads/<branch> --force
+   # 2. reopen while the head matches what was stored
+   gh pr reopen <n>
+   # 3. now push the correct commit (force-pushing an OPEN request is allowed)
+   git push origin <full-sha>:refs/heads/<branch> --force
+   gh pr view <n> --json headRefOid,state
+   ```
+   Capture `<closed-time-head-sha>` from `gh pr view <n> --json headRefOid`
+   before anything else changes it, or from the closed request's timeline.
+   Opening a fresh request is always a valid fallback. Note the recovery push
+   is a non-fast-forward and needs `--force`, since it overwrites the erroneous
+   state on the remote.
 
 The general rule behind all three: *which tree or object am I operating on* is
 a question to ANSWER explicitly, never to infer from ambient context. The same

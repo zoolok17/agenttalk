@@ -77,6 +77,8 @@ SKILL_INVARIANTS = [
         "agenttalk broadcast",             # fan-out for group input
         "decide and act within",           # Independence policy (must be mirrored both sides)
         "do not stall on a call that is yours",  # Independence: report, don't over-ask
+        "does not protect you here",       # --force-with-lease is not a safeguard (mirror both sides)
+        "descendant of whatever",          # reopen is conditional; the fallback must not be dropped
     ]),
     ("agenttalk.consult.md", "agenttalk-consult", [
         "AGENTTALK_SELF",
