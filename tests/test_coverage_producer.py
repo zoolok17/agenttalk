@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import assurance, cli, close, gates
+from agenttalk import assurance, cli, close, coverage_parse, gates
 from agenttalk.coverage_parse import MAX_COVERAGE_ARTIFACT_BYTES, parse_coverage_percent
 from agenttalk.store import Store
 
@@ -578,10 +579,20 @@ def test_cli_finalization_lock_failure_returns_one_after_artifact_write(
         def __exit__(self, *_args):
             return False
 
+    real_config_lock = Store.config_lock
+    lock_calls = 0
+
+    def fail_only_finalization_lock(store: Store, **kwargs):
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 1:
+            return real_config_lock(store, **kwargs)
+        return FailingLock()
+
     monkeypatch.setattr(
         Store,
         "config_lock",
-        lambda _self, **_kwargs: FailingLock(),
+        fail_only_finalization_lock,
     )
 
     rc = _run_assurance_cli(tmp_path)
@@ -591,10 +602,83 @@ def test_cli_finalization_lock_failure_returns_one_after_artifact_write(
         (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
     )
     assert rc == 1
+    assert lock_calls == 2
     assert len(artifacts) == 1
     assert captured.out == ""
     assert "could not finalize coverage gate" in captured.err
     assert "simulated coverage finalization lock timeout" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_gate_snapshot_load_error_fails_before_scan(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _ci_revision(tmp_path, monkeypatch)
+
+    monkeypatch.setattr(
+        gates,
+        "load_gate_state",
+        lambda _root: {
+            "schema_version": 1,
+            "required_gates": [],
+            "gates": {},
+            "load_error": "simulated unreadable gate state",
+        },
+    )
+
+    rc = _run_assurance_cli(tmp_path)
+
+    captured = capsys.readouterr()
+    artifacts = list(
+        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
+    )
+    assert rc == 1
+    assert artifacts == []
+    assert "could not produce artifact" in captured.err
+    assert "simulated unreadable gate state" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_finalizer_load_error_preserves_gate_and_returns_one_after_artifact(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    _set_green_coverage_gate(tmp_path, revision, scope="change")
+    gate_path = tmp_path / ".agenttalk" / "gates.json"
+    original_gate_bytes = gate_path.read_bytes()
+    real_load_gate_state = gates.load_gate_state
+    load_calls = 0
+
+    def fail_only_finalizer_load(root: Path) -> dict:
+        nonlocal load_calls
+        load_calls += 1
+        if load_calls == 1:
+            return real_load_gate_state(root)
+        return {
+            "schema_version": 1,
+            "required_gates": [],
+            "gates": {},
+            "load_error": "simulated transient finalizer read failure",
+        }
+
+    monkeypatch.setattr(gates, "load_gate_state", fail_only_finalizer_load)
+
+    rc = _run_assurance_cli(tmp_path)
+
+    captured = capsys.readouterr()
+    artifacts = list(
+        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
+    )
+    assert rc == 1
+    assert load_calls == 2
+    assert len(artifacts) == 1
+    assert gate_path.read_bytes() == original_gate_bytes
+    assert "could not finalize coverage gate" in captured.err
+    assert "simulated transient finalizer read failure" in captured.err
     assert "Traceback" not in captured.err
 
 
@@ -1071,6 +1155,99 @@ def test_concurrent_coverage_transactions_do_not_cross_claim_or_lose_report(
     ] == pytest.approx(92.0)
 
 
+def test_older_noncoverage_scan_cannot_invalidate_newer_coverage_attestation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    older_entered = threading.Event()
+    release_older = threading.Event()
+    results: dict[str, assurance.ScanResult] = {}
+    errors: list[BaseException] = []
+
+    older = _plan(
+        tmp_path,
+        "unused",
+        profile="change",
+        revision=revision,
+    )
+    older.run_id = "older-noncoverage-run"
+    older.tools = [
+        {
+            "tool_id": "slow-quality",
+            "dimension": "quality",
+            "command": ["slow-quality"],
+            "timeout_seconds": 10,
+        }
+    ]
+    newer = _plan(
+        tmp_path,
+        "unused",
+        profile="change",
+        revision=revision,
+    )
+    newer.run_id = "newer-coverage-run"
+
+    def fake_run_external(root: Path, spec: dict, command: list[str]):
+        if spec["tool_id"] == "slow-quality":
+            older_entered.set()
+            if not release_older.wait(timeout=5.0):
+                raise RuntimeError("older scan was not released")
+        else:
+            (root / "coverage.json").write_text(
+                '{"totals": {"percent_covered": 91.0}}',
+                encoding="utf-8",
+            )
+        run = assurance._run_record(
+            spec,
+            "pass",
+            time.monotonic(),
+            command=command,
+            exit_code=0,
+        )
+        return run, [], "", ""
+
+    monkeypatch.setattr(assurance, "_run_external", fake_run_external)
+
+    def execute(name: str, plan: assurance.ScanPlan) -> None:
+        try:
+            results[name] = assurance.run_plan(plan)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    older_thread = threading.Thread(
+        target=execute,
+        args=("older", older),
+        name="older-noncoverage-scan",
+    )
+    newer_thread = threading.Thread(
+        target=execute,
+        args=("newer", newer),
+        name="newer-coverage-scan",
+    )
+    intermediate: dict | None = None
+    try:
+        older_thread.start()
+        assert older_entered.wait(timeout=5.0)
+        newer_thread.start()
+        newer_thread.join(timeout=10.0)
+        assert not newer_thread.is_alive()
+        intermediate = json.loads(json.dumps(_coverage_gate(tmp_path, "change")))
+        assert intermediate["status"] == "green"
+        assert intermediate["evidence"][-1]["coverage_percent"] == pytest.approx(91.0)
+    finally:
+        release_older.set()
+        older_thread.join(timeout=10.0)
+        newer_thread.join(timeout=10.0)
+
+    assert not older_thread.is_alive()
+    assert not newer_thread.is_alive()
+    assert errors == []
+    assert set(results) == {"older", "newer"}
+    assert intermediate is not None
+    assert _coverage_gate(tmp_path, "change") == intermediate
+
+
 @pytest.mark.parametrize(
     "payload_expression",
     [
@@ -1359,6 +1536,207 @@ def test_coverage_json_requires_a_numeric_percent(value) -> None:
     json_text = json.dumps({"totals": {"percent_covered": value}})
 
     assert parse_coverage_percent("", json_text=json_text) is None
+
+
+def test_huge_coverage_json_fails_closed_and_cli_writes_red_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {
+            "pyproject.toml": (
+                "[project]\n"
+                "name = 'coverage-overflow-fixture'\n"
+                "version = '1.0'\n"
+            ),
+            "src/fixture/__init__.py": "VALUE = 1\n",
+        },
+    )
+    payload = json.dumps({"totals": {"percent_covered": 10**400}})
+    manifest_path = tmp_path / ".agenttalk" / "assurance.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "custom_commands": {
+                    "coverage": [
+                        sys.executable,
+                        "-c",
+                        (
+                            "from pathlib import Path; "
+                            f"Path('coverage.json').write_text({payload!r}, encoding='utf-8')"
+                        ),
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = _run_assurance_cli(tmp_path, profile="change")
+
+    artifacts = list(
+        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
+    )
+    assert rc == 0
+    assert len(artifacts) == 1
+    artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    coverage_run = next(
+        run for run in artifact["tools"]["run"] if run["tool_id"] == "coverage"
+    )
+    assert coverage_run["status"] == "pass"
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "red"
+    assert "no overall percentage could be parsed" in gate["reason"]
+    assert "coverage_percent" not in gate["evidence"][-1]
+    assert gate["revision"] == revision
+
+
+def test_coverage_parser_contains_unexpected_source_exception(
+    monkeypatch,
+) -> None:
+    def fail_json_parse(_text: str) -> float | None:
+        raise RuntimeError("simulated future parser defect")
+
+    monkeypatch.setattr(coverage_parse, "_from_json", fail_json_parse)
+
+    assert parse_coverage_percent(
+        "TOTAL 10 0 88%",
+        json_text='{"totals": {"percent_covered": 99.0}}',
+    ) == pytest.approx(88.0)
+
+
+def test_coverage_parser_never_raises_for_deterministic_bytes_corpus() -> None:
+    directed = [
+        ("huge-positive-int", json.dumps({"totals": {"percent_covered": 10**400}}).encode()),
+        ("huge-negative-int", json.dumps({"totals": {"percent_covered": -(10**400)}}).encode()),
+        ("positive-overflow-float", b'{"totals":{"percent_covered":1e400}}'),
+        ("negative-overflow-float", b'{"totals":{"percent_covered":-1e400}}'),
+        ("literal-nan", b'{"totals":{"percent_covered":NaN}}'),
+        ("literal-infinity", b'{"totals":{"percent_covered":Infinity}}'),
+        ("literal-negative-infinity", b'{"totals":{"percent_covered":-Infinity}}'),
+        ("string-nan", b'{"totals":{"percent_covered":"NaN"}}'),
+        ("string-infinity", b'{"totals":{"percent_covered":"Infinity"}}'),
+        ("string-negative-infinity", b'{"totals":{"percent_covered":"-Infinity"}}'),
+        ("negative-percent", b'{"totals":{"percent_covered":-0.1}}'),
+        ("over-hundred", b'{"totals":{"percent_covered":100.1}}'),
+        ("zero", b'{"totals":{"percent_covered":0}}'),
+        ("hundred", b'{"totals":{"percent_covered":100}}'),
+        ("fraction", b'{"totals":{"percent_covered":87.25}}'),
+        ("root-null", b"null"),
+        ("root-bool", b"true"),
+        ("root-list", b"[]"),
+        ("root-string", b'"totals"'),
+        ("totals-null", b'{"totals":null}'),
+        ("totals-bool", b'{"totals":true}'),
+        ("totals-list", b'{"totals":[]}'),
+        ("totals-string", b'{"totals":"wrong"}'),
+        ("totals-missing", b'{"other":1}'),
+        ("percent-null", b'{"totals":{"percent_covered":null}}'),
+        ("percent-bool", b'{"totals":{"percent_covered":true}}'),
+        ("percent-list", b'{"totals":{"percent_covered":[]}}'),
+        ("percent-dict", b'{"totals":{"percent_covered":{}}}'),
+        ("percent-string", b'{"totals":{"percent_covered":"50"}}'),
+        ("deep-array", (b"[" * 1200) + b"0" + (b"]" * 1200)),
+        ("deep-object", (b'{"x":' * 1200) + b"0" + (b"}" * 1200)),
+        ("empty", b""),
+        ("truncated", b'{"totals":{"percent_covered":'),
+        ("invalid-utf8", b'{"totals":\xff}'),
+        (
+            "utf8-bom-valid",
+            b'\xef\xbb\xbf{"totals":{"percent_covered":50.0}}',
+        ),
+        ("bom-only", b"\xef\xbb\xbf"),
+        ("stdout-total", b"TOTAL 10 0 96%"),
+        (
+            "rounded-over-hundred",
+            b'{"totals":{"percent_covered":100.0000000000000000000000000000000001}}',
+        ),
+        ("rounded-negative", b'{"totals":{"percent_covered":-1e-400}}'),
+        (
+            "duplicate-percent",
+            b'{"totals":{"percent_covered":0,"percent_covered":100}}',
+        ),
+    ]
+    payloads = (
+        [b""]
+        + [bytes((value,)) for value in range(256)]
+        + [
+            bytes((first, second))
+            for first in range(256)
+            for second in range(256)
+        ]
+        + [payload for _name, payload in directed]
+    )
+    assert len(directed) == 40
+    assert len(payloads) == 65_833
+
+    directed_results: dict[str, float | None] = {}
+    directed_stdout_results: dict[str, float | None] = {}
+    invocation_count = 0
+    for index, payload in enumerate(payloads):
+        stdout_result = parse_coverage_percent(payload)
+        json_result = parse_coverage_percent(b"", json_text=payload)
+        invocation_count += 2
+        for result in (stdout_result, json_result):
+            assert result is None or (
+                isinstance(result, float)
+                and math.isfinite(result)
+                and 0.0 <= result <= 100.0
+            ), f"invalid parser result for corpus input {index}: {result!r}"
+        if index >= len(payloads) - len(directed):
+            name = directed[index - (len(payloads) - len(directed))][0]
+            directed_results[name] = json_result
+            directed_stdout_results[name] = stdout_result
+
+    assert invocation_count == 131_666
+    assert directed_results["zero"] == 0.0
+    assert directed_results["hundred"] == 100.0
+    assert directed_results["fraction"] == pytest.approx(87.25)
+    assert directed_results["utf8-bom-valid"] == 50.0
+    assert directed_stdout_results["stdout-total"] == 96.0
+    for name in {
+        "huge-positive-int",
+        "huge-negative-int",
+        "positive-overflow-float",
+        "negative-overflow-float",
+        "literal-nan",
+        "literal-infinity",
+        "literal-negative-infinity",
+        "string-nan",
+        "string-infinity",
+        "string-negative-infinity",
+        "negative-percent",
+        "over-hundred",
+        "rounded-over-hundred",
+        "rounded-negative",
+        "duplicate-percent",
+        "root-null",
+        "root-bool",
+        "root-list",
+        "root-string",
+        "totals-null",
+        "totals-bool",
+        "totals-list",
+        "totals-string",
+        "totals-missing",
+        "percent-null",
+        "percent-bool",
+        "percent-list",
+        "percent-dict",
+        "percent-string",
+        "deep-array",
+        "deep-object",
+        "empty",
+        "truncated",
+        "invalid-utf8",
+        "bom-only",
+        "stdout-total",
+    }:
+        assert directed_results[name] is None
 
 
 @pytest.mark.parametrize(

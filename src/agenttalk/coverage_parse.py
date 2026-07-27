@@ -1,10 +1,11 @@
-"""Pure extraction of an overall coverage percentage from coverage-tool output (#60 inc-3).
+"""Pure, fail-closed extraction of an overall coverage percentage (#60 inc-3).
 
-The DoD ``coverage`` dimension needs a NUMBER, but the ``coverage`` assurance tool today only
-yields pass/fail. This module turns tool output into a single ``float`` percentage (0-100) or
-``None``. JSON artifacts are producer-controlled evidence and therefore size-bounded. The module
-is PURE (no I/O) and FAIL-CLOSED: any ambiguity or parse failure returns ``None``, which the
-caller treats as "coverage unknown" so the gate HOLDs. It never raises.
+For built-in ``str`` or ``bytes`` sources, every ordinary data-dependent ``Exception`` raised
+while decoding, parsing, or coercing coverage output is contained: the public parser returns a
+finite ``float`` in [0, 100] or ``None``. JSON artifacts are producer-controlled evidence and
+therefore size-bounded. Process-control ``BaseException`` signals (for example
+``KeyboardInterrupt``, ``SystemExit``, and ``GeneratorExit``) intentionally remain outside this
+contract rather than being misreported as malformed evidence.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from decimal import Decimal, InvalidOperation
 
 __all__ = ["MAX_COVERAGE_ARTIFACT_BYTES", "parse_coverage_percent"]
 
@@ -26,15 +28,18 @@ _TOTAL_COVERAGE = re.compile(
 )
 
 
-def _valid(pct: float | None) -> float | None:
+def _valid(pct: int | float | Decimal | str | None) -> float | None:
     """Accept only a real number in [0, 100]; anything else is fail-closed ``None``."""
-    if pct is None:
+    if pct is None or isinstance(pct, bool):
         return None
     try:
-        f = float(pct)
-    except (TypeError, ValueError):
+        exact = Decimal(str(pct)) if isinstance(pct, float) else Decimal(pct)
+    except (InvalidOperation, OverflowError, TypeError, ValueError):
         return None
-    if math.isnan(f) or math.isinf(f) or f < 0.0 or f > 100.0:
+    if not exact.is_finite() or exact < 0 or exact > 100:
+        return None
+    f = float(exact)
+    if math.isnan(f) or math.isinf(f):
         return None
     return f
 
@@ -48,12 +53,35 @@ def _artifact_within_limit(text: str) -> bool:
         return False
 
 
+def _source_text(source: str | bytes, *, artifact: bool) -> str | None:
+    if isinstance(source, bytes):
+        if artifact and len(source) > MAX_COVERAGE_ARTIFACT_BYTES:
+            return None
+        return source.decode("utf-8-sig")
+    if not isinstance(source, str):
+        return None
+    return source.removeprefix("\ufeff")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def _from_json(json_text: str) -> float | None:
     """coverage.py JSON: ``["totals"]["percent_covered"]`` (already 0-100)."""
     if not _artifact_within_limit(json_text):
         return None
     try:
-        data = json.loads(json_text)
+        data = json.loads(
+            json_text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_float=Decimal,
+        )
     except (RecursionError, TypeError, ValueError):
         return None
     if not isinstance(data, dict):
@@ -62,7 +90,7 @@ def _from_json(json_text: str) -> float | None:
     if not isinstance(totals, dict) or "percent_covered" not in totals:
         return None
     value = totals.get("percent_covered")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         return None
     return _valid(value)
 
@@ -83,24 +111,32 @@ def _from_stdout(stdout: str) -> float | None:
 
 
 def parse_coverage_percent(
-    stdout: str,
-    json_text: str | None = None,
+    stdout: str | bytes,
+    json_text: str | bytes | None = None,
 ) -> float | None:
     """Return the overall line-coverage percentage (0.0-100.0), or ``None`` if it cannot be
-    confidently determined. PURE, FAIL-CLOSED, never raises.
+    confidently determined.
 
     Sources are consulted in priority order; the first that yields a valid number wins (we do
     NOT average disagreeing sources): coverage.json (``totals.percent_covered``), then the
     terminal summary in ``stdout``. ``None`` means "coverage unknown" -> the DoD ``coverage``
-    dimension HOLDs. XML is deliberately not accepted as evidence.
+    dimension HOLDs. XML is deliberately not accepted as evidence. For built-in ``str`` and
+    ``bytes`` sources, ordinary parser exceptions are contained at this public boundary;
+    process-control ``BaseException`` signals intentionally propagate.
     """
-    for source in (
-        (_from_json, json_text),
-        (_from_stdout, stdout),
+    for parser, source, artifact in (
+        (_from_json, json_text, True),
+        (_from_stdout, stdout, False),
     ):
-        fn, text = source
-        if isinstance(text, str) and text:
-            pct = fn(text)
-            if pct is not None:
-                return pct
+        if not isinstance(source, (str, bytes)) or not source:
+            continue
+        try:
+            text = _source_text(source, artifact=artifact)
+            if not text:
+                continue
+            pct = _valid(parser(text))
+        except Exception:  # noqa: BLE001 - enforce the public fail-closed parser boundary
+            pct = None
+        if pct is not None:
+            return pct
     return None

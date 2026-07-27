@@ -543,6 +543,7 @@ def build_plan(
 
 
 def run_plan(plan: ScanPlan) -> ScanResult:
+    coverage_gate_snapshot = _snapshot_coverage_gate(plan.root, plan.profile)
     fresh_coverage_attestations: set[tuple[str, str]] = set()
     try:
         result = _run_plan(plan, fresh_coverage_attestations)
@@ -554,6 +555,7 @@ def run_plan(plan: ScanPlan) -> ScanResult:
                 revision=plan.provenance.get("git_sha"),
                 run_id=plan.run_id,
                 fresh_coverage_attestations=fresh_coverage_attestations,
+                expected_gate=coverage_gate_snapshot,
             )
         except Exception as finalization_exc:
             raise scan_exc from finalization_exc
@@ -565,6 +567,7 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             revision=plan.provenance.get("git_sha"),
             run_id=plan.run_id,
             fresh_coverage_attestations=fresh_coverage_attestations,
+            expected_gate=coverage_gate_snapshot,
         )
         return result
 
@@ -802,10 +805,14 @@ def main(argv: list[str] | None = None) -> int:
     run_id = _new_run_id()
     revision: str | None = None
     runner_errors: list[str] = []
+    coverage_gate_snapshot: dict[str, Any] | None = None
+    coverage_gate_snapshot_captured = False
     status = 1
     result: ScanResult | None = None
     paths: ArtifactPaths | None = None
     try:
+        coverage_gate_snapshot = _snapshot_coverage_gate(root, args.profile)
+        coverage_gate_snapshot_captured = True
         revision = _git_output(root, ["rev-parse", "HEAD"])
         try:
             manifest = load_manifest(root, args.manifest)
@@ -842,20 +849,22 @@ def main(argv: list[str] | None = None) -> int:
     else:
         status = 0
     finally:
-        try:
-            _invalidate_stale_coverage_gate(
-                root=root,
-                profile=args.profile,
-                revision=revision,
-                run_id=run_id,
-                fresh_coverage_attestations=fresh_coverage_attestations,
-            )
-        except Exception as exc:  # noqa: BLE001 - finalization is a bounded CLI failure
-            sys.stderr.write(
-                f"agenttalk assurance: could not finalize coverage gate: {exc}\n"
-            )
-            if status == 0:
-                status = 1
+        if coverage_gate_snapshot_captured:
+            try:
+                _invalidate_stale_coverage_gate(
+                    root=root,
+                    profile=args.profile,
+                    revision=revision,
+                    run_id=run_id,
+                    fresh_coverage_attestations=fresh_coverage_attestations,
+                    expected_gate=coverage_gate_snapshot,
+                )
+            except Exception as exc:  # noqa: BLE001 - finalization is a bounded CLI failure
+                sys.stderr.write(
+                    f"agenttalk assurance: could not finalize coverage gate: {exc}\n"
+                )
+                if status == 0:
+                    status = 1
 
     if status != 0:
         return status
@@ -1842,7 +1851,7 @@ def _rollback_coverage_preparation(
     )
 
 
-def _read_coverage_artifact(path: Path) -> str | None:
+def _read_coverage_artifact(path: Path) -> bytes | None:
     try:
         if path.is_symlink() or not path.is_file():
             return None
@@ -1850,10 +1859,10 @@ def _read_coverage_artifact(path: Path) -> str | None:
             data = handle.read(MAX_COVERAGE_ARTIFACT_BYTES + 1)
         if len(data) > MAX_COVERAGE_ARTIFACT_BYTES:
             return None
-        return data.decode("utf-8-sig")
+        return data
     except FileNotFoundError:
         return None
-    except (OSError, UnicodeError):
+    except OSError:
         return None
 
 
@@ -1872,9 +1881,9 @@ def _remove_generated_coverage_artifact(path: Path) -> bool:
 def _finish_coverage_artifacts(
     root: Path,
     state: _CoverageArtifactState,
-) -> tuple[dict[str, str | None], bool, str | None]:
+) -> tuple[dict[str, bytes | None], bool, str | None]:
     """Capture fresh reports, then restore the pre-run worktree before attestation."""
-    outputs: dict[str, str | None] = {}
+    outputs: dict[str, bytes | None] = {}
     cleanup_errors = [state.preparation_error] if state.preparation_error is not None else []
     transaction_complete = True
     for name in _COVERAGE_ARTIFACTS:
@@ -1969,6 +1978,30 @@ def _coverage_attestation_key(profile: str, revision: str | None) -> tuple[str, 
     return profile, str(revision or "").lower()
 
 
+def _load_coverage_gate_state(root: Path) -> dict[str, Any]:
+    state = gates.load_gate_state(root)
+    load_error = state.get("load_error")
+    if load_error:
+        raise OSError(f"could not read coverage gate state: {load_error}")
+    return state
+
+
+def _snapshot_coverage_gate(root: Path, profile: str) -> dict[str, Any] | None:
+    """Capture the target gate as the finalizer's compare-and-swap token.
+
+    The coverage transaction lock already spans report preparation through gate
+    emission. It cannot order an older non-coverage scan that finishes after a
+    newer coverage scan; holding it across every full scan would also serialize
+    unrelated tools and recurse into the deliberately non-reentrant lock.
+    """
+    from agenttalk.store import Store
+
+    with Store(root).config_lock():
+        state = _load_coverage_gate_state(root)
+        existing = state.get("gates", {}).get(coverage_gate_name(profile))
+        return copy.deepcopy(existing) if isinstance(existing, dict) else None
+
+
 def _invalidate_stale_coverage_gate(
     *,
     root: Path,
@@ -1976,6 +2009,7 @@ def _invalidate_stale_coverage_gate(
     revision: str | None,
     run_id: str,
     fresh_coverage_attestations: set[tuple[str, str]],
+    expected_gate: dict[str, Any] | None,
 ) -> None:
     if _coverage_attestation_key(profile, revision) in fresh_coverage_attestations:
         return
@@ -1986,8 +2020,12 @@ def _invalidate_stale_coverage_gate(
     revision_value = str(revision or "") or None
     reason = "no fresh coverage measurement this run"
     with Store(root).config_lock():
-        state = gates.load_gate_state(root)
+        state = _load_coverage_gate_state(root)
         existing = state.get("gates", {}).get(name)
+        # The config lock makes this comparison and the red write below one
+        # atomic CAS. Any intervening gate write (green, red, or waiver) wins.
+        if existing != expected_gate:
+            return
         if not isinstance(existing, dict) or existing.get("status") == "waived":
             return
         if (
@@ -2014,7 +2052,7 @@ def _emit_coverage_gate(
     plan: ScanPlan,
     run: dict[str, Any],
     stdout: str,
-    artifact_outputs: dict[str, str | None],
+    artifact_outputs: dict[str, bytes | None],
     *,
     artifacts_clean: bool,
     artifact_error: str | None = None,
