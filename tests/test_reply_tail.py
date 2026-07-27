@@ -244,25 +244,64 @@ def test_tail_timeout_exits_0(
 def test_tail_picks_up_messages_that_arrive_during_run(
     store_root: Path,
     capsys: pytest.CaptureFixture,
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end: launch tail in a thread, send a message, verify
-    tail printed it before timing out."""
+    """Tail observes a message published after its first live poll."""
     import threading
+
     s = Store(store_root)
+    body = "injected during tail"
+    tail_ready = threading.Event()
+    message_observed = threading.Event()
+    stop_tail = threading.Event()
+    scan_count = 0
+    original_scan = Store._scan_messages
 
-    def send_after_delay():
-        import time as _time
-        _time.sleep(0.3)
-        s.send(sender="alpha", recipient="beta", body="injected during tail")
+    def scan_messages(store: Store, *, since_id: str | None = None):
+        nonlocal scan_count
+        valid, invalid = original_scan(store, since_id=since_id)
+        if store.root == s.root:
+            scan_count += 1
+            if scan_count == 2:
+                # Default tail performs one baseline scan, then enters its live loop.
+                tail_ready.set()
+            if any(message.body == body for message in valid):
+                message_observed.set()
+        return valid, invalid
 
-    t = threading.Thread(target=send_after_delay, daemon=True)
+    def sleep_until_stopped(interval: float) -> None:
+        if stop_tail.wait(interval):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(Store, "_scan_messages", scan_messages)
+    monkeypatch.setattr(cli.time, "sleep", sleep_until_stopped)
+
+    result: list[int] = []
+    errors: list[BaseException] = []
+
+    def run_tail() -> None:
+        try:
+            result.append(
+                _run(["tail", "--timeout", "30", "--interval", "0.1"], store_root)
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    t = threading.Thread(target=run_tail, daemon=True)
     t.start()
-    rc = _run(["tail", "--timeout", "1.5", "--interval", "0.1"], store_root)
-    t.join(timeout=2)
-    assert rc == 0
+    try:
+        assert tail_ready.wait(timeout=5), "tail never reached its first live poll"
+        s.send(sender="alpha", recipient="beta", body=body)
+        assert message_observed.wait(timeout=5), "tail never observed the new message"
+    finally:
+        stop_tail.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+    assert errors == []
+    assert result == [0]
     out = capsys.readouterr().out
-    assert "injected during tail" in out
+    assert body in out
 
 
 # ----------------------------------------------------------- Store.last_received_for
