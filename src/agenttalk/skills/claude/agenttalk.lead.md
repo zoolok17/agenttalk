@@ -340,6 +340,57 @@ the agents you plan.
    summarize the outcome to the user with unresolved blockers called
    out explicitly.
 
+## Publishing a sandboxed worker's commit
+
+A sandboxed worker can commit in its own worktree but cannot push, so the
+lead publishes on its behalf. Three failures live in that one step, and the
+first two are silent.
+
+1. **Require a clean-SHA handoff.** The worker's reply must carry the final
+   full SHA and an empty `git status --porcelain` for its worktree. Pushing a
+   branch publishes the committed HEAD, never uncommitted edits — so a dirty
+   worktree publishes a tree nobody tested.
+   ```powershell
+   git -C <worktree> status --porcelain     # must be empty
+   git -C <worktree> log -1 --format=%H     # must equal the reported SHA
+   ```
+
+2. **Never let the current directory choose which commit is pushed.** This is
+   the trap:
+   ```powershell
+   # WRONG when run from the main checkout: HEAD is the MAIN branch,
+   # not the worker's commit. This publishes the base branch over the
+   # feature branch.
+   git push origin HEAD:<branch>
+   ```
+   Push the **explicit full SHA**, which cannot be ambiguous about which tree
+   it means and is self-documenting in shell history:
+   ```powershell
+   git push origin <full-sha>:refs/heads/<branch>
+   ```
+   `git -C <worktree> push origin HEAD:<branch>` also works. Prefer the
+   explicit SHA.
+
+   **`--force-with-lease` does not protect you here.** The lease asserts what
+   the *remote* looked like, which you may legitimately hold; it says nothing
+   about whether your *local* ref is the one you meant. A wrong-but-leased
+   force push is "safe" by the flag's definition and destructive in fact.
+
+3. **Verify the result, not the push output.** Pushing the base branch onto a
+   pull request's head makes the head equal the base, and hosts such as GitHub
+   read that as already-merged and **auto-close the PR**. The push output looks
+   like an ordinary fast-forward, so only an explicit check reveals it:
+   ```powershell
+   gh pr view <n> --json headRefOid,state,mergeable
+   ```
+   Recovery, if it happens: the objects are still local, so re-push the correct
+   explicit SHA and reopen the request. Confirm the head afterwards.
+
+The general rule behind all three: *which tree or object am I operating on* is
+a question to ANSWER explicitly, never to infer from ambient context. The same
+rule catches a stale checkout behind a running process, a test run from the
+wrong directory, and a static check scanning a tree the runtime never imports.
+
 ## Targeting
 
 - Use `agenttalk send --to <agent>` for one named recipient.
