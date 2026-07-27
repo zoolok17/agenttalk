@@ -6,4 +6,4 @@ ruff>=0.6
 bandit>=1.7
 pip-audit>=2.7
 semgrep>=1.170.1
-zizmor>=1.20
+zizmor>=1.28.0
