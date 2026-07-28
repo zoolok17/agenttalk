@@ -6305,7 +6305,7 @@ function Preflight($name, $plan, $file, $codexHome) {
     if ($ToolRuntimePinned) {
       $savedToolRuntimeEnv = Enter-ToolRuntimePythonEnvironment
       try {
-        $toolRuntimeVersion = & $AgenttalkPython -I -c 'import sys; print("%d.%d" % sys.version_info[:2]); raise SystemExit(sys.version_info < (3, 11))'
+        $toolRuntimeVersion = & $AgenttalkPython -I -c 'import sys; print(sys.version_info[:2]); raise SystemExit(sys.version_info < (3, 11))'
         $rc = $LASTEXITCODE
       } finally {
         Exit-ToolRuntimePythonEnvironment $savedToolRuntimeEnv

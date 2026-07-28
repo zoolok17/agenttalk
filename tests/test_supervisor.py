@@ -5029,6 +5029,97 @@ def test_tool_runtime_preflight_requires_python_311_only_when_pinned(
         assert "requires Python 3.11+" not in diagnostics
 
 
+def _tool_runtime_preflight_shells() -> list[object]:
+    if os.name != "nt":
+        return []
+    shells = []
+    if pwsh := shutil.which("pwsh"):
+        shells.append(pytest.param(pwsh, id="pwsh-7"))
+    windows_powershell = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    if windows_powershell.is_file():
+        shells.append(
+            pytest.param(
+                str(windows_powershell),
+                id="windows-powershell-5.1",
+            )
+        )
+    return shells
+
+
+@pytest.mark.parametrize("shell", _tool_runtime_preflight_shells())
+def test_tool_runtime_preflight_executes_version_gate_in_each_windows_powershell(
+    tmp_path: Path,
+    shell: str,
+) -> None:
+    expected = sys.version_info >= (3, 11)
+    tool_home = tmp_path / "tool-runtime"
+    venv.EnvBuilder(with_pip=False).create(tool_home)
+    tool_python = tool_home / "Scripts" / "python.exe"
+    tool_package = tool_home / "Lib" / "site-packages" / "agenttalk"
+    tool_package.mkdir(parents=True)
+    (tool_package / "__init__.py").write_text("", encoding="utf-8")
+    (tool_package / "__main__.py").write_text(
+        "import sys\n"
+        "if sys.argv[1:] != ['--version']:\n"
+        "    raise SystemExit(2)\n"
+        "print('agenttalk test runtime')\n",
+        encoding="utf-8",
+    )
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"tool_runtime_python": str(tool_python)}),
+        encoding="utf-8",
+    )
+    generated = sup.render_artifact_bundle(
+        store,
+        python_exe=str(tool_python),
+    )["supervisor.ps1"].decode("utf-8")
+    preflight_dependencies = generated[
+        generated.index("$AgenttalkPython = "):
+        generated.index("# endregion exec-helpers")
+    ]
+    result_path = tmp_path / "supported-preflight.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        preflight_dependencies,
+        "$plan = [pscustomobject]@{ launch_mode='manual'; cli='claude' }",
+        "$ok = Preflight 'worker' $plan 'ignored.exe' $null",
+        "@{ ok=[bool]$ok } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ])
+    harness_path = tmp_path / "supported-preflight.ps1"
+    harness_path.write_text(harness, encoding="utf-8-sig")
+
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads(
+        result_path.read_text(encoding="utf-8-sig")
+    )["ok"] is expected, completed.stdout + completed.stderr
+    diagnostics = completed.stdout + completed.stderr
+    if expected:
+        assert "requires Python 3.11+" not in diagnostics
+    else:
+        assert "requires Python 3.11+" in diagnostics
+        assert (
+            f"({sys.version_info.major}, {sys.version_info.minor})"
+            in diagnostics
+        )
+        assert "unavailable" not in diagnostics
+
+
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
