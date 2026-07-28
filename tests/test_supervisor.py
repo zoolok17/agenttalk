@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import venv
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -4924,6 +4925,31 @@ def test_pinned_preflight_restores_codex_home_when_env_isolation_throws(
     ]
 
 
+def _create_preflight_witness_runtime(home: Path) -> tuple[Path, Path]:
+    venv.EnvBuilder(with_pip=False).create(home)
+    python = home / "Scripts" / "python.exe"
+    package = home / "Lib" / "site-packages" / "agenttalk"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    main = package / "__main__.py"
+    main.write_text(
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "witness = Path(os.environ['AGENTTALK_TEST_INVOCATION_WITNESS'])\n"
+        "records = (json.loads(witness.read_text(encoding='utf-8')) "
+        "if witness.exists() else [])\n"
+        "records.append({'executable': sys.executable, 'argv': sys.argv})\n"
+        "witness.write_text(json.dumps(records), encoding='utf-8')\n"
+        "if sys.argv[1:] != ['--version']:\n"
+        "    raise SystemExit(2)\n"
+        "print('agenttalk test runtime')\n",
+        encoding="utf-8",
+    )
+    return python, main
+
+
 def _tool_runtime_preflight_cases() -> list[object]:
     """All Preflight plan shapes under both Windows PowerShell editions."""
     if os.name != "nt":
@@ -4940,9 +4966,9 @@ def _tool_runtime_preflight_cases() -> list[object]:
         ),
     ]
     plans = [
-        ("wrapped", "wrap", "codex", 2),
-        ("codex", "manual", "codex", 1),
-        ("generic-claude", "manual", "claude", 1),
+        ("wrapped", "wrap", "codex"),
+        ("codex", "manual", "codex"),
+        ("generic-claude", "manual", "claude"),
     ]
     return [
         pytest.param(
@@ -4950,16 +4976,15 @@ def _tool_runtime_preflight_cases() -> list[object]:
             plan_shape,
             launch_mode,
             cli_name,
-            expected_invocations,
             id=f"{shell_id}-{plan_shape}",
         )
         for shell_id, shell in shells
-        for plan_shape, launch_mode, cli_name, expected_invocations in plans
+        for plan_shape, launch_mode, cli_name in plans
     ]
 
 
 @pytest.mark.parametrize(
-    ("shell", "plan_shape", "launch_mode", "cli_name", "expected_invocations"),
+    ("shell", "plan_shape", "launch_mode", "cli_name"),
     _tool_runtime_preflight_cases(),
 )
 def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
@@ -4968,7 +4993,6 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
     plan_shape: str,
     launch_mode: str,
     cli_name: str,
-    expected_invocations: int,
 ) -> None:
     """Every pinned Preflight branch must invoke its configured interpreter.
 
@@ -4979,35 +5003,23 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
     launch refusal for every pinned agent, and pwsh-only coverage cannot see the
     class at all.
 
-    Each parameter gets a real venv and a private invocation witness. The wrapped
-    branch invokes that interpreter twice (the configured wrapper file and the
-    pinned AGENTTALK_PY); the other branches invoke it once.
+    Each parameter gets a real tool-runtime venv and a private invocation
+    witness. The wrapped branch also gets a distinct wrapper venv, proving both
+    the configured wrapper file and pinned AGENTTALK_PY were invoked.
     """
     assert shell and Path(shell).is_file(), (
         f"required PowerShell edition is absent on Windows: {shell!r}"
     )
 
-    tool_home = tmp_path / "tool-runtime"
-    venv.EnvBuilder(with_pip=False).create(tool_home)
-    tool_python = tool_home / "Scripts" / "python.exe"
-    tool_package = tool_home / "Lib" / "site-packages" / "agenttalk"
-    tool_package.mkdir(parents=True)
-    (tool_package / "__init__.py").write_text("", encoding="utf-8")
-    (tool_package / "__main__.py").write_text(
-        "import json\n"
-        "import os\n"
-        "import sys\n"
-        "from pathlib import Path\n"
-        "witness = Path(os.environ['AGENTTALK_TEST_INVOCATION_WITNESS'])\n"
-        "records = (json.loads(witness.read_text(encoding='utf-8')) "
-        "if witness.exists() else [])\n"
-        "records.append({'executable': sys.executable, 'argv': sys.argv})\n"
-        "witness.write_text(json.dumps(records), encoding='utf-8')\n"
-        "if sys.argv[1:] != ['--version']:\n"
-        "    raise SystemExit(2)\n"
-        "print('agenttalk test runtime')\n",
-        encoding="utf-8",
+    tool_python, tool_main = _create_preflight_witness_runtime(
+        tmp_path / "tool-runtime"
     )
+    wrapper_python = tool_python
+    wrapper_main = tool_main
+    if plan_shape == "wrapped":
+        wrapper_python, wrapper_main = _create_preflight_witness_runtime(
+            tmp_path / "wrapper-runtime"
+        )
     native_cli = tmp_path / "codex.exe"
     shutil.copy2(tool_python, native_cli)
     store = _team(tmp_path)
@@ -5053,7 +5065,7 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
         preflight_dependencies,
         f"$plan = [pscustomobject]@{{ launch_mode={_pslit(launch_mode)}; "
         f"cli={_pslit(cli_name)} }}",
-        f"$ok = Preflight 'worker' $plan {_pslit(str(tool_python))} $null",
+        f"$ok = Preflight 'worker' $plan {_pslit(str(wrapper_python))} $null",
         "@{ ok=[bool]$ok } | ConvertTo-Json | "
         f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
     ])
@@ -5082,14 +5094,22 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
         f"the pinned interpreter: {completed.stdout}{completed.stderr}"
     )
     invocations = json.loads(witness_path.read_text(encoding="utf-8"))
-    assert len(invocations) == expected_invocations
-    expected_python = tool_python.resolve()
-    expected_main = (tool_package / "__main__.py").resolve()
-    for invocation in invocations:
-        assert Path(invocation["executable"]).resolve() == expected_python
-        argv = invocation["argv"]
-        assert Path(argv[0]).resolve() == expected_main
-        assert argv[1:] == ["--version"]
+    expected_invocations = Counter({
+        (tool_python.resolve(), tool_main.resolve(), ("--version",)): 1,
+    })
+    if plan_shape == "wrapped":
+        expected_invocations[
+            (wrapper_python.resolve(), wrapper_main.resolve(), ("--version",))
+        ] += 1
+    actual_invocations = Counter(
+        (
+            Path(invocation["executable"]).resolve(),
+            Path(invocation["argv"][0]).resolve(),
+            tuple(invocation["argv"][1:]),
+        )
+        for invocation in invocations
+    )
+    assert actual_invocations == expected_invocations
 
 
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:
