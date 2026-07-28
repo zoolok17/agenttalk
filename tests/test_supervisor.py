@@ -4940,7 +4940,8 @@ def _create_preflight_witness_runtime(home: Path) -> tuple[Path, Path]:
         "witness = Path(os.environ['AGENTTALK_TEST_INVOCATION_WITNESS'])\n"
         "records = (json.loads(witness.read_text(encoding='utf-8')) "
         "if witness.exists() else [])\n"
-        "records.append({'executable': sys.executable, 'argv': sys.argv})\n"
+        "records.append({'executable': sys.executable, 'argv': sys.argv, "
+        "'codex_home': os.environ.get('CODEX_HOME')})\n"
         "witness.write_text(json.dumps(records), encoding='utf-8')\n"
         "if sys.argv[1:] != ['--version']:\n"
         "    raise SystemExit(2)\n"
@@ -5031,6 +5032,10 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
     assert all(endpoint.is_file() for endpoint in endpoints.values()), endpoints
     assert len(set(endpoints.values())) == len(endpoints), endpoints
 
+    outer_codex_home = tmp_path / "outer-codex-home"
+    inner_codex_home = tmp_path / "inner-codex-home"
+    outer_codex_home.mkdir()
+    inner_codex_home.mkdir()
     store = _team(tmp_path)
     config_path = store.dir / "supervisor.json"
     config_path.write_text(
@@ -5074,8 +5079,10 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
         preflight_dependencies,
         f"$plan = [pscustomobject]@{{ launch_mode={_pslit(launch_mode)}; "
         f"cli={_pslit(cli_name)} }}",
-        f"$ok = Preflight 'worker' $plan {_pslit(str(preflight_file))} $null",
-        "@{ ok=[bool]$ok } | ConvertTo-Json | "
+        f"$ok = Preflight 'worker' $plan {_pslit(str(preflight_file))} "
+        f"{_pslit(str(inner_codex_home))}",
+        "@{ ok=[bool]$ok; codex_home=[string]$env:CODEX_HOME } | "
+        "ConvertTo-Json | "
         f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
     ])
     harness_path = tmp_path / f"pinned-preflight-{plan_shape}.ps1"
@@ -5083,6 +5090,7 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
 
     env = dict(os.environ)
     env["AGENTTALK_TEST_INVOCATION_WITNESS"] = str(witness_path)
+    env["CODEX_HOME"] = str(outer_codex_home)
     completed = subprocess.run(
         [shell, "-NoProfile", "-File", str(harness_path)],
         capture_output=True,
@@ -5092,30 +5100,44 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert json.loads(
-        result_path.read_text(encoding="utf-8-sig")
-    )["ok"] is True, (
+    result = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert result["ok"] is True, (
         f"pinned Preflight FAILED under {shell} - a native-argument marshalling "
         f"regression: {completed.stdout}{completed.stderr}"
     )
+    assert Path(result["codex_home"]).resolve() == outer_codex_home.resolve()
     assert witness_path.is_file(), (
         f"{plan_shape} Preflight returned success under {shell} without invoking "
         f"the pinned interpreter: {completed.stdout}{completed.stderr}"
     )
     invocations = json.loads(witness_path.read_text(encoding="utf-8"))
+    expected_codex_home = (
+        outer_codex_home if plan_shape == "generic-claude" else inner_codex_home
+    ).resolve()
     expected_invocations = Counter({
-        (tool_python.resolve(), tool_main.resolve(), ("--version",)): 1,
+        (
+            tool_python.resolve(),
+            tool_main.resolve(),
+            ("--version",),
+            expected_codex_home,
+        ): 1,
     })
     if plan_shape == "wrapped":
         assert wrapper_main is not None
         expected_invocations[
-            (preflight_file.resolve(), wrapper_main.resolve(), ("--version",))
+            (
+                preflight_file.resolve(),
+                wrapper_main.resolve(),
+                ("--version",),
+                expected_codex_home,
+            )
         ] += 1
     actual_invocations = Counter(
         (
             Path(invocation["executable"]).resolve(),
             Path(invocation["argv"][0]).resolve(),
             tuple(invocation["argv"][1:]),
+            Path(invocation["codex_home"]).resolve(),
         )
         for invocation in invocations
     )
