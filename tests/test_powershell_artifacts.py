@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -14,6 +15,164 @@ def _store(tmp_path: Path) -> Store:
     store = Store(tmp_path)
     store.init(["lead", "worker"])
     return store
+
+
+def _mark_as_source_checkout(store: Store) -> None:
+    package = store.root / "src" / "agenttalk"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+
+
+def test_tool_runtime_config_pins_control_plane_off_checkout(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _mark_as_source_checkout(store)
+    fallback = r"C:\Fallback Python\python.exe"
+    tool_python = tmp_path / "tool runtime" / "Scripts" / "python.exe"
+    tool_python.parent.mkdir(parents=True)
+    tool_python.touch()
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"tool_runtime_python": str(tool_python)}),
+        encoding="utf-8",
+    )
+
+    bundle = sup.render_artifact_bundle(store, python_exe=fallback)
+
+    script = bundle["supervisor.ps1"].decode("utf-8")
+    shim = bundle["bin/agenttalk.cmd"].decode("utf-8")
+    escaped_tool_python = str(tool_python).replace("'", "''")
+    assert f"$AgenttalkPython = '{escaped_tool_python}'" in script
+    assert "$SrcOnPyPath = $false" in script
+    assert f'AGENTTALK_PYTHON={tool_python}"' in shim
+    assert 'set "PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%"' not in shim
+
+
+def test_tool_runtime_config_unset_preserves_checkout_generation(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _mark_as_source_checkout(store)
+    fallback = r"C:\Fallback Python\python.exe"
+    before = sup.render_artifact_bundle(store, python_exe=fallback)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"poll_seconds": 17}),
+        encoding="utf-8",
+    )
+
+    after = sup.render_artifact_bundle(store, python_exe=fallback)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"tool_runtime_python": None}),
+        encoding="utf-8",
+    )
+    explicit_null = sup.render_artifact_bundle(store, python_exe=fallback)
+
+    assert after == before
+    assert explicit_null == before
+    script = after["supervisor.ps1"].decode("utf-8")
+    shim = after["bin/agenttalk.cmd"].decode("utf-8")
+    assert "$AgenttalkPython = 'C:\\Fallback Python\\python.exe'" in script
+    assert "$SrcOnPyPath = $true" in script
+    assert 'AGENTTALK_PYTHON=C:\\Fallback Python\\python.exe"' in shim
+    assert 'set "PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%"' in shim
+
+
+def test_tool_runtime_generated_bundle_passes_artifact_validation(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _mark_as_source_checkout(store)
+    fallback = r"C:\Fallback Python\python.exe"
+    tool_python = tmp_path / "tool-runtime" / "Scripts" / "python.exe"
+    tool_python.parent.mkdir(parents=True)
+    tool_python.touch()
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"tool_runtime_python": str(tool_python)}),
+        encoding="utf-8",
+    )
+
+    sup.refresh_artifacts(store, python_exe=fallback)
+
+    result = sup.validate_artifact_bundle(store)
+    assert result["ok"] is True
+    shim = (store.dir / "bin" / "agenttalk.cmd").read_text(encoding="utf-8")
+    assert f'AGENTTALK_PYTHON={tool_python}"' in shim
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ["different-runtime", None],
+    ids=["runtime-changed", "runtime-removed"],
+)
+def test_tool_runtime_config_drift_requires_artifact_refresh(
+    tmp_path: Path,
+    replacement: str | None,
+) -> None:
+    store = _store(tmp_path)
+    _mark_as_source_checkout(store)
+    fallback = r"C:\Fallback Python\python.exe"
+    first = tmp_path / "runtime-a" / "python.exe"
+    second = tmp_path / "runtime-b" / "python.exe"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.touch()
+    second.touch()
+    config_path = store.dir / "supervisor.json"
+    config_path.write_text(
+        json.dumps({"tool_runtime_python": str(first)}),
+        encoding="utf-8",
+    )
+    sup.refresh_artifacts(store, python_exe=fallback)
+    changed = (
+        {"tool_runtime_python": str(second)}
+        if replacement is not None else {}
+    )
+    config_path.write_text(json.dumps(changed), encoding="utf-8")
+
+    with pytest.raises(sup.ArtifactValidationError, match="rendered content"):
+        sup.validate_artifact_bundle(store)
+
+    sup.refresh_artifacts(store, python_exe=fallback)
+    assert sup.validate_artifact_bundle(store)["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        "python.exe",
+        " C:\\Python\\python.exe",
+        "C:\\Python%PATH%\\python.exe",
+        7,
+        [],
+    ],
+)
+def test_tool_runtime_config_rejects_invalid_values(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    store = _store(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"tool_runtime_python": value}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(sup.ArtifactValidationError, match="tool_runtime_python"):
+        sup.render_artifact_bundle(store)
+
+
+def test_tool_runtime_config_rejects_missing_absolute_file(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    missing = tmp_path / "missing-runtime" / "python.exe"
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"tool_runtime_python": str(missing)}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        sup.ArtifactValidationError,
+        match="must name an existing file",
+    ):
+        sup.render_artifact_bundle(store)
 
 
 def test_rendered_artifacts_share_derived_marker_and_are_bom_free(tmp_path: Path) -> None:

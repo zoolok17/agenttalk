@@ -52,6 +52,7 @@ _ADAPTERS: dict[str, Callable[[object], list[Event]]] = {
 # high-confidence signature -> escalation-enabled.
 _TELEMETRY_ONLY = {"codex": True, "claude": False}
 _NO_CHILD_WINDOW_ENV = "AGENTTALK_NO_CHILD_WINDOW"
+TOOL_RUNTIME_PYTHON_ENV = "AGENTTALK_TOOL_RUNTIME_PYTHON"
 WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
 INBOUND_REQUEST_ID_ENV = "AGENTTALK_INBOUND_REQUEST_ID"
 OVH_QWEN_CLAUDE_MAX_OUTPUT = "4096"
@@ -586,7 +587,18 @@ def _child_env(
             for k, v in os.environ.items()
             if k not in {LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV}
         }
-    env["AGENTTALK_PY"] = _agenttalk_py()
+    tool_runtime_python = env.get(TOOL_RUNTIME_PYTHON_ENV)
+    if tool_runtime_python:
+        tool_runtime_path = Path(tool_runtime_python).expanduser()
+        if not tool_runtime_path.is_absolute():
+            raise ValueError(f"{TOOL_RUNTIME_PYTHON_ENV} must name an absolute executable")
+        env["AGENTTALK_PY"] = str(tool_runtime_path.resolve())
+        env["AGENTTALK_PYTHON"] = env["AGENTTALK_PY"]
+        # A checkout path inherited by the wrapper would otherwise beat the
+        # non-editable tool install even though AGENTTALK_PY is pinned.
+        env.pop("PYTHONPATH", None)
+    else:
+        env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
     if isinstance(wrapper_generation, str) and wrapper_generation:
         env[WRAPPER_GENERATION_ENV] = wrapper_generation

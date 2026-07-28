@@ -164,6 +164,7 @@ archetype you need:
   "poll_seconds": 15,              // how often the monitor checks
   "stuck_after_seconds": 120,      // global stale threshold (per-agent overrides win)
   "launch_grace_seconds": 120,     // startup grace before liveness is judged
+  "tool_runtime_python": "D:\\agenttalk-tool-runtime\\Scripts\\python.exe",
   "claude_permission_mode": "bypassPermissions",
   "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
   "agents": { /* one block per agent */ }
@@ -173,6 +174,27 @@ archetype you need:
 `backoff` throttles relaunch storms: a flapping agent waits
 `base..cap` seconds (exponential) between attempts, resetting after
 `reset_after_seconds` of health.
+
+`tool_runtime_python` optionally pins the supervisor, generated
+`bin/agenttalk.cmd`, and model-side `AGENTTALK_PY` bus commands to one stable,
+non-editable agenttalk installation. The configured interpreter must contain
+the same artifact generator version as the checkout that runs
+`supervise --refresh-scripts`; an older runtime rejects the new generated
+marker/body as stale. Build or install that runtime from the release you are
+deploying, then refresh and restart the supervisor while attended:
+
+```powershell
+agenttalk supervise --refresh-scripts
+agenttalk request-restart --for <agent>
+```
+
+Configured mode removes checkout `PYTHONPATH` from control-plane commands.
+Selecting a separate per-lane environment for code-under-test is a different
+concern and is not configured by this field.
+
+To roll back, remove `tool_runtime_python` (or set it to `null`), refresh the
+generated scripts, and restart. The unset behavior remains the legacy behavior:
+a source checkout is added to `PYTHONPATH`.
 
 ### A manual-listen agent
 

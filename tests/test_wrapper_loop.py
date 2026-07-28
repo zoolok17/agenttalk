@@ -10,7 +10,9 @@ import gc
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
+import venv
 
 import pytest
 
@@ -1264,6 +1266,69 @@ def test_child_env_stamps_pin_root_and_strips_lease(tmp_path, monkeypatch) -> No
     assert env["AGENTTALK_PY"] == str(Path(sys.executable).resolve())
     assert env["AGENTTALK_ROOT"] == str(tmp_path.resolve())
     assert "AGENTTALK_LEAD_LOOP_LEASE" not in env
+
+
+def test_child_env_uses_inherited_tool_runtime_and_strips_pythonpath(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    tool_home = tmp_path / "tool-runtime"
+    venv.EnvBuilder(with_pip=False).create(tool_home)
+    executable = "python.exe" if sys.platform == "win32" else "python"
+    scripts = "Scripts" if sys.platform == "win32" else "bin"
+    site_packages = (
+        tool_home / "Lib" / "site-packages"
+        if sys.platform == "win32"
+        else next((tool_home / "lib").glob("python*/site-packages"))
+    )
+    tool_package = site_packages / "agenttalk"
+    tool_package.mkdir(parents=True)
+    (tool_package / "__init__.py").write_text("", encoding="utf-8")
+    tool_python = str((tool_home / scripts / executable).resolve())
+    checkout_source = str((tmp_path / "checkout" / "src").resolve())
+    checkout_package = Path(checkout_source) / "agenttalk"
+    checkout_package.mkdir(parents=True)
+    (checkout_package / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("AGENTTALK_TOOL_RUNTIME_PYTHON", tool_python)
+    monkeypatch.setenv("AGENTTALK_PY", "wrong-python.exe")
+    monkeypatch.setenv("PYTHONPATH", checkout_source)
+
+    env = run._child_env(tmp_path)
+    completed = subprocess.run(
+        [
+            env["AGENTTALK_PY"],
+            "-c",
+            "import agenttalk; print(agenttalk.__file__)",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert env["AGENTTALK_TOOL_RUNTIME_PYTHON"] == tool_python
+    assert env["AGENTTALK_PY"] == tool_python
+    assert "PYTHONPATH" not in env
+    assert completed.returncode == 0, completed.stderr
+    assert Path(completed.stdout.strip()).resolve().is_relative_to(
+        tool_package.resolve()
+    )
+
+
+def test_child_env_without_tool_runtime_preserves_legacy_runtime_and_pythonpath(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    checkout_source = str((tmp_path / "checkout" / "src").resolve())
+    monkeypatch.delenv("AGENTTALK_TOOL_RUNTIME_PYTHON", raising=False)
+    monkeypatch.setenv("PYTHONPATH", checkout_source)
+
+    env = run._child_env(tmp_path)
+
+    assert env["AGENTTALK_PY"] == str(Path(sys.executable).resolve())
+    assert env["PYTHONPATH"] == checkout_source
 
 
 def test_child_creationflags_set_no_window_only_for_hidden_windows() -> None:

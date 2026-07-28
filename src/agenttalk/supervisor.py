@@ -5514,6 +5514,8 @@ CONFIG_TEMPLATE = """\
   "launch_grace_seconds": 120,
   "window_style": "hidden",
   "_comment_window_style": "Windows launch window style for supervised agents: hidden (default), minimized, or normal. Per-agent entries and ephemeral allowed_profiles may override it. hidden also tells wrapped agents to create their per-turn CLI child with no visible console.",
+  "tool_runtime_python": null,
+  "_comment_tool_runtime_python": "Optional absolute Python path for the stable agenttalk control plane. The installed agenttalk must contain the same artifact generator as the checkout running refresh-scripts; an older runtime rejects the new marker/body. When set, generated supervisor artifacts pin AGENTTALK_PY and the project-local shim to this interpreter and exclude checkout source from their PYTHONPATH. Remove the field (or set null), refresh scripts, and restart to restore the legacy checkout-backed behavior. Code-under-test runtime selection is separate.",
   "max_readiness_retries": 3,
   "_comment_max_readiness_retries": "After this many relaunches of an agent that NEVER reaches readiness (no first heartbeat - e.g. a manual resume that does not re-enter the listen loop), the supervisor STOPS relaunching and surfaces READINESS_GAVE_UP (warn/notify, no kill) instead of churning forever. Reset by a fresh heartbeat or an operator restart/clear. A WRAPPED agent avoids this class entirely (the wrapper owns the heartbeat regardless of the model prompt) - prefer wrapped for hands-off supervision.",
   "claude_permission_mode": "bypassPermissions",
@@ -5568,7 +5570,7 @@ CONFIG_TEMPLATE = """\
         "windows_args": ["{SESSION_ARGS}"],
         "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
-      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
+      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + the per-agent env). Without tool_runtime_python, a source checkout also prepends <repo>/src to PYTHONPATH (legacy/code-under-test mode); with tool_runtime_python, the control-plane environment excludes checkout PYTHONPATH. The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
       "_comment_liveness": "For this MANUAL archetype heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck. The hook runs `agenttalk heartbeat --hook` (soft: it can never block a tool call). For a NON-wrapped codex agent with activity_hook=true, the supervisor adds the GLOBAL --dangerously-bypass-hook-trust to the codex launch: the installed agenttalk hook changes codex's hook-trust hash and would otherwise PROMPT to re-trust on every unattended launch and strand the agent. This bypasses hook-trust for the supervisor's OWN hook, for controlled UNATTENDED supervision only (a wrapped codex does not use the activity hook and is unaffected)."
     },
@@ -5868,10 +5870,12 @@ function Read-SupervisorConfig {
   return $value
 }
 $cfg = Read-SupervisorConfig
-# Baked at `supervise --init`: the Python that runs the bus + whether this is a
-# source checkout (prepend <root>/src to PYTHONPATH) vs a pip install.
+# Baked at generation: the Python that runs the bus, whether checkout source is
+# selected, and whether an explicit stable tool runtime must exclude ambient
+# checkout paths.
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
 $SrcOnPyPath = __SRC_ON_PYPATH__
+$ToolRuntimePinned = __TOOL_RUNTIME_PINNED__
 
 function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }
 function Assert-ActionsEnabled([string]$what) {
@@ -6258,6 +6262,7 @@ function Preflight($name, $plan, $file, $codexHome) {
       $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
       if ($codexHome) { $env:CODEX_HOME = $codexHome }
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+      elseif ($ToolRuntimePinned) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
       try {
         & $file -m agenttalk --version | Out-Null
         $rc = $LASTEXITCODE
@@ -6286,6 +6291,7 @@ function Preflight($name, $plan, $file, $codexHome) {
       $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
       if ($codexHome) { $env:CODEX_HOME = $codexHome }
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+      elseif ($ToolRuntimePinned) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
       try { & $AgenttalkPython -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
       finally {
         if ($null -eq $saved) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $saved }
@@ -6298,6 +6304,7 @@ function Preflight($name, $plan, $file, $codexHome) {
       # PYTHONPATH (the in-sandbox-robust invocation the skills use).
       $savedPP = $env:PYTHONPATH
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+      elseif ($ToolRuntimePinned) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
       try { & $AgenttalkPython -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
       finally { if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP } }
       if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight `AGENTTALK_PY -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
@@ -6372,6 +6379,14 @@ function Launch($name, $plan, $codexHome) {
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
+  if ($ToolRuntimePinned) {
+    # The configured tool runtime is authoritative for bus/control commands.
+    # B1 code-under-test isolation needs a separate lane-scoped mechanism.
+    $applied['AGENTTALK_PY'] = $AgenttalkPython
+    $applied['AGENTTALK_PYTHON'] = $AgenttalkPython
+    $applied['AGENTTALK_TOOL_RUNTIME_PYTHON'] = $AgenttalkPython
+    $applied['PYTHONPATH'] = ''
+  }
   foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
   try {
     $cwd = if ($a.cwd) { $a.cwd } else { $Root }
@@ -6422,6 +6437,12 @@ function Launch-Spec($name, $spec, $codexHome) {
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }
+  if ($ToolRuntimePinned) {
+    $applied['AGENTTALK_PY'] = $AgenttalkPython
+    $applied['AGENTTALK_PYTHON'] = $AgenttalkPython
+    $applied['AGENTTALK_TOOL_RUNTIME_PYTHON'] = $AgenttalkPython
+    $applied['PYTHONPATH'] = ''
+  }
   foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
   try {
     $cwd = if ($spec.cwd) { $spec.cwd } else { $Root }
@@ -6752,25 +6773,36 @@ $pollNum = 0
 def agenttalk_shim(
     python_exe: str,
     checkout_id: str = "__AGENTTALK_CHECKOUT_ID__",
+    *,
+    tool_runtime_pinned: bool = False,
 ) -> str:
     """A project-local Windows shim so a bare ``agenttalk`` resolves regardless
     of console-script PATH discovery. It runs ``python -m agenttalk`` with a
     KNOWN Python (``sys.executable`` captured at init, overridable via
-    AGENTTALK_PYTHON) and prepends ``<root>/src`` to PYTHONPATH only when this is
-    a source checkout - so it works for BOTH a pip install and a checkout. The
-    supervisor prepends ``.agenttalk/bin`` to PATH before launching an agent."""
+    AGENTTALK_PYTHON in legacy mode). The configured tool-runtime mode makes the
+    baked interpreter authoritative and clears PYTHONPATH; legacy mode prepends
+    ``<root>/src`` when this is a source checkout. The supervisor prepends
+    ``.agenttalk/bin`` to PATH before launching an agent."""
     py = python_exe.replace('"', '')
+    if tool_runtime_pinned:
+        python_pin = f'set "AGENTTALK_PYTHON={py}"\r\n'
+        python_path = 'set "PYTHONPATH="\r\n'
+    else:
+        python_pin = f'if not defined AGENTTALK_PYTHON set "AGENTTALK_PYTHON={py}"\r\n'
+        # %~dp0 = <root>\\.agenttalk\\bin\\ ; ..\\..\\src = <root>\\src
+        python_path = (
+            'if exist "%~dp0..\\..\\src\\agenttalk\\__init__.py" '
+            'set "PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%"\r\n'
+        )
     return (
         f'@rem agenttalk-artifact: {{"artifact_schema":{ARTIFACT_SCHEMA},'
         '"generator_generation":"__AGENTTALK_GENERATION__"}\r\n'
         f"@rem agenttalk-checkout-id: {checkout_id}\r\n"
         "@echo off\r\n"
         "setlocal\r\n"
-        f'if not defined AGENTTALK_PYTHON set "AGENTTALK_PYTHON={py}"\r\n'
-        # %~dp0 = <root>\\.agenttalk\\bin\\ ; ..\\..\\src = <root>\\src
-        'if exist "%~dp0..\\..\\src\\agenttalk\\__init__.py" '
-        'set "PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%"\r\n'
-        '"%AGENTTALK_PYTHON%" -m agenttalk %*\r\n'
+        + python_pin
+        + python_path
+        + '"%AGENTTALK_PYTHON%" -m agenttalk %*\r\n'
     )
 
 
@@ -6928,13 +6960,60 @@ _MARKER_RE = re.compile(
     rb'"generator_generation":"([0-9a-f]{64})"\}$'
 )
 _SHIM_PYTHON_PIN_RE = re.compile(
-    rb'^if not defined AGENTTALK_PYTHON set "AGENTTALK_PYTHON=([^"\r\n]+)"\r?$',
+    rb'^(?:if not defined AGENTTALK_PYTHON )?set '
+    rb'"AGENTTALK_PYTHON=([^"\r\n]+)"\r?$',
     re.MULTILINE,
 )
 
 
 class ArtifactValidationError(RuntimeError):
     pass
+
+
+def _artifact_tool_runtime(
+    store: Store,
+    python_exe: str | None,
+) -> tuple[str, bool, bool]:
+    """Resolve the generated control-plane interpreter and source policy.
+
+    A configured tool runtime is authoritative over the caller's interpreter
+    and excludes checkout/ambient PYTHONPATH. Absent/null preserves the legacy
+    behavior.
+    """
+    try:
+        config = load_supervisor_config(store.dir / "supervisor.json")
+    except SupervisorPersistenceError as exc:
+        raise ArtifactValidationError(str(exc)) from exc
+    configured = config.get("tool_runtime_python")
+    if configured is None:
+        py = python_exe or sys.executable
+        src_on_pythonpath = (
+            store.root / "src" / "agenttalk" / "__init__.py"
+        ).exists()
+        return py, src_on_pythonpath, False
+    if not isinstance(configured, str) or not configured.strip():
+        raise ArtifactValidationError(
+            "supervisor config tool_runtime_python must be a non-empty string or null"
+        )
+    if configured != configured.strip():
+        raise ArtifactValidationError(
+            "supervisor config tool_runtime_python must not contain surrounding whitespace"
+        )
+    if any(character in configured for character in ('"', "\r", "\n", "%", "!")):
+        raise ArtifactValidationError(
+            "supervisor config tool_runtime_python contains characters unsafe for "
+            "the generated Windows command shim"
+        )
+    configured_path = Path(configured)
+    if not configured_path.is_absolute():
+        raise ArtifactValidationError(
+            "supervisor config tool_runtime_python must be an absolute path"
+        )
+    if not configured_path.is_file():
+        raise ArtifactValidationError(
+            "supervisor config tool_runtime_python must name an existing file"
+        )
+    return configured, False, True
 
 
 def _baked_python_pin(raw: bytes) -> str:
@@ -6958,9 +7037,10 @@ def _marker_placeholder_bundle(
     *,
     python_exe: str | None = None,
 ) -> dict[str, bytes]:
-    py = python_exe or sys.executable
+    py, src_on_pythonpath, tool_runtime_pinned = _artifact_tool_runtime(
+        store, python_exe,
+    )
     checkout_id = hashlib.sha256(str(store.root).encode("utf-8")).hexdigest()
-    src_is_checkout = (store.root / "src" / "agenttalk" / "__init__.py").exists()
     substitutions = {
         "__AGENTTALK_ARTIFACT_MARKER__": _PS_MARKER,
         "__AGENTTALK_CHECKOUT_ID__": checkout_id,
@@ -6974,7 +7054,14 @@ def _marker_placeholder_bundle(
             text = text.replace(old, new)
         text = (
             text.replace("__AGENTTALK_PYTHON__", py.replace("'", "''"))
-            .replace("__SRC_ON_PYPATH__", "$true" if src_is_checkout else "$false")
+            .replace(
+                "__SRC_ON_PYPATH__",
+                "$true" if src_on_pythonpath else "$false",
+            )
+            .replace(
+                "__TOOL_RUNTIME_PINNED__",
+                "$true" if tool_runtime_pinned else "$false",
+            )
         )
         return text.encode("utf-8")
 
@@ -6982,7 +7069,11 @@ def _marker_placeholder_bundle(
         "supervisor.ps1": render_ps(PS_TEMPLATE),
         "supervisor-task.ps1": render_ps(TASK_PS_TEMPLATE),
         "deadman.ps1": render_ps(DEADMAN_PS_TEMPLATE),
-        "bin/agenttalk.cmd": agenttalk_shim(py, checkout_id).encode("utf-8"),
+        "bin/agenttalk.cmd": agenttalk_shim(
+            py,
+            checkout_id,
+            tool_runtime_pinned=tool_runtime_pinned,
+        ).encode("utf-8"),
     }
 
 

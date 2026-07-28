@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import venv
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from agenttalk import (
     wrapper_runtime as wrt,
 )
 from agenttalk.store import Store
+from agenttalk.wrapper import run as wrapper_run
 
 
 def _run(argv: list[str], root: Path) -> int:
@@ -4619,6 +4621,190 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     assert "is not recognized" not in combined and "CommandNotFound" not in combined, combined
     # the DryRun plan line for the dead worker actually printed (the bus call ran)
     assert "worker:" in res.stdout, f"no plan emitted; stdout={res.stdout!r} stderr={res.stderr!r}"
+
+
+def test_wrapped_child_control_command_imports_from_tool_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rendered Launch environment must bind AGENTTALK_PY and import
+    ``agenttalk`` from the configured tool runtime, never from the checkout.
+
+    This executes the generated Launch function with Start-Process replaced by
+    a synchronous probe of the exact environment the child would inherit.
+    """
+    shell = _pick_powershell()
+    if not shell:
+        return
+    tool_home = tmp_path / "tool-runtime"
+    venv.EnvBuilder(with_pip=False).create(tool_home)
+    tool_python = tool_home / "Scripts" / "python.exe"
+    tool_package = tool_home / "Lib" / "site-packages" / "agenttalk"
+    tool_package.mkdir(parents=True)
+    (tool_package / "__init__.py").write_text(
+        'ORIGIN = "tool-runtime"\n',
+        encoding="utf-8",
+    )
+    (tool_package / "__main__.py").write_text(
+        "import agenttalk\nprint(agenttalk.__file__)\n",
+        encoding="utf-8",
+    )
+
+    # Make the store root a source checkout with a competing import. Before the
+    # fix, the rendered Launch environment prepends this path to PYTHONPATH.
+    checkout_package = tmp_path / "src" / "agenttalk"
+    checkout_package.mkdir(parents=True)
+    (checkout_package / "__init__.py").write_text(
+        'ORIGIN = "checkout"\n',
+        encoding="utf-8",
+    )
+    (checkout_package / "__main__.py").write_text(
+        "import agenttalk\nprint(agenttalk.__file__)\n",
+        encoding="utf-8",
+    )
+    store = _team(tmp_path)
+    config = {
+        "tool_runtime_python": str(tool_python),
+        "agents": {
+            "worker": {
+                "cli": "codex",
+                "wrapped": True,
+                "cwd": str(tmp_path),
+                "launch": {"windows_file": "ignored.exe", "windows_args": []},
+            },
+        },
+    }
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(config),
+        encoding="utf-8",
+    )
+    sup.init(store, python_exe=sys.executable)
+    generated = (store.dir / "supervisor.ps1").read_text(encoding="utf-8")
+    launch = generated[
+        generated.index("function Launch($name"):
+        generated.index("function Launch-Spec", generated.index("function Launch($name"))
+    ]
+    rendered_runtime = next(
+        line for line in generated.splitlines()
+        if line.startswith("$AgenttalkPython = ")
+    )
+    rendered_source_policy = next(
+        line for line in generated.splitlines()
+        if line.startswith("$SrcOnPyPath = ")
+    )
+    rendered_tool_policy = next(
+        line for line in generated.splitlines()
+        if line.startswith("$ToolRuntimePinned = ")
+    )
+
+    result_path = tmp_path / "child-env.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        f"$ResultPath = {_pslit(str(result_path))}",
+        f"$cfg = Get-Content -LiteralPath {_pslit(str(store.dir / 'supervisor.json'))} "
+        "-Raw | ConvertFrom-Json",
+        rendered_runtime,
+        rendered_source_policy,
+        rendered_tool_policy,
+        "function Assert-ActionsEnabled([string]$what) { return $true }",
+        "function Ensure-AgenttalkWrapRootArg($argv) { return @($argv) }",
+        "function Add-SupervisorLaunchNonce($file, $argv, $nonce) { "
+        "return @{ argv=@($argv); injected=$false; source='test'; "
+        "missing_reason='test' } }",
+        "function Quote-Arg([string]$value) { return $value }",
+        "function Proc-Start($id) { return $null }",
+        "function Start-Process {",
+        "  param([string]$FilePath, [string]$ArgumentList, "
+        "[string]$WorkingDirectory, [string]$WindowStyle, [switch]$PassThru)",
+        "  $origin = & $env:AGENTTALK_PY -c "
+        "'import agenttalk; print(agenttalk.__file__)'",
+        "  if ($LASTEXITCODE -ne 0) { throw 'tool runtime import probe failed' }",
+        "  @{ origin=[string]$origin; agenttalk_py=$env:AGENTTALK_PY; "
+        "agenttalk_python=$env:AGENTTALK_PYTHON; "
+        "tool_runtime_python=$env:AGENTTALK_TOOL_RUNTIME_PYTHON; "
+        "pythonpath=$env:PYTHONPATH } | ConvertTo-Json | "
+        "Set-Content -LiteralPath $ResultPath -Encoding utf8",
+        "  return [pscustomobject]@{ Id=$PID }",
+        "}",
+        launch,
+        "$plan = [pscustomobject]@{ session_id=$null; session_args=@(); "
+        "launch_mode='fresh'; window_style='Hidden' }",
+        "$null = Launch 'worker' $plan $null",
+    ])
+    harness_path = tmp_path / "child-env.ps1"
+    harness_path.write_text(harness, encoding="utf-8")
+    env = dict(os.environ)
+    env.pop("PYTHONHOME", None)
+    env["PYTHONPATH"] = str(tmp_path / "src")
+    env["AGENTTALK_PYTHON"] = sys.executable
+
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness_path)],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    effective = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    shim_command = subprocess.list2cmdline(
+        [str(store.dir / "bin" / "agenttalk.cmd"), "origin"]
+    )
+    shim_result = subprocess.run(
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", shim_command],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert shim_result.returncode == 0, shim_result.stdout + shim_result.stderr
+    shim_origin = Path(shim_result.stdout.strip()).resolve()
+    monkeypatch.setenv(
+        wrapper_run.TOOL_RUNTIME_PYTHON_ENV,
+        effective["tool_runtime_python"],
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "src"))
+    child_env = wrapper_run._child_env(tmp_path)
+    child_result = subprocess.run(
+        [
+            child_env["AGENTTALK_PY"],
+            "-c",
+            "import agenttalk; print(agenttalk.__file__)",
+        ],
+        cwd=str(tmp_path),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert child_result.returncode == 0, child_result.stdout + child_result.stderr
+    child_origin = Path(child_result.stdout.strip()).resolve()
+    checkout_source = str((tmp_path / "src").resolve()).casefold()
+    observed = {
+        "launch_pin": Path(effective["agenttalk_py"]).resolve()
+        == tool_python.resolve(),
+        "launch_shim_pin": Path(effective["agenttalk_python"]).resolve()
+        == tool_python.resolve(),
+        "launch_pythonpath_clean": checkout_source
+        not in str(effective["pythonpath"] or "").casefold(),
+        "launch_origin": Path(effective["origin"]).resolve().is_relative_to(
+            tool_package.resolve()
+        ),
+        "wrapped_child_origin": child_origin.is_relative_to(tool_package.resolve()),
+        "shim_origin": shim_origin.is_relative_to(tool_package.resolve()),
+    }
+    assert observed == {
+        "launch_pin": True,
+        "launch_shim_pin": True,
+        "launch_pythonpath_clean": True,
+        "launch_origin": True,
+        "wrapped_child_origin": True,
+        "shim_origin": True,
+    }
 
 
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:
