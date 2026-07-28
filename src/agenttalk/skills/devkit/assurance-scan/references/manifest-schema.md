@@ -25,16 +25,38 @@ Optional top-level fields:
 - `python.package` or `python.packages`: package imports to resolve for
   provenance.
 
-A custom `coverage` command must either print a recognized coverage.py or
-pytest-cov terminal summary, or create root-level `coverage.json` with a numeric
-`totals.percent_covered` value. Coverage XML is deliberately ignored as evidence.
-The conventional `coverage.xml` path is still transactionally protected so a
-custom command cannot overwrite an operator's pre-existing report.
+A custom `coverage` command must print a recognized coverage.py or pytest-cov
+terminal summary on stdout. Stdout is the sole coverage-evidence channel; root
+JSON and XML reports are not parsed. The parser rejects stdout evidence over
+16 MiB, but `capture_output=True` buffers the complete subprocess stream before
+that parse-time check; capture-time bounding remains #106.
 
-Fresh coverage evidence is published under the scan profile's finite producer gate:
-`coverage:change`, `coverage:release`, or `coverage:deep`. In the separate `dod.json`
-close policy, `coverage.gate` is required and must name one of those gates. It is not
-derived from the close scope.
+Before executing the command, the scanner refuses when either canonical root
+path, `coverage.xml` or `coverage.json`, exists as any filesystem object,
+including a regular file, symlink, or directory. It names every conflicting path
+and does not run the command. If postflight observes either path after the
+command, it refuses the evidence without reading the observed object's contents,
+moving it, or removing it. A refusal produces a red automated result unless the
+persisted gate is an active operator waiver, which automated scans preserve.
+Legacy recovery residue likewise causes refusal and names its root and backup
+paths for manual recovery; agenttalk never treats legacy marker contents as
+authorship, restores a backup, or removes a report. Configured commands are not
+filesystem-isolated: they may create or modify paths while running. Process
+containment or an owned-output protocol remains #107.
+
+The recognized path class is exactly `coverage.xml` and `coverage.json`. An
+arbitrary custom command can write another path, and agenttalk neither discovers,
+parses, nor cleans it. Case variants are outside the class on case-sensitive
+filesystems. A producer descendant can also create a canonical path after
+postflight, making a later scan refuse until an operator removes it. This
+deliberate false-DOWN remains until #107 provides owned-output containment and is
+preferred to guessing ownership and deleting operator data.
+
+Absent an active persisted operator waiver, fresh coverage evidence is published
+under the scan profile's finite producer gate: `coverage:change`,
+`coverage:release`, or `coverage:deep`. In the separate `dod.json` close policy,
+`coverage.gate` is required and must name one of those gates. It is not derived
+from the close scope.
 
 Example `.agenttalk/dod.json`:
 

@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess  # nosec B404 - scanner runs fixed argv lists with shell disabled
 import sys
 import tempfile
@@ -25,9 +26,8 @@ from pathlib import Path
 from typing import Any
 
 from agenttalk import __version__, gates
-from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk.coverage_contract import ASSURANCE_PROFILES, coverage_gate_name
-from agenttalk.coverage_parse import MAX_COVERAGE_ARTIFACT_BYTES, parse_coverage_percent
+from agenttalk.coverage_parse import parse_coverage_percent
 
 
 SCHEMA_VERSION = 1
@@ -163,11 +163,11 @@ GENERATED_KIND_ALIASES = {
     "sh": "shell",
 }
 EXECUTED_STATUSES = {"pass", "fail-blocking", "fail-advisory"}
+# This is the complete class of report paths that the coverage measurement
+# discovers. Arbitrary configured outputs, and case variants on case-sensitive
+# filesystems, are outside this boundary.
 _COVERAGE_ARTIFACTS = ("coverage.xml", "coverage.json")
-_COVERAGE_RECOVERY_DIR = Path(".agenttalk") / "assurance" / "coverage-recovery"
-_COVERAGE_RECOVERY_MARKER = "transaction.json"
-_COVERAGE_RECOVERY_SCHEMA = 2
-_COVERAGE_RECOVERY_PHASES = {"preparing", "running"}
+_LEGACY_COVERAGE_RECOVERY_DIR = Path(".agenttalk") / "assurance" / "coverage-recovery"
 _GIT_SHA_RE = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 _GITHUB_REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _ASCII_DIGITS_RE = re.compile(r"\A[0-9]+\Z")
@@ -228,14 +228,6 @@ class ScanResult:
     native_suppressions: dict[str, Any] = field(default_factory=lambda: {"count_by_tool": {}, "examples": []})
     raw_logs: dict[str, str] = field(default_factory=dict)
     artifact: dict[str, Any] | None = None
-
-
-@dataclass
-class _CoverageArtifactState:
-    eligible: set[str]
-    backups: dict[str, Path]
-    quarantine: Path | None
-    preparation_error: str | None = None
 
 
 def _default_manifest(path: Path | None = None) -> dict[str, Any]:
@@ -1390,7 +1382,22 @@ def _run_coverage_external(
     command: list[str],
     fresh_coverage_attestations: set[tuple[str, str]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str, str]:
-    """Run one fail-closed, root-serialized coverage-artifact transaction."""
+    """Run one fail-closed, root-serialized coverage measurement.
+
+    Stdout is the sole coverage evidence channel. Before and after the
+    subprocess, both names in ``_COVERAGE_ARTIFACTS`` and any branch-local
+    legacy recovery residue are classified without following or mutating them.
+    Any such path refuses or invalidates the measurement; agenttalk leaves it
+    untouched for manual recovery.
+
+    The configured subprocess is not filesystem-isolated. A late output from
+    this producer can therefore make the next scan refuse (a deliberate
+    false-DOWN until #107), but agenttalk never guesses that a root report is
+    its own and never deletes it. Arbitrary output paths and case variants on
+    case-sensitive filesystems are outside the exact tuple boundary. Stdout is
+    bounded at the parser boundary, not while ``capture_output=True`` buffers
+    the subprocess streams (#106).
+    """
     from agenttalk.store import Store
 
     lock_timeout = max(10.0, float(spec.get("timeout_seconds") or 60) + 10.0)
@@ -1404,18 +1411,13 @@ def _run_coverage_external(
     )
     try:
         with Store(plan.root).coverage_transaction_lock(timeout=lock_timeout):
-            stage = "preparing"
-            coverage_state = _prepare_coverage_artifacts(plan.root)
-            if coverage_state.preparation_error is None:
-                phase_error = _mark_coverage_transaction_running(coverage_state)
-                if phase_error is not None:
-                    coverage_state.preparation_error = phase_error
-            if coverage_state.preparation_error is not None:
-                rollback_ok, artifact_error = _rollback_coverage_preparation(
-                    plan.root,
-                    coverage_state,
-                )
-                plan.runner_errors.append(artifact_error)
+            stage = "preflight"
+            canonical_paths_clear, path_error = _classify_coverage_path_conflicts(
+                plan.root
+            )
+            if not canonical_paths_clear:
+                assert path_error is not None
+                plan.runner_errors.append(path_error)
                 failure_status = (
                     "error-required-tool" if spec.get("required") else "error-optional-tool"
                 )
@@ -1431,18 +1433,14 @@ def _run_coverage_external(
                     plan,
                     run,
                     "",
-                    {},
-                    artifacts_clean=False,
-                    artifact_error=artifact_error,
+                    canonical_paths_clear=False,
+                    path_error=path_error,
                     failure_reason=(
-                        "coverage artifact preparation failed; "
+                        "coverage command refused because a canonical report or "
+                        "legacy recovery path requires manual recovery; "
                         "coverage command was not run"
                     ),
                 )
-                if not rollback_ok:
-                    plan.runner_errors.append(
-                        "coverage preparation rollback requires manual recovery"
-                    )
                 outcome = (run, [], "", "")
             else:
                 try:
@@ -1456,12 +1454,11 @@ def _run_coverage_external(
                 except BaseException as exc:
                     runner_exception = (exc, exc.__traceback__)
                     stage = "finishing"
-                    outputs, cleanup_ok, artifact_error = _finish_coverage_artifacts(
-                        plan.root,
-                        coverage_state,
+                    canonical_paths_clear, path_error = (
+                        _classify_coverage_path_conflicts(plan.root)
                     )
-                    if artifact_error is not None:
-                        plan.runner_errors.append(artifact_error)
+                    if path_error is not None:
+                        plan.runner_errors.append(path_error)
                     failure_status = (
                         "error-required-tool"
                         if spec.get("required")
@@ -1472,27 +1469,33 @@ def _run_coverage_external(
                         plan,
                         {"status": failure_status, "exit_code": None},
                         "",
-                        outputs,
-                        artifacts_clean=cleanup_ok,
-                        artifact_error=artifact_error,
+                        canonical_paths_clear=canonical_paths_clear,
+                        path_error=path_error,
                         failure_reason=f"coverage runner failed with {type(exc).__name__}",
                     )
                 else:
                     stage = "finishing"
-                    outputs, cleanup_ok, artifact_error = _finish_coverage_artifacts(
-                        plan.root,
-                        coverage_state,
+                    canonical_paths_clear, path_error = (
+                        _classify_coverage_path_conflicts(plan.root)
                     )
-                    if artifact_error is not None:
-                        plan.runner_errors.append(artifact_error)
+                    if path_error is not None:
+                        plan.runner_errors.append(path_error)
                     stage = "emitting"
                     _emit_coverage_gate(
                         plan,
                         run,
                         stdout,
-                        outputs,
-                        artifacts_clean=cleanup_ok,
-                        artifact_error=artifact_error,
+                        canonical_paths_clear=canonical_paths_clear,
+                        path_error=path_error,
+                        failure_reason=(
+                            None
+                            if canonical_paths_clear
+                            else (
+                                "a canonical report or legacy recovery path appeared "
+                                "during the coverage command; agenttalk left the "
+                                "path untouched for manual recovery"
+                            )
+                        ),
                     )
                     outcome = (run, findings, raw, stdout)
             stage = "releasing"
@@ -1531,9 +1534,8 @@ def _run_coverage_external(
             plan,
             run,
             "",
-            {},
-            artifacts_clean=False,
-            artifact_error=detail,
+            canonical_paths_clear=False,
+            path_error=detail,
             failure_reason=f"coverage transaction failed; {command_disposition}",
         )
         fresh_coverage_attestations.add(attestation_key)
@@ -1549,403 +1551,107 @@ def _run_coverage_external(
     return outcome
 
 
-def _coverage_recovery_reference(root: Path, transaction: Path) -> str:
-    marker = transaction / _COVERAGE_RECOVERY_MARKER
-    try:
-        return _slash(str(marker.relative_to(root)))
-    except ValueError:
-        return _slash(str(marker))
+def _classify_coverage_path_conflicts(root: Path) -> tuple[bool, str | None]:
+    """Classify the complete known report-path boundary without mutation.
 
+    ``os.lstat`` classifies the two canonical root names and any branch-local
+    legacy recovery root, transaction, and immediate marker/backup/unexpected
+    entries. Marker contents are never read, and symlink/reparse directories
+    are never traversed. Missing paths are clear; every existing or
+    uninspectable path is UNKNOWN and therefore refuses untouched.
+    """
 
-def _coverage_recovery_directory_reference(root: Path, transaction: Path) -> str:
-    try:
-        return _slash(str(transaction.relative_to(root)))
-    except ValueError:
-        return _slash(str(transaction))
+    conflicts: list[str] = []
+    inspection_errors: list[str] = []
 
-
-def _load_coverage_transaction(marker: Path) -> tuple[list[str], str]:
-    try:
-        is_regular = not marker.is_symlink() and marker.is_file()
-    except OSError as exc:
-        raise ValueError(f"unreadable transaction marker: {type(exc).__name__}") from exc
-    if not is_regular:
-        raise ValueError("transaction marker is not a regular file")
-    try:
-        value = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"unreadable transaction marker: {type(exc).__name__}") from exc
-    if not isinstance(value, dict):
-        raise ValueError("transaction marker has an invalid shape")
-    schema = value.get("schema_version")
-    if schema == 1 and set(value) == {"schema_version", "artifacts"}:
-        # Legacy branch-only markers did not persist whether the command had
-        # started. Recover them conservatively without deleting a target.
-        phase = "preparing"
-    else:
-        phase_value = value.get("phase")
-        if not (
-            schema == _COVERAGE_RECOVERY_SCHEMA
-            and set(value) == {"schema_version", "artifacts", "phase"}
-            and isinstance(phase_value, str)
-            and phase_value in _COVERAGE_RECOVERY_PHASES
-        ):
-            raise ValueError("transaction marker has an unsupported schema")
-        phase = phase_value
-    artifacts = value["artifacts"]
-    if (
-        not isinstance(artifacts, list)
-        or not artifacts
-        or not all(isinstance(name, str) for name in artifacts)
-        or len(artifacts) != len(set(artifacts))
-        or any(name not in _COVERAGE_ARTIFACTS for name in artifacts)
-    ):
-        raise ValueError("transaction marker has invalid artifacts")
-    return list(artifacts), phase
-
-
-def _recover_coverage_transaction(
-    root: Path,
-    transaction: Path,
-    artifacts: list[str],
-    *,
-    phase: str,
-) -> str | None:
-    marker = transaction / _COVERAGE_RECOVERY_MARKER
-    for name in artifacts:
-        target = root / name
-        backup = transaction / name
+    def reference(path: Path) -> str:
         try:
-            backup_exists = backup.exists() or backup.is_symlink()
-            target_exists = target.exists() or target.is_symlink()
-            backup_is_regular = not backup.is_symlink() and backup.is_file()
-            target_is_regular = not target.is_symlink() and target.is_file()
-        except OSError as exc:
-            return f"could not inspect {name}: {type(exc).__name__}"
-        if backup_exists:
-            if not backup_is_regular:
-                return f"quarantined {name} is not a regular file"
-            if target_exists:
-                return (
-                    f"{name} reappeared while recovering a {phase} coverage transaction; "
-                    "both files were preserved for manual recovery"
-                )
-            try:
-                os.replace(backup, target)
-            except OSError as exc:
-                return f"could not restore {name}: {type(exc).__name__}"
-        elif not target_exists or not target_is_regular:
-            return f"both original and quarantined {name} are missing or invalid"
-    try:
-        leftovers = sorted(path.name for path in transaction.iterdir() if path != marker)
-    except OSError as exc:
-        return f"could not inspect recovered transaction: {type(exc).__name__}"
-    if leftovers:
-        return f"recovered transaction has unexpected files: {', '.join(leftovers)}"
-    try:
-        marker.unlink()
-        transaction.rmdir()
-    except OSError as exc:
-        return f"could not remove recovered transaction: {type(exc).__name__}"
-    return None
+            return _slash(str(path.relative_to(root)))
+        except ValueError:
+            return _slash(str(path))
 
-
-def _recover_coverage_transactions(root: Path) -> str | None:
-    recovery_root = root / _COVERAGE_RECOVERY_DIR
-    try:
-        if not recovery_root.exists():
+    def classify(path: Path) -> os.stat_result | None:
+        path_reference = reference(path)
+        try:
+            path_stat = os.lstat(path)
+        except FileNotFoundError:
             return None
-        if recovery_root.is_symlink() or not recovery_root.is_dir():
-            return "coverage recovery path is not a regular directory"
-        entries = list(recovery_root.iterdir())
-        invalid_entries = [path.name for path in entries if path.is_symlink() or not path.is_dir()]
-        if invalid_entries:
-            return f"coverage recovery directory has invalid entries: {', '.join(sorted(invalid_entries))}"
-        transactions = sorted(entries)
-    except OSError as exc:
-        return f"could not inspect recovery directory: {type(exc).__name__}"
-    for transaction in transactions:
-        marker = transaction / _COVERAGE_RECOVERY_MARKER
-        try:
-            marker_exists = marker.exists() or marker.is_symlink()
         except OSError as exc:
-            return (
-                f"could not inspect recovery marker: {type(exc).__name__}; "
-                f"recovery directory: {_coverage_recovery_directory_reference(root, transaction)}"
+            inspection_errors.append(
+                f"{path_reference} ({type(exc).__name__}: {exc})"
             )
-        if not marker_exists:
-            try:
-                if any(transaction.iterdir()):
-                    return (
-                        "markerless recovery transaction is not empty; "
-                        f"recovery directory: {_coverage_recovery_directory_reference(root, transaction)}"
-                    )
-                transaction.rmdir()
-            except OSError as exc:
-                return (
-                    f"could not remove empty recovery transaction: {type(exc).__name__}; "
-                    f"recovery directory: {_coverage_recovery_directory_reference(root, transaction)}"
+            return None
+        conflicts.append(path_reference)
+        return path_stat
+
+    def is_plain_directory(path_stat: os.stat_result) -> bool:
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        file_attributes = getattr(path_stat, "st_file_attributes", 0)
+        return stat.S_ISDIR(path_stat.st_mode) and not (
+            reparse_flag and file_attributes & reparse_flag
+        )
+
+    for name in _COVERAGE_ARTIFACTS:
+        classify(root / name)
+
+    recovery_root = root / _LEGACY_COVERAGE_RECOVERY_DIR
+    recovery_stat = classify(recovery_root)
+    if recovery_stat is not None and is_plain_directory(recovery_stat):
+        try:
+            with os.scandir(recovery_root) as entries:
+                transactions = sorted(
+                    (Path(entry.path) for entry in entries),
+                    key=lambda path: path.name,
                 )
-            continue
-        try:
-            artifacts, phase = _load_coverage_transaction(marker)
-        except ValueError as exc:
-            return f"{exc}; recovery marker: {_coverage_recovery_reference(root, transaction)}"
-        error = _recover_coverage_transaction(
-            root,
-            transaction,
-            artifacts,
-            phase=phase,
-        )
-        if error is not None:
-            return f"{error}; recovery marker: {_coverage_recovery_reference(root, transaction)}"
-    try:
-        recovery_root.rmdir()
-    except OSError:
-        pass
-    return None
-
-
-def _prepare_coverage_artifacts(root: Path) -> _CoverageArtifactState:
-    """Quarantine conventional report paths before a coverage command can reuse them."""
-    recovery_error = _recover_coverage_transactions(root)
-    if recovery_error is not None:
-        return _CoverageArtifactState(set(), {}, None, recovery_error)
-
-    eligible: set[str] = set()
-    candidates: list[str] = []
-    preparation_errors: list[str] = []
-    for name in _COVERAGE_ARTIFACTS:
-        path = root / name
-        try:
-            exists = path.exists() or path.is_symlink()
-            is_regular = not path.is_symlink() and path.is_file()
         except OSError as exc:
-            preparation_errors.append(f"could not inspect {name}: {type(exc).__name__}")
-            continue
-        if not exists:
-            eligible.add(name)
-        elif not is_regular:
-            preparation_errors.append(f"pre-run {name} is not a regular file")
-        else:
-            candidates.append(name)
-
-    if preparation_errors:
-        return _CoverageArtifactState(
-            eligible=eligible,
-            backups={},
-            quarantine=None,
-            preparation_error="; ".join(preparation_errors),
-        )
-
-    backups: dict[str, Path] = {}
-    quarantine: Path | None = None
-    if candidates:
-        recovery_root = root / _COVERAGE_RECOVERY_DIR
-        try:
-            recovery_root.mkdir(parents=True, exist_ok=True)
-            quarantine = Path(tempfile.mkdtemp(prefix="transaction-", dir=recovery_root))
-            marker = quarantine / _COVERAGE_RECOVERY_MARKER
-            _atomic_write_text(
-                marker,
-                json.dumps(
-                    {
-                        "schema_version": _COVERAGE_RECOVERY_SCHEMA,
-                        "artifacts": candidates,
-                        "phase": "preparing",
-                    },
-                    indent=2,
-                    sort_keys=True,
-                ),
+            inspection_errors.append(
+                f"{reference(recovery_root)} ({type(exc).__name__}: {exc})"
             )
-        except OSError as exc:
-            if quarantine is not None:
-                try:
-                    quarantine.rmdir()
-                except OSError:
-                    pass
-            preparation_errors.append(f"could not create recovery transaction: {type(exc).__name__}")
-            quarantine = None
-        if quarantine is not None:
-            for name in candidates:
-                path = root / name
-                backup = quarantine / name
-                try:
-                    os.replace(path, backup)
-                except OSError as exc:
-                    preparation_errors.append(f"could not quarantine {name}: {type(exc).__name__}")
-                    break
-                backups[name] = backup
-                eligible.add(name)
-
-    return _CoverageArtifactState(
-        eligible=eligible,
-        backups=backups,
-        quarantine=quarantine,
-        preparation_error="; ".join(preparation_errors) or None,
-    )
-
-
-def _mark_coverage_transaction_running(
-    state: _CoverageArtifactState,
-) -> str | None:
-    """Durably commit a prepared transaction before its command may start."""
-    if state.quarantine is None:
-        return None
-    marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
-    try:
-        artifacts, phase = _load_coverage_transaction(marker)
-        if phase != "preparing":
-            return "coverage recovery transaction is not in the preparing phase"
-        _atomic_write_text(
-            marker,
-            json.dumps(
-                {
-                    "schema_version": _COVERAGE_RECOVERY_SCHEMA,
-                    "artifacts": artifacts,
-                    "phase": "running",
-                },
-                indent=2,
-                sort_keys=True,
-            ),
-        )
-    except (OSError, ValueError) as exc:
-        return f"could not commit coverage recovery transaction: {type(exc).__name__}"
-    return None
-
-
-def _rollback_coverage_preparation(
-    root: Path,
-    state: _CoverageArtifactState,
-) -> tuple[bool, str]:
-    """Undo an aborted preparation without deleting any path that reappeared."""
-    preparation_error = state.preparation_error or "unknown preparation failure"
-    detail = f"coverage artifact preparation failed ({preparation_error})"
-    if state.quarantine is None:
-        return True, detail
-
-    marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
-    try:
-        artifacts, _phase = _load_coverage_transaction(marker)
-    except ValueError as exc:
-        return (
-            False,
-            f"{detail}; {exc}; recovery marker: "
-            f"{_coverage_recovery_reference(root, state.quarantine)}",
-        )
-    rollback_error = _recover_coverage_transaction(
-        root,
-        state.quarantine,
-        artifacts,
-        phase="preparing",
-    )
-    if rollback_error is None:
-        return True, detail
-    return (
-        False,
-        f"{detail}; preparation rollback failed ({rollback_error}); "
-        f"recovery marker: {_coverage_recovery_reference(root, state.quarantine)}",
-    )
-
-
-def _read_coverage_artifact(path: Path) -> bytes | None:
-    try:
-        if path.is_symlink() or not path.is_file():
-            return None
-        with path.open("rb") as handle:
-            data = handle.read(MAX_COVERAGE_ARTIFACT_BYTES + 1)
-        if len(data) > MAX_COVERAGE_ARTIFACT_BYTES:
-            return None
-        return data
-    except FileNotFoundError:
-        return None
-    except OSError:
-        return None
-
-
-def _remove_generated_coverage_artifact(path: Path) -> bool:
-    try:
-        if not path.exists() and not path.is_symlink():
-            return True
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-            return True
-    except OSError:
-        return False
-    return False
-
-
-def _finish_coverage_artifacts(
-    root: Path,
-    state: _CoverageArtifactState,
-) -> tuple[dict[str, bytes | None], bool, str | None]:
-    """Capture fresh reports, then restore the pre-run worktree before attestation."""
-    outputs: dict[str, bytes | None] = {}
-    cleanup_errors = [state.preparation_error] if state.preparation_error is not None else []
-    transaction_complete = True
-    for name in _COVERAGE_ARTIFACTS:
-        path = root / name
-        if name in state.eligible:
-            outputs[name] = _read_coverage_artifact(path)
-            if not _remove_generated_coverage_artifact(path):
-                cleanup_errors.append(f"could not remove generated {name}")
-                transaction_complete = False
-        backup = state.backups.get(name)
-        if backup is None:
-            continue
-        try:
-            if path.exists() or path.is_symlink():
-                cleanup_errors.append(f"generated {name} still blocks restore")
-                transaction_complete = False
+            transactions = []
+        for transaction in transactions:
+            transaction_stat = classify(transaction)
+            if transaction_stat is None or not is_plain_directory(transaction_stat):
                 continue
-            os.replace(backup, path)
-        except OSError as exc:
-            cleanup_errors.append(f"could not restore {name}: {type(exc).__name__}")
-            transaction_complete = False
-    if state.quarantine is not None and transaction_complete:
-        marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
-        try:
-            leftovers = [path for path in state.quarantine.iterdir() if path != marker]
-        except OSError as exc:
-            cleanup_errors.append(f"could not inspect recovery transaction: {type(exc).__name__}")
-        else:
-            if leftovers:
-                cleanup_errors.append("recovery transaction still contains quarantined files")
-            else:
-                try:
-                    marker.unlink()
-                except OSError as exc:
-                    cleanup_errors.append(f"could not remove recovery marker: {type(exc).__name__}")
-                else:
-                    try:
-                        state.quarantine.rmdir()
-                    except OSError as exc:
-                        cleanup_errors.append(f"could not remove empty recovery transaction: {type(exc).__name__}")
-    if not cleanup_errors:
-        return outputs, True, None
-    detail = f"coverage artifact cleanup failed ({'; '.join(cleanup_errors)})"
-    if state.quarantine is not None:
-        marker = state.quarantine / _COVERAGE_RECOVERY_MARKER
-        try:
-            marker_exists = marker.exists() or marker.is_symlink()
-            quarantine_exists = state.quarantine.exists()
-        except OSError:
-            quarantine_exists = True
-            marker_exists = False
-        if marker_exists:
-            detail += f"; recovery marker: {_coverage_recovery_reference(root, state.quarantine)}"
-        elif quarantine_exists:
-            detail += f"; recovery directory: {_coverage_recovery_directory_reference(root, state.quarantine)}"
-    return outputs, False, detail
+            try:
+                with os.scandir(transaction) as entries:
+                    transaction_entries = sorted(
+                        (Path(entry.path) for entry in entries),
+                        key=lambda path: path.name,
+                    )
+            except OSError as exc:
+                inspection_errors.append(
+                    f"{reference(transaction)} ({type(exc).__name__}: {exc})"
+                )
+                continue
+            for entry in transaction_entries:
+                classify(entry)
+
+    if not conflicts and not inspection_errors:
+        return True, None
+
+    details: list[str] = []
+    if conflicts:
+        details.append(
+            "agenttalk left paths untouched for manual recovery: "
+            + ", ".join(conflicts)
+        )
+    if inspection_errors:
+        details.append(
+            "paths could not be inspected: " + ", ".join(inspection_errors)
+        )
+    details.append(
+        "move or remove the named paths only after verifying their ownership"
+    )
+    return False, "coverage report path safety check failed (" + "; ".join(details) + ")"
 
 
 def _github_actions_evidence(
     root: Path,
     provenance: dict[str, Any],
     *,
-    artifacts_clean: bool,
+    canonical_paths_clear: bool,
 ) -> str | None:
-    """Return a revision-bound CI reference only for a clean pre/post Git state."""
+    """Return CI evidence only when the worktree and canonical report paths are clear."""
     revision = str(provenance.get("git_sha") or "")
     github_sha = os.environ.get("GITHUB_SHA", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -1953,7 +1659,7 @@ def _github_actions_evidence(
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     if os.environ.get("CI", "").lower() != "true" or os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
         return None
-    if not artifacts_clean or provenance.get("git_dirty") is not False:
+    if not canonical_paths_clear or provenance.get("git_dirty") is not False:
         return None
     if not _GIT_SHA_RE.fullmatch(revision) or github_sha.lower() != revision.lower():
         return None
@@ -1987,7 +1693,7 @@ def _load_coverage_gate_state(root: Path) -> dict[str, Any]:
 def _snapshot_coverage_gate(root: Path, profile: str) -> dict[str, Any] | None:
     """Capture the target gate as the finalizer's compare-and-swap token.
 
-    The coverage transaction lock already spans report preparation through gate
+    The coverage transaction lock already spans report-path preflight through gate
     emission. It cannot order an older non-coverage scan that finishes after a
     newer coverage scan; holding it across every full scan would also serialize
     unrelated tools and recurse into the deliberately non-reentrant lock.
@@ -2050,16 +1756,14 @@ def _emit_coverage_gate(
     plan: ScanPlan,
     run: dict[str, Any],
     stdout: str,
-    artifact_outputs: dict[str, bytes | None],
     *,
-    artifacts_clean: bool,
-    artifact_error: str | None = None,
+    canonical_paths_clear: bool,
+    path_error: str | None = None,
     failure_reason: str | None = None,
 ) -> None:
     from agenttalk.store import Store
 
-    json_text = artifact_outputs.get("coverage.json")
-    percent = parse_coverage_percent(stdout, json_text=json_text)
+    percent = parse_coverage_percent(stdout)
     command_succeeded = run.get("status") == "pass" and run.get("exit_code") == 0
     evidence_details = {"coverage_percent": float(percent)} if percent is not None else None
     gate_name = coverage_gate_name(plan.profile)
@@ -2076,9 +1780,14 @@ def _emit_coverage_gate(
         ci_evidence = _github_actions_evidence(
             plan.root,
             plan.provenance,
-            artifacts_clean=artifacts_clean,
+            canonical_paths_clear=canonical_paths_clear,
         )
-        is_green = command_succeeded and percent is not None and ci_evidence is not None
+        is_green = (
+            canonical_paths_clear
+            and command_succeeded
+            and percent is not None
+            and ci_evidence is not None
+        )
         evidence_source = "automation_ci" if ci_evidence is not None else "local_command"
         if failure_reason is not None:
             reason = failure_reason
@@ -2090,8 +1799,8 @@ def _emit_coverage_gate(
             reason = "coverage percentage is not bound to an attested clean CI revision"
         else:
             reason = "coverage command succeeded with a parsed, revision-bound CI measurement"
-        if artifact_error is not None:
-            reason = f"{reason}; {artifact_error}"
+        if path_error is not None:
+            reason = f"{reason}; {path_error}"
         evidence = [ci_evidence] if ci_evidence is not None else [f"assurance-run:{plan.run_id}"]
         gates.set_gate(
             plan.root,

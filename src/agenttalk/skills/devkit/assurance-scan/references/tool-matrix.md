@@ -22,12 +22,33 @@ Python v1:
 - ruff check and ruff format when configured or required.
 - test command from the manifest, or the safe inferred pytest command.
 - mypy or pyright only when configured or required.
-- coverage only when configured. Evidence is accepted from a bounded root
-  `coverage.json` (`totals.percent_covered`) or a recognized coverage.py/pytest-cov
-  terminal summary. XML is not parsed; conventional `coverage.xml` and
-  `coverage.json` paths are still protected for the command transaction. Fresh
-  CI-attested evidence updates `coverage:<profile>`; a close policy must explicitly
-  select that producer gate rather than infer one from its close scope.
+- coverage only when configured. A recognized coverage.py/pytest-cov terminal
+  summary on stdout is the sole evidence channel; root JSON and XML reports are
+  not parsed. Before the command runs, the scanner refuses if either canonical
+  root path, `coverage.xml` or `coverage.json`, exists as any filesystem object.
+  If postflight observes either path, it refuses the evidence without reading
+  its contents, moving it, or removing it. Legacy recovery residue also causes
+  refusal and names its root and backup paths for manual recovery; the scanner
+  never auto-restores them. Configured commands are not filesystem-isolated and
+  may create or modify paths while running; process containment or an
+  owned-output protocol remains #107. A refusal produces a red automated result
+  unless the persisted gate is an active operator waiver, which automated scans
+  preserve. Fresh CI-attested evidence updates `coverage:<profile>` unless such
+  a waiver is active; a close policy must explicitly select that producer gate
+  rather than infer one from its close scope.
+
+The canonical coverage-path class is exactly `coverage.xml` and `coverage.json`.
+An arbitrary configured command can write another path, and the scanner neither
+discovers, parses, nor cleans it. Case variants are outside this class on
+case-sensitive filesystems.
+
+A producer descendant can create a canonical report after postflight. The next
+scan then refuses and requires manual cleanup, even if the late report came from
+the prior producer. This deliberate false-DOWN remains until #107 provides an
+owned-output protocol or process containment; refusing a named path is safer than
+guessing ownership and deleting operator data. Stdout evidence is limited to
+16 MiB when parsed, but `capture_output=True` buffers the complete subprocess
+stream before that check. Capture-time bounding remains #106.
 - bandit, semgrep local rules, gitleaks, osv-scanner, and pip-audit when
   installed and applicable. Network-dependent dependency tools are skipped by
   default unless the manifest permits them.

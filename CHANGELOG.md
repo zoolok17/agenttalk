@@ -9,15 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Coverage evidence now preserves the zero-runtime-dependency boundary.** Attestation
-  accepts bounded `coverage.json` totals or recognized coverage.py/pytest-cov terminal
-  summaries and deliberately never parses XML. Concurrent scans serialize the full
-  report transaction, and a report that cannot be quarantined aborts before the coverage
-  command runs. Conventional XML and JSON report paths remain protected and restored.
-  DoD coverage policy now explicitly selects one of the finite `coverage:change`,
-  `coverage:release`, or `coverage:deep` producer gates, so every supported close scope has a
-  satisfiable evidence path. Coverage-gate finalization failures are bounded CLI failures
-  and no longer escape, mask an earlier scan failure, or print a false success.
+- **Coverage evidence now preserves the zero-runtime-dependency boundary without taking
+  custody of report files.** Attestation accepts only a recognized coverage.py/pytest-cov
+  terminal summary from stdout; it no longer parses root JSON or XML reports. A scan
+  refuses before running when either canonical root path, `coverage.xml` or
+  `coverage.json`, already exists, including a symlink or directory. If either path
+  is observed during postflight, agenttalk does not read its contents, move it, or
+  remove it and records a red automated result; an active persisted operator waiver
+  remains unchanged. Concurrent scans serialize preflight, execution, postflight,
+  and gate emission, but agenttalk never consumes, deletes, quarantines, or restores
+  either report path. Configured commands are not filesystem-isolated and may
+  create or modify paths while they run; containment remains #107.
+  Legacy recovery residue also causes an actionable refusal for manual recovery.
+  A late report from agenttalk's own producer can therefore cause a deliberate
+  false-DOWN that requires manual cleanup until #107 supplies owned-output containment;
+  this is preferred to silently deleting operator data. Protection and discovery cover
+  exactly the two canonical names: arbitrary configured output paths, and case variants
+  on case-sensitive filesystems, are neither discovered, parsed, nor cleaned. The stdout
+  parser rejects evidence over 16 MiB, but subprocess `capture_output=True` still buffers
+  the complete stream before that parse-time bound (#106). DoD coverage policy explicitly
+  selects one of the finite `coverage:change`, `coverage:release`, or `coverage:deep`
+  producer gates. Coverage-gate finalization failures are bounded CLI failures and no
+  longer escape, mask an earlier scan failure, or print a false success.
 
 ## [0.79.1] - 2026-07-25
 

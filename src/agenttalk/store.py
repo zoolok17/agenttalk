@@ -1532,12 +1532,14 @@ class Store:
 
     def coverage_transaction_lock(self, *, timeout: float = 70.0,
                                   poll: float = 0.05):
-        """Serialize one assurance coverage-artifact transaction per root.
+        """Serialize one assurance coverage scan per root.
 
-        Coverage commands temporarily quarantine conventional report paths.
-        Holding this lock across prepare, command execution, restore, and gate
-        emission prevents concurrent scans from consuming or deleting each
-        other's reports.  The underlying store lock supplies the same
+        Holding this lock across canonical-path preflight, command execution,
+        postflight, and gate emission prevents concurrent agenttalk scans from
+        cross-claiming evidence. The scan never takes custody of root coverage
+        reports: a preflight conflict causes refusal, and agenttalk does not
+        read its contents, move it, or remove it. This lock does not
+        filesystem-isolate the configured command. The underlying store lock supplies the same
         cross-platform ownership and stale-holder recovery as other store
         transactions.
         """
