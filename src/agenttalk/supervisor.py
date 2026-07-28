@@ -6302,6 +6302,21 @@ function Preflight($name, $plan, $file, $codexHome) {
   # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
   # the launch grace in a relaunch loop. Returns $true on success.
   try {
+    if ($ToolRuntimePinned) {
+      $savedToolRuntimeEnv = Enter-ToolRuntimePythonEnvironment
+      try {
+        $toolRuntimeVersion = & $AgenttalkPython -I -c 'import sys; print("%d.%d" % sys.version_info[:2]); raise SystemExit(sys.version_info < (3, 11))'
+        $rc = $LASTEXITCODE
+      } finally {
+        Exit-ToolRuntimePythonEnvironment $savedToolRuntimeEnv
+      }
+      if ($rc -ne 0) {
+        $reportedVersion = ([string]$toolRuntimeVersion).Trim()
+        if (-not $reportedVersion) { $reportedVersion = 'unavailable' }
+        Write-Warning ("supervisor: {0}: CONFIG ERROR - tool_runtime_python requires Python 3.11+ to enforce PYTHONSAFEPATH; configured interpreter reports Python {1}; NOT launching (fail closed)" -f $name, $reportedVersion)
+        return $false
+      }
+    }
     if ($plan.launch_mode -eq 'wrap') {
       # WRAPPED agent: $file is the PYTHON wrapper exe (it runs `agenttalk wrap
       # --loop`), NOT the CLI. Smoke-test both the configured wrapper python and

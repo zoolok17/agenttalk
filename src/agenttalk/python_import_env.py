@@ -10,6 +10,9 @@ the Windows profile variables (``USERPROFILE`` or
 ``HOMEDRIVE``/``HOMEPATH``), while
 ``PYTHONSAFEPATH`` closes the working-directory/script-directory prefix on
 Python 3.11+.
+``PYTHONPYCACHEPREFIX`` is intentionally excluded because CPython validates
+cached bytecode against the current source mtime/size or hash, so it cannot
+substitute import origin and only leaves a stale-bytecode/clock-skew edge.
 
 Executable-adjacent ``._pth``/``pyvenv.cfg`` files and packages installed in
 the pinned runtime remain part of that runtime's trust anchor, not ambient
