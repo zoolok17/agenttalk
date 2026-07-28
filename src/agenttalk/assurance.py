@@ -1626,13 +1626,10 @@ def _recover_coverage_transaction(
             if not backup_is_regular:
                 return f"quarantined {name} is not a regular file"
             if target_exists:
-                if phase != "running":
-                    return (
-                        f"{name} reappeared before the coverage command started; "
-                        "both files were preserved for manual recovery"
-                    )
-                if not _remove_generated_coverage_artifact(target):
-                    return f"could not remove generated {name}"
+                return (
+                    f"{name} reappeared while recovering a {phase} coverage transaction; "
+                    "both files were preserved for manual recovery"
+                )
             try:
                 os.replace(backup, target)
             except OSError as exc:

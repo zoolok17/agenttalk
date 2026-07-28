@@ -1026,6 +1026,100 @@ def test_aborted_partial_quarantine_never_deletes_reappeared_report_on_recovery(
     assert any("manual recovery" in error for error in second.runner_errors)
 
 
+@pytest.mark.parametrize(
+    ("artifact_name", "original", "reappeared"),
+    [
+        (
+            "coverage.json",
+            b'{"totals": {"percent_covered": 17.0}, "owner": "original"}',
+            b'{"totals": {"percent_covered": 91.0}, "owner": "operator-new"}',
+        ),
+        (
+            "coverage.xml",
+            b'<coverage line-rate="0.17" owner="original"/>',
+            b'<coverage line-rate="0.91" owner="operator-new"/>',
+        ),
+    ],
+)
+def test_running_crash_recovery_preserves_reappeared_report_and_backup(
+    tmp_path: Path,
+    monkeypatch,
+    artifact_name: str,
+    original: bytes,
+    reappeared: bytes,
+) -> None:
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {artifact_name: original.decode("utf-8")},
+    )
+    state = assurance._prepare_coverage_artifacts(tmp_path)
+    assert state.preparation_error is None
+    assert state.quarantine is not None
+    assert assurance._mark_coverage_transaction_running(state) is None
+    report = tmp_path / artifact_name
+    report.write_bytes(reappeared)
+    marker = state.quarantine / "transaction.json"
+    backup = state.quarantine / artifact_name
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "from pathlib import Path; Path('next-command-ran').touch()",
+            revision=revision,
+        )
+    )
+
+    assert not (tmp_path / "next-command-ran").exists()
+    assert report.read_bytes() == reappeared
+    assert backup.read_bytes() == original
+    assert json.loads(marker.read_text(encoding="utf-8"))["phase"] == "running"
+    assert any(
+        artifact_name in error and "both files were preserved for manual recovery" in error
+        for error in result.runner_errors
+    )
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "coverage command was not run" in gate["reason"]
+
+
+def test_failed_command_output_is_cleaned_and_original_report_restored(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original = b'{"totals": {"percent_covered": 17.0}, "owner": "operator"}'
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {"coverage.json": original.decode("utf-8")},
+    )
+    report = tmp_path / "coverage.json"
+    generated = '{"totals": {"percent_covered": 91.0}, "owner": "command"}'
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            (
+                "from pathlib import Path; "
+                f"Path('coverage.json').write_text({generated!r}, encoding='utf-8'); "
+                "raise SystemExit(1)"
+            ),
+            revision=revision,
+        )
+    )
+
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    assert report.read_bytes() == original
+    assert not list(
+        (tmp_path / ".agenttalk" / "assurance" / "coverage-recovery").glob(
+            "*/transaction.json"
+        )
+    )
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(91.0)
+
+
 def test_coverage_phase_transition_failure_aborts_and_restores_before_command(
     tmp_path: Path,
     monkeypatch,
