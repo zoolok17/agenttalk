@@ -10,6 +10,9 @@ asserts both sides carry the same policy invariants.
 from __future__ import annotations
 
 import re
+import shlex
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -238,18 +241,42 @@ def test_sk_loop_has_no_stale_lane_names_or_default_force() -> None:
 #     so a worktree full of uncommitted new files reads as clean; and
 #   * an unquoted `git -C <path>` splits on a worktree path containing spaces, so git
 #     fails BEFORE validating anything.
-# Prose probes in SKILL_INVARIANTS are cheap sentinels but they are not semantic
-# parity: a reworded section can keep every probe while deleting the operative
-# command, and reverting this fix to its immediate parent did exactly that with the
-# whole suite still green. These two guards assert the COMMAND SHAPE instead.
-
-_PORCELAIN_CALL = re.compile(r"status\s+--porcelain(?P<rest>[^\n]*)")
-_UNQUOTED_DASH_C = re.compile(r'git\s+-C\s+(?!")\S')
+#
+# Two earlier attempts at guarding this were themselves defeated, which is why the
+# code below is shaped the way it is:
+#   1. Prose probes in SKILL_INVARIANTS: a reworded section keeps every probe while
+#      deleting the operative command.
+#   2. Regex over the whole body: `--untracked-files=all` written inside a trailing
+#      `#` comment satisfied it, and inserting the harmless global option
+#      `--no-pager` hid the unquoted `-C` from an adjacency pattern. Both bypasses
+#      kept the full suite green while the effective command was broken.
+#
+# So these guards do not pattern-match prose. They extract the RUNNABLE fenced
+# command, inspect its real tokens with comments stripped, and then EXECUTE the
+# extracted behavior against a temporary repository configured with the exact git
+# setting that made the original check a placebo.
 
 LEAD_SKILL_PATHS = (
     ("claude", ("claude", "agenttalk.lead.md")),
     ("codex", ("codex", "agenttalk-lead", "SKILL.md")),
 )
+
+# `-u` / `--untracked-files` in any spelling, including `-uno` and a bare `-u` whose
+# value is the next token. Git honours the LAST one it is given, so a correct flag
+# followed by `-uno` is still broken.
+_UNTRACKED_OPT = re.compile(r"^(-u.*|--untracked-files(=.*)?)$")
+
+
+def _tokens(cmd: str, posix: bool) -> list[str] | None:
+    """Tokenize, or None when the line cannot be tokenized (unbalanced quotes).
+
+    None is a REJECTION, never a skip: a command a shell cannot parse is not a
+    command the skill may teach.
+    """
+    try:
+        return shlex.split(cmd, posix=posix)
+    except ValueError:
+        return None
 
 
 def _lead_bodies() -> list[tuple[str, str]]:
@@ -264,31 +291,225 @@ def _lead_bodies() -> list[tuple[str, str]]:
     return out
 
 
-def test_lead_clean_sha_check_cannot_be_a_placebo() -> None:
-    """Every porcelain status check the lead skill teaches must carry
-    ``--untracked-files=all``, in BOTH mirrors."""
-    for label, raw in _lead_bodies():
-        calls = list(_PORCELAIN_CALL.finditer(raw))
-        assert calls, (
-            f"{label} lead skill no longer shows a porcelain status check at all - "
-            "the clean-SHA handoff step lost its command"
-        )
-        bare = [m.group(0) for m in calls if "--untracked-files=all" not in m.group("rest")]
-        assert not bare, (
-            f"{label} lead skill teaches a bare `status --porcelain`, which is "
-            f"silently empty under status.showUntrackedFiles=no: {bare}"
-        )
+def _strip_shell_comment(line: str) -> str:
+    """Drop a trailing shell comment. A `#` inside quotes is not a comment.
+
+    This exists because `--untracked-files=all` written in a COMMENT satisfied the
+    previous regex guard while the executed command lacked the flag entirely.
+    """
+    out, quote = [], None
+    for ch in line:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out).strip()
 
 
-def test_lead_worktree_paths_are_quoted() -> None:
-    """``git -C`` takes exactly ONE argument, so every occurrence in BOTH mirrors
-    must quote its path or the recipe dies on a worktree path with a space."""
+def _fenced_git_commands(text: str) -> list[tuple[int, str]]:
+    """Every runnable ``git`` line inside a fenced block, comments stripped."""
+    cmds: list[tuple[int, str]] = []
+    in_fence = False
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if line.strip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            continue
+        stripped = _strip_shell_comment(line)
+        first = stripped.split(" ", 1)[0] if stripped else ""
+        if first in ("git", "git.exe"):
+            cmds.append((lineno, stripped))
+    return cmds
+
+
+_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+
+
+def _inline_git_commands(text: str) -> list[tuple[int, str]]:
+    """Every ``git`` invocation written in inline backticks, comments stripped.
+
+    Fenced blocks are the runnable recipes, but the section also gives commands
+    inline, and the quoting property has to hold for those too.
+    """
+    cmds: list[tuple[int, str]] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        for m in _INLINE_CODE.finditer(line):
+            snippet = _strip_shell_comment(m.group(1))
+            first = snippet.split(" ", 1)[0] if snippet else ""
+            if first in ("git", "git.exe"):
+                cmds.append((lineno, snippet))
+    return cmds
+
+
+def _dash_c_problems(cmd: str) -> list[str]:
+    """Every ``-C`` argument in ``cmd`` that is not a single balanced-quoted token.
+
+    Finds `-C` wherever it appears, so intervening global options (`--no-pager`) or
+    a `git.exe` spelling cannot hide it.
+    """
+    raw = _tokens(_strip_shell_comment(cmd), posix=False)
+    if raw is None:
+        return ["cannot be tokenized (unbalanced quotes)"]
+    problems = []
+    for i, tok in enumerate(raw):
+        if tok != "-C":
+            continue
+        if i + 1 >= len(raw):
+            problems.append("`-C` with no argument")
+            continue
+        arg = raw[i + 1]
+        if not (len(arg) >= 2 and arg[0] == '"' and arg[-1] == '"'):
+            problems.append(f"`-C {arg}` is not a whole quoted token")
+    return problems
+
+
+def _untracked_problems(cmd: str) -> list[str]:
+    """Reject a `status` invocation whose EFFECTIVE untracked mode is not `all`."""
+    # Strip the comment HERE, not only in the extractor: these inspectors are the
+    # security boundary and must be safe wherever they are called. The bypass that
+    # motivated this wrote `--untracked-files=all` into a trailing comment.
+    toks = _tokens(_strip_shell_comment(cmd), posix=True)
+    if toks is None:
+        return ["cannot be tokenized (unbalanced quotes)"]
+    if "status" not in toks:
+        return []
+    opts = [t for t in toks if _UNTRACKED_OPT.match(t)]
+    if not opts:
+        return ["no --untracked-files=all (silently empty under status.showUntrackedFiles=no)"]
+    if len(opts) > 1:
+        return [f"multiple untracked-mode options {opts}; git honours the last one"]
+    if opts[0] != "--untracked-files=all":
+        return [f"untracked mode is {opts[0]!r}, not --untracked-files=all"]
+    return []
+
+
+def _run_extracted(cmd: str, repo: Path) -> subprocess.CompletedProcess:
+    """Execute an extracted command with its `-C` argument pointed at ``repo``."""
+    toks = shlex.split(cmd, posix=True)
+    for i, tok in enumerate(toks):
+        if tok == "-C" and i + 1 < len(toks):
+            toks[i + 1] = str(repo)
+    return subprocess.run(toks, capture_output=True, text=True, timeout=60)
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True, timeout=60)
+
+
+def test_lead_clean_sha_command_is_effective(tmp_path: Path) -> None:
+    """The clean-SHA status command in BOTH mirrors must actually report an
+    untracked file under ``status.showUntrackedFiles=no`` — executed, not matched.
+
+    This is the property that matters: the previous two guards passed while the
+    effective command returned rc=0 and empty output in exactly this repository
+    configuration.
+    """
+    dirty = tmp_path / "dirty"
+    dirty.mkdir()
+    _git(dirty, "init")
+    _git(dirty, "config", "status.showUntrackedFiles", "no")
+    (dirty / "sentinel.txt").write_text("unpublished work\n", encoding="utf-8")
+
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    _git(clean, "init")
+    _git(clean, "config", "status.showUntrackedFiles", "no")
+
     for label, raw in _lead_bodies():
-        found = _UNQUOTED_DASH_C.search(raw)
-        assert found is None, (
-            f"{label} lead skill has an unquoted `git -C <path>` at offset "
-            f"{found.start()}: {raw[found.start():found.start() + 60]!r}"
+        # A line that will not tokenize is KEPT, not skipped, so it fails below
+        # rather than vanishing from the check.
+        status_cmds = [
+            (n, c) for n, c in _fenced_git_commands(raw)
+            if (_tokens(c, posix=True) is None or "status" in _tokens(c, posix=True))
+        ]
+        assert status_cmds, (
+            f"{label} lead skill has no runnable fenced `git ... status` command - "
+            "the clean-SHA handoff step lost its command entirely"
         )
+        for lineno, cmd in status_cmds:
+            problems = _untracked_problems(cmd) + _dash_c_problems(cmd)
+            assert not problems, f"{label} lead skill line {lineno}: {problems} in {cmd!r}"
+
+            res = _run_extracted(cmd, dirty)
+            assert res.returncode == 0, (
+                f"{label} line {lineno}: extracted command failed rc={res.returncode}: "
+                f"{res.stderr.strip()!r}"
+            )
+            assert "sentinel.txt" in res.stdout, (
+                f"{label} line {lineno}: EXECUTED command did not report an untracked "
+                f"file under status.showUntrackedFiles=no - it is a placebo. "
+                f"cmd={cmd!r} stdout={res.stdout!r}"
+            )
+
+            control = _run_extracted(cmd, clean)
+            assert control.stdout.strip() == "", (
+                f"{label} line {lineno}: command reports dirt in a clean repository, "
+                f"so an empty result would not mean anything: {control.stdout!r}"
+            )
+
+
+def test_lead_every_shown_git_c_is_quoted() -> None:
+    """``git -C`` takes exactly ONE argument, so EVERY git invocation the lead skill
+    shows - fenced or inline - must quote its path in BOTH mirrors.
+
+    Token-based rather than adjacency-based, so an intervening global option
+    (``--no-pager``) or a ``git.exe`` spelling cannot hide the unsafe form.
+    """
+    for label, raw in _lead_bodies():
+        snippets = _fenced_git_commands(raw) + _inline_git_commands(raw)
+        assert snippets, f"{label} lead skill shows no git commands at all"
+        offenders = [
+            (lineno, cmd, problems)
+            for lineno, cmd in snippets
+            if (problems := _dash_c_problems(cmd))
+        ]
+        assert not offenders, f"{label} lead skill unquoted/malformed `-C`: {offenders}"
+
+
+# Every bypass below defeated an earlier version of these guards while the whole
+# suite stayed green. They are the mutation controls: each must be REJECTED.
+CLEAN_SHA_BYPASSES = [
+    # --untracked-files=all hidden in a trailing comment
+    ('git -C "<worktree>" status --porcelain   # --untracked-files=all is required',
+     "flag only in a comment"),
+    # a correct flag overridden by a later one; git honours the last
+    ('git -C "<worktree>" status --porcelain --untracked-files=all -uno',
+     "later -uno override"),
+    ('git -C "<worktree>" status --porcelain --untracked-files=all --untracked-files=no',
+     "later long-form override"),
+    # an intervening global option hides the unquoted -C from an adjacency pattern
+    ('git --no-pager -C <worktree> status --porcelain --untracked-files=all',
+     "--no-pager hides unquoted -C"),
+    ('git.exe -C <worktree> status --porcelain --untracked-files=all',
+     "git.exe spelling with unquoted -C"),
+    # partially quoted path
+    ('git -C "<worktree> status --porcelain --untracked-files=all',
+     "partial quote"),
+    # the original placebo
+    ('git -C "<worktree>" status --porcelain',
+     "bare porcelain"),
+]
+
+
+@pytest.mark.parametrize("cmd,why", CLEAN_SHA_BYPASSES, ids=[b[1] for b in CLEAN_SHA_BYPASSES])
+def test_clean_sha_guards_reject_known_bypasses(cmd: str, why: str) -> None:
+    """Each historically-successful bypass must be caught by the token inspectors.
+
+    Without these, the guards only prove they accept today's text - they would not
+    prove they reject a plausible rewording, which is exactly how the previous two
+    attempts failed review.
+    """
+    problems = _untracked_problems(cmd) + _dash_c_problems(cmd)
+    assert problems, f"bypass NOT caught ({why}): {cmd!r}"
 
 
 def _fenced_bare_agenttalk_lines(text: str) -> list[tuple[int, str]]:
