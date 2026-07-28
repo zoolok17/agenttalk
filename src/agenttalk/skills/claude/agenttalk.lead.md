@@ -340,6 +340,80 @@ the agents you plan.
    summarize the outcome to the user with unresolved blockers called
    out explicitly.
 
+## Publishing a sandboxed worker's commit
+
+A sandboxed worker can commit in its own worktree but cannot push, so the
+lead publishes on its behalf. Three failures live in that one step, and the
+first two are silent.
+
+1. **Require a clean-SHA handoff.** The worker's reply must carry the final
+   full SHA and an empty `git status --porcelain` for its worktree. Pushing a
+   branch publishes the committed HEAD, never uncommitted edits — so a dirty
+   worktree publishes a tree nobody tested.
+   ```powershell
+   git -C <worktree> status --porcelain     # must be empty
+   git -C <worktree> log -1 --format=%H     # must equal the reported SHA
+   ```
+
+2. **Never let the current directory choose which commit is pushed.** This is
+   the trap:
+   ```powershell
+   # WRONG when run from the main checkout: HEAD is the MAIN branch,
+   # not the worker's commit. This publishes the base branch over the
+   # feature branch.
+   git push origin HEAD:<branch>
+   ```
+   Push the **explicit full SHA**, which cannot be ambiguous about which tree
+   it means and is self-documenting in shell history:
+   ```powershell
+   git push origin <full-sha>:refs/heads/<branch>
+   ```
+   `git -C <worktree> push origin HEAD:<branch>` also works. Prefer the
+   explicit SHA.
+
+   **`--force-with-lease` does not protect you here.** The lease asserts what
+   the *remote* looked like, which you may legitimately hold; it says nothing
+   about whether your *local* ref is the one you meant. A wrong-but-leased
+   force push is "safe" by the flag's definition and destructive in fact.
+
+3. **Verify the result, not the push output.** Pushing the base branch onto a
+   pull request's head makes the head equal the base, and hosts such as GitHub
+   then **auto-close the request** (often displaying it as *merged*). The push
+   output looks like an ordinary fast-forward, so only an explicit check
+   reveals it:
+   ```powershell
+   gh pr view <n> --json headRefOid,state,mergeable
+   ```
+
+   **Recovery is conditional — read this before you need it.** The objects are
+   still local, so nothing is lost, but re-pushing the correct SHA and
+   reopening only works *directly* when that SHA is a **descendant of whatever
+   became the erroneous head**. GitHub refuses a reopen when the current head
+   is not a descendant of the head SHA recorded at close time. A worker's
+   branch frequently forks from an earlier base commit than the base has since
+   advanced to, so the refusal is the common case, not the rare one.
+
+   If the reopen is refused:
+   ```powershell
+   # 1. put back the SHA the host recorded as head at close time
+   git push origin <closed-time-head-sha>:refs/heads/<branch> --force
+   # 2. reopen while the head matches what was stored
+   gh pr reopen <n>
+   # 3. now push the correct commit (force-pushing an OPEN request is allowed)
+   git push origin <full-sha>:refs/heads/<branch> --force
+   gh pr view <n> --json headRefOid,state
+   ```
+   Capture `<closed-time-head-sha>` from `gh pr view <n> --json headRefOid`
+   before anything else changes it, or from the closed request's timeline.
+   Opening a fresh request is always a valid fallback. Note the recovery push
+   is a non-fast-forward and needs `--force`, since it overwrites the erroneous
+   state on the remote.
+
+The general rule behind all three: *which tree or object am I operating on* is
+a question to ANSWER explicitly, never to infer from ambient context. The same
+rule catches a stale checkout behind a running process, a test run from the
+wrong directory, and a static check scanning a tree the runtime never imports.
+
 ## Targeting
 
 - Use `agenttalk send --to <agent>` for one named recipient.
