@@ -4924,36 +4924,53 @@ def test_pinned_preflight_restores_codex_home_when_env_isolation_throws(
     ]
 
 
-def _tool_runtime_preflight_shells() -> list[object]:
-    """BOTH Windows PowerShell editions - and always both, on Windows.
-
-    A param is emitted even when the executable is absent (the test then skips
-    with a reason) deliberately: a parametrization that silently SHRINKS when a
-    shell disappears keeps reporting green while no longer covering the edition
-    whose argument marshalling differs. That is the failure this test exists to
-    catch, so its own coverage must not be able to vanish quietly.
-    """
+def _tool_runtime_preflight_cases() -> list[object]:
+    """All Preflight plan shapes under both Windows PowerShell editions."""
     if os.name != "nt":
         return []
     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-    return [
-        pytest.param(shutil.which("pwsh"), id="pwsh-7"),
-        pytest.param(
+    shells = [
+        ("pwsh-7", shutil.which("pwsh")),
+        (
+            "windows-powershell-5.1",
             str(
                 system_root / "System32" / "WindowsPowerShell" / "v1.0"
                 / "powershell.exe"
             ),
-            id="windows-powershell-5.1",
         ),
+    ]
+    plans = [
+        ("wrapped", "wrap", "codex", 2),
+        ("codex", "manual", "codex", 1),
+        ("generic-claude", "manual", "claude", 1),
+    ]
+    return [
+        pytest.param(
+            shell,
+            plan_shape,
+            launch_mode,
+            cli_name,
+            expected_invocations,
+            id=f"{shell_id}-{plan_shape}",
+        )
+        for shell_id, shell in shells
+        for plan_shape, launch_mode, cli_name, expected_invocations in plans
     ]
 
 
-@pytest.mark.parametrize("shell", _tool_runtime_preflight_shells())
+@pytest.mark.parametrize(
+    ("shell", "plan_shape", "launch_mode", "cli_name", "expected_invocations"),
+    _tool_runtime_preflight_cases(),
+)
 def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
     tmp_path: Path,
     shell: str | None,
+    plan_shape: str,
+    launch_mode: str,
+    cli_name: str,
+    expected_invocations: int,
 ) -> None:
-    """A pinned `Preflight` must SUCCEED under both Windows PowerShell editions.
+    """Every pinned Preflight branch must invoke its configured interpreter.
 
     The two editions marshal native arguments differently: Windows PowerShell 5.1
     strips embedded double quotes from a single-quoted string handed to a native
@@ -4962,13 +4979,13 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
     launch refusal for every pinned agent, and pwsh-only coverage cannot see the
     class at all.
 
-    Deliberately a POSITIVE test with no version assertions - it guards the three
-    native `-m agenttalk --version` probes `Preflight` already runs under the
-    pinned runtime, so the shell boundary stays covered independently of any
-    version gate that may or may not exist later.
+    Each parameter gets a real venv and a private invocation witness. The wrapped
+    branch invokes that interpreter twice (the configured wrapper file and the
+    pinned AGENTTALK_PY); the other branches invoke it once.
     """
-    if not shell or not Path(shell).is_file():
-        pytest.skip(f"PowerShell edition not present on this host: {shell!r}")
+    assert shell and Path(shell).is_file(), (
+        f"required PowerShell edition is absent on Windows: {shell!r}"
+    )
 
     tool_home = tmp_path / "tool-runtime"
     venv.EnvBuilder(with_pip=False).create(tool_home)
@@ -4977,15 +4994,41 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
     tool_package.mkdir(parents=True)
     (tool_package / "__init__.py").write_text("", encoding="utf-8")
     (tool_package / "__main__.py").write_text(
+        "import json\n"
+        "import os\n"
         "import sys\n"
+        "from pathlib import Path\n"
+        "witness = Path(os.environ['AGENTTALK_TEST_INVOCATION_WITNESS'])\n"
+        "records = (json.loads(witness.read_text(encoding='utf-8')) "
+        "if witness.exists() else [])\n"
+        "records.append({'executable': sys.executable, 'argv': sys.argv})\n"
+        "witness.write_text(json.dumps(records), encoding='utf-8')\n"
         "if sys.argv[1:] != ['--version']:\n"
         "    raise SystemExit(2)\n"
         "print('agenttalk test runtime')\n",
         encoding="utf-8",
     )
+    native_cli = tmp_path / "codex.exe"
+    shutil.copy2(tool_python, native_cli)
     store = _team(tmp_path)
-    (store.dir / "supervisor.json").write_text(
-        json.dumps({"tool_runtime_python": str(tool_python)}),
+    config_path = store.dir / "supervisor.json"
+    config_path.write_text(
+        json.dumps({
+            "tool_runtime_python": str(tool_python),
+            "agents": {
+                "worker": {
+                    "launch": {
+                        "windows_args": [
+                            "-m",
+                            "agenttalk",
+                            "wrap",
+                            "--",
+                            str(native_cli),
+                        ],
+                    },
+                },
+            },
+        }),
         encoding="utf-8",
     )
     generated = sup.render_artifact_bundle(
@@ -5000,24 +5043,31 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
         generated.index("$AgenttalkPython = "):
         generated.index("# endregion exec-helpers")
     ]
-    result_path = tmp_path / "pinned-preflight.json"
+    result_path = tmp_path / f"pinned-preflight-{plan_shape}.json"
+    witness_path = tmp_path / f"invocation-witness-{plan_shape}.json"
     harness = "\n".join([
         "$ErrorActionPreference = 'Stop'",
         f"$Root = {_pslit(str(tmp_path))}",
+        f"$cfg = Get-Content -LiteralPath {_pslit(str(config_path))} "
+        "-Raw | ConvertFrom-Json",
         preflight_dependencies,
-        "$plan = [pscustomobject]@{ launch_mode='manual'; cli='claude' }",
-        "$ok = Preflight 'worker' $plan 'ignored.exe' $null",
+        f"$plan = [pscustomobject]@{{ launch_mode={_pslit(launch_mode)}; "
+        f"cli={_pslit(cli_name)} }}",
+        f"$ok = Preflight 'worker' $plan {_pslit(str(tool_python))} $null",
         "@{ ok=[bool]$ok } | ConvertTo-Json | "
         f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
     ])
-    harness_path = tmp_path / "pinned-preflight.ps1"
+    harness_path = tmp_path / f"pinned-preflight-{plan_shape}.ps1"
     harness_path.write_text(harness, encoding="utf-8-sig")
 
+    env = dict(os.environ)
+    env["AGENTTALK_TEST_INVOCATION_WITNESS"] = str(witness_path)
     completed = subprocess.run(
         [shell, "-NoProfile", "-File", str(harness_path)],
         capture_output=True,
         text=True,
         timeout=120,
+        env=env,
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
@@ -5027,6 +5077,19 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
         f"pinned Preflight FAILED under {shell} - a native-argument marshalling "
         f"regression: {completed.stdout}{completed.stderr}"
     )
+    assert witness_path.is_file(), (
+        f"{plan_shape} Preflight returned success under {shell} without invoking "
+        f"the pinned interpreter: {completed.stdout}{completed.stderr}"
+    )
+    invocations = json.loads(witness_path.read_text(encoding="utf-8"))
+    assert len(invocations) == expected_invocations
+    expected_python = tool_python.resolve()
+    expected_main = (tool_package / "__main__.py").resolve()
+    for invocation in invocations:
+        assert Path(invocation["executable"]).resolve() == expected_python
+        argv = invocation["argv"]
+        assert Path(argv[0]).resolve() == expected_main
+        assert argv[1:] == ["--version"]
 
 
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:
