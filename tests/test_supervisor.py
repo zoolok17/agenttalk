@@ -5003,9 +5003,9 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
     launch refusal for every pinned agent, and pwsh-only coverage cannot see the
     class at all.
 
-    Each parameter gets a real tool-runtime venv and a private invocation
-    witness. The wrapped branch also gets a distinct wrapper venv, proving both
-    the configured wrapper file and pinned AGENTTALK_PY were invoked.
+    Each parameter gets a real tool-runtime venv, a distinct CLI executable,
+    and a private invocation witness. The wrapped branch also gets a distinct
+    wrapper venv, proving every endpoint keeps its production-shaped identity.
     """
     assert shell and Path(shell).is_file(), (
         f"required PowerShell edition is absent on Windows: {shell!r}"
@@ -5014,14 +5014,23 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
     tool_python, tool_main = _create_preflight_witness_runtime(
         tmp_path / "tool-runtime"
     )
-    wrapper_python = tool_python
-    wrapper_main = tool_main
+    native_cli = tmp_path / f"{cli_name}.exe"
+    shutil.copy2(tool_python, native_cli)
+    preflight_file = native_cli
+    wrapper_main: Path | None = None
     if plan_shape == "wrapped":
-        wrapper_python, wrapper_main = _create_preflight_witness_runtime(
+        preflight_file, wrapper_main = _create_preflight_witness_runtime(
             tmp_path / "wrapper-runtime"
         )
-    native_cli = tmp_path / "codex.exe"
-    shutil.copy2(tool_python, native_cli)
+    endpoints = {
+        "$file": preflight_file.resolve(),
+        "$AgenttalkPython": tool_python.resolve(),
+    }
+    if plan_shape == "wrapped":
+        endpoints["wrapped argv CLI"] = native_cli.resolve()
+    assert all(endpoint.is_file() for endpoint in endpoints.values()), endpoints
+    assert len(set(endpoints.values())) == len(endpoints), endpoints
+
     store = _team(tmp_path)
     config_path = store.dir / "supervisor.json"
     config_path.write_text(
@@ -5065,7 +5074,7 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
         preflight_dependencies,
         f"$plan = [pscustomobject]@{{ launch_mode={_pslit(launch_mode)}; "
         f"cli={_pslit(cli_name)} }}",
-        f"$ok = Preflight 'worker' $plan {_pslit(str(wrapper_python))} $null",
+        f"$ok = Preflight 'worker' $plan {_pslit(str(preflight_file))} $null",
         "@{ ok=[bool]$ok } | ConvertTo-Json | "
         f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
     ])
@@ -5098,8 +5107,9 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
         (tool_python.resolve(), tool_main.resolve(), ("--version",)): 1,
     })
     if plan_shape == "wrapped":
+        assert wrapper_main is not None
         expected_invocations[
-            (wrapper_python.resolve(), wrapper_main.resolve(), ("--version",))
+            (preflight_file.resolve(), wrapper_main.resolve(), ("--version",))
         ] += 1
     actual_invocations = Counter(
         (
