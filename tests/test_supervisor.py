@@ -3867,16 +3867,19 @@ public static class AgenttalkStateWriteLock
         return thread;
     }
 
-    public static Thread LockExistingForMilliseconds(
-        string path, string readyPath, int milliseconds)
+    public static Thread LockExistingUntilSignaled(
+        string path, EventWaitHandle readySignal, EventWaitHandle releaseSignal)
     {
         Thread thread = new Thread(() =>
         {
             using (FileStream stream = new FileStream(
                 path, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
-                File.WriteAllText(readyPath, "ready");
-                Thread.Sleep(milliseconds);
+                readySignal.Set();
+                if (!releaseSignal.WaitOne(TimeSpan.FromSeconds(30)))
+                {
+                    throw new TimeoutException("state write lock release was not signaled");
+                }
             }
         });
         thread.IsBackground = true;
@@ -4062,18 +4065,28 @@ def test_ps_poll_state_save_warns_and_survives_persistent_contention(
         retry_path=retry_path,
     )
     harness += [
-        "$locker = [AgenttalkStateWriteLock]::LockExistingForMilliseconds(",
-        "  $StatePath, $ReadyPath, 2500)",
-        "while (-not (Microsoft.PowerShell.Management\\Test-Path "
-        "-LiteralPath $ReadyPath)) {",
-        "  Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 1",
+        "$readySignal = [Threading.ManualResetEvent]::new($false)",
+        "$releaseSignal = [Threading.ManualResetEvent]::new($false)",
+        "$locker = [AgenttalkStateWriteLock]::LockExistingUntilSignaled(",
+        "  $StatePath, $readySignal, $releaseSignal)",
+        "if (-not $readySignal.WaitOne(10000)) {",
+        "  throw 'state write lock did not become ready'",
         "}",
-        "$next = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
+        "try {",
+        "  $next = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
         "[pscustomobject]@{ pid = 202 } } }",
-        "$results = @()",
-        "for ($poll = 0; $poll -lt 2; $poll++) {",
-        "  $results += [bool](Save-StateForPoll $next)",
+        "  $results = @()",
+        "  for ($poll = 0; $poll -lt 2; $poll++) {",
+        "    $results += [bool](Save-StateForPoll $next)",
+        "  }",
+        "} finally {",
+        "  $null = $releaseSignal.Set()",
         "}",
+        "if (-not $locker.Join(10000)) {",
+        "  throw 'state write lock did not release'",
+        "}",
+        "$readySignal.Dispose()",
+        "$releaseSignal.Dispose()",
         "$primary = Read-StateFile $StatePath",
         "@{ polls = $results.Count; saved = @($results | Where-Object { $_ }).Count; "
         "pid = $primary.agents.worker.pid } | ConvertTo-Json | "
