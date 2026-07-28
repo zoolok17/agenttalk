@@ -565,6 +565,156 @@ def test_cli_pre_plan_failure_preserves_coverage_waiver(
     assert _coverage_gate(tmp_path, "change")["status"] == "waived"
 
 
+@pytest.mark.parametrize(
+    ("script", "expected_status"),
+    [
+        (
+            (
+                "from pathlib import Path; "
+                "Path('.agenttalk/coverage-command-ran').write_text('ran', encoding='utf-8'); "
+                "print('TOTAL 100 0 100%')"
+            ),
+            "pass",
+        ),
+        (
+            (
+                "from pathlib import Path; "
+                "Path('.agenttalk/coverage-command-ran').write_text('ran', encoding='utf-8'); "
+                "print('TOTAL 100 0 100%'); "
+                "raise SystemExit(1)"
+            ),
+            "error-optional-tool",
+        ),
+    ],
+    ids=["green-measurement", "red-measurement"],
+)
+def test_completed_coverage_scan_preserves_existing_waiver(
+    tmp_path: Path,
+    monkeypatch,
+    script: str,
+    expected_status: str,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    with Store(tmp_path).config_lock():
+        gates.waive_gate(
+            tmp_path,
+            name="coverage:change",
+            operator="test-operator",
+            reason="accepted fixture waiver",
+            scope="change",
+            expires="2099-01-01T00:00:00Z",
+        )
+    waiver = json.loads(json.dumps(_coverage_gate(tmp_path, "change")))
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            script,
+            profile="change",
+            revision=revision,
+        )
+    )
+
+    assert result.tools_run[0]["status"] == expected_status
+    assert (tmp_path / ".agenttalk" / "coverage-command-ran").read_text(encoding="utf-8") == "ran"
+    assert _coverage_gate(tmp_path, "change") == waiver
+
+
+def test_completed_coverage_scan_updates_existing_nonwaived_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    with Store(tmp_path).config_lock():
+        gates.set_gate(
+            tmp_path,
+            name="coverage:change",
+            status="red",
+            severity="blocker",
+            scope="change",
+            actor="previous-assurance-run",
+            evidence_source="local_command",
+            evidence=["assurance-run:previous"],
+            reason="previous measurement was red",
+            revision=revision,
+        )
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 100 12 88%')",
+            profile="change",
+            revision=revision,
+        )
+    )
+
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "green"
+    assert gate["updated_by"] == "assurance-ci"
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(88.0)
+
+
+def test_waiver_written_during_coverage_scan_survives_emission(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    command_started = threading.Event()
+    release_command = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocked_run_external(root: Path, spec: dict, command: list[str]):
+        command_started.set()
+        if not release_command.wait(timeout=5.0):
+            raise RuntimeError("coverage command was not released")
+        run = assurance._run_record(
+            spec,
+            "pass",
+            time.monotonic(),
+            command=command,
+            exit_code=0,
+        )
+        return run, [], "TOTAL 100 12 88%", "TOTAL 100 12 88%"
+
+    monkeypatch.setattr(assurance, "_run_external", blocked_run_external)
+
+    def execute_scan() -> None:
+        try:
+            assurance.run_plan(
+                _plan(
+                    tmp_path,
+                    "unused",
+                    profile="change",
+                    revision=revision,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    scan = threading.Thread(target=execute_scan, name="coverage-waiver-ordering")
+    try:
+        scan.start()
+        assert command_started.wait(timeout=5.0)
+        with Store(tmp_path).config_lock():
+            gates.waive_gate(
+                tmp_path,
+                name="coverage:change",
+                operator="test-operator",
+                reason="waived while coverage was running",
+                scope="change",
+                expires="2099-01-01T00:00:00Z",
+            )
+    finally:
+        release_command.set()
+        scan.join(timeout=10.0)
+
+    assert not scan.is_alive()
+    assert errors == []
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "waived"
+    assert gate["waiver"]["reason"] == "waived while coverage was running"
+
+
 def test_cli_finalization_lock_failure_returns_one_after_artifact_write(
     tmp_path: Path,
     monkeypatch,
@@ -1547,6 +1697,71 @@ def test_failed_report_restore_is_marked_and_recovered_by_next_run(
     assert not list((tmp_path / ".agenttalk" / "assurance" / "coverage-recovery").glob("*/transaction.json"))
 
 
+@pytest.mark.parametrize("preexisting_json", [False, True], ids=["fresh", "backed-up"])
+def test_artifact_removal_failure_keeps_transaction_open(
+    tmp_path: Path,
+    monkeypatch,
+    preexisting_json: bool,
+) -> None:
+    original_xml = '<coverage line-rate="0.25"/>'
+    original_json = '{"totals": {"percent_covered": 17.0}}'
+    generated_json = '{"totals": {"percent_covered": 81.0}}'
+    files = {"coverage.xml": original_xml}
+    if preexisting_json:
+        files["coverage.json"] = original_json
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        files,
+    )
+    real_remove = assurance._remove_generated_coverage_artifact
+
+    def fail_fresh_json_removal(path: Path) -> bool:
+        if path == tmp_path / "coverage.json":
+            return False
+        return real_remove(path)
+
+    monkeypatch.setattr(
+        assurance,
+        "_remove_generated_coverage_artifact",
+        fail_fresh_json_removal,
+    )
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            (
+                "from pathlib import Path; "
+                f"Path('coverage.json').write_text({generated_json!r}, encoding='utf-8')"
+            ),
+            revision=revision,
+        )
+    )
+
+    gate = _coverage_gate(tmp_path)
+    markers = list(
+        (tmp_path / ".agenttalk" / "assurance" / "coverage-recovery").glob(
+            "*/transaction.json"
+        )
+    )
+    assert gate["status"] == "red"
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(81.0)
+    assert "could not remove generated coverage.json" in gate["reason"]
+    assert any("could not remove generated coverage.json" in error for error in result.runner_errors)
+    assert (tmp_path / "coverage.json").read_text(encoding="utf-8") == generated_json
+    assert (tmp_path / "coverage.xml").read_text(encoding="utf-8") == original_xml
+    assert len(markers) == 1
+    marker = json.loads(markers[0].read_text(encoding="utf-8"))
+    assert marker["phase"] == "running"
+    expected_artifacts = ["coverage.xml", "coverage.json"] if preexisting_json else ["coverage.xml"]
+    assert marker["artifacts"] == expected_artifacts
+    backup_json = markers[0].parent / "coverage.json"
+    if preexisting_json:
+        assert backup_json.read_text(encoding="utf-8") == original_json
+    else:
+        assert not backup_json.exists()
+
+
 def test_empty_transaction_left_after_marker_unlink_is_recovered_next_run(
     tmp_path: Path,
     monkeypatch,
@@ -1623,6 +1838,40 @@ def test_oversized_coverage_json_is_rejected_before_parsing() -> None:
     )
 
     assert parse_coverage_percent("", json_text=json_text) is None
+
+
+@pytest.mark.parametrize("as_bytes", [False, True], ids=["str", "bytes"])
+def test_oversized_coverage_stdout_is_rejected_before_scanning(
+    monkeypatch,
+    as_bytes: bool,
+) -> None:
+    monkeypatch.setattr(coverage_parse, "MAX_COVERAGE_ARTIFACT_BYTES", 64)
+    stdout = "TOTAL 10 0 96%\n" + ("x" * 64)
+    source = stdout.encode("utf-8") if as_bytes else stdout
+
+    assert parse_coverage_percent(source) is None
+
+
+@pytest.mark.parametrize("as_bytes", [False, True], ids=["str", "bytes"])
+def test_coverage_stdout_at_size_limit_is_accepted(
+    monkeypatch,
+    as_bytes: bool,
+) -> None:
+    monkeypatch.setattr(coverage_parse, "MAX_COVERAGE_ARTIFACT_BYTES", 64)
+    total = "TOTAL 10 0 96%\n"
+    stdout = total + ("x" * (64 - len(total)))
+    source = stdout.encode("utf-8") if as_bytes else stdout
+
+    assert parse_coverage_percent(source) == pytest.approx(96.0)
+
+
+def test_coverage_stdout_limit_counts_utf8_bytes(monkeypatch) -> None:
+    monkeypatch.setattr(coverage_parse, "MAX_COVERAGE_ARTIFACT_BYTES", 64)
+    stdout = "TOTAL 10 0 96%\n" + ("\N{LATIN SMALL LETTER E WITH ACUTE}" * 25)
+    assert len(stdout) < 64
+    assert len(stdout.encode("utf-8")) > 64
+
+    assert parse_coverage_percent(stdout) is None
 
 
 @pytest.mark.parametrize("value", ["99.0", True, None, [], {}])

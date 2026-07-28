@@ -1889,6 +1889,7 @@ def _finish_coverage_artifacts(
             outputs[name] = _read_coverage_artifact(path)
             if not _remove_generated_coverage_artifact(path):
                 cleanup_errors.append(f"could not remove generated {name}")
+                transaction_complete = False
         backup = state.backups.get(name)
         if backup is None:
             continue
@@ -2061,7 +2062,14 @@ def _emit_coverage_gate(
     percent = parse_coverage_percent(stdout, json_text=json_text)
     command_succeeded = run.get("status") == "pass" and run.get("exit_code") == 0
     evidence_details = {"coverage_percent": float(percent)} if percent is not None else None
+    gate_name = coverage_gate_name(plan.profile)
     with Store(plan.root).config_lock():
+        state = _load_coverage_gate_state(plan.root)
+        existing = state.get("gates", {}).get(gate_name)
+        # Automated measurements are last-write-wins only while the target is
+        # not protected by an explicit operator waiver.
+        if isinstance(existing, dict) and existing.get("status") == "waived":
+            return
         # This is a point-in-time revision + clean-worktree attestation. A
         # mutation racing the check-to-persist gap is the accepted #66/#31
         # residual and is detected by close provenance/verify, not serialized here.
@@ -2087,7 +2095,7 @@ def _emit_coverage_gate(
         evidence = [ci_evidence] if ci_evidence is not None else [f"assurance-run:{plan.run_id}"]
         gates.set_gate(
             plan.root,
-            name=coverage_gate_name(plan.profile),
+            name=gate_name,
             status="green" if is_green else "red",
             severity="blocker",
             scope=plan.profile,

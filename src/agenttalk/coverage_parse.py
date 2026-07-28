@@ -2,10 +2,10 @@
 
 For built-in ``str`` or ``bytes`` sources, every ordinary data-dependent ``Exception`` raised
 while decoding, parsing, or coercing coverage output is contained: the public parser returns a
-finite ``float`` in [0, 100] or ``None``. JSON artifacts are producer-controlled evidence and
-therefore size-bounded. Process-control ``BaseException`` signals (for example
-``KeyboardInterrupt``, ``SystemExit``, and ``GeneratorExit``) intentionally remain outside this
-contract rather than being misreported as malformed evidence.
+finite ``float`` in [0, 100] or ``None``. JSON artifacts and process stdout are
+producer-controlled evidence and therefore size-bounded. Process-control ``BaseException``
+signals (for example ``KeyboardInterrupt``, ``SystemExit``, and ``GeneratorExit``)
+intentionally remain outside this contract rather than being misreported as malformed evidence.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from decimal import Decimal, InvalidOperation
 __all__ = ["MAX_COVERAGE_ARTIFACT_BYTES", "parse_coverage_percent"]
 
 MAX_COVERAGE_ARTIFACT_BYTES = 16 * 1024 * 1024
+# Shared budget for every producer-controlled coverage evidence channel.
 # coverage.py / pytest-cov terminal summary: a "TOTAL" row whose last token is a percent.
 #   TOTAL                        1234    56    96%
 _TOTAL_LINE = re.compile(r"^TOTAL\b.*?(?<!\S)([0-9]+(?:\.[0-9]+)?)%\s*$", re.MULTILINE)
@@ -44,7 +45,7 @@ def _valid(pct: int | float | Decimal | str | None) -> float | None:
     return f
 
 
-def _artifact_within_limit(text: str) -> bool:
+def _evidence_within_limit(text: str) -> bool:
     if len(text) > MAX_COVERAGE_ARTIFACT_BYTES:
         return False
     try:
@@ -53,9 +54,9 @@ def _artifact_within_limit(text: str) -> bool:
         return False
 
 
-def _source_text(source: str | bytes, *, artifact: bool) -> str | None:
+def _source_text(source: str | bytes) -> str | None:
     if isinstance(source, bytes):
-        if artifact and len(source) > MAX_COVERAGE_ARTIFACT_BYTES:
+        if len(source) > MAX_COVERAGE_ARTIFACT_BYTES:
             return None
         return source.decode("utf-8-sig")
     if not isinstance(source, str):
@@ -74,7 +75,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 
 def _from_json(json_text: str) -> float | None:
     """coverage.py JSON: ``["totals"]["percent_covered"]`` (already 0-100)."""
-    if not _artifact_within_limit(json_text):
+    if not _evidence_within_limit(json_text):
         return None
     try:
         data = json.loads(
@@ -97,6 +98,8 @@ def _from_json(json_text: str) -> float | None:
 
 def _from_stdout(stdout: str) -> float | None:
     """coverage.py ``TOTAL ... 96%`` or pytest-cov ``Total coverage: 87.34%``. Last match wins."""
+    if not _evidence_within_limit(stdout):
+        return None
     frac = None
     matches = _TOTAL_COVERAGE.findall(stdout)
     if matches:
@@ -124,14 +127,14 @@ def parse_coverage_percent(
     ``bytes`` sources, ordinary parser exceptions are contained at this public boundary;
     process-control ``BaseException`` signals intentionally propagate.
     """
-    for parser, source, artifact in (
-        (_from_json, json_text, True),
-        (_from_stdout, stdout, False),
+    for parser, source in (
+        (_from_json, json_text),
+        (_from_stdout, stdout),
     ):
         if not isinstance(source, (str, bytes)) or not source:
             continue
         try:
-            text = _source_text(source, artifact=artifact)
+            text = _source_text(source)
             if not text:
                 continue
             pct = _valid(parser(text))
