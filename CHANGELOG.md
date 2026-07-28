@@ -22,15 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   create or modify paths while they run; containment remains #107.
   Legacy recovery residue also causes an actionable refusal for manual recovery.
   A late report from agenttalk's own producer can therefore cause a deliberate
-  false-DOWN that requires manual cleanup until #107 supplies owned-output containment;
-  this is preferred to silently deleting operator data. Protection and discovery cover
+  false-DOWN that requires manual cleanup until #107 supplies owned-output containment.
+  Any coverage command that spawns subprocesses can plausibly trigger this on an ordinary
+  setup; until #107, the operator remedy is to inspect and manually clean up the named path.
+  This is preferred to silently deleting operator data. Detection and refusal cover
   exactly the two canonical names: arbitrary configured output paths, and case variants
-  on case-sensitive filesystems, are neither discovered, parsed, nor cleaned. The stdout
-  parser rejects evidence over 16 MiB, but subprocess `capture_output=True` still buffers
-  the complete stream before that parse-time bound (#106). DoD coverage policy explicitly
-  selects one of the finite `coverage:change`, `coverage:release`, or `coverage:deep`
-  producer gates. Coverage-gate finalization failures are bounded CLI failures and no
-  longer escape, mask an earlier scan failure, or print a false success.
+  on case-sensitive filesystems, are neither discovered, parsed, nor cleaned. Executed
+  proof for Windows symlink/reparse refusal remains unconfirmed: the local symlink cases
+  skip with `WinError 1314`, and CI does not explicitly grant symlink-creation privilege.
+  The stdout parser rejects evidence over 16 MiB, but subprocess `capture_output=True`
+  still buffers the complete stream before that parse-time bound (#106). DoD coverage
+  policy explicitly selects one of the finite `coverage:change`, `coverage:release`, or
+  `coverage:deep` producer gates. Coverage-gate finalization failures are bounded CLI
+  failures and no longer escape, mask an earlier scan failure, or print a false success.
 
 ## [0.79.1] - 2026-07-25
 

@@ -46,9 +46,14 @@ A producer descendant can create a canonical report after postflight. The next
 scan then refuses and requires manual cleanup, even if the late report came from
 the prior producer. This deliberate false-DOWN remains until #107 provides an
 owned-output protocol or process containment; refusing a named path is safer than
-guessing ownership and deleting operator data. Stdout evidence is limited to
-16 MiB when parsed, but `capture_output=True` buffers the complete subprocess
-stream before that check. Capture-time bounding remains #106.
+guessing ownership and deleting operator data. Any coverage command that spawns
+subprocesses can plausibly trigger this on an ordinary setup; until #107, the
+operator remedy is to inspect and manually clean up the named path. Executed
+proof for Windows symlink/reparse refusal remains unconfirmed: the local symlink
+cases skip with `WinError 1314`, and CI does not explicitly grant
+symlink-creation privilege. Stdout evidence is limited to 16 MiB when parsed,
+but `capture_output=True` buffers the complete subprocess stream before that
+check. Capture-time bounding remains #106.
 - bandit, semgrep local rules, gitleaks, osv-scanner, and pip-audit when
   installed and applicable. Network-dependent dependency tools are skipped by
   default unless the manifest permits them.

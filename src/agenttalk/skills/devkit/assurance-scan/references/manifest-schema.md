@@ -50,7 +50,12 @@ parses, nor cleans it. Case variants are outside the class on case-sensitive
 filesystems. A producer descendant can also create a canonical path after
 postflight, making a later scan refuse until an operator removes it. This
 deliberate false-DOWN remains until #107 provides owned-output containment and is
-preferred to guessing ownership and deleting operator data.
+preferred to guessing ownership and deleting operator data. Any coverage command
+that spawns subprocesses can plausibly trigger this on an ordinary setup; until
+#107, the operator remedy is to inspect and manually clean up the named path.
+Executed proof for Windows symlink/reparse refusal remains unconfirmed: the local
+symlink cases skip with `WinError 1314`, and CI does not explicitly grant
+symlink-creation privilege.
 
 Absent an active persisted operator waiver, fresh coverage evidence is published
 under the scan profile's finite producer gate: `coverage:change`,
