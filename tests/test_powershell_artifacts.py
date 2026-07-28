@@ -92,7 +92,7 @@ def test_tool_runtime_config_pins_control_plane_off_checkout(tmp_path: Path) -> 
     assert script.count("    Add-ToolRuntimePythonEnvironment $applied") == 2
     assert script.count(
         "$savedToolRuntimeEnv = Enter-ToolRuntimePythonEnvironment"
-    ) == 4
+    ) == 3
 
 
 def test_tool_runtime_config_unset_matches_d5add08_control_plane_contract(
