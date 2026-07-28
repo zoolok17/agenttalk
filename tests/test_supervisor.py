@@ -4645,10 +4645,20 @@ def test_wrapped_child_control_command_imports_from_tool_runtime(
         'ORIGIN = "tool-runtime"\n',
         encoding="utf-8",
     )
-    (tool_package / "__main__.py").write_text(
-        "import agenttalk\nprint(agenttalk.__file__)\n",
-        encoding="utf-8",
+    probe_main = (
+        "import json, os, sys, agenttalk\n"
+        "if sys.argv[1:] == ['env']:\n"
+        "    clear = {'PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE', "
+        "'PYTHONPLATLIBDIR', 'PYTHONCASEOK'}\n"
+        "    present = sorted(k for k in os.environ if k.upper() in clear)\n"
+        "    print(json.dumps({'origin': agenttalk.__file__, "
+        "'clear_present': present, "
+        "'nousersite': os.environ.get('PYTHONNOUSERSITE'), "
+        "'safepath': os.environ.get('PYTHONSAFEPATH')}))\n"
+        "else:\n"
+        "    print(agenttalk.__file__)\n"
     )
+    (tool_package / "__main__.py").write_text(probe_main, encoding="utf-8")
 
     # Make the store root a source checkout with a competing import. Before the
     # fix, the rendered Launch environment prepends this path to PYTHONPATH.
@@ -4658,10 +4668,7 @@ def test_wrapped_child_control_command_imports_from_tool_runtime(
         'ORIGIN = "checkout"\n',
         encoding="utf-8",
     )
-    (checkout_package / "__main__.py").write_text(
-        "import agenttalk\nprint(agenttalk.__file__)\n",
-        encoding="utf-8",
-    )
+    (checkout_package / "__main__.py").write_text(probe_main, encoding="utf-8")
     store = _team(tmp_path)
     config = {
         "tool_runtime_python": str(tool_python),
@@ -4671,6 +4678,12 @@ def test_wrapped_child_control_command_imports_from_tool_runtime(
                 "wrapped": True,
                 "cwd": str(tmp_path),
                 "launch": {"windows_file": "ignored.exe", "windows_args": []},
+                # The pin must win case-insensitively even when the agent
+                # injects a competing channel after ambient env construction.
+                "env": {
+                    "pythoncaseok": "1",
+                    "PythonUserBase": str(tmp_path / "agent-poison-userbase"),
+                },
             },
         },
     }
@@ -4692,10 +4705,10 @@ def test_wrapped_child_control_command_imports_from_tool_runtime(
         line for line in generated.splitlines()
         if line.startswith("$SrcOnPyPath = ")
     )
-    rendered_tool_policy = next(
-        line for line in generated.splitlines()
-        if line.startswith("$ToolRuntimePinned = ")
-    )
+    rendered_tool_policy = generated[
+        generated.index("$ToolRuntimePinned = "):
+        generated.index("function Actions-Enabled")
+    ].rstrip()
 
     result_path = tmp_path / "child-env.json"
     harness = "\n".join([
@@ -4720,10 +4733,20 @@ def test_wrapped_child_control_command_imports_from_tool_runtime(
         "  $origin = & $env:AGENTTALK_PY -c "
         "'import agenttalk; print(agenttalk.__file__)'",
         "  if ($LASTEXITCODE -ne 0) { throw 'tool runtime import probe failed' }",
+        "  & $env:AGENTTALK_PY -c 'import JSON' 2>$null",
+        "  $caseMismatchRc = $LASTEXITCODE",
         "  @{ origin=[string]$origin; agenttalk_py=$env:AGENTTALK_PY; "
         "agenttalk_python=$env:AGENTTALK_PYTHON; "
         "tool_runtime_python=$env:AGENTTALK_TOOL_RUNTIME_PYTHON; "
-        "pythonpath=$env:PYTHONPATH } | ConvertTo-Json | "
+        "pythonpath=$env:PYTHONPATH; pythonhome=$env:PYTHONHOME; "
+        "pythonuserbase=$env:PYTHONUSERBASE; "
+        "pythonplatlibdir=$env:PYTHONPLATLIBDIR; "
+        "pythoncaseok=$env:PYTHONCASEOK; "
+        "pythonnousersite=$env:PYTHONNOUSERSITE; "
+        "pythonsafepath=$env:PYTHONSAFEPATH; "
+        "clear_keys_present=@($ToolRuntimePythonClearEnv | Where-Object { "
+        "$null -ne [Environment]::GetEnvironmentVariable($_) }).Count; "
+        "case_mismatch_rc=$caseMismatchRc } | ConvertTo-Json | "
         "Set-Content -LiteralPath $ResultPath -Encoding utf8",
         "  return [pscustomobject]@{ Id=$PID }",
         "}",
@@ -4735,8 +4758,13 @@ def test_wrapped_child_control_command_imports_from_tool_runtime(
     harness_path = tmp_path / "child-env.ps1"
     harness_path.write_text(harness, encoding="utf-8")
     env = dict(os.environ)
-    env.pop("PYTHONHOME", None)
     env["PYTHONPATH"] = str(tmp_path / "src")
+    env["PYTHONHOME"] = str(tmp_path / "poison-home")
+    env["PYTHONUSERBASE"] = str(tmp_path / "poison-userbase")
+    env["PYTHONPLATLIBDIR"] = "poison-platlib"
+    env["PYTHONCASEOK"] = "1"
+    env["PYTHONNOUSERSITE"] = "ambient"
+    env.pop("PYTHONSAFEPATH", None)
     env["AGENTTALK_PYTHON"] = sys.executable
 
     completed = subprocess.run(
@@ -4763,11 +4791,32 @@ def test_wrapped_child_control_command_imports_from_tool_runtime(
     )
     assert shim_result.returncode == 0, shim_result.stdout + shim_result.stderr
     shim_origin = Path(shim_result.stdout.strip()).resolve()
+    shim_env_command = subprocess.list2cmdline(
+        [str(store.dir / "bin" / "agenttalk.cmd"), "env"]
+    )
+    shim_env_result = subprocess.run(
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", shim_env_command],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert shim_env_result.returncode == 0, (
+        shim_env_result.stdout + shim_env_result.stderr
+    )
+    shim_environment = json.loads(shim_env_result.stdout)
     monkeypatch.setenv(
         wrapper_run.TOOL_RUNTIME_PYTHON_ENV,
         effective["tool_runtime_python"],
     )
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "src"))
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "poison-home"))
+    monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "poison-userbase"))
+    monkeypatch.setenv("PYTHONPLATLIBDIR", "poison-platlib")
+    monkeypatch.setenv("PYTHONCASEOK", "1")
+    monkeypatch.setenv("PYTHONNOUSERSITE", "ambient")
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
     child_env = wrapper_run._child_env(tmp_path)
     child_result = subprocess.run(
         [
@@ -4791,20 +4840,88 @@ def test_wrapped_child_control_command_imports_from_tool_runtime(
         == tool_python.resolve(),
         "launch_pythonpath_clean": checkout_source
         not in str(effective["pythonpath"] or "").casefold(),
+        "launch_import_env_clean": effective["clear_keys_present"] == 0,
+        "launch_case_mismatch_rejected": effective["case_mismatch_rc"] != 0,
+        "launch_user_site_disabled": effective["pythonnousersite"] == "1",
+        "launch_safe_path": effective["pythonsafepath"] == "1",
         "launch_origin": Path(effective["origin"]).resolve().is_relative_to(
             tool_package.resolve()
         ),
         "wrapped_child_origin": child_origin.is_relative_to(tool_package.resolve()),
         "shim_origin": shim_origin.is_relative_to(tool_package.resolve()),
+        "shim_import_env_clean": shim_environment["clear_present"] == [],
+        "shim_user_site_disabled": shim_environment["nousersite"] == "1",
+        "shim_safe_path": shim_environment["safepath"] == "1",
     }
     assert observed == {
         "launch_pin": True,
         "launch_shim_pin": True,
         "launch_pythonpath_clean": True,
+        "launch_import_env_clean": True,
+        "launch_case_mismatch_rejected": True,
+        "launch_user_site_disabled": True,
+        "launch_safe_path": True,
         "launch_origin": True,
         "wrapped_child_origin": True,
         "shim_origin": True,
+        "shim_import_env_clean": True,
+        "shim_user_site_disabled": True,
+        "shim_safe_path": True,
     }
+
+
+def test_pinned_preflight_restores_codex_home_when_env_isolation_throws(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"tool_runtime_python": sys.executable}),
+        encoding="utf-8",
+    )
+    generated = sup.render_artifact_bundle(
+        store,
+        python_exe=sys.executable,
+    )["supervisor.ps1"].decode("utf-8")
+    preflight_dependencies = generated[
+        generated.index("$AgenttalkPython = "):
+        generated.index("# endregion exec-helpers")
+    ]
+    result_path = tmp_path / "preflight-rollback.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        preflight_dependencies,
+        "function Enter-ToolRuntimePythonEnvironment { throw 'injected isolation failure' }",
+        "$results = @()",
+        "foreach ($case in @(",
+        "  @{ launch_mode='wrap'; cli='codex' },",
+        "  @{ launch_mode='manual'; cli='codex' }",
+        ")) {",
+        "  $env:CODEX_HOME = 'operator-home'",
+        "  $plan = [pscustomobject]$case",
+        "  $ok = Preflight 'worker' $plan 'ignored.exe' 'agent-home'",
+        "  $results += @{ ok=[bool]$ok; codex_home=$env:CODEX_HOME }",
+        "}",
+        "$results | ConvertTo-Json -Depth 4 | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ])
+    harness_path = tmp_path / "preflight-rollback.ps1"
+    harness_path.write_text(harness, encoding="utf-8-sig")
+
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads(result_path.read_text(encoding="utf-8-sig")) == [
+        {"ok": False, "codex_home": "operator-home"},
+        {"ok": False, "codex_home": "operator-home"},
+    ]
 
 
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:

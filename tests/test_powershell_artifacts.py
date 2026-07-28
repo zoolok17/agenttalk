@@ -23,6 +23,39 @@ def _mark_as_source_checkout(store: Store) -> None:
     (package / "__init__.py").write_text("", encoding="utf-8")
 
 
+def _unset_control_plane_contract(bundle: dict[str, bytes]) -> dict[str, object]:
+    """Project the behavior carried by the pre-#93 generated artifacts."""
+    script = bundle["supervisor.ps1"].decode("utf-8")
+    shim_lines = bundle["bin/agenttalk.cmd"].decode("utf-8").splitlines()
+    source_preflight = (
+        "if ($SrcOnPyPath) { $env:PYTHONPATH = "
+        "(Join-Path $Root 'src') + ';' + $env:PYTHONPATH }"
+    )
+    launch_base = (
+        "$applied = @{ AGENTTALK_ROOT = $Root; "
+        "AGENTTALK_PY = $AgenttalkPython }"
+    )
+    source_launch = (
+        "if ($SrcOnPyPath) { $applied['PYTHONPATH'] = "
+        "(Join-Path $Root 'src') + ';' + $env:PYTHONPATH }"
+    )
+    return {
+        "agenttalk_python": next(
+            line for line in script.splitlines()
+            if line.startswith("$AgenttalkPython = ")
+        ),
+        "src_on_pythonpath": next(
+            line for line in script.splitlines()
+            if line.startswith("$SrcOnPyPath = ")
+        ),
+        "source_preflight_count": script.count(source_preflight),
+        "launch_base_count": script.count(launch_base),
+        "source_launch_count": script.count(source_launch),
+        # Marker generation and checkout identity are deliberately dynamic.
+        "shim_body": shim_lines[2:],
+    }
+
+
 def test_tool_runtime_config_pins_control_plane_off_checkout(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _mark_as_source_checkout(store)
@@ -44,35 +77,61 @@ def test_tool_runtime_config_pins_control_plane_off_checkout(tmp_path: Path) -> 
     assert "$SrcOnPyPath = $false" in script
     assert f'AGENTTALK_PYTHON={tool_python}"' in shim
     assert 'set "PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%"' not in shim
+    for name in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "PYTHONPLATLIBDIR",
+        "PYTHONCASEOK",
+    ):
+        assert f'set "{name}="' in shim
+        assert f"'{name}'" in script
+    for name in ("PYTHONNOUSERSITE", "PYTHONSAFEPATH"):
+        assert f'set "{name}=1"' in shim
+        assert f"'{name}' = '1'" in script
+    assert script.count("    Add-ToolRuntimePythonEnvironment $applied") == 2
+    assert script.count(
+        "$savedToolRuntimeEnv = Enter-ToolRuntimePythonEnvironment"
+    ) == 3
 
 
-def test_tool_runtime_config_unset_preserves_checkout_generation(
+def test_tool_runtime_config_unset_matches_d5add08_control_plane_contract(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
     _mark_as_source_checkout(store)
     fallback = r"C:\Fallback Python\python.exe"
-    before = sup.render_artifact_bundle(store, python_exe=fallback)
-    (store.dir / "supervisor.json").write_text(
-        json.dumps({"poll_seconds": 17}),
-        encoding="utf-8",
+    bundle = sup.render_artifact_bundle(store, python_exe=fallback)
+    fixture = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "tool-runtime-unset-d5add08.json"
+        ).read_text(encoding="utf-8")
     )
 
-    after = sup.render_artifact_bundle(store, python_exe=fallback)
+    assert fixture["source_commit"] == (
+        "d5add08f76f59d4aa919a1e88ee656d81d940163"
+    )
+    assert _unset_control_plane_contract(bundle) == fixture["contract"]
+    script = bundle["supervisor.ps1"].decode("utf-8")
+    assert "$ToolRuntimePinned = $false" in script
+
+
+def test_tool_runtime_config_absent_and_explicit_null_are_equivalent(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _mark_as_source_checkout(store)
+    fallback = r"C:\Fallback Python\python.exe"
+    absent = sup.render_artifact_bundle(store, python_exe=fallback)
     (store.dir / "supervisor.json").write_text(
         json.dumps({"tool_runtime_python": None}),
         encoding="utf-8",
     )
     explicit_null = sup.render_artifact_bundle(store, python_exe=fallback)
 
-    assert after == before
-    assert explicit_null == before
-    script = after["supervisor.ps1"].decode("utf-8")
-    shim = after["bin/agenttalk.cmd"].decode("utf-8")
-    assert "$AgenttalkPython = 'C:\\Fallback Python\\python.exe'" in script
-    assert "$SrcOnPyPath = $true" in script
-    assert 'AGENTTALK_PYTHON=C:\\Fallback Python\\python.exe"' in shim
-    assert 'set "PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%"' in shim
+    assert explicit_null == absent
 
 
 def test_tool_runtime_generated_bundle_passes_artifact_validation(
@@ -127,7 +186,10 @@ def test_tool_runtime_config_drift_requires_artifact_refresh(
     )
     config_path.write_text(json.dumps(changed), encoding="utf-8")
 
-    with pytest.raises(sup.ArtifactValidationError, match="rendered content"):
+    with pytest.raises(
+        sup.ArtifactValidationError,
+        match="artifact generator.*tool runtime.*refresh-scripts",
+    ):
         sup.validate_artifact_bundle(store)
 
     sup.refresh_artifacts(store, python_exe=fallback)
@@ -171,6 +233,31 @@ def test_tool_runtime_config_rejects_missing_absolute_file(tmp_path: Path) -> No
     with pytest.raises(
         sup.ArtifactValidationError,
         match="must name an existing file",
+    ):
+        sup.render_artifact_bundle(store)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        r"\\server\share\python.exe",
+        r"\\?\UNC\server\share\python.exe",
+        r"\\?\C:\Python\python.exe",
+    ],
+)
+def test_tool_runtime_config_rejects_unc_and_device_paths(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    store = _store(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"tool_runtime_python": value}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        sup.ArtifactValidationError,
+        match="local.*UNC|UNC.*unsupported",
     ):
         sup.render_artifact_bundle(store)
 

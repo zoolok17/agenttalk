@@ -34,7 +34,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterable
 
 from agenttalk._atomic import write_text as _atomic_write_text
@@ -43,6 +43,10 @@ from agenttalk import health as health_model
 from agenttalk import lanes as lane_mod
 from agenttalk.store import Store, _process_alive, validate_agent_name
 from agenttalk import powershell_host as psh
+from agenttalk.python_import_env import (
+    PINNED_PYTHON_ENV_CLEAR,
+    PINNED_PYTHON_ENV_FORCE,
+)
 from agenttalk import supervisor_lifecycle as lifecycle
 from agenttalk import wrapper_runtime as runtime_obs
 
@@ -5515,7 +5519,7 @@ CONFIG_TEMPLATE = """\
   "window_style": "hidden",
   "_comment_window_style": "Windows launch window style for supervised agents: hidden (default), minimized, or normal. Per-agent entries and ephemeral allowed_profiles may override it. hidden also tells wrapped agents to create their per-turn CLI child with no visible console.",
   "tool_runtime_python": null,
-  "_comment_tool_runtime_python": "Optional absolute Python path for the stable agenttalk control plane. The installed agenttalk must contain the same artifact generator as the checkout running refresh-scripts; an older runtime rejects the new marker/body. When set, generated supervisor artifacts pin AGENTTALK_PY and the project-local shim to this interpreter and exclude checkout source from their PYTHONPATH. Remove the field (or set null), refresh scripts, and restart to restore the legacy checkout-backed behavior. Code-under-test runtime selection is separate.",
+  "_comment_tool_runtime_python": "Optional non-UNC/device absolute Python path for the stable agenttalk control plane. The installed agenttalk must contain the same artifact generator as the checkout running refresh-scripts; update a stale runtime before refreshing because refresh-scripts cannot update the interpreter. When set, generated supervisor artifacts pin AGENTTALK_PY and the project-local shim to this interpreter and exclude ambient CPython import-path overrides. Remove the field (or set null), refresh scripts, and restart to restore the functionally identical legacy checkout-backed behavior. Code-under-test runtime selection is separate.",
   "max_readiness_retries": 3,
   "_comment_max_readiness_retries": "After this many relaunches of an agent that NEVER reaches readiness (no first heartbeat - e.g. a manual resume that does not re-enter the listen loop), the supervisor STOPS relaunching and surfaces READINESS_GAVE_UP (warn/notify, no kill) instead of churning forever. Reset by a fresh heartbeat or an operator restart/clear. A WRAPPED agent avoids this class entirely (the wrapper owns the heartbeat regardless of the model prompt) - prefer wrapped for hands-off supervision.",
   "claude_permission_mode": "bypassPermissions",
@@ -5570,7 +5574,7 @@ CONFIG_TEMPLATE = """\
         "windows_args": ["{SESSION_ARGS}"],
         "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
-      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + the per-agent env). Without tool_runtime_python, a source checkout also prepends <repo>/src to PYTHONPATH (legacy/code-under-test mode); with tool_runtime_python, the control-plane environment excludes checkout PYTHONPATH. The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
+      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + the per-agent env). Without tool_runtime_python, a source checkout also prepends <repo>/src to PYTHONPATH (legacy/code-under-test mode); with tool_runtime_python, the control-plane environment excludes ambient CPython import-path overrides. The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
       "_comment_liveness": "For this MANUAL archetype heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck. The hook runs `agenttalk heartbeat --hook` (soft: it can never block a tool call). For a NON-wrapped codex agent with activity_hook=true, the supervisor adds the GLOBAL --dangerously-bypass-hook-trust to the codex launch: the installed agenttalk hook changes codex's hook-trust hash and would otherwise PROMPT to re-trust on every unattended launch and strand the agent. This bypasses hook-trust for the supervisor's OWN hook, for controlled UNATTENDED supervision only (a wrapped codex does not use the activity hook and is unaffected)."
     },
@@ -5876,6 +5880,50 @@ $cfg = Read-SupervisorConfig
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
 $SrcOnPyPath = __SRC_ON_PYPATH__
 $ToolRuntimePinned = __TOOL_RUNTIME_PINNED__
+$ToolRuntimePythonClearEnv = @(__TOOL_RUNTIME_PYTHON_CLEAR_ENV__)
+$ToolRuntimePythonForceEnv = [ordered]@{
+__TOOL_RUNTIME_PYTHON_FORCE_ENV__
+}
+
+# Keep the CPython import-origin channel class structural: every pinned
+# invocation surface consumes these same rendered sets.
+function Add-ToolRuntimePythonEnvironment([hashtable]$target) {
+  # A null value is an explicit removal instruction.  Empty is not equivalent:
+  # CPython enables presence-only controls such as PYTHONCASEOK even when their
+  # value is "".
+  foreach ($key in $ToolRuntimePythonClearEnv) { $target[$key] = $null }
+  foreach ($key in $ToolRuntimePythonForceEnv.Keys) {
+    $target[$key] = $ToolRuntimePythonForceEnv[$key]
+  }
+}
+function Enter-ToolRuntimePythonEnvironment {
+  $applied = @{}
+  Add-ToolRuntimePythonEnvironment $applied
+  $saved = @{}
+  try {
+    foreach ($key in $applied.Keys) {
+      $saved[$key] = [Environment]::GetEnvironmentVariable($key)
+      if ($null -eq $applied[$key]) {
+        Remove-Item -Path ("Env:" + $key) -ErrorAction SilentlyContinue
+      } else {
+        Set-Item -Path ("Env:" + $key) -Value $applied[$key]
+      }
+    }
+  } catch {
+    Exit-ToolRuntimePythonEnvironment $saved
+    throw
+  }
+  return $saved
+}
+function Exit-ToolRuntimePythonEnvironment([hashtable]$saved) {
+  foreach ($key in $saved.Keys) {
+    if ($null -eq $saved[$key]) {
+      Remove-Item -Path ("Env:" + $key) -ErrorAction SilentlyContinue
+    } else {
+      Set-Item -Path ("Env:" + $key) -Value $saved[$key]
+    }
+  }
+}
 
 function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }
 function Assert-ActionsEnabled([string]$what) {
@@ -6260,10 +6308,11 @@ function Preflight($name, $plan, $file, $codexHome) {
       # the pinned AGENTTALK_PY interpreter, then validate that the fixed argv tail
       # after -- names a real CLI executable instead of a shim.
       $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
-      if ($codexHome) { $env:CODEX_HOME = $codexHome }
-      if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
-      elseif ($ToolRuntimePinned) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
+      $savedToolRuntimeEnv = @{}
       try {
+        if ($codexHome) { $env:CODEX_HOME = $codexHome }
+        if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+        elseif ($ToolRuntimePinned) { $savedToolRuntimeEnv = Enter-ToolRuntimePythonEnvironment }
         & $file -m agenttalk --version | Out-Null
         $rc = $LASTEXITCODE
         if ($rc -eq 0) {
@@ -6272,7 +6321,9 @@ function Preflight($name, $plan, $file, $codexHome) {
         }
       } finally {
         if ($null -eq $saved) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $saved }
-        if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
+        if ($SrcOnPyPath) {
+          if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
+        } elseif ($ToolRuntimePinned) { Exit-ToolRuntimePythonEnvironment $savedToolRuntimeEnv }
       }
       if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped preflight (AGENTTALK_PY -m agenttalk --version) exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
       if (-not (Test-WrappedBaseCli $name)) { return $false }
@@ -6289,13 +6340,19 @@ function Preflight($name, $plan, $file, $codexHome) {
       # A genuine codex sandbox/runtime problem now surfaces at launch (no heartbeat
       # -> stale -> backoff restart) instead of bricking a good agent here.
       $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
-      if ($codexHome) { $env:CODEX_HOME = $codexHome }
-      if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
-      elseif ($ToolRuntimePinned) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
-      try { & $AgenttalkPython -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
+      $savedToolRuntimeEnv = @{}
+      try {
+        if ($codexHome) { $env:CODEX_HOME = $codexHome }
+        if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+        elseif ($ToolRuntimePinned) { $savedToolRuntimeEnv = Enter-ToolRuntimePythonEnvironment }
+        & $AgenttalkPython -m agenttalk --version | Out-Null
+        $rc = $LASTEXITCODE
+      }
       finally {
         if ($null -eq $saved) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $saved }
-        if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
+        if ($SrcOnPyPath) {
+          if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
+        } elseif ($ToolRuntimePinned) { Exit-ToolRuntimePythonEnvironment $savedToolRuntimeEnv }
       }
       if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight `AGENTTALK_PY -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
       return $true
@@ -6303,10 +6360,18 @@ function Preflight($name, $plan, $file, $codexHome) {
       # claude / generic: confirm `AGENTTALK_PY -m agenttalk` resolves with the src on
       # PYTHONPATH (the in-sandbox-robust invocation the skills use).
       $savedPP = $env:PYTHONPATH
-      if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
-      elseif ($ToolRuntimePinned) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
-      try { & $AgenttalkPython -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
-      finally { if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP } }
+      $savedToolRuntimeEnv = @{}
+      try {
+        if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+        elseif ($ToolRuntimePinned) { $savedToolRuntimeEnv = Enter-ToolRuntimePythonEnvironment }
+        & $AgenttalkPython -m agenttalk --version | Out-Null
+        $rc = $LASTEXITCODE
+      }
+      finally {
+        if ($SrcOnPyPath) {
+          if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
+        } elseif ($ToolRuntimePinned) { Exit-ToolRuntimePythonEnvironment $savedToolRuntimeEnv }
+      }
       if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight `AGENTTALK_PY -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
       return $true
     }
@@ -6385,9 +6450,13 @@ function Launch($name, $plan, $codexHome) {
     $applied['AGENTTALK_PY'] = $AgenttalkPython
     $applied['AGENTTALK_PYTHON'] = $AgenttalkPython
     $applied['AGENTTALK_TOOL_RUNTIME_PYTHON'] = $AgenttalkPython
-    $applied['PYTHONPATH'] = ''
+    Add-ToolRuntimePythonEnvironment $applied
   }
-  foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  foreach ($k in $applied.Keys) {
+    $saved[$k] = [Environment]::GetEnvironmentVariable($k)
+    if ($null -eq $applied[$k]) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
+    else { Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  }
   try {
     $cwd = if ($a.cwd) { $a.cwd } else { $Root }
     # Quote each token per Windows rules and pass ONE command-line string: a bare
@@ -6441,9 +6510,13 @@ function Launch-Spec($name, $spec, $codexHome) {
     $applied['AGENTTALK_PY'] = $AgenttalkPython
     $applied['AGENTTALK_PYTHON'] = $AgenttalkPython
     $applied['AGENTTALK_TOOL_RUNTIME_PYTHON'] = $AgenttalkPython
-    $applied['PYTHONPATH'] = ''
+    Add-ToolRuntimePythonEnvironment $applied
   }
-  foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  foreach ($k in $applied.Keys) {
+    $saved[$k] = [Environment]::GetEnvironmentVariable($k)
+    if ($null -eq $applied[$k]) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
+    else { Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  }
   try {
     $cwd = if ($spec.cwd) { $spec.cwd } else { $Root }
     if (@($argv).Count -gt 0) {
@@ -6780,17 +6853,24 @@ def agenttalk_shim(
     of console-script PATH discovery. It runs ``python -m agenttalk`` with a
     KNOWN Python (``sys.executable`` captured at init, overridable via
     AGENTTALK_PYTHON in legacy mode). The configured tool-runtime mode makes the
-    baked interpreter authoritative and clears PYTHONPATH; legacy mode prepends
-    ``<root>/src`` when this is a source checkout. The supervisor prepends
-    ``.agenttalk/bin`` to PATH before launching an agent."""
+    baked interpreter authoritative and applies the complete CPython
+    import-origin environment policy; legacy mode prepends ``<root>/src`` when
+    this is a source checkout. The supervisor prepends ``.agenttalk/bin`` to
+    PATH before launching an agent."""
     py = python_exe.replace('"', '')
     if tool_runtime_pinned:
         python_pin = f'set "AGENTTALK_PYTHON={py}"\r\n'
-        python_path = 'set "PYTHONPATH="\r\n'
+        python_environment = "".join(
+            f'set "{name}="\r\n'
+            for name in PINNED_PYTHON_ENV_CLEAR
+        ) + "".join(
+            f'set "{name}={value}"\r\n'
+            for name, value in PINNED_PYTHON_ENV_FORCE
+        )
     else:
         python_pin = f'if not defined AGENTTALK_PYTHON set "AGENTTALK_PYTHON={py}"\r\n'
         # %~dp0 = <root>\\.agenttalk\\bin\\ ; ..\\..\\src = <root>\\src
-        python_path = (
+        python_environment = (
             'if exist "%~dp0..\\..\\src\\agenttalk\\__init__.py" '
             'set "PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%"\r\n'
         )
@@ -6801,7 +6881,7 @@ def agenttalk_shim(
         "@echo off\r\n"
         "setlocal\r\n"
         + python_pin
-        + python_path
+        + python_environment
         + '"%AGENTTALK_PYTHON%" -m agenttalk %*\r\n'
     )
 
@@ -6977,8 +7057,10 @@ def _artifact_tool_runtime(
     """Resolve the generated control-plane interpreter and source policy.
 
     A configured tool runtime is authoritative over the caller's interpreter
-    and excludes checkout/ambient PYTHONPATH. Absent/null preserves the legacy
-    behavior.
+    and excludes the ambient CPython import-origin environment. UNC/device
+    path syntax is deliberately unsupported: the fleet control plane must not
+    acquire a direct UNC-share availability dependency. Absent/null preserves
+    the legacy behavior.
     """
     try:
         config = load_supervisor_config(store.dir / "supervisor.json")
@@ -7003,6 +7085,11 @@ def _artifact_tool_runtime(
         raise ArtifactValidationError(
             "supervisor config tool_runtime_python contains characters unsafe for "
             "the generated Windows command shim"
+        )
+    if PureWindowsPath(configured).drive.startswith("\\\\"):
+        raise ArtifactValidationError(
+            "supervisor config tool_runtime_python must be a non-UNC/device "
+            "absolute path; UNC and Windows device paths are unsupported"
         )
     configured_path = Path(configured)
     if not configured_path.is_absolute():
@@ -7061,6 +7148,24 @@ def _marker_placeholder_bundle(
             .replace(
                 "__TOOL_RUNTIME_PINNED__",
                 "$true" if tool_runtime_pinned else "$false",
+            )
+            .replace(
+                "__TOOL_RUNTIME_PYTHON_CLEAR_ENV__",
+                ", ".join(
+                    "'" + name.replace("'", "''") + "'"
+                    for name in PINNED_PYTHON_ENV_CLEAR
+                ),
+            )
+            .replace(
+                "__TOOL_RUNTIME_PYTHON_FORCE_ENV__",
+                "\n".join(
+                    "  '"
+                    + name.replace("'", "''")
+                    + "' = '"
+                    + value.replace("'", "''")
+                    + "'"
+                    for name, value in PINNED_PYTHON_ENV_FORCE
+                ),
             )
         )
         return text.encode("utf-8")

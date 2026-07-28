@@ -12,8 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Supervisor tool-runtime pinning now separates control commands from checkout code.**
   An optional top-level `tool_runtime_python` pins generated supervisor bus calls,
   the project-local command shim, and wrapped-child `AGENTTALK_PY` to a stable
-  installation while excluding inherited checkout `PYTHONPATH`. Leaving the field
-  unset preserves the existing checkout-backed behavior.
+  installation at a non-UNC/device path while excluding ambient CPython import redirects
+  (`PYTHONPATH`, home/user-site/platform-path overrides, and unsafe working
+  directories on Python 3.11+). Leaving the field unset is functionally
+  identical to the existing checkout-backed behavior.
 
 ## [0.79.1] - 2026-07-25
 

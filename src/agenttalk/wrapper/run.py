@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 from datetime import datetime, timezone
 
 from agenttalk import health as health_model
+from agenttalk.python_import_env import isolate_pinned_python_environment
 from agenttalk.redaction import normalize_child_output_tail
 from agenttalk.store import LEAD_LOOP_LEASE_ENV
 
@@ -594,9 +595,13 @@ def _child_env(
             raise ValueError(f"{TOOL_RUNTIME_PYTHON_ENV} must name an absolute executable")
         env["AGENTTALK_PY"] = str(tool_runtime_path.resolve())
         env["AGENTTALK_PYTHON"] = env["AGENTTALK_PY"]
-        # A checkout path inherited by the wrapper would otherwise beat the
-        # non-editable tool install even though AGENTTALK_PY is pinned.
-        env.pop("PYTHONPATH", None)
+        # The default profile copies os.environ wholesale.  Apply the shared
+        # CPython import-origin policy after that copy and after profile
+        # filtering so no ambient or injected path constructor can beat the
+        # pinned installation.  The ovh-qwen allowlist already excludes these
+        # constructors; NOUSERSITE also prevents its scoped APPDATA/profile
+        # variables from deriving a new user-site channel.
+        isolate_pinned_python_environment(env)
     else:
         env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
