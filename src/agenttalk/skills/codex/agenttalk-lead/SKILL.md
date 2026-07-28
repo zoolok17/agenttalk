@@ -356,9 +356,10 @@ first two are silent.
 2. **Never let the current directory choose which commit is pushed.** This is
    the trap:
    ```bash
-   # WRONG when run from the main checkout: HEAD is the MAIN branch,
-   # not the worker's commit. This publishes the base branch over the
-   # feature branch.
+   # WRONG when run from the main checkout: HEAD is the MAIN branch, not the
+   # worker's commit. If Git accepts it — as a fast-forward, or with force or a
+   # lease — this publishes the base branch over the feature branch. A
+   # non-fast-forward rejection here is luck, not a safeguard.
    git push origin HEAD:<branch>
    ```
    Push the **explicit full SHA**, which cannot be ambiguous about which tree

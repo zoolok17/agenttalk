@@ -79,6 +79,8 @@ SKILL_INVARIANTS = [
         "do not stall on a call that is yours",  # Independence: report, don't over-ask
         "does not protect you here",       # --force-with-lease is not a safeguard (mirror both sides)
         "descendant of whatever",          # reopen is conditional; the fallback must not be dropped
+        "status --porcelain --untracked-files=all",  # the operative clean-SHA command itself
+        "showUntrackedFiles=no",           # WHY the flag is required; the rationale must not be dropped
     ]),
     ("agenttalk.consult.md", "agenttalk-consult", [
         "AGENTTALK_SELF",
@@ -226,6 +228,67 @@ def test_sk_loop_has_no_stale_lane_names_or_default_force() -> None:
     for body, label in ((claude, "claude"), (codex, "codex")):
         present = [bad for bad in SK_LOOP_FORBIDDEN if _normalize(bad) in body]
         assert not present, f"{label} sk-loop still contains stale/forbidden: {present}"
+
+
+# ------------------------------- lead publish-a-worker-commit: semantic guards
+
+# The clean-SHA handoff check is only a check if it CAN fail. Two ways it silently
+# cannot, both of which shipped once (GH#91 -> GH#93):
+#   * a bare `status --porcelain` prints NOTHING under `status.showUntrackedFiles=no`,
+#     so a worktree full of uncommitted new files reads as clean; and
+#   * an unquoted `git -C <path>` splits on a worktree path containing spaces, so git
+#     fails BEFORE validating anything.
+# Prose probes in SKILL_INVARIANTS are cheap sentinels but they are not semantic
+# parity: a reworded section can keep every probe while deleting the operative
+# command, and reverting this fix to its immediate parent did exactly that with the
+# whole suite still green. These two guards assert the COMMAND SHAPE instead.
+
+_PORCELAIN_CALL = re.compile(r"status\s+--porcelain(?P<rest>[^\n]*)")
+_UNQUOTED_DASH_C = re.compile(r'git\s+-C\s+(?!")\S')
+
+LEAD_SKILL_PATHS = (
+    ("claude", ("claude", "agenttalk.lead.md")),
+    ("codex", ("codex", "agenttalk-lead", "SKILL.md")),
+)
+
+
+def _lead_bodies() -> list[tuple[str, str]]:
+    """RAW (un-normalized) lead skill bodies. These guards are line-oriented, so
+    they must NOT collapse newlines the way the prose probes do."""
+    out = []
+    for label, parts in LEAD_SKILL_PATHS:
+        path = SKILLS_ROOT
+        for part in parts:
+            path = path / part
+        out.append((label, path.read_text(encoding="utf-8")))
+    return out
+
+
+def test_lead_clean_sha_check_cannot_be_a_placebo() -> None:
+    """Every porcelain status check the lead skill teaches must carry
+    ``--untracked-files=all``, in BOTH mirrors."""
+    for label, raw in _lead_bodies():
+        calls = list(_PORCELAIN_CALL.finditer(raw))
+        assert calls, (
+            f"{label} lead skill no longer shows a porcelain status check at all - "
+            "the clean-SHA handoff step lost its command"
+        )
+        bare = [m.group(0) for m in calls if "--untracked-files=all" not in m.group("rest")]
+        assert not bare, (
+            f"{label} lead skill teaches a bare `status --porcelain`, which is "
+            f"silently empty under status.showUntrackedFiles=no: {bare}"
+        )
+
+
+def test_lead_worktree_paths_are_quoted() -> None:
+    """``git -C`` takes exactly ONE argument, so every occurrence in BOTH mirrors
+    must quote its path or the recipe dies on a worktree path with a space."""
+    for label, raw in _lead_bodies():
+        found = _UNQUOTED_DASH_C.search(raw)
+        assert found is None, (
+            f"{label} lead skill has an unquoted `git -C <path>` at offset "
+            f"{found.start()}: {raw[found.start():found.start() + 60]!r}"
+        )
 
 
 def _fenced_bare_agenttalk_lines(text: str) -> list[tuple[int, str]]:
