@@ -6,6 +6,7 @@ import math
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from contextlib import contextmanager
@@ -1132,6 +1133,80 @@ def test_preexisting_canonical_report_refuses_without_running_or_changing_bytes(
     assert gate["status"] == "red"
     assert artifact_name in gate["reason"]
     assert "coverage command was not run" in gate["reason"]
+
+
+@pytest.mark.subprocess
+def test_optimized_interpreter_refusal_keeps_named_path_diagnostic(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "coverage.json"
+    original = b'{"owner":"operator"}'
+    report.write_bytes(original)
+    probe = textwrap.dedent(
+        f"""
+        import json
+        import sys
+        from pathlib import Path
+
+        from agenttalk import assurance, gates
+
+        root = Path(sys.argv[1])
+        plan = assurance.ScanPlan(
+            root=root,
+            profile="release",
+            manifest={{"schema_version": 1}},
+            baseline={{"schema_version": 1, "findings": []}},
+            detection={{}},
+            provenance={{"git_sha": {REVISION!r}, "git_dirty": False}},
+            tools=[
+                {{
+                    "tool_id": "coverage",
+                    "dimension": "quality",
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; Path('coverage-command-ran').touch()",
+                    ],
+                    "timeout_seconds": 10,
+                }}
+            ],
+            run_id="optimized-refusal-test",
+        )
+        result = assurance.run_plan(plan)
+        gate = gates.load_gate_state(root)["gates"]["coverage:release"]
+        print(
+            json.dumps(
+                {{
+                    "debug": __debug__,
+                    "optimize": sys.flags.optimize,
+                    "command_ran": (root / "coverage-command-ran").exists(),
+                    "runner_errors": result.runner_errors,
+                    "gate_status": gate["status"],
+                    "gate_reason": gate["reason"],
+                }}
+            )
+        )
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-O", "-c", probe, str(tmp_path)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    observed = json.loads(completed.stdout)
+    assert observed["optimize"] == 1
+    assert observed["debug"] is False
+    assert observed["command_ran"] is False
+    assert report.read_bytes() == original
+    assert observed["gate_status"] == "red"
+    assert "coverage.json" in observed["gate_reason"]
+    assert any("coverage.json" in error for error in observed["runner_errors"])
 
 
 def test_preflight_names_all_canonical_reports_before_running(

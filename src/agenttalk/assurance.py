@@ -1443,11 +1443,8 @@ def _run_coverage_external(
     try:
         with Store(plan.root).coverage_transaction_lock(timeout=lock_timeout):
             stage = "preflight"
-            canonical_paths_clear, path_error = _classify_coverage_path_conflicts(
-                plan.root
-            )
-            if not canonical_paths_clear:
-                assert path_error is not None
+            path_error = _classify_coverage_path_conflicts(plan.root)
+            if path_error is not None:
                 plan.runner_errors.append(path_error)
                 failure_status = (
                     "error-required-tool" if spec.get("required") else "error-optional-tool"
@@ -1464,7 +1461,6 @@ def _run_coverage_external(
                     plan,
                     run,
                     "",
-                    canonical_paths_clear=False,
                     path_error=path_error,
                     failure_reason=(
                         "coverage command refused because a canonical report or "
@@ -1485,9 +1481,7 @@ def _run_coverage_external(
                 except BaseException as exc:
                     runner_exception = (exc, exc.__traceback__)
                     stage = "finishing"
-                    canonical_paths_clear, path_error = (
-                        _classify_coverage_path_conflicts(plan.root)
-                    )
+                    path_error = _classify_coverage_path_conflicts(plan.root)
                     if path_error is not None:
                         plan.runner_errors.append(path_error)
                     failure_status = (
@@ -1500,15 +1494,12 @@ def _run_coverage_external(
                         plan,
                         {"status": failure_status, "exit_code": None},
                         "",
-                        canonical_paths_clear=canonical_paths_clear,
                         path_error=path_error,
                         failure_reason=f"coverage runner failed with {type(exc).__name__}",
                     )
                 else:
                     stage = "finishing"
-                    canonical_paths_clear, path_error = (
-                        _classify_coverage_path_conflicts(plan.root)
-                    )
+                    path_error = _classify_coverage_path_conflicts(plan.root)
                     if path_error is not None:
                         plan.runner_errors.append(path_error)
                     stage = "emitting"
@@ -1516,11 +1507,10 @@ def _run_coverage_external(
                         plan,
                         run,
                         stdout,
-                        canonical_paths_clear=canonical_paths_clear,
                         path_error=path_error,
                         failure_reason=(
                             None
-                            if canonical_paths_clear
+                            if path_error is None
                             else (
                                 "a canonical report or legacy recovery path appeared "
                                 "during the coverage command; agenttalk left the "
@@ -1565,7 +1555,6 @@ def _run_coverage_external(
             plan,
             run,
             "",
-            canonical_paths_clear=False,
             path_error=detail,
             failure_reason=f"coverage transaction failed; {command_disposition}",
         )
@@ -1582,14 +1571,15 @@ def _run_coverage_external(
     return outcome
 
 
-def _classify_coverage_path_conflicts(root: Path) -> tuple[bool, str | None]:
+def _classify_coverage_path_conflicts(root: Path) -> str | None:
     """Classify the complete known report-path boundary without mutation.
 
     ``os.lstat`` classifies the two canonical root names and any branch-local
     legacy recovery root, transaction, and immediate marker/backup/unexpected
     entries. Marker contents are never read, and symlink/reparse directories
     are never traversed. Missing paths are clear; every existing or
-    uninspectable path is UNKNOWN and therefore refuses untouched.
+    uninspectable path is UNKNOWN and therefore refuses untouched. ``None``
+    means clear; every refusal is represented by its non-optional diagnostic.
     """
 
     conflicts: list[str] = []
@@ -1658,7 +1648,7 @@ def _classify_coverage_path_conflicts(root: Path) -> tuple[bool, str | None]:
                 classify(entry)
 
     if not conflicts and not inspection_errors:
-        return True, None
+        return None
 
     details: list[str] = []
     if conflicts:
@@ -1673,7 +1663,7 @@ def _classify_coverage_path_conflicts(root: Path) -> tuple[bool, str | None]:
     details.append(
         "move or remove the named paths only after verifying their ownership"
     )
-    return False, "coverage report path safety check failed (" + "; ".join(details) + ")"
+    return "coverage report path safety check failed (" + "; ".join(details) + ")"
 
 
 def _github_actions_evidence(
@@ -1798,8 +1788,7 @@ def _emit_coverage_gate(
     run: dict[str, Any],
     stdout: str,
     *,
-    canonical_paths_clear: bool,
-    path_error: str | None = None,
+    path_error: str | None,
     failure_reason: str | None = None,
 ) -> None:
     from agenttalk.store import Store
@@ -1807,6 +1796,7 @@ def _emit_coverage_gate(
     percent = parse_coverage_percent(stdout)
     command_succeeded = run.get("status") == "pass" and run.get("exit_code") == 0
     evidence_details = {"coverage_percent": float(percent)} if percent is not None else None
+    canonical_paths_clear = path_error is None
     gate_name = coverage_gate_name(plan.profile)
     with Store(plan.root).config_lock():
         state = _load_coverage_gate_state(plan.root)
