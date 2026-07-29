@@ -2,6 +2,8 @@
 
 Path: `.agenttalk/assurance.json`.
 
+Audience: contributors configuring assurance commands and close-policy coverage gates.
+
 The manifest is JSON so Python 3.10 can parse it without optional dependencies.
 Missing manifests are allowed; malformed manifests become blocking validation
 findings in the artifact.
@@ -31,13 +33,33 @@ JSON and XML reports are not parsed. The parser rejects stdout evidence over
 16 MiB, but `capture_output=True` buffers the complete subprocess stream before
 that parse-time check; capture-time bounding remains #106.
 
+Accepted coverage stdout is built-in text, or direct UTF-8 byte input with an
+optional BOM, using LF/CRLF. It must contain a coverage.py `TOTAL` row or
+pytest-cov `Total coverage:` summary with an ASCII integer or dot-decimal
+percentage. SGR color sequences with at most 32 digit, semicolon, or colon
+parameter characters may decorate the text. The final recognized summary across
+both formats wins, and the configured process must exit zero.
+
+The parser refuses bare-carriage-return progress rewrites, unsupported or
+overlong escape sequences, locale-comma decimals, malformed or out-of-range
+percentages, and direct byte input that is not UTF-8 with an optional BOM.
+Stdout and stderr are captured separately, so stderr-only summaries and their
+ordering relative to stdout are not evidence. Coverage stdout is captured as
+bytes to preserve bare CR versus CRLF, then decoded as strict UTF-8 with an
+optional BOM; undecodable output records a red tool result without aborting the
+scan. Agenttalk cannot identify an inner failed sub-run when a wrapper suppresses
+its status and exits zero. Such wrappers must propagate failures and print the
+intended aggregate summary last.
+
 Before executing the command, the scanner refuses when either canonical root
 path, `coverage.xml` or `coverage.json`, exists as any filesystem object,
 including a regular file, symlink, or directory. It names every conflicting path
 and does not run the command. If postflight observes either path after the
 command, it refuses the evidence without reading the observed object's contents,
 moving it, or removing it. A refusal produces a red automated result unless the
-persisted gate is an active operator waiver, which automated scans preserve.
+persisted gate is an active, valid operator waiver, which automated scans
+preserve. Expired, malformed, or incomplete waivers do not suppress fresh
+evidence and are invalidated red when a scan has no fresh measurement.
 Legacy recovery residue likewise causes refusal and names its root and backup
 paths for manual recovery; agenttalk never treats legacy marker contents as
 authorship, restores a backup, or removes a report. Configured commands are not
@@ -57,7 +79,7 @@ Executed proof for Windows symlink/reparse refusal remains unconfirmed: the loca
 symlink cases skip with `WinError 1314`, and CI does not explicitly grant
 symlink-creation privilege.
 
-Absent an active persisted operator waiver, fresh coverage evidence is published
+Absent an active, valid persisted operator waiver, fresh coverage evidence is published
 under the scan profile's finite producer gate: `coverage:change`,
 `coverage:release`, or `coverage:deep`. In the separate `dod.json` close policy,
 `coverage.gate` is required and must name one of those gates. It is not derived

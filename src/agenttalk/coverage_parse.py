@@ -7,6 +7,12 @@ this parse boundary. The subprocess capture is not bounded before parsing (#106)
 must not mistake this for a capture-time memory bound. Process-control ``BaseException``
 signals (for example ``KeyboardInterrupt``, ``SystemExit``, and ``GeneratorExit``)
 intentionally remain outside this contract rather than being misreported as malformed evidence.
+
+Accepted text uses LF or CRLF line endings and contains a coverage.py ``TOTAL`` row or
+pytest-cov ``Total coverage:`` summary with an ASCII integer or dot-decimal percentage.
+Bounded SGR color sequences may decorate the summary; the final recognized summary across
+both formats wins. Bare-carriage-return rewrites and every remaining terminal control fail
+closed. Direct byte input must decode as UTF-8 with an optional BOM.
 """
 
 from __future__ import annotations
@@ -19,6 +25,10 @@ __all__ = ["MAX_COVERAGE_ARTIFACT_BYTES", "parse_coverage_percent"]
 
 MAX_COVERAGE_ARTIFACT_BYTES = 16 * 1024 * 1024
 # Parse-time budget for the sole producer-controlled coverage evidence channel.
+# SGR color parameters are normally only a few characters. The explicit cap
+# keeps normalization bounded and leaves every other terminal control untrusted.
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;:]{0,32}m")
+_UNSUPPORTED_TERMINAL_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 # coverage.py / pytest-cov terminal summary: a "TOTAL" row whose last token is a percent.
 #   TOTAL                        1234    56    96%
 _TOTAL_LINE = re.compile(r"^TOTAL\b.*?(?<!\S)([0-9]+(?:\.[0-9]+)?)%\s*$", re.MULTILINE)
@@ -65,20 +75,21 @@ def _source_text(source: str | bytes) -> str | None:
 
 
 def _from_stdout(stdout: str) -> float | None:
-    """coverage.py ``TOTAL ... 96%`` or pytest-cov ``Total coverage: 87.34%``. Last match wins."""
+    """Return the final recognized summary by stream position across both formats."""
     if not _evidence_within_limit(stdout):
         return None
-    frac = None
-    matches = _TOTAL_COVERAGE.findall(stdout)
-    if matches:
-        frac = matches[-1]
-    else:
-        totals = _TOTAL_LINE.findall(stdout)
-        if totals:
-            frac = totals[-1]
-    if frac is None:
+
+    normalized = _ANSI_SGR.sub("", stdout).replace("\r\n", "\n")
+    if "\r" in normalized or _UNSUPPORTED_TERMINAL_CONTROL.search(normalized):
         return None
-    return _valid(frac)
+
+    last_match: tuple[int, str] | None = None
+    for pattern in (_TOTAL_LINE, _TOTAL_COVERAGE):
+        for match in pattern.finditer(normalized):
+            candidate = (match.end(), match.group(1))
+            if last_match is None or candidate[0] > last_match[0]:
+                last_match = candidate
+    return _valid(last_match[1]) if last_match is not None else None
 
 
 def parse_coverage_percent(stdout: str | bytes) -> float | None:
@@ -89,6 +100,8 @@ def parse_coverage_percent(stdout: str | bytes) -> float | None:
     ``coverage`` dimension HOLDs. Root JSON and XML reports are deliberately not read. For
     built-in ``str`` and ``bytes`` sources, ordinary parser exceptions are contained at this
     public boundary; process-control ``BaseException`` signals intentionally propagate.
+    Producer callers pass only stdout; stderr-only summaries, locale-comma decimals, and
+    terminal progress rewrites are outside the accepted input class.
     """
     if not isinstance(stdout, (str, bytes)) or not stdout:
         return None

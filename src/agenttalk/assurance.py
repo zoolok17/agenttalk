@@ -1309,12 +1309,15 @@ def _run_external(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str, str]:
     start = time.monotonic()
     timeout = int(spec.get("timeout_seconds") or 60)
+    # Coverage must retain bare CR versus CRLF until its fail-closed parser sees
+    # the stream; text-mode universal-newline translation destroys that evidence.
+    capture_bytes = spec.get("tool_id") == "coverage"
     raw = ""
     try:
         completed = subprocess.run(  # nosec B603 - argv list, shell disabled by default
             command,
             cwd=root,
-            text=True,
+            text=not capture_bytes,
             capture_output=True,
             timeout=timeout,
             check=False,
@@ -1345,9 +1348,35 @@ def _run_external(
             raw_log_pending=bool(raw),
         )
         return run, [], raw, stdout
-    stdout = completed.stdout or ""
-    stderr = completed.stderr or ""
-    raw = stdout + ("\n" if stdout and stderr else "") + stderr
+
+    if capture_bytes:
+        stdout_bytes = completed.stdout if isinstance(completed.stdout, bytes) else b""
+        stderr = _process_output_text(completed.stderr)
+        try:
+            stdout = stdout_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raw_stdout = _process_output_text(stdout_bytes)
+            status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+            detail = f"coverage stdout is not valid UTF-8: {exc}"
+            raw = detail + ("\n" + raw_stdout if raw_stdout else "")
+            if stderr:
+                raw += "\n" + stderr
+            run = _run_record(
+                spec,
+                status,
+                start,
+                command=command,
+                exit_code=completed.returncode,
+                raw_log_pending=True,
+            )
+            return run, [], raw, ""
+        raw_stdout = stdout
+    else:
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        raw_stdout = stdout
+
+    raw = raw_stdout + ("\n" if raw_stdout and stderr else "") + stderr
     findings = _parse_tool_findings(spec, stdout, stderr)
     if findings:
         status = _pre_baseline_status(
@@ -1394,9 +1423,11 @@ def _run_coverage_external(
     this producer can therefore make the next scan refuse (a deliberate
     false-DOWN until #107), but agenttalk never guesses that a root report is
     its own and never deletes it. Arbitrary output paths and case variants on
-    case-sensitive filesystems are outside the exact tuple boundary. Stdout is
-    bounded at the parser boundary, not while ``capture_output=True`` buffers
-    the subprocess streams (#106).
+    case-sensitive filesystems are outside the exact tuple boundary. Coverage
+    stdout is captured as bytes and decoded as strict UTF-8 so universal-newline
+    translation cannot hide a bare-carriage-return rewrite. Stdout is bounded at
+    the parser boundary, not while ``capture_output=True`` buffers the subprocess
+    streams (#106).
     """
     from agenttalk.store import Store
 
@@ -1706,6 +1737,16 @@ def _snapshot_coverage_gate(root: Path, profile: str) -> dict[str, Any] | None:
         return copy.deepcopy(existing) if isinstance(existing, dict) else None
 
 
+def _coverage_waiver_active(gate: object) -> bool:
+    if not isinstance(gate, dict) or gate.get("status") != "waived":
+        return False
+    waiver = gate.get("waiver")
+    return isinstance(waiver, dict) and gates._waiver_active(
+        waiver,
+        now=datetime.now(timezone.utc),
+    )
+
+
 def _invalidate_stale_coverage_gate(
     *,
     root: Path,
@@ -1730,7 +1771,7 @@ def _invalidate_stale_coverage_gate(
         # atomic CAS. Any intervening gate write (green, red, or waiver) wins.
         if existing != expected_gate:
             return
-        if not isinstance(existing, dict) or existing.get("status") == "waived":
+        if not isinstance(existing, dict) or _coverage_waiver_active(existing):
             return
         if (
             existing.get("status") == "red"
@@ -1771,8 +1812,8 @@ def _emit_coverage_gate(
         state = _load_coverage_gate_state(plan.root)
         existing = state.get("gates", {}).get(gate_name)
         # Automated measurements are last-write-wins only while the target is
-        # not protected by an explicit operator waiver.
-        if isinstance(existing, dict) and existing.get("status") == "waived":
+        # not protected by an active, valid operator waiver.
+        if _coverage_waiver_active(existing):
             return
         # This is a point-in-time revision + clean-worktree attestation. A
         # mutation racing the check-to-persist gap is the accepted #66/#31

@@ -32,10 +32,31 @@ Python v1:
   never auto-restores them. Configured commands are not filesystem-isolated and
   may create or modify paths while running; process containment or an
   owned-output protocol remains #107. A refusal produces a red automated result
-  unless the persisted gate is an active operator waiver, which automated scans
-  preserve. Fresh CI-attested evidence updates `coverage:<profile>` unless such
-  a waiver is active; a close policy must explicitly select that producer gate
-  rather than infer one from its close scope.
+  unless the persisted gate is an active, valid operator waiver, which automated
+  scans preserve. Fresh CI-attested evidence updates `coverage:<profile>` unless
+  such a waiver is active; a close policy must explicitly select that producer
+  gate rather than infer one from its close scope. Expired, malformed, or
+  incomplete waivers do not suppress fresh evidence and are invalidated red when
+  a scan has no fresh measurement.
+
+Accepted coverage stdout is built-in text, or direct UTF-8 byte input with an
+optional BOM, no larger than 16 MiB at the parse boundary. It uses LF/CRLF and
+must contain a coverage.py `TOTAL` row or pytest-cov `Total coverage:` summary
+with an ASCII integer or dot-decimal percentage. SGR color sequences with at
+most 32 digit, semicolon, or colon parameter characters may decorate the text.
+The final recognized summary across both formats wins, and the configured
+process must exit zero.
+
+The parser refuses bare-carriage-return progress rewrites, unsupported or
+overlong escape sequences, locale-comma decimals, malformed or out-of-range
+percentages, and direct byte input that is not UTF-8 with an optional BOM.
+Stdout and stderr are captured separately, so stderr-only summaries and their
+ordering relative to stdout are not evidence. Coverage stdout is captured as
+bytes to preserve bare CR versus CRLF, then decoded as strict UTF-8 with an
+optional BOM; undecodable output records a red tool result without aborting the
+scan. Agenttalk cannot identify an inner failed sub-run when a wrapper suppresses
+its status and exits zero. Such wrappers must propagate failures and print the
+intended aggregate summary last.
 
 The canonical coverage-path class is exactly `coverage.xml` and `coverage.json`.
 An arbitrary configured command can write another path, and the scanner neither

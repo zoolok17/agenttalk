@@ -295,6 +295,68 @@ def test_failed_coverage_command_stays_red_with_parseable_output(
     assert gate["evidence"][-1]["coverage_percent"] == 99.0
 
 
+def test_stderr_only_coverage_summary_stays_red(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "import sys; print('TOTAL 100 1 99%', file=sys.stderr)",
+            revision=revision,
+        )
+    )
+
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "coverage_percent" not in gate["evidence"][-1]
+
+
+def test_bare_carriage_return_rewrite_stays_red_through_subprocess_capture(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            (
+                "import sys; "
+                "sys.stdout.write('Total coverage: 99%\\r"
+                "progress output replaced the summary')"
+            ),
+            revision=revision,
+        )
+    )
+
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "coverage_percent" not in gate["evidence"][-1]
+
+
+def test_non_utf8_coverage_stdout_stays_red_without_aborting_scan(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "import sys; sys.stdout.buffer.write(b'TOTAL 100 1 99%\\xff')",
+            revision=revision,
+        )
+    )
+
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "coverage_percent" not in gate["evidence"][-1]
+
+
 def test_coverage_spawn_error_emits_red_gate(
     tmp_path: Path,
     monkeypatch,
@@ -567,6 +629,34 @@ def test_cli_pre_plan_failure_preserves_coverage_waiver(
     assert _coverage_gate(tmp_path, "change")["status"] == "waived"
 
 
+def test_cli_pre_plan_failure_replaces_expired_coverage_waiver(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _ci_revision(tmp_path, monkeypatch)
+    with Store(tmp_path).config_lock():
+        gates.waive_gate(
+            tmp_path,
+            name="coverage:change",
+            operator="test-operator",
+            reason="expired fixture waiver",
+            scope="change",
+            expires="2000-01-01T00:00:00Z",
+        )
+
+    def fail_detection(*_args, **_kwargs):
+        raise PermissionError("simulated detection failure")
+
+    monkeypatch.setattr(assurance, "detect_project", fail_detection)
+
+    rc = _run_assurance_cli(tmp_path)
+
+    assert rc == 1
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "red"
+    assert gate["reason"] == "no fresh coverage measurement this run"
+
+
 @pytest.mark.parametrize(
     ("script", "expected_status"),
     [
@@ -640,6 +730,69 @@ def test_completed_coverage_scan_updates_existing_nonwaived_gate(
             reason="previous measurement was red",
             revision=revision,
         )
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 100 12 88%')",
+            profile="change",
+            revision=revision,
+        )
+    )
+
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "green"
+    assert gate["updated_by"] == "assurance-ci"
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(88.0)
+
+
+def test_completed_coverage_scan_replaces_expired_waiver(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    with Store(tmp_path).config_lock():
+        gates.waive_gate(
+            tmp_path,
+            name="coverage:change",
+            operator="test-operator",
+            reason="expired fixture waiver",
+            scope="change",
+            expires="2000-01-01T00:00:00Z",
+        )
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 100 12 88%')",
+            profile="change",
+            revision=revision,
+        )
+    )
+
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "green"
+    assert gate["updated_by"] == "assurance-ci"
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(88.0)
+
+
+def test_completed_coverage_scan_replaces_invalid_waiver(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    with Store(tmp_path).config_lock():
+        gates.waive_gate(
+            tmp_path,
+            name="coverage:change",
+            operator="test-operator",
+            reason="fixture waiver that will be invalidated",
+            scope="change",
+            expires="2099-01-01T00:00:00Z",
+        )
+        state = gates.load_gate_state(tmp_path)
+        state["gates"]["coverage:change"]["waiver"]["operator"] = ""
+        gates.write_gate_state(tmp_path, state)
 
     assurance.run_plan(
         _plan(
@@ -1493,7 +1646,9 @@ def test_git_status_error_is_unknown_and_cannot_attest(
         ("TOTAL 10 0 1100%", None),
         ("TOTAL 10 0 999%", None),
         ("TOTAL 10 0 12x34%", None),
+        ("TOTAL 10 0 87,34%", None),
         ("TOTAL 10 0 96%", 96.0),
+        ("Total coverage: 87,34%", None),
         ("Total coverage: 87.34%", 87.34),
     ],
 )
@@ -1507,6 +1662,86 @@ def test_stdout_percent_parser_consumes_the_full_token(
         assert actual is None
     else:
         assert actual == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        (
+            "\x1b[32mTOTAL\x1b[0m 100 12 \x1b[1;32m88%\x1b[0m",
+            88.0,
+        ),
+        (
+            "\x1b[36mTotal coverage:\x1b[0m \x1b[1;36m87.34%\x1b[0m",
+            87.34,
+        ),
+    ],
+    ids=["coverage-total-row", "pytest-cov-total-coverage"],
+)
+def test_coverage_parser_accepts_bounded_ansi_sgr_decoration(
+    stdout: str,
+    expected: float,
+) -> None:
+    assert parse_coverage_percent(stdout) == pytest.approx(expected)
+
+
+def test_ansi_sgr_decoration_does_not_create_a_coverage_summary() -> None:
+    stdout = "\x1b[32mcoverage command completed at 99%\x1b[0m"
+
+    assert parse_coverage_percent(stdout) is None
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "\x1b[2K Total coverage: 99%",
+        "\x9b2K Total coverage: 99%",
+        f"\x1b[{'1;' * 17}31m Total coverage: 99%",
+    ],
+    ids=["non-sgr-control", "c1-control", "overlong-sgr"],
+)
+def test_coverage_parser_rejects_unsupported_ansi_sequences(stdout: str) -> None:
+    assert parse_coverage_percent(stdout) is None
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        (
+            "Total coverage: 99%\nTOTAL 100 50 50%",
+            50.0,
+        ),
+        (
+            "TOTAL 100 50 50%\nTotal coverage: 99%",
+            99.0,
+        ),
+    ],
+    ids=["coverage-row-last", "pytest-cov-summary-last"],
+)
+def test_coverage_parser_uses_last_summary_across_supported_formats(
+    stdout: str,
+    expected: float,
+) -> None:
+    assert parse_coverage_percent(stdout) == pytest.approx(expected)
+
+
+def test_coverage_parser_does_not_fallback_from_invalid_final_summary() -> None:
+    stdout = "Total coverage: 99%\nTOTAL 100 50 101%"
+
+    assert parse_coverage_percent(stdout) is None
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_coverage_parser_accepts_newline_delimited_summary(line_ending: str) -> None:
+    stdout = f"coverage output{line_ending}TOTAL 100 50 50%{line_ending}"
+
+    assert parse_coverage_percent(stdout) == pytest.approx(50.0)
+
+
+def test_coverage_parser_rejects_bare_carriage_return_rewrites() -> None:
+    stdout = "Total coverage: 99%\rprogress output replaced the summary"
+
+    assert parse_coverage_percent(stdout) is None
 
 
 @pytest.mark.parametrize("as_bytes", [False, True], ids=["str", "bytes"])

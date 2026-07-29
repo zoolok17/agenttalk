@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses before running when either canonical root path, `coverage.xml` or
   `coverage.json`, already exists, including a symlink or directory. If either path
   is observed during postflight, agenttalk does not read its contents, move it, or
-  remove it and records a red automated result; an active persisted operator waiver
+  remove it and records a red automated result; an active, valid persisted operator waiver
   remains unchanged. Concurrent scans serialize preflight, execution, postflight,
   and gate emission, but agenttalk never consumes, deletes, quarantines, or restores
   either report path. Configured commands are not filesystem-isolated and may
@@ -31,10 +31,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proof for Windows symlink/reparse refusal remains unconfirmed: the local symlink cases
   skip with `WinError 1314`, and CI does not explicitly grant symlink-creation privilege.
   The stdout parser rejects evidence over 16 MiB, but subprocess `capture_output=True`
-  still buffers the complete stream before that parse-time bound (#106). DoD coverage
-  policy explicitly selects one of the finite `coverage:change`, `coverage:release`, or
-  `coverage:deep` producer gates. Coverage-gate finalization failures are bounded CLI
-  failures and no longer escape, mask an earlier scan failure, or print a false success.
+  still buffers the complete stream before that parse-time bound (#106). The accepted
+  parser class is built-in text, or direct UTF-8 byte input with an optional BOM, using
+  LF/CRLF and containing a coverage.py `TOTAL` row or pytest-cov `Total coverage:`
+  summary with an ASCII integer or dot-decimal percentage. Bounded SGR color decoration
+  is removed, and the final recognized match across both formats wins.
+  Bare-carriage-return rewrites, unsupported or overlong terminal escapes, locale-comma
+  decimals, and stderr-only summaries fail closed. Coverage stdout is captured as bytes,
+  preserving bare CR versus CRLF, and decoded as strict UTF-8 with an optional BOM;
+  undecodable output records a red tool result without aborting the scan. The configured
+  process must exit zero; agenttalk cannot observe an inner failed sub-run whose wrapper
+  suppresses its status, so wrappers must propagate failures and print the intended
+  aggregate summary last. Only an active, valid operator waiver suppresses automated writes:
+  expired, malformed, or incomplete waivers are replaced by fresh evidence or invalidated
+  red when no fresh measurement exists. DoD coverage policy explicitly selects one of the
+  finite `coverage:change`, `coverage:release`, or `coverage:deep` producer gates.
+  Coverage-gate finalization failures are bounded CLI failures and no longer escape, mask
+  an earlier scan failure, or print a false success.
 
 ## [0.79.1] - 2026-07-25
 
