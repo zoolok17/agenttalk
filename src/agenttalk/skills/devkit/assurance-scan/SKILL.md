@@ -36,6 +36,34 @@ Profiles:
   generated executable artifact evidence.
 - `deep`: a broader evidence profile for explicit manual use.
 
+When a configured coverage command yields a fresh CI-attested measurement, each profile emits
+exactly one blocker gate with the matching producer identity: `coverage:change`,
+`coverage:release`, or `coverage:deep`. A close scope is a separate policy axis; a `dod.json`
+coverage requirement must explicitly select one of those three gate names instead of deriving a
+gate from the close scope. This lets `feature`, `milestone`, `hotfix`, and custom close scopes
+choose the scan depth they require without creating a gate no scan can emit.
+
+For example, a feature close can require release-depth coverage evidence:
+
+```json
+{
+  "schema_version": 1,
+  "scopes": {
+    "feature": {
+      "coverage": {
+        "gate": "coverage:release",
+        "min_percent": 80,
+        "max_age_days": 14
+      }
+    }
+  }
+}
+```
+
+Fractional `min_percent` values are decoded exactly and normalized only at or
+above the configured floor; policy conversion never lowers the threshold
+toward passing.
+
 Missing optional tools are recorded as `skipped-not-installed` plus residual
 risk. Missing required tools are recorded as gate-visible evidence in the
 artifact. Network-dependent tools are `skipped-network-disabled` unless the

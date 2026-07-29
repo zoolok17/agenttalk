@@ -2,6 +2,8 @@
 
 Path: `.agenttalk/assurance.json`.
 
+Audience: contributors configuring assurance commands and close-policy coverage gates.
+
 The manifest is JSON so Python 3.10 can parse it without optional dependencies.
 Missing manifests are allowed; malformed manifests become blocking validation
 findings in the artifact.
@@ -24,6 +26,142 @@ Optional top-level fields:
 - `monorepo.packages`: list of child package descriptors.
 - `python.package` or `python.packages`: package imports to resolve for
   provenance.
+
+A custom `coverage` command must print a recognized coverage.py or pytest-cov
+terminal summary on stdout. Stdout is the sole coverage-evidence channel; root
+JSON and XML reports are not parsed. The parser rejects stdout evidence over
+16 MiB, but `capture_output=True` buffers the complete subprocess stream before
+that parse-time check; capture-time bounding remains #106.
+
+Accepted coverage stdout is built-in text, or direct UTF-8 byte input with an
+optional BOM, using LF/CRLF. After bounded SGR removal, a recognized summary
+must occupy one complete line with optional horizontal indentation. A
+coverage.py `TOTAL` row has exactly two ASCII unsigned-integer count columns
+(`Stmts Miss`) or four (`Stmts Miss Branch BrPart`) before the final ASCII
+integer/dot-decimal percentage. For a two-count row, all three numeric values
+participate: `Miss` cannot exceed `Stmts`, and the percentage must equal
+coverage.py's configured-precision rendering of the covered-statement ratio
+(`Stmts=0` renders `100`). For a four-count row, all five displayed values
+participate. `Miss` cannot exceed `Stmts`, `BrPart` cannot exceed `Branch`, and
+the percentage must be possible for some total number of missing branch arcs.
+That total is not printed: `BrPart` counts only missing arcs whose source
+statement ran. The parser therefore uses coverage.py's count relationships to
+model the hidden total rather than treating `BrPart` as every missing branch.
+Each branch source contributes at least two arcs. Hidden misses beyond `BrPart`
+therefore require a distinct unexecuted branch source and add either zero
+(`no branch`) or at least two arcs; the displayed percentage must be possible
+in one of those aggregate-feasible ranges. A positive `BrPart` also requires at
+least one executed statement. The model includes both producer-real endpoints:
+`no branch` arcs can reduce the hidden total, and a condition that raises after
+its source statement executes can make `BrPart` equal `Branch`.
+
+Pytest-cov's native success line is
+`Required test coverage of <required>% reached. Total coverage: <actual>%`;
+its native failure line is
+`FAIL Required test coverage of <required>% not reached. Total coverage: <actual>%`.
+For those native forms, `required` is an ASCII integer/dot decimal with an
+optional decimal exponent of at most four digits, whose parsed float is in
+`(0, 100]`; `actual` is a two-decimal ASCII value in `[0, 100]`. Both are
+captured. Pytest-cov compares an unrounded total and then displays `actual` with
+`.2f`, so the sentence is accepted only when its reached/not-reached
+relationship is possible under the same float comparison and ties-to-even
+formatting. Success is bounded by the `.2f` rendering of the parsed requirement;
+failure is bounded by the rendering of its immediate float predecessor. An
+impossible final native sentence refuses all evidence rather than exposing an
+earlier summary.
+A complete legacy/custom `Total coverage: <actual>%` line is also accepted.
+It captures one number and therefore has no cross-field relationship to check.
+Only horizontal whitespace may follow any form, so incidental prose containing
+familiar words is refused. SGR color sequences may contain at most 32 digit,
+semicolon, or colon parameter characters. The final structurally recognized
+summary across all forms wins.
+
+Displayed percentage tokens are parsed as exact decimals before
+JSON-compatible float attestation. If nearest-float conversion would serialize
+above the exact token, the attested value steps down one representable float
+(or refuses if it still cannot prove a non-overstatement). Conversion can
+therefore conservatively understate the displayed token but cannot cross a
+configured floor toward passing. This does not recover precision already lost
+by the producer. Coverage.py count consistency uses its configured-precision
+ties-to-even rendering, including its rule that only exact zero or exact 100
+can display those endpoints. Pytest-cov's `.2f` display can exceed its
+unrounded total by at most `0.005` percentage points. Scientific notation is
+accepted only for the native pytest-cov requirement, with the bounded exponent
+above; actual-coverage and legacy/custom tokens remain integer/dot-decimal only.
+Coverage process success requires exit zero without timeout, spawn, or
+stdout-decoding failure. Scanner-shaped JSON in coverage stdout is retained as
+raw diagnostic text, not interpreted as generic assurance findings.
+
+The parser refuses bare-carriage-return progress rewrites, unsupported or
+overlong escape sequences, locale-comma decimals, malformed or out-of-range
+percentages, and direct byte input that is not UTF-8 with an optional BOM.
+Stdout and stderr are captured separately, so stderr-only summaries and their
+ordering relative to stdout are not evidence. Coverage stdout is captured as
+bytes to preserve bare CR versus CRLF, then decoded as strict UTF-8 with an
+optional BOM; undecodable output records a red tool result without aborting the
+scan. Agenttalk cannot identify an inner failed sub-run when a wrapper suppresses
+its status and exits zero. Such wrappers must propagate failures and print the
+intended aggregate summary last.
+
+Before executing the command, the scanner refuses when either canonical root
+path, `coverage.xml` or `coverage.json`, exists as any filesystem object,
+including a regular file, symlink, or directory. It names every conflicting path
+and does not run the command. If postflight observes either path after the
+command, it refuses the evidence without reading the observed object's contents,
+moving it, or removing it. A refusal produces a red automated result unless the
+persisted gate is an active, valid operator waiver, which automated scans
+preserve. Expired, malformed, or incomplete waivers do not suppress fresh
+evidence and are invalidated red when a scan has no fresh measurement.
+Legacy recovery residue likewise causes refusal and names its root and backup
+paths for manual recovery; agenttalk never treats legacy marker contents as
+authorship, restores a backup, or removes a report. Configured commands are not
+filesystem-isolated: they may create or modify paths while running. Process
+containment or an owned-output protocol remains #107.
+
+The recognized path class is exactly `coverage.xml` and `coverage.json`. An
+arbitrary custom command can write another path, and agenttalk neither discovers,
+parses, nor cleans it. Case variants are outside the class on case-sensitive
+filesystems. A producer descendant can also create a canonical path after
+postflight, making a later scan refuse until an operator removes it. This
+deliberate false-DOWN remains until #107 provides owned-output containment and is
+preferred to guessing ownership and deleting operator data. Any coverage command
+that spawns subprocesses can plausibly trigger this on an ordinary setup; until
+#107, the operator remedy is to inspect and manually clean up the named path.
+Executed proof for Windows symlink/reparse refusal remains unconfirmed: the local
+symlink cases skip with `WinError 1314`, and CI does not explicitly grant
+symlink-creation privilege.
+
+Absent an active, valid persisted operator waiver, fresh coverage evidence is published
+under the scan profile's finite producer gate: `coverage:change`,
+`coverage:release`, or `coverage:deep`. In the separate `dod.json` close policy,
+`coverage.gate` is required and must name one of those gates. It is not derived
+from the close scope.
+
+Example `.agenttalk/dod.json`:
+
+```json
+{
+  "schema_version": 1,
+  "scopes": {
+    "feature": {
+      "coverage": {
+        "gate": "coverage:release",
+        "min_percent": 80,
+        "max_age_days": 14
+      }
+    }
+  }
+}
+```
+
+`coverage.min_percent` is the only fractional numeric DoD policy field. JSON
+fractions are decoded exactly, then normalized to a JSON-compatible float that
+is equal to or stricter than the configured value; an unrepresentable floor can
+move upward but never downward toward passing. `schema_version`,
+`assurance.max_age_days`, `coverage.max_age_days`, `knowledge.min_notes`, and
+`knowledge.min_body_chars` are integer-only and JSON preserves them exactly.
+Derived evidence ages round away from the fresh interval, so float conversion
+cannot make a stale or future timestamp pass an integer `max_age_days` floor.
 
 Unknown top-level manifest keys are validation errors. Unknown keys inside
 `profiles.<profile>` are also validation errors; the profile namespace is limited

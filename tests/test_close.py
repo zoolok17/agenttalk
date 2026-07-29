@@ -16,6 +16,8 @@ through to the pinned-SHA branch and `_worktree_clean` reports None -> clean.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import json
 from pathlib import Path
 import threading
@@ -967,7 +969,7 @@ def test_validate_dod_policy_allows_absent_max_age() -> None:
     {"schema_version": True, "scopes": {}},
     {"schema_version": 1, "scopes": "nope"},
     {"schema_version": 1, "scopes": {"release": "nope"}},
-    {"schema_version": 1, "scopes": {"release": {"coverage": {"floor_pct": 70}}}},  # unsupported
+    {"schema_version": 1, "scopes": {"release": {"coverage": {"floor_pct": 70}}}},  # unknown key
     {"schema_version": 1, "scopes": {"release": {"assurance": {}}}},                # missing gate
     {"schema_version": 1, "scopes": {"release": {"assurance": {"gate": ""}}}},      # empty gate
     {"schema_version": 1, "scopes": {"release": {"assurance": {"gate": "g",
@@ -1304,6 +1306,454 @@ def test_evaluate_dod_assurance_revisionless_waiver_does_not_clear() -> None:
     # (Codex re-review of 848841a, BLOCKER). Authenticated operator escape = task #65.
     a = _assurance_bundle(status="waived", waiver_active=True, revision=None)
     assert close.HOLD_MISSING_ASSURANCE in _dcodes(close.evaluate_dod(_satisfied(), _dod_eval(a)))
+
+
+# ============================================================= #60 inc-3: coverage dimension
+
+def _coverage_bundle(**over) -> dict:
+    """A fully satisfied coverage gate bundle. Override fields for fail-closed variants."""
+    b = {
+        "gate": "coverage:release",
+        "present": True,
+        "status": "green",
+        "severity": "blocker",
+        "evidence_source": "automation_ci",
+        "revision": SHA,
+        "waiver_active": False,
+        "gate_scope": "release",
+        "coverage_percent": 85.0,
+        "min_percent": 80.0,
+        "age_days": 1.0,
+        "max_age_days": 14,
+    }
+    b.update(over)
+    return b
+
+
+def _dod_eval_c(coverage: dict | None) -> dict:
+    return {
+        "policy_present": True,
+        "policy_error": None,
+        "required_dimensions": {
+            "coverage": {
+                "gate": "coverage:release",
+                "min_percent": 80.0,
+                "max_age_days": 14,
+            },
+        },
+        "coverage": coverage,
+    }
+
+
+@pytest.mark.parametrize("min_percent", [0, 0.0, 72, 72.5, 100, 100.0])
+def test_validate_dod_coverage_spec_roundtrips_numeric_floor(min_percent) -> None:
+    pol = close.validate_dod_policy({
+        "schema_version": 1,
+        "scopes": {
+            "Release": {
+                "coverage": {
+                    "gate": "coverage:release",
+                    "min_percent": min_percent,
+                }
+            }
+        },
+    })
+    assert pol["scopes"]["release"]["coverage"] == {
+        "gate": "coverage:release",
+        "min_percent": min_percent,
+        "max_age_days": None,
+    }
+
+
+@pytest.mark.parametrize("spec", [
+    {},
+    {"gate": [], "min_percent": 80},
+    {"gate": "", "min_percent": 80},
+    {"gate": "coverage:Release", "min_percent": 80},
+    {"gate": "coverage:unknown", "min_percent": 80},
+    {"gate": "coverage:release", "min_percent": None},
+    {"gate": "coverage:release", "min_percent": True},
+    {"gate": "coverage:release", "min_percent": "80"},
+    {"gate": "coverage:release", "min_percent": -0.01},
+    {"gate": "coverage:release", "min_percent": 100.01},
+    {"gate": "coverage:release", "min_percent": float("nan")},
+    {"gate": "coverage:release", "min_percent": float("inf")},
+    {"gate": "coverage:release", "min_percent": 10 ** 1000},
+    {"gate": "coverage:release", "min_percent": 80, "max_age_days": True},
+    {"gate": "coverage:release", "min_percent": 80, "max_age_days": -1},
+    {"gate": "coverage:release", "min_percent": 80, "max_age_days": 1.5},
+    {"gate": "coverage:release", "min_percent": 80, "minimum_percent": 70},
+])
+def test_validate_dod_coverage_spec_malformed_or_unknown_key_raises(spec) -> None:
+    with pytest.raises(close.CloseError):
+        close.validate_dod_policy({
+            "schema_version": 1,
+            "scopes": {"release": {"coverage": spec}},
+        })
+
+
+def test_evaluate_dod_coverage_satisfied_is_empty() -> None:
+    assert close.evaluate_dod(_satisfied(), _dod_eval_c(_coverage_bundle())) == []
+
+
+@pytest.mark.parametrize(
+    ("floor_token", "coverage_percent", "expected_codes"),
+    [
+        ("80.000000000000000001", 80.0, {close.HOLD_LOW_COVERAGE}),
+        ("80.000000000000000001", 80.00000000000001, set()),
+        ("80", 80.0, set()),
+        ("80", 85.0, set()),
+        ("80.1", 80.1, set()),
+    ],
+    ids=[
+        "exact-floor-above-measurement",
+        "exact-floor-below-representable-measurement",
+        "normal-floor-at-threshold",
+        "normal-floor-legitimately-above-threshold",
+        "normal-fractional-floor-at-threshold",
+    ],
+)
+def test_loaded_coverage_floor_never_rounds_down_toward_passing(
+    tmp_path: Path,
+    floor_token: str,
+    coverage_percent: float,
+    expected_codes: set[str],
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    close.dod_policy_path(store).write_text(
+        '{"schema_version":1,"scopes":{"release":{"coverage":'
+        '{"gate":"coverage:release","min_percent":'
+        f"{floor_token}"
+        ',"max_age_days":14}}}}',
+        encoding="utf-8",
+    )
+
+    policy, error = close.load_dod_policy(store)
+
+    assert error is None
+    assert policy is not None
+    required = close.derive_required_dod(policy, "release")["dimensions"]["coverage"]
+    assert Decimal(str(required["min_percent"])) >= Decimal(floor_token)
+    dod_eval = _dod_eval_c(_coverage_bundle(coverage_percent=coverage_percent))
+    dod_eval["required_dimensions"]["coverage"] = required
+    holds = close.evaluate_dod(_satisfied(), dod_eval)
+    assert _dcodes(holds) == expected_codes
+    if expected_codes:
+        assert repr(coverage_percent) in holds[0][1]
+        assert repr(required["min_percent"]) in holds[0][1]
+
+
+@pytest.mark.parametrize(
+    ("required_gate", "resolved_gate", "resolved_scope"),
+    [
+        ("coverage:release", "coverage:change", "change"),
+        ("coverage:deep", "coverage:release", "release"),
+    ],
+)
+def test_evaluate_dod_coverage_cannot_substitute_a_different_producer_gate(
+    required_gate,
+    resolved_gate,
+    resolved_scope,
+) -> None:
+    dod_eval = _dod_eval_c(
+        _coverage_bundle(gate=resolved_gate, gate_scope=resolved_scope)
+    )
+    dod_eval["required_dimensions"]["coverage"]["gate"] = required_gate
+
+    holds = close.evaluate_dod(_satisfied(), dod_eval)
+
+    assert _dcodes(holds) == {close.HOLD_MISSING_COVERAGE}
+
+
+@pytest.mark.parametrize("coverage", [
+    None,
+    "malformed",
+    [],
+    _coverage_bundle(present=False),
+    _coverage_bundle(present="yes"),
+    _coverage_bundle(status="red"),
+    _coverage_bundle(status="skipped"),
+    _coverage_bundle(status="waived", waiver_active=True),
+    _coverage_bundle(severity="warn"),
+    _coverage_bundle(evidence_source="manual_review"),
+    _coverage_bundle(revision=OTHER_SHA),
+    _coverage_bundle(gate=None),
+    _coverage_bundle(gate=[]),
+    _coverage_bundle(gate="coverage:unknown"),
+    _coverage_bundle(gate_scope="feature"),
+    _coverage_bundle(gate_scope=None),
+    _coverage_bundle(coverage_percent=None),
+    _coverage_bundle(coverage_percent=True),
+    _coverage_bundle(coverage_percent="85"),
+    _coverage_bundle(coverage_percent=float("nan")),
+    _coverage_bundle(coverage_percent=float("inf")),
+    _coverage_bundle(coverage_percent=10 ** 1000),
+    _coverage_bundle(coverage_percent=-1),
+    _coverage_bundle(coverage_percent=101),
+])
+def test_evaluate_dod_coverage_unusable_evidence_holds_missing(coverage) -> None:
+    holds = close.evaluate_dod(_satisfied(), _dod_eval_c(coverage))
+    assert _dcodes(holds) == {close.HOLD_MISSING_COVERAGE}
+
+
+def test_evaluate_dod_coverage_low_percent_holds_low() -> None:
+    holds = close.evaluate_dod(
+        _satisfied(), _dod_eval_c(_coverage_bundle(coverage_percent=79.99)))
+    assert _dcodes(holds) == {close.HOLD_LOW_COVERAGE}
+
+
+@pytest.mark.parametrize(
+    "age_days", [None, "invalid", float("nan"), float("inf"), -1.0, 14.01, 10 ** 1000])
+def test_evaluate_dod_coverage_freshness_fails_closed(age_days) -> None:
+    holds = close.evaluate_dod(
+        _satisfied(), _dod_eval_c(_coverage_bundle(age_days=age_days)))
+    assert _dcodes(holds) == {close.HOLD_STALE_COVERAGE}
+
+
+def test_evaluate_dod_coverage_no_max_age_skips_freshness() -> None:
+    ev = _dod_eval_c(_coverage_bundle(age_days=None, max_age_days=None))
+    ev["required_dimensions"]["coverage"]["max_age_days"] = None
+    assert close.evaluate_dod(_satisfied(), ev) == []
+
+
+def test_derived_age_never_rounds_toward_passing_extreme_freshness_floor() -> None:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    updated_at = (now - timedelta(days=200_000, microseconds=1)).isoformat()
+    future_at = (now + timedelta(days=200_000, microseconds=1)).isoformat()
+
+    age_days = cli._iso_age_days(updated_at, now)
+    future_age_days = cli._iso_age_days(future_at, now)
+
+    assert age_days is not None
+    assert age_days > 200_000
+    assert future_age_days is not None
+    assert future_age_days < -200_000
+    dod_eval = _dod_eval_c(
+        _coverage_bundle(age_days=age_days, max_age_days=200_000)
+    )
+    dod_eval["required_dimensions"]["coverage"]["max_age_days"] = 200_000
+    assert _dcodes(close.evaluate_dod(_satisfied(), dod_eval)) == {
+        close.HOLD_STALE_COVERAGE
+    }
+
+
+def test_evaluate_dod_coverage_waiver_never_clears() -> None:
+    for revision in (SHA, OTHER_SHA, None):
+        coverage = _coverage_bundle(
+            status="waived",
+            waiver_active=True,
+            evidence_source="operator_waiver",
+            revision=revision,
+        )
+        holds = close.evaluate_dod(_satisfied(), _dod_eval_c(coverage))
+        assert _dcodes(holds) == {close.HOLD_MISSING_COVERAGE}
+
+
+def test_evaluate_dod_coverage_matching_or_global_scope_clears() -> None:
+    for gate_scope in ("release", "global"):
+        coverage = _coverage_bundle(gate_scope=gate_scope)
+        assert close.evaluate_dod(_satisfied(), _dod_eval_c(coverage)) == []
+
+
+def test_compute_verdict_unmet_coverage_flips_go_to_hold() -> None:
+    result = close.compute_verdict(
+        _satisfied(),
+        _gate_go(),
+        None,
+        None,
+        _dod_eval_c(_coverage_bundle(present=False)),
+    )
+    assert result["verdict"] == close.VERDICT_HOLD
+    assert _codes(result) == {close.HOLD_MISSING_COVERAGE}
+
+
+def test_compute_verdict_satisfied_coverage_stays_go() -> None:
+    result = close.compute_verdict(
+        _satisfied(), _gate_go(), None, None, _dod_eval_c(_coverage_bundle()))
+    assert result["verdict"] == close.VERDICT_GO
+    assert result["holds"] == []
+
+
+def _write_coverage_dod(root: Path, *, min_percent: float = 80.0,
+                        max_age_days: int | None = 14) -> None:
+    close.dod_policy_path(Store(root)).write_text(json.dumps({
+        "schema_version": 1,
+        "scopes": {
+            "release": {
+                "coverage": {
+                    "gate": "coverage:release",
+                    "min_percent": min_percent,
+                    "max_age_days": max_age_days,
+                },
+            },
+        },
+    }), encoding="utf-8")
+
+
+def _set_coverage_gate(root: Path, *, percent: object, revision: str = SHA,
+                       scope: str = "release") -> None:
+    gates.set_gate(
+        root,
+        name="coverage:release",
+        status="green",
+        severity="blocker",
+        scope=scope,
+        actor="ci",
+        evidence_source="automation_ci",
+        evidence=["run:coverage-123"],
+        revision=revision,
+    )
+    state = gates.load_gate_state(root)
+    # The producer stores coverage_percent in the gate's latest EVIDENCE entry (via
+    # set_gate evidence_details), NOT top-level. Inject it there directly so this helper can
+    # still exercise invalid values for the fail-closed tests (real set_gate would reject them).
+    g = state["gates"]["coverage:release"]
+    entries = g.get("evidence")
+    if not isinstance(entries, list) or not entries:
+        entries = [{"source": "automation_ci", "refs": ["run:coverage-123"]}]
+    entries[-1]["coverage_percent"] = percent
+    g["evidence"] = entries
+    gates.write_gate_state(root, state)
+
+
+def test_resolve_dod_coverage_gate_reads_producer_evidence_seam(tmp_path: Path) -> None:
+    # Producer↔consumer contract (#60 inc-3 integration): the producer writes the percent via the
+    # REAL gates.set_gate(evidence_details={"coverage_percent": ...}) path (→ latest evidence
+    # entry). Prove the floor resolver reads it from there, not top-level.
+    root = _init(tmp_path)
+    gates.set_gate(
+        root, name="coverage:release", status="green", severity="blocker", scope="release",
+        actor="ci", evidence_source="automation_ci", evidence=["run:cov-1"], revision=SHA,
+        evidence_details={"coverage_percent": 91.0})
+    resolved = cli._resolve_dod_coverage_gate(
+        Store(root),
+        {"gate": "coverage:release", "min_percent": 80.0, "max_age_days": 14},
+        _satisfied(),
+    )
+    assert resolved["present"] is True
+    assert resolved["coverage_percent"] == 91.0          # read from the evidence entry
+    assert resolved["evidence_source"] == "automation_ci" and resolved["revision"] == SHA
+    assert resolved["min_percent"] == 80.0 and isinstance(resolved["age_days"], float)
+
+
+def test_resolve_dod_coverage_gate_no_backtrack_to_stale_percent(tmp_path: Path) -> None:
+    # reviewer-1 #60 inc-3: a later percent-less GREEN must NOT inherit an older entry's percent.
+    # green@A(95) -> red@B -> green@B(no percent): resolver must read only the latest entry -> None.
+    root = _init(tmp_path)
+    gates.set_gate(root, name="coverage:release", status="green", severity="blocker",
+                   scope="release", actor="ci", evidence_source="automation_ci",
+                   evidence=["run:A"], revision=SHA, evidence_details={"coverage_percent": 95.0})
+    gates.set_gate(root, name="coverage:release", status="red", severity="blocker",
+                   scope="release", actor="ci", evidence_source="automation_ci",
+                   evidence=["run:B-red"], revision=OTHER_SHA)
+    gates.set_gate(root, name="coverage:release", status="green", severity="blocker",
+                   scope="release", actor="ci", evidence_source="automation_ci",
+                   evidence=["run:B-green"], revision=OTHER_SHA)  # green, NO coverage_percent
+    resolved = cli._resolve_dod_coverage_gate(
+        Store(root),
+        {"gate": "coverage:release", "min_percent": 80.0, "max_age_days": 14},
+        _satisfied(),
+    )
+    assert resolved["coverage_percent"] is None   # NOT 95.0 from the stale A entry
+
+
+def test_resolve_dod_coverage_gate_reads_own_fields(tmp_path: Path) -> None:
+    root = _init(tmp_path)
+    _set_coverage_gate(root, percent=87.25)
+    resolved = cli._resolve_dod_coverage_gate(
+        Store(root),
+        {"gate": "coverage:release", "min_percent": 80.0, "max_age_days": 14},
+        _satisfied(),
+    )
+    assert resolved["gate"] == "coverage:release"
+    assert resolved["coverage_percent"] == 87.25
+    assert resolved["revision"] == SHA
+    assert resolved["gate_scope"] == "release"
+    assert isinstance(resolved["age_days"], float)
+
+
+def test_cli_dod_coverage_holds_until_attested_floor_is_met(tmp_path: Path, capsys) -> None:
+    root = _init(tmp_path)
+    _write_coverage_dod(root)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and codes == {close.HOLD_MISSING_COVERAGE}
+
+    _set_coverage_gate(root, percent=79.9)
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and codes == {close.HOLD_LOW_COVERAGE}
+
+    _set_coverage_gate(root, percent=80.0)
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 0 and codes == set()
+
+
+def test_cli_dod_coverage_cross_revision_does_not_satisfy(tmp_path: Path, capsys) -> None:
+    root = _init(tmp_path)
+    _write_coverage_dod(root)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    _set_coverage_gate(root, percent=90.0, revision=OTHER_SHA)
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and codes == {close.HOLD_MISSING_COVERAGE}
+
+
+def test_cli_dod_coverage_cross_scope_does_not_satisfy(tmp_path: Path, capsys) -> None:
+    root = _init(tmp_path)
+    _write_coverage_dod(root)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    _set_coverage_gate(root, percent=90.0, scope="feature")
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and codes == {close.HOLD_MISSING_COVERAGE}
+
+
+def test_cli_dod_coverage_gate_waiver_does_not_satisfy(tmp_path: Path, capsys) -> None:
+    root = _init(tmp_path)
+    _write_coverage_dod(root)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    assert _run([
+        "gate", "waive",
+        "--from", "lead",
+        "--name", "coverage:release",
+        "--operator", "claimed-boss",
+        "--reason", "bypass",
+        "--scope", "release",
+        "--expires", "2099-01-01",
+    ], root) == 0
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and codes == {close.HOLD_MISSING_COVERAGE}
+
+
+@pytest.mark.parametrize("updated_at", [None, "2000-01-01T00:00:00Z", "2099-01-01T00:00:00Z"])
+def test_resolved_dod_coverage_timestamp_fails_closed(
+    tmp_path: Path, updated_at: str | None,
+) -> None:
+    root = _init(tmp_path)
+    _set_coverage_gate(root, percent=90.0)
+    state = gates.load_gate_state(root)
+    state["gates"]["coverage:release"]["updated_at"] = updated_at
+    gates.write_gate_state(root, state)
+
+    resolved = cli._resolve_dod_coverage_gate(
+        Store(root),
+        {"gate": "coverage:release", "min_percent": 80.0, "max_age_days": 14},
+        _satisfied(),
+    )
+    holds = close._evaluate_dod_coverage(
+        _satisfied(),
+        resolved,
+        {
+            "gate": "coverage:release",
+            "min_percent": 80.0,
+            "max_age_days": 14,
+        },
+    )
+    assert _dcodes(holds) == {close.HOLD_STALE_COVERAGE}
 
 
 # ============================================================ #60 inc-2: knowledge dimension

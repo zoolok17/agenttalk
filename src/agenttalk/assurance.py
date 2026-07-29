@@ -14,17 +14,21 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess  # nosec B404 - scanner runs fixed argv lists with shell disabled
 import sys
 import tempfile
 import time
+import uuid
 import venv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agenttalk import __version__
+from agenttalk import __version__, gates
+from agenttalk.coverage_contract import ASSURANCE_PROFILES, coverage_gate_name
+from agenttalk.coverage_parse import parse_coverage_percent
 
 
 SCHEMA_VERSION = 1
@@ -35,7 +39,7 @@ DEFAULT_MANIFEST = Path(".agenttalk") / "assurance.json"
 DEFAULT_BASELINE = Path(".agenttalk") / "assurance" / "baseline.json"
 DEFAULT_RUNS_DIR = Path(".agenttalk") / "assurance" / "runs"
 
-PROFILES = ("change", "release", "deep")
+PROFILES = ASSURANCE_PROFILES
 STATUS_VOCAB = (
     "pass",
     "fail-blocking",
@@ -160,6 +164,17 @@ GENERATED_KIND_ALIASES = {
     "sh": "shell",
 }
 EXECUTED_STATUSES = {"pass", "fail-blocking", "fail-advisory"}
+# This is the complete class of report paths that the coverage measurement
+# discovers. Arbitrary configured outputs, and case variants on case-sensitive
+# filesystems, are outside this boundary.
+_COVERAGE_ARTIFACTS = ("coverage.xml", "coverage.json")
+_LEGACY_COVERAGE_RECOVERY_DIR = Path(".agenttalk") / "assurance" / "coverage-recovery"
+_GIT_SHA_RE = re.compile(r"\A[0-9a-fA-F]{40}\Z")
+_GITHUB_REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_ASCII_DIGITS_RE = re.compile(r"\A[0-9]+\Z")
+_COMMAND_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_NO_COVERAGE_GATE_CAS = object()
+_NO_PRECOMPUTED_CI_EVIDENCE = object()
 
 
 class AssuranceUsageError(ValueError):
@@ -231,6 +246,7 @@ def _default_manifest(path: Path | None = None) -> dict[str, Any]:
         "monorepo": {"packages": []},
         "python": {},
         "_path": str(path or DEFAULT_MANIFEST),
+        "_source_sha256": None,
         "_validation_errors": [],
     }
 
@@ -241,8 +257,38 @@ def _default_baseline(path: Path | None = None) -> dict[str, Any]:
         "baseline_id": "none",
         "findings": [],
         "_path": str(path or DEFAULT_BASELINE),
+        "_source_sha256": None,
         "_validation_errors": [],
     }
+
+
+def _read_selected_policy_bytes(path: Path, *, label: str) -> bytes:
+    """Read one selected policy generation without following a link."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    binary = getattr(os, "O_BINARY", 0)
+    try:
+        before = os.lstat(path)
+        fd = os.open(str(path), os.O_RDONLY | binary | nofollow)
+    except OSError as exc:
+        raise AssuranceUsageError(f"could not read {label}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or _reparse_stat(opened) or not os.path.samestat(before, opened):
+            raise AssuranceUsageError(f"{label} path changed or is not a regular, non-reparse file: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        current = os.lstat(path)
+        if not stat.S_ISREG(current.st_mode) or _reparse_stat(current) or not os.path.samestat(opened, current):
+            raise AssuranceUsageError(f"{label} path changed while it was being read: {path}")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise AssuranceUsageError(f"could not read {label}: {exc}") from exc
+    finally:
+        os.close(fd)
 
 
 def load_manifest(root: Path | str, path: Path | str | None = None) -> dict[str, Any]:
@@ -253,28 +299,46 @@ def load_manifest(root: Path | str, path: Path | str | None = None) -> dict[str,
     a blocking validation finding in the artifact.
     """
     root_path = Path(root).resolve()
-    manifest_path = _resolve_under_root(root_path, path or DEFAULT_MANIFEST)
-    if not manifest_path.exists():
+    manifest_path = _resolve_selected_path(root_path, path or DEFAULT_MANIFEST)
+    if not _selected_policy_file_present(
+        root_path,
+        manifest_path,
+        label="assurance manifest",
+    ):
         return _default_manifest(manifest_path)
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        source = _read_selected_policy_bytes(
+            manifest_path,
+            label="assurance manifest",
+        )
+        data = json.loads(source.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AssuranceUsageError(f"malformed assurance manifest: {exc}") from exc
     manifest = _normalize_manifest(data, manifest_path)
+    manifest["_source_sha256"] = hashlib.sha256(source).hexdigest()
     return manifest
 
 
 def load_baseline(root: Path | str, path: Path | str | None = None) -> dict[str, Any]:
     """Load and validate `.agenttalk/assurance/baseline.json`."""
     root_path = Path(root).resolve()
-    baseline_path = _resolve_under_root(root_path, path or DEFAULT_BASELINE)
-    if not baseline_path.exists():
+    baseline_path = _resolve_selected_path(root_path, path or DEFAULT_BASELINE)
+    if not _selected_policy_file_present(
+        root_path,
+        baseline_path,
+        label="assurance baseline",
+    ):
         return _default_baseline(baseline_path)
     try:
-        data = json.loads(baseline_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        source = _read_selected_policy_bytes(
+            baseline_path,
+            label="assurance baseline",
+        )
+        data = json.loads(source.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AssuranceUsageError(f"malformed assurance baseline: {exc}") from exc
     baseline = _normalize_baseline(data, baseline_path)
+    baseline["_source_sha256"] = hashlib.sha256(source).hexdigest()
     return baseline
 
 
@@ -315,13 +379,27 @@ def collect_provenance(
 ) -> dict[str, Any]:
     root_path = Path(root).resolve()
     baseline = baseline or _default_baseline()
-    manifest_path = _resolve_under_root(root_path, manifest.get("_path") or DEFAULT_MANIFEST)
-    baseline_path = _resolve_under_root(root_path, baseline.get("_path") or DEFAULT_BASELINE)
+    manifest_path = _resolve_selected_path(
+        root_path,
+        manifest.get("_path") or DEFAULT_MANIFEST,
+    )
+    baseline_path = _resolve_selected_path(
+        root_path,
+        baseline.get("_path") or DEFAULT_BASELINE,
+    )
+    manifest_rel = _slash(_lexical_rel(root_path, manifest_path))
+    baseline_rel = _slash(_lexical_rel(root_path, baseline_path))
+    manifest_source_sha = manifest.get("_source_sha256")
+    baseline_source_sha = baseline.get("_source_sha256")
+    manifest_source_sha = manifest_source_sha if isinstance(manifest_source_sha, str) else None
+    baseline_source_sha = baseline_source_sha if isinstance(baseline_source_sha, str) else None
     git_sha = _git_output(root_path, ["rev-parse", "HEAD"])
-    git_dirty = bool(_git_output(root_path, ["status", "--porcelain"]))
+    git_dirty = _git_worktree_dirty(
+        root_path,
+        protected_paths=(manifest_rel, baseline_rel),
+        protected_hashes=(manifest_source_sha, baseline_source_sha),
+    )
     changed_files = _changed_files(root_path, changed_from=changed_from, changed_to=changed_to)
-    manifest_rel = _slash(_rel(root_path, manifest_path))
-    baseline_rel = _slash(_rel(root_path, baseline_path))
     packages = _packages_to_resolve(root_path, manifest)
     resolved = [_resolve_package(root_path, package) for package in packages]
     return {
@@ -331,10 +409,10 @@ def collect_provenance(
         "changed_to": changed_to,
         "changed_files": changed_files,
         "manifest_path": manifest_rel,
-        "manifest_sha256": _sha256_file(manifest_path),
+        "manifest_sha256": manifest_source_sha,
         "manifest_changed_in_scan_range": manifest_rel in changed_files,
         "baseline_path": baseline_rel,
-        "baseline_sha256": _sha256_file(baseline_path),
+        "baseline_sha256": baseline_source_sha,
         "baseline_changed_in_scan_range": baseline_rel in changed_files,
         "resolved_package_paths": resolved,
         "profile": profile,
@@ -522,6 +600,44 @@ def build_plan(
 
 
 def run_plan(plan: ScanPlan) -> ScanResult:
+    coverage_gate_snapshot = _snapshot_coverage_gate(plan.root, plan.profile)
+    fresh_coverage_attestations: set[tuple[str, str]] = set()
+    try:
+        result = _run_plan(
+            plan,
+            fresh_coverage_attestations,
+            coverage_gate_snapshot,
+        )
+    except BaseException as scan_exc:
+        try:
+            _invalidate_stale_coverage_gate(
+                root=plan.root,
+                profile=plan.profile,
+                revision=plan.provenance.get("git_sha"),
+                run_id=plan.run_id,
+                fresh_coverage_attestations=fresh_coverage_attestations,
+                expected_gate=coverage_gate_snapshot,
+            )
+        except Exception as finalization_exc:
+            raise scan_exc from finalization_exc
+        raise
+    else:
+        _invalidate_stale_coverage_gate(
+            root=plan.root,
+            profile=plan.profile,
+            revision=plan.provenance.get("git_sha"),
+            run_id=plan.run_id,
+            fresh_coverage_attestations=fresh_coverage_attestations,
+            expected_gate=coverage_gate_snapshot,
+        )
+        return result
+
+
+def _run_plan(
+    plan: ScanPlan,
+    fresh_coverage_attestations: set[tuple[str, str]],
+    coverage_gate_snapshot: dict[str, Any] | None,
+) -> ScanResult:
     tools_run: list[dict[str, Any]] = []
     tools_skipped: list[dict[str, Any]] = []
     required_missing: list[dict[str, Any]] = []
@@ -558,7 +674,16 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             else:
                 residual.append(_risk(spec["dimension"], reason, "medium", tool_id=tool_id))
             continue
-        run, ext_findings, raw = _run_external(plan.root, spec, command)
+        if tool_id == "coverage":
+            run, ext_findings, raw, stdout = _run_coverage_external(
+                plan,
+                spec,
+                command,
+                fresh_coverage_attestations,
+                coverage_gate_snapshot,
+            )
+        else:
+            run, ext_findings, raw, stdout = _run_external(plan.root, spec, command)
         tools_run.append(run)
         if raw:
             raw_logs[tool_id] = raw
@@ -686,18 +811,81 @@ def apply_baseline(
     return result
 
 
+def _ensure_plain_output_directory(path: Path) -> Path:
+    """Create/validate a directory path one non-reparse component at a time."""
+    absolute = Path(os.path.abspath(path))
+    anchor = Path(absolute.anchor)
+    current = anchor
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            current_stat = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except OSError as exc:
+                raise AssuranceUsageError(f"could not create assurance output directory {current}: {exc}") from exc
+            current_stat = os.lstat(current)
+        except OSError as exc:
+            raise AssuranceUsageError(f"could not inspect assurance output directory {current}: {exc}") from exc
+        if not _plain_directory_stat(current_stat):
+            raise AssuranceUsageError(
+                f"assurance output path has a symlink, reparse point, or non-directory component: {current}"
+            )
+    return absolute
+
+
+def _make_new_plain_output_directory(path: Path) -> None:
+    """Create one fresh output directory, refusing every existing object."""
+    _ensure_plain_output_directory(path.parent)
+    try:
+        os.mkdir(path)
+    except OSError as exc:
+        raise AssuranceUsageError(f"assurance output run directory must be new: {path} ({exc})") from exc
+    created = os.lstat(path)
+    if not _plain_directory_stat(created):
+        raise AssuranceUsageError(f"assurance output directory is not plain: {path}")
+
+
+def _write_new_plain_text(path: Path, text: str) -> None:
+    """Create one output leaf exclusively without following links."""
+    _ensure_plain_output_directory(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(path), flags, 0o600)
+    except OSError as exc:
+        raise AssuranceUsageError(f"assurance output file must be new: {path} ({exc})") from exc
+    try:
+        opened = os.fstat(fd)
+        current = os.lstat(path)
+        if not stat.S_ISREG(opened.st_mode) or _reparse_stat(opened) or not os.path.samestat(opened, current):
+            raise AssuranceUsageError(f"assurance output file is not a plain new file: {path}")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            fd = -1
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def write_artifact(result: ScanResult, out_dir: Path | str, summary: Path | str | None = None) -> ArtifactPaths:
     out_path = Path(out_dir)
     if not out_path.is_absolute():
         out_path = result.root / out_path
+    out_path = _ensure_plain_output_directory(out_path)
     run_dir = out_path / result.run_id
+    _make_new_plain_output_directory(run_dir)
     raw_dir = run_dir / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    _make_new_plain_output_directory(raw_dir)
     artifact = copy.deepcopy(result.artifact or _artifact_from_result(result, []))
     raw_paths: dict[str, str] = {}
     for tool_id, text in result.raw_logs.items():
         raw_path = raw_dir / f"{_safe_id(tool_id)}.txt"
-        raw_path.write_text(text, encoding="utf-8")
+        _write_new_plain_text(raw_path, text)
         raw_paths[tool_id] = _slash(_rel(result.root, raw_path))
     for run in artifact["tools"]["run"]:
         tool_id = run.get("tool_id")
@@ -708,7 +896,10 @@ def write_artifact(result: ScanResult, out_dir: Path | str, summary: Path | str 
         if finding.get("raw_ref") is None and tool_id in raw_paths:
             finding["raw_ref"] = raw_paths[tool_id]
     artifact_path = run_dir / "artifact.json"
-    artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_new_plain_text(
+        artifact_path,
+        json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+    )
     summary_path: Path | None = None
     if summary:
         summary_path = Path(summary)
@@ -716,8 +907,8 @@ def write_artifact(result: ScanResult, out_dir: Path | str, summary: Path | str 
             summary_path = run_dir / summary_path
     else:
         summary_path = run_dir / "summary.md"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(_summary_text(artifact), encoding="utf-8")
+    summary_path = Path(os.path.abspath(summary_path))
+    _write_new_plain_text(summary_path, _summary_text(artifact))
     result.artifact = artifact
     return ArtifactPaths(run_dir=run_dir, artifact=artifact_path, summary=summary_path)
 
@@ -739,18 +930,29 @@ def main(argv: list[str] | None = None) -> int:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
     root = Path(args.root).resolve()
+    fresh_coverage_attestations: set[tuple[str, str]] = set()
+    run_id = _new_run_id()
+    revision: str | None = None
     runner_errors: list[str] = []
+    coverage_gate_snapshot: dict[str, Any] | None = None
+    coverage_gate_snapshot_captured = False
+    status = 1
+    result: ScanResult | None = None
+    paths: ArtifactPaths | None = None
     try:
-        manifest = load_manifest(root, args.manifest)
-    except AssuranceUsageError as exc:
-        manifest = _default_manifest(_resolve_under_root(root, args.manifest))
-        manifest["_validation_errors"] = [str(exc)]
-    try:
-        baseline = load_baseline(root, args.baseline)
-    except AssuranceUsageError as exc:
-        baseline = _default_baseline(_resolve_under_root(root, args.baseline))
-        baseline["_validation_errors"] = [str(exc)]
-    try:
+        coverage_gate_snapshot = _snapshot_coverage_gate(root, args.profile)
+        coverage_gate_snapshot_captured = True
+        revision = _git_output(root, ["rev-parse", "HEAD"])
+        try:
+            manifest = load_manifest(root, args.manifest)
+        except AssuranceUsageError as exc:
+            manifest = _default_manifest(_resolve_selected_path(root, args.manifest))
+            manifest["_validation_errors"] = [str(exc)]
+        try:
+            baseline = load_baseline(root, args.baseline)
+        except AssuranceUsageError as exc:
+            baseline = _default_baseline(_resolve_selected_path(root, args.baseline))
+            baseline["_validation_errors"] = [str(exc)]
         detection = detect_project(root, manifest)
         provenance = collect_provenance(
             root,
@@ -760,16 +962,45 @@ def main(argv: list[str] | None = None) -> int:
             changed_from=args.changed_from,
             changed_to=args.changed_to,
         )
+        revision = str(provenance.get("git_sha") or "") or revision
         plan = build_plan(root, args.profile, manifest, detection, baseline, provenance)
+        plan.run_id = run_id
         plan.runner_errors.extend(runner_errors)
-        result = run_plan(plan)
+        result = _run_plan(
+            plan,
+            fresh_coverage_attestations,
+            coverage_gate_snapshot,
+        )
         result = apply_baseline(result, baseline, manifest, provenance.get("changed_files") or [])
         paths = write_artifact(result, args.out, summary=args.summary)
     except AssuranceUsageError as exc:
         sys.stderr.write(f"agenttalk assurance: {exc}\n")
-        return 2
+        status = 2
     except Exception as exc:  # noqa: BLE001 - fail-safe is no artifact, bounded stderr
         sys.stderr.write(f"agenttalk assurance: could not produce artifact: {exc}\n")
+        status = 1
+    else:
+        status = 0
+    finally:
+        if coverage_gate_snapshot_captured:
+            try:
+                _invalidate_stale_coverage_gate(
+                    root=root,
+                    profile=args.profile,
+                    revision=revision,
+                    run_id=run_id,
+                    fresh_coverage_attestations=fresh_coverage_attestations,
+                    expected_gate=coverage_gate_snapshot,
+                )
+            except Exception as exc:  # noqa: BLE001 - finalization is a bounded CLI failure
+                sys.stderr.write(f"agenttalk assurance: could not finalize coverage gate: {exc}\n")
+                if status == 0:
+                    status = 1
+
+    if status != 0:
+        return status
+    if paths is None or result is None:
+        sys.stderr.write("agenttalk assurance: could not produce artifact: missing result\n")
         return 1
     if args.json_only:
         print(str(paths.artifact))
@@ -803,6 +1034,7 @@ def _normalize_manifest(data: Any, path: Path) -> dict[str, Any]:
                 raise AssuranceUsageError(f"manifest {key} must be an object")
             manifest[key] = data[key]
     _validate_profiles(manifest["profiles"])
+    _validate_manifest_commands(manifest)
     for key in ("accepted_findings", "generated_artifacts"):
         if key in data:
             if not isinstance(data[key], list):
@@ -845,6 +1077,26 @@ def _validate_profiles(profiles: dict[str, Any]) -> None:
         unknown = sorted(set(cfg) - PROFILE_KEYS)
         if unknown:
             raise AssuranceUsageError(f"manifest profiles.{name} has unknown key(s): {', '.join(unknown)}")
+
+
+def _validate_manifest_commands(manifest: dict[str, Any]) -> None:
+    for name, command in manifest["custom_commands"].items():
+        _validate_command_argv(command, f"custom_commands.{name}")
+    for tool_id, config in manifest["tools"].items():
+        if isinstance(config, dict) and "command" in config:
+            _validate_command_argv(config["command"], f"tools.{tool_id}.command")
+
+
+def _validate_command_argv(command: Any, location: str) -> None:
+    if not isinstance(command, list) or not command:
+        raise AssuranceUsageError(f"manifest {location} must be a non-empty argv list")
+    for index, part in enumerate(command):
+        if not isinstance(part, str) or not part:
+            raise AssuranceUsageError(f"manifest {location}[{index}] must be a non-empty string")
+        if index == 0 and not part.strip():
+            raise AssuranceUsageError(f"manifest {location}[0] must name an executable")
+        if _COMMAND_CONTROL_RE.search(part):
+            raise AssuranceUsageError(f"manifest {location}[{index}] contains a control character")
 
 
 def _validate_accepted_findings(items: list[Any]) -> None:
@@ -1193,22 +1445,42 @@ def _run_external(
     root: Path,
     spec: dict[str, Any],
     command: list[str],
-) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, str]:
     start = time.monotonic()
     timeout = int(spec.get("timeout_seconds") or 60)
+    # Coverage must retain bare CR versus CRLF until its fail-closed parser sees
+    # the stream; text-mode universal-newline translation destroys that evidence.
+    # Its process result is also specialized below: scanner-shaped JSON in stdout
+    # is evidence text, not a generic assurance finding.
+    is_coverage_command = spec.get("tool_id") == "coverage"
+    capture_bytes = is_coverage_command
     raw = ""
     try:
         completed = subprocess.run(  # nosec B603 - argv list, shell disabled by default
             command,
             cwd=root,
-            text=True,
+            text=not capture_bytes,
             capture_output=True,
             timeout=timeout,
             check=False,
         )
+    except OSError as exc:
+        status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+        raw = f"{type(exc).__name__}: {exc}"
+        run = _run_record(
+            spec,
+            status,
+            start,
+            command=command,
+            exit_code=None,
+            raw_log_pending=True,
+        )
+        return run, [], raw, ""
     except subprocess.TimeoutExpired as exc:
         status = "timeout-required" if spec.get("required") else "timeout-optional"
-        raw = (exc.stdout or "") + (exc.stderr or "")
+        stdout = _process_output_text(exc.stdout)
+        stderr = _process_output_text(exc.stderr)
+        raw = stdout + stderr
         run = _run_record(
             spec,
             status,
@@ -1217,9 +1489,37 @@ def _run_external(
             exit_code=None,
             raw_log_pending=bool(raw),
         )
-        return run, [], raw
-    raw = (completed.stdout or "") + ("\n" if completed.stdout and completed.stderr else "") + (completed.stderr or "")
-    findings = _parse_tool_findings(spec, completed.stdout or "", completed.stderr or "")
+        return run, [], raw, stdout
+
+    if capture_bytes:
+        stdout_bytes = completed.stdout if isinstance(completed.stdout, bytes) else b""
+        stderr = _process_output_text(completed.stderr)
+        try:
+            stdout = stdout_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raw_stdout = _process_output_text(stdout_bytes)
+            status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+            detail = f"coverage stdout is not valid UTF-8: {exc}"
+            raw = detail + ("\n" + raw_stdout if raw_stdout else "")
+            if stderr:
+                raw += "\n" + stderr
+            run = _run_record(
+                spec,
+                status,
+                start,
+                command=command,
+                exit_code=completed.returncode,
+                raw_log_pending=True,
+            )
+            return run, [], raw, ""
+        raw_stdout = stdout
+    else:
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        raw_stdout = stdout
+
+    raw = raw_stdout + ("\n" if raw_stdout and stderr else "") + stderr
+    findings = [] if is_coverage_command else _parse_tool_findings(spec, stdout, stderr)
     if findings:
         status = _pre_baseline_status(
             findings,
@@ -1238,7 +1538,619 @@ def _run_external(
         exit_code=completed.returncode,
         raw_log_pending=bool(raw),
     )
-    return run, findings, raw
+    return run, findings, raw, stdout
+
+
+def _process_output_text(output: str | bytes | None) -> str:
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output or ""
+
+
+def _run_coverage_external(
+    plan: ScanPlan,
+    spec: dict[str, Any],
+    command: list[str],
+    fresh_coverage_attestations: set[tuple[str, str]],
+    coverage_gate_snapshot: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, str]:
+    """Run one fail-closed, root-serialized coverage measurement.
+
+    Stdout is the sole coverage evidence channel. Before and after the
+    subprocess, both names in ``_COVERAGE_ARTIFACTS`` and any branch-local
+    legacy recovery residue are classified without following or mutating them.
+    Any such path refuses or invalidates the measurement; agenttalk leaves it
+    untouched for manual recovery.
+
+    The configured subprocess is not filesystem-isolated. A late output from
+    this producer can therefore make the next scan refuse (a deliberate
+    false-DOWN until #107), but agenttalk never guesses that a root report is
+    its own and never deletes it. Arbitrary output paths and case variants on
+    case-sensitive filesystems are outside the exact tuple boundary. Coverage
+    stdout is captured as bytes and decoded as strict UTF-8 so universal-newline
+    translation cannot hide a bare-carriage-return rewrite. Stdout is bounded at
+    the parser boundary, not while ``capture_output=True`` buffers the subprocess
+    streams (#106). Command success comes only from subprocess exit/timeout,
+    spawn, and decoding outcomes; generic scanner-shaped JSON in coverage stdout
+    is never reclassified as an assurance finding.
+    """
+    from agenttalk.store import Store
+
+    lock_timeout = max(10.0, float(spec.get("timeout_seconds") or 60) + 10.0)
+    command_started = False
+    runner_exception: tuple[BaseException, Any] | None = None
+    stage = "acquiring"
+    outcome: tuple[dict[str, Any], list[dict[str, Any]], str, str] | None = None
+    gate_run: dict[str, Any] | None = None
+    gate_stdout = ""
+    gate_path_error: str | None = None
+    gate_failure_reason: str | None = None
+    gate_ci_evidence: str | None = None
+    gate_config_generation: str | None = None
+    transaction_token = uuid.uuid4().hex
+    attestation_key = _coverage_attestation_key(
+        plan.profile,
+        plan.provenance.get("git_sha"),
+    )
+    fallback_expected_gate = copy.deepcopy(coverage_gate_snapshot)
+    coverage_context: Any = None
+    try:
+        coverage_context = Store(plan.root).coverage_transaction_lock(
+            timeout=lock_timeout,
+        )
+        coverage_context.__enter__()
+    except BaseException as exc:
+        if not isinstance(exc, (OSError, TimeoutError)):
+            raise
+        detail = f"coverage transaction failed ({type(exc).__name__}: {exc})"
+        plan.runner_errors.append(detail)
+        failure_status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+        run = _run_record(
+            spec,
+            failure_status,
+            time.monotonic(),
+            command=command,
+            exit_code=None,
+        )
+        _emit_coverage_gate(
+            plan,
+            run,
+            "",
+            path_error=detail,
+            failure_reason=("coverage transaction failed; coverage command was not run"),
+            expected_gate=fallback_expected_gate,
+        )
+        fresh_coverage_attestations.add(attestation_key)
+        return run, [], "", ""
+
+    coverage_entered = True
+    try:
+        # Every holder crosses the coverage-only handoff and takes the config
+        # lock briefly to obtain its expected gate generation before it can run
+        # or mutate the tree. It publishes a unique provisional red unless an
+        # active operator waiver must be preserved.
+        with Store(plan.root).coverage_handoff_lock(timeout=lock_timeout):
+            fallback_expected_gate = _emit_coverage_gate(
+                plan,
+                {"status": "running", "exit_code": None},
+                "",
+                path_error=None,
+                failure_reason=(f"coverage measurement is in progress (transaction {transaction_token})"),
+                transaction_complete=False,
+            )
+        stage = "preflight"
+        path_error = _classify_coverage_path_conflicts(plan.root)
+        if path_error is not None:
+            plan.runner_errors.append(path_error)
+            failure_status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+            run = _run_record(
+                spec,
+                failure_status,
+                time.monotonic(),
+                command=command,
+                exit_code=None,
+            )
+            gate_run = run
+            gate_path_error = path_error
+            gate_failure_reason = (
+                "coverage command refused because a canonical report or "
+                "legacy recovery path requires manual recovery; "
+                "coverage command was not run"
+            )
+            outcome = (run, [], "", "")
+        else:
+            try:
+                stage = "running"
+                command_started = True
+                run, findings, raw, stdout = _run_external(
+                    plan.root,
+                    spec,
+                    command,
+                )
+            except BaseException as exc:
+                runner_exception = (exc, exc.__traceback__)
+                stage = "finishing"
+                path_error = _classify_coverage_path_conflicts(plan.root)
+                if path_error is not None:
+                    plan.runner_errors.append(path_error)
+                failure_status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+                gate_run = {"status": failure_status, "exit_code": None}
+                gate_path_error = path_error
+                gate_failure_reason = f"coverage runner failed with {type(exc).__name__}"
+            else:
+                stage = "finishing"
+                path_error = _classify_coverage_path_conflicts(plan.root)
+                if path_error is not None:
+                    plan.runner_errors.append(path_error)
+                gate_run = run
+                gate_stdout = stdout
+                gate_path_error = path_error
+                gate_failure_reason = (
+                    None
+                    if path_error is None
+                    else (
+                        "a canonical report or legacy recovery path appeared "
+                        "during the coverage command; agenttalk left the "
+                        "path untouched for manual recovery"
+                    )
+                )
+                outcome = (run, findings, raw, stdout)
+
+        if gate_run is None:
+            raise RuntimeError("coverage transaction completed without a gate result")
+        if (
+            gate_path_error is None
+            and gate_run.get("status") == "pass"
+            and gate_run.get("exit_code") == 0
+            and gate_failure_reason is None
+        ):
+            # Establish a current-client config-generation fence, then probe
+            # without holding the global config lock. Finalization validates
+            # the fence and re-probes outside the lock if another current
+            # config transaction interposed.
+            try:
+                with Store(plan.root).config_lock() as config_generation:
+                    gate_config_generation = config_generation[1]
+            except (OSError, TimeoutError) as exc:
+                gate_failure_reason = (
+                    "coverage Git attestation could not establish a config "
+                    f"transaction fence ({type(exc).__name__}: {exc})"
+                )
+                plan.runner_errors.append(gate_failure_reason)
+            else:
+                gate_ci_evidence = _github_actions_evidence(
+                    plan.root,
+                    plan.provenance,
+                    canonical_paths_clear=True,
+                )
+
+        stage = "handoff"
+        with Store(plan.root).coverage_handoff_lock(timeout=lock_timeout):
+            # Release the root-global coverage lock while retaining only the
+            # coverage handoff lock. The next holder can acquire coverage.lock,
+            # but cannot obtain its expected gate generation or start its
+            # command until this final CAS completes. Unrelated config/gate
+            # operations remain free during a slow or failed lock release.
+            coverage_entered = False
+            stage = "releasing"
+            try:
+                coverage_context.__exit__(None, None, None)
+            except BaseException as release_exc:
+                detail = f"coverage transaction failed ({type(release_exc).__name__}: {release_exc})"
+                plan.runner_errors.append(detail)
+                failure_status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+                failure_run = _run_record(
+                    spec,
+                    failure_status,
+                    time.monotonic(),
+                    command=command,
+                    exit_code=None,
+                )
+                command_disposition = (
+                    "coverage result was discarded" if command_started else "coverage command was not run"
+                )
+                try:
+                    _emit_coverage_gate(
+                        plan,
+                        failure_run,
+                        "",
+                        path_error=detail,
+                        failure_reason=(f"coverage transaction failed; {command_disposition}"),
+                        expected_gate=fallback_expected_gate,
+                    )
+                except BaseException as finalization_exc:
+                    if runner_exception is not None:
+                        original, traceback = runner_exception
+                        plan.runner_errors.append(
+                            "coverage transaction secondary failure during "
+                            f"{stage} ({type(finalization_exc).__name__}: "
+                            f"{finalization_exc})"
+                        )
+                        raise original.with_traceback(traceback) from finalization_exc
+                    raise
+                fresh_coverage_attestations.add(attestation_key)
+                if runner_exception is not None:
+                    original, traceback = runner_exception
+                    plan.runner_errors.append(
+                        "coverage transaction secondary failure during "
+                        f"{stage} ({type(release_exc).__name__}: {release_exc})"
+                    )
+                    raise original.with_traceback(traceback) from release_exc
+                return failure_run, [], "", ""
+
+            stage = "committing"
+            _emit_coverage_gate(
+                plan,
+                gate_run,
+                gate_stdout,
+                path_error=gate_path_error,
+                failure_reason=gate_failure_reason,
+                expected_gate=fallback_expected_gate,
+                precomputed_ci_evidence=gate_ci_evidence,
+                expected_config_generation=gate_config_generation,
+            )
+    finally:
+        if coverage_entered:
+            coverage_entered = False
+            coverage_context.__exit__(*sys.exc_info())
+
+    if runner_exception is not None:
+        fresh_coverage_attestations.add(attestation_key)
+        original, traceback = runner_exception
+        raise original.with_traceback(traceback)
+    if outcome is None:  # defensive: every non-exception path assigns an outcome
+        raise RuntimeError("coverage transaction completed without a result")
+    fresh_coverage_attestations.add(attestation_key)
+    return outcome
+
+
+def _classify_coverage_path_conflicts(root: Path) -> str | None:
+    """Classify the complete known report-path boundary without mutation.
+
+    ``os.lstat`` classifies the two canonical root names and any branch-local
+    legacy recovery root, transaction, and immediate marker/backup/unexpected
+    entries. Marker contents are never read, and symlink/reparse directories
+    are never traversed. Missing paths are clear; every existing or
+    uninspectable path is UNKNOWN and therefore refuses untouched. ``None``
+    means clear; every refusal is represented by its non-optional diagnostic.
+    """
+
+    conflicts: list[str] = []
+    inspection_errors: list[str] = []
+
+    def reference(path: Path) -> str:
+        try:
+            return _slash(str(path.relative_to(root)))
+        except ValueError:
+            return _slash(str(path))
+
+    def classify(path: Path) -> os.stat_result | None:
+        path_reference = reference(path)
+        try:
+            path_stat = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            inspection_errors.append(f"{path_reference} ({type(exc).__name__}: {exc})")
+            return None
+        conflicts.append(path_reference)
+        return path_stat
+
+    def is_plain_directory(path_stat: os.stat_result) -> bool:
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        file_attributes = getattr(path_stat, "st_file_attributes", 0)
+        return stat.S_ISDIR(path_stat.st_mode) and not (reparse_flag and file_attributes & reparse_flag)
+
+    for name in _COVERAGE_ARTIFACTS:
+        classify(root / name)
+
+    recovery_root = root / _LEGACY_COVERAGE_RECOVERY_DIR
+    recovery_stat = classify(recovery_root)
+    if recovery_stat is not None and is_plain_directory(recovery_stat):
+        try:
+            with os.scandir(recovery_root) as entries:
+                transactions = sorted(
+                    (Path(entry.path) for entry in entries),
+                    key=lambda path: path.name,
+                )
+        except OSError as exc:
+            inspection_errors.append(f"{reference(recovery_root)} ({type(exc).__name__}: {exc})")
+            transactions = []
+        for transaction in transactions:
+            transaction_stat = classify(transaction)
+            if transaction_stat is None or not is_plain_directory(transaction_stat):
+                continue
+            try:
+                with os.scandir(transaction) as entries:
+                    transaction_entries = sorted(
+                        (Path(entry.path) for entry in entries),
+                        key=lambda path: path.name,
+                    )
+            except OSError as exc:
+                inspection_errors.append(f"{reference(transaction)} ({type(exc).__name__}: {exc})")
+                continue
+            for entry in transaction_entries:
+                classify(entry)
+
+    if not conflicts and not inspection_errors:
+        return None
+
+    details: list[str] = []
+    if conflicts:
+        details.append("agenttalk left paths untouched for manual recovery: " + ", ".join(conflicts))
+    if inspection_errors:
+        details.append("paths could not be inspected: " + ", ".join(inspection_errors))
+    details.append("move or remove the named paths only after verifying their ownership")
+    return "coverage report path safety check failed (" + "; ".join(details) + ")"
+
+
+def _github_actions_evidence(
+    root: Path,
+    provenance: dict[str, Any],
+    *,
+    canonical_paths_clear: bool,
+) -> str | None:
+    """Return CI evidence only for a clean revision and clear report paths.
+
+    The worktree probe discounts only exact, regular AgentTalk runtime outputs;
+    arbitrary runtime neighbors and every other repository change remain dirty.
+    """
+    revision = str(provenance.get("git_sha") or "")
+    github_sha = os.environ.get("GITHUB_SHA", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if os.environ.get("CI", "").lower() != "true" or os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+        return None
+    if not canonical_paths_clear or provenance.get("git_dirty") is not False:
+        return None
+    if not _GIT_SHA_RE.fullmatch(revision) or github_sha.lower() != revision.lower():
+        return None
+    if (
+        not _ASCII_DIGITS_RE.fullmatch(run_id)
+        or not _ASCII_DIGITS_RE.fullmatch(run_attempt)
+        or not _GITHUB_REPOSITORY_RE.fullmatch(repository)
+    ):
+        return None
+    current_revision = _git_output(root, ["rev-parse", "HEAD"])
+    current_dirty = _git_worktree_dirty(
+        root,
+        protected_paths=(
+            str(provenance.get("manifest_path") or DEFAULT_MANIFEST),
+            str(provenance.get("baseline_path") or DEFAULT_BASELINE),
+        ),
+        protected_hashes=(
+            (str(provenance["manifest_sha256"]) if provenance.get("manifest_sha256") else None),
+            (str(provenance["baseline_sha256"]) if provenance.get("baseline_sha256") else None),
+        ),
+    )
+    if current_revision is None or current_dirty is not False:
+        return None
+    if current_revision.lower() != revision.lower():
+        return None
+    return f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run_attempt}"
+
+
+def _coverage_attestation_key(profile: str, revision: str | None) -> tuple[str, str]:
+    return profile, str(revision or "").lower()
+
+
+def _load_coverage_gate_state(root: Path) -> dict[str, Any]:
+    state = gates.load_gate_state(root)
+    load_error = state.get("load_error")
+    if load_error:
+        raise OSError(f"could not read coverage gate state: {load_error}")
+    return state
+
+
+def _snapshot_coverage_gate(root: Path, profile: str) -> dict[str, Any] | None:
+    """Capture the target gate as the finalizer's compare-and-swap token.
+
+    The coverage transaction lock already spans report-path preflight through gate
+    emission. It cannot order an older non-coverage scan that finishes after a
+    newer coverage scan; holding it across every full scan would also serialize
+    unrelated tools and recurse into the deliberately non-reentrant lock.
+    """
+    from agenttalk.store import Store
+
+    with Store(root).config_lock():
+        state = _load_coverage_gate_state(root)
+        existing = state.get("gates", {}).get(coverage_gate_name(profile))
+        return copy.deepcopy(existing) if isinstance(existing, dict) else None
+
+
+def _coverage_waiver_active(gate: object) -> bool:
+    if not isinstance(gate, dict) or gate.get("status") != "waived":
+        return False
+    waiver = gate.get("waiver")
+    return isinstance(waiver, dict) and gates._waiver_active(
+        waiver,
+        now=datetime.now(timezone.utc),
+    )
+
+
+def _waiver_overlays_expected_gate(
+    gate: object,
+    expected_gate: object,
+) -> bool:
+    """Return whether ``gate`` is a waiver written over our gate generation.
+
+    ``gates.waive_gate`` starts from the existing gate and changes only this
+    overlay. Comparing every retained field—including the unique provisional
+    transaction reason—lets an expired/invalid interposed waiver yield to the
+    fresh measurement without treating an unrelated newer gate as ours.
+    """
+    if not isinstance(gate, dict) or gate.get("status") != "waived" or not isinstance(expected_gate, dict):
+        return False
+    overlay_keys = {
+        "status",
+        "scope",
+        "updated_by",
+        "updated_at",
+        "evidence_source",
+        "waiver",
+    }
+    retained_gate = {key: value for key, value in gate.items() if key not in overlay_keys}
+    retained_expected = {key: value for key, value in expected_gate.items() if key not in overlay_keys}
+    return retained_gate == retained_expected
+
+
+def _invalidate_stale_coverage_gate(
+    *,
+    root: Path,
+    profile: str,
+    revision: str | None,
+    run_id: str,
+    fresh_coverage_attestations: set[tuple[str, str]],
+    expected_gate: dict[str, Any] | None,
+) -> None:
+    if _coverage_attestation_key(profile, revision) in fresh_coverage_attestations:
+        return
+
+    from agenttalk.store import Store
+
+    name = coverage_gate_name(profile)
+    revision_value = str(revision or "") or None
+    reason = "no fresh coverage measurement this run"
+    with Store(root).config_lock():
+        state = _load_coverage_gate_state(root)
+        existing = state.get("gates", {}).get(name)
+        # The config lock makes this comparison and the red write below one
+        # atomic CAS. Any intervening gate write (green, red, or waiver) wins.
+        if existing != expected_gate:
+            return
+        if not isinstance(existing, dict) or _coverage_waiver_active(existing):
+            return
+        if (
+            existing.get("status") == "red"
+            and existing.get("reason") == reason
+            and existing.get("revision") == revision_value
+        ):
+            return
+        gates.set_gate(
+            root,
+            name=name,
+            status="red",
+            severity="blocker",
+            scope=profile,
+            actor="assurance-finalizer",
+            evidence_source="local_command",
+            evidence=[f"assurance-run:{run_id}"],
+            reason=reason,
+            revision=revision_value,
+        )
+
+
+def _emit_coverage_gate(
+    plan: ScanPlan,
+    run: dict[str, Any],
+    stdout: str,
+    *,
+    path_error: str | None,
+    failure_reason: str | None = None,
+    expected_gate: object = _NO_COVERAGE_GATE_CAS,
+    precomputed_ci_evidence: object = _NO_PRECOMPUTED_CI_EVIDENCE,
+    expected_config_generation: str | None = None,
+    transaction_complete: bool = True,
+) -> dict[str, Any] | None:
+    from agenttalk.store import Store
+
+    percent = parse_coverage_percent(stdout)
+    command_succeeded = run.get("status") == "pass" and run.get("exit_code") == 0
+    evidence_details = {"coverage_percent": float(percent)} if percent is not None else None
+    canonical_paths_clear = path_error is None
+    gate_name = coverage_gate_name(plan.profile)
+    ci_evidence = None
+    if transaction_complete and canonical_paths_clear and command_succeeded and failure_reason is None:
+        if precomputed_ci_evidence is _NO_PRECOMPUTED_CI_EVIDENCE:
+            # Direct callers have no enclosing coverage transaction. Git probes
+            # still stay outside the global config lock.
+            ci_evidence = _github_actions_evidence(
+                plan.root,
+                plan.provenance,
+                canonical_paths_clear=True,
+            )
+        elif isinstance(precomputed_ci_evidence, str):
+            ci_evidence = precomputed_ci_evidence
+
+    def commit_gate() -> dict[str, Any] | None:
+        state = _load_coverage_gate_state(plan.root)
+        existing = state.get("gates", {}).get(gate_name)
+        if expected_gate is not _NO_COVERAGE_GATE_CAS and existing != expected_gate:
+            if _coverage_waiver_active(existing):
+                return copy.deepcopy(existing)
+            if not _waiver_overlays_expected_gate(existing, expected_gate):
+                return copy.deepcopy(existing) if isinstance(existing, dict) else None
+        # Automated measurements are last-write-wins only while the target is
+        # not protected by an active, valid operator waiver.
+        if _coverage_waiver_active(existing):
+            return copy.deepcopy(existing)
+        # This remains a point-in-time revision + worktree attestation. The
+        # config lock never serialized arbitrary worktree writers, so moving
+        # Git probes outside it does not create that race. A mutation after the
+        # probe can still evade this write unless a later verifier reprobes;
+        # closing that accepted #66/#31 residual needs a broader provenance
+        # envelope, not a long-held config lock.
+        is_green = (
+            transaction_complete
+            and canonical_paths_clear
+            and command_succeeded
+            and percent is not None
+            and ci_evidence is not None
+        )
+        evidence_source = "automation_ci" if ci_evidence is not None else "local_command"
+        if failure_reason is not None:
+            reason = failure_reason
+        elif not command_succeeded:
+            reason = "coverage command did not complete successfully"
+        elif percent is None:
+            reason = "coverage command succeeded but no overall percentage could be parsed"
+        elif not transaction_complete:
+            reason = "coverage measurement is provisional until transaction lock release"
+        elif ci_evidence is None:
+            reason = "coverage percentage is not bound to an attested clean CI revision"
+        else:
+            reason = "coverage command succeeded with a parsed, revision-bound CI measurement"
+        if path_error is not None:
+            reason = f"{reason}; {path_error}"
+        evidence = [ci_evidence] if ci_evidence is not None else [f"assurance-run:{plan.run_id}"]
+        gate = gates.set_gate(
+            plan.root,
+            name=gate_name,
+            status="green" if is_green else "red",
+            severity="blocker",
+            scope=plan.profile,
+            actor="assurance-ci" if ci_evidence is not None else "assurance-local",
+            evidence_source=evidence_source,
+            evidence=evidence if transaction_complete else None,
+            evidence_details=evidence_details if transaction_complete else None,
+            reason=reason,
+            revision=str(plan.provenance.get("git_sha") or "") or None,
+        )
+        return copy.deepcopy(gate)
+
+    config_generation = expected_config_generation
+    reprobes_remaining = 2
+    while True:
+        with Store(plan.root).config_lock() as acquired_generation:
+            previous_generation, current_generation = acquired_generation
+            if config_generation is None or previous_generation == config_generation:
+                return commit_gate()
+            if reprobes_remaining == 0:
+                # Repeated current-client config churn means the cached Git
+                # observation cannot be bound to this write. Fail closed.
+                ci_evidence = None
+                return commit_gate()
+        # Never run Git under the config lock. The coverage-only handoff held by
+        # the caller still prevents another coverage command from crossing this
+        # finalization boundary. This acquisition's token fences the re-probe.
+        ci_evidence = _github_actions_evidence(
+            plan.root,
+            plan.provenance,
+            canonical_paths_clear=canonical_paths_clear,
+        )
+        config_generation = current_generation
+        reprobes_remaining -= 1
 
 
 def _run_record(
@@ -2344,6 +3256,140 @@ def _vacuous_attestation_record(result: ScanResult, record: dict[str, Any]) -> b
 # --------------------------------------------------------------------------- filesystem/git helpers
 
 
+def _resolve_selected_path(root: Path, path: Path | str) -> Path:
+    """Return a lexical absolute policy path without following links."""
+    selected = Path(path)
+    if not selected.is_absolute():
+        selected = root / selected
+    return Path(os.path.abspath(selected))
+
+
+def _lexical_rel(root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def _selected_policy_file_present(
+    root: Path,
+    path: Path,
+    *,
+    label: str,
+) -> bool:
+    """Validate a selected policy object, distinguishing absent from hidden.
+
+    Missing untracked defaults are allowed. A tracked-but-missing path (for
+    example hidden by ``skip-worktree``), an outside-root path, or any
+    symlink/reparse/non-regular component refuses before a weaker default can
+    replace the selected policy.
+    """
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise AssuranceUsageError(f"{label} path must stay within the assurance root: {path}") from exc
+    if not relative.parts:
+        raise AssuranceUsageError(f"{label} path is not a file: {path}")
+
+    current = root
+    missing = False
+    for component in relative.parts[:-1]:
+        current /= component
+        try:
+            current_stat = os.lstat(current)
+        except FileNotFoundError:
+            missing = True
+            break
+        except OSError as exc:
+            raise AssuranceUsageError(f"could not inspect {label} path {path}: {exc}") from exc
+        if not _plain_directory_stat(current_stat):
+            raise AssuranceUsageError(f"{label} path has a symlink, reparse point, or non-directory parent: {current}")
+
+    if not missing:
+        try:
+            selected_stat = os.lstat(path)
+        except FileNotFoundError:
+            missing = True
+        except OSError as exc:
+            raise AssuranceUsageError(f"could not inspect {label} path {path}: {exc}") from exc
+        else:
+            if not stat.S_ISREG(selected_stat.st_mode) or _reparse_stat(selected_stat):
+                raise AssuranceUsageError(f"{label} path must be a regular, non-reparse file: {path}")
+            return True
+
+    tracked = _git_index_tracks_path(root, path)
+    if tracked is None:
+        raise AssuranceUsageError(f"could not determine whether missing {label} is tracked: {path}")
+    if tracked:
+        raise AssuranceUsageError(f"tracked {label} is missing from the worktree: {path}")
+    return False
+
+
+def _git_index_tracks_path(root: Path, path: Path) -> bool | None:
+    """Return whether Git stage 0 contains this exact lexical pathname."""
+    git = shutil.which("git")
+    if git is None:
+        return False
+    try:
+        repository = subprocess.run(  # nosec B603 - resolved executable, argv list
+            [git, "rev-parse", "--path-format=absolute", "--show-toplevel"],
+            cwd=root,
+            text=False,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if repository.returncode != 0:
+        return False
+    raw_root = repository.stdout.strip()
+    if not raw_root or b"\0" in raw_root or b"\n" in raw_root or b"\r" in raw_root:
+        return None
+    repository_root = Path(os.fsdecode(raw_root))
+    try:
+        relative = path.relative_to(repository_root)
+    except ValueError:
+        return False
+    relative_text = _slash(str(relative))
+    try:
+        listed = subprocess.run(  # nosec B603 - resolved executable, argv list
+            [
+                git,
+                "--literal-pathspecs",
+                "ls-files",
+                "--cached",
+                "--stage",
+                "-z",
+                "--",
+                relative_text,
+            ],
+            cwd=repository_root,
+            text=False,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if listed.returncode != 0:
+        return None
+    selected_key = os.path.normcase(os.path.abspath(path))
+    for entry in listed.stdout.split(b"\0"):
+        if not entry:
+            continue
+        metadata, separator, raw_path = entry.partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            return None
+        if fields[2] != b"0":
+            continue
+        tracked_path = repository_root / os.fsdecode(raw_path)
+        if os.path.normcase(os.path.abspath(tracked_path)) == selected_key:
+            return True
+    return False
+
+
 def _resolve_under_root(root: Path, path: Path | str) -> Path:
     p = Path(path)
     if p.is_absolute():
@@ -2410,6 +3456,550 @@ def _git_output(root: Path, args: list[str]) -> str | None:
     if completed.returncode != 0:
         return None
     return completed.stdout.strip()
+
+
+def _git_worktree_dirty(
+    root: Path,
+    *,
+    protected_paths: tuple[str, ...] = (),
+    protected_hashes: tuple[str | None, ...] = (),
+) -> bool | None:
+    """Return Git dirtiness without self-counting exact AgentTalk outputs.
+
+    ``agenttalk init`` does not edit ``.gitignore``. Exact init/assurance state
+    may therefore be untracked without invalidating its producer, but arbitrary
+    neighbors below ``.agenttalk/`` remain dirty. Existing selected manifests
+    and baselines must be tracked independently of ignore rules. Tracked
+    AgentTalk state is repository state: every worktree modification remains
+    dirty, including exact scanner pathnames.
+    Selected inputs are independently proved Git-clean-equivalent to their
+    index blobs, so status-hiding index flags cannot make a changed policy look
+    clean while normal Git clean filters (for example CRLF normalization)
+    remain supported.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        repository_result = subprocess.run(  # nosec B603 - resolved executable, argv list
+            [
+                git,
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--show-prefix",
+            ],
+            cwd=root,
+            text=False,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        completed = subprocess.run(  # nosec B603 - resolved executable, argv list
+            [
+                git,
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ],
+            cwd=root,
+            text=False,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if repository_result.returncode != 0 or completed.returncode != 0:
+        return None
+    repository_metadata = repository_result.stdout.replace(b"\r\n", b"\n")
+    if not repository_metadata.endswith(b"\n"):
+        return None
+    metadata_lines = repository_metadata[:-1].split(b"\n")
+    if len(metadata_lines) != 2 or not metadata_lines[0]:
+        return None
+    repository_root = Path(os.fsdecode(metadata_lines[0])).resolve()
+    repository_prefix = metadata_lines[1]
+    if (
+        b"\r" in repository_prefix
+        or b"\n" in repository_prefix
+        or (repository_prefix and not repository_prefix.endswith(b"/"))
+    ):
+        return None
+    runtime_root_state = _plain_agenttalk_runtime_root(root)
+    if runtime_root_state is None:
+        return None
+    if runtime_root_state is False:
+        return True
+    protected_tracked = _selected_inputs_tracked(
+        git,
+        root,
+        repository_root,
+        protected_paths,
+        protected_hashes,
+    )
+    if protected_tracked is None:
+        return None
+    if protected_tracked is False:
+        return True
+    tracked_visibility = _tracked_index_visibility_clean(
+        git,
+        root,
+        repository_root,
+        repository_prefix,
+        protected_paths,
+    )
+    if tracked_visibility is None:
+        return None
+    if tracked_visibility is False:
+        return True
+    for entry in completed.stdout.split(b"\0"):
+        if not entry:
+            continue
+        if len(entry) < 4 or entry[2:3] != b" ":
+            # A malformed status stream is unknown, never clean.
+            return None
+        status = entry[:2]
+        path = entry[3:]
+        if repository_prefix:
+            if not path.startswith(repository_prefix):
+                return True
+            selected_path = path[len(repository_prefix) :]
+        else:
+            selected_path = path
+        if _status_path_matches_protected_input(
+            root,
+            selected_path,
+            protected_paths,
+        ):
+            return True
+        runtime_relative = _agenttalk_runtime_relative(root, selected_path)
+        if runtime_relative is not None:
+            if status == b"??" and _is_agenttalk_created_untracked_path(
+                root,
+                runtime_relative,
+            ):
+                continue
+        return True
+    return False
+
+
+def _tracked_index_visibility_clean(
+    git: str,
+    root: Path,
+    repository_root: Path,
+    repository_prefix: bytes,
+    protected_paths: tuple[str, ...],
+) -> bool | None:
+    """Refuse tracked paths hidden from the ordinary worktree status probe.
+
+    ``git status`` honors ``skip-worktree`` and ``assume-unchanged``. A clean
+    attestation cannot infer that a hidden file is unchanged. Selected policy
+    inputs are the sole exception because ``_selected_inputs_tracked`` has
+    already compared their exact loaded bytes, filesystem identity, clean
+    filtered content, and stage-zero index blob.
+    """
+    try:
+        completed = subprocess.run(  # nosec B603 - resolved executable, argv list
+            [
+                git,
+                "ls-files",
+                "-v",
+                "-z",
+            ],
+            cwd=repository_root,
+            text=False,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    for entry in completed.stdout.split(b"\0"):
+        if not entry:
+            continue
+        if len(entry) < 3 or entry[1:2] != b" ":
+            return None
+        tag = entry[:1]
+        if tag == b"H":
+            continue
+        repository_path = entry[2:]
+        if tag in {b"S", b"h"} and (not repository_prefix or repository_path.startswith(repository_prefix)):
+            selected_path = repository_path[len(repository_prefix) :] if repository_prefix else repository_path
+            if _index_path_matches_protected_input(
+                root,
+                selected_path,
+                protected_paths,
+            ):
+                continue
+        return False
+    return True
+
+
+def _index_path_matches_protected_input(
+    root: Path,
+    git_path: bytes,
+    protected_paths: tuple[str, ...],
+) -> bool:
+    """Match the selected lexical path, never a hardlink identity alias."""
+    candidate = root / os.fsdecode(git_path)
+    candidate_key = os.path.normcase(os.path.abspath(candidate))
+    for raw in protected_paths:
+        protected = Path(raw)
+        if not protected.is_absolute():
+            protected = root / protected
+        if candidate_key == os.path.normcase(os.path.abspath(protected)):
+            return True
+    return False
+
+
+def _selected_inputs_tracked(
+    git: str,
+    root: Path,
+    repository_root: Path,
+    protected_paths: tuple[str, ...],
+    protected_hashes: tuple[str | None, ...],
+) -> bool | None:
+    """Prove each selected input is tracked and Git-clean-equal to its index."""
+    if protected_hashes and len(protected_hashes) != len(protected_paths):
+        return None
+    expected_hashes = protected_hashes if protected_hashes else (None,) * len(protected_paths)
+    selected: list[tuple[Path, os.stat_result | None, str, str | None]] = []
+    for raw, expected_hash in zip(
+        protected_paths,
+        expected_hashes,
+        strict=True,
+    ):
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        candidate = Path(os.path.abspath(candidate))
+        try:
+            candidate.relative_to(root)
+            repository_relative = candidate.relative_to(repository_root)
+        except ValueError:
+            return False
+        try:
+            present = _selected_policy_file_present(
+                root,
+                candidate,
+                label="selected assurance input",
+            )
+        except AssuranceUsageError:
+            return False
+        if present:
+            try:
+                candidate_stat: os.stat_result | None = os.lstat(candidate)
+            except OSError:
+                return None
+            if expected_hash is None or _sha256_file(candidate) != expected_hash:
+                return False
+        else:
+            candidate_stat = None
+            if expected_hash is not None:
+                return False
+        relative_text = _slash(str(repository_relative))
+        selected.append((candidate, candidate_stat, relative_text, expected_hash))
+    if not selected:
+        return True
+    try:
+        completed = subprocess.run(  # nosec B603 - resolved executable, argv list
+            [
+                git,
+                "--literal-pathspecs",
+                "ls-files",
+                "--cached",
+                "--stage",
+                "-z",
+                "--",
+                *(item[2] for item in selected),
+            ],
+            cwd=repository_root,
+            text=False,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    tracked: list[tuple[os.stat_result | None, str, str, str]] = []
+    for entry in completed.stdout.split(b"\0"):
+        if not entry:
+            continue
+        metadata, separator, raw_path = entry.partition(b"\t")
+        fields = metadata.split(b" ")
+        if (
+            not separator
+            or len(fields) != 3
+            or fields[2] != b"0"
+            or re.fullmatch(rb"[0-9a-f]{40,64}", fields[1]) is None
+        ):
+            return None
+        tracked_relative = os.fsdecode(raw_path)
+        tracked_path = repository_root / tracked_relative
+        try:
+            tracked_stat: os.stat_result | None = os.lstat(tracked_path)
+        except FileNotFoundError:
+            tracked_stat = None
+        except OSError:
+            return None
+        tracked.append(
+            (
+                tracked_stat,
+                fields[1].decode("ascii"),
+                tracked_relative,
+                os.path.normcase(os.path.abspath(tracked_path)),
+            )
+        )
+    for candidate, candidate_stat, _, _expected_hash in selected:
+        candidate_key = os.path.normcase(os.path.abspath(candidate))
+        pathname_entries = [
+            (tracked_stat, oid, tracked_relative)
+            for tracked_stat, oid, tracked_relative, tracked_key in tracked
+            if candidate_key == tracked_key
+        ]
+        if candidate_stat is None:
+            if pathname_entries:
+                return False
+            continue
+        matching_entries = {
+            (oid, tracked_relative)
+            for tracked_stat, oid, tracked_relative in pathname_entries
+            if tracked_stat is not None and os.path.samestat(candidate_stat, tracked_stat)
+        }
+        if not matching_entries:
+            return False
+        matches_index = False
+        for oid, tracked_relative in matching_entries:
+            try:
+                hashed = subprocess.run(  # nosec B603 - resolved executable, argv list
+                    [
+                        git,
+                        "hash-object",
+                        f"--path={tracked_relative}",
+                        "--",
+                        str(candidate),
+                    ],
+                    cwd=repository_root,
+                    text=False,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if hashed.returncode != 0:
+                return None
+            hashed_oid = hashed.stdout.strip()
+            if re.fullmatch(rb"[0-9a-f]{40,64}", hashed_oid) is None:
+                return None
+            if hashed_oid.decode("ascii") == oid:
+                matches_index = True
+                break
+        if not matches_index:
+            return False
+    return True
+
+
+def _status_path_matches_protected_input(
+    root: Path,
+    git_path: bytes,
+    protected_paths: tuple[str, ...],
+) -> bool:
+    """Give selected manifest/baseline dirtiness precedence over exemptions."""
+    candidate = root / os.fsdecode(git_path)
+    candidate_key = os.path.normcase(os.path.abspath(candidate))
+    try:
+        candidate_stat = os.lstat(candidate)
+    except OSError:
+        candidate_stat = None
+    for raw in protected_paths:
+        protected = Path(raw)
+        if not protected.is_absolute():
+            protected = root / protected
+        if candidate_key == os.path.normcase(os.path.abspath(protected)):
+            return True
+        if candidate_stat is None:
+            continue
+        try:
+            if os.path.samestat(candidate_stat, os.lstat(protected)):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _plain_agenttalk_runtime_root(root: Path) -> bool | None:
+    """Return whether an existing canonical runtime root is a real directory."""
+    try:
+        runtime_stat = os.lstat(root / ".agenttalk")
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return None
+    return _plain_directory_stat(runtime_stat)
+
+
+def _reparse_stat(path_stat: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(path_stat, "st_file_attributes", 0)
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _plain_directory_stat(path_stat: os.stat_result) -> bool:
+    return stat.S_ISDIR(path_stat.st_mode) and not _reparse_stat(path_stat)
+
+
+def _regular_runtime_file_stat(
+    root: Path,
+    relative: str,
+) -> os.stat_result | None:
+    """Validate every runtime component without following reparse parents."""
+    components = relative.split("/")
+    if not components or any(component in {"", ".", ".."} for component in components):
+        return None
+    current = root / ".agenttalk"
+    for component in components[:-1]:
+        current /= component
+        try:
+            current_stat = os.lstat(current)
+        except OSError:
+            return None
+        if not _plain_directory_stat(current_stat):
+            return None
+    try:
+        leaf_stat = os.lstat(current / components[-1])
+    except OSError:
+        return None
+    if not stat.S_ISREG(leaf_stat.st_mode) or _reparse_stat(leaf_stat):
+        return None
+    return leaf_stat
+
+
+def _agenttalk_runtime_relative(root: Path, git_path: bytes) -> str | None:
+    """Return ``git_path`` relative to the actual AgentTalk runtime tree.
+
+    Git preserves on-disk spelling. Case-insensitive filesystems can therefore
+    report ``.AgentTalk`` for Store's ``.agenttalk`` path, while case-sensitive
+    filesystems (including suitably configured Windows directories) can keep
+    both names distinct. Compare filesystem identities instead of guessing from
+    the host OS; symlink aliases are not treated as scanner-owned.
+    """
+    decoded = os.fsdecode(git_path)
+    component, separator, relative = decoded.partition("/")
+    if _plain_agenttalk_runtime_root(root) is not True:
+        return None
+    if component == ".agenttalk":
+        return relative if separator else ""
+    if component.casefold() != ".agenttalk":
+        return None
+    try:
+        canonical = os.lstat(root / ".agenttalk")
+        reported = os.lstat(root / component)
+    except OSError:
+        return None
+    if not os.path.samestat(canonical, reported):
+        return None
+    return relative if separator else ""
+
+
+def _same_runtime_path(root: Path, left: str, right: str) -> bool:
+    """Compare two runtime spellings by actual filesystem identity."""
+    left_stat = _regular_runtime_file_stat(root, left)
+    if left_stat is None:
+        return False
+    if left == right:
+        return True
+    right_stat = _regular_runtime_file_stat(root, right)
+    if right_stat is None:
+        return False
+    return os.path.samestat(left_stat, right_stat)
+
+
+def _is_agenttalk_created_untracked_path(root: Path, relative: str) -> bool:
+    """Match only paths AgentTalk init or assurance can create."""
+    from agenttalk.store import validate_agent_name
+
+    persistent = {
+        "config.json",
+        "config.lock",
+        ".config.lock.generation",
+        "assurance/coverage.lock",
+        "assurance/.coverage.lock.generation",
+        "assurance/coverage-handoff.lock",
+        "assurance/.coverage-handoff.lock.generation",
+        "gates.json",
+    }
+    if any(_same_runtime_path(root, relative, candidate) for candidate in persistent):
+        return True
+
+    cursor = re.fullmatch(
+        r"state/([^/]+)\.cursor",
+        relative,
+        flags=re.IGNORECASE,
+    )
+    if cursor is not None:
+        try:
+            agent_name = validate_agent_name(cursor.group(1))
+        except ValueError:
+            return False
+        candidate = "state/" + agent_name + ".cursor"
+        if _same_runtime_path(root, relative, candidate):
+            return True
+
+    lowercase_patterns = (
+        r"config\.json\.[a-z0-9_]{8}",
+        r"gates\.json\.[a-z0-9_]{8}",
+        r"(?:\.config\.lock|assurance/\.(?:coverage|coverage-handoff)\.lock)\."
+        r"[0-9a-f]{32}\.(?:prepare|unlink)",
+        r"(?:\.\.config\.lock|"
+        r"assurance/\.\.(?:coverage|coverage-handoff)\.lock)\."
+        r"[0-9a-f]{32}\.prepare\.[0-9a-f]{32}\.unlink",
+    )
+    for pattern in lowercase_patterns:
+        if re.fullmatch(pattern, relative, flags=re.IGNORECASE):
+            if _same_runtime_path(root, relative, relative.lower()):
+                return True
+
+    cursor_temp = re.fullmatch(
+        r"state/([^/]+)\.cursor\.([a-z0-9_]{8})",
+        relative,
+        flags=re.IGNORECASE,
+    )
+    if cursor_temp is not None:
+        try:
+            agent_name = validate_agent_name(cursor_temp.group(1))
+        except ValueError:
+            return False
+        candidate = "state/" + agent_name + ".cursor." + cursor_temp.group(2).lower()
+        if _same_runtime_path(root, relative, candidate):
+            return True
+
+    run_output = re.fullmatch(
+        r"assurance/runs/"
+        r"([0-9]{8}T[0-9]{6}\.[0-9]{6}Z)/"
+        r"(artifact\.json|summary\.md|raw/([A-Za-z0-9_.-]+)\.txt)",
+        relative,
+        flags=re.IGNORECASE,
+    )
+    if run_output is None:
+        return False
+    run_id = run_output.group(1).upper()
+    tool_id = run_output.group(3)
+    if tool_id is None:
+        leaf = run_output.group(2).lower()
+    else:
+        safe_tool_id = _safe_id(tool_id)
+        if safe_tool_id != tool_id:
+            return False
+        leaf = f"raw/{safe_tool_id}.txt"
+    candidate = f"assurance/runs/{run_id}/{leaf}"
+    return _same_runtime_path(root, relative, candidate)
 
 
 def _changed_files(root: Path, *, changed_from: str | None, changed_to: str | None) -> list[str]:

@@ -20,6 +20,7 @@ import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException
+from fractions import Fraction
 from pathlib import Path
 
 from agenttalk import __version__
@@ -2316,6 +2317,8 @@ def _build_dod_eval(store, record: dict):
               "required_dimensions": dims}
     if "assurance" in dims:
         bundle["assurance"] = _resolve_dod_assurance_gate(store, dims["assurance"], record)
+    if "coverage" in dims:
+        bundle["coverage"] = _resolve_dod_coverage_gate(store, dims["coverage"], record)
     if "knowledge" in dims:
         bundle["knowledge"] = _resolve_dod_knowledge(store, dims["knowledge"], record)
     return bundle
@@ -2472,18 +2475,97 @@ def _resolve_dod_assurance_gate(store, spec: dict, record: dict) -> dict:
     }
 
 
+def _coverage_percent_from_gate(g: dict):
+    """Extract the coverage percentage the producer stored on this gate. The producer writes it
+    into the gate's latest EVIDENCE entry (``gates.set_gate(..., evidence_details={"coverage_
+    percent": <float>})`` → ``gate["evidence"][-1]["coverage_percent"]``), NOT top-level. Read the
+    most recent evidence entry that carries it; return ``None`` if absent (the pure evaluator then
+    fails closed). This is the producer↔consumer contract seam for #60 inc-3."""
+    entries = g.get("evidence")
+    if not isinstance(entries, list) or not entries:
+        return None
+    # Read ONLY the latest evidence entry — do NOT backtrack. Backtracking could bind a stale
+    # percentage from an older green to newer green metadata (e.g. green@A(95) -> red@B ->
+    # green@B with no percent would wrongly surface 95 as B's coverage). If the current entry
+    # lacks the field, return None and let the evaluator fail closed. (reviewer-1, #60 inc-3)
+    latest = entries[-1]
+    if not isinstance(latest, dict):
+        return None
+    return latest.get("coverage_percent")
+
+
+def _resolve_dod_coverage_gate(store, spec: dict, record: dict) -> dict:
+    """Read the policy-selected ``coverage:<profile>`` gate from the gate record itself.
+
+    Close scope and assurance scan profile are deliberately independent. Policy selects one of
+    the finite producer gates validated by ``close.validate_dod_policy``; the gate's own
+    attestation fields, revision, timestamp, producer-profile scope, and numeric
+    ``coverage_percent`` (from its latest evidence entry) form the entire binding.
+    """
+    from datetime import datetime, timezone
+
+    from agenttalk import gates as gate_mod
+
+    gate_name = spec["gate"]
+    state = gate_mod.load_gate_state(store.root)
+    g = (state.get("gates") or {}).get(gate_name)
+    if not isinstance(g, dict):
+        return {
+            "gate": gate_name,
+            "present": False,
+            "min_percent": spec.get("min_percent"),
+            "max_age_days": spec.get("max_age_days"),
+        }
+    now = datetime.now(timezone.utc)
+    waiver = g.get("waiver")
+    waiver_active = False
+    if isinstance(waiver, dict):
+        try:
+            waiver_active = gate_mod._waiver_active(waiver, now=now)
+        except (ValueError, TypeError):
+            waiver_active = False
+    return {
+        "gate": gate_name,
+        "present": True,
+        "status": g.get("status"),
+        "severity": g.get("severity"),
+        "evidence_source": g.get("evidence_source"),
+        "revision": g.get("revision"),
+        "waiver_active": waiver_active,
+        "gate_scope": g.get("scope"),
+        "coverage_percent": _coverage_percent_from_gate(g),
+        "min_percent": spec.get("min_percent"),
+        "age_days": _iso_age_days(g.get("updated_at"), now),
+        "max_age_days": spec.get("max_age_days"),
+    }
+
+
 def _iso_age_days(updated_at: object, now) -> float | None:
     """SIGNED age in days of an ISO-8601 ``updated_at`` vs ``now`` (NEGATIVE = future-dated);
     ``None`` if missing/unparseable. Never raises (a bad timestamp must not crash `close check`) -
     but the DoD evaluator FAILS CLOSED on a ``None``/future age when freshness is required, so this
     must NOT clamp a future timestamp to 0 (that would mask a future-dated attestation as fresh).
-    Reuses the existing :func:`_parse_ts` timestamp parser."""
+    The returned float is rounded away from the valid interval: positive ages round upward and
+    negative ages downward, so conversion cannot make stale/future evidence look fresh. Reuses the
+    existing :func:`_parse_ts` timestamp parser."""
     if not isinstance(updated_at, str):
         return None
     parsed = _parse_ts(updated_at)
     if parsed is None:
         return None
-    return (now - parsed).total_seconds() / 86400.0
+    delta = now - parsed
+    total_microseconds = (
+        (delta.days * 86400 + delta.seconds) * 1_000_000
+        + delta.microseconds
+    )
+    exact_days = Fraction(total_microseconds, 86_400_000_000)
+    age_days = float(exact_days)
+    represented = Fraction.from_float(age_days)
+    if exact_days > 0 and represented < exact_days:
+        age_days = math.nextafter(age_days, math.inf)
+    elif exact_days < 0 and represented > exact_days:
+        age_days = math.nextafter(age_days, -math.inf)
+    return age_days
 
 
 def _signoff_risk_inventory(args, store, record: dict) -> list[dict]:

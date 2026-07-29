@@ -7,6 +7,164 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Coverage evidence now preserves the zero-runtime-dependency boundary without taking
+  custody of report files.** Attestation accepts only a recognized coverage.py/pytest-cov
+  terminal summary from stdout; it no longer parses root JSON or XML reports. A scan
+  refuses before running when either canonical root path, `coverage.xml` or
+  `coverage.json`, already exists, including a symlink or directory. If either path
+  is observed during postflight, agenttalk does not read its contents, move it, or
+  remove it and records a red automated result; an active, valid persisted operator waiver
+  remains unchanged. Concurrent scans serialize preflight, execution, and postflight;
+  final gate promotion is ordered by a coverage-only handoff across coverage-lock
+  release. Agenttalk never consumes, deletes, quarantines, or restores either
+  report path. Configured commands are not filesystem-isolated and may
+  create or modify paths while they run; containment remains #107.
+  Legacy recovery residue also causes an actionable refusal for manual recovery.
+  A late report from agenttalk's own producer can therefore cause a deliberate
+  false-DOWN that requires manual cleanup until #107 supplies owned-output containment.
+  Any coverage command that spawns subprocesses can plausibly trigger this on an ordinary
+  setup; until #107, the operator remedy is to inspect and manually clean up the named path.
+  This is preferred to silently deleting operator data. Detection and refusal cover
+  exactly the two canonical names: arbitrary configured output paths, and case variants
+  on case-sensitive filesystems, are neither discovered, parsed, nor cleaned. Executed
+  proof for the file-symlink exclusion branches on Windows remains unconfirmed.
+  The two canonical-report cases, the `.agenttalk` runtime-alias case, and the
+  config-lock marker case skip locally with `WinError 1314`; selected
+  policy-file and pre-existing output-leaf symlink refusal also have no
+  executed Windows proof, and CI does not explicitly grant symlink-creation
+  privilege. Windows
+  junction/reparse-directory refusal is exercised separately.
+  The stdout parser rejects evidence over 16 MiB, but subprocess `capture_output=True`
+  still buffers the complete stream before that parse-time bound (#106). The accepted
+  parser class is built-in text, or direct UTF-8 byte input with an optional BOM, using
+  LF/CRLF. After bounded SGR removal, a summary must occupy a complete line with optional
+  horizontal indentation: coverage.py `TOTAL` requires exactly the two `Stmts Miss`
+  integer columns or the four `Stmts Miss Branch BrPart` integer columns before its final
+  ASCII integer/dot-decimal percentage. Every multi-number grammar validates the complete
+  relationship: statement-only rows must render the displayed percentage from `Stmts`
+  and `Miss`; branch rows must permit it for some total missing-branch count consistent
+  with all four displayed counts. `BrPart` is only the missing arcs whose source
+  statement ran, so it is not substituted for that hidden total. Because every branch
+  source has at least two exits, additional hidden misses require a distinct unexecuted
+  source and add either zero (`no branch`) or at least two arcs; a positive `BrPart`
+  also requires an executed statement. Coverage.py's actual configured-precision
+  rounding is modelled, including its rule that only exact zero or exact 100 displays
+  those endpoints. Pytest-cov accepts its complete native fail-under
+  success or `FAIL ... not reached` sentence, or a complete legacy/custom
+  `Total coverage: <actual>%` line. The legacy form captures one number and has no
+  cross-field relationship. A native requirement must be in `(0, 100]`, its
+  displayed actual value must have two decimal places and be in `[0, 100]`, and both
+  values are validated. Because pytest-cov compares its unrounded total before formatting
+  the actual value with `.2f`, reached/not-reached is checked against the actual float
+  boundary on each side of the requirement. This preserves genuine rounded and
+  ties-to-even boundary output while an impossible final sentence cannot expose an earlier
+  green summary. Incidental prose containing familiar words is not evidence.
+  The final structurally recognized match across all forms wins. Decimal-to-float
+  attestation is conservative: if the persisted float would overstate the exact displayed
+  token, it steps down, so agenttalk's conversion cannot cross a DoD floor toward passing.
+  Producer display quantization remains: pytest-cov's displayed value can exceed its
+  unrounded total by at most `0.005` percentage points. Bounded scientific notation is accepted only
+  for the native pytest-cov requirement, matching small positive float thresholds;
+  actual-coverage and legacy/custom tokens remain integer/dot-decimal only.
+  Bare-carriage-return rewrites, unsupported or overlong terminal escapes, locale-comma
+  decimals, and stderr-only summaries fail closed. Coverage stdout is captured as bytes,
+  preserving bare CR versus CRLF, and decoded as strict UTF-8 with an optional BOM;
+  undecodable output records a red tool result without aborting the scan. The configured
+  process must exit zero. Coverage process success is derived only from exit, timeout,
+  spawn, and stdout-decoding outcomes; scanner-shaped JSON in coverage stdout is not
+  reclassified as generic findings. Agenttalk cannot observe an inner failed sub-run whose
+  wrapper suppresses its status, so wrappers must propagate failures and print the intended
+  aggregate summary last. Only an active, valid operator waiver suppresses automated writes:
+  expired, malformed, or incomplete waivers are replaced by fresh evidence or invalidated
+  red when no fresh measurement exists. DoD coverage policy explicitly selects one of the
+  finite `coverage:change`, `coverage:release`, or `coverage:deep` producer gates.
+  Fractional `coverage.min_percent` values are decoded exactly and normalized only upward
+  when a JSON-compatible float cannot represent them, so policy conversion never lowers
+  the floor toward passing. All other numeric DoD fields are integer-only and exact;
+  derived timestamp ages round away from the fresh interval before comparison with
+  `max_age_days`.
+  Coverage-gate finalization failures are bounded CLI failures and no longer escape,
+  mask an earlier scan failure, or print a false success. Clean-tree attestation
+  excludes only complete *untracked* paths in AgentTalk's init/scanner pathname
+  grammar: `config.json` and cursor files whose names pass
+  `validate_agent_name()`, plus their eight-character `[a-z0-9_]` atomic-write
+  siblings; config, coverage, and coverage-handoff lock markers plus
+  32-lowercase-hex generation/prepare/unlink residue;
+  `gates.json` plus its atomic-write sibling; and default assurance output at
+  `.agenttalk/assurance/runs/YYYYMMDDTHHMMSS.ffffffZ/`
+  `{artifact.json,summary.md,raw/<safe-id>.txt}`,
+  where `<safe-id>` is a fixed point of `_safe_id()` and matches
+  `[A-Za-z0-9_.-]+`. This prevents self-invalidation even though
+  `agenttalk init` does not edit an adopter's `.gitignore`. No tracked path is
+  exempt: any tracked modification, including an exact scanner pathname, makes
+  the attestation dirty. The attestation also rejects tracked paths hidden by
+  `skip-worktree` or `assume-unchanged`; the sole exception is a selected
+  manifest/baseline whose loaded bytes, filesystem identity, clean-filtered
+  content, and stage-zero index blob are independently proved. Arbitrary
+  `.agenttalk` neighbors and similarly prefixed paths also remain dirty when
+  Git reports them.
+  The selected assurance manifest and baseline are protected inputs: every
+  existing selected path must be tracked, its bytes must still match the bytes
+  loaded for this scan, and its Git-clean content must match the index blob
+  even when ignored or hidden by an index status flag. Normal clean filters
+  such as CRLF normalization remain supported, while a path outside the
+  selected assurance root (including a parent-repository path from a nested
+  root), a tracked-but-missing selected input, or any selected
+  non-regular/reparse object fails closed. The selected lexical pathname and
+  filesystem identity must both match the index entry, so one hardlink cannot
+  borrow another selected path's provenance. Case aliases use filesystem
+  identity, and a symlink, junction/reparse point, or non-directory
+  `.agenttalk` root is never treated as scanner-owned. Every intermediate
+  runtime component must be a plain directory and each recognized scanner leaf
+  must be a regular, non-reparse file. Nested scan roots rebase
+  repo-root-relative status paths without hiding dirty repository siblings.
+  Other untracked files inside an ignored `.agenttalk/` remain outside Git
+  cleanliness unless selected as a manifest/baseline and must be force-tracked
+  when revision binding is required.
+  Authorship of an untracked path cannot be proved after the fact: any actor,
+  including a configured command, operator, or concurrent external writer,
+  that creates an object with an exact exempt pathname and object shape is
+  observationally identical to AgentTalk output. That pathname-collision
+  false-GREEN is explicit residual risk. Custom `--out` and `--summary`
+  destinations outside the grammar are ordinary dirty paths when Git reports
+  them. Inside an ignored runtime, all untracked files inherit Git's existing
+  invisibility; tracked changes remain visible and dirty.
+  Each coverage scan first acquires the coverage transaction lock, crosses a
+  coverage-only handoff, and stages a unique provisional red unless an active,
+  valid waiver must be preserved. After a successful command, it briefly
+  acquires the config lock to advance and record a current-client acquisition
+  token in `.config.lock.generation`, then runs the Git revision/worktree
+  probes without the global config lock. Finalization retains only the handoff
+  lock across coverage-lock release, briefly reacquires the config lock, and
+  validates that token before the gate compare-and-swap. A current-client
+  config transaction that interposed forces a bounded re-probe outside the
+  config lock; repeated churn fails closed red. Ordinary concurrent activity
+  from any `config.lock` caller can exhaust the two-re-probe budget and produce
+  an avoidable red; re-run the scan before concluding that coverage regressed.
+  Release-failure fallback uses the same provisional-gate CAS, so an older scan
+  cannot publish over a newer generation. Gate, waiver, roster, and
+  configuration work can contend during the brief fence or commit
+  transactions, but never waits on the coverage subprocess, Git probes, or
+  coverage-lock release.
+  This fence requires a homogeneous current client: a legacy client that obeys
+  `config.lock` but does not advance the acquisition token is not detected.
+  The coverage handoff likewise orders only current producers; a legacy or
+  mixed-version producer that honors `coverage.lock` without crossing
+  `coverage-handoff.lock` can enter after release and before the current
+  holder's final CAS. This producer is not yet released, so no released
+  migration is required, but branch-local mixed binaries remain a named
+  residual. The config lock also never serializes arbitrary worktree writers,
+  so a mutation after the last probe remains the existing point-in-time
+  #66/#31 residual. Existing and newly created lock/output directory components are
+  required to be plain, non-reparse directories; output run/raw directories
+  must be new, and output leaves are created exclusively without following
+  links. A hostile writer that replaces a validated parent before the following
+  filesystem operation remains a point-in-time check/use residual because
+  portable pathname APIs do not provide directory-handle-relative isolation
+  here.
+
 ## [0.79.1] - 2026-07-25
 
 ### Fixed
@@ -41,7 +199,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lead should decide and act within its mandate and report, reserving operator questions for
   decisions that are genuinely the operator's. The policy is mirrored on both surfaces and the
   mirroring is enforced by `tests/test_skill_lint.py`. (#79)
-
 
 ## [0.79.0] - 2026-07-24
 

@@ -86,6 +86,7 @@ _LOCK_OWNERLESS_STALE_SECONDS = 30.0
 _LOCK_OWNERLESS_CONFIRM_SECONDS = 0.05
 _LOCK_PID_PREFIX_RE = re.compile(rb'"pid"\s*:\s*([0-9]+)')
 _LOCK_GENERATION_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+_CONFIG_LOCK_TOKEN_PREFIX = b"\0agenttalk-config-lock-generation-v1:"
 
 _AWAIT_SCHEMA_VERSION = 1
 _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION = 1
@@ -1346,7 +1347,13 @@ class Store:
                 raise OSError(
                     f"unsafe lock path {guard}: generation changed while locking"
                 )
-            yield
+            yield fd
+            current_guard = os.lstat(guard)
+            _validate_lock_file_stat(guard, current_guard)
+            if not _same_file(guard_identity, current_guard):
+                raise OSError(
+                    f"unsafe lock path {guard}: generation changed while held"
+                )
         finally:
             release_error: OSError | None = None
             if acquired and fd is not None:
@@ -1378,7 +1385,10 @@ class Store:
         only after an explicit conservative stale age plus a stable-generation
         observation. NOT re-entrant.
         """
-        lock.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_plain_lock_directory(
+            lock.parent,
+            what=f"{what} parent directory",
+        )
         deadline = time.monotonic() + timeout
         identity: os.stat_result | None = None
         ownerless_generation: tuple[int, int] | None = None
@@ -1513,22 +1523,151 @@ class Store:
                             f"could not release the {what} at {lock}: {last_error}"
                         ) from last_error
 
+    def _advance_config_lock_generation(
+        self,
+        lock: Path,
+        *,
+        timeout: float,
+        poll: float,
+    ) -> tuple[str | None, str]:
+        """Advance the durable current-client config acquisition token."""
+        deadline = time.monotonic() + timeout
+        with self._lock_generation_guard(
+            lock,
+            deadline=deadline,
+            poll=poll,
+            what="config lock generation",
+        ) as fd:
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 256)
+            previous: str | None = None
+            if raw.startswith(_CONFIG_LOCK_TOKEN_PREFIX):
+                candidate = raw[len(_CONFIG_LOCK_TOKEN_PREFIX):]
+                try:
+                    decoded = candidate.decode("ascii")
+                except UnicodeDecodeError:
+                    decoded = ""
+                if _LOCK_GENERATION_RE.fullmatch(decoded):
+                    previous = decoded
+            current = uuid.uuid4().hex
+            payload = _CONFIG_LOCK_TOKEN_PREFIX + current.encode("ascii")
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            _write_all(fd, payload)
+            os.fsync(fd)
+            return previous, current
+
+    @contextlib.contextmanager
     def _config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
-        """Hold an exclusive lock across a config read-modify-write."""
-        return self._exclusive_lock(self.dir / "config.lock", timeout=timeout,
-                                    poll=poll, what="config lock (another agent may be "
-                                    "mid roster-admin)")
+        """Hold a versioned exclusive config read-modify-write transaction."""
+        self._ensure_plain_lock_directory(
+            self.dir,
+            what="AgentTalk runtime lock directory",
+        )
+        lock = self.dir / "config.lock"
+        with self._exclusive_lock(
+            lock,
+            timeout=timeout,
+            poll=poll,
+            what="config lock (another agent may be mid roster-admin)",
+        ):
+            yield self._advance_config_lock_generation(
+                lock,
+                timeout=timeout,
+                poll=poll,
+            )
 
     def config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
         """Public alias for the config read-modify-write lock.
 
-        Additive and behaviour-free: delegates to ``_config_lock`` so a
+        Delegates to ``_config_lock`` so a
         boundary-respecting external module (e.g. the Native Work & Evidence
         spine) can run its read-modify-write / JSONL append under the same
         exclusive lock without reaching across the module boundary into a
-        private helper. An unlocked RMW is a lost-update fail-open.
+        private helper. The yielded ``(previous, current)`` acquisition token is
+        optional for callers and lets assurance fence an out-of-lock Git probe
+        against current-client config transactions. An unlocked RMW is a
+        lost-update fail-open.
         """
         return self._config_lock(timeout=timeout, poll=poll)
+
+    def coverage_transaction_lock(self, *, timeout: float = 70.0,
+                                  poll: float = 0.05):
+        """Serialize one assurance coverage scan per root.
+
+        Holding this lock across canonical-path preflight, command execution,
+        and postflight prevents concurrent agenttalk scans from cross-claiming
+        evidence. A separate coverage-only handoff lock orders this lock's
+        release with final gate compare-and-swap without holding the global
+        config lock across either subprocess work or lock release. The scan
+        assumes every concurrent coverage producer implements that current
+        handoff protocol; a legacy coverage-lock-only holder is not ordered
+        after release. The scan never takes custody of root coverage reports:
+        a preflight conflict causes refusal, and agenttalk does not read its
+        contents, move it, or remove it. This lock does not filesystem-isolate
+        the configured command. The underlying store lock supplies the same
+        cross-platform ownership and stale-holder recovery as other store
+        transactions.
+        """
+        assurance_dir = self._ensure_plain_assurance_lock_directory()
+        return self._exclusive_lock(
+            assurance_dir / "coverage.lock",
+            timeout=timeout,
+            poll=poll,
+            what="assurance coverage transaction lock",
+        )
+
+    def coverage_handoff_lock(self, *, timeout: float = 70.0,
+                              poll: float = 0.05):
+        """Order coverage-lock release with the succeeding gate transaction.
+
+        A holder takes this coverage-only lock once after acquiring
+        ``coverage.lock`` to obtain its expected gate generation, and again
+        while releasing ``coverage.lock`` and committing its final gate. The
+        next coverage holder can acquire ``coverage.lock`` after that release,
+        but cannot obtain its own expected generation or start its command
+        until the prior handoff finishes, provided every producer implements
+        this current two-lock protocol. Unlike ``config.lock``, this lock never
+        blocks unrelated gate, waiver, roster, or configuration work.
+        """
+        assurance_dir = self._ensure_plain_assurance_lock_directory()
+        return self._exclusive_lock(
+            assurance_dir / "coverage-handoff.lock",
+            timeout=timeout,
+            poll=poll,
+            what="assurance coverage gate handoff lock",
+        )
+
+    def _ensure_plain_assurance_lock_directory(self) -> Path:
+        self._ensure_plain_lock_directory(
+            self.dir,
+            what="AgentTalk runtime lock directory",
+        )
+        assurance_dir = self.dir / "assurance"
+        self._ensure_plain_lock_directory(
+            assurance_dir,
+            what="assurance lock directory",
+        )
+        return assurance_dir
+
+    @staticmethod
+    def _ensure_plain_lock_directory(path: Path, *, what: str) -> None:
+        """Create or validate one lock parent without following a link."""
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise OSError(f"could not create {what} at {path}: {exc}") from exc
+        try:
+            path_stat = os.lstat(path)
+        except OSError as exc:
+            raise OSError(f"could not inspect {what} at {path}: {exc}") from exc
+        if not stat.S_ISDIR(path_stat.st_mode) or _is_reparse_point(path_stat):
+            raise OSError(
+                f"unsafe {what} at {path}: expected a plain directory, "
+                "found a symlink, reparse point, or non-directory object"
+            )
 
     def _supervisor_lifecycle_lock(self, *, timeout: float = 10.0,
                                    poll: float = 0.05):
