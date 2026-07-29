@@ -2237,7 +2237,7 @@ def test_tracked_file_dirtied_by_coverage_command_cannot_attest(
     script = (
         "from pathlib import Path; "
         "Path('tracked.txt').write_text('changed\\n', encoding='utf-8'); "
-        "print('TOTAL 10 0 99%')"
+        "print('TOTAL 100 1 99%')"
     )
 
     assurance.run_plan(_plan(tmp_path, script, revision=revision))
@@ -2265,7 +2265,7 @@ def test_unignored_agenttalk_runtime_paths_do_not_dirty_coverage_attestation(
     result = assurance.run_plan(
         _plan(
             tmp_path,
-            "print('TOTAL 10 0 99%')",
+            "print('TOTAL 100 1 99%')",
             revision=revision,
             provenance=provenance,
         )
@@ -2376,7 +2376,7 @@ def test_case_variant_agenttalk_runtime_path_follows_filesystem_identity(
     assurance.run_plan(
         _plan(
             tmp_path,
-            "print('TOTAL 10 0 99%')",
+            "print('TOTAL 100 1 99%')",
             revision=revision,
             provenance=provenance,
         )
@@ -2448,7 +2448,7 @@ def test_case_variant_selected_input_created_after_preflight_cannot_attest(
         f"target = Path({relative!r}); "
         "target.parent.mkdir(parents=True, exist_ok=True); "
         "target.write_text('{\"schema_version\": 1}\\n', encoding='utf-8'); "
-        "print('TOTAL 10 0 99%')"
+        "print('TOTAL 100 1 99%')"
     )
 
     assurance.run_plan(
@@ -2537,7 +2537,7 @@ def test_nested_assurance_root_ignores_own_runtime_but_not_repo_siblings(
     assurance.run_plan(
         _plan(
             nested,
-            "print('TOTAL 10 0 99%')",
+            "print('TOTAL 100 1 99%')",
             revision=revision,
             provenance=provenance,
         )
@@ -2558,7 +2558,7 @@ def test_nested_assurance_root_ignores_own_runtime_but_not_repo_siblings(
     assurance.run_plan(
         _plan(
             nested,
-            "print('TOTAL 10 0 99%')",
+            "print('TOTAL 100 1 99%')",
             revision=revision,
             provenance={"git_sha": revision, "git_dirty": False},
         )
@@ -2591,7 +2591,7 @@ def test_tracked_scanner_gate_state_remains_repository_dirt(
     revision = _git(tmp_path, "rev-parse", "HEAD")
     _set_github_ci(monkeypatch, revision)
 
-    first = assurance.run_plan(_plan(tmp_path, "print('TOTAL 10 0 98%')", revision=revision))
+    first = assurance.run_plan(_plan(tmp_path, "print('TOTAL 100 2 98%')", revision=revision))
     assert first.tools_run[0]["status"] == "pass"
     assert _coverage_gate(tmp_path)["status"] == "red"
     assert "gates.json" in _git(tmp_path, "status", "--porcelain")
@@ -3070,7 +3070,7 @@ def test_unignored_agenttalk_exclusion_keeps_tracked_changes_dirty(
     assurance.run_plan(
         _plan(
             tmp_path,
-            "print('TOTAL 10 0 99%')",
+            "print('TOTAL 100 1 99%')",
             revision=revision,
             provenance={"git_sha": revision, "git_dirty": False},
         )
@@ -3108,7 +3108,7 @@ def test_unignored_agenttalk_exclusion_keeps_untracked_policy_dirty(
     assurance.run_plan(
         _plan(
             tmp_path,
-            "print('TOTAL 10 0 99%')",
+            "print('TOTAL 100 1 99%')",
             revision=revision,
             provenance={"git_sha": revision, "git_dirty": False},
         )
@@ -3141,7 +3141,7 @@ def test_unignored_agenttalk_exclusion_keeps_other_untracked_paths_dirty(
     assurance.run_plan(
         _plan(
             tmp_path,
-            "print('TOTAL 10 0 99%')",
+            "print('TOTAL 100 1 99%')",
             revision=revision,
             provenance={"git_sha": revision, "git_dirty": False},
         )
@@ -3298,7 +3298,7 @@ def test_artifact_writer_refuses_reparse_output_parent(
     monkeypatch,
 ) -> None:
     revision = _ci_revision(tmp_path, monkeypatch, {".gitignore": ""})
-    result = assurance.run_plan(_plan(tmp_path, "print('TOTAL 10 0 98%')", revision=revision))
+    result = assurance.run_plan(_plan(tmp_path, "print('TOTAL 100 2 98%')", revision=revision))
     assurance_dir = tmp_path / ".agenttalk" / "assurance"
     original_dir = tmp_path / ".agenttalk" / "assurance-original"
     assurance_dir.rename(original_dir)
@@ -3388,7 +3388,7 @@ def test_custom_output_outside_runtime_is_a_named_dirty_residual(
     monkeypatch,
 ) -> None:
     revision = _ci_revision(tmp_path, monkeypatch)
-    first = assurance.run_plan(_plan(tmp_path, "print('TOTAL 10 0 98%')", revision=revision))
+    first = assurance.run_plan(_plan(tmp_path, "print('TOTAL 100 2 98%')", revision=revision))
     paths = assurance.write_artifact(first, tmp_path / "assurance-results")
     assert paths.artifact.is_file()
 
@@ -3403,7 +3403,7 @@ def test_custom_output_outside_runtime_is_a_named_dirty_residual(
     assurance.run_plan(
         _plan(
             tmp_path,
-            "print('TOTAL 10 0 99%')",
+            "print('TOTAL 100 1 99%')",
             revision=revision,
             provenance=provenance,
         )
@@ -3418,7 +3418,7 @@ def test_custom_summary_inside_runtime_is_a_named_dirty_residual(
     monkeypatch,
 ) -> None:
     revision = _ci_revision(tmp_path, monkeypatch, {".gitignore": ""})
-    first = assurance.run_plan(_plan(tmp_path, "print('TOTAL 10 0 98%')", revision=revision))
+    first = assurance.run_plan(_plan(tmp_path, "print('TOTAL 100 2 98%')", revision=revision))
     destination = tmp_path / ".agenttalk" / "assurance" / "runs" / first.run_id / "operator-selected.txt"
     paths = assurance.write_artifact(
         first,
@@ -3462,7 +3462,7 @@ def test_git_status_error_is_unknown_and_cannot_attest(
     assurance.run_plan(
         _plan(
             tmp_path,
-            "print('TOTAL 10 0 99%')",
+            "print('TOTAL 100 1 99%')",
             revision=revision,
             # Exercise the independent post-command check even if a caller
             # supplies an incorrectly optimistic pre-command state.
@@ -3481,7 +3481,7 @@ def test_git_status_error_is_unknown_and_cannot_attest(
         ("TOTAL 10 0 999%", None),
         ("TOTAL 10 0 12x34%", None),
         ("TOTAL 10 0 87,34%", None),
-        ("TOTAL 10 0 96%", 96.0),
+        ("TOTAL 25 1 96%", 96.0),
         ("Total coverage: 87,34%", None),
         ("Total coverage: 87.34%", 87.34),
     ],
@@ -3556,6 +3556,122 @@ def test_coverage_parser_accepts_structural_terminal_summaries(
 )
 def test_coverage_parser_rejects_noncoverage_total_shapes(stdout: str) -> None:
     assert parse_coverage_percent(stdout) is None
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "TOTAL 10 10 99%",
+        "TOTAL 10 10 20 0 99%",
+        "TOTAL 10 11 99%",
+        "TOTAL 10 1 2 3 90%",
+        "TOTAL 10 10 2 1 0%",
+        "TOTAL 0 0 2 0 100%",
+        "TOTAL 10 1 1 0 90%",
+        "TOTAL 0 0 0%",
+        "TOTAL 0 0 0 0 0%",
+        "TOTAL 10 0 4 1 100%",
+        "TOTAL -1 0 0%",
+        "TOTAL 1000 1 100%",
+        "TOTAL 1000 999 0%",
+        "TOTAL 2 1 2 1 25%",
+        "TOTAL 2 1 2 0 50%",
+        "TOTAL 2 2 2 1 25%",
+    ],
+    ids=[
+        "connector-two-count-row",
+        "four-count-row",
+        "misses-exceed-statements",
+        "partial-exceeds-branches",
+        "partial-with-no-executed-statements",
+        "branches-without-statements",
+        "single-branch-impossible",
+        "empty-row-must-display-hundred",
+        "empty-branch-row-must-display-hundred",
+        "all-statements-covered-impossible-percent",
+        "negative-count",
+        "near-hundred-cannot-round-to-hundred",
+        "near-zero-cannot-round-to-zero",
+        "single-source-cannot-hide-another-missed-branch",
+        "single-source-cannot-hide-one-missed-branch",
+        "partial-branch-requires-an-executed-source",
+    ],
+)
+def test_coverage_parser_rejects_impossible_total_count_relationships(
+    stdout: str,
+) -> None:
+    assert parse_coverage_percent(stdout) is None
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("TOTAL 1000 1 99.9%", 99.9),
+        ("TOTAL 3 1 67%", 67.0),
+        ("TOTAL 1000 1 99%", 99.0),
+        ("TOTAL 1000 999 1%", 1.0),
+        ("TOTAL 5 1 80.0%", 80.0),
+        ("TOTAL 5 1 2 1 71.4%", 71.4),
+        ("TOTAL 5 3 2 0 29%", 29.0),
+        ("TOTAL 94 38 44 15 54.3%", 54.3),
+        ("TOTAL 4 4 2 0 33.3%", 33.3),
+        ("TOTAL 10 2 2 2 66.7%", 66.7),
+        ("TOTAL 2 1 2 1 50%", 50.0),
+        ("TOTAL 2 1 2 0 25%", 25.0),
+        ("TOTAL 10 10 20 0 0%", 0.0),
+        ("TOTAL 10 0 4 1 92.9%", 92.9),
+        ("TOTAL 0 0 100%", 100.0),
+        ("TOTAL 0 0 0 0 100%", 100.0),
+    ],
+    ids=[
+        "rounded-one-decimal",
+        "rounded-integer",
+        "near-hundred-clamp",
+        "near-zero-clamp",
+        "real-statement-report",
+        "real-branch-report",
+        "real-wholly-missed-branch-report",
+        "real-mixed-branch-report-hidden-misses",
+        "real-no-branch-all-statements-missed",
+        "real-condition-raised-all-branches-partial",
+        "single-source-partial",
+        "single-source-entirely-missed",
+        "all-statements-missed",
+        "all-statements-covered",
+        "empty-statement-report",
+        "empty-branch-report",
+    ],
+)
+def test_coverage_parser_accepts_possible_rounded_total_relationships(
+    stdout: str,
+    expected: float,
+) -> None:
+    assert parse_coverage_percent(stdout) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "final_summary",
+    [
+        "TOTAL 10 10 99%",
+        "TOTAL 10 10 20 0 99%",
+    ],
+    ids=["two-count-row", "four-count-row"],
+)
+def test_invalid_final_total_relationship_does_not_expose_earlier_green(
+    final_summary: str,
+) -> None:
+    stdout = f"Total coverage: 99%\n{final_summary}"
+
+    assert parse_coverage_percent(stdout) is None
+
+
+def test_invalid_earlier_total_counts_do_not_hide_later_valid_summary() -> None:
+    enormous_count = "9" * 5000
+    invalid = f"TOTAL {enormous_count} 0 99%"
+    valid = "TOTAL 3 1 67%"
+
+    assert parse_coverage_percent(f"{invalid}\n{valid}") == pytest.approx(67.0)
+    assert parse_coverage_percent(f"{valid}\n{invalid}") is None
 
 
 def test_coverage_parser_accepts_branch_total_shape() -> None:
@@ -3846,7 +3962,7 @@ def test_oversized_coverage_stdout_is_rejected_before_scanning(
     as_bytes: bool,
 ) -> None:
     monkeypatch.setattr(coverage_parse, "MAX_COVERAGE_ARTIFACT_BYTES", 64)
-    stdout = "TOTAL 10 0 96%\n" + ("x" * 64)
+    stdout = "TOTAL 25 1 96%\n" + ("x" * 64)
     source = stdout.encode("utf-8") if as_bytes else stdout
 
     assert parse_coverage_percent(source) is None
@@ -3858,7 +3974,7 @@ def test_coverage_stdout_at_size_limit_is_accepted(
     as_bytes: bool,
 ) -> None:
     monkeypatch.setattr(coverage_parse, "MAX_COVERAGE_ARTIFACT_BYTES", 64)
-    total = "TOTAL 10 0 96%\n"
+    total = "TOTAL 25 1 96%\n"
     stdout = total + ("x" * (64 - len(total)))
     source = stdout.encode("utf-8") if as_bytes else stdout
 
@@ -3867,7 +3983,7 @@ def test_coverage_stdout_at_size_limit_is_accepted(
 
 def test_coverage_stdout_limit_counts_utf8_bytes(monkeypatch) -> None:
     monkeypatch.setattr(coverage_parse, "MAX_COVERAGE_ARTIFACT_BYTES", 64)
-    stdout = "TOTAL 10 0 96%\n" + ("\N{LATIN SMALL LETTER E WITH ACUTE}" * 25)
+    stdout = "TOTAL 25 1 96%\n" + ("\N{LATIN SMALL LETTER E WITH ACUTE}" * 25)
     assert len(stdout) < 64
     assert len(stdout.encode("utf-8")) > 64
 
@@ -3928,7 +4044,7 @@ def test_coverage_parser_contains_unexpected_source_exception(
 
     monkeypatch.setattr(coverage_parse, "_from_stdout", fail_stdout_parse)
 
-    assert parse_coverage_percent("TOTAL 10 0 88%") is None
+    assert parse_coverage_percent("TOTAL 100 12 88%") is None
 
 
 def test_coverage_parser_never_raises_for_deterministic_bytes_corpus() -> None:
@@ -3972,7 +4088,7 @@ def test_coverage_parser_never_raises_for_deterministic_bytes_corpus() -> None:
             b"\xef\xbb\xbfTOTAL 10 5 50%",
         ),
         ("bom-only", b"\xef\xbb\xbf"),
-        ("stdout-total", b"TOTAL 10 0 96%"),
+        ("stdout-total", b"TOTAL 25 1 96%"),
         (
             "rounded-over-hundred",
             b"Total coverage: 100.0000000000000000000000000000000001%",
@@ -4061,7 +4177,7 @@ def test_non_ascii_github_run_ids_cannot_attest(
     revision = _ci_revision(tmp_path, monkeypatch)
     monkeypatch.setenv(environment_name, invalid_id)
 
-    assurance.run_plan(_plan(tmp_path, "print('TOTAL 10 0 99%')", revision=revision))
+    assurance.run_plan(_plan(tmp_path, "print('TOTAL 100 1 99%')", revision=revision))
 
     gate = _coverage_gate(tmp_path)
     assert gate["status"] == "red"

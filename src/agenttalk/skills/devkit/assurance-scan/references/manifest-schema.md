@@ -38,20 +38,39 @@ optional BOM, using LF/CRLF. After bounded SGR removal, a recognized summary
 must occupy one complete line with optional horizontal indentation. A
 coverage.py `TOTAL` row has exactly two ASCII unsigned-integer count columns
 (`Stmts Miss`) or four (`Stmts Miss Branch BrPart`) before the final ASCII
-integer/dot-decimal percentage. Pytest-cov's native success line is `Required
-test coverage of <required>% reached. Total coverage: <actual>%`; its native
-failure line is `FAIL Required test coverage of <required>% not reached. Total
-coverage: <actual>%`. For those native forms, `required` is an ASCII
-integer/dot decimal with an optional decimal exponent of at most four digits,
-whose parsed float is in `(0, 100]`; `actual` is a two-decimal ASCII value in
-`[0, 100]`. Both are captured. Pytest-cov compares an unrounded total and then
-displays `actual` with `.2f`, so the sentence is accepted only when its
-reached/not-reached relationship is possible under the same float comparison
-and ties-to-even formatting. Success is bounded by the `.2f` rendering of the
-parsed requirement; failure is bounded by the rendering of its immediate float
-predecessor. An impossible final native sentence refuses all evidence rather
-than exposing an earlier summary.
+integer/dot-decimal percentage. For a two-count row, all three numeric values
+participate: `Miss` cannot exceed `Stmts`, and the percentage must equal
+coverage.py's configured-precision rendering of the covered-statement ratio
+(`Stmts=0` renders `100`). For a four-count row, all five displayed values
+participate. `Miss` cannot exceed `Stmts`, `BrPart` cannot exceed `Branch`, and
+the percentage must be possible for some total number of missing branch arcs.
+That total is not printed: `BrPart` counts only missing arcs whose source
+statement ran. The parser therefore uses coverage.py's count relationships to
+model the hidden total rather than treating `BrPart` as every missing branch.
+Each branch source contributes at least two arcs. Hidden misses beyond `BrPart`
+therefore require a distinct unexecuted branch source and add either zero
+(`no branch`) or at least two arcs; the displayed percentage must be possible
+in one of those aggregate-feasible ranges. A positive `BrPart` also requires at
+least one executed statement. The model includes both producer-real endpoints:
+`no branch` arcs can reduce the hidden total, and a condition that raises after
+its source statement executes can make `BrPart` equal `Branch`.
+
+Pytest-cov's native success line is
+`Required test coverage of <required>% reached. Total coverage: <actual>%`;
+its native failure line is
+`FAIL Required test coverage of <required>% not reached. Total coverage: <actual>%`.
+For those native forms, `required` is an ASCII integer/dot decimal with an
+optional decimal exponent of at most four digits, whose parsed float is in
+`(0, 100]`; `actual` is a two-decimal ASCII value in `[0, 100]`. Both are
+captured. Pytest-cov compares an unrounded total and then displays `actual` with
+`.2f`, so the sentence is accepted only when its reached/not-reached
+relationship is possible under the same float comparison and ties-to-even
+formatting. Success is bounded by the `.2f` rendering of the parsed requirement;
+failure is bounded by the rendering of its immediate float predecessor. An
+impossible final native sentence refuses all evidence rather than exposing an
+earlier summary.
 A complete legacy/custom `Total coverage: <actual>%` line is also accepted.
+It captures one number and therefore has no cross-field relationship to check.
 Only horizontal whitespace may follow any form, so incidental prose containing
 familiar words is refused. SGR color sequences may contain at most 32 digit,
 semicolon, or colon parameter characters. The final structurally recognized
@@ -63,10 +82,12 @@ above the exact token, the attested value steps down one representable float
 (or refuses if it still cannot prove a non-overstatement). Conversion can
 therefore conservatively understate the displayed token but cannot cross a
 configured floor toward passing. This does not recover precision already lost
-by the producer: pytest-cov's `.2f` display can exceed its unrounded total by
-at most `0.005` percentage points. Scientific notation is accepted only for the native
-pytest-cov requirement, with the bounded exponent above; actual-coverage and
-legacy/custom tokens remain integer/dot-decimal only.
+by the producer. Coverage.py count consistency uses its configured-precision
+ties-to-even rendering, including its rule that only exact zero or exact 100
+can display those endpoints. Pytest-cov's `.2f` display can exceed its
+unrounded total by at most `0.005` percentage points. Scientific notation is
+accepted only for the native pytest-cov requirement, with the bounded exponent
+above; actual-coverage and legacy/custom tokens remain integer/dot-decimal only.
 Coverage process success requires exit zero without timeout, spawn, or
 stdout-decoding failure. Scanner-shaped JSON in coverage stdout is retained as
 raw diagnostic text, not interpreted as generic assurance findings.

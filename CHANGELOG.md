@@ -42,9 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LF/CRLF. After bounded SGR removal, a summary must occupy a complete line with optional
   horizontal indentation: coverage.py `TOTAL` requires exactly the two `Stmts Miss`
   integer columns or the four `Stmts Miss Branch BrPart` integer columns before its final
-  ASCII integer/dot-decimal percentage; pytest-cov accepts its complete native fail-under
+  ASCII integer/dot-decimal percentage. Every multi-number grammar validates the complete
+  relationship: statement-only rows must render the displayed percentage from `Stmts`
+  and `Miss`; branch rows must permit it for some total missing-branch count consistent
+  with all four displayed counts. `BrPart` is only the missing arcs whose source
+  statement ran, so it is not substituted for that hidden total. Because every branch
+  source has at least two exits, additional hidden misses require a distinct unexecuted
+  source and add either zero (`no branch`) or at least two arcs; a positive `BrPart`
+  also requires an executed statement. Coverage.py's actual configured-precision
+  rounding is modelled, including its rule that only exact zero or exact 100 displays
+  those endpoints. Pytest-cov accepts its complete native fail-under
   success or `FAIL ... not reached` sentence, or a complete legacy/custom
-  `Total coverage: <actual>%` line. A native requirement must be in `(0, 100]`, its
+  `Total coverage: <actual>%` line. The legacy form captures one number and has no
+  cross-field relationship. A native requirement must be in `(0, 100]`, its
   displayed actual value must have two decimal places and be in `[0, 100]`, and both
   values are validated. Because pytest-cov compares its unrounded total before formatting
   the actual value with `.2f`, reached/not-reached is checked against the actual float
