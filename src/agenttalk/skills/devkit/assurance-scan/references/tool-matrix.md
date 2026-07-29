@@ -48,10 +48,10 @@ AgentTalk-created class:
 - `agenttalk init` bootstrap state:
   `.agenttalk/config.json`, its `config.json.<8-character>` atomic-write
   sibling, `.agenttalk/state/<name>.cursor`, and its
-  `<name>.cursor.<8-character>` atomic-write sibling, where `<name>` matches
-  `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` and each `<8-character>` component matches
-  `[a-z0-9_]{8}`; this is a pathname grammar, not proof that the name belongs
-  to the current roster or is otherwise semantically valid;
+  `<name>.cursor.<8-character>` atomic-write sibling, where `<name>` passes
+  canonical `validate_agent_name()` validation and each `<8-character>`
+  component matches `[a-z0-9_]{8}`; this is a pathname grammar, not proof that
+  the name belongs to the current roster or that AgentTalk authored the path;
 - `.agenttalk/config.lock` and its
   `.config.lock.<generation>.prepare`,
   `.config.lock.<generation>.unlink`,
@@ -73,8 +73,8 @@ AgentTalk-created class:
 - default assurance output
   `.agenttalk/assurance/runs/<UTC-run-id>/artifact.json`, `summary.md`, and
   `raw/<safe-tool-id>.txt`, where `<UTC-run-id>` has the exact
-  `YYYYMMDDTHHMMSS.ffffffZ` shape and `<safe-tool-id>` matches
-  `[A-Za-z0-9_.-]+`.
+  `YYYYMMDDTHHMMSS.ffffffZ` shape and `<safe-tool-id>` is a fixed point of the
+  producer's `_safe_id()` sanitizer and matches `[A-Za-z0-9_.-]+`.
 
 `agenttalk init` does not modify an adopter's `.gitignore`, so these exact
 bootstrap and scanner outputs must not self-invalidate a no-ignore adopter.
@@ -142,9 +142,12 @@ global config lock. Finalization takes the handoff lock again, releases the
 coverage lock, and briefly reacquires the config lock. If the prior acquisition
 token still matches, it applies the provisional-gate compare-and-swap. A
 current-client config transaction that interposed forces a bounded re-probe
-outside the config lock; repeated churn fails closed red. A newly admitted
-coverage holder may acquire the transaction lock but cannot cross its initial
-handoff or start its command until the prior finalization completes.
+outside the config lock; repeated churn fails closed red. Ordinary concurrent
+activity from any `config.lock` caller can exhaust the two-re-probe budget and
+produce an avoidable red; re-run the scan before concluding that coverage
+regressed. A newly admitted coverage holder may acquire the transaction lock
+but cannot cross its initial handoff or start its command until the prior
+finalization completes.
 Gate, waiver, roster, and configuration operations can contend during the
 brief fence or commit transaction, but do not wait on coverage subprocesses,
 Git probes, or coverage-lock release. Release-failure fallback uses the same

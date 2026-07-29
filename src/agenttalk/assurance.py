@@ -3923,6 +3923,8 @@ def _same_runtime_path(root: Path, left: str, right: str) -> bool:
 
 def _is_agenttalk_created_untracked_path(root: Path, relative: str) -> bool:
     """Match only paths AgentTalk init or assurance can create."""
+    from agenttalk.store import validate_agent_name
+
     persistent = {
         "config.json",
         "config.lock",
@@ -3937,12 +3939,16 @@ def _is_agenttalk_created_untracked_path(root: Path, relative: str) -> bool:
         return True
 
     cursor = re.fullmatch(
-        r"state/([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\.cursor",
+        r"state/([^/]+)\.cursor",
         relative,
         flags=re.IGNORECASE,
     )
     if cursor is not None:
-        candidate = f"state/{cursor.group(1)}.cursor"
+        try:
+            agent_name = validate_agent_name(cursor.group(1))
+        except ValueError:
+            return False
+        candidate = "state/" + agent_name + ".cursor"
         if _same_runtime_path(root, relative, candidate):
             return True
 
@@ -3961,13 +3967,16 @@ def _is_agenttalk_created_untracked_path(root: Path, relative: str) -> bool:
                 return True
 
     cursor_temp = re.fullmatch(
-        r"state/([A-Za-z0-9][A-Za-z0-9_.-]{0,63})"
-        r"\.cursor\.([a-z0-9_]{8})",
+        r"state/([^/]+)\.cursor\.([a-z0-9_]{8})",
         relative,
         flags=re.IGNORECASE,
     )
     if cursor_temp is not None:
-        candidate = f"state/{cursor_temp.group(1)}.cursor.{cursor_temp.group(2).lower()}"
+        try:
+            agent_name = validate_agent_name(cursor_temp.group(1))
+        except ValueError:
+            return False
+        candidate = "state/" + agent_name + ".cursor." + cursor_temp.group(2).lower()
         if _same_runtime_path(root, relative, candidate):
             return True
 
@@ -3981,10 +3990,14 @@ def _is_agenttalk_created_untracked_path(root: Path, relative: str) -> bool:
     if run_output is None:
         return False
     run_id = run_output.group(1).upper()
-    if run_output.group(3) is None:
+    tool_id = run_output.group(3)
+    if tool_id is None:
         leaf = run_output.group(2).lower()
     else:
-        leaf = f"raw/{run_output.group(3)}.txt"
+        safe_tool_id = _safe_id(tool_id)
+        if safe_tool_id != tool_id:
+            return False
+        leaf = f"raw/{safe_tool_id}.txt"
     candidate = f"assurance/runs/{run_id}/{leaf}"
     return _same_runtime_path(root, relative, candidate)
 

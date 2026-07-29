@@ -2278,6 +2278,76 @@ def test_unignored_agenttalk_runtime_paths_do_not_dirty_coverage_attestation(
     assert provenance["git_dirty"] is False
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "expected_dirty"),
+    [
+        ("state/claude.cursor", False),
+        ("state/claude.cursor.abcdefgh", False),
+        ("state/operator.cursor", True),
+        ("state/operator.cursor.abcdefgh", True),
+    ],
+    ids=[
+        "valid-cursor",
+        "valid-cursor-temp",
+        "reserved-principal-cursor",
+        "reserved-principal-cursor-temp",
+    ],
+)
+def test_unignored_cursor_state_uses_canonical_agent_name_validation(
+    tmp_path: Path,
+    monkeypatch,
+    relative_path: str,
+    expected_dirty: bool,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    candidate = tmp_path / ".agenttalk" / relative_path
+    if not candidate.exists():
+        candidate.write_text("", encoding="utf-8")
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is expected_dirty
+
+
+@pytest.mark.parametrize(
+    ("safe_tool_id", "expected_dirty"),
+    [
+        ("coverage", False),
+        ("-coverage", True),
+        ("coverage-", True),
+    ],
+    ids=["canonical-safe-id", "leading-hyphen", "trailing-hyphen"],
+)
+def test_unignored_raw_output_requires_canonical_safe_tool_id(
+    tmp_path: Path,
+    monkeypatch,
+    safe_tool_id: str,
+    expected_dirty: bool,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    raw_dir = tmp_path / ".agenttalk" / "assurance" / "runs" / "20260729T010203.123456Z" / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / f"{safe_tool_id}.txt").write_text("", encoding="utf-8")
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is expected_dirty
+
+
 def test_case_variant_agenttalk_runtime_path_follows_filesystem_identity(
     tmp_path: Path,
     monkeypatch,

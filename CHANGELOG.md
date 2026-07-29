@@ -78,21 +78,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Coverage-gate finalization failures are bounded CLI failures and no longer escape,
   mask an earlier scan failure, or print a false success. Clean-tree attestation
   excludes only complete *untracked* paths in AgentTalk's init/scanner pathname
-  grammar: `config.json` and cursor files plus their eight-character
-  `[a-z0-9_]` atomic-write siblings; config, coverage, and coverage-handoff lock
-  markers plus 32-lowercase-hex generation/prepare/unlink residue;
+  grammar: `config.json` and cursor files whose names pass
+  `validate_agent_name()`, plus their eight-character `[a-z0-9_]` atomic-write
+  siblings; config, coverage, and coverage-handoff lock markers plus
+  32-lowercase-hex generation/prepare/unlink residue;
   `gates.json` plus its atomic-write sibling; and default assurance output at
   `.agenttalk/assurance/runs/YYYYMMDDTHHMMSS.ffffffZ/`
   `{artifact.json,summary.md,raw/<safe-id>.txt}`,
-  where `<safe-id>` matches `[A-Za-z0-9_.-]+`. This prevents
-  self-invalidation even though `agenttalk init` does not edit an adopter's
-  `.gitignore`. No tracked path is exempt: any tracked modification, including
-  an exact scanner pathname, makes the attestation dirty. The attestation also
-  rejects tracked paths hidden by `skip-worktree` or `assume-unchanged`; the
-  sole exception is a selected manifest/baseline whose loaded bytes,
-  filesystem identity, clean-filtered content, and stage-zero index blob are
-  independently proved. Arbitrary `.agenttalk` neighbors and similarly
-  prefixed paths also remain dirty when Git reports them.
+  where `<safe-id>` is a fixed point of `_safe_id()` and matches
+  `[A-Za-z0-9_.-]+`. This prevents self-invalidation even though
+  `agenttalk init` does not edit an adopter's `.gitignore`. No tracked path is
+  exempt: any tracked modification, including an exact scanner pathname, makes
+  the attestation dirty. The attestation also rejects tracked paths hidden by
+  `skip-worktree` or `assume-unchanged`; the sole exception is a selected
+  manifest/baseline whose loaded bytes, filesystem identity, clean-filtered
+  content, and stage-zero index blob are independently proved. Arbitrary
+  `.agenttalk` neighbors and similarly prefixed paths also remain dirty when
+  Git reports them.
   The selected assurance manifest and baseline are protected inputs: every
   existing selected path must be tracked, its bytes must still match the bytes
   loaded for this scan, and its Git-clean content must match the index blob
@@ -128,11 +130,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lock across coverage-lock release, briefly reacquires the config lock, and
   validates that token before the gate compare-and-swap. A current-client
   config transaction that interposed forces a bounded re-probe outside the
-  config lock; repeated churn fails closed red. Release-failure fallback uses
-  the same provisional-gate CAS, so an older scan cannot publish over a newer
-  generation. Gate, waiver, roster, and configuration work can contend during
-  the brief fence or commit transactions, but never waits on the coverage
-  subprocess, Git probes, or coverage-lock release.
+  config lock; repeated churn fails closed red. Ordinary concurrent activity
+  from any `config.lock` caller can exhaust the two-re-probe budget and produce
+  an avoidable red; re-run the scan before concluding that coverage regressed.
+  Release-failure fallback uses the same provisional-gate CAS, so an older scan
+  cannot publish over a newer generation. Gate, waiver, roster, and
+  configuration work can contend during the brief fence or commit
+  transactions, but never waits on the coverage subprocess, Git probes, or
+  coverage-lock release.
   This fence requires a homogeneous current client: a legacy client that obeys
   `config.lock` but does not advance the acquisition token is not detected.
   The coverage handoff likewise orders only current producers; a legacy or
