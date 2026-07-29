@@ -266,6 +266,42 @@ LEAD_SKILL_PATHS = (
 # followed by `-uno` is still broken.
 _UNTRACKED_OPT = re.compile(r"^(-u.*|--untracked-files(=.*)?)$")
 
+# The ONE spelling the recipe may use for the worker's worktree. `_run_extracted`
+# binds exactly this token and nothing else, so a taught command that names any other
+# target (`.`, `$PWD`, an empty string, a second `-C`) cannot be executed against the
+# fixture and silently pass.
+WORKTREE_PLACEHOLDER = "<worktree>"
+
+# A taught clean-SHA command is a single argv, not a shell program. `subprocess.run`
+# does not interpret any of these, so a pipeline or redirection written in the skill
+# would be handed to git as literal pathspecs: `... -- . | cat >/dev/null` returned
+# rc=0 with empty output while the worktree was dirty, because git saw `|`, `cat` and
+# `>/dev/null` as paths and `.` made the sentinel visible to the harness. Reject the
+# grammar instead of executing a command whose real behaviour differs from the test's.
+_SHELL_METACHARS = ("|", "&", ";", "<", ">", "`", "$(", "${", "\n", "\r")
+
+
+# A documented placeholder is `<word>` with no spaces; a redirection is `<`/`>` next to
+# a filename. Mask the former before scanning so the guard does not reject the very
+# recipe it exists to protect — the first version of this check flagged `<worktree>`
+# itself, which is a false-DOWN of exactly the kind these guards are meant to prevent.
+_PLACEHOLDER_TOKEN = re.compile(r"<[A-Za-z][A-Za-z0-9_.-]*>")
+
+
+def _shell_grammar_problems(cmd: str) -> list[str]:
+    """Reject anything that is a shell program rather than one plain argv."""
+    problems: list[str] = []
+    probe = _PLACEHOLDER_TOKEN.sub("PH", cmd)
+    for meta in _SHELL_METACHARS:
+        if meta in probe:
+            problems.append(
+                f"contains shell metacharacter {meta!r}; the recipe must be a single "
+                "argv because nothing interprets a shell here"
+            )
+    if cmd.rstrip().endswith("\\"):
+        problems.append("ends with a line continuation; the recipe must be one line")
+    return problems
+
 
 def _tokens(cmd: str, posix: bool) -> list[str] | None:
     """Tokenize, or None when the line cannot be tokenized (unbalanced quotes).
@@ -292,13 +328,22 @@ def _lead_bodies() -> list[tuple[str, str]]:
 
 
 def _strip_shell_comment(line: str) -> str:
-    """Drop a trailing shell comment. A `#` inside quotes is not a comment.
+    """Drop a trailing shell comment. A `#` inside quotes is not a comment, and
+    neither is a `#` ATTACHED to a word.
 
-    This exists because `--untracked-files=all` written in a COMMENT satisfied the
-    previous regex guard while the executed command lacked the flag entirely.
+    Two bypasses shaped this. First, `--untracked-files=all` written in a comment
+    satisfied a regex guard while the executed command lacked the flag. Then
+    `--untracked-files=all#broken` defeated the fix: breaking at every unquoted `#`
+    silently REPAIRED the broken token into the valid parent command before either
+    inspector saw it, so the guard validated a command the shell would never run
+    (`fatal: Invalid untracked files mode 'all#broken'`).
+
+    A shell opens a comment only where `#` STARTS a word — at the beginning of the
+    line or after whitespace. Anywhere else it is an ordinary character of the
+    current token, so it must be preserved and allowed to fail validation.
     """
     out, quote = [], None
-    for ch in line:
+    for i, ch in enumerate(line):
         if quote:
             out.append(ch)
             if ch == quote:
@@ -308,23 +353,45 @@ def _strip_shell_comment(line: str) -> str:
             quote = ch
             out.append(ch)
             continue
-        if ch == "#":
+        if ch == "#" and (i == 0 or line[i - 1].isspace()):
             break
         out.append(ch)
     return "".join(out).strip()
 
 
+# A prompt prefix is decoration, not part of the command. Without stripping it, a
+# VISIBLE `PS> git ... status ...` was skipped entirely (its first token was `PS>`),
+# so the recipe could be shown in a broken form while an inert copy hidden elsewhere
+# satisfied the "a status command exists" assertion.
+_PROMPT_PREFIX = re.compile(r"^\s*(?:PS[^>]*>|\$|>|#\s)\s*")
+
+# `<!-- ... -->` is not rendered, so a command inside it is not taught. Counting it
+# satisfied the global "there is a status command" check while every command a reader
+# can actually see was ignored or broken. Spans can cross lines, so blank the region
+# in place rather than dropping lines, to keep line numbers honest in failures.
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _visible(text: str) -> str:
+    """The document as a reader sees it: HTML-comment spans blanked, lines preserved."""
+    return _HTML_COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
 def _fenced_git_commands(text: str) -> list[tuple[int, str]]:
-    """Every runnable ``git`` line inside a fenced block, comments stripped."""
+    """Every runnable ``git`` line inside a fenced block, comments stripped.
+
+    Operates on the VISIBLE document, so a decoy inside an HTML comment cannot stand in
+    for a command a reader is actually shown.
+    """
     cmds: list[tuple[int, str]] = []
     in_fence = False
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    for lineno, line in enumerate(_visible(text).splitlines(), start=1):
         if line.strip().startswith(("```", "~~~")):
             in_fence = not in_fence
             continue
         if not in_fence:
             continue
-        stripped = _strip_shell_comment(line)
+        stripped = _strip_shell_comment(_PROMPT_PREFIX.sub("", line))
         first = stripped.split(" ", 1)[0] if stripped else ""
         if first in ("git", "git.exe"):
             cmds.append((lineno, stripped))
@@ -341,9 +408,9 @@ def _inline_git_commands(text: str) -> list[tuple[int, str]]:
     inline, and the quoting property has to hold for those too.
     """
     cmds: list[tuple[int, str]] = []
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    for lineno, line in enumerate(_visible(text).splitlines(), start=1):
         for m in _INLINE_CODE.finditer(line):
-            snippet = _strip_shell_comment(m.group(1))
+            snippet = _strip_shell_comment(_PROMPT_PREFIX.sub("", m.group(1)))
             first = snippet.split(" ", 1)[0] if snippet else ""
             if first in ("git", "git.exe"):
                 cmds.append((lineno, snippet))
@@ -360,15 +427,31 @@ def _dash_c_problems(cmd: str) -> list[str]:
     if raw is None:
         return ["cannot be tokenized (unbalanced quotes)"]
     problems = []
+    seen = 0
     for i, tok in enumerate(raw):
         if tok != "-C":
             continue
+        seen += 1
         if i + 1 >= len(raw):
             problems.append("`-C` with no argument")
             continue
         arg = raw[i + 1]
         if not (len(arg) >= 2 and arg[0] == '"' and arg[-1] == '"'):
             problems.append(f"`-C {arg}` is not a whole quoted token")
+            continue
+        # Quoting alone is not enough. `git -C "."` is perfectly quoted and utterly
+        # wrong: run from a lead's own checkout it reports nothing about the worker's
+        # worktree, and the old harness hid that by rewriting the argument. The target
+        # must be the documented placeholder so the executed command and the taught
+        # command select the same repository.
+        if arg[1:-1] != WORKTREE_PLACEHOLDER:
+            problems.append(
+                f"`-C {arg}` targets {arg[1:-1]!r}, not {WORKTREE_PLACEHOLDER!r}; a "
+                "recipe that selects the current directory silently reports on the "
+                "wrong repository"
+            )
+    if seen > 1:
+        problems.append(f"{seen} `-C` options; git honours the last, so the target is ambiguous")
     return problems
 
 
@@ -393,11 +476,32 @@ def _untracked_problems(cmd: str) -> list[str]:
 
 
 def _run_extracted(cmd: str, repo: Path) -> subprocess.CompletedProcess:
-    """Execute an extracted command with its `-C` argument pointed at ``repo``."""
+    """Execute an extracted command, binding ONLY the documented placeholder to ``repo``.
+
+    The previous version replaced whatever followed `-C`, which meant it executed the
+    command only AFTER deleting the repository-selection behaviour it was supposed to
+    validate: `git -C "."` was silently rewritten to point at the fixture repo and
+    passed, while the real command run from a lead's own checkout returns rc=0 and
+    empty output and reports nothing about the worker's worktree. That is circular
+    validation — substituting the part under test.
+
+    So the binding is exact: the `-C` argument must be the placeholder, and the
+    placeholder is the only token substituted. Anything else raises rather than being
+    quietly repaired, because a caller that reaches here with an unbound target has
+    already lost the property this test exists to prove.
+    """
     toks = shlex.split(cmd, posix=True)
+    bound = 0
     for i, tok in enumerate(toks):
-        if tok == "-C" and i + 1 < len(toks):
-            toks[i + 1] = str(repo)
+        if tok == WORKTREE_PLACEHOLDER:
+            toks[i] = str(repo)
+            bound += 1
+    if bound != 1:
+        raise AssertionError(
+            f"refusing to execute {cmd!r}: expected exactly one {WORKTREE_PLACEHOLDER!r} "
+            f"to bind, found {bound}. The target must be the documented placeholder, "
+            "never a path this helper substitutes for it."
+        )
     return subprocess.run(toks, capture_output=True, text=True, timeout=60)
 
 
@@ -436,7 +540,7 @@ def test_lead_clean_sha_command_is_effective(tmp_path: Path) -> None:
             "the clean-SHA handoff step lost its command entirely"
         )
         for lineno, cmd in status_cmds:
-            problems = _untracked_problems(cmd) + _dash_c_problems(cmd)
+            problems = _untracked_problems(cmd) + _dash_c_problems(cmd) + _shell_grammar_problems(cmd)
             assert not problems, f"{label} lead skill line {lineno}: {problems} in {cmd!r}"
 
             res = _run_extracted(cmd, dirty)
@@ -497,6 +601,29 @@ CLEAN_SHA_BYPASSES = [
     # the original placebo
     ('git -C "<worktree>" status --porcelain',
      "bare porcelain"),
+    # --- bypasses that defeated the EXECUTING version (round 3), all four reported
+    # --- with reproductions by an independent reviewer while the suite stayed green.
+    # `#` attached to a token is not a comment; breaking at it REPAIRED the command.
+    # Real git: fatal: Invalid untracked files mode 'all#broken'
+    ('git -C "<worktree>" status --porcelain --untracked-files=all#broken',
+     "attached-# repaired by the comment stripper"),
+    # perfectly quoted and utterly wrong: reports on the lead's own checkout. The old
+    # harness rewrote the -C argument, so it validated after deleting the behaviour.
+    ('git -C "." status --porcelain --untracked-files=all',
+     "-C . targets the wrong repository"),
+    ('git -C "$PWD" status --porcelain --untracked-files=all',
+     "-C $PWD targets the wrong repository"),
+    ('git -C "" status --porcelain --untracked-files=all',
+     "-C empty targets the wrong repository"),
+    # git honours the last -C, so a correct target followed by another is ambiguous
+    ('git -C "<worktree>" -C "." status --porcelain --untracked-files=all',
+     "second -C overrides the target"),
+    # a shell program, not an argv: git receives |, cat and >/dev/null as pathspecs,
+    # while `.` makes the sentinel visible, so the harness saw a plausible result
+    ('git -C "<worktree>" status --porcelain --untracked-files=all -- . | cat >/dev/null',
+     "pipeline passed to git as pathspecs"),
+    ('git -C "<worktree>" status --porcelain --untracked-files=all > NUL',
+     "redirection discards the evidence"),
 ]
 
 
@@ -508,8 +635,52 @@ def test_clean_sha_guards_reject_known_bypasses(cmd: str, why: str) -> None:
     prove they reject a plausible rewording, which is exactly how the previous two
     attempts failed review.
     """
-    problems = _untracked_problems(cmd) + _dash_c_problems(cmd)
+    problems = _untracked_problems(cmd) + _dash_c_problems(cmd) + _shell_grammar_problems(cmd)
     assert problems, f"bypass NOT caught ({why}): {cmd!r}"
+
+
+def test_extraction_ignores_html_comments_and_sees_prompt_prefixed_commands() -> None:
+    """A decoy inside `<!-- -->` must NOT satisfy the guards, and a VISIBLE command
+    must not escape them by wearing a prompt prefix.
+
+    This is the fourth reported bypass, and it is a document-level one: a correct
+    command hidden in an HTML comment satisfied the global "a status command exists"
+    assertion, while the command a reader can actually see was skipped because its
+    first token was `PS>` rather than `git`. Both halves are needed - hiding the decoy
+    alone would just make the visible-but-ignored command the new hiding place.
+    """
+    doc = (
+        "# Recipe\n"
+        "<!--\n"
+        "```bash\n"
+        'git -C "<worktree>" status --porcelain --untracked-files=all\n'
+        "```\n"
+        "-->\n"
+        "```bash\n"
+        'PS> git -C "<worktree>" status --porcelain\n'
+        "```\n"
+    )
+    found = _fenced_git_commands(doc)
+
+    assert len(found) == 1, f"expected exactly the visible command, got {found}"
+    lineno, cmd = found[0]
+    assert lineno == 8, f"line number should point at the VISIBLE command, got {lineno}"
+    assert cmd == 'git -C "<worktree>" status --porcelain', cmd
+
+    # And having been seen, it must be judged - the prompt prefix bought it nothing.
+    assert _untracked_problems(cmd), (
+        "the visible command is a bare porcelain placebo and must be rejected once the "
+        "prompt prefix no longer hides it"
+    )
+
+    # Direction control: the commented-out text is genuinely well-formed, so its
+    # exclusion is what makes this test meaningful rather than an accident of syntax.
+    hidden = 'git -C "<worktree>" status --porcelain --untracked-files=all'
+    assert not (_untracked_problems(hidden) + _dash_c_problems(hidden)
+                + _shell_grammar_problems(hidden)), (
+        "the decoy must be a command that WOULD have passed; otherwise this test proves "
+        "nothing about HTML comments"
+    )
 
 
 def _fenced_bare_agenttalk_lines(text: str) -> list[tuple[int, str]]:
