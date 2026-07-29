@@ -34,11 +34,27 @@ JSON and XML reports are not parsed. The parser rejects stdout evidence over
 that parse-time check; capture-time bounding remains #106.
 
 Accepted coverage stdout is built-in text, or direct UTF-8 byte input with an
-optional BOM, using LF/CRLF. It must contain a coverage.py `TOTAL` row or
-pytest-cov `Total coverage:` summary with an ASCII integer or dot-decimal
-percentage. SGR color sequences with at most 32 digit, semicolon, or colon
-parameter characters may decorate the text. The final recognized summary across
-both formats wins, and the configured process must exit zero.
+optional BOM, using LF/CRLF. After bounded SGR removal, a recognized summary
+must occupy one complete line with optional horizontal indentation. A
+coverage.py `TOTAL` row has exactly two ASCII unsigned-integer count columns
+(`Stmts Miss`) or four (`Stmts Miss Branch BrPart`) before the final ASCII
+integer/dot-decimal percentage. Pytest-cov's native success line is `Required
+test coverage of <required>% reached. Total coverage: <actual>%`; its native
+failure line is `FAIL Required test coverage of <required>% not reached. Total
+coverage: <actual>%`. A complete legacy/custom `Total coverage: <actual>%` line
+is also accepted. Only horizontal whitespace may follow any form, so
+incidental prose containing familiar words is refused. SGR color sequences may
+contain at most 32 digit, semicolon, or colon parameter characters. The final
+structurally recognized summary across all forms wins.
+
+Percentage tokens are parsed as exact decimals before JSON-compatible float
+attestation. If nearest-float conversion would serialize above the exact token,
+the attested value steps down one representable float (or refuses if it still
+cannot prove a non-overstatement). Conversion can therefore conservatively
+understate coverage but cannot cross a configured floor toward passing.
+Coverage process success requires exit zero without timeout, spawn, or
+stdout-decoding failure. Scanner-shaped JSON in coverage stdout is retained as
+raw diagnostic text, not interpreted as generic assurance findings.
 
 The parser refuses bare-carriage-return progress rewrites, unsupported or
 overlong escape sequences, locale-comma decimals, malformed or out-of-range

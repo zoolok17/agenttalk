@@ -33,15 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The stdout parser rejects evidence over 16 MiB, but subprocess `capture_output=True`
   still buffers the complete stream before that parse-time bound (#106). The accepted
   parser class is built-in text, or direct UTF-8 byte input with an optional BOM, using
-  LF/CRLF and containing a coverage.py `TOTAL` row or pytest-cov `Total coverage:`
-  summary with an ASCII integer or dot-decimal percentage. Bounded SGR color decoration
-  is removed, and the final recognized match across both formats wins.
+  LF/CRLF. After bounded SGR removal, a summary must occupy a complete line with optional
+  horizontal indentation: coverage.py `TOTAL` requires exactly the two `Stmts Miss`
+  integer columns or the four `Stmts Miss Branch BrPart` integer columns before its final
+  ASCII integer/dot-decimal percentage; pytest-cov accepts its complete native fail-under
+  success or `FAIL ... not reached` sentence, or a complete legacy/custom
+  `Total coverage: <actual>%` line. Incidental prose
+  containing those words is not evidence. The final structurally recognized match across
+  all forms wins. Decimal-to-float attestation is conservative: if the persisted float
+  would overstate the exact token, it steps down, so conversion cannot cross a DoD floor
+  toward passing.
   Bare-carriage-return rewrites, unsupported or overlong terminal escapes, locale-comma
   decimals, and stderr-only summaries fail closed. Coverage stdout is captured as bytes,
   preserving bare CR versus CRLF, and decoded as strict UTF-8 with an optional BOM;
   undecodable output records a red tool result without aborting the scan. The configured
-  process must exit zero; agenttalk cannot observe an inner failed sub-run whose wrapper
-  suppresses its status, so wrappers must propagate failures and print the intended
+  process must exit zero. Coverage process success is derived only from exit, timeout,
+  spawn, and stdout-decoding outcomes; scanner-shaped JSON in coverage stdout is not
+  reclassified as generic findings. Agenttalk cannot observe an inner failed sub-run whose
+  wrapper suppresses its status, so wrappers must propagate failures and print the intended
   aggregate summary last. Only an active, valid operator waiver suppresses automated writes:
   expired, malformed, or incomplete waivers are replaced by fresh evidence or invalidated
   red when no fresh measurement exists. DoD coverage policy explicitly selects one of the

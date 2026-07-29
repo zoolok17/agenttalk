@@ -1311,7 +1311,10 @@ def _run_external(
     timeout = int(spec.get("timeout_seconds") or 60)
     # Coverage must retain bare CR versus CRLF until its fail-closed parser sees
     # the stream; text-mode universal-newline translation destroys that evidence.
-    capture_bytes = spec.get("tool_id") == "coverage"
+    # Its process result is also specialized below: scanner-shaped JSON in stdout
+    # is evidence text, not a generic assurance finding.
+    is_coverage_command = spec.get("tool_id") == "coverage"
+    capture_bytes = is_coverage_command
     raw = ""
     try:
         completed = subprocess.run(  # nosec B603 - argv list, shell disabled by default
@@ -1377,7 +1380,7 @@ def _run_external(
         raw_stdout = stdout
 
     raw = raw_stdout + ("\n" if raw_stdout and stderr else "") + stderr
-    findings = _parse_tool_findings(spec, stdout, stderr)
+    findings = [] if is_coverage_command else _parse_tool_findings(spec, stdout, stderr)
     if findings:
         status = _pre_baseline_status(
             findings,
@@ -1427,7 +1430,9 @@ def _run_coverage_external(
     stdout is captured as bytes and decoded as strict UTF-8 so universal-newline
     translation cannot hide a bare-carriage-return rewrite. Stdout is bounded at
     the parser boundary, not while ``capture_output=True`` buffers the subprocess
-    streams (#106).
+    streams (#106). Command success comes only from subprocess exit/timeout,
+    spawn, and decoding outcomes; generic scanner-shaped JSON in coverage stdout
+    is never reclassified as an assurance finding.
     """
     from agenttalk.store import Store
 

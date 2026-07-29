@@ -40,12 +40,19 @@ Python v1:
   a scan has no fresh measurement.
 
 Accepted coverage stdout is built-in text, or direct UTF-8 byte input with an
-optional BOM, no larger than 16 MiB at the parse boundary. It uses LF/CRLF and
-must contain a coverage.py `TOTAL` row or pytest-cov `Total coverage:` summary
-with an ASCII integer or dot-decimal percentage. SGR color sequences with at
-most 32 digit, semicolon, or colon parameter characters may decorate the text.
-The final recognized summary across both formats wins, and the configured
-process must exit zero.
+optional BOM, no larger than 16 MiB at the parse boundary. Bounded SGR
+decoration is removed before the following complete-line grammar is applied:
+
+| Input class | Structural requirement | Disposition |
+| --- | --- | --- |
+| coverage.py terminal row | One LF/CRLF-delimited line with optional horizontal indentation, literal `TOTAL`, exactly two ASCII unsigned-integer count columns (`Stmts Miss`) or four (`Stmts Miss Branch BrPart`), then an ASCII integer/dot-decimal percentage as the final field. | Handled |
+| pytest-cov fail-under summary | One LF/CRLF-delimited line with optional horizontal indentation: native success `Required test coverage of <required>% reached. Total coverage: <actual>%`, native failure `FAIL Required test coverage of <required>% not reached. Total coverage: <actual>%`, or the complete legacy/custom `Total coverage: <actual>%` form. Only horizontal whitespace may follow. | Handled |
+| Incidental percentage prose | Text such as `application log says Total coverage: 99% but no report` or `TOTAL deployment success 99%` does not have the required complete-line/numeric-column structure. | Refused |
+| Percentage precision | The token is parsed as an exact decimal. Its persisted float never serializes to a decimal above that token; conversion steps down when nearest-float conversion would round upward. | Handled conservatively |
+| Coverage process outcome | Success requires exit zero without timeout, spawn, or stdout-decoding failure. Generic scanner-shaped JSON in stdout is not interpreted as coverage findings; nonzero/failed execution remains red even with a valid summary. | Handled |
+
+SGR sequences may contain at most 32 digit, semicolon, or colon parameter
+characters. The final structurally recognized summary across all forms wins.
 
 The parser refuses bare-carriage-return progress rewrites, unsupported or
 overlong escape sequences, locale-comma decimals, malformed or out-of-range
@@ -54,9 +61,10 @@ Stdout and stderr are captured separately, so stderr-only summaries and their
 ordering relative to stdout are not evidence. Coverage stdout is captured as
 bytes to preserve bare CR versus CRLF, then decoded as strict UTF-8 with an
 optional BOM; undecodable output records a red tool result without aborting the
-scan. Agenttalk cannot identify an inner failed sub-run when a wrapper suppresses
-its status and exits zero. Such wrappers must propagate failures and print the
-intended aggregate summary last.
+scan. Scanner-shaped JSON in coverage stdout remains raw diagnostic text and
+does not enter the generic finding parser. Agenttalk cannot identify an inner
+failed sub-run when a wrapper suppresses its status and exits zero. Such wrappers
+must propagate failures and print the intended aggregate summary last.
 
 The canonical coverage-path class is exactly `coverage.xml` and `coverage.json`.
 An arbitrary configured command can write another path, and the scanner neither

@@ -8,11 +8,13 @@ must not mistake this for a capture-time memory bound. Process-control ``BaseExc
 signals (for example ``KeyboardInterrupt``, ``SystemExit``, and ``GeneratorExit``)
 intentionally remain outside this contract rather than being misreported as malformed evidence.
 
-Accepted text uses LF or CRLF line endings and contains a coverage.py ``TOTAL`` row or
-pytest-cov ``Total coverage:`` summary with an ASCII integer or dot-decimal percentage.
-Bounded SGR color sequences may decorate the summary; the final recognized summary across
-both formats wins. Bare-carriage-return rewrites and every remaining terminal control fail
-closed. Direct byte input must decode as UTF-8 with an optional BOM.
+Accepted text uses LF or CRLF line endings and contains one complete coverage.py ``TOTAL``
+row (exactly two or four integer count columns) or one complete pytest-cov summary line.
+The pytest-cov class includes its native fail-under sentence and the legacy/custom bare
+``Total coverage:`` form. Percentages are ASCII integers or dot decimals. Bounded SGR color
+sequences may decorate the summary; the final recognized summary across all forms wins.
+Bare-carriage-return rewrites and every remaining terminal control fail closed. Direct byte
+input must decode as UTF-8 with an optional BOM.
 """
 
 from __future__ import annotations
@@ -29,18 +31,45 @@ MAX_COVERAGE_ARTIFACT_BYTES = 16 * 1024 * 1024
 # keeps normalization bounded and leaves every other terminal control untrusted.
 _ANSI_SGR = re.compile(r"\x1b\[[0-9;:]{0,32}m")
 _UNSUPPORTED_TERMINAL_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
-# coverage.py / pytest-cov terminal summary: a "TOTAL" row whose last token is a percent.
-#   TOTAL                        1234    56    96%
-_TOTAL_LINE = re.compile(r"^TOTAL\b.*?(?<!\S)([0-9]+(?:\.[0-9]+)?)%\s*$", re.MULTILINE)
-# pytest-cov "Total coverage: 87.34%" (fractional) form.
+_PERCENT_PATTERN = r"[0-9]+(?:\.[0-9]+)?"
+# coverage.py emits exactly two count columns without branch coverage and four with it:
+#   TOTAL                         1234     56    96%
+#   TOTAL                         1234     56    200     12    94%
+_TOTAL_LINE = re.compile(
+    rf"^[ \t]*TOTAL[ \t]+[0-9]+[ \t]+[0-9]+"
+    rf"(?:[ \t]+[0-9]+[ \t]+[0-9]+)?"
+    rf"[ \t]+({_PERCENT_PATTERN})%[ \t]*$",
+    re.MULTILINE,
+)
+# A legacy/custom bare pytest-cov summary retained as a complete-line form.
 _TOTAL_COVERAGE = re.compile(
-    r"\bTotal coverage:\s*([0-9]+(?:\.[0-9]+)?)%(?=\s|$)",
-    re.IGNORECASE,
+    rf"^[ \t]*Total coverage:[ \t]*({_PERCENT_PATTERN})%[ \t]*$",
+    re.MULTILINE,
+)
+# pytest-cov's native --cov-fail-under terminal summaries. A failed run adds
+# both "FAIL " and "not"; process outcome, not this text, determines success.
+_PYTEST_COV_SUCCESS = re.compile(
+    rf"^[ \t]*Required test coverage of[ \t]+"
+    rf"{_PERCENT_PATTERN}%[ \t]+reached\.[ \t]+"
+    rf"Total coverage:[ \t]*({_PERCENT_PATTERN})%[ \t]*$",
+    re.MULTILINE,
+)
+_PYTEST_COV_FAILURE = re.compile(
+    rf"^[ \t]*FAIL[ \t]+Required test coverage of[ \t]+"
+    rf"{_PERCENT_PATTERN}%[ \t]+not[ \t]+reached\.[ \t]+"
+    rf"Total coverage:[ \t]*({_PERCENT_PATTERN})%[ \t]*$",
+    re.MULTILINE,
 )
 
 
 def _valid(pct: int | float | Decimal | str | None) -> float | None:
-    """Accept only a real number in [0, 100]; anything else is fail-closed ``None``."""
+    """Return a finite percentage without ever rounding its decimal value upward.
+
+    Gate evidence is JSON-compatible ``float`` data. If nearest-float conversion would
+    serialize to a decimal greater than the producer's exact token, step down one
+    representable float. This can conservatively understate coverage but cannot move it
+    across a configured floor toward passing.
+    """
     if pct is None or isinstance(pct, bool):
         return None
     try:
@@ -52,6 +81,10 @@ def _valid(pct: int | float | Decimal | str | None) -> float | None:
     f = float(exact)
     if math.isnan(f) or math.isinf(f):
         return None
+    if Decimal(str(f)) > exact:
+        f = math.nextafter(f, -math.inf)
+        if Decimal(str(f)) > exact:
+            return None
     return f
 
 
@@ -75,7 +108,7 @@ def _source_text(source: str | bytes) -> str | None:
 
 
 def _from_stdout(stdout: str) -> float | None:
-    """Return the final recognized summary by stream position across both formats."""
+    """Return the final structurally recognized summary by stream position."""
     if not _evidence_within_limit(stdout):
         return None
 
@@ -84,7 +117,12 @@ def _from_stdout(stdout: str) -> float | None:
         return None
 
     last_match: tuple[int, str] | None = None
-    for pattern in (_TOTAL_LINE, _TOTAL_COVERAGE):
+    for pattern in (
+        _TOTAL_LINE,
+        _TOTAL_COVERAGE,
+        _PYTEST_COV_SUCCESS,
+        _PYTEST_COV_FAILURE,
+    ):
         for match in pattern.finditer(normalized):
             candidate = (match.end(), match.group(1))
             if last_match is None or candidate[0] > last_match[0]:
@@ -100,8 +138,10 @@ def parse_coverage_percent(stdout: str | bytes) -> float | None:
     ``coverage`` dimension HOLDs. Root JSON and XML reports are deliberately not read. For
     built-in ``str`` and ``bytes`` sources, ordinary parser exceptions are contained at this
     public boundary; process-control ``BaseException`` signals intentionally propagate.
-    Producer callers pass only stdout; stderr-only summaries, locale-comma decimals, and
-    terminal progress rewrites are outside the accepted input class.
+    Producer callers pass only stdout. Recognized forms must occupy a complete line and
+    carry the documented numeric structure; incidental prose is not evidence. Stderr-only
+    summaries, locale-comma decimals, and terminal progress rewrites are outside the
+    accepted input class.
     """
     if not isinstance(stdout, (str, bytes)) or not stdout:
         return None

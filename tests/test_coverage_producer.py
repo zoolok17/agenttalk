@@ -10,6 +10,7 @@ import textwrap
 import threading
 import time
 from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -294,6 +295,51 @@ def test_failed_coverage_command_stays_red_with_parseable_output(
     gate = _coverage_gate(tmp_path)
     assert gate["status"] == "red"
     assert gate["evidence"][-1]["coverage_percent"] == 99.0
+
+
+def test_successful_coverage_ignores_generic_scanner_findings_in_stdout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    script = (
+        "import json; "
+        "print('TOTAL 100 12 88%'); "
+        "print(json.dumps({'findings': [{'rule_id': 'unrelated', "
+        "'severity': 'high', 'message': 'not coverage'}]}))"
+    )
+
+    result = assurance.run_plan(_plan(tmp_path, script, revision=revision))
+
+    assert result.tools_run[0]["exit_code"] == 0
+    assert result.tools_run[0]["status"] == "pass"
+    assert result.findings == []
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "green"
+    assert gate["evidence"][-1]["coverage_percent"] == 88.0
+
+
+def test_failed_coverage_with_generic_scanner_findings_stays_red(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    script = (
+        "import json; "
+        "print('TOTAL 100 12 88%'); "
+        "print(json.dumps({'findings': [{'rule_id': 'unrelated', "
+        "'severity': 'high', 'message': 'not coverage'}]})); "
+        "raise SystemExit(7)"
+    )
+
+    result = assurance.run_plan(_plan(tmp_path, script, revision=revision))
+
+    assert result.tools_run[0]["exit_code"] == 7
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    assert result.findings == []
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert gate["evidence"][-1]["coverage_percent"] == 88.0
 
 
 def test_stderr_only_coverage_summary_stays_red(
@@ -1737,6 +1783,183 @@ def test_stdout_percent_parser_consumes_the_full_token(
         assert actual is None
     else:
         assert actual == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "application log says Total coverage: 99% but no report",
+        "TOTAL deployment success 99%",
+    ],
+    ids=["incidental-pytest-cov-words", "total-without-numeric-columns"],
+)
+def test_coverage_parser_rejects_incidental_percentage_prose(stdout: str) -> None:
+    assert parse_coverage_percent(stdout) is None
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        (
+            "\x1b[32m  TOTAL\x1b[0m 100 50 \x1b[1;32m50%\x1b[0m\r\n",
+            50.0,
+        ),
+        (
+            "\x1b[32m  Required test coverage of 80% reached. Total coverage: 87.34%\x1b[0m\r\n",
+            87.34,
+        ),
+        (
+            "  FAIL Required test coverage of 90% not reached. Total coverage: 87.34%\r\n",
+            87.34,
+        ),
+    ],
+    ids=[
+        "coverage-total-indented-sgr-crlf",
+        "pytest-cov-success-indented-sgr-crlf",
+        "pytest-cov-failure-indented-crlf",
+    ],
+)
+def test_coverage_parser_accepts_structural_terminal_summaries(
+    stdout: str,
+    expected: float,
+) -> None:
+    assert parse_coverage_percent(stdout) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "TOTAL 100 99%",
+        "TOTAL 100 50 25 99%",
+        "TOTAL 100 50 25 12 6 99%",
+        "TOTAL 100 50 99% trailing prose",
+    ],
+    ids=[
+        "one-count-column",
+        "three-count-columns",
+        "five-count-columns",
+        "trailing-prose",
+    ],
+)
+def test_coverage_parser_rejects_noncoverage_total_shapes(stdout: str) -> None:
+    assert parse_coverage_percent(stdout) is None
+
+
+def test_coverage_parser_accepts_branch_total_shape() -> None:
+    stdout = "  TOTAL 100 50 20 10 50.00%\r\n"
+
+    assert parse_coverage_percent(stdout) == pytest.approx(50.0)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "FAIL Required test coverage of 90% reached. Total coverage: 99%",
+        "Required test coverage of 90% not reached. Total coverage: 99%",
+    ],
+    ids=["fail-prefix-with-reached", "missing-fail-prefix-with-not-reached"],
+)
+def test_coverage_parser_rejects_impossible_pytest_cov_summary_combinations(
+    stdout: str,
+) -> None:
+    assert parse_coverage_percent(stdout) is None
+
+
+def test_coverage_parser_never_rounds_toward_passing() -> None:
+    stdout = "Total coverage: 79.999999999999999999999999%"
+
+    parsed = parse_coverage_percent(stdout)
+
+    assert parsed is not None
+    assert Decimal(str(parsed)) <= Decimal("79.999999999999999999999999")
+    assert parsed < 80.0
+
+
+def test_final_high_precision_summary_cannot_expose_earlier_green() -> None:
+    stdout = "Total coverage: 99%\nTotal coverage: 79.999999999999999999999999%"
+
+    parsed = parse_coverage_percent(stdout)
+
+    assert parsed is None or parsed < 80.0
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "Total coverage: 80%",
+        "Total coverage: 80.000000000000000000000001%",
+    ],
+    ids=["exact-floor", "above-floor-below-float-resolution"],
+)
+def test_coverage_parser_preserves_values_legitimately_at_or_above_floor(
+    stdout: str,
+) -> None:
+    parsed = parse_coverage_percent(stdout)
+
+    assert parsed is not None
+    assert parsed >= 80.0
+
+
+@pytest.mark.parametrize(
+    ("reported", "expect_satisfied"),
+    [
+        ("79.999999999999999999999999", False),
+        ("80", True),
+        ("80.000000000000000000000001", True),
+    ],
+    ids=["below-floor", "at-floor", "above-floor-below-float-resolution"],
+)
+def test_coverage_attestation_compares_conservatively_at_dod_floor(
+    tmp_path: Path,
+    monkeypatch,
+    reported: str,
+    expect_satisfied: bool,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            f"print('Total coverage: {reported}%')",
+            revision=revision,
+        )
+    )
+    policy = close.validate_dod_policy(
+        {
+            "schema_version": 1,
+            "scopes": {
+                "release": {
+                    "coverage": {
+                        "gate": "coverage:release",
+                        "min_percent": 80.0,
+                        "max_age_days": 14,
+                    }
+                }
+            },
+        }
+    )
+    required = close.derive_required_dod(policy, "release")["dimensions"]
+    record = {
+        "scope": "release",
+        "gate_scope": "release",
+        "revision": revision,
+    }
+    resolved = cli._resolve_dod_coverage_gate(
+        Store(tmp_path),
+        required["coverage"],
+        record,
+    )
+
+    issues = close.evaluate_dod(
+        record,
+        {
+            "policy_present": True,
+            "policy_error": None,
+            "required_dimensions": required,
+            "coverage": resolved,
+        },
+    )
+
+    assert (issues == []) is expect_satisfied
 
 
 @pytest.mark.parametrize(
