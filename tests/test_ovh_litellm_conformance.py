@@ -19,38 +19,25 @@ from agenttalk.ovh_gateway import (
     settlement_cost_micro_eur,
 )
 from agenttalk.ovh_gateway_front import FrontConfig, GatewayFront
+from tests._socket_harness import (
+    CANCELLATION_JOIN_SECONDS,
+    CompletionBudget,
+    ServerActivity,
+    SocketCancellation,
+    TimeoutLatch,
+    TrackedHTTPConnection,
+    await_completed,
+    cancellable_http_connection,
+    run_cleanup_steps,
+    track_server,
+)
 
 
 TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
-# Public front exchanges use completion events rather than socket read
-# deadlines. This matches the suite's existing synchronized-contention
-# watchdog (#94) and only reports a stuck harness worker.
-COMPLETION_WATCHDOG_SECONDS = 30
-
-
-def _await_completed(operation, *, label: str):
-    completed = threading.Event()
-    results: list[object] = []
-    errors: list[BaseException] = []
-
-    def run() -> None:
-        try:
-            results.append(operation())
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            completed.set()
-
-    worker = threading.Thread(target=run, daemon=True)
-    worker.start()
-    assert completed.wait(timeout=COMPLETION_WATCHDOG_SECONDS), (
-        f"{label} did not complete after its synchronization condition was armed"
-    )
-    worker.join()
-    if errors:
-        raise errors[0]
-    assert len(results) == 1
-    return results[0]
+# The front phase has the same honest cumulative runtime deadline as the
+# hermetic gateway-front tests. A first deadline is cleaned up and then latches
+# later parametrized cases to fail fast instead of paying the budget repeatedly.
+_CONFORMANCE_TIMEOUT_LATCH = TimeoutLatch()
 
 
 def _free_port() -> int:
@@ -63,6 +50,8 @@ class _FakeOpenAI:
     def __init__(self, *, status: int = 200) -> None:
         self.requests: list[dict] = []
         self.status = status
+        self.activity = ServerActivity()
+        self._cancelling = threading.Event()
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -157,7 +146,14 @@ class _FakeOpenAI:
                 self.end_headers()
                 self.wfile.write(response)
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        class Server(ThreadingHTTPServer):
+            def handle_error(self, request, client_address) -> None:
+                if owner._cancelling.is_set():
+                    return
+                super().handle_error(request, client_address)
+
+        self.server = Server(("127.0.0.1", 0), Handler)
+        track_server(self.server, self.activity)
         self.port = int(self.server.server_address[1])
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -166,9 +162,31 @@ class _FakeOpenAI:
         return self
 
     def __exit__(self, *_args: object) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
+        deadline = time.monotonic() + CANCELLATION_JOIN_SECONDS
+
+        def cancel_requests() -> None:
+            self._cancelling.set()
+            self.activity.cancel_active_sockets(reject_new=True)
+
+        def stop_listener() -> None:
+            if self.thread.is_alive():
+                self.server.shutdown()
+
+        def join_listener() -> None:
+            if self.thread.ident is not None:
+                self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert not self.thread.is_alive(), "fake OpenAI listener survived teardown"
+
+        run_cleanup_steps(
+            cancel_requests,
+            stop_listener,
+            self.server.server_close,
+            join_listener,
+            lambda: self.activity.wait_stopped(
+                label="fake OpenAI upstream",
+                deadline=deadline,
+            ),
+        )
 
 
 def _wait_liveliness(port: int, process: subprocess.Popen, *, timeout: float = 60) -> None:
@@ -196,6 +214,7 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
     tmp_path: Path,
     upstream_status: int,
 ) -> None:
+    _CONFORMANCE_TIMEOUT_LATCH.ensure_clear()
     executable_value = os.environ.get("AGENTTALK_TEST_LITELLM_EXE")
     if not executable_value:
         pytest.skip("set AGENTTALK_TEST_LITELLM_EXE for the pinned local conformance test")
@@ -252,6 +271,15 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
             request_id="q-litellm-conformance",
             issuer_token=TEST_CHILD_CAP_ISSUER,
         )
+        internal_cancellation = SocketCancellation()
+
+        def tracked_connection(*args, **kwargs) -> http.client.HTTPConnection:
+            return TrackedHTTPConnection(
+                internal_cancellation,
+                *args,
+                **kwargs,
+            )
+
         front = GatewayFront(
             FrontConfig(
                 public_token="sk-fake-front",
@@ -261,27 +289,37 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
                 request_timeout_seconds=10,
             ),
             ledger,
+            connection_factory=tracked_connection,
         )
         front_server = front.make_server()
+        front_activity = ServerActivity()
+        track_server(front_server, front_activity)
         front_thread = threading.Thread(target=front_server.serve_forever, daemon=True)
         try:
             _wait_liveliness(port, process)
+            front_budget = CompletionBudget(latch=_CONFORMANCE_TIMEOUT_LATCH)
             front_thread.start()
-            def front_ready() -> None:
-                connection = http.client.HTTPConnection(
+            def cancel_front() -> None:
+                internal_cancellation.cancel()
+                front_activity.cancel_active_sockets(reject_new=True)
+
+            def front_ready(cancellation: SocketCancellation) -> None:
+                with cancellable_http_connection(
+                    cancellation,
                     "127.0.0.1",
                     public_port,
-                    timeout=None,
-                )
-                try:
+                ) as connection:
                     connection.request("GET", "/")
                     response = connection.getresponse()
                     response.read()
                     assert response.status == 404
-                finally:
-                    connection.close()
 
-            _await_completed(front_ready, label="gateway front readiness probe")
+            await_completed(
+                front_ready,
+                budget=front_budget,
+                label="gateway front readiness probe",
+                on_cancel=cancel_front,
+            )
             tools = [
                 {
                     "name": name,
@@ -303,13 +341,14 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
                 "messages": [{"role": "user", "content": "Read README.md"}],
                 "tools": tools,
             }).encode("utf-8")
-            def exchange() -> tuple[int, bytes]:
-                connection = http.client.HTTPConnection(
+            def exchange(
+                cancellation: SocketCancellation,
+            ) -> tuple[int, bytes]:
+                with cancellable_http_connection(
+                    cancellation,
                     "127.0.0.1",
                     public_port,
-                    timeout=None,
-                )
-                try:
+                ) as connection:
                     connection.request(
                         "POST",
                         "/v1/messages",
@@ -322,20 +361,44 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
                     )
                     response = connection.getresponse()
                     return response.status, response.read()
-                finally:
-                    connection.close()
 
-            response_status, response_body = _await_completed(
+            response_status, response_body = await_completed(
                 exchange,
+                budget=front_budget,
                 label="gateway front conformance request",
+                on_cancel=cancel_front,
             )
         finally:
             try:
-                if front_thread.is_alive():
-                    front_server.shutdown()
-                front_server.server_close()
-                if front_thread.ident is not None:
-                    front_thread.join(timeout=5)
+                deadline = time.monotonic() + CANCELLATION_JOIN_SECONDS
+
+                def cancel_front_requests() -> None:
+                    internal_cancellation.cancel()
+                    front_activity.cancel_active_sockets(reject_new=True)
+
+                def stop_front_listener() -> None:
+                    if front_thread.is_alive():
+                        front_server.shutdown()
+
+                def join_front_listener() -> None:
+                    if front_thread.ident is not None:
+                        front_thread.join(
+                            timeout=max(0.0, deadline - time.monotonic())
+                        )
+                    assert not front_thread.is_alive(), (
+                        "gateway conformance listener survived teardown"
+                    )
+
+                run_cleanup_steps(
+                    cancel_front_requests,
+                    stop_front_listener,
+                    front_server.server_close,
+                    join_front_listener,
+                    lambda: front_activity.wait_stopped(
+                        label="gateway conformance front",
+                        deadline=deadline,
+                    ),
+                )
             finally:
                 process.terminate()
                 try:

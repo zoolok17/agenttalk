@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import http.client
 import io
 import json
@@ -26,46 +27,27 @@ from agenttalk.ovh_gateway_front import (
     GatewayFront,
     StreamUsage,
 )
+from tests._socket_harness import (
+    CANCELLATION_JOIN_SECONDS,
+    CompletionBudget,
+    ServerActivity,
+    SocketCancellation,
+    TimeoutLatch,
+    TrackedHTTPConnection,
+    await_completed,
+    cancellable_http_connection,
+    cancellable_socket,
+    run_cleanup_steps,
+    track_server,
+)
 
 
 TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
-# A deadlock watchdog, not a socket read deadline: successful operations wake
-# their completion event immediately. Thirty seconds matches the synchronized
-# contention watchdog already used elsewhere in the suite (#94).
-COMPLETION_WATCHDOG_SECONDS = 30
-
-
-def _await_completed(operation, *, label: str):
-    completed = threading.Event()
-    results: list[object] = []
-    errors: list[BaseException] = []
-
-    def run() -> None:
-        try:
-            results.append(operation())
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            completed.set()
-
-    worker = threading.Thread(target=run, daemon=True)
-    worker.start()
-    assert completed.wait(timeout=COMPLETION_WATCHDOG_SECONDS), (
-        f"{label} did not complete after its synchronization condition was armed"
-    )
-    worker.join()
-    if errors:
-        raise errors[0]
-    assert len(results) == 1
-    return results[0]
-
-
-def _fake_upstream_connection(*args, **kwargs) -> http.client.HTTPConnection:
-    # GatewayFront still has to request its configured timeout. The fake local
-    # transport itself has no read deadline; _await_completed bounds the whole
-    # exchange on an observable completion condition instead.
-    assert kwargs.pop("timeout") == 5
-    return http.client.HTTPConnection(*args, timeout=None, **kwargs)
+# Hard cumulative test-runtime deadline. A correct hermetic loopback phase that
+# takes longer than 30 seconds is intentionally failed; this cannot distinguish
+# deadlock from extreme scheduling delay. The value is six times the five-second
+# deadline that flaked on loaded Windows runners and matches #94's stall ceiling.
+_FRONT_TIMEOUT_LATCH = TimeoutLatch()
 
 
 def _listen_port() -> int:
@@ -86,6 +68,10 @@ class FakeUpstream:
         release: threading.Event | None = None,
     ) -> None:
         self.status = status
+        self.entered = entered
+        self.release = release
+        self.activity = ServerActivity()
+        self._cancelling = threading.Event()
         self.response = response or (
             b'event: message_start\n'
             b'data: {"type":"message_start","message":{"model":"'
@@ -137,7 +123,14 @@ class FakeUpstream:
                 self.end_headers()
                 self.wfile.write(owner.response)
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        class Server(ThreadingHTTPServer):
+            def handle_error(self, request, client_address) -> None:
+                if owner._cancelling.is_set():
+                    return
+                super().handle_error(request, client_address)
+
+        self.server = Server(("127.0.0.1", 0), Handler)
+        track_server(self.server, self.activity)
         self.port = int(self.server.server_address[1])
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -146,9 +139,37 @@ class FakeUpstream:
         return self
 
     def __exit__(self, *_args: object) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
+        deadline = time.monotonic() + CANCELLATION_JOIN_SECONDS
+
+        def stop_listener() -> None:
+            if self.thread.is_alive():
+                self.server.shutdown()
+
+        def join_listener() -> None:
+            if self.thread.ident is not None:
+                self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert not self.thread.is_alive(), "fake upstream listener survived teardown"
+
+        run_cleanup_steps(
+            lambda: self.cancel_pending(reject_new=True),
+            stop_listener,
+            self.server.server_close,
+            join_listener,
+            lambda: self.activity.wait_stopped(
+                label="fake upstream",
+                deadline=deadline,
+            ),
+        )
+
+    def cancel_pending(self, *, reject_new: bool = False) -> None:
+        self._cancelling.set()
+        self.activity.cancel_active_sockets(reject_new=reject_new)
+        if self.release is not None:
+            self.release.set()
+
+    def wait_idle(self, *, deadline: float | None = None) -> None:
+        self.activity.wait_stopped(label="fake upstream", deadline=deadline)
+        self._cancelling.clear()
 
 
 class RunningFront:
@@ -159,7 +180,19 @@ class RunningFront:
         *,
         ledger: SpendLedger | None = None,
         credential=None,
+        completion_budget: CompletionBudget | None = None,
     ) -> None:
+        self.upstream = upstream
+        self.completion_budget = completion_budget or CompletionBudget(
+            latch=_FRONT_TIMEOUT_LATCH
+        )
+        self.client_workers: list[threading.Thread] = []
+        self.client_cancellations: list[SocketCancellation] = []
+        self._client_lock = threading.Lock()
+        self._clients_cancelled = False
+        self._active_clients: set[SocketCancellation] = set()
+        self._internal_cancellation = SocketCancellation()
+        self.activity = ServerActivity()
         self.ledger = ledger or SpendLedger(
             tmp_path / "ledger.sqlite3",
             tmp_path / "install.json",
@@ -185,15 +218,29 @@ class RunningFront:
             internal_port=upstream.port,
             request_timeout_seconds=5,
         )
+
+        def fake_upstream_connection(*args, **kwargs) -> http.client.HTTPConnection:
+            # GatewayFront still has to request its configured timeout. The
+            # hermetic fake transport is governed by the cumulative test budget.
+            assert kwargs.pop("timeout") == 5
+            return TrackedHTTPConnection(
+                self._internal_cancellation,
+                *args,
+                timeout=None,
+                **kwargs,
+            )
+
         self.front = GatewayFront(
             self.config,
             self.ledger,
-            connection_factory=_fake_upstream_connection,
+            connection_factory=fake_upstream_connection,
         )
         self.server = self.front.make_server()
+        track_server(self.server, self.activity)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def __enter__(self) -> RunningFront:
+        self.completion_budget.ensure_clear()
         self.thread.start()
         # Readiness barrier: serve_forever() starts accepting asynchronously, and
         # on a loaded runner (esp. Windows) a request can otherwise race a
@@ -213,9 +260,79 @@ class RunningFront:
         return self
 
     def __exit__(self, *_args: object) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
+        deadline = time.monotonic() + CANCELLATION_JOIN_SECONDS
+
+        def stop_listener() -> None:
+            if self.thread.is_alive():
+                self.server.shutdown()
+
+        def join_listener() -> None:
+            if self.thread.ident is not None:
+                self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert not self.thread.is_alive(), "gateway front listener survived teardown"
+
+        def join_clients() -> None:
+            for worker in self.client_workers:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert all(not worker.is_alive() for worker in self.client_workers), (
+                "gateway front retained client workers after cancellation"
+            )
+
+        run_cleanup_steps(
+            self.cancel_active_requests,
+            stop_listener,
+            self.server.server_close,
+            join_listener,
+            lambda: self.activity.wait_stopped(
+                label="gateway front",
+                deadline=deadline,
+            ),
+            self.upstream.cancel_pending,
+            lambda: self.upstream.wait_idle(deadline=deadline),
+            join_clients,
+        )
+
+    def _register_client(self, cancellation: SocketCancellation) -> None:
+        with self._client_lock:
+            self.client_cancellations.append(cancellation)
+            cancelled = self._clients_cancelled
+            if not cancelled:
+                self._active_clients.add(cancellation)
+        if cancelled:
+            cancellation.cancel()
+            raise ConnectionAbortedError("gateway front fixture is shutting down")
+
+    def _unregister_client(self, cancellation: SocketCancellation) -> None:
+        with self._client_lock:
+            self._active_clients.discard(cancellation)
+
+    def _cancel_server_side(self) -> None:
+        self._internal_cancellation.cancel()
+        self.activity.cancel_active_sockets(reject_new=True)
+        self.upstream.cancel_pending()
+
+    def cancel_active_requests(self) -> None:
+        with self._client_lock:
+            self._clients_cancelled = True
+            clients = tuple(self._active_clients)
+        for cancellation in clients:
+            cancellation.cancel()
+        self._cancel_server_side()
+
+    def _await(self, operation, *, label: str):
+        cancellation = SocketCancellation()
+        self._register_client(cancellation)
+        try:
+            return await_completed(
+                operation,
+                budget=self.completion_budget,
+                label=label,
+                cancellation=cancellation,
+                on_cancel=self._cancel_server_side,
+                workers=self.client_workers,
+            )
+        finally:
+            self._unregister_client(cancellation)
 
     def request(
         self,
@@ -239,36 +356,47 @@ class RunningFront:
             "Content-Type": "application/json",
         }
         request_headers.update(headers or {})
-        def exchange() -> tuple[int, bytes]:
+
+        def exchange(cancellation: SocketCancellation) -> tuple[int, bytes]:
             # Retry ONLY connection-level aborts (transient localhost socket races
             # on loaded Windows runners) - never an HTTP response, so no status
             # assertion is ever masked.
             last_exc: OSError | None = None
             for _ in range(5):
-                conn = http.client.HTTPConnection(
-                    "127.0.0.1", self.config.public_port, timeout=None
-                )
                 try:
-                    conn.request(method, path, body=encoded, headers=request_headers)
-                    response = conn.getresponse()
-                    return response.status, response.read()
+                    with cancellable_http_connection(
+                        cancellation,
+                        "127.0.0.1",
+                        self.config.public_port,
+                    ) as conn:
+                        conn.request(
+                            method,
+                            path,
+                            body=encoded,
+                            headers=request_headers,
+                        )
+                        response = conn.getresponse()
+                        return response.status, response.read()
                 except (
                     ConnectionAbortedError,
                     ConnectionResetError,
                     ConnectionRefusedError,
+                    socket.timeout,
                 ) as exc:
+                    if cancellation.cancelled:
+                        raise
                     last_exc = exc
                     time.sleep(0.05)
-                finally:
-                    conn.close()
             raise last_exc if last_exc is not None else RuntimeError("request failed")
 
-        return _await_completed(exchange, label="front request")
+        return self._await(exchange, label="front request")
 
     def raw_request(self, request: bytes) -> tuple[int, bytes]:
-        def exchange() -> tuple[int, bytes]:
-            with socket.create_connection(
-                ("127.0.0.1", self.config.public_port), timeout=None
+        def exchange(cancellation: SocketCancellation) -> tuple[int, bytes]:
+            with cancellable_socket(
+                cancellation,
+                "127.0.0.1",
+                self.config.public_port,
             ) as connection:
                 connection.sendall(request)
                 connection.shutdown(socket.SHUT_WR)
@@ -279,11 +407,11 @@ class RunningFront:
             status = int(response.split(b" ", 2)[1])
             return status, response
 
-        return _await_completed(exchange, label="raw front request")
+        return self._await(exchange, label="raw front request")
 
     def internal_liveliness(self) -> bool:
-        return _await_completed(
-            self.front.internal_liveliness,
+        return self._await(
+            lambda _cancellation: self.front.internal_liveliness(),
             label="front internal liveliness probe",
         )
 
@@ -549,8 +677,13 @@ def test_front_forwards_capped_claude_beta_query_and_rich_body_intact(
 
 
 def test_beta_rich_body_and_child_cap_exhaustion_survive_front_restart(tmp_path) -> None:
+    completion_budget = CompletionBudget(latch=_FRONT_TIMEOUT_LATCH)
     with FakeUpstream() as upstream:
-        with RunningFront(tmp_path, upstream) as first:
+        with RunningFront(
+            tmp_path,
+            upstream,
+            completion_budget=completion_budget,
+        ) as first:
             status, _ = first.request(path="/v1/messages?beta=true")
             assert status == 200
 
@@ -569,6 +702,7 @@ def test_beta_rich_body_and_child_cap_exhaustion_survive_front_restart(tmp_path)
             upstream,
             ledger=restarted,
             credential=replay,
+            completion_budget=completion_budget,
         ) as second:
             denied, _ = second.request(
                 path="/v1/messages?beta=true",
@@ -730,20 +864,127 @@ def test_single_permit_covers_transport_through_settlement(tmp_path) -> None:
         worker = threading.Thread(target=request_first, daemon=True)
         worker.start()
         try:
-            assert entered.wait(timeout=COMPLETION_WATCHDOG_SECONDS)
-
+            if not front.completion_budget.wait(entered):
+                raise front.completion_budget.timeout("permit upstream entry")
             status, body = front.request()
-
-            assert status == 429
-            assert b"ATGW_INFRA_BUSY" in body
-            assert len(upstream.requests) == 1
         finally:
             release.set()
-        assert completed.wait(timeout=COMPLETION_WATCHDOG_SECONDS)
-        worker.join()
+            if not completed.is_set():
+                try:
+                    finished = front.completion_budget.wait(completed)
+                except AssertionError:
+                    finished = False
+                if not finished:
+                    front.cancel_active_requests()
+            worker.join(timeout=CANCELLATION_JOIN_SECONDS)
+            if worker.is_alive():
+                front.cancel_active_requests()
+                worker.join(timeout=CANCELLATION_JOIN_SECONDS)
+            assert not worker.is_alive()
+
         assert errors == []
         assert first and first[0][0] == 200
+        assert status == 429
+        assert b"ATGW_INFRA_BUSY" in body
+        assert len(upstream.requests) == 1
         assert front.ledger.status()["ready"] is True
+
+
+def test_front_deadline_cancels_hung_exchange_before_teardown(tmp_path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    timeout_latch = TimeoutLatch()
+    cleanup_steps: list[str] = []
+
+    def expire_after_provider_entry(
+        completed: threading.Event,
+        remaining: float,
+    ) -> bool:
+        assert entered.wait(timeout=remaining)
+        assert not completed.is_set()
+        return False
+
+    completion_budget = CompletionBudget(
+        latch=timeout_latch,
+        wait_for_completion=expire_after_provider_entry,
+    )
+    upstream = FakeUpstream(entered=entered, release=release)
+    front = RunningFront(
+        tmp_path,
+        upstream,
+        completion_budget=completion_budget,
+    )
+
+    original_server_close = front.server.server_close
+
+    def fail_after_server_close() -> None:
+        original_server_close()
+        cleanup_steps.append("injected server-close failure")
+        raise RuntimeError("injected teardown-stage failure")
+
+    original_front_wait_stopped = front.activity.wait_stopped
+
+    def observe_front_cleanup(*, label: str, deadline: float | None = None) -> None:
+        cleanup_steps.append("front handlers")
+        original_front_wait_stopped(label=label, deadline=deadline)
+
+    original_upstream_wait_stopped = upstream.activity.wait_stopped
+
+    def observe_upstream_cleanup(*, label: str, deadline: float | None = None) -> None:
+        cleanup_steps.append("upstream handlers")
+        original_upstream_wait_stopped(label=label, deadline=deadline)
+
+    front.server.server_close = fail_after_server_close
+    front.activity.wait_stopped = observe_front_cleanup
+    upstream.activity.wait_stopped = observe_upstream_cleanup
+
+    with pytest.raises(RuntimeError, match="injected teardown-stage failure"):
+        with upstream, front:
+            with pytest.raises(
+                AssertionError,
+                match="30s cumulative socket-phase deadline",
+            ):
+                front.request()
+
+    assert entered.is_set()
+    assert release.is_set()
+    assert len(upstream.requests) == 1
+    assert cleanup_steps.index("injected server-close failure") < cleanup_steps.index(
+        "front handlers"
+    )
+    assert cleanup_steps.index("front handlers") < cleanup_steps.index(
+        "upstream handlers"
+    )
+    assert front.client_workers
+    assert all(not worker.is_alive() for worker in front.client_workers)
+    assert front.activity.threads
+    assert upstream.activity.threads
+    assert all(not thread.is_alive() for thread in front.activity.threads)
+    assert all(not thread.is_alive() for thread in upstream.activity.threads)
+    assert front.activity.sockets
+    assert upstream.activity.sockets
+    assert all(connection.fileno() == -1 for connection in front.activity.sockets)
+    assert all(connection.fileno() == -1 for connection in upstream.activity.sockets)
+    client_sockets = [
+        connection
+        for cancellation in front.client_cancellations
+        for connection in cancellation.sockets
+    ]
+    assert client_sockets
+    assert front._internal_cancellation.sockets
+    assert all(connection.fileno() == -1 for connection in client_sockets)
+    assert all(
+        connection.fileno() == -1
+        for connection in front._internal_cancellation.sockets
+    )
+
+    ledger_after_teardown = copy.deepcopy(front.ledger.status())
+    requests_after_teardown = copy.deepcopy(upstream.requests)
+    release.set()
+    assert front.ledger.status() == ledger_after_teardown
+    assert upstream.requests == requests_after_teardown
+    with pytest.raises(AssertionError, match="already exceeded its deadline"):
+        timeout_latch.ensure_clear()
 
 
 class _FakeResponse:
