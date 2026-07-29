@@ -16,6 +16,8 @@ through to the pinned-SHA branch and `_worktree_clean` reports None -> clean.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import json
 from pathlib import Path
 import threading
@@ -1395,6 +1397,54 @@ def test_evaluate_dod_coverage_satisfied_is_empty() -> None:
 
 
 @pytest.mark.parametrize(
+    ("floor_token", "coverage_percent", "expected_codes"),
+    [
+        ("80.000000000000000001", 80.0, {close.HOLD_LOW_COVERAGE}),
+        ("80.000000000000000001", 80.00000000000001, set()),
+        ("80", 80.0, set()),
+        ("80", 85.0, set()),
+        ("80.1", 80.1, set()),
+    ],
+    ids=[
+        "exact-floor-above-measurement",
+        "exact-floor-below-representable-measurement",
+        "normal-floor-at-threshold",
+        "normal-floor-legitimately-above-threshold",
+        "normal-fractional-floor-at-threshold",
+    ],
+)
+def test_loaded_coverage_floor_never_rounds_down_toward_passing(
+    tmp_path: Path,
+    floor_token: str,
+    coverage_percent: float,
+    expected_codes: set[str],
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    close.dod_policy_path(store).write_text(
+        '{"schema_version":1,"scopes":{"release":{"coverage":'
+        '{"gate":"coverage:release","min_percent":'
+        f"{floor_token}"
+        ',"max_age_days":14}}}}',
+        encoding="utf-8",
+    )
+
+    policy, error = close.load_dod_policy(store)
+
+    assert error is None
+    assert policy is not None
+    required = close.derive_required_dod(policy, "release")["dimensions"]["coverage"]
+    assert Decimal(str(required["min_percent"])) >= Decimal(floor_token)
+    dod_eval = _dod_eval_c(_coverage_bundle(coverage_percent=coverage_percent))
+    dod_eval["required_dimensions"]["coverage"] = required
+    holds = close.evaluate_dod(_satisfied(), dod_eval)
+    assert _dcodes(holds) == expected_codes
+    if expected_codes:
+        assert repr(coverage_percent) in holds[0][1]
+        assert repr(required["min_percent"]) in holds[0][1]
+
+
+@pytest.mark.parametrize(
     ("required_gate", "resolved_gate", "resolved_scope"),
     [
         ("coverage:release", "coverage:change", "change"),
@@ -1465,6 +1515,27 @@ def test_evaluate_dod_coverage_no_max_age_skips_freshness() -> None:
     ev = _dod_eval_c(_coverage_bundle(age_days=None, max_age_days=None))
     ev["required_dimensions"]["coverage"]["max_age_days"] = None
     assert close.evaluate_dod(_satisfied(), ev) == []
+
+
+def test_derived_age_never_rounds_toward_passing_extreme_freshness_floor() -> None:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    updated_at = (now - timedelta(days=200_000, microseconds=1)).isoformat()
+    future_at = (now + timedelta(days=200_000, microseconds=1)).isoformat()
+
+    age_days = cli._iso_age_days(updated_at, now)
+    future_age_days = cli._iso_age_days(future_at, now)
+
+    assert age_days is not None
+    assert age_days > 200_000
+    assert future_age_days is not None
+    assert future_age_days < -200_000
+    dod_eval = _dod_eval_c(
+        _coverage_bundle(age_days=age_days, max_age_days=200_000)
+    )
+    dod_eval["required_dimensions"]["coverage"]["max_age_days"] = 200_000
+    assert _dcodes(close.evaluate_dod(_satisfied(), dod_eval)) == {
+        close.HOLD_STALE_COVERAGE
+    }
 
 
 def test_evaluate_dod_coverage_waiver_never_clears() -> None:

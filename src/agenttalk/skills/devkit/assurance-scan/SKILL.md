@@ -60,6 +60,10 @@ For example, a feature close can require release-depth coverage evidence:
 }
 ```
 
+Fractional `min_percent` values are decoded exactly and normalized only at or
+above the configured floor; policy conversion never lowers the threshold
+toward passing.
+
 Missing optional tools are recorded as `skipped-not-installed` plus residual
 risk. Missing required tools are recorded as gate-visible evidence in the
 artifact. Network-dependent tools are `skipped-network-disabled` unless the

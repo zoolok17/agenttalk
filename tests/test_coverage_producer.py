@@ -1865,6 +1865,96 @@ def test_coverage_parser_rejects_impossible_pytest_cov_summary_combinations(
     assert parse_coverage_percent(stdout) is None
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "Required test coverage of 90% reached. Total coverage: 10%",
+        "Required test coverage of 90% reached. Total coverage: 10.00%",
+        "FAIL Required test coverage of 90% not reached. Total coverage: 99.00%",
+        "FAIL Required test coverage of 101% not reached. Total coverage: 99.00%",
+        "Required test coverage of 0% reached. Total coverage: 10.00%",
+        "Required test coverage of 90% reached. Total coverage: 100.01%",
+        "Required test coverage of 90.015% reached. Total coverage: 90.01%",
+        "FAIL Required test coverage of 89.995% not reached. Total coverage: 90.00%",
+    ],
+    ids=[
+        "connector-success-actual-not-native-precision",
+        "success-actual-below-required",
+        "failure-actual-above-required",
+        "failure-required-out-of-range",
+        "success-required-zero",
+        "success-actual-out-of-range",
+        "success-impossible-at-ties-to-even-boundary",
+        "failure-impossible-at-ties-to-even-boundary",
+    ],
+)
+def test_coverage_parser_rejects_impossible_native_threshold_relationships(
+    stdout: str,
+) -> None:
+    assert parse_coverage_percent(stdout) is None
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("Required test coverage of 80% reached. Total coverage: 80.00%", 80.0),
+        (
+            "Required test coverage of 80.000000000000000001% reached. "
+            "Total coverage: 80.00%",
+            80.0,
+        ),
+        (
+            "FAIL Required test coverage of 80.000000000000000001% not reached. "
+            "Total coverage: 80.00%",
+            80.0,
+        ),
+        ("FAIL Required test coverage of 90% not reached. Total coverage: 90.00%", 90.0),
+        (
+            "Required test coverage of 90.004% reached. Total coverage: 90.00%",
+            90.0,
+        ),
+        (
+            "Required test coverage of 90.005% reached. Total coverage: 90.00%",
+            90.0,
+        ),
+        ("Required test coverage of 1e-05% reached. Total coverage: 10.00%", 10.0),
+    ],
+    ids=[
+        "success-at-threshold",
+        "high-precision-success-at-threshold",
+        "high-precision-failure-below-threshold",
+        "rounded-failure-displays-threshold",
+        "rounded-success-displays-below-threshold",
+        "float-threshold-rounds-down-at-display-boundary",
+        "scientific-notation-required",
+    ],
+)
+def test_coverage_parser_accepts_consistent_native_threshold_relationships(
+    stdout: str,
+    expected: float,
+) -> None:
+    assert parse_coverage_percent(stdout) == pytest.approx(expected)
+
+
+def test_invalid_final_native_relationship_does_not_expose_earlier_green() -> None:
+    for final_summary in (
+        "Required test coverage of 90% reached. Total coverage: 10.00%",
+        "FAIL Required test coverage of 90% not reached. Total coverage: 99.00%",
+    ):
+        stdout = f"Total coverage: 99%\n{final_summary}"
+
+        assert parse_coverage_percent(stdout) is None
+
+
+def test_final_native_scientific_requirement_supersedes_earlier_summary() -> None:
+    stdout = (
+        "Total coverage: 99%\n"
+        "Required test coverage of 1e-05% reached. Total coverage: 10.00%"
+    )
+
+    assert parse_coverage_percent(stdout) == pytest.approx(10.0)
+
+
 def test_coverage_parser_never_rounds_toward_passing() -> None:
     stdout = "Total coverage: 79.999999999999999999999999%"
 

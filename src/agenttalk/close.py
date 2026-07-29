@@ -30,6 +30,7 @@ severity policy, ephemeral adversarial reviewers.
 from __future__ import annotations
 
 import contextlib
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -747,8 +748,14 @@ def load_dod_policy(store) -> tuple[dict | None, str | None]:
             return None, f"dod.json exceeds max size ({size} > {_DOD_MAX_BYTES} bytes)"
         # object_pairs_hook rejects duplicate keys at every level (a duplicated key would otherwise
         # silently keep its last value and erase a requirement / disable freshness -> false GO).
-        raw = json.loads(path.read_text(encoding="utf-8-sig"),
-                         object_pairs_hook=_reject_duplicate_keys)
+        raw = json.loads(
+            path.read_text(encoding="utf-8-sig"),
+            object_pairs_hook=_reject_duplicate_keys,
+            # ``min_percent`` is the only fractional DoD policy operand. Decode every
+            # JSON fraction exactly so validation can keep its floor from rounding down
+            # before a pass/fail comparison. Integer-only fields reject Decimal values.
+            parse_float=Decimal,
+        )
     except (ValueError, OSError, RecursionError) as e:
         # RecursionError: deeply-nested JSON. Must fail CLOSED, never propagate out of close check.
         return None, f"dod.json is unreadable/corrupt: {type(e).__name__}: {e}"
@@ -842,6 +849,27 @@ def _is_percent(value: object) -> bool:
     return _is_finite_number(value) and 0 <= value <= 100
 
 
+def _normalize_coverage_floor(value: object) -> int | float | None:
+    """Return a JSON-compatible floor that never understates an exact JSON decimal.
+
+    Direct callers retain the existing builtin int/float contract. ``load_dod_policy``
+    supplies ``Decimal`` for JSON fractions; nearest-float conversion is accepted only
+    when its canonical decimal is at least the configured value, otherwise the result is
+    stepped upward. The conservative adjustment can make an unrepresentable floor
+    marginally stricter, but it cannot move the policy toward passing.
+    """
+    if isinstance(value, Decimal):
+        if not value.is_finite() or value < 0 or value > 100:
+            return None
+        normalized = float(value)
+        if Decimal(str(normalized)) < value:
+            normalized = math.nextafter(normalized, math.inf)
+            if Decimal(str(normalized)) < value:
+                return None
+        return normalized if _is_percent(normalized) else None
+    return value if _is_percent(value) else None
+
+
 def _validate_dod_coverage_spec(spec: object, scope_name: str) -> dict:
     """Normalize a scope's coverage producer and floor without accepting impossible gates."""
     if not isinstance(spec, dict):
@@ -856,8 +884,8 @@ def _validate_dod_coverage_spec(spec: object, scope_name: str) -> dict:
             f"dod scope {scope_name!r} coverage.gate must be one of "
             f"{sorted(COVERAGE_GATE_NAMES)}"
         )
-    min_percent = spec.get("min_percent")
-    if not _is_percent(min_percent):
+    min_percent = _normalize_coverage_floor(spec.get("min_percent"))
+    if min_percent is None:
         raise CloseError(
             f"dod scope {scope_name!r} coverage.min_percent must be a finite number from 0 to 100")
     max_age = spec.get("max_age_days")
@@ -1160,8 +1188,8 @@ def _evaluate_dod_coverage(
     if coverage_percent < min_percent:
         return [(
             HOLD_LOW_COVERAGE,
-            f"coverage gate {gate!r} reports {coverage_percent:g}% below the "
-            f"required {min_percent:g}%",
+            f"coverage gate {gate!r} reports {coverage_percent!r}% below the "
+            f"required {min_percent!r}%",
         )]
     return []
 

@@ -20,6 +20,7 @@ import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException
+from fractions import Fraction
 from pathlib import Path
 
 from agenttalk import __version__
@@ -2544,13 +2545,27 @@ def _iso_age_days(updated_at: object, now) -> float | None:
     ``None`` if missing/unparseable. Never raises (a bad timestamp must not crash `close check`) -
     but the DoD evaluator FAILS CLOSED on a ``None``/future age when freshness is required, so this
     must NOT clamp a future timestamp to 0 (that would mask a future-dated attestation as fresh).
-    Reuses the existing :func:`_parse_ts` timestamp parser."""
+    The returned float is rounded away from the valid interval: positive ages round upward and
+    negative ages downward, so conversion cannot make stale/future evidence look fresh. Reuses the
+    existing :func:`_parse_ts` timestamp parser."""
     if not isinstance(updated_at, str):
         return None
     parsed = _parse_ts(updated_at)
     if parsed is None:
         return None
-    return (now - parsed).total_seconds() / 86400.0
+    delta = now - parsed
+    total_microseconds = (
+        (delta.days * 86400 + delta.seconds) * 1_000_000
+        + delta.microseconds
+    )
+    exact_days = Fraction(total_microseconds, 86_400_000_000)
+    age_days = float(exact_days)
+    represented = Fraction.from_float(age_days)
+    if exact_days > 0 and represented < exact_days:
+        age_days = math.nextafter(age_days, math.inf)
+    elif exact_days < 0 and represented > exact_days:
+        age_days = math.nextafter(age_days, -math.inf)
+    return age_days
 
 
 def _signoff_risk_inventory(args, store, record: dict) -> list[dict]:

@@ -38,11 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integer columns or the four `Stmts Miss Branch BrPart` integer columns before its final
   ASCII integer/dot-decimal percentage; pytest-cov accepts its complete native fail-under
   success or `FAIL ... not reached` sentence, or a complete legacy/custom
-  `Total coverage: <actual>%` line. Incidental prose
-  containing those words is not evidence. The final structurally recognized match across
-  all forms wins. Decimal-to-float attestation is conservative: if the persisted float
-  would overstate the exact token, it steps down, so conversion cannot cross a DoD floor
-  toward passing.
+  `Total coverage: <actual>%` line. A native requirement must be in `(0, 100]`, its
+  displayed actual value must have two decimal places and be in `[0, 100]`, and both
+  values are validated. Because pytest-cov compares its unrounded total before formatting
+  the actual value with `.2f`, reached/not-reached is checked against the actual float
+  boundary on each side of the requirement. This preserves genuine rounded and
+  ties-to-even boundary output while an impossible final sentence cannot expose an earlier
+  green summary. Incidental prose containing familiar words is not evidence.
+  The final structurally recognized match across all forms wins. Decimal-to-float
+  attestation is conservative: if the persisted float would overstate the exact displayed
+  token, it steps down, so agenttalk's conversion cannot cross a DoD floor toward passing.
+  Producer display quantization remains: pytest-cov's displayed value can exceed its
+  unrounded total by at most `0.005` percentage points. Bounded scientific notation is accepted only
+  for the native pytest-cov requirement, matching small positive float thresholds;
+  actual-coverage and legacy/custom tokens remain integer/dot-decimal only.
   Bare-carriage-return rewrites, unsupported or overlong terminal escapes, locale-comma
   decimals, and stderr-only summaries fail closed. Coverage stdout is captured as bytes,
   preserving bare CR versus CRLF, and decoded as strict UTF-8 with an optional BOM;
@@ -55,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expired, malformed, or incomplete waivers are replaced by fresh evidence or invalidated
   red when no fresh measurement exists. DoD coverage policy explicitly selects one of the
   finite `coverage:change`, `coverage:release`, or `coverage:deep` producer gates.
+  Fractional `coverage.min_percent` values are decoded exactly and normalized only upward
+  when a JSON-compatible float cannot represent them, so policy conversion never lowers
+  the floor toward passing. All other numeric DoD fields are integer-only and exact;
+  derived timestamp ages round away from the fresh interval before comparison with
+  `max_age_days`.
   Coverage-gate finalization failures are bounded CLI failures and no longer escape, mask
   an earlier scan failure, or print a false success.
 

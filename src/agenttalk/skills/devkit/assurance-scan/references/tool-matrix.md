@@ -46,9 +46,9 @@ decoration is removed before the following complete-line grammar is applied:
 | Input class | Structural requirement | Disposition |
 | --- | --- | --- |
 | coverage.py terminal row | One LF/CRLF-delimited line with optional horizontal indentation, literal `TOTAL`, exactly two ASCII unsigned-integer count columns (`Stmts Miss`) or four (`Stmts Miss Branch BrPart`), then an ASCII integer/dot-decimal percentage as the final field. | Handled |
-| pytest-cov fail-under summary | One LF/CRLF-delimited line with optional horizontal indentation: native success `Required test coverage of <required>% reached. Total coverage: <actual>%`, native failure `FAIL Required test coverage of <required>% not reached. Total coverage: <actual>%`, or the complete legacy/custom `Total coverage: <actual>%` form. Only horizontal whitespace may follow. | Handled |
+| pytest-cov fail-under summary | One LF/CRLF-delimited line with optional horizontal indentation: native success `Required test coverage of <required>% reached. Total coverage: <actual>%`, native failure `FAIL Required test coverage of <required>% not reached. Total coverage: <actual>%`, or the complete legacy/custom `Total coverage: <actual>%` form. For native lines, `required` must be an ASCII integer/dot decimal, optionally with a decimal exponent of at most four digits, whose parsed float is in `(0, 100]`; `actual` must be a two-decimal ASCII value in `[0, 100]`; and both are captured. Because pytest-cov compares its unrounded float total but displays `actual` with `.2f`, success is checked against the `.2f` rendering of that parsed requirement, and failure against the rendering of its immediate float predecessor. This preserves genuine rounded boundary output while rejecting relationships impossible under Python's ties-to-even formatting; an impossible final line does not expose earlier evidence. Only horizontal whitespace may follow. | Handled conservatively |
 | Incidental percentage prose | Text such as `application log says Total coverage: 99% but no report` or `TOTAL deployment success 99%` does not have the required complete-line/numeric-column structure. | Refused |
-| Percentage precision | The token is parsed as an exact decimal. Its persisted float never serializes to a decimal above that token; conversion steps down when nearest-float conversion would round upward. | Handled conservatively |
+| Percentage precision | The displayed token is parsed as an exact decimal. Its persisted float never serializes to a decimal above that token; conversion steps down when nearest-float conversion would round upward. This prevents agenttalk from adding an upward round, but cannot undo producer display quantization: pytest-cov's two-decimal display can exceed its unrounded total by at most `0.005` percentage points. | Handled conservatively; producer quantization is residual |
 | Coverage process outcome | Success requires exit zero without timeout, spawn, or stdout-decoding failure. Generic scanner-shaped JSON in stdout is not interpreted as coverage findings; nonzero/failed execution remains red even with a valid summary. | Handled |
 
 SGR sequences may contain at most 32 digit, semicolon, or colon parameter
@@ -57,6 +57,9 @@ characters. The final structurally recognized summary across all forms wins.
 The parser refuses bare-carriage-return progress rewrites, unsupported or
 overlong escape sequences, locale-comma decimals, malformed or out-of-range
 percentages, and direct byte input that is not UTF-8 with an optional BOM.
+Scientific notation is accepted only for the native pytest-cov requirement and
+only with a decimal exponent of at most four digits. It remains outside every
+actual-coverage token and the legacy/custom grammar.
 Stdout and stderr are captured separately, so stderr-only summaries and their
 ordering relative to stdout are not evidence. Coverage stdout is captured as
 bytes to preserve bare CR versus CRLF, then decoded as strict UTF-8 with an
