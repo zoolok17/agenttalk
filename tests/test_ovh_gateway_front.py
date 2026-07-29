@@ -29,6 +29,43 @@ from agenttalk.ovh_gateway_front import (
 
 
 TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
+# A deadlock watchdog, not a socket read deadline: successful operations wake
+# their completion event immediately. Thirty seconds matches the synchronized
+# contention watchdog already used elsewhere in the suite (#94).
+COMPLETION_WATCHDOG_SECONDS = 30
+
+
+def _await_completed(operation, *, label: str):
+    completed = threading.Event()
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(operation())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    assert completed.wait(timeout=COMPLETION_WATCHDOG_SECONDS), (
+        f"{label} did not complete after its synchronization condition was armed"
+    )
+    worker.join()
+    if errors:
+        raise errors[0]
+    assert len(results) == 1
+    return results[0]
+
+
+def _fake_upstream_connection(*args, **kwargs) -> http.client.HTTPConnection:
+    # GatewayFront still has to request its configured timeout. The fake local
+    # transport itself has no read deadline; _await_completed bounds the whole
+    # exchange on an observable completion condition instead.
+    assert kwargs.pop("timeout") == 5
+    return http.client.HTTPConnection(*args, timeout=None, **kwargs)
 
 
 def _listen_port() -> int:
@@ -93,7 +130,7 @@ class FakeUpstream:
                 if entered is not None:
                     entered.set()
                 if release is not None:
-                    release.wait(timeout=10)
+                    release.wait()
                 self.send_response(owner.status)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Content-Length", str(len(owner.response)))
@@ -148,7 +185,11 @@ class RunningFront:
             internal_port=upstream.port,
             request_timeout_seconds=5,
         )
-        self.front = GatewayFront(self.config, self.ledger)
+        self.front = GatewayFront(
+            self.config,
+            self.ledger,
+            connection_factory=_fake_upstream_connection,
+        )
         self.server = self.front.make_server()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -198,37 +239,53 @@ class RunningFront:
             "Content-Type": "application/json",
         }
         request_headers.update(headers or {})
-        # Retry ONLY connection-level aborts (transient localhost socket races on
-        # loaded Windows runners) - never an HTTP response, so no status assertion
-        # is ever masked.
-        last_exc: OSError | None = None
-        for _ in range(5):
-            conn = http.client.HTTPConnection(
-                "127.0.0.1", self.config.public_port, timeout=5)
-            try:
-                conn.request(method, path, body=encoded, headers=request_headers)
-                response = conn.getresponse()
-                return response.status, response.read()
-            except (ConnectionAbortedError, ConnectionResetError,
-                    ConnectionRefusedError) as exc:
-                last_exc = exc
-                time.sleep(0.05)
-            finally:
-                conn.close()
-        raise last_exc if last_exc is not None else RuntimeError("request failed")
+        def exchange() -> tuple[int, bytes]:
+            # Retry ONLY connection-level aborts (transient localhost socket races
+            # on loaded Windows runners) - never an HTTP response, so no status
+            # assertion is ever masked.
+            last_exc: OSError | None = None
+            for _ in range(5):
+                conn = http.client.HTTPConnection(
+                    "127.0.0.1", self.config.public_port, timeout=None
+                )
+                try:
+                    conn.request(method, path, body=encoded, headers=request_headers)
+                    response = conn.getresponse()
+                    return response.status, response.read()
+                except (
+                    ConnectionAbortedError,
+                    ConnectionResetError,
+                    ConnectionRefusedError,
+                ) as exc:
+                    last_exc = exc
+                    time.sleep(0.05)
+                finally:
+                    conn.close()
+            raise last_exc if last_exc is not None else RuntimeError("request failed")
+
+        return _await_completed(exchange, label="front request")
 
     def raw_request(self, request: bytes) -> tuple[int, bytes]:
-        with socket.create_connection(
-            ("127.0.0.1", self.config.public_port), timeout=5
-        ) as connection:
-            connection.sendall(request)
-            connection.shutdown(socket.SHUT_WR)
-            chunks: list[bytes] = []
-            while chunk := connection.recv(16 * 1024):
-                chunks.append(chunk)
-        response = b"".join(chunks)
-        status = int(response.split(b" ", 2)[1])
-        return status, response
+        def exchange() -> tuple[int, bytes]:
+            with socket.create_connection(
+                ("127.0.0.1", self.config.public_port), timeout=None
+            ) as connection:
+                connection.sendall(request)
+                connection.shutdown(socket.SHUT_WR)
+                chunks: list[bytes] = []
+                while chunk := connection.recv(16 * 1024):
+                    chunks.append(chunk)
+            response = b"".join(chunks)
+            status = int(response.split(b" ", 2)[1])
+            return status, response
+
+        return _await_completed(exchange, label="raw front request")
+
+    def internal_liveliness(self) -> bool:
+        return _await_completed(
+            self.front.internal_liveliness,
+            label="front internal liveliness probe",
+        )
 
 
 def _rich_claude_code_body(*, stream: bool) -> dict:
@@ -545,7 +602,7 @@ def test_beta_rich_body_and_child_cap_exhaustion_survive_front_restart(tmp_path)
 
 def test_success_reserves_before_one_internal_attempt_then_settles(tmp_path) -> None:
     with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
-        assert front.front.internal_liveliness() is True
+        assert front.internal_liveliness() is True
         status, body = front.request(headers={"X-Front-Only": "must-not-forward"})
         assert status == 200
         assert b"message_stop" in body
@@ -596,8 +653,9 @@ def test_forged_well_formed_child_capability_never_reaches_provider(tmp_path) ->
 
 
 def test_front_refuses_ninth_child_call_without_provider_transport(tmp_path) -> None:
+    assert gateway.CHILD_TURN_MAX_CALLS == 8
     with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
-        for _ in range(gateway.CHILD_TURN_MAX_CALLS):
+        for _ in range(8):
             status, _ = front.request(path="/v1/messages?beta=true")
             assert status == 200
 
@@ -605,7 +663,7 @@ def test_front_refuses_ninth_child_call_without_provider_transport(tmp_path) -> 
 
         assert status == 403
         assert b"ATGW_CHILD_TURN_CAP_EXCEEDED" in body
-        assert len(upstream.requests) == gateway.CHILD_TURN_MAX_CALLS
+        assert len(upstream.requests) == 8
         assert front.ledger.status()["unresolved"] == []
 
 
@@ -658,17 +716,32 @@ def test_single_permit_covers_transport_through_settlement(tmp_path) -> None:
         upstream,
     ) as front:
         first: list[tuple[int, bytes]] = []
-        worker = threading.Thread(target=lambda: first.append(front.request()))
+        errors: list[BaseException] = []
+        completed = threading.Event()
+
+        def request_first() -> None:
+            try:
+                first.append(front.request())
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=request_first, daemon=True)
         worker.start()
-        assert entered.wait(timeout=5)
+        try:
+            assert entered.wait(timeout=COMPLETION_WATCHDOG_SECONDS)
 
-        status, body = front.request()
+            status, body = front.request()
 
-        assert status == 429
-        assert b"ATGW_INFRA_BUSY" in body
-        assert len(upstream.requests) == 1
-        release.set()
-        worker.join(timeout=10)
+            assert status == 429
+            assert b"ATGW_INFRA_BUSY" in body
+            assert len(upstream.requests) == 1
+        finally:
+            release.set()
+        assert completed.wait(timeout=COMPLETION_WATCHDOG_SECONDS)
+        worker.join()
+        assert errors == []
         assert first and first[0][0] == 200
         assert front.ledger.status()["ready"] is True
 

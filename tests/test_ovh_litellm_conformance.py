@@ -22,6 +22,35 @@ from agenttalk.ovh_gateway_front import FrontConfig, GatewayFront
 
 
 TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
+# Public front exchanges use completion events rather than socket read
+# deadlines. This matches the suite's existing synchronized-contention
+# watchdog (#94) and only reports a stuck harness worker.
+COMPLETION_WATCHDOG_SECONDS = 30
+
+
+def _await_completed(operation, *, label: str):
+    completed = threading.Event()
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(operation())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    assert completed.wait(timeout=COMPLETION_WATCHDOG_SECONDS), (
+        f"{label} did not complete after its synchronization condition was armed"
+    )
+    worker.join()
+    if errors:
+        raise errors[0]
+    assert len(results) == 1
+    return results[0]
 
 
 def _free_port() -> int:
@@ -238,6 +267,21 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
         try:
             _wait_liveliness(port, process)
             front_thread.start()
+            def front_ready() -> None:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    public_port,
+                    timeout=None,
+                )
+                try:
+                    connection.request("GET", "/")
+                    response = connection.getresponse()
+                    response.read()
+                    assert response.status == 404
+                finally:
+                    connection.close()
+
+            _await_completed(front_ready, label="gateway front readiness probe")
             tools = [
                 {
                     "name": name,
@@ -259,22 +303,32 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
                 "messages": [{"role": "user", "content": "Read README.md"}],
                 "tools": tools,
             }).encode("utf-8")
-            connection = http.client.HTTPConnection("127.0.0.1", public_port, timeout=15)
-            try:
-                connection.request(
-                    "POST",
-                    "/v1/messages",
-                    body=request,
-                    headers={
-                        "Authorization": f"Bearer {credential.token}",
-                        "Content-Type": "application/json",
-                        "Host": f"127.0.0.1:{public_port}",
-                    },
+            def exchange() -> tuple[int, bytes]:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    public_port,
+                    timeout=None,
                 )
-                response = connection.getresponse()
-                response_body = response.read()
-            finally:
-                connection.close()
+                try:
+                    connection.request(
+                        "POST",
+                        "/v1/messages",
+                        body=request,
+                        headers={
+                            "Authorization": f"Bearer {credential.token}",
+                            "Content-Type": "application/json",
+                            "Host": f"127.0.0.1:{public_port}",
+                        },
+                    )
+                    response = connection.getresponse()
+                    return response.status, response.read()
+                finally:
+                    connection.close()
+
+            response_status, response_body = _await_completed(
+                exchange,
+                label="gateway front conformance request",
+            )
         finally:
             try:
                 if front_thread.is_alive():
@@ -307,7 +361,7 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
 
     ledger_status = ledger.status()
     if upstream_status == 200:
-        assert response.status == 200, response_body.decode("utf-8", "replace")
+        assert response_status == 200, response_body.decode("utf-8", "replace")
         assert b"message_stop" in response_body
         assert ledger_status["current_committed_micro_eur"] == settlement_cost_micro_eur(
             50,
@@ -315,7 +369,7 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
         )
         assert ledger_status["unresolved"] == []
     else:
-        assert response.status == 502, response_body.decode("utf-8", "replace")
+        assert response_status == 502, response_body.decode("utf-8", "replace")
         assert b"fake-provider-secret" not in response_body
         assert ledger_status["current_committed_micro_eur"] == 0
         assert len(ledger_status["unresolved"]) == 1
