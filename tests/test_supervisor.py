@@ -5149,32 +5149,30 @@ def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
 
 def _wrapped_base_cli_validation_cases() -> list[object]:
     failures = [
-        ("missing-separator", "wrapped launch has no real CLI tail after --"),
-        ("placeholder", "wrapped launch CLI tail is not filled in"),
-        ("shim", "wrapped launch CLI tail resolves to shim"),
-        ("missing-leaf", "was not found"),
+        "separator",
+        "unfilled",
+        "shim",
+        "missing-leaf",
     ]
     return [
         pytest.param(
             shell,
             failure,
-            expected_warning,
             id=f"{shell_id}-{failure}",
         )
         for shell_id, shell in _windows_powershell_editions()
-        for failure, expected_warning in failures
+        for failure in failures
     ]
 
 
 @pytest.mark.parametrize(
-    ("shell", "failure", "expected_warning"),
+    ("shell", "failure"),
     _wrapped_base_cli_validation_cases(),
 )
 def test_pinned_preflight_rejects_invalid_wrapped_base_cli(
     tmp_path: Path,
     shell: str | None,
     failure: str,
-    expected_warning: str,
 ) -> None:
     """Wrapped Preflight must execute its probes, then reject each bad CLI tail."""
     assert shell and Path(shell).is_file(), (
@@ -5225,65 +5223,81 @@ def test_pinned_preflight_rejects_invalid_wrapped_base_cli(
         generated.index("# endregion exec-helpers")
     ]
 
-    if failure == "missing-leaf":
-        invalidate = f"Remove-Item -LiteralPath {_pslit(str(native_cli))}"
-    else:
-        if failure == "missing-separator":
-            invalid_args = ["-m", "agenttalk", "wrap"]
-        elif failure == "placeholder":
-            invalid_args = ["-m", "agenttalk", "wrap", "--", "REPLACE: codex.exe"]
-        elif failure == "shim":
-            shim = tmp_path / "codex.cmd"
-            shim.write_text("@exit /b 0\r\n", encoding="ascii")
-            invalid_args = ["-m", "agenttalk", "wrap", "--", str(shim)]
-        else:
-            raise AssertionError(f"unhandled wrapped CLI failure case: {failure}")
-        invalidate = (
+    def set_windows_args(args: list[str]) -> str:
+        return (
             "$cfg.agents.worker.launch.windows_args = @("
-            + ", ".join(_pslit(arg) for arg in invalid_args)
+            + ", ".join(_pslit(arg) for arg in args)
             + ")"
         )
 
-    result_path = tmp_path / f"wrapped-base-cli-{failure}.json"
-    witness_path = tmp_path / f"wrapped-base-cli-{failure}-witness.json"
-    harness = "\n".join([
-        "$ErrorActionPreference = 'Stop'",
-        f"$Root = {_pslit(str(tmp_path))}",
-        f"$cfg = Get-Content -LiteralPath {_pslit(str(config_path))} "
-        "-Raw | ConvertFrom-Json",
-        preflight_dependencies,
-        invalidate,
-        "$plan = [pscustomobject]@{ launch_mode='wrap'; cli='codex' }",
-        f"$ok = Preflight 'worker' $plan {_pslit(str(wrapper_python))} "
-        f"{_pslit(str(inner_codex_home))}",
-        "@{ ok=[bool]$ok; codex_home=[string]$env:CODEX_HOME } | "
-        "ConvertTo-Json | "
-        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
-    ])
-    harness_path = tmp_path / f"wrapped-base-cli-{failure}.ps1"
-    harness_path.write_text(harness, encoding="utf-8-sig")
+    scenarios: list[tuple[str, str, str]]
+    if failure == "separator":
+        expected_warning = "wrapped launch has no real CLI tail after --"
+        scenarios = [
+            (
+                "missing-separator",
+                set_windows_args(["-m", "agenttalk", "wrap"]),
+                expected_warning,
+            ),
+            (
+                "missing-tail",
+                set_windows_args(["-m", "agenttalk", "wrap", "--"]),
+                expected_warning,
+            ),
+        ]
+    elif failure == "unfilled":
+        expected_warning = "wrapped launch CLI tail is not filled in"
+        scenarios = [
+            (
+                "empty-tail",
+                set_windows_args(["-m", "agenttalk", "wrap", "--", ""]),
+                expected_warning,
+            ),
+            (
+                "placeholder",
+                set_windows_args(
+                    [
+                        "-m",
+                        "agenttalk",
+                        "wrap",
+                        "--",
+                        "REPLACE: codex.exe",
+                    ]
+                ),
+                expected_warning,
+            ),
+        ]
+    elif failure == "shim":
+        scenarios = []
+        for extension in (".cmd", ".bat", ".ps1"):
+            shim = tmp_path / f"codex{extension}"
+            shim.write_text("exit 0\r\n", encoding="ascii")
+            scenarios.append(
+                (
+                    extension.removeprefix("."),
+                    set_windows_args(
+                        [
+                            "-m",
+                            "agenttalk",
+                            "wrap",
+                            "--",
+                            str(shim),
+                        ]
+                    ),
+                    "wrapped launch CLI tail resolves to shim",
+                )
+            )
+    elif failure == "missing-leaf":
+        scenarios = [
+            (
+                "missing-leaf",
+                f"Remove-Item -LiteralPath {_pslit(str(native_cli))}",
+                "was not found",
+            )
+        ]
+    else:
+        raise AssertionError(f"unhandled wrapped CLI failure case: {failure}")
 
-    env = dict(os.environ)
-    env["AGENTTALK_TEST_INVOCATION_WITNESS"] = str(witness_path)
-    env["CODEX_HOME"] = str(outer_codex_home)
-    completed = subprocess.run(
-        [shell, "-NoProfile", "-File", str(harness_path)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env=env,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    result = json.loads(result_path.read_text(encoding="utf-8-sig"))
-    assert result["ok"] is False, (
-        f"{failure} wrapped CLI tail passed Preflight under {shell}: "
-        f"{completed.stdout}{completed.stderr}"
-    )
-    assert Path(result["codex_home"]).resolve() == outer_codex_home.resolve()
-    assert expected_warning in completed.stdout + completed.stderr
-    assert witness_path.is_file()
-    invocations = json.loads(witness_path.read_text(encoding="utf-8"))
     expected_invocations = Counter({
         (
             tool_python.resolve(),
@@ -5298,16 +5312,59 @@ def test_pinned_preflight_rejects_invalid_wrapped_base_cli(
             inner_codex_home.resolve(),
         ): 1,
     })
-    actual_invocations = Counter(
-        (
-            Path(invocation["executable"]).resolve(),
-            Path(invocation["argv"][0]).resolve(),
-            tuple(invocation["argv"][1:]),
-            Path(invocation["codex_home"]).resolve(),
+
+    for scenario, invalidate, expected_warning in scenarios:
+        result_path = tmp_path / f"wrapped-base-cli-{scenario}.json"
+        witness_path = tmp_path / f"wrapped-base-cli-{scenario}-witness.json"
+        harness = "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$Root = {_pslit(str(tmp_path))}",
+            f"$cfg = Get-Content -LiteralPath {_pslit(str(config_path))} "
+            "-Raw | ConvertFrom-Json",
+            preflight_dependencies,
+            invalidate,
+            "$plan = [pscustomobject]@{ launch_mode='wrap'; cli='codex' }",
+            f"$ok = Preflight 'worker' $plan {_pslit(str(wrapper_python))} "
+            f"{_pslit(str(inner_codex_home))}",
+            "@{ ok=[bool]$ok; codex_home=[string]$env:CODEX_HOME } | "
+            "ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ])
+        harness_path = tmp_path / f"wrapped-base-cli-{scenario}.ps1"
+        harness_path.write_text(harness, encoding="utf-8-sig")
+
+        env = dict(os.environ)
+        env["AGENTTALK_TEST_INVOCATION_WITNESS"] = str(witness_path)
+        env["CODEX_HOME"] = str(outer_codex_home)
+        completed = subprocess.run(
+            [shell, "-NoProfile", "-File", str(harness_path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
         )
-        for invocation in invocations
-    )
-    assert actual_invocations == expected_invocations
+
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        result = json.loads(result_path.read_text(encoding="utf-8-sig"))
+        assert result["ok"] is False, (
+            f"{scenario} wrapped CLI tail passed Preflight under {shell}: "
+            f"{completed.stdout}{completed.stderr}"
+        )
+        assert Path(result["codex_home"]).resolve() == outer_codex_home.resolve()
+        normalized_output = " ".join((completed.stdout + completed.stderr).split())
+        assert expected_warning in normalized_output
+        assert witness_path.is_file()
+        invocations = json.loads(witness_path.read_text(encoding="utf-8"))
+        actual_invocations = Counter(
+            (
+                Path(invocation["executable"]).resolve(),
+                Path(invocation["argv"][0]).resolve(),
+                tuple(invocation["argv"][1:]),
+                Path(invocation["codex_home"]).resolve(),
+            )
+            for invocation in invocations
+        )
+        assert actual_invocations == expected_invocations
 
 
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:
