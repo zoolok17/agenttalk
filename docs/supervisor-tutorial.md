@@ -164,6 +164,7 @@ archetype you need:
   "poll_seconds": 15,              // how often the monitor checks
   "stuck_after_seconds": 120,      // global stale threshold (per-agent overrides win)
   "launch_grace_seconds": 120,     // startup grace before liveness is judged
+  "tool_runtime_python": "D:\\agenttalk-tool-runtime\\Scripts\\python.exe",
   "claude_permission_mode": "bypassPermissions",
   "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
   "agents": { /* one block per agent */ }
@@ -173,6 +174,57 @@ archetype you need:
 `backoff` throttles relaunch storms: a flapping agent waits
 `base..cap` seconds (exponential) between attempts, resetting after
 `reset_after_seconds` of health.
+
+`tool_runtime_python` optionally pins the supervisor's bus commands, generated
+`bin/agenttalk.cmd`, and model-side `AGENTTALK_PY` bus commands to one stable,
+non-editable agenttalk installation at a non-UNC/device absolute path. Direct
+UNC and Windows device paths are unsupported because a UNC share would make
+every control-plane command depend on that share's availability. The configured interpreter must
+contain the same artifact generator version as the checkout that runs
+`supervise --refresh-scripts`; an older runtime rejects the new generated
+marker/body as stale, and refreshing alone cannot update that interpreter.
+Build or update the runtime from the release you are deploying first, then
+refresh the generated artifacts and restart the supervisor through its
+attended host/service procedure:
+
+```powershell
+agenttalk supervise --refresh-scripts
+```
+
+Already-running agents keep their existing environment until their next
+successful launch. Do not treat `request-restart` as a universal rollout
+shortcut: it can trigger recovery for a dead wrapper, but a live idle wrapper
+may remain held by the `same_agent_wrapper_survived` launch barrier (#78).
+Plan an attended agent restart until that barrier behavior is resolved.
+
+Configured mode removes the ambient CPython import-path controls
+(`PYTHONPATH`, `PYTHONHOME`, `PYTHONUSERBASE`, `PYTHONPLATLIBDIR`, and
+`PYTHONCASEOK`), disables the user site (including one derived indirectly from
+`APPDATA`, `USERPROFILE`, or `HOMEDRIVE`/`HOMEPATH`), and enables safe-path
+mode for control-plane commands. Safe-path mode is available in Python 3.11
+and newer; use a 3.11+ tool runtime when the working directory itself could
+contain an importable top-level `agenttalk` package. Selecting a separate
+per-lane environment for code-under-test is a different concern and is not
+configured by this field.
+
+Consequently, there is no automatic supported lane binding that makes
+control-plane commands exercise an agent's uncommitted agenttalk edits while
+the pin is set. For a deliberate one-command developer probe, the agent can
+run from the agent checkout root and override `PYTHONPATH` immediately before
+invoking the interpreter directly:
+
+```powershell
+$env:PYTHONPATH = (Join-Path $PWD 'src')
+& $env:AGENTTALK_PY -m agenttalk --version
+Remove-Item Env:PYTHONPATH
+```
+
+That is an explicit stopgap for a single command; the generated
+`bin/agenttalk.cmd` intentionally reapplies the pin and does not honor it.
+
+To roll back, remove `tool_runtime_python` (or set it to `null`), refresh the
+generated scripts, and restart. The unset behavior is functionally identical
+to the legacy behavior: a source checkout is added to `PYTHONPATH`.
 
 ### A manual-listen agent
 

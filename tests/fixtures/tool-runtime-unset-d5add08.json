@@ -1,0 +1,17 @@
+{
+  "source_commit": "d5add08f76f59d4aa919a1e88ee656d81d940163",
+  "contract": {
+    "agenttalk_python": "$AgenttalkPython = 'C:\\Fallback Python\\python.exe'",
+    "src_on_pythonpath": "$SrcOnPyPath = $true",
+    "source_preflight_count": 3,
+    "launch_base_count": 2,
+    "source_launch_count": 2,
+    "shim_body": [
+      "@echo off",
+      "setlocal",
+      "if not defined AGENTTALK_PYTHON set \"AGENTTALK_PYTHON=C:\\Fallback Python\\python.exe\"",
+      "if exist \"%~dp0..\\..\\src\\agenttalk\\__init__.py\" set \"PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%\"",
+      "\"%AGENTTALK_PYTHON%\" -m agenttalk %*"
+    ]
+  }
+}

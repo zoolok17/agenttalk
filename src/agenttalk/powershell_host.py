@@ -36,7 +36,11 @@ INSTALL_REMEDIATION = (
     "install PowerShell Core 7+ (pwsh) from https://aka.ms/powershell, then run "
     "`agenttalk supervise --select-pwsh`"
 )
-REFRESH_REMEDIATION = "run `agenttalk supervise --refresh-scripts`"
+REFRESH_REMEDIATION = (
+    "ensure the agenttalk installation executing this command contains the "
+    "intended artifact generator (update any configured tool runtime first), "
+    "then run `agenttalk supervise --refresh-scripts`"
+)
 
 _PROBE_COMMAND = (
     "$ErrorActionPreference='Stop';"

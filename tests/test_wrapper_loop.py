@@ -8,9 +8,12 @@ from __future__ import annotations
 import errno
 import gc
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
+import venv
 
 import pytest
 
@@ -1264,6 +1267,248 @@ def test_child_env_stamps_pin_root_and_strips_lease(tmp_path, monkeypatch) -> No
     assert env["AGENTTALK_PY"] == str(Path(sys.executable).resolve())
     assert env["AGENTTALK_ROOT"] == str(tmp_path.resolve())
     assert "AGENTTALK_LEAD_LOOP_LEASE" not in env
+
+
+def test_child_env_uses_inherited_tool_runtime_and_strips_pythonpath(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    tool_home = tmp_path / "tool-runtime"
+    venv.EnvBuilder(with_pip=False).create(tool_home)
+    executable = "python.exe" if sys.platform == "win32" else "python"
+    scripts = "Scripts" if sys.platform == "win32" else "bin"
+    site_packages = (
+        tool_home / "Lib" / "site-packages"
+        if sys.platform == "win32"
+        else next((tool_home / "lib").glob("python*/site-packages"))
+    )
+    tool_package = site_packages / "agenttalk"
+    tool_package.mkdir(parents=True)
+    (tool_package / "__init__.py").write_text("", encoding="utf-8")
+    tool_python = str((tool_home / scripts / executable).resolve())
+    checkout_source = str((tmp_path / "checkout" / "src").resolve())
+    checkout_package = Path(checkout_source) / "agenttalk"
+    checkout_package.mkdir(parents=True)
+    (checkout_package / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("AGENTTALK_TOOL_RUNTIME_PYTHON", tool_python)
+    monkeypatch.setenv("AGENTTALK_PY", "wrong-python.exe")
+    monkeypatch.setenv("PYTHONPATH", checkout_source)
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "poison-home"))
+    monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "poison-userbase"))
+    monkeypatch.setenv("PYTHONPLATLIBDIR", "poison-platlib")
+    monkeypatch.setenv("PYTHONCASEOK", "1")
+    monkeypatch.setenv("PYTHONNOUSERSITE", "ambient")
+    monkeypatch.setenv("pythonuserbase", str(tmp_path / "lower-poison-userbase"))
+    monkeypatch.setenv("pythonnousersite", "lower-ambient")
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+
+    env = run._child_env(tmp_path)
+    completed = subprocess.run(
+        [
+            env["AGENTTALK_PY"],
+            "-c",
+            "import agenttalk; print(agenttalk.__file__)",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert env["AGENTTALK_TOOL_RUNTIME_PYTHON"] == tool_python
+    assert env["AGENTTALK_PY"] == tool_python
+    cleared = {
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "PYTHONPLATLIBDIR",
+        "PYTHONCASEOK",
+    }
+    assert cleared.isdisjoint(name.upper() for name in env)
+    assert env["PYTHONNOUSERSITE"] == "1"
+    assert env["PYTHONSAFEPATH"] == "1"
+    assert {
+        "PYTHONNOUSERSITE",
+        "PYTHONSAFEPATH",
+    } == {
+        name.upper()
+        for name in env
+        if name.upper() in {"PYTHONNOUSERSITE", "PYTHONSAFEPATH"}
+    }
+    assert completed.returncode == 0, completed.stderr
+    assert Path(completed.stdout.strip()).resolve().is_relative_to(
+        tool_package.resolve()
+    )
+
+
+def test_child_env_blocks_poisoned_user_site_with_pythonpath_empty(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A supported non-venv interpreter must not inherit a user-site redirect."""
+    tool_python = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+    poison_base = tmp_path / "poison-userbase"
+    clean_env = dict(os.environ)
+    for name in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "PYTHONNOUSERSITE",
+        "PYTHONSAFEPATH",
+        "PYTHONPLATLIBDIR",
+        "PYTHONCASEOK",
+    ):
+        clean_env.pop(name, None)
+    discovery_env = dict(clean_env)
+    discovery_env["PYTHONUSERBASE"] = str(poison_base)
+    discovery = subprocess.run(
+        [
+            str(tool_python),
+            "-c",
+            "import json, site; "
+            "print(json.dumps([site.ENABLE_USER_SITE, site.getusersitepackages()]))",
+        ],
+        env=discovery_env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert discovery.returncode == 0, discovery.stderr
+    enabled, user_site_text = json.loads(discovery.stdout)
+    if not enabled:
+        pytest.skip("base interpreter disables user site-packages")
+    user_site = Path(user_site_text)
+    poison_package = user_site / "agenttalk"
+    poison_package.mkdir(parents=True)
+    (poison_package / "__init__.py").write_text(
+        'ORIGIN = "poison-user-site"\n',
+        encoding="utf-8",
+    )
+    pinned_site = tmp_path / "pinned-site"
+    pinned_package = pinned_site / "agenttalk"
+    pinned_package.mkdir(parents=True)
+    (pinned_package / "__init__.py").write_text(
+        'ORIGIN = "pinned-site"\n',
+        encoding="utf-8",
+    )
+    probe = (
+        "import json, os, site, sys; "
+        "user=os.path.normcase(os.path.abspath(site.getusersitepackages())); "
+        "sys.path[:]=[p for p in sys.path "
+        "if os.path.normcase(os.path.abspath(p or os.curdir))==user]"
+        f"+[{str(pinned_site)!r}]; "
+        "import agenttalk; "
+        "print(json.dumps([agenttalk.ORIGIN, agenttalk.__file__, "
+        "site.ENABLE_USER_SITE]))"
+    )
+
+    contaminated = dict(discovery_env)
+    before = subprocess.run(
+        [str(tool_python), "-c", probe],
+        env=contaminated,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert before.returncode == 0, before.stderr
+    assert json.loads(before.stdout)[0] == "poison-user-site"
+
+    monkeypatch.setenv(run.TOOL_RUNTIME_PYTHON_ENV, str(tool_python))
+    monkeypatch.setenv("PYTHONUSERBASE", str(poison_base))
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
+    child_env = run._child_env(tmp_path)
+    after = subprocess.run(
+        [child_env["AGENTTALK_PY"], "-c", probe],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert after.returncode == 0, after.stderr
+    after_origin, after_file, user_site_enabled = json.loads(after.stdout)
+    assert after_origin == "pinned-site"
+    assert Path(after_file).resolve().is_relative_to(pinned_site.resolve())
+    assert user_site_enabled is False
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason="PYTHONSAFEPATH is a CPython 3.11+ control",
+)
+def test_child_env_safe_path_blocks_working_directory_shadow(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    tool_home = tmp_path / "tool-runtime"
+    venv.EnvBuilder(with_pip=False).create(tool_home)
+    executable = "python.exe" if sys.platform == "win32" else "python"
+    scripts = "Scripts" if sys.platform == "win32" else "bin"
+    site_packages = (
+        tool_home / "Lib" / "site-packages"
+        if sys.platform == "win32"
+        else next((tool_home / "lib").glob("python*/site-packages"))
+    )
+    pinned_package = site_packages / "agenttalk"
+    pinned_package.mkdir(parents=True)
+    (pinned_package / "__init__.py").write_text(
+        'ORIGIN = "pinned-site"\n',
+        encoding="utf-8",
+    )
+    checkout_source = tmp_path / "checkout" / "src"
+    checkout_package = checkout_source / "agenttalk"
+    checkout_package.mkdir(parents=True)
+    (checkout_package / "__init__.py").write_text(
+        'ORIGIN = "working-directory"\n',
+        encoding="utf-8",
+    )
+    tool_python = str((tool_home / scripts / executable).resolve())
+    monkeypatch.setenv(run.TOOL_RUNTIME_PYTHON_ENV, tool_python)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+
+    child_env = run._child_env(tmp_path)
+    completed = subprocess.run(
+        [
+            child_env["AGENTTALK_PY"],
+            "-c",
+            "import json, agenttalk, sys; "
+            "print(json.dumps([agenttalk.ORIGIN, agenttalk.__file__, "
+            "sys.flags.safe_path]))",
+        ],
+        cwd=checkout_source,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    origin, package_file, safe_path = json.loads(completed.stdout)
+    assert origin == "pinned-site"
+    assert Path(package_file).resolve().is_relative_to(site_packages.resolve())
+    assert safe_path is True
+
+
+def test_child_env_without_tool_runtime_preserves_legacy_runtime_and_pythonpath(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    checkout_source = str((tmp_path / "checkout" / "src").resolve())
+    monkeypatch.delenv("AGENTTALK_TOOL_RUNTIME_PYTHON", raising=False)
+    monkeypatch.setenv("PYTHONPATH", checkout_source)
+
+    env = run._child_env(tmp_path)
+
+    assert env["AGENTTALK_PY"] == str(Path(sys.executable).resolve())
+    assert env["PYTHONPATH"] == checkout_source
 
 
 def test_child_creationflags_set_no_window_only_for_hidden_windows() -> None:

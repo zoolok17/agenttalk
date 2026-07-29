@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 import time
+import venv
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +31,7 @@ from agenttalk import (
     wrapper_runtime as wrt,
 )
 from agenttalk.store import Store
+from agenttalk.wrapper import run as wrapper_run
 
 
 def _run(argv: list[str], root: Path) -> int:
@@ -4632,6 +4635,749 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     assert "is not recognized" not in combined and "CommandNotFound" not in combined, combined
     # the DryRun plan line for the dead worker actually printed (the bus call ran)
     assert "worker:" in res.stdout, f"no plan emitted; stdout={res.stdout!r} stderr={res.stderr!r}"
+
+
+def test_wrapped_child_control_command_imports_from_tool_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rendered Launch environment must bind AGENTTALK_PY and import
+    ``agenttalk`` from the configured tool runtime, never from the checkout.
+
+    This executes the generated Launch function with Start-Process replaced by
+    a synchronous probe of the exact environment the child would inherit.
+    """
+    shell = _pick_powershell()
+    if not shell:
+        return
+    tool_home = tmp_path / "tool-runtime"
+    venv.EnvBuilder(with_pip=False).create(tool_home)
+    tool_python = tool_home / "Scripts" / "python.exe"
+    tool_package = tool_home / "Lib" / "site-packages" / "agenttalk"
+    tool_package.mkdir(parents=True)
+    (tool_package / "__init__.py").write_text(
+        'ORIGIN = "tool-runtime"\n',
+        encoding="utf-8",
+    )
+    probe_main = (
+        "import json, os, sys, agenttalk\n"
+        "if sys.argv[1:] == ['env']:\n"
+        "    clear = {'PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE', "
+        "'PYTHONPLATLIBDIR', 'PYTHONCASEOK'}\n"
+        "    present = sorted(k for k in os.environ if k.upper() in clear)\n"
+        "    print(json.dumps({'origin': agenttalk.__file__, "
+        "'clear_present': present, "
+        "'nousersite': os.environ.get('PYTHONNOUSERSITE'), "
+        "'safepath': os.environ.get('PYTHONSAFEPATH')}))\n"
+        "else:\n"
+        "    print(agenttalk.__file__)\n"
+    )
+    (tool_package / "__main__.py").write_text(probe_main, encoding="utf-8")
+
+    # Make the store root a source checkout with a competing import. Before the
+    # fix, the rendered Launch environment prepends this path to PYTHONPATH.
+    checkout_package = tmp_path / "src" / "agenttalk"
+    checkout_package.mkdir(parents=True)
+    (checkout_package / "__init__.py").write_text(
+        'ORIGIN = "checkout"\n',
+        encoding="utf-8",
+    )
+    (checkout_package / "__main__.py").write_text(probe_main, encoding="utf-8")
+    store = _team(tmp_path)
+    config = {
+        "tool_runtime_python": str(tool_python),
+        "agents": {
+            "worker": {
+                "cli": "codex",
+                "wrapped": True,
+                "cwd": str(tmp_path),
+                "launch": {"windows_file": "ignored.exe", "windows_args": []},
+                # The pin must win case-insensitively even when the agent
+                # injects a competing channel after ambient env construction.
+                "env": {
+                    "pythoncaseok": "1",
+                    "PythonUserBase": str(tmp_path / "agent-poison-userbase"),
+                },
+            },
+        },
+    }
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(config),
+        encoding="utf-8",
+    )
+    sup.init(store, python_exe=sys.executable)
+    generated = (store.dir / "supervisor.ps1").read_text(encoding="utf-8")
+    launch = generated[
+        generated.index("function Launch($name"):
+        generated.index("function Launch-Spec", generated.index("function Launch($name"))
+    ]
+    rendered_runtime = next(
+        line for line in generated.splitlines()
+        if line.startswith("$AgenttalkPython = ")
+    )
+    rendered_source_policy = next(
+        line for line in generated.splitlines()
+        if line.startswith("$SrcOnPyPath = ")
+    )
+    rendered_tool_policy = generated[
+        generated.index("$ToolRuntimePinned = "):
+        generated.index("function Actions-Enabled")
+    ].rstrip()
+
+    result_path = tmp_path / "child-env.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        f"$ResultPath = {_pslit(str(result_path))}",
+        f"$cfg = Get-Content -LiteralPath {_pslit(str(store.dir / 'supervisor.json'))} "
+        "-Raw | ConvertFrom-Json",
+        rendered_runtime,
+        rendered_source_policy,
+        rendered_tool_policy,
+        "function Assert-ActionsEnabled([string]$what) { return $true }",
+        "function Ensure-AgenttalkWrapRootArg($argv) { return @($argv) }",
+        "function Add-SupervisorLaunchNonce($file, $argv, $nonce) { "
+        "return @{ argv=@($argv); injected=$false; source='test'; "
+        "missing_reason='test' } }",
+        "function Quote-Arg([string]$value) { return $value }",
+        "function Proc-Start($id) { return $null }",
+        "function Start-Process {",
+        "  param([string]$FilePath, [string]$ArgumentList, "
+        "[string]$WorkingDirectory, [string]$WindowStyle, [switch]$PassThru)",
+        "  $origin = & $env:AGENTTALK_PY -c "
+        "'import agenttalk; print(agenttalk.__file__)'",
+        "  if ($LASTEXITCODE -ne 0) { throw 'tool runtime import probe failed' }",
+        "  & $env:AGENTTALK_PY -c 'import JSON' 2>$null",
+        "  $caseMismatchRc = $LASTEXITCODE",
+        "  @{ origin=[string]$origin; agenttalk_py=$env:AGENTTALK_PY; "
+        "agenttalk_python=$env:AGENTTALK_PYTHON; "
+        "tool_runtime_python=$env:AGENTTALK_TOOL_RUNTIME_PYTHON; "
+        "pythonpath=$env:PYTHONPATH; pythonhome=$env:PYTHONHOME; "
+        "pythonuserbase=$env:PYTHONUSERBASE; "
+        "pythonplatlibdir=$env:PYTHONPLATLIBDIR; "
+        "pythoncaseok=$env:PYTHONCASEOK; "
+        "pythonnousersite=$env:PYTHONNOUSERSITE; "
+        "pythonsafepath=$env:PYTHONSAFEPATH; "
+        "clear_keys_present=@($ToolRuntimePythonClearEnv | Where-Object { "
+        "$null -ne [Environment]::GetEnvironmentVariable($_) }).Count; "
+        "case_mismatch_rc=$caseMismatchRc } | ConvertTo-Json | "
+        "Set-Content -LiteralPath $ResultPath -Encoding utf8",
+        "  return [pscustomobject]@{ Id=$PID }",
+        "}",
+        launch,
+        "$plan = [pscustomobject]@{ session_id=$null; session_args=@(); "
+        "launch_mode='fresh'; window_style='Hidden' }",
+        "$null = Launch 'worker' $plan $null",
+    ])
+    harness_path = tmp_path / "child-env.ps1"
+    harness_path.write_text(harness, encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(tmp_path / "src")
+    env["PYTHONHOME"] = str(tmp_path / "poison-home")
+    env["PYTHONUSERBASE"] = str(tmp_path / "poison-userbase")
+    env["PYTHONPLATLIBDIR"] = "poison-platlib"
+    env["PYTHONCASEOK"] = "1"
+    env["PYTHONNOUSERSITE"] = "ambient"
+    env.pop("PYTHONSAFEPATH", None)
+    env["AGENTTALK_PYTHON"] = sys.executable
+
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness_path)],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    effective = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    shim_command = subprocess.list2cmdline(
+        [str(store.dir / "bin" / "agenttalk.cmd"), "origin"]
+    )
+    shim_result = subprocess.run(
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", shim_command],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert shim_result.returncode == 0, shim_result.stdout + shim_result.stderr
+    shim_origin = Path(shim_result.stdout.strip()).resolve()
+    shim_env_command = subprocess.list2cmdline(
+        [str(store.dir / "bin" / "agenttalk.cmd"), "env"]
+    )
+    shim_env_result = subprocess.run(
+        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", shim_env_command],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert shim_env_result.returncode == 0, (
+        shim_env_result.stdout + shim_env_result.stderr
+    )
+    shim_environment = json.loads(shim_env_result.stdout)
+    monkeypatch.setenv(
+        wrapper_run.TOOL_RUNTIME_PYTHON_ENV,
+        effective["tool_runtime_python"],
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "src"))
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "poison-home"))
+    monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "poison-userbase"))
+    monkeypatch.setenv("PYTHONPLATLIBDIR", "poison-platlib")
+    monkeypatch.setenv("PYTHONCASEOK", "1")
+    monkeypatch.setenv("PYTHONNOUSERSITE", "ambient")
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    child_env = wrapper_run._child_env(tmp_path)
+    child_result = subprocess.run(
+        [
+            child_env["AGENTTALK_PY"],
+            "-c",
+            "import agenttalk; print(agenttalk.__file__)",
+        ],
+        cwd=str(tmp_path),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert child_result.returncode == 0, child_result.stdout + child_result.stderr
+    child_origin = Path(child_result.stdout.strip()).resolve()
+    checkout_source = str((tmp_path / "src").resolve()).casefold()
+    observed = {
+        "launch_pin": Path(effective["agenttalk_py"]).resolve()
+        == tool_python.resolve(),
+        "launch_shim_pin": Path(effective["agenttalk_python"]).resolve()
+        == tool_python.resolve(),
+        "launch_pythonpath_clean": checkout_source
+        not in str(effective["pythonpath"] or "").casefold(),
+        "launch_import_env_clean": effective["clear_keys_present"] == 0,
+        "launch_case_mismatch_rejected": effective["case_mismatch_rc"] != 0,
+        "launch_user_site_disabled": effective["pythonnousersite"] == "1",
+        "launch_safe_path": effective["pythonsafepath"] == "1",
+        "launch_origin": Path(effective["origin"]).resolve().is_relative_to(
+            tool_package.resolve()
+        ),
+        "wrapped_child_origin": child_origin.is_relative_to(tool_package.resolve()),
+        "shim_origin": shim_origin.is_relative_to(tool_package.resolve()),
+        "shim_import_env_clean": shim_environment["clear_present"] == [],
+        "shim_user_site_disabled": shim_environment["nousersite"] == "1",
+        "shim_safe_path": shim_environment["safepath"] == "1",
+    }
+    assert observed == {
+        "launch_pin": True,
+        "launch_shim_pin": True,
+        "launch_pythonpath_clean": True,
+        "launch_import_env_clean": True,
+        "launch_case_mismatch_rejected": True,
+        "launch_user_site_disabled": True,
+        "launch_safe_path": True,
+        "launch_origin": True,
+        "wrapped_child_origin": True,
+        "shim_origin": True,
+        "shim_import_env_clean": True,
+        "shim_user_site_disabled": True,
+        "shim_safe_path": True,
+    }
+
+
+def test_pinned_preflight_restores_codex_home_when_env_isolation_throws(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"tool_runtime_python": sys.executable}),
+        encoding="utf-8",
+    )
+    generated = sup.render_artifact_bundle(
+        store,
+        python_exe=sys.executable,
+    )["supervisor.ps1"].decode("utf-8")
+    preflight_dependencies = generated[
+        generated.index("$AgenttalkPython = "):
+        generated.index("# endregion exec-helpers")
+    ]
+    result_path = tmp_path / "preflight-rollback.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        preflight_dependencies,
+        "function Enter-ToolRuntimePythonEnvironment { throw 'injected isolation failure' }",
+        "$results = @()",
+        "foreach ($case in @(",
+        "  @{ launch_mode='wrap'; cli='codex' },",
+        "  @{ launch_mode='manual'; cli='codex' }",
+        ")) {",
+        "  $env:CODEX_HOME = 'operator-home'",
+        "  $plan = [pscustomobject]$case",
+        "  $ok = Preflight 'worker' $plan 'ignored.exe' 'agent-home'",
+        "  $results += @{ ok=[bool]$ok; codex_home=$env:CODEX_HOME }",
+        "}",
+        "$results | ConvertTo-Json -Depth 4 | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ])
+    harness_path = tmp_path / "preflight-rollback.ps1"
+    harness_path.write_text(harness, encoding="utf-8-sig")
+
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads(result_path.read_text(encoding="utf-8-sig")) == [
+        {"ok": False, "codex_home": "operator-home"},
+        {"ok": False, "codex_home": "operator-home"},
+    ]
+
+
+def _create_preflight_witness_runtime(home: Path) -> tuple[Path, Path]:
+    venv.EnvBuilder(with_pip=False).create(home)
+    python = home / "Scripts" / "python.exe"
+    package = home / "Lib" / "site-packages" / "agenttalk"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    main = package / "__main__.py"
+    main.write_text(
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "witness = Path(os.environ['AGENTTALK_TEST_INVOCATION_WITNESS'])\n"
+        "records = (json.loads(witness.read_text(encoding='utf-8')) "
+        "if witness.exists() else [])\n"
+        "records.append({'executable': sys.executable, 'argv': sys.argv, "
+        "'codex_home': os.environ.get('CODEX_HOME')})\n"
+        "witness.write_text(json.dumps(records), encoding='utf-8')\n"
+        "if sys.argv[1:] != ['--version']:\n"
+        "    raise SystemExit(2)\n"
+        "print('agenttalk test runtime')\n",
+        encoding="utf-8",
+    )
+    return python, main
+
+
+def _windows_powershell_editions() -> list[tuple[str, str | None]]:
+    if os.name != "nt":
+        return []
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    return [
+        ("pwsh-7", shutil.which("pwsh")),
+        (
+            "windows-powershell-5.1",
+            str(
+                system_root / "System32" / "WindowsPowerShell" / "v1.0"
+                / "powershell.exe"
+            ),
+        ),
+    ]
+
+
+def _tool_runtime_preflight_cases() -> list[object]:
+    """All Preflight plan shapes under both Windows PowerShell editions."""
+    plans = [
+        ("wrapped", "wrap", "codex"),
+        ("codex", "manual", "codex"),
+        ("generic-claude", "manual", "claude"),
+    ]
+    return [
+        pytest.param(
+            shell,
+            plan_shape,
+            launch_mode,
+            cli_name,
+            id=f"{shell_id}-{plan_shape}",
+        )
+        for shell_id, shell in _windows_powershell_editions()
+        for plan_shape, launch_mode, cli_name in plans
+    ]
+
+
+@pytest.mark.parametrize(
+    ("shell", "plan_shape", "launch_mode", "cli_name"),
+    _tool_runtime_preflight_cases(),
+)
+def test_pinned_preflight_import_probe_executes_in_each_windows_powershell(
+    tmp_path: Path,
+    shell: str | None,
+    plan_shape: str,
+    launch_mode: str,
+    cli_name: str,
+) -> None:
+    """Every pinned Preflight branch must invoke its configured interpreter.
+
+    The two editions marshal native arguments differently: Windows PowerShell 5.1
+    strips embedded double quotes from a single-quoted string handed to a native
+    process, while pwsh 7 (``$PSNativeCommandArgumentPassing = Windows``) does
+    not. That difference once turned a perfectly valid interpreter into a hard
+    launch refusal for every pinned agent, and pwsh-only coverage cannot see the
+    class at all.
+
+    Each parameter gets a real tool-runtime venv, a distinct CLI executable,
+    and a private invocation witness. The wrapped branch also gets a distinct
+    wrapper venv, proving every endpoint keeps its production-shaped identity.
+    """
+    assert shell and Path(shell).is_file(), (
+        f"required PowerShell edition is absent on Windows: {shell!r}"
+    )
+
+    tool_python, tool_main = _create_preflight_witness_runtime(
+        tmp_path / "tool-runtime"
+    )
+    native_cli = tmp_path / f"{cli_name}.exe"
+    shutil.copy2(tool_python, native_cli)
+    preflight_file = native_cli
+    wrapper_main: Path | None = None
+    if plan_shape == "wrapped":
+        preflight_file, wrapper_main = _create_preflight_witness_runtime(
+            tmp_path / "wrapper-runtime"
+        )
+    endpoints = {
+        "$file": preflight_file.resolve(),
+        "$AgenttalkPython": tool_python.resolve(),
+    }
+    if plan_shape == "wrapped":
+        endpoints["wrapped argv CLI"] = native_cli.resolve()
+    assert all(endpoint.is_file() for endpoint in endpoints.values()), endpoints
+    assert len(set(endpoints.values())) == len(endpoints), endpoints
+
+    outer_codex_home = tmp_path / "outer-codex-home"
+    inner_codex_home = tmp_path / "inner-codex-home"
+    outer_codex_home.mkdir()
+    inner_codex_home.mkdir()
+    store = _team(tmp_path)
+    config_path = store.dir / "supervisor.json"
+    config_path.write_text(
+        json.dumps({
+            "tool_runtime_python": str(tool_python),
+            "agents": {
+                "worker": {
+                    "launch": {
+                        "windows_args": [
+                            "-m",
+                            "agenttalk",
+                            "wrap",
+                            "--",
+                            str(native_cli),
+                        ],
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    generated = sup.render_artifact_bundle(
+        store,
+        python_exe=str(tool_python),
+    )["supervisor.ps1"].decode("utf-8")
+    assert "$ToolRuntimePinned = $true" in generated, (
+        "the rendered bundle is not actually pinned, so this test would not be "
+        "exercising the pinned Preflight path at all"
+    )
+    preflight_dependencies = generated[
+        generated.index("$AgenttalkPython = "):
+        generated.index("# endregion exec-helpers")
+    ]
+    result_path = tmp_path / f"pinned-preflight-{plan_shape}.json"
+    witness_path = tmp_path / f"invocation-witness-{plan_shape}.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        f"$cfg = Get-Content -LiteralPath {_pslit(str(config_path))} "
+        "-Raw | ConvertFrom-Json",
+        preflight_dependencies,
+        f"$plan = [pscustomobject]@{{ launch_mode={_pslit(launch_mode)}; "
+        f"cli={_pslit(cli_name)} }}",
+        f"$ok = Preflight 'worker' $plan {_pslit(str(preflight_file))} "
+        f"{_pslit(str(inner_codex_home))}",
+        "@{ ok=[bool]$ok; codex_home=[string]$env:CODEX_HOME } | "
+        "ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ])
+    harness_path = tmp_path / f"pinned-preflight-{plan_shape}.ps1"
+    harness_path.write_text(harness, encoding="utf-8-sig")
+
+    env = dict(os.environ)
+    env["AGENTTALK_TEST_INVOCATION_WITNESS"] = str(witness_path)
+    env["CODEX_HOME"] = str(outer_codex_home)
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    result = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert result["ok"] is True, (
+        f"pinned Preflight FAILED under {shell} - a native-argument marshalling "
+        f"regression: {completed.stdout}{completed.stderr}"
+    )
+    assert Path(result["codex_home"]).resolve() == outer_codex_home.resolve()
+    assert witness_path.is_file(), (
+        f"{plan_shape} Preflight returned success under {shell} without invoking "
+        f"the pinned interpreter: {completed.stdout}{completed.stderr}"
+    )
+    invocations = json.loads(witness_path.read_text(encoding="utf-8"))
+    expected_codex_home = (
+        outer_codex_home if plan_shape == "generic-claude" else inner_codex_home
+    ).resolve()
+    expected_invocations = Counter({
+        (
+            tool_python.resolve(),
+            tool_main.resolve(),
+            ("--version",),
+            expected_codex_home,
+        ): 1,
+    })
+    if plan_shape == "wrapped":
+        assert wrapper_main is not None
+        expected_invocations[
+            (
+                preflight_file.resolve(),
+                wrapper_main.resolve(),
+                ("--version",),
+                expected_codex_home,
+            )
+        ] += 1
+    actual_invocations = Counter(
+        (
+            Path(invocation["executable"]).resolve(),
+            Path(invocation["argv"][0]).resolve(),
+            tuple(invocation["argv"][1:]),
+            Path(invocation["codex_home"]).resolve(),
+        )
+        for invocation in invocations
+    )
+    assert actual_invocations == expected_invocations
+
+
+def _wrapped_base_cli_validation_cases() -> list[object]:
+    failures = [
+        "separator",
+        "unfilled",
+        "shim",
+        "missing-leaf",
+    ]
+    return [
+        pytest.param(
+            shell,
+            failure,
+            id=f"{shell_id}-{failure}",
+        )
+        for shell_id, shell in _windows_powershell_editions()
+        for failure in failures
+    ]
+
+
+@pytest.mark.parametrize(
+    ("shell", "failure"),
+    _wrapped_base_cli_validation_cases(),
+)
+def test_pinned_preflight_rejects_invalid_wrapped_base_cli(
+    tmp_path: Path,
+    shell: str | None,
+    failure: str,
+) -> None:
+    """Wrapped Preflight must execute its probes, then reject each bad CLI tail."""
+    assert shell and Path(shell).is_file(), (
+        f"required PowerShell edition is absent on Windows: {shell!r}"
+    )
+
+    tool_python, tool_main = _create_preflight_witness_runtime(
+        tmp_path / "tool-runtime"
+    )
+    wrapper_python, wrapper_main = _create_preflight_witness_runtime(
+        tmp_path / "wrapper-runtime"
+    )
+    native_cli = tmp_path / "codex.exe"
+    shutil.copy2(tool_python, native_cli)
+    assert native_cli.is_file()
+
+    outer_codex_home = tmp_path / "outer-codex-home"
+    inner_codex_home = tmp_path / "inner-codex-home"
+    outer_codex_home.mkdir()
+    inner_codex_home.mkdir()
+    store = _team(tmp_path)
+    config_path = store.dir / "supervisor.json"
+    config_path.write_text(
+        json.dumps({
+            "tool_runtime_python": str(tool_python),
+            "agents": {
+                "worker": {
+                    "launch": {
+                        "windows_args": [
+                            "-m",
+                            "agenttalk",
+                            "wrap",
+                            "--",
+                            str(native_cli),
+                        ],
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    generated = sup.render_artifact_bundle(
+        store,
+        python_exe=str(tool_python),
+    )["supervisor.ps1"].decode("utf-8")
+    preflight_dependencies = generated[
+        generated.index("$AgenttalkPython = "):
+        generated.index("# endregion exec-helpers")
+    ]
+
+    def set_windows_args(args: list[str]) -> str:
+        return (
+            "$cfg.agents.worker.launch.windows_args = @("
+            + ", ".join(_pslit(arg) for arg in args)
+            + ")"
+        )
+
+    scenarios: list[tuple[str, str, str]]
+    if failure == "separator":
+        expected_warning = "wrapped launch has no real CLI tail after --"
+        scenarios = [
+            (
+                "missing-separator",
+                set_windows_args(["-m", "agenttalk", "wrap"]),
+                expected_warning,
+            ),
+            (
+                "missing-tail",
+                set_windows_args(["-m", "agenttalk", "wrap", "--"]),
+                expected_warning,
+            ),
+        ]
+    elif failure == "unfilled":
+        expected_warning = "wrapped launch CLI tail is not filled in"
+        scenarios = [
+            (
+                "empty-tail",
+                set_windows_args(["-m", "agenttalk", "wrap", "--", ""]),
+                expected_warning,
+            ),
+            (
+                "placeholder",
+                set_windows_args(
+                    [
+                        "-m",
+                        "agenttalk",
+                        "wrap",
+                        "--",
+                        "REPLACE: codex.exe",
+                    ]
+                ),
+                expected_warning,
+            ),
+        ]
+    elif failure == "shim":
+        scenarios = []
+        for extension in (".cmd", ".bat", ".ps1"):
+            shim = tmp_path / f"codex{extension}"
+            shim.write_text("exit 0\r\n", encoding="ascii")
+            scenarios.append(
+                (
+                    extension.removeprefix("."),
+                    set_windows_args(
+                        [
+                            "-m",
+                            "agenttalk",
+                            "wrap",
+                            "--",
+                            str(shim),
+                        ]
+                    ),
+                    "wrapped launch CLI tail resolves to shim",
+                )
+            )
+    elif failure == "missing-leaf":
+        scenarios = [
+            (
+                "missing-leaf",
+                f"Remove-Item -LiteralPath {_pslit(str(native_cli))}",
+                "was not found",
+            )
+        ]
+    else:
+        raise AssertionError(f"unhandled wrapped CLI failure case: {failure}")
+
+    expected_invocations = Counter({
+        (
+            tool_python.resolve(),
+            tool_main.resolve(),
+            ("--version",),
+            inner_codex_home.resolve(),
+        ): 1,
+        (
+            wrapper_python.resolve(),
+            wrapper_main.resolve(),
+            ("--version",),
+            inner_codex_home.resolve(),
+        ): 1,
+    })
+
+    for scenario, invalidate, expected_warning in scenarios:
+        result_path = tmp_path / f"wrapped-base-cli-{scenario}.json"
+        witness_path = tmp_path / f"wrapped-base-cli-{scenario}-witness.json"
+        harness = "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$Root = {_pslit(str(tmp_path))}",
+            f"$cfg = Get-Content -LiteralPath {_pslit(str(config_path))} "
+            "-Raw | ConvertFrom-Json",
+            preflight_dependencies,
+            invalidate,
+            "$plan = [pscustomobject]@{ launch_mode='wrap'; cli='codex' }",
+            f"$ok = Preflight 'worker' $plan {_pslit(str(wrapper_python))} "
+            f"{_pslit(str(inner_codex_home))}",
+            "@{ ok=[bool]$ok; codex_home=[string]$env:CODEX_HOME } | "
+            "ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ])
+        harness_path = tmp_path / f"wrapped-base-cli-{scenario}.ps1"
+        harness_path.write_text(harness, encoding="utf-8-sig")
+
+        env = dict(os.environ)
+        env["AGENTTALK_TEST_INVOCATION_WITNESS"] = str(witness_path)
+        env["CODEX_HOME"] = str(outer_codex_home)
+        completed = subprocess.run(
+            [shell, "-NoProfile", "-File", str(harness_path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        result = json.loads(result_path.read_text(encoding="utf-8-sig"))
+        assert result["ok"] is False, (
+            f"{scenario} wrapped CLI tail passed Preflight under {shell}: "
+            f"{completed.stdout}{completed.stderr}"
+        )
+        assert Path(result["codex_home"]).resolve() == outer_codex_home.resolve()
+        normalized_output = " ".join((completed.stdout + completed.stderr).split())
+        assert expected_warning in normalized_output
+        assert witness_path.is_file()
+        invocations = json.loads(witness_path.read_text(encoding="utf-8"))
+        actual_invocations = Counter(
+            (
+                Path(invocation["executable"]).resolve(),
+                Path(invocation["argv"][0]).resolve(),
+                tuple(invocation["argv"][1:]),
+                Path(invocation["codex_home"]).resolve(),
+            )
+            for invocation in invocations
+        )
+        assert actual_invocations == expected_invocations
 
 
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:
