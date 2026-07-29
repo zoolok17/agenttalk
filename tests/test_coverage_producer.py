@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,34 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
         link.symlink_to(target)
     except (NotImplementedError, OSError) as exc:
         pytest.skip(f"file symlinks are unavailable: {exc}")
+
+
+def _junction_or_skip(link: Path, target: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows junctions are not applicable")
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable for junction creation")
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            (
+                "& { param([string]$link, [string]$target) "
+                "New-Item -ItemType Junction -Path $link -Target $target "
+                "| Out-Null }"
+            ),
+            str(link),
+            str(target),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"junction creation is unavailable: {completed.stderr.strip()}")
 
 
 def _plan(
@@ -237,15 +266,18 @@ def test_each_supported_close_scope_can_select_each_producible_coverage_gate(
 
     assert resolved["gate"] == gate_name
     assert resolved["gate_scope"] == profile
-    assert close.evaluate_dod(
-        record,
-        {
-            "policy_present": True,
-            "policy_error": None,
-            "required_dimensions": required,
-            "coverage": resolved,
-        },
-    ) == []
+    assert (
+        close.evaluate_dod(
+            record,
+            {
+                "policy_present": True,
+                "policy_error": None,
+                "required_dimensions": required,
+                "coverage": resolved,
+            },
+        )
+        == []
+    )
 
 
 def test_unparseable_ci_coverage_run_never_emits_green_gate(
@@ -370,11 +402,7 @@ def test_bare_carriage_return_rewrite_stays_red_through_subprocess_capture(
     assurance.run_plan(
         _plan(
             tmp_path,
-            (
-                "import sys; "
-                "sys.stdout.write('Total coverage: 99%\\r"
-                "progress output replaced the summary')"
-            ),
+            ("import sys; sys.stdout.write('Total coverage: 99%\\rprogress output replaced the summary')"),
             revision=revision,
         )
     )
@@ -475,6 +503,56 @@ def test_coverage_lock_acquisition_failure_aborts_before_command(
     assert "coverage command was not run" in _coverage_gate(tmp_path)["reason"]
 
 
+def test_coverage_lock_acquisition_fallback_cannot_overwrite_newer_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+
+    class RacingAcquireLock:
+        def __enter__(self):
+            with Store(tmp_path).config_lock():
+                gates.set_gate(
+                    tmp_path,
+                    name="coverage:release",
+                    status="green",
+                    severity="blocker",
+                    scope="release",
+                    actor="newer-coverage-scan",
+                    evidence_source="automation_ci",
+                    evidence=["https://github.com/example/agenttalk/actions/runs/2/attempts/1"],
+                    evidence_details={"coverage_percent": 77.0},
+                    reason="newer coverage scan completed",
+                    revision=revision,
+                )
+            raise TimeoutError("simulated coverage lock contention")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        Store,
+        "coverage_transaction_lock",
+        lambda self, **_kwargs: RacingAcquireLock(),
+    )
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "from pathlib import Path; Path('coverage-command-ran').touch()",
+            revision=revision,
+        )
+    )
+
+    assert not (tmp_path / "coverage-command-ran").exists()
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "green"
+    assert gate["updated_by"] == "newer-coverage-scan"
+    assert gate["reason"] == "newer coverage scan completed"
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(77.0)
+
+
 def test_coverage_lock_release_failure_discards_provisional_green(
     tmp_path: Path,
     monkeypatch,
@@ -513,6 +591,196 @@ def test_coverage_lock_release_failure_discards_provisional_green(
     gate = _coverage_gate(tmp_path)
     assert gate["status"] == "red"
     assert "coverage result was discarded" in gate["reason"]
+
+
+def test_coverage_lock_release_fallback_cannot_overwrite_newer_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {".gitignore": ".agenttalk/\ncoverage.xml\ncoverage.json\n"},
+    )
+
+    class RacingReleaseLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            # Fault-inject an interposed write without reacquiring config.lock:
+            # production coverage contenders cannot do this because the caller
+            # retains coverage-handoff.lock across coverage-lock release.
+            gates.set_gate(
+                tmp_path,
+                name="coverage:release",
+                status="green",
+                severity="blocker",
+                scope="release",
+                actor="newer-coverage-scan",
+                evidence_source="automation_ci",
+                evidence=["https://github.com/example/agenttalk/actions/runs/2/attempts/1"],
+                evidence_details={"coverage_percent": 77.0},
+                reason="newer coverage scan completed",
+                revision=revision,
+            )
+            raise OSError("simulated coverage lock release failure")
+
+    monkeypatch.setattr(
+        Store,
+        "coverage_transaction_lock",
+        lambda self, **_kwargs: RacingReleaseLock(),
+    )
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 100 1 99%')",
+            revision=revision,
+        )
+    )
+
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    assert any("release failure" in error for error in result.runner_errors)
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "green"
+    assert gate["updated_by"] == "newer-coverage-scan"
+    assert gate["reason"] == "newer coverage scan completed"
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(77.0)
+
+
+def test_coverage_lock_release_fallback_uses_one_short_config_transaction(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+
+    class FailingReleaseLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            raise OSError("simulated coverage lock release failure")
+
+    real_config_lock = Store.config_lock
+    config_lock_calls = 0
+
+    def count_config_locks(store: Store, **kwargs):
+        nonlocal config_lock_calls
+        config_lock_calls += 1
+        return real_config_lock(store, **kwargs)
+
+    monkeypatch.setattr(
+        Store,
+        "coverage_transaction_lock",
+        lambda self, **_kwargs: FailingReleaseLock(),
+    )
+    monkeypatch.setattr(Store, "config_lock", count_config_locks)
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 100 1 99%')",
+            revision=revision,
+        )
+    )
+
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    # Snapshot, provisional gate, pre-probe generation fence, fallback CAS.
+    assert config_lock_calls == 4
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "release failure" in gate["reason"]
+    assert "coverage result was discarded" in gate["reason"]
+
+
+@pytest.mark.parametrize("operation", ["unrelated-gate", "coverage-waiver"])
+def test_coverage_lock_release_does_not_hold_global_config_lock(
+    tmp_path: Path,
+    monkeypatch,
+    operation: str,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    release_started = threading.Event()
+    allow_release = threading.Event()
+    scan_errors: list[BaseException] = []
+
+    class BlockingReleaseLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            release_started.set()
+            if not allow_release.wait(timeout=5.0):
+                raise RuntimeError("coverage lock release was not allowed")
+            return False
+
+    monkeypatch.setattr(
+        Store,
+        "coverage_transaction_lock",
+        lambda self, **_kwargs: BlockingReleaseLock(),
+    )
+
+    def execute_scan() -> None:
+        try:
+            assurance.run_plan(
+                _plan(
+                    tmp_path,
+                    "print('TOTAL 100 12 88%')",
+                    profile="change",
+                    revision=revision,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            scan_errors.append(exc)
+
+    scan = threading.Thread(
+        target=execute_scan,
+        name=f"coverage-release-{operation}",
+    )
+    config_error: BaseException | None = None
+    try:
+        scan.start()
+        assert release_started.wait(timeout=5.0)
+        try:
+            with Store(tmp_path).config_lock(timeout=1.0, poll=0.005):
+                if operation == "unrelated-gate":
+                    gates.set_gate(
+                        tmp_path,
+                        name="security:release",
+                        status="red",
+                        severity="blocker",
+                        scope="release",
+                        actor="concurrent-gate-writer",
+                        evidence_source="local_command",
+                        evidence=["test:during-coverage-release"],
+                        reason="concurrent unrelated gate write",
+                    )
+                else:
+                    gates.waive_gate(
+                        tmp_path,
+                        name="coverage:change",
+                        operator="test-operator",
+                        reason="waived during coverage-lock release",
+                        scope="change",
+                        expires="2099-01-01T00:00:00Z",
+                    )
+        except BaseException as exc:  # asserted after scan cleanup
+            config_error = exc
+    finally:
+        allow_release.set()
+        scan.join(timeout=10.0)
+
+    assert not scan.is_alive()
+    assert scan_errors == []
+    assert config_error is None
+    state = gates.load_gate_state(tmp_path)["gates"]
+    if operation == "unrelated-gate":
+        assert state["security:release"]["reason"] == ("concurrent unrelated gate write")
+        assert state["coverage:change"]["status"] == "green"
+    else:
+        assert state["coverage:change"]["status"] == "waived"
+        assert state["coverage:change"]["waiver"]["reason"] == ("waived during coverage-lock release")
 
 
 @pytest.mark.parametrize(
@@ -917,6 +1185,203 @@ def test_waiver_written_during_coverage_scan_survives_emission(
     assert gate["waiver"]["reason"] == "waived while coverage was running"
 
 
+def test_expired_waiver_written_during_coverage_scan_yields_to_fresh_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    command_started = threading.Event()
+    release_command = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocked_run_external(root: Path, spec: dict, command: list[str]):
+        command_started.set()
+        if not release_command.wait(timeout=5.0):
+            raise RuntimeError("coverage command was not released")
+        run = assurance._run_record(
+            spec,
+            "pass",
+            time.monotonic(),
+            command=command,
+            exit_code=0,
+        )
+        return run, [], "TOTAL 100 12 88%", "TOTAL 100 12 88%"
+
+    monkeypatch.setattr(assurance, "_run_external", blocked_run_external)
+
+    def execute_scan() -> None:
+        try:
+            assurance.run_plan(
+                _plan(
+                    tmp_path,
+                    "unused",
+                    profile="change",
+                    revision=revision,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    scan = threading.Thread(
+        target=execute_scan,
+        name="expired-coverage-waiver-ordering",
+    )
+    try:
+        scan.start()
+        assert command_started.wait(timeout=5.0)
+        with Store(tmp_path).config_lock():
+            gates.waive_gate(
+                tmp_path,
+                name="coverage:change",
+                operator="test-operator",
+                reason="already expired while coverage was running",
+                scope="change",
+                expires="2000-01-01T00:00:00Z",
+            )
+    finally:
+        release_command.set()
+        scan.join(timeout=10.0)
+
+    assert not scan.is_alive()
+    assert errors == []
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "green"
+    assert gate["updated_by"] == "assurance-ci"
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(88.0)
+
+
+@pytest.mark.parametrize("operation", ["unrelated-gate", "coverage-waiver"])
+def test_git_evidence_probe_does_not_hold_global_config_lock(
+    tmp_path: Path,
+    monkeypatch,
+    operation: str,
+) -> None:
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    emitter_errors: list[BaseException] = []
+
+    def blocked_evidence(*_args, **_kwargs) -> str:
+        probe_started.set()
+        if not release_probe.wait(timeout=5.0):
+            raise RuntimeError("Git evidence probe was not released")
+        return "https://github.com/example/agenttalk/actions/runs/12345/attempts/2"
+
+    monkeypatch.setattr(assurance, "_github_actions_evidence", blocked_evidence)
+    plan = _plan(tmp_path, "unused")
+
+    def emit() -> None:
+        try:
+            assurance._emit_coverage_gate(
+                plan,
+                {"status": "pass", "exit_code": 0},
+                "TOTAL 100 12 88%",
+                path_error=None,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            emitter_errors.append(exc)
+
+    emitter = threading.Thread(target=emit, name=f"coverage-emitter-{operation}")
+    config_error: BaseException | None = None
+    try:
+        emitter.start()
+        assert probe_started.wait(timeout=5.0)
+        try:
+            with Store(tmp_path).config_lock(timeout=1.0, poll=0.005):
+                if operation == "unrelated-gate":
+                    gates.set_gate(
+                        tmp_path,
+                        name="security:release",
+                        status="red",
+                        severity="blocker",
+                        scope="release",
+                        actor="concurrent-gate-writer",
+                        evidence_source="local_command",
+                        evidence=["test:concurrent-write"],
+                        reason="concurrent unrelated gate write",
+                    )
+                else:
+                    gates.waive_gate(
+                        tmp_path,
+                        name="coverage:release",
+                        operator="test-operator",
+                        reason="waived while Git evidence was probed",
+                        scope="release",
+                        expires="2099-01-01T00:00:00Z",
+                    )
+        except BaseException as exc:  # asserted after the emitter is released
+            config_error = exc
+    finally:
+        release_probe.set()
+        emitter.join(timeout=10.0)
+
+    assert not emitter.is_alive()
+    assert emitter_errors == []
+    assert config_error is None
+    state = gates.load_gate_state(tmp_path)["gates"]
+    if operation == "unrelated-gate":
+        assert state["security:release"]["reason"] == "concurrent unrelated gate write"
+        assert state["coverage:release"]["status"] == "green"
+    else:
+        assert state["coverage:release"]["status"] == "waived"
+        assert state["coverage:release"]["waiver"]["reason"] == "waived while Git evidence was probed"
+
+
+def test_config_transaction_after_git_probe_forces_reprobe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    store = Store(tmp_path)
+    store.init(["claude", "codex"])
+    _git(tmp_path, "add", ".agenttalk/config.json")
+    _git(tmp_path, "commit", "-m", "track AgentTalk config")
+    revision = _git(tmp_path, "rev-parse", "HEAD")
+    _set_github_ci(monkeypatch, revision)
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        assurance.load_manifest(tmp_path),
+        "release",
+        assurance.load_baseline(tmp_path),
+    )
+    assert provenance["git_dirty"] is False
+
+    real_evidence = assurance._github_actions_evidence
+    successful_probes = 0
+
+    def mutate_after_first_probe(*args, **kwargs):
+        nonlocal successful_probes
+        evidence = real_evidence(*args, **kwargs)
+        if evidence is not None and successful_probes == 0:
+            successful_probes += 1
+            Store(tmp_path).set_role("claude", "lead")
+        return evidence
+
+    monkeypatch.setattr(
+        assurance,
+        "_github_actions_evidence",
+        mutate_after_first_probe,
+    )
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 100 1 99%')",
+            revision=revision,
+            provenance=provenance,
+        )
+    )
+
+    assert successful_probes == 1
+    assert "M .agenttalk/config.json" in _git(
+        tmp_path,
+        "status",
+        "--porcelain",
+    )
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert gate["evidence_source"] == "local_command"
+
+
 def test_cli_finalization_lock_failure_returns_one_after_artifact_write(
     tmp_path: Path,
     monkeypatch,
@@ -950,9 +1415,7 @@ def test_cli_finalization_lock_failure_returns_one_after_artifact_write(
     rc = _run_assurance_cli(tmp_path)
 
     captured = capsys.readouterr()
-    artifacts = list(
-        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
-    )
+    artifacts = list((tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json"))
     assert rc == 1
     assert lock_calls == 2
     assert len(artifacts) == 1
@@ -983,9 +1446,7 @@ def test_cli_gate_snapshot_load_error_fails_before_scan(
     rc = _run_assurance_cli(tmp_path)
 
     captured = capsys.readouterr()
-    artifacts = list(
-        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
-    )
+    artifacts = list((tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json"))
     assert rc == 1
     assert artifacts == []
     assert "could not produce artifact" in captured.err
@@ -1022,9 +1483,7 @@ def test_cli_finalizer_load_error_preserves_gate_and_returns_one_after_artifact(
     rc = _run_assurance_cli(tmp_path)
 
     captured = capsys.readouterr()
-    artifacts = list(
-        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
-    )
+    artifacts = list((tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json"))
     assert rc == 1
     assert load_calls == 2
     assert len(artifacts) == 1
@@ -1050,9 +1509,7 @@ def test_cli_finalization_persist_failure_returns_one_after_artifact_write(
     rc = _run_assurance_cli(tmp_path)
 
     captured = capsys.readouterr()
-    artifacts = list(
-        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
-    )
+    artifacts = list((tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json"))
     assert rc == 1
     assert len(artifacts) == 1
     assert _coverage_gate(tmp_path, "change")["status"] == "green"
@@ -1141,6 +1598,10 @@ def test_cli_fresh_ci_coverage_measurement_stays_green(
         ),
         encoding="utf-8",
     )
+    _git(tmp_path, "add", "-f", ".agenttalk/assurance.json")
+    _git(tmp_path, "commit", "-m", "track selected assurance manifest")
+    revision = _git(tmp_path, "rev-parse", "HEAD")
+    _set_github_ci(monkeypatch, revision)
 
     rc = _run_assurance_cli(tmp_path)
 
@@ -1331,9 +1792,7 @@ def test_clean_tree_emits_gate_from_stdout_without_canonical_reports(
 ) -> None:
     revision = _ci_revision(tmp_path, monkeypatch)
 
-    assurance.run_plan(
-        _plan(tmp_path, "print('TOTAL 100 12 88%')", revision=revision)
-    )
+    assurance.run_plan(_plan(tmp_path, "print('TOTAL 100 12 88%')", revision=revision))
 
     gate = _coverage_gate(tmp_path)
     assert gate["status"] == "green"
@@ -1427,10 +1886,7 @@ def test_postflight_coverage_json_is_not_consumed_as_evidence(
     )
     report = tmp_path / "coverage.json"
     payload = b'{"totals":{"percent_covered":99.0},"owner":"command"}'
-    script = (
-        "from pathlib import Path; "
-        f"Path('coverage.json').write_bytes({payload!r})"
-    )
+    script = f"from pathlib import Path; Path('coverage.json').write_bytes({payload!r})"
 
     assurance.run_plan(_plan(tmp_path, script, revision=revision))
 
@@ -1471,9 +1927,7 @@ def test_concurrent_stdout_coverage_scans_serialize_without_cross_claiming_evide
             first_entered.set()
             assert second_attempted_lock.wait(timeout=5.0)
             if second_entered.is_set():
-                serialization_violations.append(
-                    "scan-b entered while scan-a held the coverage lock"
-                )
+                serialization_violations.append("scan-b entered while scan-a held the coverage lock")
             percent = 81
         else:
             second_entered.set()
@@ -1494,9 +1948,7 @@ def test_concurrent_stdout_coverage_scans_serialize_without_cross_claiming_evide
 
     def scan(name: str, profile: str) -> None:
         try:
-            results[name] = assurance.run_plan(
-                _plan(tmp_path, name, profile=profile, revision=revision)
-            )
+            results[name] = assurance.run_plan(_plan(tmp_path, name, profile=profile, revision=revision))
         except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)
 
@@ -1522,12 +1974,95 @@ def test_concurrent_stdout_coverage_scans_serialize_without_cross_claiming_evide
     assert serialization_violations == []
     assert second_entered.is_set()
     assert set(results) == {"scan-a", "scan-b"}
-    assert _coverage_gate(tmp_path, "release")["evidence"][-1][
-        "coverage_percent"
-    ] == pytest.approx(81.0)
-    assert _coverage_gate(tmp_path, "change")["evidence"][-1][
-        "coverage_percent"
-    ] == pytest.approx(92.0)
+    assert _coverage_gate(tmp_path, "release")["evidence"][-1]["coverage_percent"] == pytest.approx(81.0)
+    assert _coverage_gate(tmp_path, "change")["evidence"][-1]["coverage_percent"] == pytest.approx(92.0)
+
+
+def test_coverage_handoff_orders_cross_profile_promotion_before_newer_command(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    older_ready_to_promote = threading.Event()
+    allow_older_promotion = threading.Event()
+    newer_is_dirty_and_running = threading.Event()
+    release_newer = threading.Event()
+    real_emit = assurance._emit_coverage_gate
+    errors: list[BaseException] = []
+
+    def observed_emit(*args, **kwargs):
+        if (
+            threading.current_thread().name == "older-coverage-holder"
+            and kwargs.get("transaction_complete", True)
+            and "expected_gate" in kwargs
+            and not older_ready_to_promote.is_set()
+        ):
+            older_ready_to_promote.set()
+            assert allow_older_promotion.wait(timeout=5.0)
+        return real_emit(*args, **kwargs)
+
+    def fake_run_external(root: Path, spec: dict, command: list[str]):
+        assert root == tmp_path
+        if command[-1] == "newer":
+            (tmp_path / "tracked.txt").write_text(
+                "newer command mutation\n",
+                encoding="utf-8",
+            )
+            newer_is_dirty_and_running.set()
+            assert release_newer.wait(timeout=5.0)
+            percent = 92
+        else:
+            percent = 81
+        run = assurance._run_record(
+            spec,
+            "pass",
+            time.monotonic(),
+            command=command,
+            exit_code=0,
+        )
+        return run, [], "", f"TOTAL 100 {100 - percent} {percent}%"
+
+    monkeypatch.setattr(assurance, "_emit_coverage_gate", observed_emit)
+    monkeypatch.setattr(assurance, "_run_external", fake_run_external)
+
+    def scan(name: str, profile: str) -> None:
+        try:
+            assurance.run_plan(_plan(tmp_path, name, profile=profile, revision=revision))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    older = threading.Thread(
+        target=scan,
+        args=("older", "release"),
+        name="older-coverage-holder",
+    )
+    newer = threading.Thread(
+        target=scan,
+        args=("newer", "change"),
+        name="newer-coverage-holder",
+    )
+    older.start()
+    assert older_ready_to_promote.wait(timeout=5.0)
+    newer.start()
+    assert not newer_is_dirty_and_running.wait(timeout=0.2)
+    try:
+        allow_older_promotion.set()
+        older.join(timeout=5.0)
+        assert not older.is_alive()
+        assert _coverage_gate(tmp_path, "release")["status"] == "green"
+        assert newer_is_dirty_and_running.wait(timeout=5.0)
+        gate_while_newer_runs = _coverage_gate(tmp_path, "change")
+        assert gate_while_newer_runs["status"] == "red"
+        assert "in progress" in gate_while_newer_runs["reason"]
+    finally:
+        allow_older_promotion.set()
+        release_newer.set()
+        older.join(timeout=5.0)
+        newer.join(timeout=5.0)
+
+    assert not newer.is_alive()
+    assert errors == []
+    assert _coverage_gate(tmp_path, "change")["status"] == "red"
 
 
 @pytest.mark.parametrize(
@@ -1556,13 +2091,7 @@ def test_legacy_recovery_residue_refuses_and_is_left_for_manual_recovery(
     marker_expected: bool,
 ) -> None:
     revision = _ci_revision(tmp_path, monkeypatch)
-    transaction = (
-        tmp_path
-        / ".agenttalk"
-        / "assurance"
-        / "coverage-recovery"
-        / "transaction-legacy"
-    )
+    transaction = tmp_path / ".agenttalk" / "assurance" / "coverage-recovery" / "transaction-legacy"
     transaction.mkdir(parents=True)
     backup = transaction / "coverage.json"
     backup.write_bytes(b"legacy operator-owned backup")
@@ -1571,11 +2100,7 @@ def test_legacy_recovery_residue_refuses_and_is_left_for_manual_recovery(
     marker = transaction / "transaction.json"
     if marker_payload is not None:
         marker.write_text(marker_payload, encoding="utf-8")
-    before = {
-        path: path.read_bytes()
-        for path in (backup, marker)
-        if path.exists()
-    }
+    before = {path: path.read_bytes() for path in (backup, marker) if path.exists()}
 
     result = assurance.run_plan(
         _plan(
@@ -1596,9 +2121,7 @@ def test_legacy_recovery_residue_refuses_and_is_left_for_manual_recovery(
     assert gate["status"] == "red"
     assert "coverage command was not run" in gate["reason"]
     assert "coverage.xml" in gate["reason"]
-    assert "coverage-recovery/transaction-legacy/coverage.json" in gate[
-        "reason"
-    ].replace("\\", "/")
+    assert "coverage-recovery/transaction-legacy/coverage.json" in gate["reason"].replace("\\", "/")
 
 
 def test_older_noncoverage_scan_cannot_invalidate_newer_coverage_attestation(
@@ -1723,6 +2246,1126 @@ def test_tracked_file_dirtied_by_coverage_command_cannot_attest(
     gate = _coverage_gate(tmp_path)
     assert gate["status"] == "red"
     assert gate["evidence_source"] == "local_command"
+
+
+def test_unignored_agenttalk_runtime_paths_do_not_dirty_coverage_attestation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 10 0 99%')",
+            revision=revision,
+            provenance=provenance,
+        )
+    )
+
+    assert result.tools_run[0]["status"] == "pass"
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "green"
+    assert gate["evidence_source"] == "automation_ci"
+    assert provenance["git_dirty"] is False
+
+
+def test_case_variant_agenttalk_runtime_path_follows_filesystem_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    variant = tmp_path / ".AgentTalk"
+    variant.mkdir()
+    Store(tmp_path).init(["claude", "codex"])
+    canonical = tmp_path / ".agenttalk"
+    aliases_runtime = os.path.samestat(os.lstat(canonical), os.lstat(variant))
+    if not aliases_runtime:
+        (variant / "operator-note.txt").write_text(
+            "distinct case-sensitive path\n",
+            encoding="utf-8",
+        )
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is not aliases_runtime
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 10 0 99%')",
+            revision=revision,
+            provenance=provenance,
+        )
+    )
+    assert _coverage_gate(tmp_path)["status"] == ("green" if aliases_runtime else "red")
+
+
+@pytest.mark.parametrize("protected_kind", ["manifest", "baseline"])
+def test_case_variant_selected_provenance_input_remains_dirty(
+    tmp_path: Path,
+    monkeypatch,
+    protected_kind: str,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    variant = tmp_path / ".AgentTalk"
+    variant.mkdir()
+    Store(tmp_path).init(["claude", "codex"])
+    if protected_kind == "manifest":
+        relative = ".AgentTalk/assurance.json"
+        manifest = {"schema_version": 1, "_path": relative}
+        baseline = {"schema_version": 1, "findings": []}
+    else:
+        relative = ".AgentTalk/assurance/baseline.json"
+        manifest = {"schema_version": 1}
+        baseline = {
+            "schema_version": 1,
+            "findings": [],
+            "_path": relative,
+        }
+    selected = tmp_path / relative
+    selected.parent.mkdir(parents=True, exist_ok=True)
+    selected.write_text('{"schema_version": 1}\n', encoding="utf-8")
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        manifest,
+        "release",
+        baseline,
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+@pytest.mark.parametrize("protected_kind", ["manifest", "baseline"])
+def test_case_variant_selected_input_created_after_preflight_cannot_attest(
+    tmp_path: Path,
+    monkeypatch,
+    protected_kind: str,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    if protected_kind == "manifest":
+        relative = ".AgentTalk/Assurance.JSON"
+        provenance = {
+            "git_sha": revision,
+            "git_dirty": False,
+            "manifest_path": relative,
+        }
+    else:
+        relative = ".AgentTalk/Assurance/Baseline.JSON"
+        provenance = {
+            "git_sha": revision,
+            "git_dirty": False,
+            "baseline_path": relative,
+        }
+    script = (
+        "from pathlib import Path; "
+        f"target = Path({relative!r}); "
+        "target.parent.mkdir(parents=True, exist_ok=True); "
+        "target.write_text('{\"schema_version\": 1}\\n', encoding='utf-8'); "
+        "print('TOTAL 10 0 99%')"
+    )
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            script,
+            revision=revision,
+            provenance=provenance,
+        )
+    )
+
+    assert (tmp_path / relative).is_file()
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert gate["evidence_source"] == "local_command"
+
+
+@pytest.mark.parametrize("protected_kind", ["manifest", "baseline"])
+def test_ignored_selected_input_must_be_tracked_to_attest(
+    tmp_path: Path,
+    monkeypatch,
+    protected_kind: str,
+) -> None:
+    revision = _init_git_project(tmp_path)
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    if protected_kind == "manifest":
+        relative = ".agenttalk/assurance.json"
+        selected_text = '{"schema_version": 1}\n'
+    else:
+        relative = ".agenttalk/assurance/baseline.json"
+        selected_text = '{"schema_version": 1, "baseline_id": "test", "findings": []}\n'
+    selected = tmp_path / relative
+    selected.parent.mkdir(parents=True, exist_ok=True)
+    selected.write_text(selected_text, encoding="utf-8")
+    if protected_kind == "manifest":
+        manifest = assurance.load_manifest(tmp_path, relative)
+        baseline = assurance.load_baseline(tmp_path)
+    else:
+        manifest = assurance.load_manifest(tmp_path)
+        baseline = assurance.load_baseline(tmp_path, relative)
+
+    untracked = assurance.collect_provenance(
+        tmp_path,
+        manifest,
+        "release",
+        baseline,
+    )
+    assert untracked["git_dirty"] is True
+
+    _git(tmp_path, "add", "-f", relative)
+    _git(tmp_path, "commit", "-m", f"track selected {protected_kind}")
+    revision = _git(tmp_path, "rev-parse", "HEAD")
+    _set_github_ci(monkeypatch, revision)
+    tracked = assurance.collect_provenance(
+        tmp_path,
+        manifest,
+        "release",
+        baseline,
+    )
+    assert tracked["git_dirty"] is False
+
+
+def test_nested_assurance_root_ignores_own_runtime_but_not_repo_siblings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    nested = tmp_path / "packages" / "demo"
+    revision = _init_git_project(
+        tmp_path,
+        {
+            ".gitignore": "",
+            "packages/demo/tracked.txt": "nested baseline\n",
+        },
+    )
+    _set_github_ci(monkeypatch, revision)
+    Store(nested).init(["claude", "codex"])
+
+    provenance = assurance.collect_provenance(
+        nested,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is False
+    assurance.run_plan(
+        _plan(
+            nested,
+            "print('TOTAL 10 0 99%')",
+            revision=revision,
+            provenance=provenance,
+        )
+    )
+    assert _coverage_gate(nested)["status"] == "green"
+
+    (tmp_path / "operator-sibling.txt").write_text(
+        "uncommitted sibling\n",
+        encoding="utf-8",
+    )
+    dirty_provenance = assurance.collect_provenance(
+        nested,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert dirty_provenance["git_dirty"] is True
+    assurance.run_plan(
+        _plan(
+            nested,
+            "print('TOTAL 10 0 99%')",
+            revision=revision,
+            provenance={"git_sha": revision, "git_dirty": False},
+        )
+    )
+    assert _coverage_gate(nested)["status"] == "red"
+
+
+def test_tracked_scanner_gate_state_remains_repository_dirt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    with Store(tmp_path).config_lock():
+        gates.set_gate(
+            tmp_path,
+            name="coverage:release",
+            status="red",
+            severity="blocker",
+            scope="release",
+            actor="fixture",
+            evidence_source="local_command",
+            evidence=["fixture:initial-gate"],
+            reason="initial tracked scanner state",
+            revision=revision,
+        )
+    _git(tmp_path, "add", ".agenttalk")
+    _git(tmp_path, "commit", "-m", "track generated AgentTalk state")
+    revision = _git(tmp_path, "rev-parse", "HEAD")
+    _set_github_ci(monkeypatch, revision)
+
+    first = assurance.run_plan(_plan(tmp_path, "print('TOTAL 10 0 98%')", revision=revision))
+    assert first.tools_run[0]["status"] == "pass"
+    assert _coverage_gate(tmp_path)["status"] == "red"
+    assert "gates.json" in _git(tmp_path, "status", "--porcelain")
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is True
+
+
+@pytest.mark.parametrize("operation", ["worktree", "stage", "delete"])
+def test_staged_or_deleted_tracked_scanner_path_remains_dirty(
+    tmp_path: Path,
+    monkeypatch,
+    operation: str,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    with Store(tmp_path).config_lock():
+        gates.set_gate(
+            tmp_path,
+            name="coverage:release",
+            status="red",
+            severity="blocker",
+            scope="release",
+            actor="fixture",
+            evidence_source="local_command",
+            evidence=["fixture:tracked-gate"],
+            reason="tracked scanner state",
+            revision=revision,
+        )
+    _git(tmp_path, "add", ".agenttalk")
+    _git(tmp_path, "commit", "-m", "track generated AgentTalk state")
+    gate_path = tmp_path / ".agenttalk" / "gates.json"
+    if operation in {"worktree", "stage"}:
+        state = json.loads(gate_path.read_text(encoding="utf-8"))
+        state["fixture"] = "staged operator mutation"
+        gate_path.write_text(json.dumps(state), encoding="utf-8")
+        if operation == "stage":
+            _git(tmp_path, "add", ".agenttalk/gates.json")
+            assert _git(tmp_path, "status", "--porcelain").startswith("M ")
+        else:
+            assert _git(tmp_path, "status", "--porcelain").startswith("M ")
+    else:
+        gate_path.unlink()
+        status = _git(tmp_path, "status", "--porcelain")
+        assert "D" in status[:2]
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+def test_selected_input_overrides_tracked_scanner_path_exemption(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    relative = ".agenttalk/gates.json"
+    revision = _init_git_project(
+        tmp_path,
+        {
+            ".gitignore": "",
+            relative: ('{"schema_version": 1, "required_gates": [], "gates": {}, "profiles": {}}\n'),
+        },
+    )
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    selected = tmp_path / relative
+    selected.write_text(
+        '{"schema_version": 1, "required_gates": [], "gates": {}, '
+        '"profiles": {"release": {"required_tools": ["coverage"]}}}\n',
+        encoding="utf-8",
+    )
+    status = _git(tmp_path, "status", "--porcelain")
+    assert "M" in status[:2]
+    assert relative in status
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1, "_path": relative},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+@pytest.mark.parametrize(
+    "index_flag",
+    ["--skip-worktree", "--assume-unchanged"],
+)
+def test_selected_input_must_match_index_when_index_flag_hides_status(
+    tmp_path: Path,
+    monkeypatch,
+    index_flag: str,
+) -> None:
+    relative = ".agenttalk/assurance.json"
+    revision = _init_git_project(
+        tmp_path,
+        {
+            ".gitignore": "",
+            relative: '{"schema_version": 1, "profiles": {}}\n',
+        },
+    )
+    _set_github_ci(monkeypatch, revision)
+    _git(tmp_path, "update-index", index_flag, relative)
+    (tmp_path / relative).write_text(
+        '{"schema_version": 1, "profiles": {"release": {"required_tools": ["coverage"]}}}\n',
+        encoding="utf-8",
+    )
+    assert _git(tmp_path, "status", "--porcelain") == ""
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1, "_path": relative},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+@pytest.mark.parametrize(
+    "index_flag",
+    ["--skip-worktree", "--assume-unchanged"],
+)
+def test_nonselected_index_visibility_flag_fails_clean_tree_closed(
+    tmp_path: Path,
+    monkeypatch,
+    index_flag: str,
+) -> None:
+    relative = ".agenttalk/gates.json"
+    revision = _init_git_project(
+        tmp_path,
+        {
+            ".gitignore": "",
+            relative: ('{"schema_version": 1, "required_gates": [], "gates": {}, "profiles": {}}\n'),
+        },
+    )
+    _set_github_ci(monkeypatch, revision)
+    _git(tmp_path, "update-index", index_flag, relative)
+    (tmp_path / relative).write_text(
+        '{"schema_version": 1, "required_gates": [], "gates": {}, '
+        '"profiles": {"release": {"required": ["coverage:release"]}}}\n',
+        encoding="utf-8",
+    )
+    assert _git(tmp_path, "status", "--porcelain") == ""
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+@pytest.mark.parametrize(
+    "index_flag",
+    ["--skip-worktree", "--assume-unchanged"],
+)
+def test_clean_selected_input_is_proved_despite_index_visibility_flag(
+    tmp_path: Path,
+    monkeypatch,
+    index_flag: str,
+) -> None:
+    relative = ".agenttalk/assurance.json"
+    revision = _init_git_project(
+        tmp_path,
+        {
+            ".gitignore": "",
+            relative: '{"schema_version": 1, "profiles": {}}\n',
+        },
+    )
+    _set_github_ci(monkeypatch, revision)
+    _git(tmp_path, "update-index", index_flag, relative)
+    manifest = assurance.load_manifest(tmp_path, relative)
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        manifest,
+        "release",
+        assurance.load_baseline(tmp_path),
+    )
+
+    assert provenance["git_dirty"] is False
+
+
+@pytest.mark.parametrize(
+    "index_flag",
+    ["--skip-worktree", "--assume-unchanged"],
+)
+def test_hidden_hardlink_cannot_borrow_selected_input_visibility_exception(
+    tmp_path: Path,
+    monkeypatch,
+    index_flag: str,
+) -> None:
+    selected_relative = ".agenttalk/assurance.json"
+    hidden_relative = "tracked-other.json"
+    revision = _init_git_project(
+        tmp_path,
+        {
+            ".gitignore": "",
+            selected_relative: '{"schema_version": 1, "profiles": {}}\n',
+            hidden_relative: '{"owner": "different index blob"}\n',
+        },
+    )
+    _set_github_ci(monkeypatch, revision)
+    selected = tmp_path / selected_relative
+    hidden = tmp_path / hidden_relative
+    hidden.unlink()
+    try:
+        os.link(selected, hidden)
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+    _git(tmp_path, "update-index", index_flag, hidden_relative)
+    assert _git(tmp_path, "status", "--porcelain") == ""
+    assert os.path.samestat(os.lstat(selected), os.lstat(hidden))
+    manifest = assurance.load_manifest(tmp_path, selected_relative)
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        manifest,
+        "release",
+        assurance.load_baseline(tmp_path),
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+def test_selected_input_cannot_borrow_another_selected_hardlink_index_entry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path)
+    _set_github_ci(monkeypatch, revision)
+    baseline_relative = ".agenttalk/assurance/baseline.json"
+    baseline = tmp_path / baseline_relative
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    baseline.write_text(
+        '{"schema_version": 1, "findings": []}\n',
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", "-f", baseline_relative)
+    _git(tmp_path, "commit", "-m", "track only selected baseline")
+    manifest_relative = ".agenttalk/assurance.json"
+    try:
+        os.link(baseline, tmp_path / manifest_relative)
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+    assert _git(tmp_path, "status", "--porcelain") == ""
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1, "_path": manifest_relative},
+        "release",
+        {
+            "schema_version": 1,
+            "findings": [],
+            "_path": baseline_relative,
+        },
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+def test_tracked_selected_input_missing_under_skip_worktree_refuses_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path)
+    _set_github_ci(monkeypatch, revision)
+    relative = ".agenttalk/assurance.json"
+    selected = tmp_path / relative
+    selected.parent.mkdir(parents=True, exist_ok=True)
+    selected.write_text(
+        '{"schema_version": 1, "profiles": {"release": {"required_tools": ["coverage"]}}}\n',
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", "-f", relative)
+    _git(tmp_path, "commit", "-m", "track selected manifest")
+    _git(tmp_path, "update-index", "--skip-worktree", relative)
+    selected.unlink()
+    assert _git(tmp_path, "status", "--porcelain") == ""
+
+    with pytest.raises(
+        assurance.AssuranceUsageError,
+        match="tracked assurance manifest is missing",
+    ):
+        assurance.load_manifest(tmp_path, relative)
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1, "_path": relative},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is True
+
+
+def test_loaded_manifest_bytes_must_match_later_index_proof(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    relative = ".agenttalk/assurance.json"
+    original = '{"schema_version": 1, "profiles": {"release": {"required_tools": ["tests"]}}}\n'
+    revision = _init_git_project(
+        tmp_path,
+        {".gitignore": "", relative: original},
+    )
+    _set_github_ci(monkeypatch, revision)
+    selected = tmp_path / relative
+    selected.write_text(
+        '{"schema_version": 1, "profiles": {"release": {"required_tools": ["coverage"]}}}\n',
+        encoding="utf-8",
+    )
+    loaded = assurance.load_manifest(tmp_path, relative)
+    selected.write_text(original, encoding="utf-8")
+    assert _git(tmp_path, "status", "--porcelain") == ""
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        loaded,
+        "release",
+        assurance.load_baseline(tmp_path),
+    )
+
+    assert loaded["profiles"]["release"]["required_tools"] == ["coverage"]
+    assert provenance["git_dirty"] is True
+
+
+def test_dangling_selected_reparse_object_refuses_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path)
+    _set_github_ci(monkeypatch, revision)
+    runtime = tmp_path / ".agenttalk"
+    runtime.mkdir()
+    target = tmp_path.with_name(f"{tmp_path.name}-selected-target")
+    target.mkdir()
+    relative = ".agenttalk/assurance.json"
+    selected = tmp_path / relative
+    _junction_or_skip(selected, target)
+    target.rmdir()
+    assert os.path.lexists(selected)
+    assert not selected.exists()
+
+    with pytest.raises(
+        assurance.AssuranceUsageError,
+        match="regular, non-reparse file|symlink, reparse point",
+    ):
+        assurance.load_manifest(tmp_path, relative)
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1, "_path": relative},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is True
+
+
+def test_tracked_scanner_path_case_alias_remains_repository_dirt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(
+        tmp_path,
+        {
+            ".gitignore": "",
+            ".AgentTalk/Gates.JSON": '{"schema_version": 1, "gates": {}}\n',
+        },
+    )
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    canonical = tmp_path / ".agenttalk" / "gates.json"
+    tracked_variant = tmp_path / ".AgentTalk" / "Gates.JSON"
+    aliases_tracked_path = canonical.exists() and os.path.samestat(os.lstat(canonical), os.lstat(tracked_variant))
+    if aliases_tracked_path:
+        with Store(tmp_path).config_lock():
+            gates.set_gate(
+                tmp_path,
+                name="coverage:release",
+                status="red",
+                severity="blocker",
+                scope="release",
+                actor="fixture",
+                evidence_source="local_command",
+                evidence=["fixture:case-alias"],
+                reason="scanner mutation through canonical spelling",
+                revision=revision,
+            )
+        assert "Gates.JSON" in _git(tmp_path, "status", "--porcelain")
+    else:
+        tracked_variant.write_text(
+            '{"schema_version": 1, "gates": {}, "operator": true}\n',
+            encoding="utf-8",
+        )
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "initial", "changed"),
+    [
+        ("tracked.txt", "baseline\n", "operator change\n"),
+        (
+            ".agenttalk/assurance.json",
+            '{"schema_version": 1}\n',
+            '{"schema_version": 1, "changed": true}\n',
+        ),
+        (
+            ".agenttalk/gates.json.operator-note",
+            "baseline\n",
+            "operator change\n",
+        ),
+        (
+            ".agenttalk/assurance/runs/operator/README.md",
+            "baseline\n",
+            "operator change\n",
+        ),
+    ],
+    ids=[
+        "tracked-project-file",
+        "tracked-agenttalk-policy",
+        "tracked-gate-lookalike",
+        "tracked-run-output-lookalike",
+    ],
+)
+def test_unignored_agenttalk_exclusion_keeps_tracked_changes_dirty(
+    tmp_path: Path,
+    monkeypatch,
+    relative_path: str,
+    initial: str,
+    changed: str,
+) -> None:
+    revision = _init_git_project(
+        tmp_path,
+        {
+            ".gitignore": "",
+            relative_path: initial,
+        },
+    )
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    target = tmp_path / relative_path
+    target.write_text(changed, encoding="utf-8")
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is True
+
+    # An optimistic caller cannot bypass the independent post-command probe.
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 10 0 99%')",
+            revision=revision,
+            provenance={"git_sha": revision, "git_dirty": False},
+        )
+    )
+
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert gate["evidence_source"] == "local_command"
+
+
+def test_unignored_agenttalk_exclusion_keeps_untracked_policy_dirty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    _git(tmp_path, "add", ".agenttalk")
+    _git(tmp_path, "commit", "-m", "track initial AgentTalk state")
+    revision = _git(tmp_path, "rev-parse", "HEAD")
+    _set_github_ci(monkeypatch, revision)
+    (tmp_path / ".agenttalk" / "assurance.json").write_text(
+        '{"schema_version": 1, "profiles": {}}\n',
+        encoding="utf-8",
+    )
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is True
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 10 0 99%')",
+            revision=revision,
+            provenance={"git_sha": revision, "git_dirty": False},
+        )
+    )
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert gate["evidence_source"] == "local_command"
+
+
+def test_unignored_agenttalk_exclusion_keeps_other_untracked_paths_dirty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    (tmp_path / ".agenttalk" / "operator-note.txt").write_text(
+        "uncommitted\n",
+        encoding="utf-8",
+    )
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is True
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 10 0 99%')",
+            revision=revision,
+            provenance={"git_sha": revision, "git_dirty": False},
+        )
+    )
+
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert gate["evidence_source"] == "local_command"
+
+
+def test_agenttalk_runtime_symlink_is_not_scanner_owned(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    external_runtime = tmp_path / "external-runtime"
+    external_runtime.mkdir()
+    _symlink_or_skip(tmp_path / ".agenttalk", external_runtime)
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+def test_agenttalk_runtime_non_directory_is_not_scanner_owned(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    (tmp_path / ".agenttalk").write_text("operator object\n", encoding="utf-8")
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+def test_agenttalk_runtime_junction_is_not_scanner_owned(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    external_runtime = tmp_path / "external-runtime"
+    external_runtime.mkdir()
+    _junction_or_skip(tmp_path / ".agenttalk", external_runtime)
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+def test_scanner_leaf_below_runtime_junction_is_not_exempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    runtime = tmp_path / ".agenttalk"
+    runtime.mkdir()
+    external_assurance = tmp_path.with_name(f"{tmp_path.name}-external-assurance")
+    external_assurance.mkdir()
+    (external_assurance / "coverage.lock").write_text(
+        "operator-owned external lock\n",
+        encoding="utf-8",
+    )
+    _junction_or_skip(runtime / "assurance", external_assurance)
+    assert not assurance._is_agenttalk_created_untracked_path(
+        tmp_path,
+        "assurance/coverage.lock",
+    )
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+def test_coverage_lock_refuses_reparse_parent_without_touching_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    runtime = tmp_path / ".agenttalk"
+    runtime.mkdir()
+    external_assurance = tmp_path.with_name(f"{tmp_path.name}-external-lock-target")
+    external_assurance.mkdir()
+    external_lock = external_assurance / "coverage.lock"
+    original = b"operator-owned external lock"
+    external_lock.write_bytes(original)
+    _junction_or_skip(runtime / "assurance", external_assurance)
+    before_names = sorted(path.name for path in external_assurance.iterdir())
+
+    result = assurance.run_plan(
+        _plan(
+            tmp_path,
+            ("from pathlib import Path; Path('coverage-command-ran').touch()"),
+            revision=revision,
+        )
+    )
+
+    assert not (tmp_path / "coverage-command-ran").exists()
+    assert external_lock.read_bytes() == original
+    assert sorted(path.name for path in external_assurance.iterdir()) == before_names
+    assert result.tools_run[0]["status"] == "error-optional-tool"
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "coverage command was not run" in gate["reason"]
+
+
+def test_stored_coverage_lock_context_revalidates_replaced_parent(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["claude", "codex"])
+    context = store.coverage_transaction_lock()
+    assurance_dir = tmp_path / ".agenttalk" / "assurance"
+    original_dir = tmp_path / ".agenttalk" / "assurance-original"
+    assurance_dir.rename(original_dir)
+    external = tmp_path.with_name(f"{tmp_path.name}-external-stored-context")
+    external.mkdir()
+    _junction_or_skip(assurance_dir, external)
+
+    with pytest.raises(OSError, match="reparse point|plain directory"):
+        with context:
+            pytest.fail("unsafe stored lock context was entered")
+
+    assert list(external.iterdir()) == []
+
+
+def test_artifact_writer_refuses_reparse_output_parent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch, {".gitignore": ""})
+    result = assurance.run_plan(_plan(tmp_path, "print('TOTAL 10 0 98%')", revision=revision))
+    assurance_dir = tmp_path / ".agenttalk" / "assurance"
+    original_dir = tmp_path / ".agenttalk" / "assurance-original"
+    assurance_dir.rename(original_dir)
+    external = tmp_path.with_name(f"{tmp_path.name}-external-artifact-target")
+    external.mkdir()
+    _junction_or_skip(assurance_dir, external)
+
+    with pytest.raises(
+        assurance.AssuranceUsageError,
+        match="symlink, reparse point",
+    ):
+        assurance.write_artifact(result, assurance.DEFAULT_RUNS_DIR)
+
+    assert list(external.iterdir()) == []
+
+
+def test_exact_scanner_leaf_directory_is_not_exempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    runtime = tmp_path / ".agenttalk"
+    runtime.mkdir()
+    non_regular_leaf = runtime / "gates.json"
+    non_regular_leaf.mkdir()
+    (non_regular_leaf / "operator.txt").write_text(
+        "operator-owned child\n",
+        encoding="utf-8",
+    )
+    assert not assurance._is_agenttalk_created_untracked_path(
+        tmp_path,
+        "gates.json",
+    )
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
+
+
+def test_default_runtime_outputs_do_not_self_invalidate_no_ignore_next_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch, {".gitignore": ""})
+    first_plan = _plan(
+        tmp_path,
+        "print('TOTAL 10 1 90%')",
+        revision=revision,
+    )
+    first_plan.run_id = "20260729T010203.123456Z"
+    first = assurance.run_plan(first_plan)
+    paths = assurance.write_artifact(first, assurance.DEFAULT_RUNS_DIR)
+    assert paths.artifact.is_file()
+    assert paths.summary is not None and paths.summary.is_file()
+    assert (paths.run_dir / "raw" / "coverage.txt").is_file()
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is False
+    second_plan = _plan(
+        tmp_path,
+        "print('TOTAL 10 0 100%')",
+        revision=revision,
+        provenance=provenance,
+    )
+    second_plan.run_id = "20260729T010204.123456Z"
+
+    assurance.run_plan(second_plan)
+
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "green"
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(100.0)
+
+
+def test_custom_output_outside_runtime_is_a_named_dirty_residual(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    first = assurance.run_plan(_plan(tmp_path, "print('TOTAL 10 0 98%')", revision=revision))
+    paths = assurance.write_artifact(first, tmp_path / "assurance-results")
+    assert paths.artifact.is_file()
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+    assert provenance["git_dirty"] is True
+
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('TOTAL 10 0 99%')",
+            revision=revision,
+            provenance=provenance,
+        )
+    )
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert gate["evidence_source"] == "local_command"
+
+
+def test_custom_summary_inside_runtime_is_a_named_dirty_residual(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch, {".gitignore": ""})
+    first = assurance.run_plan(_plan(tmp_path, "print('TOTAL 10 0 98%')", revision=revision))
+    destination = tmp_path / ".agenttalk" / "assurance" / "runs" / first.run_id / "operator-selected.txt"
+    paths = assurance.write_artifact(
+        first,
+        tmp_path / ".agenttalk" / "assurance" / "runs",
+        summary=destination,
+    )
+    assert paths.summary == destination
+    assert destination.is_file()
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is True
 
 
 def test_git_status_error_is_unknown_and_cannot_attest(
@@ -1899,13 +3542,11 @@ def test_coverage_parser_rejects_impossible_native_threshold_relationships(
     [
         ("Required test coverage of 80% reached. Total coverage: 80.00%", 80.0),
         (
-            "Required test coverage of 80.000000000000000001% reached. "
-            "Total coverage: 80.00%",
+            "Required test coverage of 80.000000000000000001% reached. Total coverage: 80.00%",
             80.0,
         ),
         (
-            "FAIL Required test coverage of 80.000000000000000001% not reached. "
-            "Total coverage: 80.00%",
+            "FAIL Required test coverage of 80.000000000000000001% not reached. Total coverage: 80.00%",
             80.0,
         ),
         ("FAIL Required test coverage of 90% not reached. Total coverage: 90.00%", 90.0),
@@ -1947,10 +3588,7 @@ def test_invalid_final_native_relationship_does_not_expose_earlier_green() -> No
 
 
 def test_final_native_scientific_requirement_supersedes_earlier_summary() -> None:
-    stdout = (
-        "Total coverage: 99%\n"
-        "Required test coverage of 1e-05% reached. Total coverage: 10.00%"
-    )
+    stdout = "Total coverage: 99%\nRequired test coverage of 1e-05% reached. Total coverage: 10.00%"
 
     assert parse_coverage_percent(stdout) == pytest.approx(10.0)
 
@@ -2174,11 +3812,7 @@ def test_huge_coverage_stdout_fails_closed_and_cli_writes_red_artifact(
         tmp_path,
         monkeypatch,
         {
-            "pyproject.toml": (
-                "[project]\n"
-                "name = 'coverage-overflow-fixture'\n"
-                "version = '1.0'\n"
-            ),
+            "pyproject.toml": ("[project]\nname = 'coverage-overflow-fixture'\nversion = '1.0'\n"),
             "src/fixture/__init__.py": "VALUE = 1\n",
         },
     )
@@ -2203,15 +3837,11 @@ def test_huge_coverage_stdout_fails_closed_and_cli_writes_red_artifact(
 
     rc = _run_assurance_cli(tmp_path, profile="change")
 
-    artifacts = list(
-        (tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json")
-    )
+    artifacts = list((tmp_path / ".agenttalk" / "assurance" / "runs").glob("*/artifact.json"))
     assert rc == 0
     assert len(artifacts) == 1
     artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
-    coverage_run = next(
-        run for run in artifact["tools"]["run"] if run["tool_id"] == "coverage"
-    )
+    coverage_run = next(run for run in artifact["tools"]["run"] if run["tool_id"] == "coverage")
     assert coverage_run["status"] == "pass"
     gate = _coverage_gate(tmp_path, "change")
     assert gate["status"] == "red"
@@ -2286,11 +3916,7 @@ def test_coverage_parser_never_raises_for_deterministic_bytes_corpus() -> None:
     payloads = (
         [b""]
         + [bytes((value,)) for value in range(256)]
-        + [
-            bytes((first, second))
-            for first in range(256)
-            for second in range(256)
-        ]
+        + [bytes((first, second)) for first in range(256) for second in range(256)]
         + [payload for _name, payload in directed]
     )
     assert len(directed) == 40
@@ -2301,11 +3927,9 @@ def test_coverage_parser_never_raises_for_deterministic_bytes_corpus() -> None:
     for index, payload in enumerate(payloads):
         result = parse_coverage_percent(payload)
         invocation_count += 1
-        assert result is None or (
-            isinstance(result, float)
-            and math.isfinite(result)
-            and 0.0 <= result <= 100.0
-        ), f"invalid parser result for corpus input {index}: {result!r}"
+        assert result is None or (isinstance(result, float) and math.isfinite(result) and 0.0 <= result <= 100.0), (
+            f"invalid parser result for corpus input {index}: {result!r}"
+        )
         if index >= len(payloads) - len(directed):
             name = directed[index - (len(payloads) - len(directed))][0]
             directed_results[name] = result
