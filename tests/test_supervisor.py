@@ -7,6 +7,7 @@ fixtures. The generated PS/bash scripts are thin executors (documented-manual).
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -33,6 +34,10 @@ from agenttalk.store import Store
 
 def _run(argv: list[str], root: Path) -> int:
     return cli.main(["--root", str(root), *argv])
+
+
+def _wrapper_log_agent_dir(name: str) -> str:
+    return f"agent-{hashlib.sha256(name.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _team(tmp_path: Path, agents: str = "lead,worker") -> Store:
@@ -628,7 +633,8 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert "supervise --plan --state-file" in ps
     assert "--record-events" in ps
     assert "--json" not in ps                       # blocker regression guard
-    assert "Start-Process -FilePath" in ps and "-ArgumentList" in ps and "-PassThru" in ps
+    assert "Start-WrapperProcess $startArgs" in ps
+    assert "ArgumentList" in ps and "PassThru = $true" in ps
     assert "Invoke-Expression" not in ps            # file/args executor, no expr
     assert "windows_file" in ps                     # launches the real exe
     assert "DryRun" in ps
@@ -1631,13 +1637,13 @@ def test_ps_template_applies_and_restores_env() -> None:
     # or a token with a space splits in two at the handoff.
     assert "function Quote-Arg" in ps
     assert "$argline = (@($argv) | ForEach-Object { Quote-Arg" in ps
-    assert "-ArgumentList $argline" in ps
-    assert "-ArgumentList $argv" not in ps
+    assert "$startArgs['ArgumentList'] = $argline" in ps
+    assert "$startArgs['ArgumentList'] = $argv" not in ps
 
 
 def test_ps_template_applies_resolved_window_style_to_all_launches() -> None:
     ps = sup.PS_TEMPLATE
-    assert ps.count("-WindowStyle $windowStyle") == 4
+    assert ps.count("WindowStyle = $windowStyle") == 2
     assert "$windowStyle = if ($plan.window_style)" in ps
     assert "$windowStyle = if ($spec.window_style)" in ps
     assert "AGENTTALK_NO_CHILD_WINDOW" in ps
@@ -3558,6 +3564,22 @@ def _pick_powershell() -> str | None:
     return shutil.which("pwsh")
 
 
+def _windows_powershell_hosts() -> tuple[str | None, ...]:
+    if os.name != "nt":
+        return (None,)
+    hosts = tuple(
+        dict.fromkeys(
+            path
+            for path in (
+                shutil.which("pwsh"),
+                shutil.which("powershell"),
+            )
+            if path is not None
+        )
+    )
+    return hosts or (None,)
+
+
 def _select_test_powershell(root: Path, shell: str) -> None:
     assert _run(["supervise", "--select-pwsh", "--pwsh", shell], root) == 0
 
@@ -4373,6 +4395,8 @@ def test_generated_ps1_two_polls_do_not_duplicate_launch_after_postspawn_content
             "    [string[]]$ArgumentList,",
             "    [string]$WorkingDirectory,",
             "    [System.Diagnostics.ProcessWindowStyle]$WindowStyle,",
+            "    [string]$RedirectStandardOutput,",
+            "    [string]$RedirectStandardError,",
             "    [switch]$PassThru",
             "  )",
             "  $startArgs = @{",
@@ -4383,6 +4407,12 @@ def test_generated_ps1_two_polls_do_not_duplicate_launch_after_postspawn_content
             "  }",
             "  if ($PSBoundParameters.ContainsKey('ArgumentList')) {",
             "    $startArgs.ArgumentList = $ArgumentList",
+            "  }",
+            "  if ($PSBoundParameters.ContainsKey('RedirectStandardOutput')) {",
+            "    $startArgs.RedirectStandardOutput = $RedirectStandardOutput",
+            "  }",
+            "  if ($PSBoundParameters.ContainsKey('RedirectStandardError')) {",
+            "    $startArgs.RedirectStandardError = $RedirectStandardError",
             "  }",
             "  $proc = Microsoft.PowerShell.Management\\Start-Process @startArgs",
             "  if ($InjectStateLock) {",
@@ -4824,6 +4854,655 @@ def test_generated_ps1_quotes_args_with_spaces_as_single_arg(tmp_path: Path) -> 
     assert data["cwd"].replace("\\", "/").endswith("dir with spaces"), data["cwd"]
 
 
+def test_ps_template_prepares_redirects_for_regular_and_ephemeral_launches() -> None:
+    regular = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("function Launch-Spec")
+    ]
+    ephemeral = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Launch-Spec"):
+        sup.PS_TEMPLATE.index("# Console action log")
+    ]
+
+    for block, configured_env in (
+        (regular, "if ($a.env)"),
+        (ephemeral, "if ($spec.env)"),
+    ):
+        assert "New-WrapperLogTargets" in block
+        assert "RedirectStandardOutput" in block
+        assert "RedirectStandardError" in block
+        assert "AGENTTALK_WRAPPER_LOG_NONCE" in block
+        assert "Start-WrapperProcess $startArgs" in block
+        assert block.index(configured_env) < block.index(
+            "AGENTTALK_WRAPPER_LOG_NONCE"
+        )
+        assert block.index(configured_env) < block.index(
+            "$applied.Remove($reserved)"
+        )
+        assert block.index("$applied.Remove($reserved)") < block.index(
+            "$applied['AGENTTALK_WRAPPER_LOG_NONCE']"
+        )
+        assert "Test-AgenttalkWrapInvocation" in block
+    assert "[bool]$a.wrapped" in regular
+    assert "$plan.launch_mode -eq 'wrap'" in regular
+
+
+def test_ps_wrapper_log_targets_preserve_output_and_prune_old_generations(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    log_root = tmp_path / "wrapper logs"
+    result_path = tmp_path / "wrapper-log-targets.json"
+    code = (
+        "import sys; "
+        "print('ACTUAL-STDOUT', flush=True); "
+        "print('ACTUAL-STDERR', file=sys.stderr, flush=True)"
+    )
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(log_root))}",
+        f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+        helpers,
+    ]
+    for index in range(sup.WRAPPER_LOG_GENERATIONS + 2):
+        rows.extend([
+            "$target = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            (
+                "$preservedStdout = $target.stdout"
+                if index == 2
+                else "$null = $target.stdout"
+            ),
+            "$lastStdout = $target.stdout",
+            "$lastStderr = $target.stderr",
+            "$startArgs = @{ FilePath = "
+            f"{_pslit(sys.executable)}; ArgumentList = "
+            f"{_pslit(subprocess.list2cmdline(['-X', 'utf8', '-c', code]))}; "
+            "WorkingDirectory = "
+            f"{_pslit(str(tmp_path))}; PassThru = $true; "
+            "RedirectStandardOutput = $target.stdout; "
+            "RedirectStandardError = $target.stderr }",
+            "$p = Start-WrapperProcess $startArgs",
+            "$p.WaitForExit()",
+            "Complete-WrapperLogTargets $target",
+        ])
+    rows.extend([
+        "$dirs = @(Get-ChildItem -LiteralPath "
+        f"(Join-Path $WrapperLogRoot {_pslit(_wrapper_log_agent_dir('worker'))}) "
+        "-Directory | Sort-Object Name)",
+        "@{ count = $dirs.Count; "
+        "stdout = [IO.File]::ReadAllText($lastStdout); "
+        "stderr = [IO.File]::ReadAllText($lastStderr); "
+        "preserved = [IO.File]::ReadAllText($preservedStdout) } | "
+        f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ])
+    script = tmp_path / "wrapper-log-targets.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["count"] == sup.WRAPPER_LOG_GENERATIONS
+    assert "ACTUAL-STDOUT" in payload["stdout"]
+    assert "ACTUAL-STDERR" in payload["stderr"]
+    assert "ACTUAL-STDOUT" in payload["preserved"]
+
+
+def test_ps_wrapper_log_cleanup_failure_uses_new_generation_and_still_launches(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    log_root = tmp_path / "primary"
+    agent_root = log_root / _wrapper_log_agent_dir("worker")
+    old = agent_root / "20260730T010203004Z-0123456789abcdef0123456789abcdef"
+    old.mkdir(parents=True)
+    (old / "stdout.log").write_text("dead-wrapper-evidence", encoding="utf-8")
+    (old / ".committed").write_text("", encoding="utf-8")
+    result_path = tmp_path / "cleanup-failure.json"
+    code = "print('LAUNCH-SURVIVED', flush=True)"
+    script = tmp_path / "cleanup-failure.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogRoot = {_pslit(str(log_root))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
+            "$WrapperLogGenerations = 1",
+            "function Remove-Item { throw 'simulated locked generation' }",
+            helpers,
+            "$target = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "$startArgs = @{ FilePath = "
+            f"{_pslit(sys.executable)}; ArgumentList = "
+            f"{_pslit(subprocess.list2cmdline(['-X', 'utf8', '-c', code]))}; "
+            "WorkingDirectory = "
+            f"{_pslit(str(tmp_path))}; PassThru = $true; "
+            "RedirectStandardOutput = $target.stdout; "
+            "RedirectStandardError = $target.stderr }",
+            "$p = Start-WrapperProcess $startArgs",
+            "$p.WaitForExit()",
+            "Complete-WrapperLogTargets $target",
+            "@{ pid = $p.Id; output = [IO.File]::ReadAllText($target.stdout); "
+            f"old = [IO.File]::ReadAllText({_pslit(str(old / 'stdout.log'))}) }} | "
+            f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["pid"] > 0
+    assert "LAUNCH-SURVIVED" in payload["output"]
+    assert payload["old"] == "dead-wrapper-evidence"
+    assert "simulated locked generation" in (result.stdout + result.stderr)
+
+
+def test_ps_wrapper_log_retention_is_global_across_primary_and_fallback(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region wrapper-log-helpers"):
+        sup.PS_TEMPLATE.index("# endregion wrapper-log-helpers")
+    ]
+    primary = tmp_path / "primary"
+    fallback = tmp_path / "fallback"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    names = [
+        "20260729T010203001Z-00000000000000000000000000000001",
+        "20260729T010203002Z-00000000000000000000000000000002",
+        "20260729T010203003Z-00000000000000000000000000000003",
+        "20260729T010203004Z-00000000000000000000000000000004",
+        "20260729T010203005Z-00000000000000000000000000000005",
+    ]
+    for index, name in enumerate(names):
+        root = primary if index < 2 else fallback
+        generation = root / agent_leaf / name
+        generation.mkdir(parents=True)
+        (generation / "stdout.log").write_text(name, encoding="utf-8")
+        (generation / ".committed").write_text("", encoding="utf-8")
+    out = tmp_path / "global-retention.json"
+    script = tmp_path / "global-retention.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogRoot = {_pslit(str(primary))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            "$target = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "Complete-WrapperLogTargets $target",
+            "$dirs = @(",
+            f"  Get-ChildItem -LiteralPath {_pslit(str(primary / agent_leaf))} "
+            "-Directory -ErrorAction SilentlyContinue",
+            f"  Get-ChildItem -LiteralPath {_pslit(str(fallback / agent_leaf))} "
+            "-Directory -ErrorAction SilentlyContinue",
+            ")",
+            "@{ count = $dirs.Count; selected = $target.generation_dir; "
+            f"oldest_exists = (Test-Path {_pslit(str(primary / agent_leaf / names[0]))}) "
+            "} | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(out))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert payload["count"] == sup.WRAPPER_LOG_GENERATIONS
+    assert Path(payload["selected"]).is_relative_to(primary)
+    assert payload["oldest_exists"] is False
+
+
+def test_ps_failed_launch_generations_never_evict_prior_evidence(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region wrapper-log-helpers"):
+        sup.PS_TEMPLATE.index("# endregion wrapper-log-helpers")
+    ]
+    primary = tmp_path / "primary"
+    agent_root = primary / _wrapper_log_agent_dir("worker")
+    old = agent_root / "20260729T010203001Z-00000000000000000000000000000001"
+    old.mkdir(parents=True)
+    (old / "stdout.log").write_text("dead-wrapper-evidence", encoding="utf-8")
+    (old / ".committed").write_text("", encoding="utf-8")
+    out = tmp_path / "failed-launch-retention.json"
+    script = tmp_path / "failed-launch-retention.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogRoot = {_pslit(str(primary))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
+            "$WrapperLogGenerations = 1",
+            helpers,
+            "1..6 | ForEach-Object {",
+            "  $target = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "  Discard-PendingWrapperLogTargets $target",
+            "}",
+            "$dirs = @(Get-ChildItem -LiteralPath "
+            f"{_pslit(str(agent_root))} -Directory)",
+            "@{ count = $dirs.Count; "
+            f"evidence = [IO.File]::ReadAllText({_pslit(str(old / 'stdout.log'))}) "
+            "} | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(out))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert payload == {"count": 1, "evidence": "dead-wrapper-evidence"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows locked-file retention")
+def test_ps_locked_uncommitted_generation_never_displaces_real_evidence(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region wrapper-log-helpers"):
+        sup.PS_TEMPLATE.index("# endregion wrapper-log-helpers")
+    ]
+    primary = tmp_path / "primary"
+    agent_root = primary / _wrapper_log_agent_dir("worker")
+    old = agent_root / "20260729T010203001Z-00000000000000000000000000000001"
+    failed = agent_root / "20260729T010203999Z-00000000000000000000000000000002"
+    old.mkdir(parents=True)
+    failed.mkdir()
+    (old / "stdout.log").write_text("dead-wrapper-evidence", encoding="utf-8")
+    (old / ".committed").write_text("", encoding="utf-8")
+    (failed / ".pending").write_text("", encoding="utf-8")
+    out = tmp_path / "locked-pending.json"
+    script = tmp_path / "locked-pending.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogRoot = {_pslit(str(primary))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
+            "$WrapperLogGenerations = 2",
+            helpers,
+            "$lock = [IO.File]::Open("
+            f"{_pslit(str(failed / '.pending'))}, [IO.FileMode]::Open, "
+            "[IO.FileAccess]::Read, [IO.FileShare]::None)",
+            "try {",
+            "  $target = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "  Complete-WrapperLogTargets $target",
+            "} finally { $lock.Dispose() }",
+            "$dirs = @(Get-ChildItem -LiteralPath "
+            f"{_pslit(str(agent_root))} -Directory)",
+            "@{ count = $dirs.Count; "
+            f"old_exists = (Test-Path {_pslit(str(old))}); "
+            f"pending_exists = (Test-Path {_pslit(str(failed))}) "
+            "} | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(out))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "count": 3,
+        "old_exists": True,
+        "pending_exists": True,
+    }
+    assert "preserving unresolved wrapper log generation" in (
+        result.stdout + result.stderr
+    )
+
+
+def test_ps_markerless_failed_generation_never_displaces_real_evidence(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region wrapper-log-helpers"):
+        sup.PS_TEMPLATE.index("# endregion wrapper-log-helpers")
+    ]
+    primary = tmp_path / "primary"
+    agent_root = primary / _wrapper_log_agent_dir("worker")
+    old = agent_root / "20260729T010203001Z-00000000000000000000000000000001"
+    failed = agent_root / "20260729T010203999Z-00000000000000000000000000000002"
+    old.mkdir(parents=True)
+    failed.mkdir()
+    (old / "stdout.log").write_text("dead-wrapper-evidence", encoding="utf-8")
+    (old / ".committed").write_text("", encoding="utf-8")
+    out = tmp_path / "markerless-retention.json"
+    script = tmp_path / "markerless-retention.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogRoot = {_pslit(str(primary))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
+            "$WrapperLogGenerations = 2",
+            helpers,
+            "$target = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "Complete-WrapperLogTargets $target",
+            "$dirs = @(Get-ChildItem -LiteralPath "
+            f"{_pslit(str(agent_root))} -Directory)",
+            "@{ count = $dirs.Count; "
+            f"old_exists = (Test-Path {_pslit(str(old))}); "
+            f"failed_exists = (Test-Path {_pslit(str(failed))}) "
+            "} | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(out))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "count": 3,
+        "old_exists": True,
+        "failed_exists": True,
+    }
+    assert "preserving unresolved wrapper log generation" in (
+        result.stdout + result.stderr
+    )
+
+
+def test_ps_wrapper_log_agent_paths_do_not_alias_windows_names(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region wrapper-log-helpers"):
+        sup.PS_TEMPLATE.index("# endregion wrapper-log-helpers")
+    ]
+    root = tmp_path / "logs"
+    out = tmp_path / "agent-leaves.json"
+    script = tmp_path / "agent-leaves.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogRoot = {_pslit(str(root))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            "$a = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "$b = New-WrapperLogTargets 'worker.' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "$c = New-WrapperLogTargets 'NUL' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "@{ leaves = @(",
+            "  (Split-Path (Split-Path $a.generation_dir -Parent) -Leaf),",
+            "  (Split-Path (Split-Path $b.generation_dir -Parent) -Leaf),",
+            "  (Split-Path (Split-Path $c.generation_dir -Parent) -Leaf)",
+            ") } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(out))} -Encoding utf8",
+            "Discard-PendingWrapperLogTargets $a",
+            "Discard-PendingWrapperLogTargets $b",
+            "Discard-PendingWrapperLogTargets $c",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    leaves = json.loads(out.read_text(encoding="utf-8-sig"))["leaves"]
+    assert len(set(leaves)) == 3
+    assert all(leaf.startswith("agent-") for leaf in leaves)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction guard")
+def test_ps_wrapper_log_root_reparse_is_rejected_before_traversal(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region wrapper-log-helpers"):
+        sup.PS_TEMPLATE.index("# endregion wrapper-log-helpers")
+    ]
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    primary = tmp_path / "primary-junction"
+    fallback = tmp_path / "fallback"
+    out = tmp_path / "reparse-root.json"
+    script = tmp_path / "reparse-root.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$null = New-Item -ItemType Junction -Path {_pslit(str(primary))} "
+            f"-Target {_pslit(str(victim))}",
+            f"$WrapperLogRoot = {_pslit(str(primary))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            "$target = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "@{ selected = $target.generation_dir; "
+            f"victim_children = @(Get-ChildItem -LiteralPath {_pslit(str(victim))}).Count "
+            "} | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(out))} -Encoding utf8",
+            "Discard-PendingWrapperLogTargets $target",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert Path(payload["selected"]).is_relative_to(fallback)
+    assert payload["victim_children"] == 0
+    assert "reparse point" in (result.stdout + result.stderr)
+
+
+@pytest.mark.parametrize(
+    "shell",
+    _windows_powershell_hosts(),
+    ids=lambda shell: Path(shell).stem if shell else "unavailable",
+)
+def test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit(
+    tmp_path: Path,
+    shell: str | None,
+) -> None:
+    """A long-lived wrapper must not inherit the supervisor caller's PIPEs."""
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    log_root = tmp_path / "logs"
+    stop_path = tmp_path / "stop"
+    pid_path = tmp_path / "child-pid.txt"
+    result_path = tmp_path / "launch-result.json"
+    code = "\n".join([
+        "import os",
+        "import sys",
+        "import time",
+        "from pathlib import Path",
+        f"Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='utf-8')",
+        "print('PIPE-CLOSURE-STDOUT', flush=True)",
+        "print('PIPE-CLOSURE-STDERR', file=sys.stderr, flush=True)",
+        f"stop = Path({str(stop_path)!r})",
+        "while not stop.exists():",
+        "    time.sleep(0.02)",
+    ])
+    script = tmp_path / "capture-pipe-closure.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogRoot = {_pslit(str(log_root))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            "$target = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "$startArgs = @{ FilePath = "
+            f"{_pslit(sys.executable)}; ArgumentList = "
+            f"{_pslit(subprocess.list2cmdline(['-X', 'utf8', '-c', code]))}; "
+            f"WorkingDirectory = {_pslit(str(tmp_path))}; PassThru = $true; "
+            "RedirectStandardOutput = $target.stdout; "
+            "RedirectStandardError = $target.stderr }",
+            "$p = Start-WrapperProcess $startArgs",
+            "@{ pid = $p.Id; stdout = $target.stdout; stderr = $target.stderr } | "
+            f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    proc = subprocess.Popen(
+        [shell, "-NoProfile", "-File", str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            stop_path.write_text("stop", encoding="utf-8")
+            stdout, stderr = proc.communicate(timeout=15)
+            pytest.fail(
+                "supervisor capture pipes stayed open until the wrapper exited: "
+                f"{stdout}{stderr}"
+            )
+        assert proc.returncode == 0, f"{stdout}{stderr}"
+        payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not pid_path.exists():
+            time.sleep(0.02)
+        assert pid_path.exists(), "wrapper never reached its first observable instruction"
+        assert int(pid_path.read_text(encoding="utf-8")) == payload["pid"]
+        alive = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-Command",
+                f"if (Get-Process -Id {payload['pid']} -ErrorAction SilentlyContinue) "
+                "{ exit 0 } else { exit 1 }",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert alive.returncode == 0
+        deadline = time.monotonic() + 5
+        captured_stdout = ""
+        captured_stderr = ""
+        while time.monotonic() < deadline:
+            captured_stdout = Path(payload["stdout"]).read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+            captured_stderr = Path(payload["stderr"]).read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+            if (
+                "PIPE-CLOSURE-STDOUT" in captured_stdout
+                and "PIPE-CLOSURE-STDERR" in captured_stderr
+            ):
+                break
+            time.sleep(0.02)
+        assert "PIPE-CLOSURE-STDOUT" in captured_stdout
+        assert "PIPE-CLOSURE-STDERR" in captured_stderr
+    finally:
+        stop_path.write_text("stop", encoding="utf-8")
+        if pid_path.exists():
+            child_pid = int(pid_path.read_text(encoding="utf-8"))
+            subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-Command",
+                    f"Wait-Process -Id {child_pid} -Timeout 5 "
+                    "-ErrorAction SilentlyContinue; "
+                    f"Stop-Process -Id {child_pid} -Force "
+                    "-ErrorAction SilentlyContinue",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+
 def test_manual_restart_marker_clears_only_after_readiness(tmp_path: Path) -> None:
     """Slice 1: applying a manual restart leaves the marker latched until a
     later fresh heartbeat/readiness tick. Launch success alone is not release."""
@@ -4878,8 +5557,30 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         f"$nonce = {_pslit(SUPERVISOR_NONCE)}",
         "$py = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','R','wrap') $nonce",
         "$console = Add-SupervisorLaunchNonce 'agenttalk.exe' @('--root','R','wrap') $nonce",
+        "$wait = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','R','wait') $nonce",
+        "$rootNamedWrap = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','wrap','wait') $nonce",
+        "$scriptPrefix = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('helper.py','-m','agenttalk','--root','R','wrap') $nonce",
+        "$commandPrefix = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-c','pass','-m','agenttalk','--root','R','wrap') $nonce",
+        "$duplicate = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-m','agenttalk','--supervisor-launch-nonce','old','wrap') $nonce",
+        "$duplicateEq = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-m','agenttalk','--supervisor-launch-nonce=old','wrap') $nonce",
         "$native = Add-SupervisorLaunchNonce 'codex.exe' @('exec') $nonce",
-        "@{ py = $py; console = $console; native = $native } | ConvertTo-Json -Depth 6 | "
+        "@{ py = $py; console = $console; native = $native; "
+        "duplicate = $duplicate; duplicate_eq = $duplicateEq; "
+        "py_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $py.argv $py); "
+        "console_wrap = (Test-AgenttalkWrapInvocation 'agenttalk.exe' $console.argv $console); "
+        "wait_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $wait.argv $wait); "
+        "script_prefix = $scriptPrefix; "
+        "script_prefix_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
+        "$scriptPrefix.argv $scriptPrefix); "
+        "command_prefix = $commandPrefix; "
+        "command_prefix_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
+        "$commandPrefix.argv $commandPrefix); "
+        "root_value_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
+        "$rootNamedWrap.argv $rootNamedWrap) } | ConvertTo-Json -Depth 6 | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
     hp = tmp_path / "nonce_injection.ps1"
@@ -4899,6 +5600,182 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     ]
     assert data["native"]["injected"] is False
     assert data["native"]["missing_reason"] == "unsupported_launch_argv"
+    assert data["duplicate"]["injected"] is False
+    assert data["duplicate"]["missing_reason"] == "reserved_launch_nonce_present"
+    assert data["duplicate_eq"]["injected"] is False
+    assert data["duplicate_eq"]["missing_reason"] == "reserved_launch_nonce_present"
+    assert data["py_wrap"] is True
+    assert data["console_wrap"] is True
+    assert data["wait_wrap"] is False
+    assert data["root_value_wrap"] is False
+    assert data["script_prefix"]["injected"] is False
+    assert data["script_prefix_wrap"] is False
+    assert data["command_prefix"]["injected"] is False
+    assert data["command_prefix_wrap"] is False
+
+
+def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    launchers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# Console action log")
+    ]
+    out = tmp_path / "wrapper-logging-scope.json"
+    fake_stdout = tmp_path / "stdout.log"
+    fake_stderr = tmp_path / "stderr.log"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        "$AgenttalkPython = 'python.exe'",
+        "$SrcOnPyPath = $false",
+        f"$WrapperLogMaxBytes = {sup.WRAPPER_LOG_MAX_BYTES}",
+        f"$WrapperLogSegments = {sup.WRAPPER_LOG_SEGMENT_COUNT}",
+        "$WrapperLogEnvKeys = @("
+        "'AGENTTALK_WRAPPER_STDOUT_LOG',"
+        "'AGENTTALK_WRAPPER_STDERR_LOG',"
+        "'AGENTTALK_WRAPPER_LOG_MAX_BYTES',"
+        "'AGENTTALK_WRAPPER_LOG_SEGMENTS',"
+        "'AGENTTALK_WRAPPER_LOG_NONCE')",
+        helpers,
+        "$script:rows = @()",
+        "$script:caseName = $null",
+        "function New-WrapperLogTargets($name, $nonce) {",
+        "  return [pscustomobject]@{",
+        f"    stdout = {_pslit(str(fake_stdout))}",
+        f"    stderr = {_pslit(str(fake_stderr))}",
+        f"    generation_dir = {_pslit(str(tmp_path / 'generation'))}",
+        "    agent_name = $name",
+        "  }",
+        "}",
+        "function Complete-WrapperLogTargets($targets) {}",
+        "function Discard-PendingWrapperLogTargets($targets) {}",
+        "function Proc-Start($id) { return '1' }",
+        "function Quote-Arg([string]$arg) { return $arg }",
+        "function Start-WrapperProcess($startArgs) {",
+        "  $script:rows += [pscustomobject]@{",
+        "    name = $script:caseName",
+        "    stdout_redirect = $startArgs.ContainsKey('RedirectStandardOutput')",
+        "    stderr_redirect = $startArgs.ContainsKey('RedirectStandardError')",
+        "    nonce = [Environment]::GetEnvironmentVariable("
+        "'AGENTTALK_WRAPPER_LOG_NONCE')",
+        "    stdout_capability = [Environment]::GetEnvironmentVariable("
+        "'AGENTTALK_WRAPPER_STDOUT_LOG')",
+        "  }",
+        "  return [pscustomobject]@{ Id = 4242 }",
+        "}",
+        launchers,
+        "function Invoke-RegularCase("
+        "[string]$label, [string]$file, [object[]]$argv, "
+        "[bool]$wrapped, [string]$mode) {",
+        "  $script:caseName = $label",
+        "  $agent = [pscustomobject]@{",
+        "    backend_profile = $null",
+        "    wrapped = $wrapped",
+        "    cwd = $Root",
+        "    env = $null",
+        "    launch = [pscustomobject]@{",
+        "      windows_file = $file",
+        "      windows_args = @($argv)",
+        "    }",
+        "  }",
+        "  $script:cfg = [pscustomobject]@{",
+        "    agents = [pscustomobject]@{ worker = $agent }",
+        "  }",
+        "  $plan = [pscustomobject]@{",
+        "    launch_mode = $mode",
+        "    window_style = 'Hidden'",
+        "    window_style_warning = $null",
+        "    session_id = $null",
+        "    session_args = @()",
+        "  }",
+        "  $null = Launch 'worker' $plan $null",
+        "}",
+        "function Invoke-EphemeralCase("
+        "[string]$label, [string]$file, [object[]]$argv) {",
+        "  $script:caseName = $label",
+        "  $spec = [pscustomobject]@{",
+        "    cwd = $Root",
+        "    env = $null",
+        "    window_style = 'Hidden'",
+        "    window_style_warning = $null",
+        "    launch = [pscustomobject]@{",
+        "      windows_file = $file",
+        "      windows_args = @($argv)",
+        "    }",
+        "  }",
+        "  $null = Launch-Spec 'reviewer' $spec $null",
+        "}",
+        "$env:AGENTTALK_WRAPPER_LOG_NONCE = 'ambient-nonce'",
+        "$env:AGENTTALK_WRAPPER_STDOUT_LOG = 'ambient-stdout'",
+        "Invoke-RegularCase 'regular_python_wrap' 'python.exe' "
+        "@('-m','agenttalk','wrap') $true 'wrap'",
+        "Invoke-RegularCase 'regular_no_args' 'python.exe' @() $true 'wrap'",
+        "Invoke-RegularCase 'regular_script_prefix' 'python.exe' "
+        "@('helper.py','-m','agenttalk','wrap') $true 'wrap'",
+        "Invoke-RegularCase 'regular_command_prefix' 'python.exe' "
+        "@('-c','pass','-m','agenttalk','wrap') $true 'wrap'",
+        "Invoke-RegularCase 'regular_wait' 'python.exe' "
+        "@('-m','agenttalk','wait') $true 'wrap'",
+        "Invoke-RegularCase 'regular_not_wrapped' 'python.exe' "
+        "@('-m','agenttalk','wrap') $false 'wrap'",
+        "Invoke-RegularCase 'regular_not_wrap_mode' 'python.exe' "
+        "@('-m','agenttalk','wrap') $true 'fresh'",
+        "Invoke-EphemeralCase 'ephemeral_python_wrap' 'python.exe' "
+        "@('-m','agenttalk','wrap')",
+        "Invoke-EphemeralCase 'ephemeral_console_wrap' 'agenttalk.exe' "
+        "@('wrap')",
+        "Invoke-EphemeralCase 'ephemeral_no_args' 'python.exe' @()",
+        "Invoke-EphemeralCase 'ephemeral_script_prefix' 'python.exe' "
+        "@('helper.py','-m','agenttalk','wrap')",
+        "Invoke-EphemeralCase 'ephemeral_command_prefix' 'python.exe' "
+        "@('-c','pass','-m','agenttalk','wrap')",
+        "Invoke-EphemeralCase 'ephemeral_wait' 'agenttalk.exe' @('wait')",
+        "$script:rows | ConvertTo-Json -Depth 5 | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    script = tmp_path / "wrapper-logging-scope.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    rows = json.loads(out.read_text(encoding="utf-8-sig"))
+    expected_logged = {
+        "regular_python_wrap",
+        "ephemeral_python_wrap",
+        "ephemeral_console_wrap",
+    }
+    assert {row["name"] for row in rows} == {
+        "regular_python_wrap",
+        "regular_no_args",
+        "regular_script_prefix",
+        "regular_command_prefix",
+        "regular_wait",
+        "regular_not_wrapped",
+        "regular_not_wrap_mode",
+        "ephemeral_python_wrap",
+        "ephemeral_console_wrap",
+        "ephemeral_no_args",
+        "ephemeral_script_prefix",
+        "ephemeral_command_prefix",
+        "ephemeral_wait",
+    }
+    for row in rows:
+        should_log = row["name"] in expected_logged
+        assert row["stdout_redirect"] is should_log, row
+        assert row["stderr_redirect"] is should_log, row
+        assert bool(row["nonce"]) is should_log, row
+        assert bool(row["stdout_capability"]) is should_log, row
 
 
 def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_path: Path) -> None:

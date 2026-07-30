@@ -27,6 +27,11 @@ def test_non_profile_child_environment_is_unchanged(tmp_path, monkeypatch) -> No
         "AGENTTALK_LEAD_LOOP_LEASE": "removed-by-existing-contract",
         "AGENTTALK_WRAPPER_GENERATION": "removed-by-existing-contract",
         "AGENTTALK_INBOUND_REQUEST_ID": "removed-by-existing-contract",
+        "AGENTTALK_WRAPPER_STDOUT_LOG": "controller-only",
+        "AGENTTALK_WRAPPER_STDERR_LOG": "controller-only",
+        "AGENTTALK_WRAPPER_LOG_MAX_BYTES": "controller-only",
+        "AGENTTALK_WRAPPER_LOG_SEGMENTS": "controller-only",
+        "AGENTTALK_WRAPPER_LOG_NONCE": "controller-only",
     }
     monkeypatch.setattr(os, "environ", ambient.copy())
     result = run._child_env(tmp_path)
@@ -53,6 +58,11 @@ def test_ovh_qwen_child_environment_starts_from_allowlist(tmp_path, monkeypatch)
             "AGENTTALK_LEAD_LOOP_LEASE": "must-not-pass",
             "AGENTTALK_WRAPPER_GENERATION": "stale-must-not-pass",
             "AGENTTALK_INBOUND_REQUEST_ID": "stale-must-not-pass",
+            "AGENTTALK_WRAPPER_STDOUT_LOG": "must-not-pass",
+            "AGENTTALK_WRAPPER_STDERR_LOG": "must-not-pass",
+            "AGENTTALK_WRAPPER_LOG_MAX_BYTES": "must-not-pass",
+            "AGENTTALK_WRAPPER_LOG_SEGMENTS": "must-not-pass",
+            "AGENTTALK_WRAPPER_LOG_NONCE": "must-not-pass",
             "ANTHROPIC_API_KEY": "must-not-pass",
             "ANTHROPIC_AUTH_TOKEN": "ambient-must-not-pass",
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
@@ -101,6 +111,11 @@ def test_ovh_qwen_child_environment_starts_from_allowlist(tmp_path, monkeypatch)
     assert "AGENTTALK_LEAD_LOOP_LEASE" not in env
     assert "ambient-must-not-pass" not in env.values()
     assert "stale-must-not-pass" not in env.values()
+    assert "AGENTTALK_WRAPPER_STDOUT_LOG" not in env
+    assert "AGENTTALK_WRAPPER_STDERR_LOG" not in env
+    assert "AGENTTALK_WRAPPER_LOG_MAX_BYTES" not in env
+    assert "AGENTTALK_WRAPPER_LOG_SEGMENTS" not in env
+    assert "AGENTTALK_WRAPPER_LOG_NONCE" not in env
 
 
 @pytest.mark.parametrize(

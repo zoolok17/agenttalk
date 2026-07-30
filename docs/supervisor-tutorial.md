@@ -141,6 +141,52 @@ fail closed. Do not delete these files casually: doing so while the monitor is
 stopped discards launch/session/backoff continuity even though bus messages and
 cursors remain.
 
+Each supervisor-launched `agenttalk wrap` process also gets distinct stdout and
+stderr logs outside the checkout. Legacy/manual direct CLI launches are not
+redirected because an arbitrary executable cannot enforce the cooperative byte
+bound described below. On Windows wrapper logs live under
+`%LOCALAPPDATA%\agenttalk\wrapper-logs\<project-hash>\agent-<agent-hash>\<generation>\`;
+on POSIX the base is an absolute `$XDG_STATE_HOME` or `~/.local/state`. Relative
+ambient state paths are ignored. The path-derived project hash keeps projects
+separate without relying on adopter repositories to ignore `.agenttalk/`;
+`agenttalk init` does not provision that ignore rule. Treat these files as
+sensitive: they can contain model output, tool output, and tracebacks. The
+agent directory is the first 16 hex characters of SHA-256 over the exact UTF-8
+agent name, prefixed with `agent-`; hashing avoids Windows reserved-name and
+trailing-dot aliases.
+
+Before starting the process, the supervisor creates a new immutable generation
+and then retains that generation plus the three newest prior generations across
+both the persistent and temporary fallback roots. Once `agenttalk wrap` begins
+command dispatch, Python-level writes through its standard streams are bounded
+to 1 MiB per stream using four fixed segments; suffixes `.1` through `.3`
+retain the newest output after the initial redirect segment fills.
+Interpreter/package bootstrap output written before that entry point, and
+direct native/file-descriptor writes, are not intercepted by the cooperative
+Python stream bound. The switch to a new immutable destination happens before
+the relaunch, so the wrapper that just died is never overwritten. Retention
+pruning commits only after the launch returns a PID; repeated launch failures
+therefore cannot evict the prior evidence. If the persistent root is
+unavailable, the supervisor warns and tries the OS temporary directory. If a
+stale handle or filesystem error prevents cleanup, the recovery launch
+continues with a unique generation and warns; the quota can remain exceeded
+until that filesystem problem is resolved. If neither root can accept a new
+generation, recovery launches without redirection.
+
+On Windows the generated supervisor gives the child an explicit allowlist of
+only stdin (`NUL`) and the two log handles. This avoids leaking the
+supervisor's caller pipes or state-file locks into a long-lived wrapper. If the
+safe logging launcher cannot initialize, recovery still launches without the
+PowerShell redirect and emits a warning; logging never grants launch authority
+or blocks recovery.
+
+Wrapper stderr also includes compact JSON lines for facts such as
+`turn_started`, `child_spawned`, `child_exited`, `turn_ended`, and wrapper
+termination. They are post-mortem evidence only. They are not heartbeat,
+progress, health, or restart inputs, and they never describe the wrapper as
+healthy or alive. An OOM, hard kill, or power loss cannot write a final event;
+the gap after the last factual line is the evidence in that case.
+
 Heartbeat freshness is also future-bounded. A timestamp farther ahead than the
 configured clock-skew allowance cannot authorize a healthy state; a timestamp
 within the allowance can.

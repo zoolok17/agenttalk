@@ -57,6 +57,13 @@ _TELEMETRY_ONLY = {"codex": True, "claude": False}
 _NO_CHILD_WINDOW_ENV = "AGENTTALK_NO_CHILD_WINDOW"
 WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
 INBOUND_REQUEST_ID_ENV = "AGENTTALK_INBOUND_REQUEST_ID"
+_WRAPPER_LOG_ENV_NAMES = {
+    "AGENTTALK_WRAPPER_STDOUT_LOG",
+    "AGENTTALK_WRAPPER_STDERR_LOG",
+    "AGENTTALK_WRAPPER_LOG_MAX_BYTES",
+    "AGENTTALK_WRAPPER_LOG_SEGMENTS",
+    "AGENTTALK_WRAPPER_LOG_NONCE",
+}
 OVH_QWEN_CLAUDE_MAX_OUTPUT = "4096"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 _WATCHDOG_STREAM_POLL_SECONDS = 0.05
@@ -556,7 +563,12 @@ def _child_env(
                 "ovh_key",
             }:
                 env.pop(key, None)
-        for key in (LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV):
+        for key in (
+            LEAD_LOOP_LEASE_ENV,
+            WRAPPER_GENERATION_ENV,
+            INBOUND_REQUEST_ID_ENV,
+            *_WRAPPER_LOG_ENV_NAMES,
+        ):
             env.pop(key, None)
         env.update(injected)
         # Claude Code must not discover the operator's normal ~/.claude profile
@@ -584,12 +596,19 @@ def _child_env(
     elif backend_profile is not None:
         raise ValueError(f"unsupported backend_profile {backend_profile!r}")
     else:
-        # Preserve the historical environment byte-for-byte for every ordinary
-        # backend; the restrictive profile is intentionally opt-in.
+        # Preserve the historical environment for every ordinary backend except
+        # controller-only ownership/diagnostic markers. Wrapper-log paths and the
+        # launch nonce belong to this process; model children must not reopen or
+        # truncate the ring, or learn an operator-local diagnostic path.
         env = {
             k: v
             for k, v in os.environ.items()
-            if k not in {LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV}
+            if k not in {
+                LEAD_LOOP_LEASE_ENV,
+                WRAPPER_GENERATION_ENV,
+                INBOUND_REQUEST_ID_ENV,
+                *_WRAPPER_LOG_ENV_NAMES,
+            }
         }
     env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
@@ -1531,6 +1550,7 @@ class _ProcStream:
                  work_heartbeat_status=None,
                  child_env: dict[str, str] | None = None,
                  on_spawn: Callable[[int, str | None], None] | None = None,
+                 on_exit: Callable[[int, str | None, int], None] | None = None,
                  lease_lost_exceptions: tuple = ()) -> None:
         # argv is the operator-provided launch command; never shell=True.
         # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
@@ -1559,6 +1579,7 @@ class _ProcStream:
         self._watchdog_root_waiter: threading.Thread | None = None
         self.work_heartbeat_result: dict | None = None
         self._work_hb = None
+        self._on_exit = on_exit
         try:
             # Record the per-turn root start-time right after spawn (~ the OS-reported create
             # time, within spawn jitter) so the watchdog can start-time-guard the kill against
@@ -1667,6 +1688,15 @@ class _ProcStream:
                     # result or allowing the next turn to start.
                     self._watchdog.join()
                     self.watchdog_result = self._watchdog.result
+            # After returncode is finalized (every branch above sets it) and any
+            # watchdog kill pass has finished either way - a diagnostic sink must
+            # never race the authoritative watchdog/abort handling above it, and
+            # must never change the child result or strand its cleanup.
+            if self._on_exit is not None:
+                try:
+                    self._on_exit(self.pid, self.pid_start, self.returncode)
+                except Exception as exc:
+                    _ = exc
 
     def _interrupt_watchdog_stream(self) -> None:
         with self._watchdog_stream_condition:
@@ -1973,6 +2003,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                wrapper_generation: str | None = None,
                backend_profile: str | None = None,
                profile_env: dict[str, str] | None = None,
+               lifecycle_log=None,
                lease_lost_exceptions: tuple = ()) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
@@ -2162,6 +2193,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                                on_spawn=(
                                    runtime_writer.active
                                    if runtime_writer is not None
+                                   else None
+                               ),
+                               on_exit=(
+                                   lifecycle_log.child_exited
+                                   if lifecycle_log is not None
                                    else None
                                ),
                                lease_lost_exceptions=lease_lost_exceptions)
@@ -2600,6 +2636,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                        persist: Callable[[object], None] | None = None,
                        runtime_writer=None,
                        work_heartbeat=None,
+                       lifecycle_log=None,
                        lease_lost_exceptions: tuple = (),
                        ) -> Callable[[dict, list], bool]:
     """Build the SYNTHETIC cadence-turn drive for the managed lead-loop controller (WP3).
@@ -2666,6 +2703,11 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                                on_spawn=(
                                    runtime_writer.active
                                    if runtime_writer is not None
+                                   else None
+                               ),
+                               on_exit=(
+                                   lifecycle_log.child_exited
+                                   if lifecycle_log is not None
                                    else None
                                ),
                                lease_lost_exceptions=lease_lost_exceptions)

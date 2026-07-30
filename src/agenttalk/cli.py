@@ -10229,7 +10229,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     runtime_effort: str | None = None,
                     runtime_fingerprint: str | None = None,
                     backend_profile: str | None = None,
-                    profile_env: dict[str, str] | None = None) -> int:
+                    profile_env: dict[str, str] | None = None,
+                    supervisor_launch_nonce: str | None = None,
+                    lifecycle_log: object | None = None) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -10249,11 +10251,21 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     from .wrapper.health import WrapperHealthWriter
     from .wrapper import session as wsession
     from .wrapper_runtime import WrapperRuntimeWriter
+    from .wrapper_logs import WrapperLifecycleLog
 
     # One observational generation spans this wrapper process.  It is safe to
     # expose to the child (unlike the lead-loop lease id): it grants no mailbox
     # authority and only binds body-free --await-reply markers to this loop.
     wrapper_generation = uuid.uuid4().hex
+    if lifecycle_log is None:
+        lifecycle_log = WrapperLifecycleLog.from_environment(
+            agent,
+            expected_nonce=supervisor_launch_nonce,
+        )
+
+    def _wrapper_exit(code: int, reason: str) -> int:
+        lifecycle_log.wrapper_exited(code, reason=reason)
+        return code
 
     # --- managed lead-loop CONTROLLER lease lifecycle (WP2) -------------------
     lease_id: str | None = None
@@ -10264,7 +10276,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             sys.stderr.write(
                 f"agenttalk wrap --lead-loop: {agent!r} is not a configured managed "
                 f"lead-loop identity (run `agenttalk managed-lead-loop set {agent}`)\n")
-            return 2
+            return _wrapper_exit(2, "managed_lead_loop_not_configured")
         timing = lead_loop_runtime.resolve_timing(
             store, agent, supervisor_config=supervisor_config)
         ttl = timing["ttl_seconds"]
@@ -10285,7 +10297,10 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                 f"agenttalk wrap --lead-loop: {agent!r} mailbox is already owned by a live "
                 f"controller (PID {existing.get('owner_pid')}); standing down "
                 f"(supervisor HOLD, no relaunch).\n")
-            return _LEAD_LOOP_BLOCKED_EXIT
+            return _wrapper_exit(
+                _LEAD_LOOP_BLOCKED_EXIT,
+                "managed_lead_loop_acquire_blocked",
+            )
         lease_id = lease["lease_id"]
         store.clear_lead_loop_exit(agent)  # a live controller makes any prior exit state moot
 
@@ -10339,6 +10354,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         store.state_dir,
         agent,
         wrapper_generation,
+        on_transition=lifecycle_log.runtime_transition,
     )
     try:
         drive = wrapper_run.make_drive(
@@ -10352,6 +10368,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             wrapper_generation=wrapper_generation,
             backend_profile=backend_profile,
             profile_env=profile_env,
+            lifecycle_log=lifecycle_log,
             # the lead-loop combined stamp raises _LeadLoopLeaseLost on a lost lease:
             # the ticker treats it as TYPED loss (permanent stop for the turn, status
             # lost_lease, never a bus heartbeat without the lease), while the
@@ -10361,7 +10378,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     except ValueError as e:
         _release()
         sys.stderr.write(f"agenttalk wrap: {e}\n")
-        return 2
+        return _wrapper_exit(2, "drive_configuration_rejected")
     capacity_refresh = None
     if one_shot_request_id is None:
 
@@ -10422,6 +10439,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             persist=lambda st: wsession.save_session(store, agent, st),
             runtime_writer=runtime_writer,
             work_heartbeat=work_heartbeat,
+            lifecycle_log=lifecycle_log,
             lease_lost_exceptions=(_LeadLoopLeaseLost,))
         cadence_health = _cadence_health_notifier(store, agent)
 
@@ -10531,7 +10549,10 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         _release()
         sys.stderr.write(f"agenttalk wrap --lead-loop: {agent!r} lost the mailbox lease "
                          f"(stolen / torn / force-released); exiting for supervisor recovery.\n")
-        return _LEAD_LOOP_LEASE_LOST_EXIT
+        return _wrapper_exit(
+            _LEAD_LOOP_LEASE_LOST_EXIT,
+            "managed_lead_loop_lease_lost",
+        )
     except BaseException:
         # CRASH / interruption: best-effort release (fast handoff; a SIGKILL skips this
         # but the owner pid is then CONFIRMED-dead -> immediately stealable, D-12). NO
@@ -10547,7 +10568,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         why = ("thread closed/superseded" if (sc.get("closed") or sc.get("superseded"))
                else f"no message on request {one_shot_request_id!r} within the one-shot bound")
         sys.stderr.write(f"agenttalk wrap --one-shot: no turn driven ({why}).\n")
-        return 1
+        return _wrapper_exit(1, "one_shot_request_not_driven")
     if lead_loop:
         # A CLEAN return from the unbounded continuous lead-loop == a VALID human
         # release/end (classify_loop_control "stop"): a DELIBERATE stand-down. Release
@@ -10558,11 +10579,52 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         store.write_lead_loop_exit(agent, state=store.LEAD_LOOP_EXIT_STOOD_DOWN,
                                    owner_pid=os.getpid(),
                                    reason="valid human release/end (deliberate stand-down)")
-        return _LEAD_LOOP_STOOD_DOWN_EXIT
-    return 0
+        return _wrapper_exit(
+            _LEAD_LOOP_STOOD_DOWN_EXIT,
+            "managed_lead_loop_stood_down",
+        )
+    return _wrapper_exit(0, "loop_returned")
 
 
 def cmd_wrap(args: argparse.Namespace) -> int:
+    """Install supervisor-authenticated logging before wrapper setup begins."""
+    from .wrapper_logs import (
+        WrapperLifecycleLog,
+        capture_termination_signals,
+        installed_standard_streams_from_environment,
+    )
+
+    with installed_standard_streams_from_environment(
+        expected_nonce=getattr(args, "supervisor_launch_nonce", None),
+    ):
+        agent = (
+            getattr(args, "agent", None)
+            or os.environ.get("AGENTTALK_SELF")
+            or "unknown"
+        )
+        lifecycle_log = WrapperLifecycleLog.from_environment(
+            str(agent),
+            expected_nonce=getattr(args, "supervisor_launch_nonce", None),
+        )
+        args._wrapper_lifecycle_log = lifecycle_log
+        try:
+            with capture_termination_signals(lifecycle_log):
+                result = _cmd_wrap_with_logging(args)
+        except BaseException as exc:
+            if not lifecycle_log.terminal_emitted:
+                lifecycle_log.wrapper_exception(exc)
+            raise
+        finally:
+            del args._wrapper_lifecycle_log
+        if not lifecycle_log.terminal_emitted:
+            lifecycle_log.wrapper_exited(
+                int(result),
+                reason="wrap_command_returned",
+            )
+        return result
+
+
+def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
     """Run an agent CLI under the progress-adapter wrapper (0.30.0).
 
     Default (one-shot ``-- <argv>``): launch the CLI in structured-stream mode,
@@ -10579,6 +10641,9 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     store = _get_store(args)
     roster = store.load_config().get("agents") or []
     agent = _resolve_self(args.agent, roster=roster)
+    lifecycle_log = getattr(args, "_wrapper_lifecycle_log", None)
+    if lifecycle_log is not None:
+        lifecycle_log.agent = agent
     argv = list(args.cmd or [])
     if argv and argv[0] == "--":
         argv = argv[1:]
@@ -10865,28 +10930,53 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                 return _handle_launch_config_blocked(
                     store, agent, args.cli, mode=whb_mode,
                     min_interval=args.min_interval, summary=summary)
-        return _wrap_loop_mode(store, agent, cli=args.cli, base_argv=argv,
-                               sender=sender, min_interval=args.min_interval,
-                               render=not args.no_render,
-                               one_shot_request_id=args.to_request if args.one_shot else None,
-                               k_poison=k_poison, k_escalate=k_escalate,
-                               infra_exhaust_after_seconds=infra_ceiling[
-                                   "infra_exhaust_after_seconds"],
-                               infra_exhaust_min_attempts=infra_ceiling[
-                                   "infra_exhaust_min_attempts"],
-                               noninfra_sub_ceiling=infra_ceiling["noninfra_sub_ceiling"],
-                               lead_loop=lead_loop, supervisor_config=sup_cfg,
-                               turn_watchdog=watchdog_cfg,
-                               work_heartbeat=whb_cfg,
-                               runtime_model=runtime_model,
-                               runtime_effort=runtime_effort,
-                               runtime_fingerprint=runtime_fingerprint,
-                               backend_profile=backend_profile,
-                               profile_env=profile_env)
+        return _wrap_loop_mode(
+            store,
+            agent,
+            cli=args.cli,
+            base_argv=argv,
+            sender=sender,
+            min_interval=args.min_interval,
+            render=not args.no_render,
+            one_shot_request_id=args.to_request if args.one_shot else None,
+            k_poison=k_poison,
+            k_escalate=k_escalate,
+            infra_exhaust_after_seconds=infra_ceiling[
+                "infra_exhaust_after_seconds"
+            ],
+            infra_exhaust_min_attempts=infra_ceiling[
+                "infra_exhaust_min_attempts"
+            ],
+            noninfra_sub_ceiling=infra_ceiling["noninfra_sub_ceiling"],
+            lead_loop=lead_loop,
+            supervisor_config=sup_cfg,
+            turn_watchdog=watchdog_cfg,
+            work_heartbeat=whb_cfg,
+            runtime_model=runtime_model,
+            runtime_effort=runtime_effort,
+            runtime_fingerprint=runtime_fingerprint,
+            backend_profile=backend_profile,
+            profile_env=profile_env,
+            supervisor_launch_nonce=getattr(
+                args,
+                "supervisor_launch_nonce",
+                None,
+            ),
+            lifecycle_log=getattr(
+                args,
+                "_wrapper_lifecycle_log",
+                None,
+            ),
+        )
     try:
         return wrapper_run.run_wrapper(
-            cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,
-            min_interval=args.min_interval, render=not args.no_render,
+            cli=args.cli,
+            agent=agent,
+            argv=argv,
+            store=store,
+            sender=sender,
+            min_interval=args.min_interval,
+            render=not args.no_render,
         )
     except ValueError as e:
         sys.stderr.write(f"agenttalk wrap: {e}\n")

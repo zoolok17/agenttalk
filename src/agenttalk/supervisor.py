@@ -45,6 +45,11 @@ from agenttalk.store import Store, _process_alive, validate_agent_name
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle as lifecycle
 from agenttalk import wrapper_runtime as runtime_obs
+from agenttalk import wrapper_logs as wrapper_log
+
+WRAPPER_LOG_GENERATIONS = wrapper_log.WRAPPER_LOG_GENERATIONS
+WRAPPER_LOG_MAX_BYTES = wrapper_log.WRAPPER_LOG_MAX_BYTES
+WRAPPER_LOG_SEGMENT_COUNT = wrapper_log.WRAPPER_LOG_SEGMENT_COUNT
 
 # ---- action vocabulary (the dry-run ACTION PLAN tokens) --------------------
 RELAUNCH = "relaunch"            # manual restart request - (re)launch now
@@ -5568,7 +5573,7 @@ CONFIG_TEMPLATE = """\
         "windows_args": ["{SESSION_ARGS}"],
         "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
-      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
+      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor launches the real file directly with the quoted argument line, working directory, and returned PID AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
       "_comment_liveness": "For this MANUAL archetype heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck. The hook runs `agenttalk heartbeat --hook` (soft: it can never block a tool call). For a NON-wrapped codex agent with activity_hook=true, the supervisor adds the GLOBAL --dangerously-bypass-hook-trust to the codex launch: the installed agenttalk hook changes codex's hook-trust hash and would otherwise PROMPT to re-trust on every unattended launch and strand the agent. This bypasses hook-trust for the supervisor's OWN hook, for controlled UNATTENDED supervision only (a wrapped codex does not use the activity hook and is unaffected)."
     },
@@ -5872,6 +5877,20 @@ $cfg = Read-SupervisorConfig
 # source checkout (prepend <root>/src to PYTHONPATH) vs a pip install.
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
 $SrcOnPyPath = __SRC_ON_PYPATH__
+$WrapperLogRoot = '__AGENTTALK_WRAPPER_LOG_ROOT__'
+$WrapperLogFallbackRoot = Join-Path (
+  Join-Path ([IO.Path]::GetTempPath()) 'agenttalk-wrapper-logs'
+) '__AGENTTALK_CHECKOUT_ID__'
+$WrapperLogGenerations = __AGENTTALK_WRAPPER_LOG_GENERATIONS__
+$WrapperLogMaxBytes = __AGENTTALK_WRAPPER_LOG_MAX_BYTES__
+$WrapperLogSegments = __AGENTTALK_WRAPPER_LOG_SEGMENTS__
+$WrapperLogEnvKeys = @(
+  'AGENTTALK_WRAPPER_STDOUT_LOG',
+  'AGENTTALK_WRAPPER_STDERR_LOG',
+  'AGENTTALK_WRAPPER_LOG_MAX_BYTES',
+  'AGENTTALK_WRAPPER_LOG_SEGMENTS',
+  'AGENTTALK_WRAPPER_LOG_NONCE'
+)
 
 function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }
 function Assert-ActionsEnabled([string]$what) {
@@ -6210,22 +6229,35 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
     missing_reason = 'unsupported_launch_argv'
   }
   if (-not $nonce) { return $unsupported }
+  foreach ($token in $args) {
+    $text = [string]$token
+    if ($text -eq '--supervisor-launch-nonce' -or
+        $text -like '--supervisor-launch-nonce=*') {
+      # This is a supervisor-owned capability. Accepting an operator-supplied
+      # duplicate would let argparse's last-value-wins behavior desynchronize
+      # the CLI nonce from the logging environment and leave a direct redirect
+      # unbounded.
+      $unsupported.missing_reason = 'reserved_launch_nonce_present'
+      return $unsupported
+    }
+  }
   $stem = File-StemLower ([string]$file)
   if ($stem -in @('python','python3','py')) {
-    for ($i = 0; $i -lt ($args.Count - 1); $i++) {
-      if (($args[$i] -eq '-m') -and ($args[$i + 1] -eq 'agenttalk')) {
-        $out = @()
-        for ($j = 0; $j -lt $args.Count; $j++) {
-          $out += $args[$j]
-          if ($j -eq ($i + 1)) { $out += @('--supervisor-launch-nonce', $nonce) }
-        }
-        return [pscustomobject]@{
-          argv = $out
-          injected = $true
-          nonce = $nonce
-          source = 'agenttalk_global_arg'
-          missing_reason = $null
-        }
+    # Accept only the canonical module-entry argv. Searching for `-m
+    # agenttalk` later in the command would misclassify
+    # `python helper.py -m agenttalk ...`: Python runs helper.py, so that
+    # process never installs the cooperative stream bound.
+    if ($args.Count -ge 2 -and
+        $args[0] -eq '-m' -and
+        $args[1] -eq 'agenttalk') {
+      $out = @($args[0], $args[1], '--supervisor-launch-nonce', $nonce)
+      if ($args.Count -gt 2) { $out += @($args[2..($args.Count - 1)]) }
+      return [pscustomobject]@{
+        argv = $out
+        injected = $true
+        nonce = $nonce
+        source = 'agenttalk_global_arg'
+        missing_reason = $null
       }
     }
     return $unsupported
@@ -6244,6 +6276,43 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
     }
   }
   return $unsupported
+}
+function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult) {
+  if (-not $nonceResult.injected) { return $false }
+  $args = @($argv)
+  $index = 0
+  $stem = File-StemLower ([string]$file)
+  if ($stem -in @('python','python3','py')) {
+    if ($args.Count -lt 2 -or
+        $args[0] -ne '-m' -or
+        $args[1] -ne 'agenttalk') {
+      return $false
+    }
+    $index = 2
+  } else {
+    $leaf = File-LeafLower ([string]$file)
+    if ($leaf -notin @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
+      return $false
+    }
+  }
+  # The CLI has two value-taking global options. The first remaining token is
+  # the subcommand; only a literal `wrap` there may receive the cooperative
+  # byte-bound log capability.
+  while ($index -lt $args.Count) {
+    $token = [string]$args[$index]
+    if ($token -in @('--root','--supervisor-launch-nonce')) {
+      if (($index + 1) -ge $args.Count) { return $false }
+      $index += 2
+      continue
+    }
+    if ($token -like '--root=*' -or
+        $token -like '--supervisor-launch-nonce=*') {
+      $index += 1
+      continue
+    }
+    return $token -eq 'wrap'
+  }
+  return $false
 }
 function Preflight($name, $plan, $file, $codexHome) {
   # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
@@ -6323,6 +6392,610 @@ function Wait-ForNextPoll($config) {
   if (-not $Once) { Start-Sleep -Seconds ([int]$config.poll_seconds) }
 }
 # endregion checked-mutations
+# region wrapper-log-helpers
+$script:WrapperLogLauncherTypeReady = $false
+function Initialize-WrapperLogLauncherType {
+  if ($env:OS -ne 'Windows_NT') { return $false }
+  if ($script:WrapperLogLauncherTypeReady) { return $true }
+  try {
+    if (-not ('Agenttalk.ExactHandleLauncher' -as [type])) {
+      Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Agenttalk {
+  public sealed class ExactHandleLaunchResult {
+    public Process Process { get; private set; }
+    public bool StdoutDegraded { get; private set; }
+    public bool StderrDegraded { get; private set; }
+
+    internal ExactHandleLaunchResult(
+        Process process, bool stdoutDegraded, bool stderrDegraded) {
+      Process = process;
+      StdoutDegraded = stdoutDegraded;
+      StderrDegraded = stderrDegraded;
+    }
+  }
+
+  public static class ExactHandleLauncher {
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint CREATE_ALWAYS = 2;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint STARTF_USESHOWWINDOW = 0x00000001;
+    private const uint STARTF_USESTDHANDLES = 0x00000100;
+    private const uint CREATE_SUSPENDED = 0x00000004;
+    private const uint CREATE_NO_WINDOW = 0x08000000;
+    private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST =
+      new IntPtr(0x00020002);
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SECURITY_ATTRIBUTES {
+      public int nLength;
+      public IntPtr lpSecurityDescriptor;
+      [MarshalAs(UnmanagedType.Bool)]
+      public bool bInheritHandle;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO {
+      public int cb;
+      public string lpReserved;
+      public string lpDesktop;
+      public string lpTitle;
+      public uint dwX;
+      public uint dwY;
+      public uint dwXSize;
+      public uint dwYSize;
+      public uint dwXCountChars;
+      public uint dwYCountChars;
+      public uint dwFillAttribute;
+      public uint dwFlags;
+      public short wShowWindow;
+      public short cbReserved2;
+      public IntPtr lpReserved2;
+      public IntPtr hStdInput;
+      public IntPtr hStdOutput;
+      public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct STARTUPINFOEX {
+      public STARTUPINFO StartupInfo;
+      public IntPtr lpAttributeList;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION {
+      public IntPtr hProcess;
+      public IntPtr hThread;
+      public uint dwProcessId;
+      public uint dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFile(
+      string fileName, uint desiredAccess, uint shareMode,
+      ref SECURITY_ATTRIBUTES securityAttributes, uint creationDisposition,
+      uint flagsAndAttributes, IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool InitializeProcThreadAttributeList(
+      IntPtr attributeList, int attributeCount, int flags, ref IntPtr size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UpdateProcThreadAttribute(
+      IntPtr attributeList, uint flags, IntPtr attribute, IntPtr value,
+      IntPtr size, IntPtr previousValue, IntPtr returnSize);
+
+    [DllImport("kernel32.dll")]
+    private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
+
+    [DllImport(
+      "kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true,
+      EntryPoint = "CreateProcessW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateProcess(
+      string applicationName, StringBuilder commandLine,
+      IntPtr processAttributes, IntPtr threadAttributes,
+      [MarshalAs(UnmanagedType.Bool)] bool inheritHandles,
+      uint creationFlags, IntPtr environment, string currentDirectory,
+      ref STARTUPINFOEX startupInfo,
+      out PROCESS_INFORMATION processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr thread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private static IntPtr OpenInherited(
+        string path, uint desiredAccess, uint creationDisposition) {
+      SECURITY_ATTRIBUTES security = new SECURITY_ATTRIBUTES();
+      security.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+      security.bInheritHandle = true;
+      IntPtr handle = CreateFile(
+        path, desiredAccess,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ref security, creationDisposition, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+      if (handle == INVALID_HANDLE_VALUE) {
+        throw new Win32Exception(
+          Marshal.GetLastWin32Error(), "CreateFile failed for " + path);
+      }
+      return handle;
+    }
+
+    private static IntPtr OpenOutputOrNull(string path, out bool degraded) {
+      try {
+        degraded = false;
+        return OpenInherited(path, GENERIC_WRITE, CREATE_ALWAYS);
+      } catch {
+        degraded = true;
+        return OpenInherited("NUL", GENERIC_WRITE, OPEN_EXISTING);
+      }
+    }
+
+    public static ExactHandleLaunchResult Start(
+        string fileName, string arguments, string workingDirectory,
+        string stdoutPath, string stderrPath, int showWindow) {
+      if (String.Equals(
+          Path.GetFullPath(stdoutPath), Path.GetFullPath(stderrPath),
+          StringComparison.OrdinalIgnoreCase)) {
+        throw new ArgumentException(
+          "stdout and stderr paths must be distinct");
+      }
+      IntPtr stdinHandle = IntPtr.Zero;
+      IntPtr stdoutHandle = IntPtr.Zero;
+      IntPtr stderrHandle = IntPtr.Zero;
+      IntPtr handleArray = IntPtr.Zero;
+      IntPtr attributeList = IntPtr.Zero;
+      PROCESS_INFORMATION processInfo = new PROCESS_INFORMATION();
+      bool processCreated = false;
+      bool stdoutDegraded;
+      bool stderrDegraded;
+
+      try {
+        stdinHandle = OpenInherited("NUL", GENERIC_READ, OPEN_EXISTING);
+        stdoutHandle = OpenOutputOrNull(stdoutPath, out stdoutDegraded);
+        stderrHandle = OpenOutputOrNull(stderrPath, out stderrDegraded);
+
+        handleArray = Marshal.AllocHGlobal(IntPtr.Size * 3);
+        Marshal.WriteIntPtr(handleArray, 0, stdinHandle);
+        Marshal.WriteIntPtr(handleArray, IntPtr.Size, stdoutHandle);
+        Marshal.WriteIntPtr(handleArray, IntPtr.Size * 2, stderrHandle);
+
+        IntPtr attributeBytes = IntPtr.Zero;
+        InitializeProcThreadAttributeList(
+          IntPtr.Zero, 1, 0, ref attributeBytes);
+        attributeList = Marshal.AllocHGlobal(attributeBytes);
+        if (!InitializeProcThreadAttributeList(
+            attributeList, 1, 0, ref attributeBytes)) {
+          throw new Win32Exception(
+            Marshal.GetLastWin32Error(),
+            "InitializeProcThreadAttributeList failed");
+        }
+        if (!UpdateProcThreadAttribute(
+            attributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            handleArray, new IntPtr(IntPtr.Size * 3),
+            IntPtr.Zero, IntPtr.Zero)) {
+          throw new Win32Exception(
+            Marshal.GetLastWin32Error(),
+            "UpdateProcThreadAttribute failed");
+        }
+
+        STARTUPINFOEX startup = new STARTUPINFOEX();
+        startup.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdinHandle;
+        startup.StartupInfo.hStdOutput = stdoutHandle;
+        startup.StartupInfo.hStdError = stderrHandle;
+        startup.lpAttributeList = attributeList;
+        if (showWindow >= 0) {
+          startup.StartupInfo.dwFlags |= STARTF_USESHOWWINDOW;
+          startup.StartupInfo.wShowWindow = (short)showWindow;
+        }
+
+        string command = "\"" + fileName + "\"";
+        if (!String.IsNullOrWhiteSpace(arguments)) {
+          command += " " + arguments;
+        }
+        uint flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
+        if (showWindow == 0) {
+          flags |= CREATE_NO_WINDOW;
+        }
+        StringBuilder commandLine = new StringBuilder(command);
+        if (!CreateProcess(
+            fileName, commandLine, IntPtr.Zero, IntPtr.Zero, true, flags,
+            IntPtr.Zero, workingDirectory, ref startup, out processInfo)) {
+          throw new Win32Exception(
+            Marshal.GetLastWin32Error(), "CreateProcess failed");
+        }
+        processCreated = true;
+
+        Process process = Process.GetProcessById((int)processInfo.dwProcessId);
+        if (ResumeThread(processInfo.hThread) == UInt32.MaxValue) {
+          throw new Win32Exception(
+            Marshal.GetLastWin32Error(), "ResumeThread failed");
+        }
+        return new ExactHandleLaunchResult(
+          process, stdoutDegraded, stderrDegraded);
+      } catch {
+        if (processCreated && processInfo.hProcess != IntPtr.Zero) {
+          TerminateProcess(processInfo.hProcess, 127);
+        }
+        throw;
+      } finally {
+        if (attributeList != IntPtr.Zero) {
+          DeleteProcThreadAttributeList(attributeList);
+          Marshal.FreeHGlobal(attributeList);
+        }
+        if (handleArray != IntPtr.Zero) {
+          Marshal.FreeHGlobal(handleArray);
+        }
+        if (stdinHandle != IntPtr.Zero &&
+            stdinHandle != INVALID_HANDLE_VALUE) {
+          CloseHandle(stdinHandle);
+        }
+        if (stdoutHandle != IntPtr.Zero &&
+            stdoutHandle != INVALID_HANDLE_VALUE) {
+          CloseHandle(stdoutHandle);
+        }
+        if (stderrHandle != IntPtr.Zero &&
+            stderrHandle != INVALID_HANDLE_VALUE) {
+          CloseHandle(stderrHandle);
+        }
+        if (processInfo.hThread != IntPtr.Zero) {
+          CloseHandle(processInfo.hThread);
+        }
+        if (processInfo.hProcess != IntPtr.Zero) {
+          CloseHandle(processInfo.hProcess);
+        }
+      }
+    }
+  }
+}
+'@
+    }
+    $script:WrapperLogLauncherTypeReady = $true
+    return $true
+  } catch {
+    Write-Warning (
+      "supervisor: cannot initialize exact-handle wrapper logger ({0})" -f
+      $_.Exception.Message)
+    return $false
+  }
+}
+function Start-WrapperProcess([hashtable]$startArgs) {
+  $redirected = (
+    $startArgs.ContainsKey('RedirectStandardOutput') -and
+    $startArgs.ContainsKey('RedirectStandardError'))
+  if ($redirected -and $env:OS -eq 'Windows_NT') {
+    # PowerShell's redirected Start-Process enables unrestricted handle
+    # inheritance. Use an explicit three-handle allowlist so a long-lived
+    # wrapper cannot retain the supervisor caller's capture pipes or locks.
+    $startCommand = Get-Command Start-Process -ErrorAction Stop
+    if ($startCommand.CommandType -eq 'Cmdlet' -and
+        (Initialize-WrapperLogLauncherType)) {
+      try {
+        $argumentLine = if ($startArgs.ContainsKey('ArgumentList')) {
+          [string]$startArgs.ArgumentList
+        } else { '' }
+        $window = [string]$startArgs.WindowStyle
+        $showWindow = switch ($window) {
+          'Hidden' { 0 }
+          'Minimized' { 2 }
+          'Maximized' { 3 }
+          default { 1 }
+        }
+        $launchResult = [Agenttalk.ExactHandleLauncher]::Start(
+          [string]$startArgs.FilePath,
+          $argumentLine,
+          [string]$startArgs.WorkingDirectory,
+          [string]$startArgs.RedirectStandardOutput,
+          [string]$startArgs.RedirectStandardError,
+          $showWindow)
+        if ($launchResult.StdoutDegraded) {
+          Write-Warning (
+            "supervisor: wrapper stdout log is unavailable; redirected to NUL")
+        }
+        if ($launchResult.StderrDegraded) {
+          Write-Warning (
+            "supervisor: wrapper stderr log is unavailable; redirected to NUL")
+        }
+        return $launchResult.Process
+      } catch {
+        Write-Warning (
+          ("supervisor: exact-handle wrapper logging failed ({0}); " +
+           "launching without PowerShell redirection") -f
+          $_.Exception.Message)
+      }
+    } else {
+      Write-Warning (
+        "supervisor: exact-handle wrapper logging unavailable; " +
+        "launching without PowerShell redirection")
+    }
+    # Logging is observational. If the safe Windows launcher is unavailable,
+    # preserve recovery by launching without it; never fall back to unrestricted
+    # inherited handles or risk a duplicate child.
+    $null = $startArgs.Remove('RedirectStandardOutput')
+    $null = $startArgs.Remove('RedirectStandardError')
+  }
+  return Start-Process @startArgs
+}
+function Get-SafeWrapperLogAgentDir(
+  [string]$candidate,
+  [string]$name,
+  [bool]$create
+) {
+  try {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+      if (-not $create) { return $null }
+      $null = New-Item -ItemType Directory -Path $candidate -Force -ErrorAction Stop
+    }
+    $rootItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      Write-Warning (
+        "supervisor: refusing wrapper-log root with a reparse point: '{0}'" -f
+        $candidate)
+      return $null
+    }
+
+    $agentDir = Join-Path $candidate $name
+    if (Test-Path -LiteralPath $agentDir) {
+      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop
+      if ((-not $agentItem.PSIsContainer) -or
+          (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Write-Warning (
+          "supervisor: refusing unsafe wrapper-log agent path: '{0}'" -f
+          $agentDir)
+        return $null
+      }
+    } elseif ($create) {
+      $null = New-Item -ItemType Directory -Path $agentDir -ErrorAction Stop
+      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop
+      if (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Write-Warning (
+          "supervisor: refusing unsafe wrapper-log agent path: '{0}'" -f
+          $agentDir)
+        return $null
+      }
+    } else {
+      return $null
+    }
+    return $agentDir
+  } catch {
+    Write-Warning (
+      "supervisor: cannot prepare wrapper log root '{0}' ({1})" -f
+      $candidate, $_.Exception.Message)
+    return $null
+  }
+}
+function Protect-WrapperLogPaths(
+  [string]$rootDir,
+  [string]$agentDir,
+  [string]$generationDir,
+  [string]$stdoutPath,
+  [string]$stderrPath
+) {
+  if ($env:OS -eq 'Windows_NT') { return $true }
+  try {
+    [IO.File]::WriteAllBytes($stdoutPath, [byte[]]@())
+    [IO.File]::WriteAllBytes($stderrPath, [byte[]]@())
+    $chmod = Get-Command chmod -CommandType Application -ErrorAction Stop
+    foreach ($path in @($rootDir, $agentDir, $generationDir)) {
+      & $chmod.Source '700' $path
+      if ($LASTEXITCODE -ne 0) { throw "chmod 700 failed for '$path'" }
+    }
+    foreach ($path in @($stdoutPath, $stderrPath)) {
+      & $chmod.Source '600' $path
+      if ($LASTEXITCODE -ne 0) { throw "chmod 600 failed for '$path'" }
+    }
+    return $true
+  } catch {
+    Write-Warning (
+      "supervisor: cannot secure sensitive wrapper logs under '{0}' ({1})" -f
+      $generationDir, $_.Exception.Message)
+    return $false
+  }
+}
+function New-WrapperLogTargets([string]$name, [string]$nonce) {
+  # Agent names are already roster-validated. Re-check here because these paths
+  # are later used by bounded cleanup; never let a config string select a parent.
+  if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$') {
+    Write-Warning "supervisor: unsafe wrapper-log agent name; using a hashed directory"
+  }
+  # Always hash the exact identity. Regex-valid leaves can still alias on
+  # Windows (`worker`/`worker.`) or be reserved devices (`NUL`, `COM1`).
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    $digest = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($name))
+    $name = 'agent-' + (
+      (($digest | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 16)
+    )
+  } finally {
+    $sha.Dispose()
+  }
+  if ($nonce -notmatch '^[0-9a-f]{32}$') {
+    $nonce = [Guid]::NewGuid().ToString('N')
+  }
+  $roots = @($WrapperLogRoot, $WrapperLogFallbackRoot) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+    Select-Object -Unique
+
+  # Create the immutable destination before pruning any prior evidence. If the
+  # persistent root cannot accept it, no old persistent evidence is removed
+  # before the fallback gets its chance.
+  $generationDir = $null
+  foreach ($candidate in $roots) {
+    $agentDir = Get-SafeWrapperLogAgentDir $candidate $name $true
+    if ($null -eq $agentDir) { continue }
+    try {
+      $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
+      $attempt = Join-Path $agentDir ("{0}-{1}" -f $stamp, $nonce)
+      $null = New-Item -ItemType Directory -Path $attempt -ErrorAction Stop
+      $stdoutPath = Join-Path $attempt 'stdout.log'
+      $stderrPath = Join-Path $attempt 'stderr.log'
+      $rootFull = [IO.Path]::GetFullPath($candidate)
+      if (-not (Protect-WrapperLogPaths $rootFull $agentDir $attempt $stdoutPath $stderrPath)) {
+        Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
+        continue
+      }
+      [IO.File]::WriteAllText(
+        (Join-Path $attempt '.pending'),
+        '',
+        (New-Object Text.UTF8Encoding($false))
+      )
+      $generationDir = $attempt
+      break
+    } catch {
+      Write-Warning (
+        ("supervisor: cannot create wrapper log generation under '{0}' ({1}); " +
+         "trying fallback") -f
+        $agentDir, $_.Exception.Message)
+    }
+  }
+  if ($null -eq $generationDir) {
+    Write-Warning "supervisor: wrapper log preparation failed; launching without redirection"
+    return $null
+  }
+
+  return [pscustomobject]@{
+    stdout = Join-Path $generationDir 'stdout.log'
+    stderr = Join-Path $generationDir 'stderr.log'
+    generation_dir = $generationDir
+    agent_name = $name
+  }
+}
+function Complete-WrapperLogTargets($targets) {
+  if ($null -eq $targets) { return }
+  $generationDir = [IO.Path]::GetFullPath([string]$targets.generation_dir)
+  try {
+    [IO.File]::WriteAllText(
+      (Join-Path $generationDir '.committed'),
+      '',
+      (New-Object Text.UTF8Encoding($false))
+    )
+    Remove-Item -LiteralPath (Join-Path $generationDir '.pending') -Force `
+      -ErrorAction SilentlyContinue
+  } catch {
+    # Without a committed marker a later failed launch must not evict prior
+    # evidence. Keep both the new process and all prior generations.
+    Write-Warning (
+      "supervisor: cannot commit wrapper log generation '{0}' ({1}); skipping prune" -f
+      $generationDir, $_.Exception.Message)
+    return
+  }
+
+  $name = [string]$targets.agent_name
+  $roots = @($WrapperLogRoot, $WrapperLogFallbackRoot) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+    Select-Object -Unique
+
+  # Retention is one per-agent budget across the persistent and fallback roots.
+  # Cleanup is deliberately restricted to exact owned names and never traverses
+  # a reparse point. Deletion failure can exceed the quota until the filesystem
+  # problem is resolved, but it never blocks the recovery launch.
+  $owned = @()
+  foreach ($candidate in $roots) {
+    $agentDir = Get-SafeWrapperLogAgentDir $candidate $name $false
+    if ($null -eq $agentDir) { continue }
+    try {
+      foreach ($old in @(
+        Get-ChildItem -LiteralPath $agentDir -Directory -ErrorAction Stop |
+          Where-Object {
+            $_.Name -match '^[0-9]{8}T[0-9]{9}Z-[0-9a-f]{32}$'
+          }
+      )) {
+        if (($old.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+          Write-Warning (
+            "supervisor: refusing to prune wrapper-log reparse point '{0}'" -f
+            $old.FullName)
+          continue
+        }
+        $committed = Test-Path -LiteralPath (Join-Path $old.FullName '.committed')
+        if (-not $committed) {
+          # A crash or filesystem failure can leave either a pending generation
+          # or markerless debris. Neither proves that CreateProcess returned.
+          # Preserve it, but never let it consume a retained slot or evict
+          # proven evidence. Only the synchronous caught-failure path may
+          # delete a pending generation.
+          Write-Warning (
+            "supervisor: preserving unresolved wrapper log generation '{0}'" -f
+            $old.FullName)
+          continue
+        }
+        $owned += [pscustomobject]@{ item = $old }
+      }
+    } catch {
+      Write-Warning (
+        "supervisor: cannot inspect wrapper log root '{0}' ({1})" -f
+        $agentDir, $_.Exception.Message)
+    }
+  }
+
+  $keep = @($generationDir)
+  $keepPrior = [Math]::Max(0, [int]$WrapperLogGenerations - 1)
+  if ($keepPrior -gt 0) {
+    $keep += @(
+      $owned |
+        Where-Object {
+          [IO.Path]::GetFullPath($_.item.FullName) -ne $generationDir
+        } |
+        Sort-Object { $_.item.Name } -Descending |
+        Select-Object -First $keepPrior |
+        ForEach-Object { [IO.Path]::GetFullPath($_.item.FullName) }
+    )
+  }
+  foreach ($record in $owned) {
+    $full = [IO.Path]::GetFullPath($record.item.FullName)
+    if ($keep -contains $full) { continue }
+    try {
+      Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+    } catch {
+      Write-Warning (
+        ("supervisor: could not prune wrapper log generation '{0}' ({1}); " +
+         "launching with a new generation") -f
+        $full, $_.Exception.Message)
+    }
+  }
+
+}
+function Discard-PendingWrapperLogTargets($targets) {
+  if ($null -eq $targets) { return }
+  $generationDir = [string]$targets.generation_dir
+  if (-not (Test-Path -LiteralPath (Join-Path $generationDir '.pending'))) {
+    return
+  }
+  try {
+    $item = Get-Item -LiteralPath $generationDir -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      return
+    }
+    Remove-Item -LiteralPath $generationDir -Recurse -Force -ErrorAction Stop
+  } catch {
+    Write-Warning (
+      "supervisor: could not discard failed wrapper log generation '{0}' ({1})" -f
+      $generationDir, $_.Exception.Message)
+  }
+}
+# endregion wrapper-log-helpers
 function Launch($name, $plan, $codexHome) {
   if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) { return $null }
   $a = $cfg.agents.$name
@@ -6362,6 +7035,14 @@ function Launch($name, $plan, $codexHome) {
   $launchNonce = [guid]::NewGuid().ToString('N')
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
   $argv = @($nonceResult.argv)
+  $shouldLog = (
+    [bool]$a.wrapped -and
+    $plan.launch_mode -eq 'wrap' -and
+    (Test-AgenttalkWrapInvocation $file $argv $nonceResult)
+  )
+  $logTargets = if ($shouldLog) {
+    New-WrapperLogTargets $name $launchNonce
+  } else { $null }
   # Apply the agent's env, launch the REAL executable directly with -PassThru,
   # then RESTORE the supervisor's own env. The in-sandbox agent reaches the bus
   # via the explicit AGENTTALK_PY pin; AGENTTALK_PYTHON remains supervisor-only
@@ -6372,17 +7053,50 @@ function Launch($name, $plan, $codexHome) {
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
-  foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  foreach ($reserved in $WrapperLogEnvKeys) {
+    $null = $applied.Remove($reserved)
+    $applied[$reserved] = $null
+  }
+  if ($null -ne $logTargets) {
+    # These are supervisor-owned capabilities, not per-agent configuration.
+    $applied['AGENTTALK_WRAPPER_STDOUT_LOG'] = $logTargets.stdout
+    $applied['AGENTTALK_WRAPPER_STDERR_LOG'] = $logTargets.stderr
+    $applied['AGENTTALK_WRAPPER_LOG_MAX_BYTES'] = [string]$WrapperLogMaxBytes
+    $applied['AGENTTALK_WRAPPER_LOG_SEGMENTS'] = [string]$WrapperLogSegments
+    $applied['AGENTTALK_WRAPPER_LOG_NONCE'] = $launchNonce
+  }
+  foreach ($k in $applied.Keys) {
+    $saved[$k] = [Environment]::GetEnvironmentVariable($k)
+    if ($null -eq $applied[$k]) {
+      Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue
+    } else {
+      Set-Item -Path ("Env:" + $k) -Value $applied[$k]
+    }
+  }
   try {
     $cwd = if ($a.cwd) { $a.cwd } else { $Root }
     # Quote each token per Windows rules and pass ONE command-line string: a bare
     # array element containing a space would otherwise be split into two args at
     # the Start-Process handoff (so a path/arg WITH SPACES survives as one arg).
+    $startArgs = @{
+      FilePath = $file
+      WorkingDirectory = $cwd
+      WindowStyle = $windowStyle
+      PassThru = $true
+    }
+    if ($null -ne $logTargets) {
+      $startArgs['RedirectStandardOutput'] = $logTargets.stdout
+      $startArgs['RedirectStandardError'] = $logTargets.stderr
+    }
     if (@($argv).Count -gt 0) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
-      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
-    } else {
-      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
+      $startArgs['ArgumentList'] = $argline
+    }
+    try {
+      $proc = Start-WrapperProcess $startArgs
+    } catch {
+      Discard-PendingWrapperLogTargets $logTargets
+      throw
     }
   } finally {
     foreach ($k in $saved.Keys) {
@@ -6391,6 +7105,7 @@ function Launch($name, $plan, $codexHome) {
     }
   }
   if ($proc -and $proc.Id) {
+    Complete-WrapperLogTargets $logTargets
     $out = @{ pid = $proc.Id; session_id = $sid; start = (Proc-Start $proc.Id);
               launcher_nonce_injected = [bool]$nonceResult.injected;
               launcher_nonce_source = $nonceResult.source;
@@ -6398,6 +7113,7 @@ function Launch($name, $plan, $codexHome) {
     if ($nonceResult.injected -and $nonceResult.nonce) { $out.launcher_nonce = $nonceResult.nonce }
     return $out
   }
+  Discard-PendingWrapperLogTargets $logTargets
   Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"; return $null
 }
 
@@ -6416,20 +7132,56 @@ function Launch-Spec($name, $spec, $codexHome) {
   $launchNonce = [guid]::NewGuid().ToString('N')
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
   $argv = @($nonceResult.argv)
+  $shouldLog = Test-AgenttalkWrapInvocation $file $argv $nonceResult
+  $logTargets = if ($shouldLog) {
+    New-WrapperLogTargets $name $launchNonce
+  } else { $null }
   $saved = @{}
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }
-  foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  foreach ($reserved in $WrapperLogEnvKeys) {
+    $null = $applied.Remove($reserved)
+    $applied[$reserved] = $null
+  }
+  if ($null -ne $logTargets) {
+    $applied['AGENTTALK_WRAPPER_STDOUT_LOG'] = $logTargets.stdout
+    $applied['AGENTTALK_WRAPPER_STDERR_LOG'] = $logTargets.stderr
+    $applied['AGENTTALK_WRAPPER_LOG_MAX_BYTES'] = [string]$WrapperLogMaxBytes
+    $applied['AGENTTALK_WRAPPER_LOG_SEGMENTS'] = [string]$WrapperLogSegments
+    $applied['AGENTTALK_WRAPPER_LOG_NONCE'] = $launchNonce
+  }
+  foreach ($k in $applied.Keys) {
+    $saved[$k] = [Environment]::GetEnvironmentVariable($k)
+    if ($null -eq $applied[$k]) {
+      Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue
+    } else {
+      Set-Item -Path ("Env:" + $k) -Value $applied[$k]
+    }
+  }
   try {
     $cwd = if ($spec.cwd) { $spec.cwd } else { $Root }
+    $startArgs = @{
+      FilePath = $file
+      WorkingDirectory = $cwd
+      WindowStyle = $windowStyle
+      PassThru = $true
+    }
+    if ($null -ne $logTargets) {
+      $startArgs['RedirectStandardOutput'] = $logTargets.stdout
+      $startArgs['RedirectStandardError'] = $logTargets.stderr
+    }
     if (@($argv).Count -gt 0) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
-      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
-    } else {
-      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
+      $startArgs['ArgumentList'] = $argline
+    }
+    try {
+      $proc = Start-WrapperProcess $startArgs
+    } catch {
+      Discard-PendingWrapperLogTargets $logTargets
+      throw
     }
   } finally {
     foreach ($k in $saved.Keys) {
@@ -6438,6 +7190,7 @@ function Launch-Spec($name, $spec, $codexHome) {
     }
   }
   if ($proc -and $proc.Id) {
+    Complete-WrapperLogTargets $logTargets
     $out = @{ pid = $proc.Id; start = (Proc-Start $proc.Id);
               launcher_nonce_injected = [bool]$nonceResult.injected;
               launcher_nonce_source = $nonceResult.source;
@@ -6445,6 +7198,7 @@ function Launch-Spec($name, $spec, $codexHome) {
     if ($nonceResult.injected -and $nonceResult.nonce) { $out.launcher_nonce = $nonceResult.nonce }
     return $out
   }
+  Discard-PendingWrapperLogTargets $logTargets
   Write-Warning "supervisor: ephemeral launch of '$name' returned no PID"; return $null
 }
 
@@ -6961,11 +7715,16 @@ def _marker_placeholder_bundle(
     py = python_exe or sys.executable
     checkout_id = hashlib.sha256(str(store.root).encode("utf-8")).hexdigest()
     src_is_checkout = (store.root / "src" / "agenttalk" / "__init__.py").exists()
+    wrapper_log_root = wrapper_log.default_wrapper_log_root(store.root)
     substitutions = {
         "__AGENTTALK_ARTIFACT_MARKER__": _PS_MARKER,
         "__AGENTTALK_CHECKOUT_ID__": checkout_id,
         "__AGENTTALK_PREAMBLE__": psh.generated_preamble().rstrip("\n"),
         "__AGENTTALK_RUNTIME_GUARD__": psh.generated_runtime_guard().rstrip("\n"),
+        "__AGENTTALK_WRAPPER_LOG_ROOT__": str(wrapper_log_root).replace("'", "''"),
+        "__AGENTTALK_WRAPPER_LOG_GENERATIONS__": str(WRAPPER_LOG_GENERATIONS),
+        "__AGENTTALK_WRAPPER_LOG_MAX_BYTES__": str(WRAPPER_LOG_MAX_BYTES),
+        "__AGENTTALK_WRAPPER_LOG_SEGMENTS__": str(WRAPPER_LOG_SEGMENT_COUNT),
     }
 
     def render_ps(template: str) -> bytes:

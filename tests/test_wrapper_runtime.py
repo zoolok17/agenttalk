@@ -1342,3 +1342,24 @@ def test_work_heartbeat_ticks_do_not_advance_runtime_progress(
     assert view["record"]["phase"] == wr.PHASE_ACTIVE
     assert view["record"]["progress_sequence"] == 0
     assert view["record"]["last_progress_at"] is None
+
+
+def test_proc_stream_reports_exact_child_exit_after_output_is_drained() -> None:
+    exits: list[tuple[int, str | None, int]] = []
+    stream = run._ProcStream(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            "-c",
+            "import sys; print('actual-output'); raise SystemExit(7)",
+        ],
+        None,
+        on_exit=lambda pid, start, rc: exits.append((pid, start, rc)),
+    )
+
+    output = list(stream)
+
+    assert output == ["actual-output\n"]
+    assert stream.returncode == 7
+    assert exits == [(stream.pid, stream.pid_start, 7)]
