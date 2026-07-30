@@ -28,7 +28,7 @@ from types import SimpleNamespace
 import pytest
 
 from agenttalk import wrapper_runtime as wr
-from agenttalk.store import Store
+from agenttalk.store import Store, _process_alive
 from agenttalk.wrapper import loop, run
 from agenttalk.wrapper import obligations
 from agenttalk.wrapper import session as wsession
@@ -576,6 +576,24 @@ def test_proc_stream_watchdog_enabled_normal_exit_needs_no_wake() -> None:
     assert stream.watchdog_result is None
 
 
+def test_proc_stream_watchdog_decoder_preserves_text_line_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = object.__new__(run._ProcStream)
+    stream._proc = SimpleNamespace(stdout=object())
+    stream._watchdog_stream_condition = threading.Condition()
+    stream._watchdog_stream_interrupted = False
+    stream._watchdog_stream_done = False
+    chunks = iter((b"\xe2", b"\x80", b"\x9d\r", b"\ninvalid:\x9d", b"partial", b""))
+    monkeypatch.setattr(run, "_read_ready_pipe_chunk", lambda _pipe: next(chunks))
+
+    assert list(stream._iter_until_watchdog_or_eof()) == [
+        "\u201d\n",
+        "invalid:\ufffdpartial",
+    ]
+    assert stream._watchdog_stream_done
+
+
 def test_proc_stream_watchdog_enabled_consumer_close_is_bounded() -> None:
     stream = run._ProcStream(
         [
@@ -620,6 +638,201 @@ def test_proc_stream_watchdog_enabled_consumer_close_is_bounded() -> None:
     assert stream.returncode is not None
 
 
+class _ObservedWatchdogProcStream(run._ProcStream):
+    """Expose the watchdog callback boundary without changing its behavior."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.watchdog_callback_done = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def _handle_watchdog_fire(self, result: dict) -> None:
+        try:
+            super()._handle_watchdog_fire(result)
+        finally:
+            self.watchdog_callback_done.set()
+
+
+def _consume_proc_stream(
+    stream: run._ProcStream,
+    *,
+    first_line: list[str],
+    first_line_ready: threading.Event,
+    owner_done: threading.Event,
+    errors: list[BaseException],
+) -> None:
+    try:
+        for line in stream:
+            if not first_line:
+                first_line.append(line)
+                first_line_ready.set()
+    except BaseException as exc:  # noqa: BLE001 - report owner failures on test thread
+        errors.append(exc)
+    finally:
+        owner_done.set()
+
+
+def test_proc_stream_does_not_wake_until_reported_root_kill_is_confirmed() -> None:
+    first_line_ready = threading.Event()
+    owner_done = threading.Event()
+    first_line: list[str] = []
+    errors: list[BaseException] = []
+    spawned: dict[str, int] = {}
+
+    def snapshot():
+        if not first_line_ready.wait(5.0):
+            return None
+        root = spawned["pid"]
+        return _snap(
+            (root, 1, "codex.exe", 1000.0),
+            (root + 1_000_000, root, "node.exe", 0.0),
+        )
+
+    # Model the real signal-vs-exit race: kill_targets reports every requested PID
+    # immediately, while the actual root process remains alive.
+    stream = _ObservedWatchdogProcStream(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "import threading; print('ready', flush=True); threading.Event().wait()",
+        ],
+        None,
+        watchdog=TurnWatchdogConfig(
+            enabled=True,
+            turn_elapsed_seconds=0.0,
+            tool_descendant_alive_seconds=0.0,
+            poll_seconds=0.01,
+        ),
+        watchdog_snapshot_fn=snapshot,
+        watchdog_kill_fn=lambda targets: [target["pid"] for target in targets],
+        watchdog_wall_clock=lambda: 1000.0,
+        on_spawn=lambda pid, _start: spawned.__setitem__("pid", pid),
+    )
+    owner = threading.Thread(
+        target=_consume_proc_stream,
+        kwargs={
+            "stream": stream,
+            "first_line": first_line,
+            "first_line_ready": first_line_ready,
+            "owner_done": owner_done,
+            "errors": errors,
+        },
+        daemon=True,
+    )
+    owner.start()
+    try:
+        assert stream.watchdog_callback_done.wait(5.0), "watchdog did not fire"
+        assert stream._proc.poll() is None
+        assert not stream._watchdog_stream_interrupted
+        assert not owner_done.is_set()
+        assert stream._watchdog_root_waiter is not None
+    finally:
+        if stream._proc.poll() is None:
+            stream._proc.kill()
+        assert owner_done.wait(5.0), "owner did not resume after confirmed root exit"
+        owner.join(5.0)
+
+    assert first_line == ["ready\n"]
+    assert errors == []
+    assert stream.returncode is not None
+
+
+def test_proc_stream_watchdog_reaps_stdout_when_inherited_writer_survives() -> None:
+    first_line_ready = threading.Event()
+    owner_done = threading.Event()
+    first_line: list[str] = []
+    errors: list[BaseException] = []
+    spawned: dict[str, object] = {}
+    readers_before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name == "turn-stdout-reader"
+    }
+    writer_pid: int | None = None
+
+    def snapshot():
+        if not first_line_ready.wait(5.0):
+            return None
+        root = int(spawned["pid"])
+        writer = int(first_line[0].strip())
+        return _snap(
+            (root, 1, "codex.exe", 1000.0),
+            (writer, root, "conhost.exe", 1000.0),
+            (root + 1_000_000, root, "node.exe", 0.0),
+        )
+
+    def kill(targets):
+        stream = spawned["stream"]
+        assert isinstance(stream, run._ProcStream)
+        stream._proc.kill()
+        stream._proc.wait(timeout=5.0)
+        return [target["pid"] for target in targets]
+
+    writer_code = "import threading; threading.Event().wait(30.0)"
+    root_code = (
+        "import subprocess, sys, threading; "
+        f"writer = subprocess.Popen([sys.executable, '-c', {writer_code!r}], "
+        "stdout=sys.stdout, stderr=sys.stderr); "
+        "print(writer.pid, flush=True); "
+        "threading.Event().wait()"
+    )
+    stream = _ObservedWatchdogProcStream(
+        [sys.executable, "-u", "-c", root_code],
+        None,
+        watchdog=TurnWatchdogConfig(
+            enabled=True,
+            turn_elapsed_seconds=0.0,
+            tool_descendant_alive_seconds=0.0,
+            poll_seconds=0.01,
+        ),
+        watchdog_snapshot_fn=snapshot,
+        watchdog_kill_fn=kill,
+        watchdog_wall_clock=lambda: 1000.0,
+        on_spawn=lambda pid, _start: spawned.__setitem__("pid", pid),
+    )
+    spawned["stream"] = stream
+    owner = threading.Thread(
+        target=_consume_proc_stream,
+        kwargs={
+            "stream": stream,
+            "first_line": first_line,
+            "first_line_ready": first_line_ready,
+            "owner_done": owner_done,
+            "errors": errors,
+        },
+        daemon=True,
+    )
+    owner.start()
+    try:
+        assert stream.watchdog_callback_done.wait(5.0), "watchdog did not fire"
+        assert owner_done.wait(5.0), "owner stayed blocked on the inherited writer"
+        owner.join(5.0)
+        writer_pid = int(first_line[0].strip())
+        assert _process_alive(writer_pid), "fixture writer did not outlive the root"
+        readers_after = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "turn-stdout-reader"
+        }
+        assert readers_after <= readers_before
+        assert stream._proc.stdout is not None
+        assert stream._proc.stdout.closed
+    finally:
+        if stream._proc.poll() is None:
+            stream._proc.kill()
+            stream._proc.wait(timeout=5.0)
+        if writer_pid is None and first_line:
+            writer_pid = int(first_line[0].strip())
+        if writer_pid is not None and _process_alive(writer_pid):
+            twd._kill_one(writer_pid)
+        reader = getattr(stream, "_watchdog_stream_reader", None)
+        if reader is not None:
+            reader.join(5.0)
+
+    assert errors == []
+    assert stream.returncode is not None
+
+
 def test_proc_stream_waits_for_root_exit_when_kill_result_omits_root() -> None:
     root_exited = threading.Event()
     stream = object.__new__(run._ProcStream)
@@ -644,12 +857,11 @@ def test_proc_stream_waits_for_root_exit_when_kill_result_omits_root() -> None:
     assert stream._watchdog_stream_interrupted
 
 
-def test_proc_stream_reader_error_is_cancelled_not_normal_eof() -> None:
+def test_proc_stream_incomplete_owner_exit_is_cancelled() -> None:
     stream = object.__new__(run._ProcStream)
     stream._watchdog_stream_condition = threading.Condition()
     stream._watchdog_stream_interrupted = False
-    stream._watchdog_stream_done = True
-    stream._watchdog_stream_error = OSError("read failed")
+    stream._watchdog_stream_done = False
 
     assert stream._cancel_watchdog_stream_after_consumer_exit() is True
     assert stream._watchdog_stream_interrupted
@@ -686,32 +898,31 @@ class _HarnessStdin:
         return None
 
 
-class _HeldOpenStdout:
-    """Model an inherited writer that survives the kill without reporting progress."""
-
-    def __init__(self, stream_blocked, pipe_release) -> None:
-        self._stream_blocked = stream_blocked
-        self._pipe_release = pipe_release
-
-    def __iter__(self):
-        self._stream_blocked.set()
-        if not self._pipe_release.wait(10.0):
-            raise RuntimeError("watchdog regression pipe was not released")
-        return iter(())
-
-    def close(self) -> None:
-        # Closing the wrapper's read object is deliberately not the synchronizer:
-        # the production failure is an independently held write handle.
-        return None
-
-
 class _HarnessProc:
     def __init__(self, stream_blocked, pipe_release, child_killed) -> None:
         self.pid = ROOT
         self.stdin = _HarnessStdin()
-        self.stdout = _HeldOpenStdout(stream_blocked, pipe_release)
+        read_fd, write_fd = os.pipe()
+        self.stdout = os.fdopen(
+            read_fd,
+            "r",
+            encoding="utf-8",
+            errors="replace",
+        )
+        self._stdout_writer = os.fdopen(write_fd, "wb", buffering=0)
         self.returncode = None
         self._child_killed = child_killed
+        stream_blocked.set()
+        self._writer_closer = threading.Thread(
+            target=self._close_writer_after_release,
+            args=(pipe_release,),
+            daemon=True,
+        )
+        self._writer_closer.start()
+
+    def _close_writer_after_release(self, pipe_release) -> None:
+        if pipe_release.wait(10.0):
+            self._stdout_writer.close()
 
     def poll(self):
         return -9 if self._child_killed.is_set() else None

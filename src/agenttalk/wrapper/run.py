@@ -12,8 +12,10 @@ a restart-request marker.
 
 from __future__ import annotations
 
-import errno
+import codecs
 import contextlib
+import errno
+import io
 import json
 import os
 from pathlib import Path
@@ -25,7 +27,6 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -58,6 +59,8 @@ WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
 INBOUND_REQUEST_ID_ENV = "AGENTTALK_INBOUND_REQUEST_ID"
 OVH_QWEN_CLAUDE_MAX_OUTPUT = "4096"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
+_WATCHDOG_STREAM_POLL_SECONDS = 0.05
+_WATCHDOG_STREAM_READ_BYTES = 64 * 1024
 
 
 class _GatewayChildCapUnavailable(RuntimeError):
@@ -648,6 +651,45 @@ def _close_pipe_suppressing_benign_pipe_teardown(pipe) -> None:
     except OSError as exc:
         if not _is_benign_pipe_teardown_error(exc):
             raise
+
+
+def _read_ready_pipe_chunk(pipe) -> bytes | None:
+    """Read one available binary chunk without waiting for a line or pipe EOF.
+
+    ``None`` means the pipe is still open but has no bytes ready; ``b""`` means
+    EOF.  The watchdog stream uses this instead of a blocking TextIO iterator so
+    an inherited writer cannot strand a reader thread after the protected root
+    has exited.
+    """
+    buffered = getattr(pipe, "buffer", pipe)
+    raw = getattr(buffered, "raw", buffered)
+    fd = raw.fileno()
+    if os.name == "nt":
+        import _winapi
+        import msvcrt
+
+        try:
+            available, _message_left = _winapi.PeekNamedPipe(
+                msvcrt.get_osfhandle(fd), 0
+            )
+        except BrokenPipeError:
+            return b""
+        if available <= 0:
+            return None
+        size = min(int(available), _WATCHDOG_STREAM_READ_BYTES)
+    else:
+        import select
+
+        readable, _, _ = select.select([fd], [], [], 0.0)
+        if not readable:
+            return None
+        size = _WATCHDOG_STREAM_READ_BYTES
+    try:
+        return os.read(fd, size)
+    except OSError as exc:
+        if _is_benign_pipe_teardown_error(exc):
+            return b""
+        raise
 
 
 def _workspace_root() -> Path:
@@ -1513,10 +1555,7 @@ class _ProcStream:
         self._watchdog = None
         self._watchdog_stream_condition = threading.Condition()
         self._watchdog_stream_interrupted = False
-        self._watchdog_stream_lines: deque[str] = deque()
         self._watchdog_stream_done = False
-        self._watchdog_stream_error: BaseException | None = None
-        self._watchdog_stream_reader: threading.Thread | None = None
         self._watchdog_root_waiter: threading.Thread | None = None
         self.work_heartbeat_result: dict | None = None
         self._work_hb = None
@@ -1585,7 +1624,7 @@ class _ProcStream:
                 self._work_hb.stop()
                 self._work_hb.join(timeout=10.0)
                 self.work_heartbeat_result = dict(self._work_hb.result)
-            if self._watchdog is None and self._proc.stdout:
+            if self._proc.stdout:
                 _close_pipe_suppressing_benign_pipe_teardown(self._proc.stdout)
             if self._watchdog is not None:
                 self._watchdog.stop()
@@ -1598,19 +1637,19 @@ class _ProcStream:
                 except Exception:  # noqa: BLE001, S110 - preserve the consumer's failure  # nosec B110
                     pass
             if self._watchdog_stream_interrupted:
-                try:
-                    self.returncode = self._proc.wait(timeout=10.0)
-                except subprocess.TimeoutExpired:
-                    if consumer_aborted:
+                if consumer_aborted:
+                    try:
+                        self.returncode = self._proc.wait(timeout=10.0)
+                    except subprocess.TimeoutExpired:
                         try:
                             self._proc.kill()
                             self.returncode = self._proc.wait(timeout=5.0)
                         except Exception:  # noqa: BLE001 - cleanup must preserve owner failure
                             self.returncode = self._proc.poll()
-                    else:
-                        # The start-guarded kill already reported success. Do not replace
-                        # one inherited-pipe wedge with an unbounded process-reap wedge.
-                        self.returncode = self._proc.poll()
+                else:
+                    # A watchdog wake is an exit confirmation, never merely a signal
+                    # report. Fail closed if that invariant is ever violated.
+                    self.returncode = self._proc.wait()
             else:
                 self.returncode = self._proc.wait()
 
@@ -1620,11 +1659,11 @@ class _ProcStream:
             self._watchdog_stream_condition.notify_all()
 
     def _cancel_watchdog_stream_after_consumer_exit(self) -> bool:
-        """Cancel the reader only when its owner stopped before EOF or watchdog wake."""
+        """Cancel direct pipe reads when the owner stopped before EOF or watchdog wake."""
         with self._watchdog_stream_condition:
             if self._watchdog_stream_interrupted:
                 return False
-            if self._watchdog_stream_done and self._watchdog_stream_error is None:
+            if self._watchdog_stream_done:
                 return False
             self._watchdog_stream_interrupted = True
             self._watchdog_stream_condition.notify_all()
@@ -1635,7 +1674,10 @@ class _ProcStream:
         with self._watchdog_stream_condition:
             if self._watchdog_stream_interrupted:
                 return
-        if self.pid in result.get("killed", ()) or self._proc.poll() is not None:
+        # kill_targets reports that a start-guarded signal was requested, not that
+        # process termination has completed. Never publish an idle turn while this
+        # Popen handle can still be alive.
+        if self._proc.poll() is not None:
             self._interrupt_watchdog_stream()
             return
         with self._watchdog_stream_condition:
@@ -1652,67 +1694,49 @@ class _ProcStream:
     def _wake_after_watchdog_root_exit(self) -> None:
         try:
             self._proc.wait()
-        except Exception:  # noqa: BLE001 - an unconfirmed root exit must stay fail-open
+        except Exception:  # noqa: BLE001 - an unconfirmed root exit must stay fail-closed
             return
         self._interrupt_watchdog_stream()
 
-    def _read_watchdog_stdout(self) -> None:
-        error: BaseException | None = None
-        try:
-            for line in _iter_suppressing_benign_pipe_teardown(
-                self._proc.stdout or []
-            ):
-                with self._watchdog_stream_condition:
-                    while (
-                        self._watchdog_stream_lines
-                        and not self._watchdog_stream_interrupted
-                    ):
-                        self._watchdog_stream_condition.wait()
-                    if self._watchdog_stream_interrupted:
-                        return
-                    self._watchdog_stream_lines.append(line)
-                    self._watchdog_stream_condition.notify_all()
-        except BaseException as exc:  # noqa: BLE001 - propagate reader failure on owner thread
-            error = exc
-        finally:
-            try:
-                if self._proc.stdout:
-                    _close_pipe_suppressing_benign_pipe_teardown(
-                        self._proc.stdout
-                    )
-            except BaseException as exc:  # noqa: BLE001 - propagate close failure on owner thread
-                if error is None:
-                    error = exc
-            with self._watchdog_stream_condition:
-                self._watchdog_stream_error = error
-                self._watchdog_stream_done = True
-                self._watchdog_stream_condition.notify_all()
-
     def _iter_until_watchdog_or_eof(self) -> Iterator[str]:
-        self._watchdog_stream_reader = threading.Thread(
-            target=self._read_watchdog_stdout,
-            name="turn-stdout-reader",
-            daemon=True,
+        stdout = self._proc.stdout
+        if stdout is None:
+            with self._watchdog_stream_condition:
+                self._watchdog_stream_done = True
+            return
+        decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder("utf-8")("replace"),
+            translate=True,
         )
-        self._watchdog_stream_reader.start()
+        pending = ""
         while True:
             with self._watchdog_stream_condition:
-                while (
-                    not self._watchdog_stream_interrupted
-                    and not self._watchdog_stream_lines
-                    and not self._watchdog_stream_done
-                ):
-                    self._watchdog_stream_condition.wait()
                 if self._watchdog_stream_interrupted:
                     return
-                if self._watchdog_stream_lines:
-                    line = self._watchdog_stream_lines.popleft()
+            chunk = _read_ready_pipe_chunk(stdout)
+            if chunk is None:
+                with self._watchdog_stream_condition:
+                    if self._watchdog_stream_interrupted:
+                        return
+                    self._watchdog_stream_condition.wait(
+                        timeout=_WATCHDOG_STREAM_POLL_SECONDS
+                    )
+                continue
+            if chunk == b"":
+                pending += decoder.decode(b"", final=True)
+                with self._watchdog_stream_condition:
+                    self._watchdog_stream_done = True
                     self._watchdog_stream_condition.notify_all()
-                elif self._watchdog_stream_error is not None:
-                    raise self._watchdog_stream_error
-                else:
-                    return
-            yield line
+                if pending:
+                    yield pending
+                return
+            pending += decoder.decode(chunk)
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                with self._watchdog_stream_condition:
+                    if self._watchdog_stream_interrupted:
+                        return
+                yield f"{line}\n"
 
     def _cleanup_after_constructor_error(self) -> None:
         # Best-effort only: preserve the original constructor failure so make_drive
