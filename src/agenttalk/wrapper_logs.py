@@ -13,6 +13,7 @@ import contextlib
 import json
 import os
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -153,10 +154,10 @@ def _harden_posix_log_paths(*paths: Path) -> None:
         directories.add(path.parent.parent)
         directories.add(path.parent.parent.parent)
         with contextlib.suppress(OSError):
-            os.chmod(path, 0o600)
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
     for directory in directories:
         with contextlib.suppress(OSError):
-            os.chmod(directory, 0o700)
+            os.chmod(directory, stat.S_IRWXU)
 
 
 class BoundedStreamTee:
@@ -262,8 +263,10 @@ class BoundedStreamTee:
                 self._advance_tail()
             available = self.segment_bytes - self._tail_size
             chunk = remaining[:available]
-            assert self._tail is not None
-            self._tail.write(chunk)
+            tail = self._tail
+            if tail is None:
+                raise OSError("wrapper log tail is unavailable")
+            tail.write(chunk)
             self._tail_size += len(chunk)
             remaining = remaining[len(chunk):]
 
@@ -334,8 +337,9 @@ def installed_standard_streams_from_environment(
         return
     stdout_path = env.get(ENV_STDOUT_PATH)
     stderr_path = env.get(ENV_STDERR_PATH)
-    assert stdout_path is not None
-    assert stderr_path is not None
+    if not stdout_path or not stderr_path:
+        yield
+        return
     _harden_posix_log_paths(Path(stdout_path), Path(stderr_path))
     max_bytes = _bounded_int(
         env.get(ENV_MAX_BYTES),

@@ -4961,6 +4961,54 @@ def test_ps_wrapper_log_targets_preserve_output_and_prune_old_generations(
     assert "ACTUAL-STDOUT" in payload["preserved"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
+def test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region wrapper-log-helpers"):
+        sup.PS_TEMPLATE.index("# endregion wrapper-log-helpers")
+    ]
+    out = tmp_path / "platform-detection.json"
+    script = tmp_path / "platform-detection.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            "$env:OS = $null",
+            "$env:PATH = Join-Path $env:SystemRoot 'System32'",
+            f"$WrapperLogRoot = {_pslit(str(tmp_path / 'primary'))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            "$target = New-WrapperLogTargets 'worker' "
+            "([Guid]::NewGuid().ToString('N'))",
+            "@{ created = ($null -ne $target); "
+            "stdout = (Test-Path -LiteralPath $target.stdout); "
+            "stderr = (Test-Path -LiteralPath $target.stderr) } | "
+            "ConvertTo-Json | "
+            f"Set-Content {_pslit(str(out))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    assert json.loads(out.read_text(encoding="utf-8-sig")) == {
+        "created": True,
+        "stdout": False,
+        "stderr": False,
+    }
+
+
 def test_ps_wrapper_log_cleanup_failure_uses_new_generation_and_still_launches(
     tmp_path: Path,
 ) -> None:
@@ -4984,6 +5032,7 @@ def test_ps_wrapper_log_cleanup_failure_uses_new_generation_and_still_launches(
     script.write_text(
         "\n".join([
             "$ErrorActionPreference = 'Stop'",
+            "$env:OS = $null",
             f"$WrapperLogRoot = {_pslit(str(log_root))}",
             f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
             "$WrapperLogGenerations = 1",
@@ -5408,6 +5457,7 @@ def test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit(
     script.write_text(
         "\n".join([
             "$ErrorActionPreference = 'Stop'",
+            "$env:OS = $null",
             f"$WrapperLogRoot = {_pslit(str(log_root))}",
             f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
             f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",

@@ -6393,9 +6393,14 @@ function Wait-ForNextPoll($config) {
 }
 # endregion checked-mutations
 # region wrapper-log-helpers
+function Test-RunningOnWindows {
+  # Ambient markers such as `$env:OS` are optional and are deliberately absent
+  # in hermetic launch environments.
+  return [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+}
 $script:WrapperLogLauncherTypeReady = $false
 function Initialize-WrapperLogLauncherType {
-  if ($env:OS -ne 'Windows_NT') { return $false }
+  if (-not (Test-RunningOnWindows)) { return $false }
   if ($script:WrapperLogLauncherTypeReady) { return $true }
   try {
     if (-not ('Agenttalk.ExactHandleLauncher' -as [type])) {
@@ -6686,7 +6691,7 @@ function Start-WrapperProcess([hashtable]$startArgs) {
   $redirected = (
     $startArgs.ContainsKey('RedirectStandardOutput') -and
     $startArgs.ContainsKey('RedirectStandardError'))
-  if ($redirected -and $env:OS -eq 'Windows_NT') {
+  if ($redirected -and (Test-RunningOnWindows)) {
     # PowerShell's redirected Start-Process enables unrestricted handle
     # inheritance. Use an explicit three-handle allowlist so a long-lived
     # wrapper cannot retain the supervisor caller's capture pipes or locks.
@@ -6794,7 +6799,7 @@ function Protect-WrapperLogPaths(
   [string]$stdoutPath,
   [string]$stderrPath
 ) {
-  if ($env:OS -eq 'Windows_NT') { return $true }
+  if (Test-RunningOnWindows) { return $true }
   try {
     [IO.File]::WriteAllBytes($stdoutPath, [byte[]]@())
     [IO.File]::WriteAllBytes($stderrPath, [byte[]]@())
