@@ -413,6 +413,24 @@ def test_loop_idle_stamps_heartbeat(tmp_path) -> None:
     assert s.read_heartbeat("beta") is not None   # idle kept the heartbeat fresh
 
 
+def test_loop_survives_a_non_iso_now_iso_placeholder(tmp_path) -> None:
+    # PR #104 CI regression: `now_iso` is used elsewhere in this loop purely as an
+    # OPAQUE stamp (never parsed back) - test_dead_letter.py's own default injects a
+    # bare "t" placeholder, not a real ISO string. The #126 pre-drive quota check
+    # parsed it unconditionally and crashed every dev-gate leg (0/13, deterministic
+    # across every OS/Python version) despite this exact scenario being green in
+    # every file this task's own targeted runs touched - the break was in a file none
+    # of them imported at module scope. Must fall back to the real wall clock instead
+    # of raising.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="task")
+    turns = loop.run_loop(
+        s, "beta", lambda rec: True, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=2, now_iso=lambda: "t",
+    )
+    assert turns == 1
+
+
 # ------------------------------------------- #58: config-blocked park visibility + re-probe
 
 def _config_blocked_drive():

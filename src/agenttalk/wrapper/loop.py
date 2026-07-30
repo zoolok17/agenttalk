@@ -1150,7 +1150,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # the instant passes), so this naturally stops firing the moment quota clears - no
         # explicit clear, no operator action. Checked BEFORE record_attempt_start: never
         # consumes an attempt while blocked.
-        now_epoch = datetime.fromisoformat(now_iso().replace("Z", "+00:00")).timestamp()
+        # `now_iso` is used elsewhere in this loop purely as an OPAQUE stamp (never parsed
+        # back) - some callers inject a bare placeholder ("t") rather than a real ISO
+        # string. Fall back to the real wall clock on anything unparseable rather than
+        # letting a non-ISO stamp crash the loop.
+        try:
+            now_epoch = datetime.fromisoformat(now_iso().replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError):
+            now_epoch = time.time()
         quota_hold = store.read_quota_blocked_hold(agent, now_epoch=now_epoch)
         if quota_hold is not None:
             _quota_park(record, reset_at=quota_hold.get("reset_at"),
