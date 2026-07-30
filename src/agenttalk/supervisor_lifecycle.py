@@ -13,11 +13,13 @@ import ctypes
 import json
 import os
 import re
+import sys
+import sysconfig
 import tempfile
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterator, Mapping
 
 from agenttalk import powershell_host as psh
@@ -433,25 +435,179 @@ def start_tokens_match(observed: str, locator: object) -> bool:
     return abs((left - right).total_seconds()) <= 0.01
 
 
+def _system_cmd_path() -> str:
+    """Return the native system-directory command interpreter."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_system_directory = kernel32.GetSystemDirectoryW
+    get_system_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    get_system_directory.restype = wintypes.UINT
+    capacity = 32768
+    buf = ctypes.create_unicode_buffer(capacity)
+    length = int(get_system_directory(buf, capacity))
+    if length <= 0 or length >= capacity:
+        raise SupervisorLifecycleError("cannot resolve the Windows system directory")
+    return str(Path(buf.value) / "cmd.exe")
+
+
+def _require_observed_image(
+    observation: ProcessObservation,
+    expected_path: str,
+    *,
+    subject: str,
+) -> None:
+    try:
+        expected = psh.native_file_identity(expected_path)
+    except (OSError, ValueError, psh.PowerShellHostError) as exc:
+        raise SupervisorLifecycleError(f"cannot identify {subject}: {exc}") from exc
+    if not psh.same_identity(observation.identity, expected):
+        raise SupervisorLifecycleError(f"{subject} image identity does not match")
+
+
+def _runtime_scripts_path() -> Path:
+    try:
+        scripts = sysconfig.get_path("scripts")
+    except (KeyError, OSError, ValueError) as exc:
+        raise SupervisorLifecycleError(
+            f"cannot resolve the active Python scripts directory: {exc}"
+        ) from exc
+    if not isinstance(scripts, str) or not scripts:
+        raise SupervisorLifecycleError(
+            "cannot resolve the active Python scripts directory"
+        )
+    return Path(scripts)
+
+
+def _classify_intermediate(
+    observation: ProcessObservation,
+    *,
+    current: ProcessObservation,
+) -> str:
+    leaf = PureWindowsPath(observation.path).name.casefold()
+    if leaf == "cmd.exe":
+        _require_observed_image(
+            observation,
+            _system_cmd_path(),
+            subject="command-interpreter ancestor",
+        )
+        return "cmd"
+    if leaf == "agenttalk.exe":
+        expected = _runtime_scripts_path() / "agenttalk.exe"
+        argv0 = sys.argv[0] if sys.argv else ""
+        expected_argv0 = {
+            psh.normalized_path_key(expected),
+            # distlib's generated console entry point strips its ``.exe``
+            # suffix before importing the target function.
+            psh.normalized_path_key(expected.with_suffix("")),
+        }
+        if (
+            not argv0
+            or psh.normalized_path_key(argv0) not in expected_argv0
+            or psh.normalized_path_key(observation.path)
+            != psh.normalized_path_key(expected)
+        ):
+            raise SupervisorLifecycleError(
+                "console-script ancestor is not the active agenttalk entry point"
+            )
+        _require_observed_image(
+            observation,
+            str(expected),
+            subject="agenttalk console-script ancestor",
+        )
+        return "console"
+    if leaf in {"python.exe", "pythonw.exe"}:
+        base_executable = getattr(sys, "_base_executable", None)
+        executable = sys.executable
+        if (
+            sys.prefix == sys.base_prefix
+            or not isinstance(base_executable, str)
+            or not base_executable
+            or psh.normalized_path_key(executable)
+            == psh.normalized_path_key(base_executable)
+            or psh.normalized_path_key(observation.path)
+            != psh.normalized_path_key(executable)
+            or psh.normalized_path_key(Path(executable).parent)
+            != psh.normalized_path_key(_runtime_scripts_path())
+        ):
+            raise SupervisorLifecycleError(
+                "Python ancestor is not the active virtual-environment launcher"
+            )
+        _require_observed_image(
+            observation,
+            executable,
+            subject="virtual-environment Python launcher",
+        )
+        _require_observed_image(
+            current,
+            base_executable,
+            subject="running base Python",
+        )
+        return "venv"
+    raise SupervisorLifecycleError(
+        "generated supervisor caller has an unidentified launcher ancestor"
+    )
+
+
+_ALLOWED_CALLER_ANCESTRIES = frozenset(
+    {
+        (),
+        ("cmd",),
+        ("console",),
+        ("venv",),
+        ("cmd", "console"),
+        ("cmd", "venv"),
+        ("console", "venv"),
+        ("cmd", "console", "venv"),
+    }
+)
+
+
 def _validate_ancestry(host: ProcessObservation) -> tuple[ProcessObservation, ...]:
     parents = _process_parent_map()
     current = _open_process_observation(os.getpid(), parents=parents)
     opened: list[ProcessObservation] = [current]
     try:
-        if current.parent_pid == host.pid:
-            if host.creation_ticks > current.creation_ticks:
-                raise SupervisorLifecycleError("PowerShell ancestor started after Python")
-            return tuple(opened)
-        if current.parent_pid <= 0:
-            raise SupervisorLifecycleError("manual --claim-instance has no PowerShell ancestor")
-        cmd = _open_process_observation(current.parent_pid, parents=parents)
-        opened.append(cmd)
-        if Path(cmd.path).name.casefold() != "cmd.exe" or cmd.parent_pid != host.pid:
+        cursor = current
+        seen = {host.pid, current.pid}
+        while cursor.parent_pid != host.pid:
+            if cursor.parent_pid <= 0:
+                raise SupervisorLifecycleError(
+                    "generated supervisor caller has no PowerShell ancestor"
+                )
+            if len(opened) > 3:
+                raise SupervisorLifecycleError(
+                    "generated supervisor caller has too many launcher ancestors"
+                )
+            if cursor.parent_pid in seen:
+                raise SupervisorLifecycleError(
+                    "generated supervisor caller ancestry contains a process cycle"
+                )
+            seen.add(cursor.parent_pid)
+            cursor = _open_process_observation(cursor.parent_pid, parents=parents)
+            opened.append(cursor)
+
+        intermediates = tuple(reversed(opened[1:]))
+        roles = tuple(
+            _classify_intermediate(observation, current=current)
+            for observation in intermediates
+        )
+        if roles not in _ALLOWED_CALLER_ANCESTRIES:
             raise SupervisorLifecycleError(
-                "manual --claim-instance is unsupported without a direct or cmd-hop PowerShell ancestor"
+                "generated supervisor caller launcher order is unsupported"
             )
-        if not (host.creation_ticks <= cmd.creation_ticks <= current.creation_ticks):
-            raise SupervisorLifecycleError("PowerShell/cmd/Python ancestry start times are inconsistent")
+        ordered = (host, *intermediates, current)
+        if any(
+            parent.creation_ticks > child.creation_ticks
+            for parent, child in zip(ordered, ordered[1:], strict=False)
+        ):
+            raise SupervisorLifecycleError(
+                "PowerShell supervisor caller ancestry start times are inconsistent"
+            )
+        if "venv" not in roles:
+            _require_observed_image(
+                current,
+                sys.executable,
+                subject="running Python",
+            )
         return tuple(opened)
     except Exception:
         for observation in opened:
@@ -524,10 +680,11 @@ def checked_powershell_supervisor_observer(
 ) -> Iterator[None]:
     """Authorize one generated-supervisor observation without claiming it.
 
-    The caller must be the Python process launched directly by the selected
-    PowerShell host, or through the generated ``agenttalk.cmd`` hop.  Locks stay
-    held through the caller's field-owned write so selection, process identity,
-    and artifact validation cannot change between authorization and publish.
+    The caller must be the active Python process reached from the selected
+    PowerShell host through one bounded, positively identified generated-shim
+    or installed-entry-point chain.  Locks stay held through the caller's
+    field-owned write so selection, process identity, and artifact validation
+    cannot change between authorization and publish.
     """
     with store._supervisor_lifecycle_lock():
         validate_artifacts()

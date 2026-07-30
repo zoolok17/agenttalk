@@ -24,7 +24,15 @@ EXPECTED_WINDOWS_ONLY = {
         "test_task_install_commit_refuses_concurrent_selection_change",
         "test_task_install_prepare_refuses_different_existing_binding",
         "test_task_uninstall_clears_binding_before_new_name_prepare",
-        "test_validate_ancestry_accepts_direct_and_cmd_hop",
+        "test_validate_ancestry_accepts_base_install_console_script",
+        "test_validate_ancestry_accepts_identified_generated_launch_classes",
+        "test_validate_ancestry_refuses_copied_cmd_and_start_inversion",
+        "test_validate_ancestry_refuses_launcher_identity_read_failure",
+        "test_validate_ancestry_refuses_missing_venv_redirector",
+        "test_validate_ancestry_refuses_replaced_console_script_image",
+        "test_validate_ancestry_refuses_unattributed_console_and_python_launchers",
+        "test_validate_ancestry_refuses_unbounded_or_reordered_launchers",
+        "test_validate_ancestry_refuses_venv_launcher_identity_mismatch",
     },
 }
 
