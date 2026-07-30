@@ -148,6 +148,10 @@ _OWNED_PROCESS_TREE_ROLES = frozenset({
     "cli_launcher",
     "cli_brain",
     "tool_descendant",
+    # #121 reservation only: never infer this label or use it alone for watchdog
+    # exclusion. Registration must bind the job's exact PID/start plus the owning
+    # wrapper's generation/nonce; every terminal outcome, including timeout/kill,
+    # must write durable SHA-bound evidence.
     "detached_gate_runner",
 })
 _OWNED_PROCESS_TREE_STATUSES = frozenset({
