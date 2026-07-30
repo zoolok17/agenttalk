@@ -5499,7 +5499,13 @@ def test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit(
         while time.monotonic() < deadline and not pid_path.exists():
             time.sleep(0.02)
         assert pid_path.exists(), "wrapper never reached its first observable instruction"
-        assert int(pid_path.read_text(encoding="utf-8")) == payload["pid"]
+        worker_pid = int(pid_path.read_text(encoding="utf-8"))
+        assert worker_pid > 0
+        # In an installed-wheel run, sys.executable is a venv launcher:
+        # CreateProcess reports that long-lived launcher's PID while the base
+        # interpreter child executes this code with a different PID (#50).
+        # Pipe closure depends on the launcher staying live and the worker's
+        # output reaching only the selected files, not on PID equality.
         alive = subprocess.run(
             [
                 shell,
