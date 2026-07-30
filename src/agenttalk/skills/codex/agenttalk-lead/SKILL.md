@@ -270,6 +270,22 @@ the agents you plan.
   same scope CORROBORATE one evidence item; they are not two proofs. Disposition rejections,
   needs-info results, and malformed fresh-review output; never rest an approval only on
   another approval.
+- **Read the host's AUTOMATED review findings before you gate - they are a separate
+  channel from CI and from your own reviewers.** Where the code host runs an automated
+  reviewer, its findings usually live as INLINE review comments on the changed lines, NOT in
+  the review body - bodies are often boilerplate, so a lead who reads only the body sees
+  nothing and concludes there is nothing. Fetch the inline comments explicitly for every
+  branch you are about to gate, merge, or approve. Two consequences to plan around:
+  (a) an automated reviewer can be HOURS ahead of a human or peer reviewer on the same
+  defect, so reading it late means paying twice for one finding; and (b) inline comments
+  RE-ANCHOR onto new commits, so an anchor alone does not tell you whether a finding is new
+  - compare the comment's original commit against the current head to separate NEW-ON-HEAD
+  from carried-over, and re-check carried-over ones against current code rather than
+  assuming a later push closed them. Fold each finding to the owning worker and require a
+  per-finding DISPOSITION: fixed (citing the code), already closed (citing the code), or
+  premise wrong (saying why, from the code). Make this a step in the gate, not something you
+  remember - an unread check is not a check, and its mere existence will be mistaken for
+  coverage.
 
 ## Procedure
 
