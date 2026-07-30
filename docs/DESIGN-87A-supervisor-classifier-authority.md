@@ -1,7 +1,7 @@
 # Design 87-A: Supervisor classifier and recovery-authority totality
 
-**Status:** Proposed, Revision 3 after the consolidated Tier-3 fold; design only.
-Nothing in this document is implemented yet.
+**Status:** Proposed, Revision 4 after the first 87-A Tier-3 panel fold; design
+only. Nothing in this document is implemented yet.
 
 **Mode:** Reference.
 
@@ -42,8 +42,8 @@ not erase mandatory escalation.
 
 | Document | Owns | Does not own |
 | --- | --- | --- |
-| 87-A, this document | Classifiers, targetability, authority equations, origin selection, physical-absence confirmation, semantic condition fingerprint, and final-barrier invariants. | Incident persistence/delivery and rollout. |
-| 87-B, future | Incident, promise, projection, and delivery contract. It consumes `escalation_required` and `RecoveryConditionFingerprintV1` from 87-A. | Classifier authority and migration. |
+| 87-A, this document | Runtime, active-child, presence, targetability, heartbeat-freshness, and manual-marker classifiers; classifier continuity state; authority equations; origin selection; physical-absence confirmation; semantic condition record/fingerprint; and final-barrier invariants. | Incident persistence/delivery and rollout. |
+| 87-B, future | Incident, promise, projection, and delivery contract. It consumes `RecoveryConditionV1` and action/result resolution inputs from 87-A. | Classifier authority and migration. |
 | 87-C, future | Activation, compatibility, migration, rollback, and flag-day procedure after 87-A and 87-B are closed. | Classifier and incident semantics. |
 
 **STATED dependencies and ordering:**
@@ -51,10 +51,14 @@ not erase mandatory escalation.
 - Task #114 owns the current cold-start kill-switch exit that precedes instance
   claim. 87-B depends on that task instead of redesigning it.
 - Task #115 owns the missing linearizable supervisor-state read-modify-write
-  lock/API. 87-A specifies a pure absence reducer, but durable poll identity and
-  one-use consumption cannot ship until task #115 supplies that mechanism.
-- Task #116 owns earlier recovery from twice-confirmed physical absence. It must
-  remain independently stageable and must not wait for the rest of Design 87.
+  lock/API. 87-A specifies pure reducers, but durable state epoch/revision,
+  freshness anchors, runtime high-water/latch, confirmation counters, poll
+  identity, consumed manual IDs, absence consumption, and guarded-identity
+  commit cannot ship until task #115 supplies that mechanism.
+- Task #116 owns earlier recovery from twice-confirmed physical absence. It is
+  mechanically blocked on task #115, explicitly not blocked on Design 87, and
+  is scheduled immediately after #115 and before 87-A implementation. It
+  remains independently stageable.
 - The task #81 recovery umbrella preceding Design 87 is consistent with the
   task #94 umbrella-first release policy. 87-A does not challenge that order.
 
@@ -63,13 +67,28 @@ incident retention, state-extension compatibility, executor capability
 activation, migration, rollback, wrapper-writer generations, or a rollout
 runbook. Those concerns must not be reintroduced here.
 
+**STATED dependency-plane constraint:** Implementation adds no daemon,
+persistence plane, or runtime dependency; `pyproject.toml:13` remains
+`dependencies = []`. It may add pure code and fields to the existing checked
+supervisor state after task #115.
+
+The companion
+[`DESIGN-87A-revision-2-disposition.md`](DESIGN-87A-revision-2-disposition.md)
+accounts for every normative Revision 2 requirement as present here, deferred
+to named 87-B/87-C work, or explicitly dropped/replaced. It is a split-integrity
+audit, not another normative specification.
+
 ## Closed inputs that remain closed
 
 **ENFORCED by independent constructors and the dominant-projection matrix:**
-`RuntimeObservation` is derived without heartbeat or process-snapshot evidence.
-`WrapperPresenceResult` is derived from one process observation without runtime
-health or heartbeat. The two values are crossed only after both exist. This
-preserves the closed F1 independence result.
+`RuntimeObservation` is derived without heartbeat or
+`WrapperPresenceResultV1`. Its active-child input is a separate projection from
+process evidence, defined below. `WrapperPresenceResult` is derived from one
+process observation without runtime health or heartbeat. Shared raw snapshot
+rows may feed both private projections, but neither projection may read the
+other's result. Runtime dominant, presence, and freshness are crossed only
+after all three exist. This preserves the closed F1 independence result while
+making the active-child evidence flow explicit.
 
 **ENFORCED by an action-scoped, non-persisted conditional value:**
 `CONDITIONAL_POST_TEARDOWN` resolves synchronously from one guarded teardown
@@ -82,6 +101,7 @@ wrapper PID/start identity and launcher attribution have succeeded and
 `wrapper_state="alive"` has been established
 (`src/agenttalk/supervisor.py:3390-3408` and
 `src/agenttalk/supervisor.py:3478-3484`). It therefore contributes
+`ActiveChildObservationV1.UNKNOWN`, and from there
 `CURRENT_UNKNOWN_ACTIVE_CHILD`, not a `WrapperPresence` state. 87-A does not
 revive the rejected visible-wrapper-attribution framing.
 
@@ -118,18 +138,342 @@ this exact rank, and sets `dominant = reasons[0]`:
 Supplying an inconsistent `(dominant, reasons)` pair is invalid. Authority code
 cannot construct this type directly.
 
-The states retain Revision 2's meanings:
+**ENFORCED state semantics:** Each state is the strict verdict of the runtime
+classifier. “Strict” means that neither heartbeat nor wrapper-presence policy
+may rewrite it.
 
-| State group | Members | Meaning |
-| --- | --- | --- |
-| Positive current contract | `CURRENT_PROGRESS_HEALTHY`, `CURRENT_STALE_RECOVERABLE`, `CURRENT_TEARDOWN_PROOF` | Strict current-schema predicates supply health, stale eligibility, or heartbeat-independent teardown proof. |
-| Current uncertainty | `CURRENT_UNKNOWN_SEQUENCE_REGRESSION`, `CURRENT_UNKNOWN_BINDING`, `CURRENT_UNKNOWN_STARTING_OVERRUN`, `CURRENT_UNKNOWN_ACTIVE_CHILD`, `CURRENT_BLOCKED_STALL`, `CURRENT_UNKNOWN_OTHER` | Current evidence cannot safely prove teardown. |
-| Contract degradation | `CONTRACT_ABSENT`, `UNSUPPORTED_CONTRACT`, `INVALID_CONTRACT` | No current contract may supply health, identity, or teardown authority. |
+| State | Exact meaning |
+| --- | --- |
+| `CURRENT_PROGRESS_HEALTHY` | The complete current schema and binding are valid, and positive current evidence such as advancing adapter progress or bounded spawn grace determines health without heartbeat staleness. |
+| `CURRENT_STALE_RECOVERABLE` | The complete current schema and binding are valid, and the phase/configuration permits authoritative stale heartbeat to complete recovery proof. This includes idle, terminal, and a confirmed active stall whose static guards permit heartbeat recovery. It means “eligible if stale,” not “heartbeat is stale.” Idle and terminal map here for both freshness values. |
+| `CURRENT_TEARDOWN_PROOF` | The complete current schema and binding are valid, and a heartbeat-independent predicate such as confirmed child death or an authoritative watchdog deadline proves recovery is due. |
+| `CURRENT_UNKNOWN_SEQUENCE_REGRESSION` | The same wrapper/turn generation publishes a sequence below persisted high-water or the sticky regression latch is already set. |
+| `CURRENT_UNKNOWN_BINDING` | A strict current record cannot bind to the supervisor-managed wrapper identity. Physical wrapper presence remains independent. |
+| `CURRENT_UNKNOWN_STARTING_OVERRUN` | Phase remains `starting` after bounded spawn grace. |
+| `CURRENT_UNKNOWN_ACTIVE_CHILD` | Active phase cannot bind a uniquely guarded live or positively absent CLI child. |
+| `CURRENT_BLOCKED_STALL` | Progress is stalled, but heartbeat/watchdog recovery guards are not authoritative. |
+| `CURRENT_UNKNOWN_OTHER` | A defensive current-schema tuple is unclassified or internally incoherent. |
+| `CONTRACT_ABSENT` | No runtime artifact exists. This is expected for a pre-contract wrapper, but absence alone does not prove why it is missing. |
+| `UNSUPPORTED_CONTRACT` | A bounded valid envelope identifies a schema version this supervisor does not implement. |
+| `INVALID_CONTRACT` | The record is malformed, torn, internally incoherent, or fails strict current-schema validation. |
+
+The positive `CURRENT_PROGRESS_HEALTHY × PRESENT_*` `HOLD` cells below are
+green health states, not operator-visible recovery holds. More generally,
+`HOLD (strict verdict)` means the current-contract health classifier chose its
+non-recovery state—healthy, working, starting, terminal, suspect, or another
+strict class as defined above. Matrix annotations after `/` are the
+operator-visible recovery dispositions.
 
 Runtime-to-managed-wrapper binding uses only the strict runtime record and
 supervisor-owned managed identity: agent/root, wrapper generation, launcher
-nonce, and guarded recorded PID/start identity. Snapshot evidence never
-participates in this constructor.
+nonce, and guarded recorded PID/start identity. `WrapperPresenceResultV1`
+never participates in this constructor.
+
+### Explicit active-child input
+
+**ENFORCED by a separate private projection:** Process evidence may enter the
+runtime classifier only as:
+
+```text
+ActiveChildObservationV1 =
+  NOT_EVALUATED(NO_STRICT_RECORD | BINDING_UNPROVEN)
+  | NOT_APPLICABLE
+  | LIVE_GUARDED(pid, start_guard, discovery_kind)
+  | ABSENT
+  | UNKNOWN(reason_codes)
+
+ActiveChildRowV1 {
+  pid: integer 1..4294967295 | null
+  parent_pid: integer 1..4294967295 | null
+  start_guard: nonempty NFC UTF-8 string of at most 128 bytes | null
+  image_stem: lowercase NFC UTF-8 string of at most 128 bytes | null
+  row_failures: ordered tuple[
+    PID_INVALID | PARENT_INVALID | START_UNREADABLE | IMAGE_UNREADABLE
+  ]
+}
+```
+
+Its inputs are the strict current runtime record, supervisor-managed identity,
+configured brain matcher/launcher-self policy, and the immutable raw
+`ProcessObservationV1`. Its forbidden inputs are heartbeat,
+`WrapperPresenceResultV1`, `TargetabilityProofV1`, and every presence
+reason/action.
+
+- `NOT_EVALUATED` exists when no strict current record or no proven
+  runtime/managed binding exists. It contributes no child reason, allowing the
+  absent/invalid/unsupported/binding runtime predicate to decide.
+- `NOT_APPLICABLE` exists only for a strict bound non-active runtime phase.
+- `LIVE_GUARDED` requires exactly one live matching child, positively bound to
+  the runtime-declared launcher/turn lineage with a matching PID/start guard,
+  and no additional matching unreadable or ambiguous candidate. PID is an
+  integer in `1..4294967295`, start guard is a nonempty NFC UTF-8 string of at
+  most 128 bytes, and `discovery_kind` is `MATCHED_DESCENDANT` or
+  `LAUNCHER_SELF`.
+- `ABSENT` requires a complete available snapshot, no matching child, and no
+  ambiguous matching candidate.
+- Every other result is `UNKNOWN`, with a deduplicated closed reason tuple in
+  this order: `SNAPSHOT_UNAVAILABLE`, `OBSERVATION_INCONSISTENT`,
+  `MATCHER_CONFIG_INVALID`, `LAUNCHER_IDENTITY_INVALID`,
+  `LAUNCHER_IDENTITY_MISMATCH`, `CHILD_PID_START_AMBIGUOUS`,
+  `MULTIPLE_MATCHES`, `BRAIN_ANCESTRY_AMBIGUOUS`, `OTHER`.
+
+**ENFORCED constructor, evaluated top to bottom:**
+
+1. No strict record or no strict managed binding returns `NOT_EVALUATED`.
+   A strict bound non-active phase returns `NOT_APPLICABLE`.
+2. Active phase requires a positive integer `turn_generation`, positive
+   `cli_launcher_pid`, nonempty bounded `cli_launcher_start`, and a normalized
+   nonempty `brain_pattern` of at most 128 UTF-8 bytes. Invalid launcher fields
+   or matcher config return the corresponding `UNKNOWN`.
+3. `ProcessObservationV1` carries every raw snapshot row through
+   `active_child_rows`. Exact duplicate normalized rows collapse. Conflicting
+   rows with the same positive PID, or two rows that make parentage cyclic,
+   make `active_child_availability=INCOMPLETE` and return
+   `UNKNOWN(OBSERVATION_INCONSISTENT)`. Active-child capture
+   `UNAVAILABLE/INCOMPLETE` returns `UNKNOWN(SNAPSHOT_UNAVAILABLE or
+   OBSERVATION_INCONSISTENT)`; it never returns absence. Presence-only candidate
+   inconsistency cannot change this projection.
+4. When a row with the launcher PID exists, its start guard must match the
+   runtime launcher guard by exact token or the existing ISO representation
+   tolerance of one millisecond. A mismatch is
+   `UNKNOWN(LAUNCHER_IDENTITY_MISMATCH)`. The row may be absent for a forking
+   launcher; direct parent references to its recorded PID remain usable.
+5. A row is a positive descendant candidate only when its known image stem
+   contains the case-folded pattern; it has positive PID and start guard; it is
+   not the launcher; its unique parent chain reaches the recorded launcher PID;
+   and its start compares in the same supported scheme no earlier than the
+   launcher start (one-millisecond ISO tolerance). A launcher row is a positive
+   self candidate only when `allow_launcher_self=true`, its guard matches, and
+   its image matches.
+6. A matching-image row that fails PID/start/ancestry proof is ambiguous. An
+   image-unreadable row whose otherwise valid ancestry reaches the launcher is
+   also ambiguous. Rows with a known nonmatching image and a parent chain that
+   conclusively does not reach the launcher are unrelated.
+7. More than one positive candidate emits `UNKNOWN(MULTIPLE_MATCHES)`. Any
+   ambiguous candidate emits the applicable PID/start reason plus
+   `BRAIN_ANCESTRY_AMBIGUOUS`. Exactly one positive candidate and no ambiguous
+   candidate emits `LIVE_GUARDED`. Zero positive/ambiguous matching candidates
+   under complete capture emits `ABSENT`. The `OTHER` defensive branch catches
+   any representation not matched above.
+
+All matching and ambiguity predicates are evaluated so `UNKNOWN.reason_codes`
+contains every applicable code in the displayed order. The constructor never
+uses wrapper-presence relevance, ownership, or targetability. These subreasons
+are bounded operator diagnostics; all normalize to the single semantic runtime
+reason `CURRENT_UNKNOWN_ACTIVE_CHILD` and do not independently alter the
+banked `RecoveryConditionFingerprintV1` payload.
+
+The runtime mapping is exact:
+
+- `UNKNOWN` contributes `CURRENT_UNKNOWN_ACTIVE_CHILD`;
+- `LIVE_GUARDED` feeds the existing progress/stall predicates;
+- `ABSENT` feeds same-wrapper/turn child-death confirmation—the first
+  qualifying poll contributes `CURRENT_UNKNOWN_ACTIVE_CHILD`, while the second
+  consecutive qualifying poll contributes `CURRENT_TEARDOWN_PROOF`; and
+- `NOT_EVALUATED` and `NOT_APPLICABLE` contribute no active-child reason.
+
+The presence and active-child projections may consume the same immutable raw
+capture but may not consume each other's result. Process-row order, exact
+duplicates, and candidates unrelated to the runtime launcher lineage and brain
+matcher cannot change `ActiveChildObservationV1`; relevant lineage evidence
+may change it. This is the permitted snapshot-to-runtime flow used by
+`_wrapped_liveness` (`src/agenttalk/supervisor.py:3379-3484`).
+
+### Classifier continuity state
+
+**ENFORCED by one pure observation reducer, durably enforceable after task
+#115:**
+
+```text
+RuntimeContinuityStateV1 =
+  NO_BASELINE
+  | BASELINE {
+      wrapper_generation: bounded NFC string
+      turn_generation_high_water: nonnegative integer
+      phase: closed runtime phase
+      progress_sequence_high_water: nonnegative integer
+      progress_seen_epoch: finite nonnegative Unix seconds
+      regression_latched: bool
+    }
+
+ConsecutiveEvidenceV1 {
+  count: integer 0..2
+  basis_digest: Hex64 | null
+  last_capture_id: CaptureIdV1 | null
+}
+
+RecoveryExecutionStateV1 =
+  IDLE
+  | RESERVED {
+      reservation_id: lowercase hyphenated UUID
+      origin: AUTOMATIC | MANUAL_AUTHORIZED
+      request_id: RequestId | null
+      marker_revision_sha256: Hex64 | null
+      authority_id: Hex64
+      authorization_snapshot_id: Hex64 | null
+      execution_gate_snapshot_id: Hex64
+      candidate: KILL_THEN_RELAUNCH | RELAUNCH_ONLY
+      evidence_id: Hex64
+      phase: PRE_BARRIER | SPAWN_IN_FLIGHT
+      prior_guarded_identity_digest: Hex64 | null
+      spawned_guard: SpawnGuardV1 | null
+      pending_attempt_deadline_epoch: finite nonnegative Unix seconds | null
+    }
+  | AMBIGUOUS_LAUNCH {
+      reservation: the complete RESERVED value normalized with
+                   phase = SPAWN_IN_FLIGHT and
+                   pending_attempt_deadline_epoch = null
+      ambiguity_boundary_poll_sequence: uint64
+      evidence: AmbiguousLaunchEvidenceV1
+    }
+
+ManualReadinessStateV1 =
+  NONE
+  | APPLIED_PENDING_READINESS {
+      request_id: RequestId
+      marker_revision_sha256: Hex64
+      committed_managed_generation: bounded NFC string
+    }
+
+SpawnGuardV1 {
+  pid: integer 1..4294967295
+  start_guard: nonempty NFC UTF-8 string of at most 128 bytes
+  launch_reservation_id: lowercase hyphenated UUID
+}
+
+AmbiguousLaunchEvidenceV1 {
+  code: START_RETURNED_WITHOUT_GUARD | IDENTITY_COMMIT_FAILED
+        | CRASHED_DURING_SPAWN
+  observed_guard: SpawnGuardV1 | null
+  first_seen_epoch: finite nonnegative Unix seconds
+}
+
+ClassifierStateV1 {
+  state_epoch: lowercase hyphenated UUID
+  revision: uint64
+  agent_key: NFC canonical agent/root string
+  managed_generation: bounded NFC string | null
+  first_managed_epoch: finite nonnegative Unix seconds
+  launch_grace_until: finite nonnegative Unix seconds | null
+  ordinary_poll_sequence: uint64
+  runtime_continuity: RuntimeContinuityStateV1
+  child_dead_confirmation: ConsecutiveEvidenceV1
+  child_stall_confirmation: ConsecutiveEvidenceV1
+  absence_confirmation: AbsenceConfirmationStateV1
+  consumed_manual_request_ids: bounded ordered set
+  recovery_execution: RecoveryExecutionStateV1
+  manual_readiness: ManualReadinessStateV1
+}
+```
+
+For `origin=AUTOMATIC`, `request_id`, `marker_revision_sha256`, and
+`authorization_snapshot_id` are null. For `origin=MANUAL_AUTHORIZED`, all
+three are non-null. Any other pairing is invalid state and holds recovery.
+`PRE_BARRIER` requires null spawned guard and deadline.
+`SPAWN_IN_FLIGHT` requires a non-null deadline and a null spawned guard; a
+returned guard either commits identity or moves into `AMBIGUOUS_LAUNCH`, whose
+nested copy may carry it while its deadline is null. Any other field/phase
+combination is invalid and holds.
+Thus automatic and manual launches share the same durable reservation,
+in-flight, and ambiguity fence. Manual readiness bookkeeping is orthogonal to
+that ownership fence and cannot authorize or block a later recovery.
+
+`ClassifierObservationDeltaV1` is a field-level pure result limited to
+freshness, runtime continuity, child confirmation, ordinary poll identity, and
+absence-observation fields. It cannot alter `recovery_execution`, consumed
+manual IDs, `manual_readiness`, launch/backoff/readiness, or
+marker/configuration state. `RecoveryAuthorityDeltaV1` is a separate pure
+result that may consume or invalidate absence proof for the named
+reservation/action outcomes, advance execution/launch fields, and update
+manual-readiness bookkeeping only after execution eligibility. Both are
+subtypes of `ClassifierStateDeltaV1`; the checked owner may compose them into
+one transaction when both are allowed. Authority and policy functions remain
+mutation-free. `decision_now_epoch` is the poll's one captured finite
+nonnegative UTC Unix-seconds value. The task #115 checked owner compares
+`(state_epoch, revision)`,
+commits one delta with `revision + 1`, and makes a stale writer reload/re-reduce
+or fail closed; a cached whole-state save may not roll back a newer field.
+The reducer returns `(observations, delta, expected_revision)`. A recovery plan
+binds to the committed successor revision and cannot execute if that exact
+delta did not commit; it must reload/re-reduce rather than combine an old
+runtime/freshness result with newer absence or manual state.
+
+**ENFORCED runtime-continuity transitions, evaluated top to bottom:** Current
+schema `turn_generation` and `progress_sequence` retain the strict runtime
+validator's arbitrary-precision nonnegative-integer domain; active phase
+separately requires `turn_generation > 0`.
+
+1. With `NO_BASELINE`, or with a strict valid bound record whose
+   `wrapper_generation` differs from
+   `RuntimeContinuityStateV1.BASELINE.wrapper_generation`,
+   establish a new baseline, set both generation/sequence high-water values,
+   set `progress_seen_epoch=decision_now_epoch`, clear the regression latch,
+   and reset child confirmation.
+2. For the same wrapper generation, a turn generation below
+   `turn_generation_high_water` preserves the complete baseline, sets the
+   latch, resets child confirmation, and emits
+   `CURRENT_UNKNOWN_SEQUENCE_REGRESSION`. It never becomes a new baseline.
+3. For the same wrapper generation, a turn generation above high-water is the
+   only new-turn transition: advance turn-generation high-water, set sequence
+   high-water to the new record's sequence, persist its phase, set
+   `progress_seen_epoch=decision_now_epoch`, clear the regression latch, and
+   reset child confirmation.
+4. Within the same wrapper and high-water turn, sequence below high-water
+   preserves high-water, phase, and timestamp; sets the latch; resets child
+   confirmation; and emits `CURRENT_UNKNOWN_SEQUENCE_REGRESSION`.
+5. Within the same wrapper and high-water turn, sequence above high-water advances high-water,
+   persists the current phase, sets
+   `progress_seen_epoch=decision_now_epoch`, resets child confirmation, and
+   preserves an already-set latch.
+6. The same wrapper/turn with equal sequence but a changed phase preserves
+   high-water and latch, persists the new phase, sets
+   `progress_seen_epoch=decision_now_epoch`, and resets child confirmation.
+7. The same wrapper/turn with equal sequence and equal phase preserves
+   high-water, timestamp, latch, and eligible confirmation progress.
+8. An absent, invalid, unsupported, unbound, or otherwise unusable current
+   record preserves the complete baseline and latch but resets child-death and
+   stall counters. If latched, reasons contain both sequence regression and
+   the current degradation; the banked rank keeps regression dominant.
+9. Only a strict valid bound different wrapper generation or a strictly higher
+   turn generation clears the latch. Lower-turn replay, torn reads, higher
+   same-turn sequence, heartbeat or snapshot changes, and policy actions cannot
+   clear it. A genuinely new `state_epoch` after irrecoverable state loss has
+   no prior baseline; cross-loss regression detection is not promised.
+
+Child-death confirmation increments only on qualifying consecutive
+same-baseline observations. Stall confirmation increments only on qualifying
+consecutive same-baseline/same-sequence observations. Uncertainty, identity
+change, sequence advance, or an incompatible observation resets the applicable
+counter; each saturates at 2. One invalid read therefore cannot launder a later
+same-turn sequence regression; clearing high-water on such a read is
+nonconforming.
+
+For either counter, `basis_digest` is SHA-256 over
+`agenttalk.supervisor.consecutive-evidence-basis.v1\0` plus
+`CanonicalJsonV1` of exactly:
+
+```text
+{
+  "schema": "consecutive-evidence-basis/v1",
+  "kind": "CHILD_DEAD" | "CHILD_STALL",
+  "state_epoch": <state_epoch>,
+  "managed_generation": <managed_generation>,
+  "wrapper_generation": <wrapper_generation>,
+  "turn_generation": <nonnegative integer turn-generation high-water>,
+  "phase": <phase>,
+  "progress_sequence": <nonnegative integer>,
+  "active_child_config_digest": <Hex64>
+}
+```
+
+The config digest covers the canonical brain matcher, launcher-self policy,
+row schema, ancestry algorithm version, and start-guard schema. A qualifying
+capture has `capture_ordinal=0`. Replay of `last_capture_id` is unchanged. A
+distinct capture with the same basis advances only when its committed ordinary
+poll sequence is exactly one greater; a gap or changed basis restarts at count
+1. Nonqualifying evidence resets to `(0, null, null)`. Count 2 is the only
+confirmed value. Cached capture replay and stale re-reduction therefore cannot
+manufacture teardown proof.
 
 ### One operand convention
 
@@ -191,6 +535,110 @@ No agent, identity, lifecycle, health, target, timing, or authority field is
 salvaged from an unsupported record. An unsupported version can never grant
 health, teardown, or replacement authority.
 
+## Heartbeat freshness
+
+**ENFORCED by a closed input and pure freshness reducer:**
+
+```text
+HeartbeatRawCaptureV1 =
+  ABSENT
+  | PRESENT_TIMESTAMP(timestamp_epoch: finite Unix seconds)
+  | INVALID(reason: HeartbeatInvalidReasonV1)
+
+HeartbeatInvalidReasonV1 =
+  UNREADABLE | SIZE | BOM_OR_NUL | UTF8 | EMPTY | TIMESTAMP | TIMEZONE
+  | NONFINITE | FUTURE_SKEW | ARITHMETIC
+
+HeartbeatEvidenceV1 =
+  OBSERVED(authoritative_age_seconds: finite non-Boolean number >= 0)
+  | MISSING
+  | INVALID_OR_FUTURE_SKEW(reason: HeartbeatInvalidReasonV1)
+
+HeartbeatFreshnessV1 = FRESH | STALE
+
+FreshnessStateV1 {
+  first_managed_epoch: finite nonnegative Unix seconds
+  launch_grace_until: finite nonnegative Unix seconds | null
+}
+```
+
+**ENFORCED raw constructor:** One bounded file capture distinguishes path
+absence alone as `ABSENT`. File-kind/path/I/O failure is
+`INVALID(UNREADABLE)`. The reader accepts at most 128 bytes, UTF-8 without BOM
+or NUL, trims surrounding Unicode whitespace, and requires a nonempty
+timezone-aware ISO-8601 timestamp accepted by the current
+`datetime.fromisoformat` grammar after terminal `Z` is normalized to `+00:00`.
+The displayed invalid-reason order is precedence when multiple failures are
+observable. Conversion to Unix seconds must be finite; range/overflow is
+`NONFINITE` or `ARITHMETIC`.
+
+`decision_now_epoch` is captured once for the poll. The existing
+`resolve_stuck_after` precedence supplies `resolved_stuck_after_seconds`, but
+each configured candidate must be a finite non-Boolean numeric value at least
+zero; an invalid per-agent/global candidate is skipped and the existing
+wrapped-CLI or 120-second built-in default applies.
+The existing per-agent/global health-timing precedence similarly supplies
+`resolved_heartbeat_skew_seconds`; a configured candidate is accepted only
+when it is finite, non-Boolean, and nonnegative, otherwise resolution continues
+to the next candidate and finally the existing 30-second default. An observed
+heartbeat timestamp later than
+`decision_now_epoch + resolved_heartbeat_skew_seconds` is
+`INVALID_OR_FUTURE_SKEW`; one inside that tolerance has
+`authoritative_age_seconds = max(0, decision_now_epoch - timestamp_epoch)`.
+`OBSERVED` requires that resulting age to be finite and nonnegative.
+`ABSENT` maps only to `MISSING`; every `INVALID` raw capture, excessive future
+skew, nonfinite subtraction, and arithmetic failure maps to
+`INVALID_OR_FUTURE_SKEW` with its exact reason. No invalid input can become
+`MISSING` or `OBSERVED`.
+`resolved_launch_grace_seconds` is the configured finite non-Boolean numeric
+value in `0..86400`, otherwise the existing 120-second default. The checked
+state owner initializes `first_managed_epoch` exactly once on the first
+committed classifier poll for every configured managed `(state_epoch,
+agent_key)`, even when runtime, heartbeat, report, and snapshot are missing.
+It does not wait for first launch. Missing heartbeat, runtime failure, snapshot
+failure, ordinary polling, and process absence cannot rewrite it.
+
+```text
+grace_deadline =
+  launch_grace_until
+    if a real launch was atomically committed for the current managed generation
+  else first_managed_epoch + resolved_launch_grace_seconds
+
+within_grace = decision_now_epoch < grace_deadline
+
+heartbeat_within_threshold =
+  evidence is OBSERVED
+  and authoritative_age_seconds <= resolved_stuck_after_seconds
+
+freshness =
+  FRESH if within_grace or heartbeat_within_threshold
+  else STALE
+```
+
+Age exactly equal to the threshold is fresh; grace expires exactly at its
+deadline. `MISSING`, malformed, or excessive-future-skew heartbeat has no
+age-based freshness and is fresh only inside applicable grace. A committed
+real launch atomically writes its generation-specific `launch_grace_until`.
+
+Irrecoverable state loss may create a new `state_epoch` and one new
+`first_managed_epoch`; no later poll in that epoch may renew it. The guarantee
+is convergence after the last state loss, not during continuous state loss.
+Thus repeated missing heartbeat and unavailable snapshots eventually yield:
+
+```text
+runtime.dominant = CONTRACT_ABSENT
+presence = UNKNOWN
+decision_now_epoch >= first_managed_epoch + resolved_launch_grace_seconds
+=> freshness = STALE
+=> stale_uncertainty = true
+=> escalation_required = true
+```
+
+No additional chronic-failure counter is required: the nonrenewable anchor is
+the finite bound. 87-B owns durable projection of that required escalation,
+and 87-C may not activate this classifier until that projection is
+capability-active.
+
 ## Shared process observation
 
 ### Capture and candidate universe
@@ -210,6 +658,11 @@ ProcessObservationV1 {
   coverage: ObserverCoverageSignatureV1 | null
   recorded_identity: ABSENT | PRESENT_MATCH | AMBIGUOUS_OR_REUSED | UNKNOWN
   candidates: full tuple[RelevantCandidateV1]
+  active_child_availability: COMPLETE | INCOMPLETE | UNAVAILABLE
+  active_child_rows: full tuple[ActiveChildRowV1]
+  active_child_failures: tuple[
+    SNAPSHOT_UNAVAILABLE | OBSERVATION_INCONSISTENT
+  ]
 }
 ```
 
@@ -217,6 +670,18 @@ ProcessObservationV1 {
 `SNAPSHOT_UNAVAILABLE`, `COVERAGE_INCOMPLETE`,
 `OBSERVATION_INCONSISTENT`. `coverage` is non-null only when both required
 coverage channels are complete. Failure reasons are deduplicated in that order.
+`active_child_availability`, `active_child_rows`, and
+`active_child_failures` form an independently derived closed projection
+consumed only by `ActiveChildObservationV1`. Its allowed combinations mirror
+the three availability forms above: complete has the full normalized row tuple
+and no failure; unavailable has an empty row tuple and only
+`SNAPSHOT_UNAVAILABLE`; incomplete retains all safely representable rows and
+has only `OBSERVATION_INCONSISTENT`. A global raw snapshot acquisition failure
+is copied into both availability projections. A presence-only candidate parse,
+recognition, ownership, or deduplication defect cannot alter the active-child
+projection; an active-child-only lineage/matcher defect cannot alter
+`availability`, `observer_reasons`, `candidates`, wrapper presence, or
+targetability.
 
 The private observer constructor permits only:
 
@@ -598,6 +1063,132 @@ This is the normative answer to Lens A's failed-post-teardown-scan question.
 
 ## Authority derivation
 
+### Global execution eligibility
+
+**ENFORCED after the pure classifier observation delta and before
+automatic/manual selection or any recovery-authority delta:**
+
+```text
+ExecutionEligibilityV1 =
+  DRY_RUN
+  | KILL_SWITCH_ACTIVE
+  | SUPERVISOR_STOPPED
+  | ACTIONS_DISABLED
+  | AGENT_NOT_REPORTED
+  | AUTO_RESTART_DISABLED
+  | ELIGIBLE
+
+ExecutionGateCaptureV1 {
+  dry_run: bool
+  kill_switch: CLEAR | ACTIVE_OR_UNREADABLE
+  supervisor_instance:
+    CURRENT(token_digest, guarded_pid, guarded_start) | STOPPED_OR_UNREADABLE
+  action_latch: ENABLED(action_epoch: uint64) | DISABLED
+  report_membership: PRESENT | ABSENT | UNREADABLE
+  auto_restart: ENABLED | DISABLED_OR_UNREADABLE
+  snapshot_id: Hex64
+}
+```
+
+**ENFORCED capture sources:** `dry_run` is the immutable invocation flag.
+`kill_switch` is `CLEAR` only when the supervisor kill-switch path is
+positively absent; presence, file-kind ambiguity, or path/I/O failure is
+`ACTIVE_OR_UNREADABLE`. `supervisor_instance` is `CURRENT` only when the
+executor is in its in-memory `RUNNING` phase and the freshly read instance
+record exactly matches its claim token plus guarded PID/start; shutdown,
+release, mismatch, or read/validation failure is `STOPPED_OR_UNREADABLE`.
+
+The executor owns an atomic `action_latch`. It becomes enabled with a fresh
+monotonic `action_epoch` only after instance claim and action-subsystem
+initialization. It is set disabled before shutdown/claim release and after a
+fatal executor-state failure. The action issuer takes its shared read guard;
+shutdown/disabling takes the exclusive write guard. `report_membership` comes
+from one freshly validated report image and is `UNREADABLE` on read/schema
+failure. `auto_restart` comes from the same configuration-lock image used for
+manual authorization and is enabled only for exact Boolean `true`; a
+read/schema failure is disabled.
+
+`snapshot_id` hashes
+`agenttalk.supervisor.execution-gate-snapshot.v1\0` plus `CanonicalJsonV1` of
+exactly:
+
+```text
+{
+  "schema": "execution-gate-snapshot/v1",
+  "dry_run": <bool>,
+  "kill_switch": "CLEAR" | "ACTIVE_OR_UNREADABLE",
+  "supervisor_instance": {
+    "state": "CURRENT" | "STOPPED_OR_UNREADABLE",
+    "token_digest": <Hex64 | null>,
+    "pid": <integer 1..4294967295 | null>,
+    "start_guard": <bounded nonempty NFC string | null>
+  },
+  "action_latch": {
+    "state": "ENABLED" | "DISABLED",
+    "epoch": <uint64 | null>
+  },
+  "report_membership": "PRESENT" | "ABSENT" | "UNREADABLE",
+  "auto_restart": "ENABLED" | "DISABLED_OR_UNREADABLE"
+}
+```
+
+`STOPPED_OR_UNREADABLE` requires null token digest, PID, and start guard;
+`DISABLED` requires null epoch. The claim token itself is represented only by
+its SHA-256 digest. The payload excludes timestamps and unrelated report/config
+fields, so equivalent recaptures match.
+
+The eligibility constructor evaluates the displayed variant precedence:
+`DRY_RUN` from `dry_run`; `KILL_SWITCH_ACTIVE` unless kill switch is clear;
+`SUPERVISOR_STOPPED` unless the instance is current; `ACTIONS_DISABLED` when
+the action latch is disabled or report/config capture is unreadable;
+`AGENT_NOT_REPORTED` for report absence; `AUTO_RESTART_DISABLED` unless exact
+Boolean true; otherwise `ELIGIBLE`. Only `ELIGIBLE` may reserve/consume
+authority, mutate a restart marker, teardown, launch, seed managed identity, or
+update launch/backoff/readiness state.
+
+`DRY_RUN` may compute and display a pure simulated decision but discards every
+`ClassifierObservationDeltaV1`; it performs no state/event/marker/config
+persistence. For every other value, the checked owner may first commit the
+observation-only fields of `ClassifierObservationDeltaV1`, including the
+nonrenewable freshness anchor, continuity, and confirmation resets. That
+observation commit cannot reserve or consume an absence/manual proof or alter
+manual execution, launch, backoff, readiness, marker, or configuration state.
+This ordering lets `AGENT_NOT_REPORTED` converge to stale uncertainty instead
+of recreating the F7 first-launch outage.
+
+`KILL_SWITCH_ACTIVE` then forbids every recovery and marker/config/seeding
+mutation. The future 87-B narrow observational path may persist and project a
+mandatory condition under the kill switch; 87-A grants that path no recovery
+authority. The other noneligible values are visible no-action holds and perform
+no recovery-authority or marker mutation.
+
+These are population/executor gates and manual origin cannot override them.
+They differ from the later per-agent configuration-blocked and lead-loop
+stand-down holds, which an eligible authorized manual request may override.
+Task #114 owns moving the shipped kill-switch exit behind instance claim so the
+87-B observational exception can exist.
+
+**ENFORCED action-time fence:** Reservation stores the eligible
+`snapshot_id`. Under the configuration lock and action-latch read guard, the
+executor recaptures eligibility and requires `ELIGIBLE` with the same semantic
+snapshot ID immediately before issuing any guarded termination and again
+immediately before `Start-Process`; manual origin also repeats live
+authorization. At both manual fences, raw capture must still be
+`PRESENT_VALID` with request ID and `revision_sha256` exactly equal to the
+reservation, and authorization must still be `AVAILABLE` with
+`snapshot_id == reservation.authorization_snapshot_id`. Deletion, replacement,
+unreadability, or any semantically different authorization snapshot is a
+veto—even when the new requester would independently be authorized.
+
+The executor reruns the origin-applicable policy gates and performs no
+intervening wait between the final check and OS action issuance. It retains the
+configuration lock and action-latch read guard through issuance, then releases
+them before any process-completion wait. A mismatch or noneligible result
+aborts the action, records a typed veto, releases the reservation, leaves any
+still-matching manual marker pending, and leaves any one-use absence proof
+consumed. If teardown already completed, it still refuses spawn and later
+recovery must rebuild ordinary absence proof.
+
 ### Dominant-only automatic predicates
 
 **ENFORCED by these equations:**
@@ -646,58 +1237,391 @@ the automatic equation must not reconstruct that invariant.
 
 ### Manual marker disposition and overlap
 
-**ENFORCED by one pre-combiner marker classifier:**
+The existing `Store.read_restart_request` collapses absent, malformed,
+non-object, and `OSError` inputs to `None`
+(`src/agenttalk/store.py:5724-5733`). It is not a conforming reader for 87-A.
+
+**ENFORCED raw capture:**
+
+```text
+ManualMarkerCaptureV1 =
+  ABSENT
+  | PRESENT_VALID(marker: ManualRestartMarkerV1, revision_sha256: Hex64)
+  | PRESENT_INVALID(reason: ManualMarkerInvalidReasonV1)
+  | UNREADABLE(reason: ManualMarkerReadErrorV1)
+```
+
+`ManualMarkerInvalidReasonV1` is the closed ordered enum `SIZE`, `BOM`,
+`UTF8`, `JSON`, `DUPLICATE_KEY`, `TOP_LEVEL`, `SCHEMA`, `FIELD`,
+`REQUEST_ID`, `TIMESTAMP`. `ManualMarkerReadErrorV1` is `LOCK_FAILURE`,
+`UNSAFE_FILE_KIND`, `IO_ERROR`, `PATH_RACE`, in that order. If more than one
+failure is observable, the first in the applicable displayed order is emitted.
+
+The reader acquires the existing configuration lock shared by marker write and
+compare-clear, returns `ABSENT` only when the path is absent under that lock,
+rejects a directory, symlink/reparse point, or other non-regular file, and
+reads at most 16 KiB. Empty/oversized content is
+`PRESENT_INVALID(SIZE)`. It requires UTF-8 without BOM, a single JSON top-level
+object, and duplicate-key rejection. I/O or path-generation races are
+`UNREADABLE`, never `ABSENT`. An accepted object carries SHA-256 of its exact
+bytes as `revision_sha256`; reservation and compare-clear match both request ID
+and revision.
+
+Implementation has one private `capture_manual_marker_locked` primitive whose
+precondition is “configuration lock held” and one public wrapper that acquires
+the lock. Write, reservation, and compare-clear call the private primitive;
+they never recursively acquire the non-reentrant configuration lock.
+
+**ENFORCED exact marker schema:** Unknown or missing keys are invalid.
+
+```text
+ManualRestartMarkerV1 {
+  "schema_version": 1,
+  "agent": AgentName,
+  "request_id": RequestId,
+  "source": "manual",
+  "requested_by": AgentName,
+  "authorized_by": AgentName,
+  "authority_result": "authorized",
+  "authority_reason": "operator_facing" | "sole_lead",
+  "issued_at_epoch_ms": uint64,
+  "expires_at_epoch_ms": uint64,
+  "force_protected": bool,
+  "force_protected_authorized": bool,
+  "force_protected_authorized_by": AgentName | null,
+  "acknowledge_live_protected_kill": bool,
+  "acknowledge_live_protected_kill_authorized": bool,
+  "acknowledge_live_protected_kill_by": AgentName | null,
+  "reason": string
+}
+```
+
+`AgentName` matches `\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\z`; marker `agent`
+equals the configured target. `RequestId` matches `\Arr-[0-9a-f]{12}\z`,
+matching the current producer shape. `requested_by == authorized_by`;
+`authority_result == "authorized"`. `reason` is at most 1,024 UTF-8 bytes and
+contains no NUL. For each protection/acknowledgement triple, a false requested
+Boolean requires false authorization and null `*_by`; a true requested Boolean
+requires true authorization and `*_by == requested_by`.
+
+The version and integer millisecond timestamps replace the current unversioned,
+mixed timestamp marker. 87-C owns producer migration and may not activate this
+reader until every active producer writes this schema.
+
+**ENFORCED clock and expiry:** The poll captures one UTC wall-clock integer
+`decision_now_epoch_ms`.
+
+```text
+MANUAL_MARKER_TTL_MS_V1 = 300000
+MAX_FUTURE_SKEW_MS_V1 = 30000
+
+expires_at_epoch_ms == issued_at_epoch_ms + MANUAL_MARKER_TTL_MS_V1
+issued_at_epoch_ms <= decision_now_epoch_ms + MAX_FUTURE_SKEW_MS_V1
+not_expired = decision_now_epoch_ms < expires_at_epoch_ms
+```
+
+Both timestamps must be exact JSON integers (not Boolean), addition must not
+overflow `uint64`, and both displayed relations must hold. Overflow, a
+mismatched expiry, or issue time beyond allowed future skew is
+`PRESENT_INVALID(TIMESTAMP)` and therefore `INVALID_HELD`; it never reaches the
+gate list as a valid marker. A structurally valid marker with
+`decision_now_epoch_ms >= expires_at_epoch_ms` is `EXPIRED_HELD`.
+
+The marker expires at the exact deadline. Five minutes is five times the
+maximum 60-second restart cooldown: it permits a bounded retry window without
+preserving destructive intent indefinitely. An expired marker remains a
+visible manual hold until removed or replaced; it cannot fall through to
+automatic teardown.
+
+**ENFORCED live authorization revalidation:** Planning and immediate
+pre-reservation execution independently capture:
+
+```text
+ManualAuthorizationSnapshotV1 =
+  UNAVAILABLE(CONFIG_LOCK_FAILURE | CONFIG_UNREADABLE | CONFIG_INVALID)
+  | AVAILABLE {
+      agent: AgentName
+      operator_facing: AgentName | null
+      sole_lead: AgentName | null
+      protected: bool
+      snapshot_id: Hex64
+    }
+```
+
+The constructor acquires the configuration lock and loads one configuration
+image. Lock, read, or schema/roster/role failure returns `UNAVAILABLE` with the
+displayed reason; unavailable authorization is always false and holds recovery.
+For an available snapshot:
+
+- `operator_facing` is the configured value only when it names a member of the
+  validated roster, otherwise null;
+- `sole_lead` is the roster member whose role case-folds to `lead` only when
+  exactly one such member exists, otherwise null; and
+- `protected` is true exactly when the target is `operator_facing` or any
+  roster member whose role case-folds to `lead`. Multiple leads therefore all
+  remain protected even though `sole_lead` is null.
+
+These values come from the same configuration image as `auto_restart` and
+cannot come from a cached report Boolean. `snapshot_id` hashes the domain
+`agenttalk.supervisor.manual-authorization-snapshot.v1\0` plus
+`CanonicalJsonV1` of exactly:
+
+```text
+{
+  "agent": <AgentName>,
+  "operator_facing": <AgentName | null>,
+  "protected": <bool>,
+  "sole_lead": <AgentName | null>
+}
+```
+
+Planning and action-time revalidation both use this constructor.
+For manual origin, each execution-gate/manual-authorization pair is derived
+from one configuration-lock acquisition and one configuration image.
+
+```text
+base_authorized =
+  snapshot is AVAILABLE
+  and (
+  if operator_facing is a valid roster member:
+    requested_by == operator_facing
+  else:
+    sole_lead != null and requested_by == sole_lead
+  )
+
+basis =
+  "operator_facing" when the first branch applies
+  else "sole_lead"
+
+base_revalidated =
+  base_authorized
+  and basis == marker.authority_reason
+
+force_authorized =
+  base_revalidated
+  and marker.force_protected
+  and marker.force_protected_authorized
+  and marker.force_protected_authorized_by == requested_by
+
+live_kill_ack_authorized =
+  base_revalidated
+  and requested_by == operator_facing
+  and marker.acknowledge_live_protected_kill
+  and marker.acknowledge_live_protected_kill_authorized
+  and marker.acknowledge_live_protected_kill_by == requested_by
+```
+
+The second snapshot must be available and have the same `snapshot_id` as
+planning or the candidate is discarded and reclassified. Stored authorization
+is audit evidence, never current authority. This preserves the current base
+authorization source (`src/agenttalk/supervisor.py:590-638` and `:965-985`).
+
+Every transition spanning marker/config and supervisor state uses one lock
+order: configuration lock, action-latch read guard when an execution snapshot
+is involved, then task #115's checked state transaction; release in reverse.
+Reservation rereads marker bytes/revision and current authorization under the
+held configuration lock before committing state. No 87-A caller may acquire
+configuration state or the action guard while already holding the checked
+state lock. Shutdown takes the action-latch write guard without holding either
+other lock. This makes marker replacement, authority/gate change, and state
+reservation one fail-closed comparison without a lock cycle.
+
+**ENFORCED candidate before acknowledgement applicability:**
+
+```text
+manual_candidate =
+  KILL_THEN_RELAUNCH
+    if presence == PRESENT_TARGETABLE
+    and targetability is COMPLETE
+  else RELAUNCH_ONLY
+    if PhysicalAbsenceProofV1 is CONFIRMED
+  else SAFETY_HELD
+
+force_required =
+  protected
+  and manual_candidate in {KILL_THEN_RELAUNCH, RELAUNCH_ONLY}
+
+live_kill_ack_required =
+  protected
+  and manual_candidate == KILL_THEN_RELAUNCH
+  and selected_targets is nonempty
+```
+
+A protected confirmed-absence no-kill restart needs force authorization, but
+not acknowledgement of a kill that will not occur. Freshness alone never makes
+the live-kill acknowledgement applicable.
+
+**STATED policy strengthening:** Shipped behavior requires the protected
+live-kill acknowledgement only while heartbeat is fresh
+(`src/agenttalk/supervisor.py:4452-4458`). 87-A deliberately requires it for
+every selected protected `KILL_THEN_RELAUNCH`, fresh or stale. Once a
+destructive action is selected, heartbeat age does not make killing a live
+protected process less destructive. This does not widen authority; it adds a
+hold. The confirmed-absence `RELAUNCH_ONLY` case remains exempt because it
+kills nothing.
 
 ```text
 ManualMarkerDispositionV1 =
   ABSENT
-  | PENDING_AUTHORIZED
-  | INVALID_OR_UNAUTHORIZED
-  | PROTECTION_ACK_REQUIRED
-  | COOLDOWN_HELD
+  | INVALID_HELD(ManualMarkerInvalidReasonV1)
+  | UNREADABLE_HELD(ManualMarkerReadErrorV1)
   | CONSUMED
+  | EXPIRED_HELD
+  | UNAUTHORIZED_HELD
+  | SAFETY_HELD
+  | FORCE_REQUIRED_HELD
+  | LIVE_KILL_ACK_REQUIRED_HELD
+  | COOLDOWN_HELD
+  | PENDING_AUTHORIZED(KILL_THEN_RELAUNCH | RELAUNCH_ONLY)
 ```
 
-The classifier evaluates this exact precedence:
+Its `CanonicalJsonV1` form is exactly
+`{"candidate": <action or null>, "reason": <reason enum or null>,
+"state": <variant name>}`. `reason` is non-null only for `INVALID_HELD` and
+`UNREADABLE_HELD`; `candidate` is non-null only for `PENDING_AUTHORIZED`.
 
-1. no marker file is `ABSENT`;
-2. a present but malformed/incomplete marker, invalid request ID, or missing,
-   mismatched, or expired requester/authorizer evidence is
-   `INVALID_OR_UNAUTHORIZED`;
-3. missing or expired protected-agent force authorization is
-   `PROTECTION_ACK_REQUIRED`;
-4. an otherwise valid request ID already in the consumed set is `CONSUMED`;
-5. missing live-protected-kill acknowledgement is
-   `PROTECTION_ACK_REQUIRED`;
-6. an unexpired restart cooldown is `COOLDOWN_HELD`; and
-7. the remaining valid marker is `PENDING_AUTHORIZED`.
+**ENFORCED total marker/gate precedence:**
 
-A pending manual marker is highest authority priority, preserving the current
-explicit-request precedence at `src/agenttalk/supervisor.py:4422-4479`:
+1. `ABSENT`: automatic authority may proceed.
+2. `PRESENT_INVALID` or `UNREADABLE`: `INVALID_HELD` or `UNREADABLE_HELD`;
+   visible manual-origin `HOLD`; retain the path; no automatic fallthrough.
+3. A valid request ID already in the committed consumed set: `CONSUMED`; no
+   manual bypass; automatic authority may proceed.
+4. Expired marker or failed planning revalidation: `EXPIRED_HELD` or
+   `UNAUTHORIZED_HELD`; visible `HOLD`; no fallthrough.
+5. `SAFETY_HELD` because presence is unknown/untargetable or proof incomplete:
+   visible `HOLD`; no fallthrough.
+6. Missing required protected force: `FORCE_REQUIRED_HELD`; visible `HOLD`; no
+   fallthrough.
+7. Missing applicable live-kill acknowledgement:
+   `LIVE_KILL_ACK_REQUIRED_HELD`; visible `HOLD`; no fallthrough.
+8. Let `raw_cooldown` be `config.restart_cooldown_seconds` when it is a finite
+   numeric non-Boolean, otherwise `45`; restart cooldown is
+   `min(60, max(30, float(raw_cooldown)))`. Thus configured zero becomes 30,
+   matching shipped normalization. A missing or null `last_launch_epoch` means
+   there is no prior-launch cooldown. A Boolean, negative, nonfinite, or
+   future-valued `last_launch_epoch` is invalid classifier state and produces
+   `SAFETY_HELD`. Otherwise its finite nonnegative value holds while
+   `decision_now_epoch - last_launch_epoch < cooldown`; retain marker and do
+   not fall through as `COOLDOWN_HELD`.
+9. A surviving candidate is `PENDING_AUTHORIZED(candidate)` and selects
+   `MANUAL_AUTHORIZED`.
+10. Manual origin overrides configuration hold and lead-loop stand-down for
+    this attempt, bypasses automatic backoff, and resets readiness give-up. It
+    cannot override targetability, start guards, protection authorization,
+    cooldown, or the final barrier.
 
-| Marker disposition | Authority/origin rule |
-| --- | --- |
-| `PENDING_AUTHORIZED` and manual targetability/protection requirements pass | Derive manual teardown or manual no-kill timing; select `MANUAL_AUTHORIZED`. |
-| `PENDING_AUTHORIZED` but a manual-specific safety or policy gate fails | `HOLD` under manual origin; do not fall through to automatic teardown in the same poll. |
-| `INVALID_OR_UNAUTHORIZED`, `PROTECTION_ACK_REQUIRED`, or `COOLDOWN_HELD` | Visible refusal/hold; do not fall through to automatic teardown in the same poll. |
-| `ABSENT` | Automatic authority may be selected. |
-| `CONSUMED` | No manual bypass remains; ordinary automatic classification may proceed, matching current fall-through behavior. |
-
-Manual teardown still requires `TargetabilityProofV1.COMPLETE`, nonempty exact
-targets, existing request/authority validation, protected-agent force
-authorization, and live-kill acknowledgement where applicable. A marker never
-changes presence or targetability.
-
-If both manual and automatic teardown candidates are allowed:
+If manual and automatic teardown are both allowed, the selector emits exactly
+one manual teardown and one manual authority ID:
 
 ```text
 selected_teardown = manual_teardown
 origin = MANUAL_AUTHORIZED
 ```
 
-Exactly one teardown is emitted. `CONDITIONAL_POST_TEARDOWN` binds to that
-manual authority ID; automatic evidence remains diagnostic only. Derivation or
-iteration order cannot change origin.
+The authority ID is SHA-256 over
+`agenttalk.supervisor.manual-authority.v1\0` plus `CanonicalJsonV1` of exactly:
+
+```text
+{
+  "schema": "manual-authority/v1",
+  "request_id": <RequestId>,
+  "marker_revision_sha256": <Hex64>,
+  "candidate": "KILL_THEN_RELAUNCH" | "RELAUNCH_ONLY",
+  "evidence_id": <targetability candidate_digest for kill,
+                  absence confirmation_id for no-kill>,
+  "authorization_snapshot_id": <Hex64>
+}
+```
+
+Automatic origin uses `AutomaticAuthorityIdV1`, SHA-256 over
+`agenttalk.supervisor.automatic-authority.v1\0` plus `CanonicalJsonV1` of
+exactly:
+
+```text
+{
+  "schema": "automatic-authority/v1",
+  "state_epoch": <ClassifierStateV1.state_epoch>,
+  "committed_revision": <revision containing the selected observations>,
+  "condition_fingerprint": <RecoveryConditionFingerprintV1>,
+  "candidate": "KILL_THEN_RELAUNCH" | "RELAUNCH_ONLY",
+  "evidence_id": <targetability candidate_digest for kill,
+                  absence confirmation_id for no-kill>
+}
+```
+
+`CONDITIONAL_POST_TEARDOWN` binds to the selected origin's ID. When manual wins
+an overlap, the losing automatic candidate remains diagnostic only. Evaluation
+order cannot change origin.
+
+**ENFORCED state deltas after task #115:** Both origins enter
+`RecoveryExecutionStateV1`; the checked owner applies these transitions and no
+executor branch may save a cached whole state.
+
+Reservation has the exact precondition `recovery_execution == IDLE`.
+`RESERVED/PRE_BARRIER`, `RESERVED/SPAWN_IN_FLIGHT`, and `AMBIGUOUS_LAUNCH`
+reject every new automatic or manual reservation without mutation, even after
+a CAS loser reloads and re-reduces. `manual_readiness` is orthogonal
+bookkeeping: `NONE` and `APPLIED_PENDING_READINESS` both permit a new
+reservation when `recovery_execution == IDLE`; replacing that bookkeeping
+during a later launch cannot make its consumed request ID reusable.
+
+| Transition | Exact delta |
+| --- | --- |
+| Refused/held | Retain marker/revision. Do not reserve, consume, kill, launch, reset readiness, or mutate automatic backoff. |
+| Reserve selected authority | Record the complete origin-specific `RESERVED/PRE_BARRIER` value, including current execution-gate snapshot ID, with null spawn guard/deadline; atomically consume selected absence proof; do not add a manual request ID to the committed consumed set. |
+| Teardown failure, action-time gate veto, or final-barrier veto | Release reservation; retain any marker; leave launch/readiness/backoff fields unchanged. A reserved no-kill absence proof remains consumed. |
+| Barrier passed, immediately before spawn | Increment `consecutive_fails`; compute normal future automatic backoff while bypassing it for this attempt; clear `healthy_since`; set readiness fields to false/zero and `launching=true`; reset child confirmation; commit `phase=SPAWN_IN_FLIGHT` and `pending_attempt_deadline_epoch=decision_now_epoch + resolved_launch_grace_seconds`. Preserve prior guarded identity. The pending deadline is never heartbeat freshness. Only after this commit may `Start-Process` run. |
+| Proven no-spawn failure | Only an OS/API result that positively proves no child was created may set `launching=false`, release reservation, retain any marker and attempt/backoff bookkeeping, preserve prior guarded identity, clear the pending deadline, and record the typed failure result. Timeout, exception, lost return, or any uncertain post-issuance effect enters `AMBIGUOUS_LAUNCH` instead. |
+| Spawn returned but guarded identity is ambiguous | Persist `AMBIGUOUS_LAUNCH` with the complete reservation, any returned `SpawnGuardV1`, a null pending deadline, and `ambiguity_boundary_poll_sequence=ordinary_poll_sequence`; reset `absence_confirmation` to `EMPTY`. Do not release authority ownership or permit another launch. |
+| New guarded identity commits | In one checked transaction replace the managed identity, clear stale brain identity, set `launch_grace_until=decision_now_epoch + resolved_launch_grace_seconds`, and set `recovery_execution=IDLE`. Manual origin also adds the request ID to the consumed set and sets `manual_readiness=APPLIED_PENDING_READINESS` for this exact generation. If an automatic commit supersedes a different pending manual generation, it records `manual_readiness_superseded`, sets `manual_readiness=NONE`, and leaves that marker untouched; otherwise it preserves the bookkeeping. |
+| Readiness observed | Only guarded readiness whose managed generation exactly equals `committed_managed_generation` satisfies the pending manual-readiness value. Compare-clear that marker using request ID plus revision, record `readiness_seen`, and set `manual_readiness=NONE`; a replaced marker is untouched. Readiness for any other generation cannot clear the marker or satisfy the request. |
+
+The consumed set retains the latest 128 IDs in checked commit-revision order
+and evicts the oldest; the five-minute TTL prevents an evicted ancient marker
+from regaining authority. Every failure leaves the marker pending. A consumed
+no-kill absence proof must be rebuilt from two ordinary polls. Consumed-set
+mutation and guarded-identity commit are both task #115-dependent.
+
+**ENFORCED crash/reload and ambiguity rules:**
+
+- Reload of `RESERVED/PRE_BARRIER` releases that reservation; no spawn was
+  permitted. Any consumed absence proof stays consumed.
+- Before invoking `Start-Process`, the checked state must already say
+  `SPAWN_IN_FLIGHT`. Reload of that phase becomes
+  `AMBIGUOUS_LAUNCH(CRASHED_DURING_SPAWN)`, records the then-current
+  `ordinary_poll_sequence` as its boundary, resets absence confirmation, and
+  sets `launching=false`.
+- The launch reservation ID is passed to the wrapper and returned in the
+  guarded managed-identity checkpoint. While `AMBIGUOUS_LAUNCH`, every manual
+  and automatic teardown/replacement attempt is `HOLD`; marker deletion does
+  not clear the hold.
+- A later strict checkpoint whose PID/start guard and launch reservation ID
+  exactly match `SpawnGuardV1` is adopted through the common guarded-launch
+  commit below. Any mismatch remains ambiguous.
+- Otherwise only a new `PhysicalAbsenceProofV1.CONFIRMED`, built from two
+  compatible ordinary captures whose poll sequences are both strictly greater
+  than `ambiguity_boundary_poll_sequence`, resolves it to `IDLE`, leaves a
+  manual marker pending when present, and sets
+  `launching=false`. That new confirmation remains available for one new
+  reservation. Present, unknown, replayed, pre-ambiguity, or incomplete
+  evidence cannot resolve the tombstone.
+- `manual_readiness=APPLIED_PENDING_READINESS` survives reload without blocking
+  recovery. Matching-generation readiness clears it only after the marker
+  compare-clear result is durably recorded; a replaced marker is never removed.
+  A later committed manual launch may replace the bookkeeping only after the
+  older request ID is already durable in the consumed set. A different
+  automatic generation supersedes and clears only the bookkeeping as specified
+  above, never the marker.
+
+**ENFORCED common origin-independent commit after task #115:** Automatic and
+manual launches use one `GuardedLaunchCommitV1`. Only after the final barrier,
+spawn, and a strict PID/start/reservation checkpoint does one checked
+transaction replace managed identity, establish the real
+`launch_grace_until`, reset child confirmation, and clear `launching`.
+Manual origin additionally commits its consumed request ID and
+sets `manual_readiness=APPLIED_PENDING_READINESS`. No pre-spawn, failed, or
+ambiguous attempt can renew heartbeat freshness.
 
 ### Replacement proof and combiner
 
@@ -825,6 +1749,9 @@ over public decision fields. It omits child reason, complete runtime reasons,
 presence, candidates, freshness, and recovery-blocked disposition. Two
 `CLI_CHILD_UNKNOWN` decisions that differ only in `child_reason` therefore
 collide. 87-A does not rename or silently change that existing concept.
+`ActiveChildObservationV1` now makes the boundary explicit: raw child
+subreasons remain diagnostic and may intentionally share one semantic
+condition; the typed 87-B export carries them separately.
 
 **ENFORCED distinct contract:**
 
@@ -954,16 +1881,104 @@ Its fingerprint suffix is
 The fingerprint controls incident-condition equivalence and duplicate
 rate-limiting only. It never supplies teardown or replacement authority.
 
+### Typed export to 87-B
+
+**ENFORCED by a closed boundary record:** A fingerprint string alone cannot
+carry the durable redacted condition evidence that 87-B must project.
+87-A exports:
+
+```text
+RecoveryConditionV1 {
+  schema: "recovery-condition-export/v1"
+  fingerprint: RecoveryConditionFingerprintV1
+  canonical_condition: the exact fingerprint payload object above
+  escalation_required: bool
+  condition_codes: ordered tuple of length 0..2[
+    "RECOVERY_BLOCKED" | "STALE_UNCERTAINTY"
+  ]
+  active_child_reason_codes: ActiveChild UNKNOWN reason tuple | null
+  operator_candidates: OperatorDiagnosticCandidateSummaryV1
+}
+
+RecoveryActionResolutionV1 {
+  schema: "recovery-action-resolution/v1"
+  fingerprint: RecoveryConditionFingerprintV1
+  origin: "AUTOMATIC" | "MANUAL_AUTHORIZED" | "NONE"
+  selected_authority_id: Hex64 | null
+  intent: "HOLD" | "KILL_THEN_RELAUNCH" | "RELAUNCH_ONLY"
+  result: "NOT_ATTEMPTED" | "POLICY_HELD" | "TEARDOWN_FAILED"
+          | "BARRIER_VETOED" | "SPAWN_FAILED"
+          | "IDENTITY_COMMIT_AMBIGUOUS" | "LAUNCH_COMMITTED"
+  manual_marker_disposition: ManualMarkerDispositionV1 | null
+}
+```
+
+`condition_codes` includes each true predicate in the displayed order.
+`canonical_condition` must reproduce the fingerprint bytes exactly; 87-B may
+persist it but cannot mutate and rehash it. The action record binds later
+policy/execution resolution without pretending that result supplied authority.
+
+**ENFORCED diagnostic projection, not authority:** The shared observer also
+projects relevant and known-foreign rows into
+`OperatorDiagnosticCandidateV1`:
+
+```text
+{
+  "classification": "RELEVANT" | "KNOWN_FOREIGN",
+  "pid": integer 1..4294967295 | null,
+  "start_guard": bounded NFC string | null,
+  "executable_basename": bounded lowercase NFC string,
+  "command_shape_fragment": bounded NFC string,
+  "failure_codes": [
+    "COMMAND_UNREADABLE" | "ROOT_MISSING" | "ROOT_FOREIGN"
+    | "ROOT_UNREADABLE" | "LAUNCH_SHAPE_AMBIGUOUS"
+    | "PID_START_AMBIGUOUS" | "IDENTITY_REUSED"
+    | "OWNERSHIP_UNPROVEN" | "OBSERVATION_INCONSISTENT"
+  ]
+}
+```
+
+The command fragment contains no raw argument values. It is exactly
+`"<exe> <shape> --for=<MATCH|MISMATCH|UNKNOWN>
+--root=<MATCH|MISMATCH|MISSING|UNKNOWN>"`, where `<exe>` and `<shape>` are the
+already-normalized basename and `WRAP|WAIT|UNKNOWN`. It is capped at 256 UTF-8
+bytes at a code-point boundary. Rows are canonicalized, exact-deduplicated,
+byte-sorted, capped at eight, and carry total/omitted counts plus a SHA-256 tail
+digest using domain
+`agenttalk.supervisor.operator-diagnostic-candidates.v1\0` and the same
+length-prefix construction as `CandidateSummaryV1`.
+
+```text
+OperatorDiagnosticCandidateSummaryV1 {
+  items: tuple[OperatorDiagnosticCandidateV1] of length 0..8
+  total_count: uint32
+  omitted_count: uint32
+  omitted_sha256: Hex64 | null
+}
+```
+
+`omitted_count = total_count - len(items)` and the digest is null exactly when
+that value is zero.
+
+This diagnostic summary restores Revision 2's bounded rootless, foreign-root,
+unreadable, PID/start, executable, structural-command, and parse-failure
+evidence without changing the independently verified semantic fingerprint or
+granting authority from known-foreign rows.
+
 ## Final launch barrier
 
 **ENFORCED by execution order:** Every actual launch follows:
 
-1. select authority and apply policy gates;
-2. atomically reserve the launch and consume any
+1. select authority, capture eligible execution gates, and apply policy gates;
+2. atomically reserve the launch with that gate snapshot and consume any
    `AbsenceConfirmationV1`;
-3. run one fresh capture through the shared observer;
-4. require that capture to classify `ABSENT`; and
-5. only then call `Start-Process`.
+3. for a kill candidate, recapture execution/manual/policy authority
+   immediately before guarded termination and issue termination only if it
+   still matches;
+4. run one fresh post-teardown/no-kill capture through the shared observer;
+5. require that capture to classify `ABSENT`;
+6. recapture execution/manual/policy authority under the action-time fence; and
+7. only then call `Start-Process`.
 
 For `CONDITIONAL_POST_TEARDOWN`, the fresh post-teardown capture is also the
 final barrier. A survivor, unavailable/incomplete capture, or ambiguous
@@ -972,6 +1987,25 @@ candidate resolves the conditional to `NONE`.
 The barrier never turns a survivor into a target. A veto preserves a pending
 manual marker, leaves any no-kill confirmation consumed, and requires a new
 two-poll confirmation before another no-kill launch attempt.
+
+**STATED shipped-behavior change:** Today, snapshot unavailability plus no
+prior process state can produce `allow_launch=true, reason=no_prior_process`
+through `_prior_wrapper_may_be_alive` and `evaluate_launch_barrier`
+(`src/agenttalk/supervisor.py:2859-2895`). 87-A deliberately removes that
+exception. Every unavailable or incomplete final-barrier capture vetoes every
+launch, including cold start and post-state-loss launch.
+
+This accepts a possible one-condition cold-start outage—snapshot capture
+failure—to eliminate a three-condition duplicate-launch race: supervisor state
+loss, snapshot loss, and an already-live wrapper. It is a safety change, not a
+restatement of shipped behavior.
+
+**STATED activation constraint binding 87-C:** The strict barrier cannot
+activate unless 87-B durable incident persistence and routine operator
+projections are capability-active for the same supervisor generation,
+including first-managed grace and chronic snapshot-failure projection.
+Otherwise 87-C must retain shipped behavior; a silent cold-start strand is not
+an acceptable partial activation.
 
 ## Heartbeat boundary and task #116
 
@@ -993,7 +2027,8 @@ that no wrapper process exists. There is no live wedge to relaunch into, so the
 live-wedge timing rationale does not transfer. Within this model, task #116
 changes the timing-eligibility decision; its independently stageable
 implementation need not wait for these proposed type names and must not weaken
-physical absence or targetability.
+two compatible independently captured absence polls, atomic one-use
+reservation/consumption, targetability, or the fresh final barrier.
 
 ## Accepted residual
 
@@ -1001,11 +2036,12 @@ physical absence or targetability.
 flap. With presence `PRESENT_TARGETABLE`, a stale poll whose dominant runtime
 state is `CURRENT_PROGRESS_HEALTHY` does not escalate; a stale poll at the same
 presence that lands in `CURRENT_UNKNOWN_ACTIVE_CHILD` does. (`UNKNOWN` presence
-already escalates in both rows.) A later ambiguous poll converges to mandatory
-escalation, so this is nondeterministic latency in which poll escalates and
-continued display churn, not widened kill authority or a silent-forever
-terminal state. 87-A supplies no wall-clock or poll-count bound for when raw
-discovery will next observe the ambiguity.
+already escalates in both rows.) If a later poll produces the unknown-child
+observation, that poll reaches mandatory escalation. 87-A supplies no fairness,
+recurrence, wall-clock, or poll-count guarantee that a later ambiguous
+observation will occur. The bounded residual is nondeterminism in which
+observation escalates and continued display churn; kill authority is not
+widened. A silent-forever claim is deliberately not made.
 
 ## Mandatory conformance evidence
 
@@ -1020,9 +2056,14 @@ without all of this executed evidence:
 3. Execute Lens C's exact
    `{CURRENT_UNKNOWN_SEQUENCE_REGRESSION, CURRENT_TEARDOWN_PROOF}` fresh/stale
    counterexample.
-4. Prove heartbeat and process-snapshot permutations cannot change
-   `RuntimeObservationV1`; prove runtime permutations cannot change
-   `WrapperPresenceResultV1`.
+4. Prove heartbeat permutations cannot change `RuntimeObservationV1`; runtime
+   contract permutations cannot change `WrapperPresenceResultV1`; changing
+   unrelated wrapper-presence candidates while holding active-child input fixed
+   cannot change runtime; and relevant child-lineage evidence changes runtime
+   only through the closed `ActiveChildObservationV1` mapping. Inject a
+   presence-only conflicting candidate and an active-child-only lineage
+   conflict in both orders: each marks only its own availability projection
+   incomplete. Global snapshot failure marks both unavailable.
 5. Cover targetable plus unreadable, targetable plus definite unowned,
    all-owned guarded, duplicate, rootless, PID-reused, unreadable-only,
    snapshot-unavailable, incomplete-empty, and complete-empty candidate sets.
@@ -1037,9 +2078,13 @@ without all of this executed evidence:
 8. Make automatic and fully authorized manual teardown true together. Assert
    one `MANUAL_AUTHORIZED` teardown, one authority ID, manual gate semantics,
    and evaluation-order independence.
-9. Assert invalid, unauthorized, protection-incomplete, and cooldown-held
-   manual markers do not fall through to automatic teardown in the same poll;
-   assert a consumed marker does.
+9. Cross absent path, corrupt/non-object/duplicate/oversized marker, unreadable
+   path, raced replacement, expiry, failed live reauthorization, force/kill-ack
+   requirements under both fresh and stale protected live-kill candidates,
+   cooldown, consumed ID, targetability hold, and confirmed-absence no-kill
+   candidate with simultaneous automatic authority. Only `ABSENT` and
+   `CONSUMED` may fall through; no-kill requires force but not kill
+   acknowledgement.
 10. Confirm physical absence from two adjacent compatible ordinary captures
     while heartbeat is fresh. Assert automatic `HOLD`, then separately assert
     fresh manual bypass and stale automatic eligibility.
@@ -1053,9 +2098,11 @@ without all of this executed evidence:
     changed coverage, and a clear scan after failed teardown. Each contributes
     zero polls; the next ordinary clear scan is only `OBSERVED_ONCE`.
 14. Execute fixed fingerprint vectors across every supported implementation.
-    Candidate permutation and exact duplicates must be invariant; child reason,
-    secondary runtime reason, presence reason, and overflow-tail changes must
-    change the fingerprint.
+    Candidate permutation and exact duplicates must be invariant; changing the
+    semantic `RuntimeObservationV1.reasons` tuple, a presence reason, or an
+    overflow-tail item must change the fingerprint. Active-child diagnostic
+    subreason changes alone must not, because they normalize to one banked
+    runtime reason.
 15. Prove the planner, post-teardown resolver, and final barrier use the same
     observer recognition and coverage-signature implementation.
 16. Prove `CONDITIONAL_POST_TEARDOWN` is never persisted and every resolution
@@ -1065,23 +2112,108 @@ without all of this executed evidence:
     salvaged.
 18. Cover the accepted stale healthy/unknown-child escalation-latency residual
     without converting either cell into kill authority.
+19. Cover first-managed and real-launch grace just before and exactly at
+    expiry; heartbeat exactly at and just over threshold; missing,
+    malformed/future-skew/overflow heartbeat; repeated snapshot failure;
+    accepted future skew at and rejected skew just over the configured bound;
+    restart persistence; and one bounded grace after state loss. Cover
+    configured launch grace and heartbeat skew at zero and with negative,
+    nonfinite, and Boolean inputs. Failed state commit cannot re-anchor
+    freshness or authorize action.
+20. Exercise baseline sequence 5, torn invalid read, same-turn sequence 4,
+    then sequence 6. High-water remains monotonic, the latch becomes and
+    remains true, degradation reasons overlap deterministically, and only a
+    strict bound higher turn/new wrapper clears it. Also exercise same-wrapper
+    turn 5 to turn 4 to turn 5; turn-generation high-water and latch never
+    clear on either replay. Accept strict nonnegative integers above `uint64`
+    for both generation and progress sequence. Dead/stall counters cannot
+    cross invalid read, identity change, or progress. Replaying one capture ID
+    or skipping an ordinary poll cannot increment either counter.
+21. Race two deltas from one state revision and prove one checked commit wins;
+    the stale writer reloads/re-reduces or fails closed. Persist/reload retains
+    freshness anchor, continuity baseline/high-water/latch, child counters,
+    absence state, and consumed marker IDs. A cached whole-state save cannot
+    roll any field back.
+22. Cover guarded live child, ancestry-ambiguous child, first/confirmed
+    complete child absence, unrelated rootless wrapper, row shuffle/exact
+    duplicate, and relevant lineage change. Assert the independent presence
+    and active-child projections and their permitted runtime effects.
+23. Inject `snapshot unavailable + no prior process state` at the final
+    barrier and require veto. Prove 87-C activation refuses the strict barrier
+    when matching-generation 87-B incident projections are not active.
+24. Reconstruct `RecoveryConditionV1` and
+    `RecoveryActionResolutionV1`; assert the canonical condition exactly
+    reproduces the banked fingerprint and that bounded relevant, rootless,
+    foreign-root, unreadable, structural-command, and overflow-tail diagnostic
+    evidence reaches the typed 87-B boundary without changing authority.
+25. Assert idle and terminal strict records map to
+    `CURRENT_STALE_RECOVERABLE` under both freshness values; the first strict
+    idle record after degraded replacement establishes a new baseline; and a
+    returned-wrapper terminal record with cleared heartbeat still enters safe
+    stale recovery rather than green health.
+26. Route every automatic relaunch-only candidate through backoff, protection,
+    readiness, configuration/lead-loop, absence, and final-barrier gates.
+    Protected, configuration-held, and stood-down agents remain held
+    automatically, while a fully authorized manual candidate has only the
+    explicitly specified overrides.
+27. Failure-inject each recovery execution transition under both origins:
+    reservation compare race, teardown failure, barrier veto, spawn failure,
+    crash during spawn, ambiguous identity, guarded-identity commit, and
+    post-ambiguity absence. Assert one durable ownership fence prevents a
+    second automatic or manual launch and only two captures strictly after the
+    stored ambiguity boundary resolve it. For manual origin also cover readiness
+    compare-clear for matching generation, different-generation automatic
+    supersession, consumed-ID eviction, and marker replacement/deletion or
+    authorization-snapshot change after reservation at both action fences;
+    neither stale marker bytes, changed authorization, nor a stale state
+    revision can execute. Concurrent marker replacement/reservation obeys
+    config-before-state lock order without deadlock. Cover missing, null,
+    future, negative, Boolean, nonfinite, and valid `last_launch_epoch` plus
+    zero/nonfinite cooldown configuration.
+28. Cross automatic and manual candidates with every
+    `ExecutionEligibilityV1` value. Assert no manual request overrides dry run,
+    kill switch, stopped supervisor, disabled actions, absent report entry, or
+    `auto_restart != true`; every noneligible value performs zero
+    recovery-authority/marker/config/launch mutation. Except for dry run,
+    commit observation-only freshness/continuity/reset deltas and prove an
+    absent report entry still reaches finite stale escalation. Separately
+    assert that the future 87-B kill-switch observation exception can persist
+    only condition evidence after task #114 and cannot reserve or execute
+    recovery authority. Toggle each gate after reservation, immediately before
+    kill, and after teardown immediately before spawn; inject unreadable
+    instance/report/config/kill-switch captures and action-latch epoch change.
+    Every mismatch vetoes the next OS action and preserves the exact
+    origin-specific state delta.
 
 ## Mechanism inventory
 
 | Property | Classification | Mechanism |
 | --- | --- | --- |
-| Runtime/presence independence | ENFORCED | Separate private constructors and permutation tests. |
+| Global executor gates cannot be bypassed by manual origin | ENFORCED | Closed capture/precedence after observation commit, reservation-bound semantic ID, and guarded pre-kill/pre-spawn recapture; noneligible paths perform zero recovery mutation. |
+| Dry run is persistence-free and kill switch has no 87-A mutation exception | ENFORCED | Pure simulated decision/discarded delta and explicit zero-mutation gates; task #114 enables only 87-B observation. |
+| Runtime/presence independence with explicit child evidence | ENFORCED | Separate runtime, active-child, and presence constructors plus narrowed permutation tests. |
 | One result for overlapping runtime reasons | ENFORCED | Ranked tuple plus dominant-only authority operands. |
+| Runtime high-water and sticky regression survive torn reads | ENFORCED after task #115 | Pure continuity reducer plus checked state revision; only new bound generation clears latch. |
+| Missing heartbeat becomes stale after finite grace | ENFORCED after task #115 | Nonrenewable `first_managed_epoch`, guarded launch deadline, and exact freshness formula. |
+| Child confirmation cannot cross uncertainty or replay | ENFORCED after task #115 | Basis-bound consecutive counters with durable capture ID and adjacent poll sequence in the sole classifier delta. |
 | Total mixed-candidate presence | ENFORCED | Ordered aggregation and closed reason codes. |
 | No partial-target kill | ENFORCED | `TargetabilityProofV1.COMPLETE` bijection invariant. |
-| One origin for simultaneous manual/automatic authority | ENFORCED | Manual-priority marker classifier and selector. |
+| Absent, invalid, and unreadable manual paths differ | ENFORCED | Locked bounded raw capture and closed codec; only true path absence is `ABSENT`. |
+| One origin for simultaneous manual/automatic authority | ENFORCED | Total manual gates, live revalidation, candidate-scoped acknowledgement, and manual-priority selector. |
+| Reserved manual authority cannot drift before action | ENFORCED after task #115 | Pre-kill/pre-spawn marker revision plus authorization snapshot equality under the fixed lock order. |
+| Consumed marker cannot replay | ENFORCED after task #115 | Revision-bound reservation, bounded committed ID set, and compare-clear. |
+| Ambiguous spawn cannot release authority or duplicate-launch | ENFORCED after task #115 | Durable `AMBIGUOUS_LAUNCH` tombstone, guarded reconciliation, and no second reservation. |
 | Physical proof independent from timing | ENFORCED | Separate closed values and reducers. |
 | Two independent compatible absence polls | ENFORCED after task #115 | Durable capture IDs, exact coverage equality, and adjacent poll sequence. |
 | Absence proof is one use | ENFORCED after task #115 | Atomic `CONFIRMED -> CONSUMED` launch reservation. |
+| New guarded managed identity commits atomically | ENFORCED after task #115 | One checked transaction commits identity, manual consumption, launch grace, and reservation resolution. |
 | Failed post-teardown scan contributes no counter | ENFORCED | Separate action-scoped reducer path. |
 | Stable semantic condition equivalence | ENFORCED | Versioned canonical fingerprint and fixed vectors. |
+| 87-B receives durable evidence rather than only a hash | ENFORCED | Typed canonical condition, action resolution, and bounded diagnostic candidate export. |
 | No launch on stale proof or observer disagreement | ENFORCED | Shared final barrier after reservation. |
-| Earlier fresh-but-confirmed-absent recovery | STATED out of scope | Task #116. |
+| Strict barrier is not silently partially activated | STATED for 87-C | Same-generation 87-B incident projection is an activation prerequisite. |
+| No new dependency or persistence plane | STATED | Existing files/state only; project dependency list remains empty. |
+| Earlier fresh-but-confirmed-absent recovery | STATED out of scope | Task #116, blocked on #115 but not #87, scheduled before 87-A implementation. |
 | Durable incident visibility/delivery | STATED out of scope | Future 87-B, dependent on tasks #114/#115. |
 | Migration and rollback | STATED out of scope | Future 87-C after 87-A/87-B. |
 | Raw discovery stops flapping | STATED not promised | Process-discovery behavior is unchanged. |
