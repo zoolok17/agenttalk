@@ -1626,7 +1626,11 @@ class _ProcStream:
                 self.work_heartbeat_result = dict(self._work_hb.result)
             if self._proc.stdout:
                 _close_pipe_suppressing_benign_pipe_teardown(self._proc.stdout)
-            if self._watchdog is not None:
+            # Owner cancellation is authoritative and must stop the watchdog before
+            # it competes with abort cleanup. Natural stdout EOF is not root exit:
+            # keep the watchdog armed through the root wait so an EOF-then-hung
+            # process can still reach the two-factor kill boundary.
+            if self._watchdog is not None and consumer_aborted:
                 self._watchdog.stop()
                 self._watchdog.join(timeout=10.0)
                 self.watchdog_result = self._watchdog.result
@@ -1636,22 +1640,33 @@ class _ProcStream:
                         self._proc.terminate()
                 except Exception:  # noqa: BLE001, S110 - preserve the consumer's failure  # nosec B110
                     pass
-            if self._watchdog_stream_interrupted:
-                if consumer_aborted:
-                    try:
-                        self.returncode = self._proc.wait(timeout=10.0)
-                    except subprocess.TimeoutExpired:
+            try:
+                if self._watchdog_stream_interrupted:
+                    if consumer_aborted:
                         try:
-                            self._proc.kill()
-                            self.returncode = self._proc.wait(timeout=5.0)
-                        except Exception:  # noqa: BLE001 - cleanup must preserve owner failure
-                            self.returncode = self._proc.poll()
+                            self.returncode = self._proc.wait(timeout=10.0)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                self._proc.kill()
+                                self.returncode = self._proc.wait(timeout=5.0)
+                            except Exception:  # noqa: BLE001 - cleanup must preserve owner failure
+                                self.returncode = self._proc.poll()
+                    else:
+                        # A watchdog wake is an exit confirmation, never merely a signal
+                        # report. Fail closed if that invariant is ever violated.
+                        self.returncode = self._proc.wait()
                 else:
-                    # A watchdog wake is an exit confirmation, never merely a signal
-                    # report. Fail closed if that invariant is ever violated.
                     self.returncode = self._proc.wait()
-            else:
-                self.returncode = self._proc.wait()
+            finally:
+                if self._watchdog is not None and not consumer_aborted:
+                    self._watchdog.stop()
+                    # Root exit is not enough to publish this turn while the
+                    # watchdog may still be finishing its start-guarded kill
+                    # pass.  Production snapshot/kill operations are bounded,
+                    # so wait for that pass to finish before exposing its
+                    # result or allowing the next turn to start.
+                    self._watchdog.join()
+                    self.watchdog_result = self._watchdog.result
 
     def _interrupt_watchdog_stream(self) -> None:
         with self._watchdog_stream_condition:
@@ -1670,9 +1685,12 @@ class _ProcStream:
             return True
 
     def _handle_watchdog_fire(self, result: dict) -> None:
-        """Wake once the protected Popen handle confirms that its root has exited."""
+        """Wake a live pipe reader once the protected root has exited."""
         with self._watchdog_stream_condition:
-            if self._watchdog_stream_interrupted:
+            # Natural EOF already handed root-exit confirmation to the owner wait.
+            # Starting a second Popen waiter here is unnecessary and can race the
+            # owner's reap on POSIX.
+            if self._watchdog_stream_interrupted or self._watchdog_stream_done:
                 return
         # kill_targets reports that a start-guarded signal was requested, not that
         # process termination has completed. Never publish an idle turn while this

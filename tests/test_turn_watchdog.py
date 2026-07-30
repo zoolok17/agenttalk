@@ -576,6 +576,108 @@ def test_proc_stream_watchdog_enabled_normal_exit_needs_no_wake() -> None:
     assert stream.watchdog_result is None
 
 
+def test_proc_stream_watchdog_stays_armed_after_stdout_eof_until_root_exit() -> None:
+    wait_entered = threading.Event()
+    owner_done = threading.Event()
+    errors: list[BaseException] = []
+    spawned: dict[str, object] = {}
+    root_alive_at_wait: list[bool] = []
+
+    def snapshot():
+        if not wait_entered.is_set():
+            return None
+        root = int(spawned["pid"])
+        return _snap(
+            (root, 1, "codex.exe", 1000.0),
+            (root + 1_000_000, root, "node.exe", 0.0),
+        )
+
+    def kill(targets):
+        stream = spawned["stream"]
+        assert isinstance(stream, run._ProcStream)
+        stream._proc.kill()
+        return [target["pid"] for target in targets]
+
+    stream = _ObservedWatchdogProcStream(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "import threading; threading.Event().wait()",
+        ],
+        None,
+        watchdog=TurnWatchdogConfig(
+            enabled=True,
+            turn_elapsed_seconds=0.0,
+            tool_descendant_alive_seconds=0.0,
+            poll_seconds=0.01,
+        ),
+        watchdog_snapshot_fn=snapshot,
+        watchdog_kill_fn=kill,
+        watchdog_wall_clock=lambda: 1000.0,
+        on_spawn=lambda pid, _start: spawned.__setitem__("pid", pid),
+    )
+    spawned["stream"] = stream
+    watchdog_join_timeouts: list[float | None] = []
+    real_watchdog_join = stream._watchdog.join
+
+    def observed_watchdog_join(timeout=None):
+        watchdog_join_timeouts.append(timeout)
+        return real_watchdog_join(timeout)
+
+    stream._watchdog.join = observed_watchdog_join
+    original_stdout = stream._proc.stdout
+    read_fd, write_fd = os.pipe()
+    stream._proc.stdout = os.fdopen(
+        read_fd,
+        "r",
+        encoding="utf-8",
+        errors="replace",
+    )
+    if original_stdout is not None:
+        original_stdout.close()
+    os.close(write_fd)
+    real_wait = stream._proc.wait
+
+    def observed_wait(timeout=None):
+        if timeout is None:
+            root_alive_at_wait.append(stream._proc.poll() is None)
+            wait_entered.set()
+        return real_wait(timeout=timeout)
+
+    stream._proc.wait = observed_wait
+
+    def consume() -> None:
+        try:
+            list(stream)
+        except BaseException as exc:  # noqa: BLE001 - report owner failures on test thread
+            errors.append(exc)
+        finally:
+            owner_done.set()
+
+    owner = threading.Thread(target=consume, daemon=True)
+    owner.start()
+    try:
+        assert wait_entered.wait(5.0), "stdout EOF did not reach the root wait"
+        assert stream.watchdog_callback_done.wait(5.0), (
+            "watchdog stopped at stdout EOF while the protected root remained alive"
+        )
+        assert owner_done.wait(5.0), "owner stayed blocked after the watchdog killed the root"
+        owner.join(5.0)
+    finally:
+        if stream._proc.poll() is None:
+            stream._proc.kill()
+        stream._proc.wait(timeout=5.0)
+        owner.join(5.0)
+
+    assert root_alive_at_wait and root_alive_at_wait[0] is True
+    assert errors == []
+    assert stream.watchdog_result is not None
+    assert stream.returncode is not None
+    assert stream._watchdog_root_waiter is None
+    assert watchdog_join_timeouts == [None]
+
+
 def test_proc_stream_watchdog_decoder_preserves_text_line_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -839,6 +941,7 @@ def test_proc_stream_waits_for_root_exit_when_kill_result_omits_root() -> None:
     stream.pid = ROOT
     stream._watchdog_stream_condition = threading.Condition()
     stream._watchdog_stream_interrupted = False
+    stream._watchdog_stream_done = False
     stream._watchdog_root_waiter = None
 
     def wait_for_root():
