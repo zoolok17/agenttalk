@@ -600,6 +600,16 @@ def _gather_status(store: Store) -> dict:
             decision = sup_row.get("decision")
             if isinstance(decision, dict):
                 row["supervisor"] = {"decision": decision}
+                # Never let the two verdicts silently disagree in favour of the
+                # cheerful one: additive flag, present only when the wrapper's
+                # own self-report still reads "fine" while the supervisor's
+                # strict, positively-bound verdict does not.
+                if (
+                    decision.get("state") not in
+                    (sup.HEALTHY_DECISION_STATES | sup.GRACE_DECISION_STATES)
+                    and health.get("state") in ("idle_waiting", "working_turn")
+                ):
+                    row["supervisor"]["disagreement"] = True
             if isinstance(sup_row.get("lead_liveness"), dict):
                 row["lead_liveness"] = sup_row["lead_liveness"]
             effective = sup_row.get("health_effective_state")
@@ -1283,6 +1293,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         dec = sv.get("decision") if isinstance(sv.get("decision"), dict) else None
         if dec:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
+            # Never let the two verdicts silently disagree in favour of the
+            # cheerful one: a wrapper that still self-reports "fine" while the
+            # supervisor's strict, positively-bound verdict says otherwise.
+            dec_state = dec.get("state")
+            if (dec_state not in sup.HEALTHY_DECISION_STATES | sup.GRACE_DECISION_STATES
+                    and h_state in ("idle_waiting", "working_turn")):
+                seen += " [DISAGREEMENT]"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")

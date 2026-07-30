@@ -4307,9 +4307,80 @@ def test_api_state_new_agent_fields_absent_when_no_data(tmp_path: Path) -> None:
         (root,) = _state(base)["roots"]
         for agent in root["agents"]:
             for absent in ("capacity", "cli", "wrapped", "restartable",
-                           "owned_domains", "task", "health_timeline"):
+                           "owned_domains", "task", "health_timeline",
+                           "supervisor_decision", "wrapper_child"):
                 assert absent not in agent, absent
         _assert_no_body_keys(_state(base))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_supervisor_decision_surfaces_strict_verdict_over_self_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper's own self-report can keep saying "working" long after its
+    CLI child has died. The web console must show BOTH the self-report
+    (``health``) and the supervisor's strict, positively-bound decision
+    (``supervisor_decision``) side by side, plus the raw wrapper-runtime
+    progress age (``wrapper_child``) — never collapsed into one adjective."""
+    from agenttalk import wrapper_runtime as wrt
+
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    now = time.time()
+    writer = wrt.WrapperRuntimeWriter(
+        s.state_dir, "alpha", "test-wrapper-1", wrapper_pid=300,
+        wrapper_start="2020-01-01T00:00:00.000000Z", clock=lambda: now - 600,
+    )
+    writer.starting(message_id="m1", turn_id="t1")
+    writer.active(301, "2020-01-01T00:00:00.000000Z")
+    writer.progress()
+    monkeypatch.setattr(web._supervisor, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "decision": {"state": "CLI_CHILD_UNKNOWN", "action": "none",
+                        "reason": "wrapper runtime could not be bound"},
+        }],
+    })
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert alpha["health"]["state"] == "working_turn"  # self-report: looks fine
+        assert alpha["supervisor_decision"] == {
+            "state": "CLI_CHILD_UNKNOWN", "action": "none",
+            "reason": "wrapper runtime could not be bound",
+        }
+        assert alpha["wrapper_child"]["phase"] == "active"
+        assert alpha["wrapper_child"]["progress_age_seconds"] >= 599.0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_supervisor_decision_absent_when_not_computable(
+    tmp_path: Path,
+) -> None:
+    """No false-DOWN, and no fabricated verdict: an agent with no supervisor
+    configured gets no ``supervisor_decision`` key at all (absent-not-null),
+    not a manufactured "unknown" or "healthy"."""
+    s = _make_store(tmp_path)
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert "supervisor_decision" not in alpha
+        assert "wrapper_child" not in alpha
     finally:
         srv.shutdown()
         srv.server_close()

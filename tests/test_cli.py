@@ -505,6 +505,85 @@ def test_status_supervisor_assessment_fail_safe(
     assert "supervisor_assessment_unavailable:ValueError" in payload["warnings"]
 
 
+def _fake_decision(state: str, *, action: str = "none",
+                   reason: str = "test") -> dict:
+    return {"agents": [{"name": "alpha",
+                        "decision": {"state": state, "action": action,
+                                     "reason": reason}}]}
+
+
+def test_status_flags_disagreement_between_self_report_and_strict_verdict(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A wrapper's self-report can keep saying "fine" after its CLI child has
+    died; the supervisor's strict decision.state is the one #105 exists to
+    surface. `status` must show BOTH facts, and flag when they disagree,
+    rather than silently resolving in favour of the cheerful self-report."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation",
+                        lambda *_a, **_k: _fake_decision("CLI_CHILD_UNKNOWN"))
+
+    rc = _run(["status", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["health"]["state"] == "working_turn"  # self-report: looks fine
+    assert alpha["supervisor"]["decision"]["state"] == "CLI_CHILD_UNKNOWN"
+    assert alpha["supervisor"]["disagreement"] is True
+
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("alpha"))
+    assert "health=working_turn" in line
+    assert "supervisor=CLI_CHILD_UNKNOWN/none" in line
+    assert "[DISAGREEMENT]" in line  # direction control: absent before the fix
+
+
+def test_status_no_disagreement_flag_for_a_genuinely_healthy_agent(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """No false-DOWN: a wrapped agent the supervisor confirms HEALTHY_WORKING
+    must not be flagged, even though its state differs from HEALTHY_IDLE."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation",
+                        lambda *_a, **_k: _fake_decision("HEALTHY_WORKING"))
+
+    rc = _run(["status", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert "disagreement" not in alpha["supervisor"]
+
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("alpha"))
+    assert "[DISAGREEMENT]" not in line
+
+
 def test_supervisor_cli_read_fail_safe(
     store_root: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -27,6 +27,7 @@ from agenttalk import signing as _signing
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle
+from agenttalk import wrapper_runtime as runtime_obs
 from agenttalk.store import (
     STORE_SCHEMA_CAPABILITIES,
     Store,
@@ -156,6 +157,7 @@ def run(project_root: Path | None = None) -> Report:
         report.checks.append(_check_codex_config(root))
         report.checks.append(_check_hmac(store, root))
         report.checks.extend(_check_heartbeats(store))
+        report.checks.extend(_check_wrapper_child_health(store))
         waiters = _check_active_waiters(store)
         if waiters is not None:  # additive: absent unless a live waiter exists
             report.checks.append(waiters)
@@ -1779,6 +1781,129 @@ def _check_heartbeats(store: Store) -> list[Check]:
                 status="ok",
                 details=f"last seen {int(age)}s ago",
             ))
+    return out
+
+
+_HEALTHY_DECISION_STATES = sup.HEALTHY_DECISION_STATES | sup.GRACE_DECISION_STATES
+_SELF_REPORT_LOOKS_FINE = frozenset({"idle_waiting", "working_turn"})
+
+
+def _check_wrapper_child_health(store: Store) -> list[Check]:
+    """One check per wrapped agent — does the SUPERVISOR's strict verdict agree
+    with the wrapper's own self-report, and is progress actually moving?
+
+    The wrapper's self-reported ``health`` (idle_waiting/working_turn/...) is
+    advisory and can go on saying "working" after its CLI child has died. The
+    supervisor's live decision (CLI_CHILD_UNKNOWN/CLI_CHILD_DEAD/...) is the
+    strict, positively-bound verdict, but until now it reached no operator
+    surface `doctor` covers. This check surfaces BOTH observations side by
+    side — never collapsing them into one adjective — plus the raw
+    ``last_progress_at`` age from the wrapper-runtime record, which is the
+    cheapest signal for "the counter is frozen" independent of any verdict.
+
+    Absent entirely when no agent is configured ``wrapped`` in
+    supervisor.json (nothing to check).
+    """
+    sup_path = store.dir / "supervisor.json"
+    if not sup_path.exists():
+        return []
+    try:
+        sup_cfg = sup.load_supervisor_config(sup_path)
+    except (ValueError, OSError):
+        return []
+    sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
+    wrapped_names = [
+        name for name, cfg_agent in sup_agents.items()
+        if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
+    ]
+    if not wrapped_names:
+        return []
+
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    state_path = store.dir / "supervisor-state.json"
+    state = sup.load_supervisor_state(state_path)
+    snapshot_path = store.dir / "supervisor-snapshot.json"
+    snapshot: list[dict] | None = None
+    if snapshot_path.exists():
+        try:
+            raw = json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
+        except (ValueError, OSError):
+            raw = None
+        snapshot = raw if isinstance(raw, list) else None
+    try:
+        obs = sup.build_supervisor_observation(
+            store, now_epoch=now_epoch, state=state, supervisor_config=sup_cfg,
+            snapshot=snapshot, event_limit=0,
+        )
+        obs_by_name = {
+            a["name"]: a for a in obs.get("agents", []) if isinstance(a, dict)
+        }
+    except Exception as exc:  # noqa: BLE001 - doctor stays fail-safe
+        return [Check(
+            name="wrapper_child_health",
+            status="warn",
+            details=f"could not compute the supervisor's decision: "
+                    f"{type(exc).__name__}: {exc}",
+        )]
+
+    out: list[Check] = []
+    for name in wrapped_names:
+        item = obs_by_name.get(name) or {}
+        health = item.get("health") if isinstance(item.get("health"), dict) else {}
+        self_state = health.get("state", "unknown")
+        self_age = health.get("age_seconds")
+        self_age_str = f"{self_age:.0f}s" if isinstance(self_age, (int, float)) else "n/a"
+
+        runtime = runtime_obs.read_runtime(store.state_dir, name, now_epoch=now_epoch)
+        progress_bit = ""
+        if runtime.get("status") == runtime_obs.STATUS_VALID:
+            record = runtime.get("record") or {}
+            progress_age = runtime.get("progress_age_seconds")
+            progress_age_str = (
+                f"{progress_age:.0f}s" if isinstance(progress_age, (int, float))
+                else "never"
+            )
+            progress_bit = (
+                f"; wrapper-runtime phase={record.get('phase')} "
+                f"last_progress_age={progress_age_str}"
+            )
+
+        decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
+        if decision is None:
+            out.append(Check(
+                name=f"wrapper_child_health.{name}",
+                status="warn",
+                details=(
+                    f"self-reported health={self_state} (age={self_age_str}){progress_bit}; "
+                    "no supervisor decision is available for this agent (it is not "
+                    "configured auto_restart, so the strict CLI-child-bound verdict "
+                    "cannot be computed here — this is the wrapper's own self-report only)"
+                ),
+            ))
+            continue
+
+        d_state = decision.get("state")
+        d_action = decision.get("action")
+        d_reason = decision.get("reason") or ""
+        if d_state in _HEALTHY_DECISION_STATES:
+            status = "ok"
+        elif d_state in sup.UNBOUND_OR_DEAD_DECISION_STATES or d_action not in (None, sup.NONE):
+            status = "error"
+        else:
+            status = "warn"
+        mismatch = ""
+        if status != "ok" and self_state in _SELF_REPORT_LOOKS_FINE:
+            mismatch = " [DISAGREEMENT: self-report looks fine, supervisor verdict does not]"
+        out.append(Check(
+            name=f"wrapper_child_health.{name}",
+            status=status,
+            details=(
+                f"supervisor={d_state}/{d_action} ({d_reason}); "
+                f"self-reported health={self_state} (age={self_age_str})"
+                f"{progress_bit}{mismatch}"
+            ),
+            fix=d_reason if status != "ok" else "",
+        ))
     return out
 
 

@@ -4,13 +4,28 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, doctor, install_skills as iskl, ovh_gateway_service, signing
+from agenttalk import (
+    cli,
+    doctor,
+    health as hm,
+    install_skills as iskl,
+    ovh_gateway_service,
+    signing,
+    wrapper_runtime as wrt,
+)
 from agenttalk.store import Store
 from agenttalk.wrapper.obligations import POLICY_ENV
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
 
 
 def test_doctor_on_uninitialized_project_reports_error(tmp_path: Path) -> None:
@@ -39,6 +54,140 @@ def test_doctor_on_initialized_project_includes_all_check_categories(
     assert "codex_config" in names
     assert "heartbeat.alpha" in names
     assert "heartbeat.beta" in names
+
+
+def test_check_wrapper_child_health_absent_without_supervisor_json(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    assert doctor._check_wrapper_child_health(store) == []
+
+
+def test_check_wrapper_child_health_absent_without_wrapped_agents(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2, "agents": {"alpha": {"auto_restart": True}},
+    }), encoding="utf-8")
+    assert doctor._check_wrapper_child_health(store) == []
+
+
+def test_check_wrapper_child_health_surfaces_strict_verdict_over_self_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper's own self-report can keep reading "working" long after its
+    CLI child has died. The supervisor's decision.state is the strict,
+    positively-bound verdict; this check must show BOTH, plus the raw
+    last_progress_at age, rather than collapsing them into one adjective."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    # A real wrapper-runtime record whose progress_sequence has been frozen
+    # for 10 minutes — the cheapest "is the counter frozen" signal, read
+    # independently of any computed verdict.
+    now = time.time()
+    writer = wrt.WrapperRuntimeWriter(
+        store.state_dir, "alpha", "test-wrapper-1", wrapper_pid=300,
+        wrapper_start="2020-01-01T00:00:00.000000Z", clock=lambda: now - 600,
+    )
+    writer.starting(message_id="m1", turn_id="t1")
+    writer.active(301, "2020-01-01T00:00:00.000000Z")
+    writer.progress()
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "working_turn", "age_seconds": 1.0},
+            "decision": {"state": "CLI_CHILD_UNKNOWN", "action": "none",
+                        "reason": "wrapper runtime could not be bound"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    check = checks[0]
+    assert check.name == "wrapper_child_health.alpha"
+    assert check.status == "error"
+    assert "CLI_CHILD_UNKNOWN" in check.details
+    assert "working_turn" in check.details
+    assert "last_progress_age=600s" in check.details
+    assert "DISAGREEMENT" in check.details
+
+    # Direction control: the PRE-EXISTING heartbeat-only check stays green for
+    # this exact scenario — this is the "dead agent reads GREEN" bug; without
+    # the new check, doctor's report has nothing that would have caught it.
+    heartbeat_checks = doctor._check_heartbeats(store)
+    hb_alpha = next(c for c in heartbeat_checks if c.name == "heartbeat.alpha")
+    assert hb_alpha.status == "ok"
+
+
+def test_check_wrapper_child_health_no_false_down_when_healthy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No false-DOWN: a wrapped agent the supervisor confirms as
+    HEALTHY_WORKING must read `ok`, with no spurious disagreement flag."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "working_turn", "age_seconds": 1.0},
+            "decision": {"state": "HEALTHY_WORKING", "action": "none", "reason": "ok"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "ok"
+    assert "DISAGREEMENT" not in checks[0].details
+
+
+def test_check_wrapper_child_health_reports_absent_decision_honestly(
+    tmp_path: Path,
+) -> None:
+    """A wrapped agent that is not `auto_restart` has no computable strict
+    decision — real (unpatched) `build_supervisor_observation` behavior. The
+    check must say so plainly rather than silently reading only self-report."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    store.write_heartbeat("alpha")
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": False}},
+    }), encoding="utf-8")
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "warn"
+    assert "no supervisor decision is available" in checks[0].details
 
 
 def test_doctor_warns_when_supervisor_deadman_config_is_ignored(tmp_path: Path) -> None:

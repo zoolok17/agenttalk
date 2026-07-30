@@ -63,6 +63,26 @@ SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"  # legacy token; no longer emitted
 READINESS_FAILED = "readiness_failed"  # legacy token; folded into stale heartbeat recovery
 READINESS_GAVE_UP = "readiness_gave_up"  # never-ready past the retry cap - STOP relaunching, await operator
 NONE = "none"                    # healthy, nothing to do
+
+# ---- decision.state operator-surface classification ------------------------
+# `status`/`doctor`/the web console all need the same answer to "is this
+# decision.state safely green?" - a single source of truth so the three
+# surfaces can never silently drift apart on what counts as healthy.
+HEALTHY_DECISION_STATES = frozenset({"HEALTHY_IDLE", "HEALTHY_WORKING"})
+# A fresh CLI spawn inside its bounded handoff grace renders healthy too -
+# it is expected, not a fault - but kept separate so a caller that only wants
+# the two POSITIVELY CONFIRMED states can use HEALTHY_DECISION_STATES alone.
+GRACE_DECISION_STATES = frozenset({"CLI_CHILD_STARTING"})
+# The child-cannot-be-positively-bound / confirmed-dead family: the strict
+# verdict this exists to surface. Everything else non-green (cooldowns,
+# refusals, rate-limited suspect warnings) is a real but lower-urgency
+# observation, not silence.
+UNBOUND_OR_DEAD_DECISION_STATES = frozenset({
+    "CLI_CHILD_UNKNOWN", "CLI_CHILD_DEAD", "CLI_CHILD_STALLED",
+    "CLI_CHILD_NO_PROGRESS", "CLI_CHILD_MISSING", "STUCK_OR_DEAD",
+    "WRAPPER_MISSING", "TURN_FAILED", "READINESS_GAVE_UP",
+})
+
 EPHEMERAL_LAUNCH = eph.ACTION_LAUNCH
 EPHEMERAL_DENY = eph.ACTION_DENY
 EPHEMERAL_COMPLETE = eph.ACTION_COMPLETE

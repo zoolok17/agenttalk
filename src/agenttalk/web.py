@@ -122,7 +122,9 @@ from agenttalk import knowledge as _knowledge
 from agenttalk import lesson_context as _lesson_context
 from agenttalk import onboarding as _onboarding
 from agenttalk import signing as _signing
+from agenttalk import supervisor as _supervisor
 from agenttalk import threads as th
+from agenttalk import wrapper_runtime as _wrapper_runtime
 from agenttalk.store import COMPOSING_INTENT_STALE_SECONDS, Message, Store
 from agenttalk.threads import Thread, derive_threads
 
@@ -1440,6 +1442,42 @@ class HealthTimelineRing:
             return []
 
 
+def _supervisor_decisions(store: Store, *, now_epoch: float) -> dict[str, dict]:
+    """The live supervisor decision per wrapped agent (best-effort, read-only).
+
+    This is the STRICT verdict (e.g. ``CLI_CHILD_UNKNOWN``) — distinct from the
+    wrapper's own self-reported ``health`` (idle_waiting/working_turn/...),
+    which can keep reporting "fine" after the CLI child has died. Computed
+    fresh from the same on-disk supervisor.json/state/snapshot cli.py reads for
+    `agenttalk status`; empty (never raises) when no supervisor is configured
+    or the read fails, so a root with no supervisor stays unaffected."""
+    sup_path = store.dir / "supervisor.json"
+    if not sup_path.exists():
+        return {}
+    try:
+        sup_cfg = _supervisor.load_supervisor_config(sup_path)
+        state = _supervisor.load_supervisor_state(store.dir / "supervisor-state.json")
+        snapshot_path = store.dir / "supervisor-snapshot.json"
+        snapshot: list[dict] | None = None
+        if snapshot_path.exists():
+            raw = json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
+            snapshot = raw if isinstance(raw, list) else None
+        obs = _supervisor.build_supervisor_observation(
+            store, now_epoch=now_epoch, state=state, supervisor_config=sup_cfg,
+            snapshot=snapshot, event_limit=0,
+        )
+    except Exception:  # noqa: BLE001 — advisory arm; never fail the root
+        return {}
+    out: dict[str, dict] = {}
+    for item in obs.get("agents") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        decision = item.get("decision")
+        if isinstance(decision, dict):
+            out[item["name"]] = decision
+    return out
+
+
 def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                    liaison: str | None, *,
                    threads_rows: list[dict] | None = None,
@@ -1447,7 +1485,8 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                    avatar_prefs: dict[str, str] | None = None,
                    history: "HealthTimelineRing | None" = None,
                    root_label: str | None = None,
-                   managed_loop: set[str] | None = None) -> list[dict]:
+                   managed_loop: set[str] | None = None,
+                   supervisor_decisions: dict[str, dict] | None = None) -> list[dict]:
     """Per-agent presence rows (data-model §3). Absent-not-null keys.
 
     0.58.0 additive fields (all OMITTED when not determinable): ``cli``,
@@ -1460,6 +1499,16 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     An agent in this set is wrapped/restartable even when its health mode is
     unknown (stale/missing snapshot) — that is exactly when the restart signal
     matters most, so health mode must not be the sole arm.
+
+    ``supervisor_decisions``: the live per-agent supervisor verdict
+    (name -> decision), computed ONCE per root by the caller via
+    :func:`_supervisor_decisions`. Surfaced as ``supervisor_decision``
+    (additive, absent when no decision is computable for that agent) —
+    deliberately alongside ``health``, never folded into it, so a wrapper
+    whose self-report still says "working" while its verdict says
+    ``CLI_CHILD_UNKNOWN`` shows BOTH facts rather than one adjective.
+    ``wrapper_child`` (additive) carries the raw wrapper-runtime phase and
+    ``last_progress_at`` age directly, independent of any verdict.
     """
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
@@ -1467,6 +1516,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     owned_domains = owned_domains or {}
     avatar_prefs = avatar_prefs or {}
     managed_loop = managed_loop or set()
+    supervisor_decisions = supervisor_decisions or {}
     now = datetime.now(timezone.utc)
     now_epoch = now.timestamp()
     # 0.19.0 (FR-001): per-agent message counts from the SAME validated `msgs`
@@ -1546,6 +1596,35 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
             e["wrapped"] = wrapped
             # restartable mirrors wrapped for v1 (only wrapped agents restart).
             e["restartable"] = wrapped
+        # supervisor_decision: the STRICT, positively-bound verdict (e.g.
+        # CLI_CHILD_UNKNOWN), shown ALONGSIDE `health` (the wrapper's own
+        # self-report) — never merged into it, so the two can visibly disagree.
+        decision = supervisor_decisions.get(a)
+        if decision is not None:
+            e["supervisor_decision"] = {
+                "state": decision.get("state"),
+                "action": decision.get("action"),
+                "reason": decision.get("reason"),
+            }
+        # wrapper_child: the raw wrapper-runtime observation (phase +
+        # last_progress_at age) — the cheapest "is the counter frozen" signal,
+        # independent of any verdict. Absent when no runtime record exists.
+        rt_obs = _wrapper_runtime.read_runtime(store.state_dir, a, now_epoch=now_epoch)
+        if rt_obs.get("status") == _wrapper_runtime.STATUS_VALID:
+            record = rt_obs.get("record") or {}
+            progress_age = rt_obs.get("progress_age_seconds")
+            updated_age = rt_obs.get("updated_age_seconds")
+            e["wrapper_child"] = {
+                "phase": record.get("phase"),
+                "progress_age_seconds": (
+                    round(progress_age, 3)
+                    if isinstance(progress_age, (int, float)) else None
+                ),
+                "updated_age_seconds": (
+                    round(updated_age, 3)
+                    if isinstance(updated_age, (int, float)) else None
+                ),
+            }
         owned = owned_domains.get(a)
         if owned:
             e["owned_domains"] = owned
@@ -1628,6 +1707,7 @@ def _root_state(desc: RootDescriptor,
                     managed_loop.add(a)
         except Exception:  # noqa: BLE001 — advisory arm; never fail the root
             managed_loop = set()
+        supervisor_decisions = _supervisor_decisions(store, now_epoch=time.time())
         out: dict[str, Any] = {
             "label": label,
             "path": path,
@@ -1659,7 +1739,7 @@ def _root_state(desc: RootDescriptor,
             store, cfg, msgs, liaison,
             threads_rows=threads_rows, owned_domains=owned_domains,
             avatar_prefs=avatar_prefs, history=history, root_label=label,
-            managed_loop=managed_loop)
+            managed_loop=managed_loop, supervisor_decisions=supervisor_decisions)
         out["retired"] = store.retired_agents()
         out["threads"] = threads_rows
         out["broadcasts"] = broadcasts
