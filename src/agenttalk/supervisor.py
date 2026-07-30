@@ -148,6 +148,7 @@ _OWNED_PROCESS_TREE_ROLES = frozenset({
     "cli_launcher",
     "cli_brain",
     "tool_descendant",
+    "detached_gate_runner",
 })
 _OWNED_PROCESS_TREE_STATUSES = frozenset({
     "complete",
@@ -2773,9 +2774,10 @@ def _owned_process_tree(
     )
     role_rank = {
         "tool_descendant": 0,
-        "cli_brain": 1,
-        "cli_launcher": 2,
-        "wrapper": 3,
+        "detached_gate_runner": 1,
+        "cli_brain": 2,
+        "cli_launcher": 3,
+        "wrapper": 4,
     }
 
     def add_node(row: dict, *, role: str, depth: int, live: bool) -> bool:

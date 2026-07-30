@@ -1306,10 +1306,18 @@ Each supervisor poll also projects the wrapper's owned process tree into a
 strict, 64-entry state record. The wrapper PID/start, runtime generation, and
 launch nonce must agree across supervisor state, `wrapper-runtime.json`, and
 the live wrapper; the nonce is re-read from the live command line. Parent/start
-edges establish descendant ownership, while process names only label the roles
-`wrapper`, `cli_launcher`, `cli_brain`, and `tool_descendant`. Only a complete
-tree feeds the existing leaves-first `Stop-Tree`. An invalid or truncated tree
-holds all automatic teardown and creates a nondismissible item in
+edges establish descendant ownership, while process names can only label an
+already-owned row. The closed role set is `wrapper`, `cli_launcher`,
+`cli_brain`, `tool_descendant`, and the reserved `detached_gate_runner`. Current
+discovery never infers the reserved role from a process name or command line;
+without registration bound to the job's exact PID/start plus the owning
+wrapper's generation and launch nonce, a gate-shaped job remains
+`tool_descendant`, and the role label alone grants no teardown authority. This
+release only reserves the label; #121 still owns detached execution, watchdog
+exclusion, and durable SHA-bound terminal evidence for every result, including
+timeout and kill. Only a complete tree feeds the existing leaves-first
+`Stop-Tree`. An invalid or truncated tree holds all automatic teardown and
+creates a nondismissible item in
 `agenttalk attention` and the dashboard. That item tells the operator to
 inspect the complete tree and verify every PID/start identity plus the live
 launch nonce before an attended teardown. Invalid/truncated evidence is sticky:

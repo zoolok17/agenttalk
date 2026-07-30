@@ -162,6 +162,22 @@ match on PID/start identity, wrapper generation, and launch nonce. The nonce is
 re-read from the live wrapper command line; process names and command-line
 patterns never establish descendant ownership.
 
+The closed role taxonomy also reserves `detached_gate_runner` for a future
+#121-style gate job that is deliberately bounded, owned, and allowed to outlive
+the wrapped turn that launched it. The role must come from an explicit
+registration bound to the job's exact PID/start plus the owning wrapper's
+generation and launch nonce; neither a process name nor a command-line pattern
+may assign it, and the label alone grants no teardown authority. Until that
+registration path exists, ordinary discovery records every such process as
+`tool_descendant`.
+
+This reservation does not implement the detached runner or change the turn
+watchdog. That later implementation must make the registered job attributable
+and reapable through this tree, exclude it from the watchdog's hung-tool test,
+and write durable SHA-bound terminal evidence for every outcome, including a
+job timeout or kill. A timeout must never reproduce the no-artifact failure
+mode tracked by #88.
+
 The wrapped tree crosses shell hosts and records at most 64 parent-first
 identities. A complete record alone supplies start-guarded `kill_targets` to the
 existing `Stop-Tree`. Invalid evidence or any omitted identity produces a HOLD

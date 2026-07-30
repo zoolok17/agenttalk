@@ -80,6 +80,12 @@ design. The item that did ship is the one measured to cost the most in the field
   migration evidence until that attended boundary, rather than being silently
   discarded. One-shot ephemeral reviewers use the same checked tree and persist
   it before teardown; their legacy command-line/name kill path has been removed.
+  The closed taxonomy also reserves `detached_gate_runner` for a future,
+  bounded gate job registered by its exact PID/start plus the owning wrapper's
+  generation and launch nonce. Current discovery never infers that role from a
+  name or command line, and the label alone grants no authority. Detached
+  execution, watchdog exclusion, and mandatory SHA-bound terminal evidence,
+  including timeout and kill results, remain the separate #121 implementation.
 
 - **Coverage evidence now preserves the zero-runtime-dependency boundary without taking
   custody of report files.** Attestation accepts only a recognized coverage.py/pytest-cov

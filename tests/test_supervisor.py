@@ -7869,6 +7869,67 @@ def test_owned_process_tree_crosses_shell_hosts_and_feeds_stop_tree_parent_first
     ]
 
 
+def test_owned_process_tree_reserves_detached_gate_runner_without_name_inference() -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            WRAP_LAUNCHER_PID,
+            "codex.exe",
+            "codex exec --json",
+            WRAP_CHILD_START,
+        ),
+        _proc(302, WRAP_CHILD_PID, "codex.exe", "codex tui", _ps_iso(700000)),
+        _proc(
+            303,
+            302,
+            "python.exe",
+            "python -m agenttalk dev-gate --profile release",
+            _ps_iso(800000),
+        ),
+    ]
+    first = _owned_tree_plan(snapshot, request_id="rr-gate-role-first")
+    first_tree = first["next_state"]["owned_process_tree"]
+    assert first_tree["entries"][-1]["role"] == "tool_descendant"
+
+    registered = json.loads(json.dumps(first_tree))
+    registered["entries"][-1]["role"] = "detached_gate_runner"
+    validate = lambda value: sup._valid_owned_process_tree(  # noqa: E731, SLF001
+        value,
+        agent="worker",
+        root_key=sup._root_key(TEST_ROOT),
+        wrapper_generation="wrapper-1",
+        launch_nonce=SUPERVISOR_NONCE,
+    )
+    assert validate(registered) is not None
+
+    unknown = json.loads(json.dumps(registered))
+    unknown["entries"][-1]["role"] = "background_job"
+    assert validate(unknown) is None
+
+    prior_state = first["next_state"]
+    prior_state["owned_process_tree"] = registered
+    refreshed = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-gate-role-refresh"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 1,
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": prior_state}},
+        now=NOW + 1,
+        snapshot=snapshot,
+    )
+    assert (
+        refreshed["next_state"]["owned_process_tree"]["entries"][-1]["role"]
+        == "detached_gate_runner"
+    )
+
+
 @pytest.mark.parametrize(
     ("descendant_count", "expected_truncated"),
     [(63, False), (64, True)],
