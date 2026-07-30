@@ -59,6 +59,7 @@ from agenttalk import threads as th
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle as supervisor_lifecycle
+from agenttalk import supervisor_runtime as supervisor_runtime
 
 # Hard ceiling on cumulative deadline extension from `composing` pings,
 # regardless of how many arrive. Prevents a misbehaving (or stuck) peer
@@ -539,8 +540,11 @@ def _gather_status(store: Store) -> dict:
     sup_agents = (
         sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
     )
-    supervisor_rows, supervisor_warnings = _status_supervisor_summaries(
-        store, now.timestamp(), sup_cfg)
+    supervisor_rows, supervisor_warnings, supervisor_runtime_status = (
+        _status_supervisor_summaries(
+            store, now.timestamp(), sup_cfg
+        )
+    )
     agents = []
     for a in cfg.get("agents", []):
         hb = store.read_heartbeat(a)
@@ -650,6 +654,8 @@ def _gather_status(store: Store) -> dict:
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
         "warnings": warnings,
     }
+    if supervisor_runtime.runtime_status_relevant(supervisor_runtime_status):
+        payload["supervisor_runtime"] = supervisor_runtime_status
     if os.name == "nt" and (
         (store.dir / psh.SELECTION_FILENAME).exists()
         or (store.dir / "supervisor.ps1").exists()
@@ -740,7 +746,10 @@ def _read_supervisor_snapshot(store: Store, path_value: str | None = None) -> li
 
 
 def _status_supervisor_summaries(store: Store, now_epoch: float,
-                                 sup_cfg: dict) -> tuple[dict[str, dict], list[str]]:
+                                 sup_cfg: dict) -> tuple[
+                                     dict[str, dict], list[str], dict
+                                 ]:
+    runtime_status = supervisor_runtime.build_runtime_status(store)
     try:
         obs = sup.build_supervisor_observation(
             store,
@@ -752,7 +761,14 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
             lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )
     except Exception as exc:
-        return {}, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
+        return (
+            {},
+            [f"supervisor_assessment_unavailable:{type(exc).__name__}"],
+            runtime_status,
+        )
+    observed_runtime = obs.get("supervisor_runtime")
+    if isinstance(observed_runtime, dict):
+        runtime_status = observed_runtime
     rows: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -777,7 +793,48 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
     for warning in ring.get("warnings") or []:
         if isinstance(warning, str):
             warnings.append(warning)
-    return rows, warnings
+    kill_switch = runtime_status.get("kill_switch")
+    if isinstance(kill_switch, dict):
+        for warning in kill_switch.get("warnings") or []:
+            if isinstance(warning, str):
+                warnings.append(warning)
+    return rows, warnings, runtime_status
+
+
+def _render_supervisor_kill_switch_status(runtime_status: object) -> str | None:
+    if not isinstance(runtime_status, dict):
+        return None
+    kill_switch = runtime_status.get("kill_switch")
+    if not isinstance(kill_switch, dict) or kill_switch.get("active") is not True:
+        return None
+    if kill_switch.get("observed") is not True:
+        return (
+            "supervisor: HOLD - supervisor.kill active; "
+            "no supervisor observation recorded"
+        )
+    observations = kill_switch.get("observations")
+    if not isinstance(observations, dict):
+        return "supervisor: HOLD - supervisor.kill active; observation unavailable"
+    candidates = []
+    for phase, observation in observations.items():
+        if not isinstance(phase, str) or not isinstance(observation, dict):
+            continue
+        epoch = observation.get("observed_at_epoch")
+        at = observation.get("observed_at")
+        if (
+            isinstance(epoch, (int, float))
+            and not isinstance(epoch, bool)
+            and isinstance(at, str)
+        ):
+            candidates.append((float(epoch), phase, at, observation))
+    if not candidates:
+        return "supervisor: HOLD - supervisor.kill active; observation unavailable"
+    _epoch, phase, observed_at, observation = max(candidates)
+    suffix = "; startup exits 3" if observation.get("exit_code") == 3 else ""
+    return (
+        "supervisor: HOLD - supervisor.kill active; "
+        f"{phase.replace('_', '-')} observed {observed_at}{suffix}"
+    )
 
 
 def _closed_rids(store: Store, agent: str) -> set[str]:
@@ -1219,6 +1276,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"session_id: {payload['session_id']}")
     print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
     print(f"messages:   {payload['message_count']}")
+    supervisor_runtime_line = _render_supervisor_kill_switch_status(
+        payload.get("supervisor_runtime")
+    )
+    if supervisor_runtime_line:
+        print(supervisor_runtime_line)
     if "powershell_host" in payload:
         host = payload["powershell_host"]
         print(
@@ -1319,6 +1381,9 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
                 "warnings": [f"supervisor_read_unavailable:{type(exc).__name__}"],
             },
         }
+        runtime_status = supervisor_runtime.build_runtime_status(store)
+        if supervisor_runtime.runtime_status_relevant(runtime_status):
+            payload["supervisor_runtime"] = runtime_status
     if args.json:
         try:
             rendered = json.dumps(payload, indent=2, allow_nan=False)
@@ -1333,6 +1398,11 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         return 0
     print(f"root:       {payload['root']}")
     print(f"supervisor: events cap={payload.get('event_ring', {}).get('cap')}")
+    supervisor_runtime_line = _render_supervisor_kill_switch_status(
+        payload.get("supervisor_runtime")
+    )
+    if supervisor_runtime_line:
+        print(supervisor_runtime_line)
     for item in payload.get("agents") or []:
         if not isinstance(item, dict):
             continue
@@ -11448,6 +11518,8 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     emits the read-only liveness JSON; --plan emits the action plan (the shared
     decision table); --clear-restart clears a restart marker by request_id."""
     store = _get_store(args)
+    # `--observe-kill-switch` is intentionally absent: it is the one checked,
+    # field-owned observation writer allowed while the emergency brake is set.
     supervisor_mutations = (
         "archive_launch_request",
         "claim_instance",
@@ -11552,6 +11624,37 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write(f"agenttalk supervise --repair-instance-marker: {e}\n")
             return 3
         print("no instance marker present" if path is None else f"quarantined: {path}")
+        return 0
+    if args.observe_kill_switch:
+        if not args.observation_phase:
+            sys.stderr.write(
+                "agenttalk supervise --observe-kill-switch: need "
+                "--observation-phase <startup|mid_poll>\n"
+            )
+            return 2
+        try:
+            payload = supervisor_runtime.observe_powershell_kill_switch(
+                store,
+                phase=args.observation_phase,
+                observer_pid=args.pid if args.pid is not None else os.getpid(),
+                observer_pid_start=args.pid_start,
+                now_epoch=args.now,
+                validate_artifacts=lambda: sup.validate_artifact_bundle(
+                    store, boundary="supervisor"
+                ),
+            )
+        except (
+            OSError,
+            ValueError,
+            sup.ArtifactValidationError,
+            supervisor_lifecycle.SupervisorLifecycleError,
+            supervisor_runtime.SupervisorRuntimeObservationError,
+        ) as e:
+            sys.stderr.write(
+                f"agenttalk supervise --observe-kill-switch: {e}\n"
+            )
+            return 3
+        print(json.dumps(payload, separators=(",", ":"), allow_nan=False))
         return 0
     if args.validate_current_pwsh:
         try:
@@ -13787,6 +13890,8 @@ def build_parser() -> argparse.ArgumentParser:
                            "<--dir>/.claude/settings.json (the Claude unattended seed).")
     gsup.add_argument("--claim-instance", dest="claim_instance", action="store_true",
                       help="(script use) Claim the singleton supervisor instance lock.")
+    gsup.add_argument("--observe-kill-switch", dest="observe_kill_switch",
+                      action="store_true", help=argparse.SUPPRESS)
     gsup.add_argument("--validate-current-pwsh", dest="validate_current_pwsh",
                       action="store_true", help=argparse.SUPPRESS)
     gsup.add_argument("--prepare-task-install", dest="prepare_task_install",
@@ -13817,6 +13922,9 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument("--pid-start", dest="pid_start", default=None,
                       help="(--record-launch) the launcher process start-time "
                            "(anti-pid-reuse guard).")
+    psup.add_argument("--observation-phase", dest="observation_phase",
+                      choices=sorted(supervisor_runtime.KILL_SWITCH_PHASES),
+                      default=None, help=argparse.SUPPRESS)
     psup.add_argument("--pwsh",
                       help="Absolute pwsh.exe path (terminal explicit selection; no fallback).")
     psup.add_argument("--artifact-boundary", dest="artifact_boundary",

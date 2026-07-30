@@ -514,6 +514,77 @@ def validate_current_powershell(
         _close_process_observation(host)
 
 
+@contextlib.contextmanager
+def checked_powershell_supervisor_observer(
+    store: Store,
+    *,
+    pid: int,
+    pid_start: object,
+    validate_artifacts: Callable[[], None],
+) -> Iterator[None]:
+    """Authorize one generated-supervisor observation without claiming it.
+
+    The caller must be the Python process launched directly by the selected
+    PowerShell host, or through the generated ``agenttalk.cmd`` hop.  Locks stay
+    held through the caller's field-owned write so selection, process identity,
+    and artifact validation cannot change between authorization and publish.
+    """
+    with store._supervisor_lifecycle_lock():
+        validate_artifacts()
+        with store._powershell_selection_lock():
+            first = _read_valid_selection_locked(store)
+            host = _open_process_observation(pid)
+            ancestry: tuple[ProcessObservation, ...] = ()
+            try:
+                if not start_tokens_match(host.creation_token, pid_start):
+                    raise SupervisorLifecycleError(
+                        "PowerShell pid/start locator was reused or ambiguous"
+                    )
+                if not _host_matches_selection(host, first):
+                    raise SupervisorLifecycleError(
+                        "observing PowerShell process does not match the "
+                        "current host selection"
+                    )
+                ancestry = _validate_ancestry(host)
+                for observation in ancestry:
+                    _require_process_active(observation)
+                _require_process_active(host)
+                second = _read_valid_selection_locked(store)
+                if (
+                    second["selection_revision"] != first["selection_revision"]
+                    or second["selection_fingerprint"]
+                    != first["selection_fingerprint"]
+                    or not _host_matches_selection(host, second)
+                ):
+                    raise SupervisorLifecycleError(
+                        "PowerShell host selection changed during "
+                        "supervisor observation"
+                    )
+                with store._config_lock():
+                    for observation in ancestry:
+                        _require_process_active(observation)
+                    _require_process_active(host)
+                    final = _read_valid_selection_locked(store)
+                    if (
+                        final["selection_revision"]
+                        != second["selection_revision"]
+                        or final["selection_fingerprint"]
+                        != second["selection_fingerprint"]
+                        or not _host_matches_selection(host, final)
+                    ):
+                        raise SupervisorLifecycleError(
+                            "PowerShell host selection changed before "
+                            "supervisor observation write"
+                        )
+                    _revalidate_process_image(host, final)
+                    _require_process_active(host)
+                    yield
+            finally:
+                for observation in ancestry:
+                    _close_process_observation(observation)
+                _close_process_observation(host)
+
+
 def _probe_observed_current_host(host: ProcessObservation) -> psh.ProbeResult:
     resolution = psh.resolve_candidate(current_path=host.path)
     if resolution.result is None:

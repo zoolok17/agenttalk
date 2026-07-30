@@ -727,7 +727,12 @@ New-Item .agenttalk\supervisor.kill -ItemType File
 ```
 
 While the kill switch exists, read-only commands still work, but mutating
-supervisor automation is disabled. Remove the file to re-enable automation.
+supervisor automation is disabled. The generated supervisor records the hold
+without acquiring executor authority; inspect it with `agenttalk status` or
+`agenttalk status --json`. After an agenttalk upgrade, stop and wait for the
+supervisor, remove the switch, run `agenttalk supervise --refresh-scripts`,
+re-arm the switch if needed, and then start the supervisor. Remove the file to
+re-enable automation.
 
 ## 9. Work lanes and isolated worktrees
 

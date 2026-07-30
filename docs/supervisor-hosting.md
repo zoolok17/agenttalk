@@ -92,7 +92,24 @@ While the kill switch exists, read-only commands such as `supervise --report`,
 `supervise --plan`, `deadman`, `status`, `threads`, `sync`, and `wait` remain
 usable. The supervisor refuses kills, relaunches, seeding, launch-request
 claim/archive, marker clearing, bus notify, and supervisor-state reconciliation
-writes. Remove the file to re-enable automation.
+writes. The new operational-state write exception is a checked, field-owned
+runtime observation in
+`.agenttalk\state\supervisor-runtime-observation.json`. It records that the
+generated supervisor observed the switch at startup or during a poll without
+claiming the executor instance or loading process state. Existing cleanup and
+repair operations remain available where their command contract permits them.
+
+`agenttalk status` prints an explicit hold line, and `agenttalk status --json`
+projects the same record under `supervisor_runtime.kill_switch`. A switch found
+at startup remains exit code 3 so Scheduled Task restart-on-failure continues to
+retry the blocked supervisor. To install this generated-script behavior after
+an upgrade, stop and wait for the supervisor, remove `supervisor.kill`, run
+`agenttalk supervise --refresh-scripts`, re-create the switch if the hold must
+continue, and then start the supervisor.
+
+The observation is level-triggered. If the file is removed and recreated
+entirely between supervisor observations, those two active intervals are
+indistinguishable. Remove the file to re-enable automation.
 
 ## Deadman
 
