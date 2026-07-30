@@ -101,6 +101,11 @@ design. The item that did ship is the one measured to cost the most in the field
 
 ### Changed
 
+- **The source and built-wheel pytest gate legs now run concurrently without reducing coverage.**
+  Both modes execute the full `tests` path with two pytest-xdist workers and `--dist loadfile`.
+  The gate provisions pytest-xdist as bootstrap-only tooling and installs it in the isolated
+  wheel-test environment; the shipped package still has no runtime dependencies.
+
 - **The lead skill now requires reading the code host's AUTOMATED review findings as a gate
   step, in both the Claude and Codex editions.** Automated reviewers typically post findings
   as INLINE comments on changed lines rather than in the review body, so a lead who reads

@@ -48,6 +48,30 @@ def test_dev_gate_reference_tracks_the_committed_authority_split() -> None:
     assert "`linux/3.12`" in reference
 
 
+def test_dev_gate_reference_tracks_parallel_pytest_without_runtime_dependency() -> None:
+    manifest = json.loads(Path("dev-gate.json").read_text(encoding="utf-8"))
+    pytest_spec = manifest["checks"]["pytest"]
+    reference = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
+    gate_requirements = Path("dev-gate-requirements.txt").read_text(encoding="utf-8")
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+
+    assert pytest_spec["paths"] == ["tests"]
+    assert pytest_spec["args"] == [
+        "-q",
+        "-p",
+        "xdist.plugin",
+        "-n",
+        "2",
+        "--dist",
+        "loadfile",
+    ]
+    assert pytest_spec["xdist_requirement"] == "pytest-xdist>=3.8.0"
+    assert "pytest-xdist>=3.8.0" in gate_requirements.splitlines()
+    assert "two workers" in reference
+    assert "`--dist loadfile`" in reference
+    assert "dependencies = []" in pyproject
+
+
 def test_dev_gate_reference_and_manifest_are_shipped_in_the_sdist() -> None:
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
 

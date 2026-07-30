@@ -67,9 +67,16 @@
         "tests"
       ],
       "args": [
-        "-q"
+        "-q",
+        "-p",
+        "xdist.plugin",
+        "-n",
+        "2",
+        "--dist",
+        "loadfile"
       ],
       "test_requirement": "pytest>=8.0",
+      "xdist_requirement": "pytest-xdist>=3.8.0",
       "timeout_seconds": 2700
     },
     "ruff": {

@@ -67,7 +67,9 @@ does not own check selection or argv.
 
 Every local run checks:
 
-- full pytest in source mode and built-wheel mode on Python 3.10 and 3.14;
+- full pytest in source mode and built-wheel mode on Python 3.10 and 3.14. Each run loads
+  `xdist.plugin` explicitly and uses two workers with `--dist loadfile`; file grouping preserves
+  within-file ordering while worker-specific pytest temp roots isolate concurrent files;
 - one sdist and one wheel built without build isolation;
 - sdist exclusion sentinels and required shipped files;
 - dependency-resolving wheel installation in fresh `system_site_packages=False` runtime and test environments,
