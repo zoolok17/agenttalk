@@ -740,6 +740,50 @@ def test_python_supervisor_state_recovers_only_from_validated_backup(tmp_path: P
         sup.load_supervisor_state(path)
 
 
+def test_read_supervisor_snapshot_if_fresh_returns_the_real_rows_when_current(
+    tmp_path: Path,
+) -> None:
+    """The GOOD state is present: a fresh snapshot file's ACTUAL rows come
+    back, not merely "something not-None" — count the thing that should be
+    there, per the review bar."""
+    path = tmp_path / "supervisor-snapshot.json"
+    rows = [{"pid": 123, "start": "t0", "name": "python.exe"}]
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    now = path.stat().st_mtime + 1.0
+
+    got = sup.read_supervisor_snapshot_if_fresh(path, now_epoch=now)
+
+    assert got == rows
+
+
+def test_read_supervisor_snapshot_if_fresh_rejects_a_stale_file(
+    tmp_path: Path,
+) -> None:
+    """Positive process binding requires a CURRENT snapshot: a supervisor that
+    stopped refreshing observations (or runs with actions disabled after an
+    enabled run) leaves a stale file on disk. It must be treated as if the
+    capture had failed (None) — the SAME degrade-safe signal a genuinely
+    missing snapshot produces — not read as a live liveness fact."""
+    path = tmp_path / "supervisor-snapshot.json"
+    path.write_text(json.dumps([{"pid": 1, "start": "t0", "name": "x"}]), encoding="utf-8")
+    stale_now = path.stat().st_mtime + sup.SNAPSHOT_STALE_AFTER_SECONDS + 1.0
+
+    assert sup.read_supervisor_snapshot_if_fresh(path, now_epoch=stale_now) is None
+
+
+def test_read_supervisor_snapshot_if_fresh_absent_and_malformed(tmp_path: Path) -> None:
+    missing = tmp_path / "does-not-exist.json"
+    assert sup.read_supervisor_snapshot_if_fresh(missing, now_epoch=time.time()) is None
+
+    malformed = tmp_path / "supervisor-snapshot.json"
+    malformed.write_text("not valid json {{{", encoding="utf-8")
+    assert sup.read_supervisor_snapshot_if_fresh(malformed, now_epoch=time.time()) is None
+
+    not_a_list = tmp_path / "supervisor-snapshot2.json"
+    not_a_list.write_text(json.dumps({"agents": {}}), encoding="utf-8")
+    assert sup.read_supervisor_snapshot_if_fresh(not_a_list, now_epoch=time.time()) is None
+
+
 def test_python_supervisor_state_interrupted_replace_preserves_primary(
     tmp_path: Path, monkeypatch,
 ) -> None:

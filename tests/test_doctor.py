@@ -209,6 +209,87 @@ def test_check_wrapper_child_health_no_false_down_for_grace_states(
     assert "DISAGREEMENT" not in checks[0].details
 
 
+def test_check_wrapper_child_health_no_false_error_for_provisional_cli_child_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI_CHILD_MISSING is the PROVISIONAL first-poll state of the
+    supervisor's two-poll anti-false-positive confirmation policy (the child
+    is absent on this poll, but no recovery action is queued yet, pending a
+    second same-turn poll). It must read `warn`, not `error` — `error` would
+    bypass that confirmation policy from the operator-surface side, exactly
+    the reviewer's correction of my own earlier over-inclusion."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "working_turn", "age_seconds": 1.0},
+            "decision": {"state": "CLI_CHILD_MISSING", "action": "none",
+                        "reason": "active CLI brain absent on first confirming poll"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "warn", checks[0].details
+    assert "CLI_CHILD_MISSING" in checks[0].details
+
+
+@pytest.mark.parametrize(
+    ("decision_state", "action"),
+    [("RESTART_COOLDOWN", "backoff_wait"), ("ACTIVE_OR_BUSY", "suspect_warn")],
+)
+def test_check_wrapper_child_health_action_alone_does_not_escalate_to_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision_state: str,
+    action: str,
+) -> None:
+    """`action` is a recovery-INTENT signal, not a severity signal: a normal
+    RESTART_COOLDOWN/backoff_wait or ACTIVE_OR_BUSY/suspect_warn must read
+    `warn`, not `error` — the live fleet repro the reviewer cited (a diagnostic
+    that cries wolf on a state the supervisor is handling exactly as designed).
+    """
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_IDLE_WAITING, updated_at=now_iso, since=now_iso,
+        reason_code="idle_waiting",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "idle_waiting", "age_seconds": 1.0},
+            "decision": {"state": decision_state, "action": action, "reason": "x"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "warn", checks[0].details
+
+
 def test_check_wrapper_child_health_fail_safe_on_corrupt_supervisor_state(
     tmp_path: Path,
 ) -> None:

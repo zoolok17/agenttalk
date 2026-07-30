@@ -1825,14 +1825,10 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
         # degrade the SAME way a bad observation does — a diagnostic tool
         # that dies on bad state is worst-useless exactly when state is bad.
         state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
-        snapshot_path = store.dir / "supervisor-snapshot.json"
-        snapshot: list[dict] | None = None
-        if snapshot_path.exists():
-            try:
-                raw = json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
-            except (ValueError, OSError):
-                raw = None
-            snapshot = raw if isinstance(raw, list) else None
+        # A stale snapshot must not be read as a live liveness fact (see
+        # read_supervisor_snapshot_if_fresh's docstring).
+        snapshot = sup.read_supervisor_snapshot_if_fresh(
+            store.dir / "supervisor-snapshot.json", now_epoch=now_epoch)
         obs = sup.build_supervisor_observation(
             store, now_epoch=now_epoch, state=state, supervisor_config=sup_cfg,
             snapshot=snapshot, event_limit=0,
@@ -1887,9 +1883,17 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
         d_state = decision.get("state")
         d_action = decision.get("action")
         d_reason = decision.get("reason") or ""
+        # `action` is a RECOVERY-INTENT signal, not a severity signal: backoff_wait
+        # (cooldown), suspect_warn (rate-limited, unconfirmed), refuse_protected
+        # (administrative refusal of a manual restart) etc. all pair with states
+        # OUTSIDE the confirmed-dead family and must not be escalated to `error`
+        # just for existing — that made a normal RESTART_COOLDOWN/backoff_wait or
+        # ACTIVE_OR_BUSY/suspect_warn cry wolf. `error` is reserved for the state
+        # itself being in the confirmed unbound/dead family (RELAUNCH/STUCK_RECOVER
+        # already pair with such a state, so this loses no real severity).
         if d_state in _HEALTHY_DECISION_STATES:
             status = "ok"
-        elif d_state in sup.UNBOUND_OR_DEAD_DECISION_STATES or d_action not in (None, sup.NONE):
+        elif d_state in sup.UNBOUND_OR_DEAD_DECISION_STATES:
             status = "error"
         else:
             status = "warn"

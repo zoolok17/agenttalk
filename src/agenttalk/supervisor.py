@@ -80,9 +80,15 @@ GRACE_DECISION_STATES = frozenset({"CLI_CHILD_STARTING", "LAUNCHING"})
 # verdict this exists to surface. Everything else non-green (cooldowns,
 # refusals, rate-limited suspect warnings) is a real but lower-urgency
 # observation, not silence.
+# NOTE: CLI_CHILD_MISSING is deliberately EXCLUDED — it is the provisional
+# first-poll state of the two-poll anti-false-positive confirmation policy
+# (see `_CLI_CHILD_CONFIRM_POLLS`): the child is absent on this poll, but the
+# planner withholds any recovery action and waits for a second same-turn poll
+# before declaring CLI_CHILD_DEAD. Treating the provisional poll as already
+# confirmed-dead would bypass that policy from the operator-surface side.
 UNBOUND_OR_DEAD_DECISION_STATES = frozenset({
     "CLI_CHILD_UNKNOWN", "CLI_CHILD_DEAD", "CLI_CHILD_STALLED",
-    "CLI_CHILD_NO_PROGRESS", "CLI_CHILD_MISSING", "STUCK_OR_DEAD",
+    "CLI_CHILD_NO_PROGRESS", "STUCK_OR_DEAD",
     "WRAPPER_MISSING", "TURN_FAILED", "READINESS_GAVE_UP",
 })
 
@@ -1825,6 +1831,42 @@ def _redacted_observation_plan(plan: dict) -> dict:
             if isinstance(agent_plan, dict)
         }
     }
+
+
+# Positive process binding requires a CURRENT snapshot. The generated PS
+# supervisor only refreshes supervisor-snapshot.json while actions are
+# enabled (`if (Actions-Enabled) { Get-ProcSnapshot ... }`), so a daemon that
+# stopped polling, or one running with actions disabled after an enabled run,
+# leaves a stale file on disk indefinitely. Reading it unconditionally would
+# let a caller present old process facts as a FRESH strict verdict - lying
+# with MORE authority than the raw self-report did. 300s generously covers
+# any normal poll cadence (default 15s) while still catching a truly-stopped
+# daemon quickly.
+SNAPSHOT_STALE_AFTER_SECONDS = 300.0
+
+
+def read_supervisor_snapshot_if_fresh(
+    path: Path, *, now_epoch: float,
+    stale_after_seconds: float = SNAPSHOT_STALE_AFTER_SECONDS,
+) -> list[dict] | None:
+    """Read ``supervisor-snapshot.json``, but only if its FILE mtime is fresh.
+
+    A stale, absent, or malformed file returns ``None`` — the SAME "capture
+    failed" signal a genuinely missing snapshot already produces, so a
+    downstream wrapped-agent classification fails closed (CLI_CHILD_UNKNOWN)
+    rather than silently trusting old process facts.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    if now_epoch - mtime > stale_after_seconds:
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None
+    return raw if isinstance(raw, list) else None
 
 
 def build_supervisor_observation(store: Store, *, now_epoch: float,

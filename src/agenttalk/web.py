@@ -1455,23 +1455,19 @@ def _supervisor_decisions(store: Store, *,
 
     Returns ``(decisions, decision_unavailable)`` — the second set is every
     agent configured ``wrapped: true`` for which no decision could be computed
-    (e.g. it is not ``auto_restart``), so the caller can surface that fact
-    explicitly rather than silently falling back to the self-report."""
+    (e.g. it is not ``auto_restart``, OR the observation itself failed), so
+    the caller can surface that fact explicitly rather than silently falling
+    back to the self-report. "Cannot verify" must never render as "verified
+    good": a state/snapshot/observation failure below still returns every
+    wrapped name in the unavailable set — it does NOT go silent — while a
+    failure to even load supervisor.json (so the wrapped set itself is
+    unknowable) returns both empty, matching doctor's own config-load
+    fallback."""
     sup_path = store.dir / "supervisor.json"
     if not sup_path.exists():
         return {}, set()
     try:
         sup_cfg = _supervisor.load_supervisor_config(sup_path)
-        state = _supervisor.load_supervisor_state(store.dir / "supervisor-state.json")
-        snapshot_path = store.dir / "supervisor-snapshot.json"
-        snapshot: list[dict] | None = None
-        if snapshot_path.exists():
-            raw = json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
-            snapshot = raw if isinstance(raw, list) else None
-        obs = _supervisor.build_supervisor_observation(
-            store, now_epoch=now_epoch, state=state, supervisor_config=sup_cfg,
-            snapshot=snapshot, event_limit=0,
-        )
     except Exception:  # noqa: BLE001 — advisory arm; never fail the root
         return {}, set()
     sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
@@ -1479,6 +1475,22 @@ def _supervisor_decisions(store: Store, *,
         name for name, cfg_agent in sup_agents.items()
         if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
     }
+    if not wrapped_names:
+        return {}, set()
+    try:
+        state = _supervisor.load_supervisor_state(store.dir / "supervisor-state.json")
+        # A stale snapshot must not be read as a live liveness fact (see
+        # read_supervisor_snapshot_if_fresh's docstring).
+        snapshot = _supervisor.read_supervisor_snapshot_if_fresh(
+            store.dir / "supervisor-snapshot.json", now_epoch=now_epoch)
+        obs = _supervisor.build_supervisor_observation(
+            store, now_epoch=now_epoch, state=state, supervisor_config=sup_cfg,
+            snapshot=snapshot, event_limit=0,
+        )
+    except Exception:  # noqa: BLE001 — advisory arm; never fail the root, but
+        # every wrapped agent becomes explicitly unavailable rather than
+        # vanishing (the #105 defect reintroduced through this error path).
+        return {}, wrapped_names
     decisions: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):

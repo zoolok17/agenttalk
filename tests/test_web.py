@@ -2827,6 +2827,16 @@ const stuck = hooks.agentStateInfo({
 });
 assert(stuck.color === 'danger', `STUCK_OR_DEAD must render danger, got ${stuck.color}`);
 
+// CLI_CHILD_MISSING is the PROVISIONAL first-poll state of the supervisor's
+// two-poll confirmation policy, not confirmed-dead - must render attn
+// (supervisor_unconfirmed), never danger (mirrors the doctor.py fix).
+const missing = hooks.agentStateInfo({
+  health: { state: 'working_turn' }, wrapped: true,
+  supervisor_decision: { state: 'CLI_CHILD_MISSING', action: 'none', reason: 'x' },
+});
+assert(missing.key === 'supervisor_unconfirmed', `expected supervisor_unconfirmed, got ${missing.key}`);
+assert(missing.color === 'attn', `CLI_CHILD_MISSING must render attn not danger, got ${missing.color}`);
+
 // B2 no-false-DOWN control: BOTH grace states render as the self-report says
 // (no override), not attn/danger.
 for (const graceState of ['CLI_CHILD_STARTING', 'LAUNCHING']) {
@@ -4517,6 +4527,45 @@ def test_api_state_supervisor_decision_unavailable_for_non_auto_restart_wrapped_
         alpha = next(a for a in root["agents"] if a["name"] == "alpha")
         assert alpha.get("supervisor_decision_unavailable") is True
         assert "supervisor_decision" not in alpha
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_supervisor_decision_unavailable_for_every_wrapped_agent_on_observation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """"Cannot verify" must never render as "verified good": when the
+    observation itself fails (corrupt state / unreadable snapshot), EVERY
+    configured-wrapped agent must still show `supervisor_decision_unavailable`
+    — count the thing that should be there (both alpha AND beta), not merely
+    confirm the absence of a false-green marker. Reproduces the
+    "#105 defect reintroduced through the error path" finding."""
+    s = _make_store(tmp_path)
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    _write_health(s, "beta", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {
+            "alpha": {"wrapped": True, "auto_restart": True},
+            "beta": {"wrapped": True, "auto_restart": True},
+        },
+    }), encoding="utf-8")
+
+    def boom(*_a, **_k):
+        raise ValueError("injected supervisor-state corruption")
+
+    monkeypatch.setattr(web._supervisor, "build_supervisor_observation", boom)
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        by_name = {a["name"]: a for a in root["agents"]}
+        assert by_name["alpha"].get("supervisor_decision_unavailable") is True
+        assert by_name["beta"].get("supervisor_decision_unavailable") is True
+        assert "supervisor_decision" not in by_name["alpha"]
+        assert "supervisor_decision" not in by_name["beta"]
     finally:
         srv.shutdown()
         srv.server_close()

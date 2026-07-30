@@ -455,9 +455,12 @@
   // the browser-side render of the same vocabulary).
   var SUP_HEALTHY_STATES = nullMap({ HEALTHY_IDLE: 1, HEALTHY_WORKING: 1 });
   var SUP_GRACE_STATES = nullMap({ CLI_CHILD_STARTING: 1, LAUNCHING: 1 });
+  // CLI_CHILD_MISSING is deliberately excluded - it is the provisional
+  // first-poll state of the supervisor's two-poll confirmation policy, not a
+  // confirmed-dead state (mirrors supervisor.py's own exclusion).
   var SUP_UNBOUND_OR_DEAD_STATES = nullMap({
     CLI_CHILD_UNKNOWN: 1, CLI_CHILD_DEAD: 1, CLI_CHILD_STALLED: 1,
-    CLI_CHILD_NO_PROGRESS: 1, CLI_CHILD_MISSING: 1, STUCK_OR_DEAD: 1,
+    CLI_CHILD_NO_PROGRESS: 1, STUCK_OR_DEAD: 1,
     WRAPPER_MISSING: 1, TURN_FAILED: 1, READINESS_GAVE_UP: 1,
   });
   function agentStateInfo(agent) {
