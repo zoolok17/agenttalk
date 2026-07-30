@@ -610,6 +610,11 @@ def _gather_status(store: Store) -> dict:
                     and health.get("state") in ("idle_waiting", "working_turn")
                 ):
                     row["supervisor"]["disagreement"] = True
+            elif sup_row.get("decision_unavailable") is True:
+                # A wrapped agent this supervisor cannot compute a strict
+                # decision for (e.g. not configured auto_restart) — say so
+                # rather than silently showing only the self-report.
+                row["supervisor"] = {"decision_unavailable": True}
             if isinstance(sup_row.get("lead_liveness"), dict):
                 row["lead_liveness"] = sup_row["lead_liveness"]
             effective = sup_row.get("health_effective_state")
@@ -766,25 +771,38 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
         )
     except Exception as exc:
         return {}, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
+    sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
+    wrapped_names = {
+        name for name, cfg_agent in sup_agents.items()
+        if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
+    }
     rows: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             continue
+        name = item["name"]
         decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
         health = item.get("health") if isinstance(item.get("health"), dict) else {}
         lead_liveness = item.get("lead_liveness") if isinstance(item.get("lead_liveness"), dict) else None
         effective = health.get("effective_state")
         raw_state = health.get("state")
-        if decision is None and lead_liveness is None and effective == raw_state:
+        # A WRAPPED agent with no computable decision (e.g. not configured
+        # auto_restart) must say so visibly rather than silently falling back
+        # to the self-report — the same honesty doctor already has.
+        wrapped_without_decision = decision is None and name in wrapped_names
+        if (decision is None and lead_liveness is None and effective == raw_state
+                and not wrapped_without_decision):
             continue
         row: dict[str, object] = {}
         if decision is not None:
             row["decision"] = decision
+        elif wrapped_without_decision:
+            row["decision_unavailable"] = True
         if isinstance(effective, str) and effective != raw_state:
             row["health_effective_state"] = effective
         if lead_liveness is not None:
             row["lead_liveness"] = lead_liveness
-        rows[item["name"]] = row
+        rows[name] = row
     warnings = []
     ring = obs.get("event_ring") if isinstance(obs.get("event_ring"), dict) else {}
     for warning in ring.get("warnings") or []:
@@ -1300,6 +1318,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             if (dec_state not in sup.HEALTHY_DECISION_STATES | sup.GRACE_DECISION_STATES
                     and h_state in ("idle_waiting", "working_turn")):
                 seen += " [DISAGREEMENT]"
+        elif sv.get("decision_unavailable") is True:
+            seen += " supervisor=UNAVAILABLE(not auto_restart)"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")

@@ -1820,17 +1820,19 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
         return []
 
     now_epoch = datetime.now(timezone.utc).timestamp()
-    state_path = store.dir / "supervisor-state.json"
-    state = sup.load_supervisor_state(state_path)
-    snapshot_path = store.dir / "supervisor-snapshot.json"
-    snapshot: list[dict] | None = None
-    if snapshot_path.exists():
-        try:
-            raw = json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
-        except (ValueError, OSError):
-            raw = None
-        snapshot = raw if isinstance(raw, list) else None
     try:
+        # Corrupt/invalid primary+backup state (load_supervisor_state) must
+        # degrade the SAME way a bad observation does — a diagnostic tool
+        # that dies on bad state is worst-useless exactly when state is bad.
+        state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+        snapshot_path = store.dir / "supervisor-snapshot.json"
+        snapshot: list[dict] | None = None
+        if snapshot_path.exists():
+            try:
+                raw = json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
+            except (ValueError, OSError):
+                raw = None
+            snapshot = raw if isinstance(raw, list) else None
         obs = sup.build_supervisor_observation(
             store, now_epoch=now_epoch, state=state, supervisor_config=sup_cfg,
             snapshot=snapshot, event_limit=0,

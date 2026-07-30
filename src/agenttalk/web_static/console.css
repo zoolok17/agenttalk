@@ -707,6 +707,20 @@ body {
 .status-unknown.tc-dot,
 .status-unknown.tc-legend-dot { background: var(--gray); }
 
+/* Supervisor decision.state overrides (#105) - a self-report that still says
+   "fine" while the supervisor's strict, positively-bound verdict does not. */
+.status-supervisor_unbound.tc-chip { color: var(--danger); background: var(--danger-soft); }
+.status-supervisor_unbound.tc-dot,
+.status-supervisor_unbound.tc-legend-dot { background: var(--danger); }
+
+.status-supervisor_unconfirmed.tc-chip { color: var(--attn); background: var(--attn-soft); }
+.status-supervisor_unconfirmed.tc-dot,
+.status-supervisor_unconfirmed.tc-legend-dot { background: var(--attn); }
+
+.status-supervisor_unavailable.tc-chip { color: var(--attn); background: var(--attn-soft); }
+.status-supervisor_unavailable.tc-dot,
+.status-supervisor_unavailable.tc-legend-dot { background: var(--attn); }
+
 /* --- Kind chip color map (message kinds) --- */
 .kind-review-request { color: var(--accent); background: var(--accent-soft); }
 .kind-review-result  { color: var(--ok); background: var(--ok-soft); }

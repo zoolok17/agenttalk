@@ -169,6 +169,75 @@ def test_check_wrapper_child_health_no_false_down_when_healthy(
     assert "DISAGREEMENT" not in checks[0].details
 
 
+@pytest.mark.parametrize("grace_state", ["CLI_CHILD_STARTING", "LAUNCHING"])
+def test_check_wrapper_child_health_no_false_down_for_grace_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    grace_state: str,
+) -> None:
+    """No false-DOWN, both grace states: a freshly launched agent still inside
+    its bounded handoff grace (CLI_CHILD_STARTING, the wrapped-CLI-spawn
+    state, or the broader LAUNCHING state the planner also returns "in launch
+    grace") must read `ok`, not `warn`/`[DISAGREEMENT]` — reproduces the
+    reviewer's LAUNCHING regression."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_IDLE_WAITING, updated_at=now_iso, since=now_iso,
+        reason_code="idle_waiting",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "idle_waiting", "age_seconds": 1.0},
+            "decision": {"state": grace_state, "action": "none",
+                        "reason": "in launch grace"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "ok", checks[0].details
+    assert "DISAGREEMENT" not in checks[0].details
+
+
+def test_check_wrapper_child_health_fail_safe_on_corrupt_supervisor_state(
+    tmp_path: Path,
+) -> None:
+    """A diagnostic tool that dies on bad state is worst-useless exactly when
+    state is bad: a corrupt supervisor-state.json must degrade to a WARN
+    check, not abort doctor entirely (SupervisorPersistenceError)."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    (store.dir / "supervisor-state.json").write_text("not valid json {{{", encoding="utf-8")
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "warn"
+    assert "could not compute the supervisor's decision" in checks[0].details
+
+    # Full doctor.run() must also survive it end-to-end (the actual failure
+    # mode reported: an unguarded load_supervisor_state() call ABORTED the
+    # whole report with SupervisorPersistenceError instead of degrading).
+    report = doctor.run(tmp_path)
+    names = {c.name for c in report.checks}
+    assert "store.initialized" in names
+    assert "heartbeat.alpha" in names
+
+
 def test_check_wrapper_child_health_reports_absent_decision_honestly(
     tmp_path: Path,
 ) -> None:

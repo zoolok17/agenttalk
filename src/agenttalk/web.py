@@ -1442,7 +1442,8 @@ class HealthTimelineRing:
             return []
 
 
-def _supervisor_decisions(store: Store, *, now_epoch: float) -> dict[str, dict]:
+def _supervisor_decisions(store: Store, *,
+                          now_epoch: float) -> tuple[dict[str, dict], set[str]]:
     """The live supervisor decision per wrapped agent (best-effort, read-only).
 
     This is the STRICT verdict (e.g. ``CLI_CHILD_UNKNOWN``) — distinct from the
@@ -1450,10 +1451,15 @@ def _supervisor_decisions(store: Store, *, now_epoch: float) -> dict[str, dict]:
     which can keep reporting "fine" after the CLI child has died. Computed
     fresh from the same on-disk supervisor.json/state/snapshot cli.py reads for
     `agenttalk status`; empty (never raises) when no supervisor is configured
-    or the read fails, so a root with no supervisor stays unaffected."""
+    or the read fails, so a root with no supervisor stays unaffected.
+
+    Returns ``(decisions, decision_unavailable)`` — the second set is every
+    agent configured ``wrapped: true`` for which no decision could be computed
+    (e.g. it is not ``auto_restart``), so the caller can surface that fact
+    explicitly rather than silently falling back to the self-report."""
     sup_path = store.dir / "supervisor.json"
     if not sup_path.exists():
-        return {}
+        return {}, set()
     try:
         sup_cfg = _supervisor.load_supervisor_config(sup_path)
         state = _supervisor.load_supervisor_state(store.dir / "supervisor-state.json")
@@ -1467,15 +1473,20 @@ def _supervisor_decisions(store: Store, *, now_epoch: float) -> dict[str, dict]:
             snapshot=snapshot, event_limit=0,
         )
     except Exception:  # noqa: BLE001 — advisory arm; never fail the root
-        return {}
-    out: dict[str, dict] = {}
+        return {}, set()
+    sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
+    wrapped_names = {
+        name for name, cfg_agent in sup_agents.items()
+        if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
+    }
+    decisions: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             continue
         decision = item.get("decision")
         if isinstance(decision, dict):
-            out[item["name"]] = decision
-    return out
+            decisions[item["name"]] = decision
+    return decisions, wrapped_names - set(decisions)
 
 
 def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
@@ -1486,7 +1497,8 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                    history: "HealthTimelineRing | None" = None,
                    root_label: str | None = None,
                    managed_loop: set[str] | None = None,
-                   supervisor_decisions: dict[str, dict] | None = None) -> list[dict]:
+                   supervisor_decisions: dict[str, dict] | None = None,
+                   decision_unavailable: set[str] | None = None) -> list[dict]:
     """Per-agent presence rows (data-model §3). Absent-not-null keys.
 
     0.58.0 additive fields (all OMITTED when not determinable): ``cli``,
@@ -1509,6 +1521,11 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     ``CLI_CHILD_UNKNOWN`` shows BOTH facts rather than one adjective.
     ``wrapper_child`` (additive) carries the raw wrapper-runtime phase and
     ``last_progress_at`` age directly, independent of any verdict.
+
+    ``decision_unavailable``: the set of agents configured ``wrapped: true``
+    for which no decision could be computed (not ``auto_restart``) — surfaced
+    as ``supervisor_decision_unavailable: true`` so this reads as visibly as
+    doctor's equivalent WARN, rather than silently showing only `health`.
     """
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
@@ -1517,6 +1534,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     avatar_prefs = avatar_prefs or {}
     managed_loop = managed_loop or set()
     supervisor_decisions = supervisor_decisions or {}
+    decision_unavailable = decision_unavailable or set()
     now = datetime.now(timezone.utc)
     now_epoch = now.timestamp()
     # 0.19.0 (FR-001): per-agent message counts from the SAME validated `msgs`
@@ -1606,6 +1624,12 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                 "action": decision.get("action"),
                 "reason": decision.get("reason"),
             }
+        elif a in decision_unavailable:
+            # A wrapped agent this supervisor cannot compute a strict decision
+            # for (e.g. not configured auto_restart) — say so visibly, as
+            # doctor's equivalent WARN already does, rather than silently
+            # showing only the self-report.
+            e["supervisor_decision_unavailable"] = True
         # wrapper_child: the raw wrapper-runtime observation (phase +
         # last_progress_at age) — the cheapest "is the counter frozen" signal,
         # independent of any verdict. Absent when no runtime record exists.
@@ -1707,7 +1731,8 @@ def _root_state(desc: RootDescriptor,
                     managed_loop.add(a)
         except Exception:  # noqa: BLE001 — advisory arm; never fail the root
             managed_loop = set()
-        supervisor_decisions = _supervisor_decisions(store, now_epoch=time.time())
+        supervisor_decisions, decision_unavailable = _supervisor_decisions(
+            store, now_epoch=time.time())
         out: dict[str, Any] = {
             "label": label,
             "path": path,
@@ -1739,7 +1764,8 @@ def _root_state(desc: RootDescriptor,
             store, cfg, msgs, liaison,
             threads_rows=threads_rows, owned_domains=owned_domains,
             avatar_prefs=avatar_prefs, history=history, root_label=label,
-            managed_loop=managed_loop, supervisor_decisions=supervisor_decisions)
+            managed_loop=managed_loop, supervisor_decisions=supervisor_decisions,
+            decision_unavailable=decision_unavailable)
         out["retired"] = store.retired_agents()
         out["threads"] = threads_rows
         out["broadcasts"] = broadcasts

@@ -72,7 +72,10 @@ HEALTHY_DECISION_STATES = frozenset({"HEALTHY_IDLE", "HEALTHY_WORKING"})
 # A fresh CLI spawn inside its bounded handoff grace renders healthy too -
 # it is expected, not a fault - but kept separate so a caller that only wants
 # the two POSITIVELY CONFIRMED states can use HEALTHY_DECISION_STATES alone.
-GRACE_DECISION_STATES = frozenset({"CLI_CHILD_STARTING"})
+# LAUNCHING is the broader "still in grace, readiness unresolved" state (see
+# the "1) LAUNCHING" branch below); CLI_CHILD_STARTING is its narrower wrapped-
+# CLI-spawn sibling. Both are expected, bounded, and not a fault.
+GRACE_DECISION_STATES = frozenset({"CLI_CHILD_STARTING", "LAUNCHING"})
 # The child-cannot-be-positively-bound / confirmed-dead family: the strict
 # verdict this exists to surface. Everything else non-green (cooldowns,
 # refusals, rate-limited suspect warnings) is a real but lower-urgency

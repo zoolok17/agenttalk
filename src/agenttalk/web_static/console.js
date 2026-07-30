@@ -449,11 +449,54 @@
     var age = Number(agent && agent.last_seen_age_seconds);
     return Number.isFinite(age) && age >= 0 && age <= UNWRAPPED_LIVE_STALE_AFTER_SECONDS;
   }
+  // decision.state operator-surface classification (#105) - MUST mirror
+  // supervisor.py's HEALTHY_DECISION_STATES / GRACE_DECISION_STATES /
+  // UNBOUND_OR_DEAD_DECISION_STATES (Python is the source of truth; this is
+  // the browser-side render of the same vocabulary).
+  var SUP_HEALTHY_STATES = nullMap({ HEALTHY_IDLE: 1, HEALTHY_WORKING: 1 });
+  var SUP_GRACE_STATES = nullMap({ CLI_CHILD_STARTING: 1, LAUNCHING: 1 });
+  var SUP_UNBOUND_OR_DEAD_STATES = nullMap({
+    CLI_CHILD_UNKNOWN: 1, CLI_CHILD_DEAD: 1, CLI_CHILD_STALLED: 1,
+    CLI_CHILD_NO_PROGRESS: 1, CLI_CHILD_MISSING: 1, STUCK_OR_DEAD: 1,
+    WRAPPER_MISSING: 1, TURN_FAILED: 1, READINESS_GAVE_UP: 1,
+  });
   function agentStateInfo(agent) {
     var raw = ((agent && agent.health) || {}).state;
     var info = stateInfo(raw);
     if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
-      return { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true, desc: 'Alive and checking in, but not running under the supervisor' };
+      info = { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true, desc: 'Alive and checking in, but not running under the supervisor' };
+    }
+    // The supervisor's strict, positively-bound decision is a SEPARATE fact
+    // from the wrapper's self-report above (`info`) - never let a cheerful
+    // self-report hide a confirmed-bad verdict. Grace states (CLI_CHILD_
+    // STARTING / LAUNCHING) and the two HEALTHY_* states never override.
+    var decision = agent && agent.supervisor_decision;
+    if (decision && typeof decision === 'object') {
+      var dstate = decision.state;
+      if (!SUP_HEALTHY_STATES[dstate] && !SUP_GRACE_STATES[dstate]) {
+        var isDead = !!SUP_UNBOUND_OR_DEAD_STATES[dstate];
+        return {
+          label: isDead ? 'Child unconfirmed' : 'Supervisor: ' + (dstate || 'unknown'),
+          key: isDead ? 'supervisor_unbound' : 'supervisor_unconfirmed',
+          color: isDead ? 'danger' : 'attn',
+          grp: 'attn',
+          desc: 'Supervisor verdict: ' + (dstate || 'unknown') +
+                ' — self-report says "' + info.label + '", but the CLI child ' +
+                'could not be confirmed',
+          selfReport: info,
+        };
+      }
+    } else if (agent && agent.supervisor_decision_unavailable === true) {
+      return {
+        label: 'No verdict',
+        key: 'supervisor_unavailable',
+        color: 'attn',
+        grp: 'attn',
+        desc: 'Wrapped, but the supervisor has no computable verdict for this ' +
+              'agent (not configured auto_restart) — self-report only: "' +
+              info.label + '"',
+        selfReport: info,
+      };
     }
     return info;
   }

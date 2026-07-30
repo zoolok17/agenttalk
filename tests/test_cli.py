@@ -584,6 +584,78 @@ def test_status_no_disagreement_flag_for_a_genuinely_healthy_agent(
     assert "[DISAGREEMENT]" not in line
 
 
+@pytest.mark.parametrize("grace_state", ["CLI_CHILD_STARTING", "LAUNCHING"])
+def test_status_no_disagreement_flag_for_grace_states(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    grace_state: str,
+) -> None:
+    """No false-DOWN, both grace states: a freshly launched agent still inside
+    its bounded handoff grace must not be flagged — reproduces the reviewer's
+    LAUNCHING regression (`supervisor=LAUNCHING/none [DISAGREEMENT]`)."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_IDLE_WAITING,
+        updated_at=now_iso, since=now_iso,
+        reason_code="idle_waiting",
+    ))
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation",
+                        lambda *_a, **_k: _fake_decision(grace_state))
+
+    rc = _run(["status", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert "disagreement" not in alpha["supervisor"]
+
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("alpha"))
+    assert "[DISAGREEMENT]" not in line, line
+
+
+def test_status_flags_decision_unavailable_for_non_auto_restart_wrapped_agent(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A wrapped agent that is not `auto_restart` has no computable strict
+    decision — real (unpatched) build_supervisor_observation behavior. status
+    must say so visibly (both JSON and text), not silently show only the
+    self-report with no supervisor field at all."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": False}},
+    }), encoding="utf-8")
+
+    rc = _run(["status", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["supervisor"]["decision_unavailable"] is True
+
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("alpha"))
+    assert "supervisor=UNAVAILABLE" in line, line
+
+
 def test_supervisor_cli_read_fail_safe(
     store_root: Path,
     monkeypatch: pytest.MonkeyPatch,

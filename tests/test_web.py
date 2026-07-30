@@ -2755,6 +2755,115 @@ assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative 
                    capture_output=True, text=True)
 
 
+def test_console_agent_state_info_reflects_supervisor_decision(tmp_path: Path) -> None:
+    """A REAL render control: drives the actual browser-side `agentStateInfo()`
+    (not `/api/state`) for the exact scenario #105 exists to fix — a wrapper
+    whose self-report still says "working" while the supervisor's decision
+    says the CLI child could not be confirmed. Without the console.js fix,
+    `agentStateInfo` classified this purely from `health.state` and returned
+    `color: 'ok'` — a browser-visible false-GREEN. This asserts it does not.
+
+    Also a no-false-DOWN control for BOTH grace states (`CLI_CHILD_STARTING`
+    and `LAUNCHING`) and the two green states, and the `supervisor_decision_
+    unavailable` case (a wrapped, non-auto_restart agent) renders visibly
+    rather than silently as plain self-report.
+    """
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the console render-control test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    agentStateInfo: agentStateInfo\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented2.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-agent-state-supervisor.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+ctx.__agenttalkConsoleTestHooks = {};
+vm.createContext(ctx);
+vm.runInContext(source, ctx, { filename: 'console.instrumented2.js' });
+const hooks = ctx.__agenttalkConsoleTestHooks;
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+
+// B1 direction control: the dead-child case, self-report still "working".
+// Before the console.js fix this returned color:'ok' (the browser-visible bug).
+const dead = hooks.agentStateInfo({
+  health: { state: 'working_turn' }, wrapped: true,
+  supervisor_decision: { state: 'CLI_CHILD_UNKNOWN', action: 'none', reason: 'x' },
+});
+assert(dead.color !== 'ok', `dead-child must not render ok, got ${dead.color}`);
+assert(dead.key === 'supervisor_unbound', `expected supervisor_unbound, got ${dead.key}`);
+assert(dead.color === 'danger', `expected danger, got ${dead.color}`);
+
+// Same for a confirmed-dead sibling state (not just CLI_CHILD_UNKNOWN).
+const stuck = hooks.agentStateInfo({
+  health: { state: 'idle_waiting' }, wrapped: true,
+  supervisor_decision: { state: 'STUCK_OR_DEAD', action: 'stuck_recover', reason: 'x' },
+});
+assert(stuck.color === 'danger', `STUCK_OR_DEAD must render danger, got ${stuck.color}`);
+
+// B2 no-false-DOWN control: BOTH grace states render as the self-report says
+// (no override), not attn/danger.
+for (const graceState of ['CLI_CHILD_STARTING', 'LAUNCHING']) {
+  const grace = hooks.agentStateInfo({
+    health: { state: 'idle_waiting' }, wrapped: true,
+    supervisor_decision: { state: graceState, action: 'none', reason: 'x' },
+  });
+  assert(grace.key === 'idle_waiting', `${graceState} must not override self-report, got ${grace.key}`);
+  assert(grace.color !== 'danger' && grace.color !== 'attn', `${graceState} false-DOWN: ${grace.color}`);
+}
+
+// Positive control: HEALTHY_WORKING never overrides either.
+const healthy = hooks.agentStateInfo({
+  health: { state: 'working_turn' }, wrapped: true,
+  supervisor_decision: { state: 'HEALTHY_WORKING', action: 'none', reason: 'ok' },
+});
+assert(healthy.key === 'working_turn', `HEALTHY_WORKING false-DOWN: ${healthy.key}`);
+assert(healthy.color === 'ok', `HEALTHY_WORKING must stay ok, got ${healthy.color}`);
+
+// B3: supervisor_decision_unavailable (wrapped, not auto_restart) renders
+// visibly rather than silently falling back to plain self-report.
+const unavailable = hooks.agentStateInfo({
+  health: { state: 'working_turn' }, wrapped: true,
+  supervisor_decision_unavailable: true,
+});
+assert(unavailable.key === 'supervisor_unavailable', `expected supervisor_unavailable, got ${unavailable.key}`);
+assert(unavailable.color === 'attn', `expected attn, got ${unavailable.color}`);
+
+// No supervisor_decision at all (unwrapped / no supervisor configured) is
+// unaffected — plain self-report, no false alarm.
+const plain = hooks.agentStateInfo({ health: { state: 'working_turn' }, wrapped: true });
+assert(plain.key === 'working_turn', `plain self-report must be unaffected, got ${plain.key}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def test_console_all_dashboard_views_render_smoke_non_empty_main(tmp_path: Path) -> None:
     if shutil.which("node") is None:
         pytest.skip("node is required for console all-views render smoke test")
@@ -4381,6 +4490,33 @@ def test_api_state_supervisor_decision_absent_when_not_computable(
         alpha = next(a for a in root["agents"] if a["name"] == "alpha")
         assert "supervisor_decision" not in alpha
         assert "wrapper_child" not in alpha
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_supervisor_decision_unavailable_for_non_auto_restart_wrapped_agent(
+    tmp_path: Path,
+) -> None:
+    """A wrapped agent that is not `auto_restart` has no computable strict
+    decision — real (unpatched) build_supervisor_observation behavior. The
+    web console must say so visibly (`supervisor_decision_unavailable: true`),
+    not silently show only `health` with no other signal at all — the
+    "dishonest on the two human surfaces" gap the reviewer found on web+status."""
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": False}},
+    }), encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert alpha.get("supervisor_decision_unavailable") is True
+        assert "supervisor_decision" not in alpha
     finally:
         srv.shutdown()
         srv.server_close()
