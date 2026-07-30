@@ -5553,8 +5553,8 @@ def test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit(
                     f"Stop-Process -Id {child_pid} -Force "
                     "-ErrorAction SilentlyContinue",
                 ],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 timeout=15,
             )
 
