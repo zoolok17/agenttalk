@@ -181,6 +181,8 @@ schema. Suggested fields:
   "turn_generation": 17,
   "turn_id": "bounded-token",
   "message_id": "20260724-...",
+  "last_started_message_id": "20260724-...",
+  "consecutive_message_turn_starts": 2,
   "cli_launcher_pid": 4200,
   "cli_launcher_start": "2026-07-24T15:03:00.000000Z",
   "progress_sequence": 9,
@@ -215,6 +217,14 @@ The wrapper writes:
 3. a higher `progress_sequence` on real adapter progress;
 4. `terminal` with a bounded outcome when the child ends; and
 5. `idle` only after the loop is ready to receive another record.
+
+`last_started_message_id` preserves the streak identity while the current
+`message_id` is cleared at idle. `consecutive_message_turn_starts` increments
+when another inbound turn starts for that message, resets to one when a
+different message starts, and is unchanged by progress, terminal, idle, or
+synthetic cadence transitions. `agenttalk status --json` exposes the count in
+the agent's `wrapper_runtime` object; human `agenttalk status` adds
+`same-message-starts=<count>` once the count reaches two.
 
 Progress events may be coalesced to one atomic write per bounded interval. The
 in-memory sequence still advances for every accepted event, and the terminal

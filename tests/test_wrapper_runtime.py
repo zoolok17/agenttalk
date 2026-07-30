@@ -68,6 +68,82 @@ def test_runtime_writer_publishes_closed_lifecycle_and_monotonic_progress(
     assert wr.read_runtime(tmp_path, "worker", now_epoch=NOW)["status"] == wr.STATUS_VALID
 
 
+def test_same_message_turn_start_count_survives_wrapper_restart(
+    tmp_path: Path,
+) -> None:
+    first = _writer(tmp_path)
+    first.idle()
+    started = first.starting(message_id="msg-1", turn_id="turn-1")
+    first.active(456, "start-456")
+
+    second = wr.WrapperRuntimeWriter(
+        tmp_path,
+        "worker",
+        "generation-2",
+        wrapper_pid=124,
+        wrapper_start="start-124",
+        clock=lambda: NOW,
+    )
+    first_restart_idle = second.idle()
+    third = wr.WrapperRuntimeWriter(
+        tmp_path,
+        "worker",
+        "generation-3",
+        wrapper_pid=125,
+        wrapper_start="start-125",
+        clock=lambda: NOW,
+    )
+    second_restart_idle = third.idle()
+    restarted = third.starting(message_id="msg-1", turn_id="turn-2")
+
+    assert started["consecutive_message_turn_starts"] == 1
+    assert first_restart_idle["consecutive_message_turn_starts"] == 1
+    assert second_restart_idle["consecutive_message_turn_starts"] == 1
+    assert restarted["consecutive_message_turn_starts"] == 2
+
+
+def test_same_message_turn_start_count_resets_for_different_message(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path)
+
+    writer.starting(message_id="msg-1", turn_id="turn-1")
+    repeated = writer.starting(message_id="msg-1", turn_id="turn-2")
+    different = writer.starting(message_id="msg-2", turn_id="turn-3")
+
+    assert repeated["consecutive_message_turn_starts"] == 2
+    assert different["consecutive_message_turn_starts"] == 1
+
+
+def test_normal_turn_does_not_inflate_same_message_turn_start_count(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path)
+
+    started = writer.starting(message_id="msg-1", turn_id="turn-1")
+    active = writer.active(456, "start-456")
+    progress = writer.progress()
+    terminal = writer.terminal(wr.OUTCOME_SUCCESS)
+    idle = writer.idle()
+    cadence = writer.starting(message_id=None, turn_id="cadence-1")
+    cadence_terminal = writer.terminal(wr.OUTCOME_SUCCESS)
+    cadence_idle = writer.idle()
+
+    assert [
+        row["consecutive_message_turn_starts"]
+        for row in (
+            started,
+            active,
+            progress,
+            terminal,
+            idle,
+            cadence,
+            cadence_terminal,
+            cadence_idle,
+        )
+    ] == [1, 1, 1, 1, 1, 1, 1, 1]
+
+
 def test_runtime_writer_coalesces_progress_and_forces_terminal_high_water(
     tmp_path: Path,
 ) -> None:
@@ -1117,6 +1193,7 @@ def test_one_shot_delivery_terminal_runtime_requires_committed_thread_seen(
         lambda row: row.update({"progress_sequence": -1}),
         lambda row: row.update({"updated_at": "not-a-time"}),
         lambda row: row.update({"phase": "active", "cli_launcher_pid": None}),
+        lambda row: row.update({"last_started_message_id": "msg-1"}),
     ],
 )
 def test_validate_record_rejects_unknown_or_inconsistent_fields(
@@ -1128,6 +1205,25 @@ def test_validate_record_rejects_unknown_or_inconsistent_fields(
 
     with pytest.raises(wr.RuntimeRecordError):
         wr.validate_record(row, expected_agent="worker", now_epoch=NOW)
+
+
+def test_validate_record_normalizes_legacy_missing_turn_start_count(
+    tmp_path: Path,
+) -> None:
+    row = _writer(tmp_path).starting(
+        message_id="msg-legacy",
+        turn_id="turn-legacy",
+    )
+    del row["last_started_message_id"]
+    del row["consecutive_message_turn_starts"]
+
+    normalized = wr.validate_record(
+        row,
+        expected_agent="worker",
+        now_epoch=NOW,
+    )
+
+    assert normalized["consecutive_message_turn_starts"] == 1
 
 
 def test_torn_or_bom_prefixed_runtime_read_is_one_invalid_observation(
