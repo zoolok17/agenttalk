@@ -5,7 +5,8 @@
 **Origin:** a "what would you build differently from scratch?" question put to the
 team — two Codex agents, two Claude agents, plus Fable and the lead, answered
 independently and **converged** on the five pillars below.
-**Roadmap:** `ROADMAP.md` → "Substrate v2 — from-scratch reflection".
+**Roadmap:** `docs/ROADMAP-ARCHIVE-2026-06.md` → "Substrate v2 — from-scratch reflection"
+(that file was the repository-root `ROADMAP.md` until it was archived on 2026-07-30).
 **This is a DIRECTION, not a committed rewrite.** The system works and is
 load-bearing; this RFC scopes an *incremental* migration and states, up front,
 what is knowable-day-one vs. learned-by-running, and the hard limits of the

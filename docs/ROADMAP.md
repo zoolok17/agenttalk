@@ -7,7 +7,9 @@
 
 **Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus/store/CLI/wrapper) is already cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The **supervisor is the open platform gap** — it currently requires PowerShell Core 7+ and Windows-only `Win32_Process`; a POSIX supervisor path is an unbuilt follow-up (see §6 cross-cutting and §8).
 
-Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/TEST-COVERAGE-REPORT.md` (test inventory, coverage, and tooling recommendations) · `docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md` (dashboard control-plane design history) · `CHANGELOG.md`.
+Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/TEST-COVERAGE-REPORT.md` (test inventory, coverage, and tooling recommendations) · `docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md` (dashboard control-plane design history) · `docs/ROADMAP-ARCHIVE-2026-06.md` (**archived** early roadmap/working notes through v0.24.0 — do not plan from it) · `CHANGELOG.md`.
+
+**This file is the only current roadmap.** Two other files carry "roadmap" in their history: the archive above, and the dashboard design history. Both were renamed on 2026-07-30 so the current one is unambiguous.
 
 ---
 

@@ -1,8 +1,17 @@
-# agenttalk — roadmap & working notes
+# agenttalk — ARCHIVED early roadmap & working notes (through 2026-06)
 
-> Historical working notes through the early production retros. The
-> authoritative current product roadmap is `docs/ROADMAP.md`; the release
-> source of truth is `CHANGELOG.md`.
+> **ARCHIVE — do not plan from this file.** Historical working notes through the
+> early production retros, baseline v0.24.0. The authoritative current product
+> roadmap is [`docs/ROADMAP.md`](ROADMAP.md) (see its §6.0 for the near-term
+> per-release plan); the release source of truth is `CHANGELOG.md`.
+>
+> Renamed 2026-07-30 from the repository-root `ROADMAP.md`, because two files
+> named `ROADMAP.md` made it ambiguous which one was current — and it did
+> mislead a reader. Content is unchanged; only the path and this banner moved.
+> Kept because it still holds material referenced elsewhere: the "Substrate v2 —
+> from-scratch reflection" that `docs/RFC-substrate-v2.md` cites, the early
+> release ritual referenced by the `kitty-specs/` archives, and the phase-by-phase
+> record of 0.13.0–0.24.0.
 
 Carry-forward notes for the next session / next machine: what production
 use validated, what hurt, and the ranked backlog to address it. Built from
