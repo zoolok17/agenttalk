@@ -158,6 +158,13 @@ design. The item that did ship is the one measured to cost the most in the field
   execution, watchdog exclusion, and mandatory SHA-bound terminal evidence,
   including timeout and kill results, remain the separate #121 implementation.
 
+- **A kill switch present before supervisor startup is now durably visible.**
+  The generated PowerShell supervisor records a strict, level-triggered runtime
+  observation before preserving exit code 3, without claiming the executor
+  instance or writing process state. Mid-poll switch transitions use the same
+  checked operation. Human and JSON `status` project the record independently
+  of the supervisor event-ring limit.
+
 - **Coverage evidence now preserves the zero-runtime-dependency boundary without taking
   custody of report files.** Attestation accepts only a recognized coverage.py/pytest-cov
   terminal summary from stdout; it no longer parses root JSON or XML reports. A scan

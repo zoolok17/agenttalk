@@ -312,6 +312,119 @@ def test_claim_refuses_unrelated_pid_without_marker(
     assert not store.supervisor_instance_path().exists()
 
 
+def test_observer_refuses_unrelated_powershell_pid_without_claiming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    selected = _selected(store)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current_pid = os.getpid()
+    current = _observation(
+        current_pid,
+        parent=200,
+        path=r"C:\Python\python.exe",
+        ticks=300,
+    )
+    unrelated = _observation(
+        200,
+        parent=999,
+        path=r"C:\Tools\runner.exe",
+        ticks=200,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_read_valid_selection_locked",
+        lambda store: selected,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_parent_map",
+        lambda: {current_pid: 200, 200: 999},
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_open_process_observation",
+        lambda pid, parents=None: (
+            host
+            if pid == host.pid
+            else current
+            if pid == current_pid
+            else unrelated
+        ),
+    )
+
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match="unsupported"):
+        with lifecycle.checked_powershell_supervisor_observer(
+            store,
+            pid=host.pid,
+            pid_start=host.creation_token,
+            validate_artifacts=lambda: None,
+        ):
+            pytest.fail("unrelated caller reached the observation write")
+    assert not store.supervisor_instance_path().exists()
+
+
+def test_observer_holds_lifecycle_selection_config_through_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    events: list[str] = []
+
+    def lock(name: str):
+        @contextlib.contextmanager
+        def held():
+            events.append("enter:" + name)
+            try:
+                yield
+            finally:
+                events.append("exit:" + name)
+
+        return held()
+
+    monkeypatch.setattr(store, "_supervisor_lifecycle_lock", lambda: lock("lifecycle"))
+    monkeypatch.setattr(store, "_powershell_selection_lock", lambda: lock("selection"))
+    monkeypatch.setattr(store, "_config_lock", lambda: lock("config"))
+    selected = _selected(store)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current = _observation(
+        os.getpid(),
+        parent=100,
+        path=r"C:\Python\python.exe",
+        ticks=200,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_read_valid_selection_locked",
+        lambda store: selected,
+    )
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
+    monkeypatch.setattr(lifecycle, "_require_process_active", lambda observed: None)
+    monkeypatch.setattr(psh, "native_file_identity", lambda path: host.identity)
+
+    with lifecycle.checked_powershell_supervisor_observer(
+        store,
+        pid=host.pid,
+        pid_start=host.creation_token,
+        validate_artifacts=lambda: events.append("artifacts"),
+    ):
+        events.append("write")
+
+    assert events == [
+        "enter:lifecycle",
+        "artifacts",
+        "enter:selection",
+        "enter:config",
+        "write",
+        "exit:config",
+        "exit:selection",
+        "exit:lifecycle",
+    ]
+    assert not store.supervisor_instance_path().exists()
+
+
 def test_generated_claim_reports_corrupt_marker_recovery_before_write(
     tmp_path: Path,
 ) -> None:
