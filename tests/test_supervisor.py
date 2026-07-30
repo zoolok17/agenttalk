@@ -18,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -4142,13 +4143,42 @@ def _select_test_powershell_with_slow_probe(root: Path, shell: str) -> None:
 
 
 def _checkout_runtime_env(base: dict[str, str] | None = None) -> dict[str, str]:
-    """Make generated-shim subprocesses execute the checkout under test."""
+    """Keep generated subprocesses on the same candidate as the test process."""
     env = dict(os.environ if base is None else base)
-    source = str(Path(__file__).resolve().parents[1] / "src")
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = source + (os.pathsep + existing if existing else "")
+    source = (Path(__file__).resolve().parents[1] / "src").resolve()
+    candidate = Path(sup.__file__).resolve()
+    pythonpath_keys = [
+        key for key in env if key.casefold() == "pythonpath"
+    ]
+    existing = next((env[key] for key in pythonpath_keys), None)
+    for key in pythonpath_keys:
+        del env[key]
+    if candidate.is_relative_to(source):
+        env["PYTHONPATH"] = str(source) + (
+            os.pathsep + existing if existing else ""
+        )
     env["AGENTTALK_PYTHON"] = sys.executable
     return env
+
+
+def test_checkout_runtime_env_preserves_imported_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = (Path(__file__).resolve().parents[1] / "src").resolve()
+    monkeypatch.setattr(sup, "__file__", str(source / "agenttalk" / "supervisor.py"))
+    source_env = _checkout_runtime_env({"PythonPath": "existing"})
+    assert source_env["PYTHONPATH"].split(os.pathsep) == [
+        str(source),
+        "existing",
+    ]
+
+    installed = tmp_path / "site-packages" / "agenttalk" / "supervisor.py"
+    monkeypatch.setattr(sup, "__file__", str(installed))
+    wheel_env = _checkout_runtime_env(
+        {"PYTHONPATH": str(source), "PythonPath": "also-source"}
+    )
+    assert not any(key.casefold() == "pythonpath" for key in wheel_env)
 
 
 def _live_supervisor_config(*agents: str) -> dict:
@@ -5342,6 +5372,20 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     reduced["PATH"] = os.pathsep.join([
         os.path.join(windir, "System32"), windir,
         os.path.join(windir, "System32", "WindowsPowerShell", "v1.0")])
+    provenance = subprocess.run(
+        [
+            reduced["AGENTTALK_PYTHON"],
+            "-c",
+            "import agenttalk.supervisor as m; print(m.__file__)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=reduced,
+        cwd=str(tmp_path),
+    )
+    assert provenance.returncode == 0, provenance.stderr
+    assert Path(provenance.stdout.strip()).resolve() == Path(sup.__file__).resolve()
     res = subprocess.run(
         [shell, "-NoProfile", "-File", str(ps1), "-Once", "-DryRun"],
         capture_output=True, text=True, timeout=120, env=reduced, cwd=str(tmp_path))
@@ -5350,6 +5394,152 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     assert "is not recognized" not in combined and "CommandNotFound" not in combined, combined
     # the DryRun plan line for the dead worker actually printed (the bus call ran)
     assert "worker:" in res.stdout, f"no plan emitted; stdout={res.stdout!r} stderr={res.stderr!r}"
+
+
+def test_generated_ps1_records_startup_kill_switch_through_wheel_shim(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """The wheel's venv redirector is part of the checked generated-shim path."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG),
+        encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+    capsys.readouterr()
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            shell,
+            "-NoProfile",
+            "-File",
+            str(store.dir / "supervisor.ps1"),
+            "-Once",
+            "-DryRun",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_checkout_runtime_env(),
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert store.read_supervisor_instance() is None
+    observation = json.loads(
+        runtime_control.runtime_observation_path(store).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert observation["kill_switch"]["active"] is True
+    assert "startup" in observation["kill_switch"]["observations"]
+
+    assert _run(["status", "--json"], tmp_path) == 0
+    projected = json.loads(capsys.readouterr().out)["supervisor_runtime"][
+        "kill_switch"
+    ]
+    assert projected["active"] is True
+    assert projected["observed"] is True
+    assert "startup" in projected["observations"]
+
+
+def test_generated_ps1_claims_and_releases_through_wheel_shim(
+    tmp_path: Path,
+) -> None:
+    """The same bounded ancestry authorizes the executor claim path."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    config = {
+        **_CONFIG,
+        "agents": {"lead": {"auto_restart": True, "cli": "claude"}},
+    }
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(config),
+        encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+
+    result = subprocess.run(
+        [
+            shell,
+            "-NoProfile",
+            "-File",
+            str(store.dir / "supervisor.ps1"),
+            "-Once",
+            "-Quiet",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_checkout_runtime_env(),
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert store.read_supervisor_instance() is None
+    assert (store.dir / "supervisor-state.json").exists()
+
+
+def test_checked_observer_accepts_identified_console_script_ancestry(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    console = Path(sysconfig.get_path("scripts")) / "agenttalk.exe"
+    if not console.is_file():
+        pytest.skip("the active Python has no installed agenttalk console script")
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG),
+        encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    harness = tmp_path / "console-observer.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                "$start = ([datetimeoffset](Get-Process -Id $PID).StartTime).ToString('o')",
+                (
+                    f"& {_pslit(str(console))} --root {_pslit(str(tmp_path))} "
+                    "supervise --observe-kill-switch "
+                    "--observation-phase startup --pid $PID --pid-start $start"
+                ),
+                "exit $LASTEXITCODE",
+            ]
+        ),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_checkout_runtime_env(),
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["active"] is True
+    observation = json.loads(
+        runtime_control.runtime_observation_path(store).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "startup" in observation["kill_switch"]["observations"]
 
 
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:
