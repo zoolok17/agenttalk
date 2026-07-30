@@ -182,7 +182,9 @@ def test_concurrent_exact_task_installer_converges_without_overwrite(tmp_path) -
     assert task_xml_matches(commands.tasks[identity.task_name], identity)
 
 
-def test_exclusive_bind_probe_refuses_occupied_listener() -> None:
+def test_exclusive_bind_probe_refuses_occupied_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     port = int(listener.getsockname()[1])
@@ -191,7 +193,27 @@ def test_exclusive_bind_probe_refuses_occupied_listener() -> None:
             exclusive_bind_probe("127.0.0.1", port)
     finally:
         listener.close()
+
+    observed: list[tuple[str, int]] = []
+
+    class ReleasedPortSocket:
+        def setsockopt(self, *_args: object) -> None:
+            return
+
+        def bind(self, address: tuple[str, int]) -> None:
+            observed.append(address)
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr(
+        service.socket,
+        "socket",
+        lambda *_args: ReleasedPortSocket(),
+    )
     exclusive_bind_probe("127.0.0.1", port)
+
+    assert observed == [("127.0.0.1", port)]
 
 
 def test_one_time_install_writes_nonsecret_config_and_tokens_outside_project(tmp_path) -> None:

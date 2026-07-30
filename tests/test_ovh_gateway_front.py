@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import http.client
 import io
 import json
@@ -56,6 +57,10 @@ def _listen_port() -> int:
         return int(server.server_address[1])
     finally:
         server.server_close()
+
+
+def _address_in_use(exc: OSError) -> bool:
+    return exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048
 
 
 class FakeUpstream:
@@ -210,15 +215,6 @@ class RunningFront:
             request_id="q-front-fixture",
             issuer_token=TEST_CHILD_CAP_ISSUER,
         )
-        public_port = _listen_port()
-        self.config = FrontConfig(
-            public_token="front-secret",
-            internal_token="internal-secret",
-            public_port=public_port,
-            internal_port=upstream.port,
-            request_timeout_seconds=5,
-        )
-
         def fake_upstream_connection(*args, **kwargs) -> http.client.HTTPConnection:
             # GatewayFront still has to request its configured timeout. The
             # hermetic fake transport is governed by the cumulative test budget.
@@ -230,12 +226,25 @@ class RunningFront:
                 **kwargs,
             )
 
-        self.front = GatewayFront(
-            self.config,
-            self.ledger,
-            connection_factory=fake_upstream_connection,
-        )
-        self.server = self.front.make_server()
+        for attempt in range(5):
+            self.config = FrontConfig(
+                public_token="front-secret",
+                internal_token="internal-secret",
+                public_port=_listen_port(),
+                internal_port=upstream.port,
+                request_timeout_seconds=5,
+            )
+            self.front = GatewayFront(
+                self.config,
+                self.ledger,
+                connection_factory=fake_upstream_connection,
+            )
+            try:
+                self.server = self.front.make_server()
+                break
+            except OSError as exc:
+                if not _address_in_use(exc) or attempt == 4:
+                    raise
         track_server(self.server, self.activity)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -490,6 +499,32 @@ def test_stream_usage_accepts_complete_sse_and_json() -> None:
         b'data: {"type":"message_stop"}\n'
     )
     assert parser.finish() == (MODEL_ALIAS, 5, 2)
+
+
+def test_running_front_retries_ephemeral_bind_collision(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_listen_port = _listen_port
+    allocations = 0
+    occupied = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    occupied_port = int(occupied.server_address[1])
+
+    def allocate_port() -> int:
+        nonlocal allocations
+        allocations += 1
+        if allocations == 1:
+            return occupied_port
+        return original_listen_port()
+
+    monkeypatch.setitem(globals(), "_listen_port", allocate_port)
+    try:
+        with FakeUpstream() as upstream:
+            with RunningFront(tmp_path, upstream) as running:
+                assert running.config.public_port != occupied_port
+    finally:
+        occupied.server_close()
+
+    assert allocations == 2
 
 
 @pytest.mark.parametrize(
