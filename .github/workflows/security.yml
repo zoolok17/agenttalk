@@ -9,6 +9,12 @@ on:
     - cron: '17 9 * * 1'
   workflow_dispatch:
 
+# See the matching block in tests.yml. master is exempt from cancellation so a
+# release-gating run is never killed by a following push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 permissions:
   contents: read
 

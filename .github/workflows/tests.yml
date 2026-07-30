@@ -10,6 +10,17 @@ on:
     - cron: '17 9 * * 1'
   workflow_dispatch:
 
+# One in-flight run per workflow+ref. A later push to a topic branch supersedes
+# the earlier one, which is otherwise pure waste: without this, every push
+# queued an ADDITIONAL full 13-job matrix and superseded runs kept holding
+# runner slots (measured 2026-07-30: 6 queued / 2 running, ~half superseded,
+# a master commit stuck queued 35+ minutes while its security run finished).
+# master is deliberately EXEMPT from cancellation - a release-gating or
+# version-ratchet run must never be killed by a following push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 permissions:
   contents: read
 
