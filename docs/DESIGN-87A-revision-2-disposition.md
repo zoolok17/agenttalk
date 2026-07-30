@@ -8,8 +8,11 @@
 **Audience:** Design 87 split-integrity reviewers.
 
 **Purpose:** Prove that splitting Revision 2 did not silently lose an
-obligation. The normative 87-A specification remains
-[`DESIGN-87A-supervisor-classifier-authority.md`](DESIGN-87A-supervisor-classifier-authority.md).
+obligation. The normative 87-A specification is the atomic set of its
+[core](DESIGN-87A-supervisor-classifier-authority.md) and
+[owned-childless module](DESIGN-87A-owned-childless-wrapper-authority.md).
+The original 59-ID register remains intact; `N01` records the later
+operator-directed requirement in the same audit.
 
 ## Method and status vocabulary
 
@@ -68,6 +71,12 @@ There is no unassigned category.
 | A34 | Make dry run and policy hold non-consuming, and make failed teardown/launch fail closed. | **PRESENT.** Reservation-bound global execution eligibility, absence/execution state transitions, and durable ambiguous-launch ownership for both origins make every 87-A no-action/failure path non-consuming or explicitly tombstoned. |
 | A35 | Require executed table, reducer, overlap, failure, fingerprint, observer, and barrier evidence before conformance. | **PRESENT.** Mandatory conformance evidence covers the complete 87-A surface. |
 
+## Post-Revision 2 operator addition
+
+| ID | New requirement | Disposition in 87-A |
+| --- | --- | --- |
+| N01 | Grant automatic teardown authority over a positively owned wrapper only after two complete CLI-child absence observations; target its complete nonce-anchored owned tree; and stop same-incumbent recovery after a hard attempt cap instead of fading into exponential backoff. | **PRESENT.** The [normative module](DESIGN-87A-owned-childless-wrapper-authority.md) exports `PROVABLY_CHILDLESS_OWNED_WRAPPER`; the [core](DESIGN-87A-supervisor-classifier-authority.md) suppresses generic teardown for the entire child-death-sourced subset and admits only that named proof. Two same-owner captures, task #120's separately designed complete tree-observation/action-closure contract, exact PID/start/nonce identity, fresh action-time raw capture plus live basis/target equality, and sole `Stop-Tree` are mandatory. Origin-neutral task #115 debt globally blocks relaunch after partial kill while its immutable residual-subset authority keeps a rootless survivor recoverable. Automatic failures one/two remain continuously visible without generic backoff; the third—including closure failure—becomes continuously exhausted, and uncertain closure release retains every fence. 87-B owns human delivery. |
+
 ## Deferred to named split documents
 
 | ID | Revision 2 requirement | Disposition |
@@ -125,7 +134,7 @@ Revision 2's rejected proposals remain accounted for:
 
 ## Audit conclusion
 
-All Revision 2 obligation families are present, named-deferred, or
-reasoned-dropped. The independently verified 87-A matrix, presence/targetability
-classifier, absence reducer, and fingerprint mechanics were not changed by
-this audit.
+All 59 Revision 2 IDs are present, named-deferred, or reasoned-dropped. `N01`
+is separately assigned rather than hidden outside the audit. The independently
+verified 87-A matrix, presence/targetability classifier, absence reducer, and
+fingerprint mechanics remain unchanged.
