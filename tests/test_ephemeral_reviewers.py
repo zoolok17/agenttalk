@@ -359,6 +359,10 @@ def test_prepare_rosters_unique_identity_sends_request_and_completion_retires(tm
     done = plan["ephemeral_reviewers"]["lr-prep"]
     assert done["action"] == eph.ACTION_COMPLETE
     assert done["completion"]["counter"] is True
+    terminal_reservation = sup.decode_supervisor_state_operation(
+        done["reserve_state_operation"]
+    )
+    assert terminal_reservation["allowed_result_kinds"] == ["delete_target"]
 
     sup.archive_ephemeral_request(
         s, state, "lr-prep", terminal_state=eph.STATE_COMPLETED,
@@ -381,6 +385,45 @@ def test_prepare_launch_request_resolves_ephemeral_window_style(tmp_path: Path) 
 
     assert spec["window_style"] == "Minimized"
     assert spec["window_style_warning"] is None
+
+
+def test_prepare_launch_request_binds_both_typed_completion_paths(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path)
+    store.write_launch_request(_marker("lr-result-contract"))
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_cfg()),
+        encoding="utf-8",
+    )
+    state_path = store.dir / "supervisor-state.json"
+
+    rc = cli.main([
+        "--root",
+        str(tmp_path),
+        "supervise",
+        "--prepare-launch-request",
+        "--request-id",
+        "lr-result-contract",
+        "--state-file",
+        str(state_path),
+        "--now",
+        str(NOW),
+    ])
+
+    assert rc == 0
+    spec = json.loads(capsys.readouterr().out)
+    durable = sup.load_supervisor_state(state_path)
+    record = durable["operations"][spec["operation_id"]]
+    assert record["allowed_result_kinds"] == [
+        "delete_target",
+        "record_ephemeral_launch",
+    ]
+    unknown = sup.decode_supervisor_state_operation(
+        spec["outcome_unknown_state_operation"]
+    )
+    assert unknown["result_kind"] == "record_ephemeral_launch"
 
 
 def test_prepare_lane_without_worktree_archives_denied_after_claim(tmp_path: Path) -> None:
@@ -436,7 +479,7 @@ def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path
     marker = _marker("lr-cli-archive", state=eph.STATE_REQUESTED, agent=agent)
     s.write_launch_request(marker)
     s.add_agent(agent, role="reviewer", groups=["ephemeral-reviewers"])
-    state_path = tmp_path / "supervisor-state.json"
+    state_path = s.dir / "supervisor-state.json"
     state_path.write_text(json.dumps({
         "ephemeral_reviewers": {
             "active": {

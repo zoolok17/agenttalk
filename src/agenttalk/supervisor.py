@@ -23,6 +23,7 @@ agents are never auto-killed (warn-only).
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -33,6 +34,8 @@ import shlex
 import sys
 import tempfile
 import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -155,6 +158,44 @@ class SupervisorPersistenceError(ValueError):
     """Supervisor state/config cannot be trusted as a complete JSON object."""
 
 
+class SupervisorStateConflict(RuntimeError):
+    """A checked supervisor-state operation no longer matches durable state."""
+
+
+class SupervisorActionHold(SupervisorStateConflict):
+    """An action result is ambiguous and the target is durably held."""
+
+
+@dataclass(frozen=True)
+class CommitResult:
+    """Identity of one committed supervisor-state generation."""
+
+    state_instance_id: str
+    generation: int
+    changed: bool
+    may_execute: bool | None = None
+
+
+_SUPERVISOR_STATE_SCHEMA_VERSION = 2
+_SUPERVISOR_STATE_OPERATION_KINDS = frozenset({
+    "commit_agent_state",
+    "commit_ephemeral_state",
+    "delete_ephemeral_state",
+    "record_launch",
+    "record_ephemeral_launch",
+    "reserve_action",
+    "update_reserved_target",
+    "complete_action",
+})
+_SUPERVISOR_ACTION_PHASES = frozenset({
+    "attempting", "completed", "result_conflict", "outcome_unknown",
+})
+_SUPERVISOR_ACTION_RESULT_KINDS = frozenset({
+    "record_launch", "record_ephemeral_launch", "replace_target", "delete_target",
+})
+_SUPERVISOR_STATE_WRITE_TOKEN = object()
+
+
 _STATE_SWAP_RETRY_DELAYS_SECONDS = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.25)
 _RETRYABLE_WINDOWS_STATE_SWAP_ERRORS = frozenset({5, 32, 33})
 
@@ -170,13 +211,197 @@ def supervisor_state_backup_path(path: Path) -> Path:
     return Path(f"{path}.bak")
 
 
+def _is_supervisor_hex_token(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is not None
+    )
+
+
+def _require_allowed_result_kinds(value: object) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(item, str)
+            or item not in _SUPERVISOR_ACTION_RESULT_KINDS
+            for item in value
+        )
+        or value != sorted(set(value))
+    ):
+        raise ValueError(
+            "supervisor allowed_result_kinds must be a non-empty, "
+            "sorted, unique list of known result kinds"
+        )
+    return tuple(value)
+
+
+def _validate_supervisor_operation_journal(value: dict, *, source: str) -> None:
+    operations = value.get("operations")
+    if isinstance(operations, dict):
+        for operation_id, record in operations.items():
+            prefix = f"{source}.operations[{operation_id!r}]"
+            if not _is_supervisor_hex_token(operation_id, 32):
+                raise SupervisorPersistenceError(
+                    f"{source}.operations key must be a 32-character operation id"
+                )
+            if not isinstance(record, dict):
+                raise SupervisorPersistenceError(f"{prefix} must be a JSON object")
+            if record.get("operation_id") != operation_id:
+                raise SupervisorPersistenceError(
+                    f"{prefix}.operation_id must match its map key"
+                )
+            if not _is_supervisor_hex_token(record.get("state_instance_id"), 32):
+                raise SupervisorPersistenceError(
+                    f"{prefix}.state_instance_id is invalid"
+                )
+            if record.get("target_kind") not in {"agent", "ephemeral"}:
+                raise SupervisorPersistenceError(f"{prefix}.target_kind is invalid")
+            if not isinstance(record.get("target"), str) or not record["target"]:
+                raise SupervisorPersistenceError(f"{prefix}.target is invalid")
+            if (
+                not isinstance(record.get("action_kind"), str)
+                or not record["action_kind"]
+            ):
+                raise SupervisorPersistenceError(f"{prefix}.action_kind is invalid")
+            try:
+                allowed_result_kinds = _require_allowed_result_kinds(
+                    record.get("allowed_result_kinds")
+                )
+            except ValueError as exc:
+                raise SupervisorPersistenceError(
+                    f"{prefix}.allowed_result_kinds is invalid"
+                ) from exc
+            if not _is_supervisor_hex_token(record.get("intent_digest"), 64):
+                raise SupervisorPersistenceError(
+                    f"{prefix}.intent_digest is invalid"
+                )
+            result_context_digest = record.get("result_context_digest")
+            if (
+                result_context_digest is not None
+                and not _is_supervisor_hex_token(result_context_digest, 64)
+            ):
+                raise SupervisorPersistenceError(
+                    f"{prefix}.result_context_digest is invalid"
+                )
+            phase = record.get("phase")
+            if phase not in _SUPERVISOR_ACTION_PHASES:
+                raise SupervisorPersistenceError(f"{prefix}.phase is invalid")
+            if phase == "completed":
+                if record.get("outcome") != "completed":
+                    raise SupervisorPersistenceError(
+                        f"{prefix}.outcome must be completed"
+                    )
+                if record.get("result_kind") not in _SUPERVISOR_ACTION_RESULT_KINDS:
+                    raise SupervisorPersistenceError(
+                        f"{prefix}.result_kind is invalid"
+                    )
+                if record["result_kind"] not in allowed_result_kinds:
+                    raise SupervisorPersistenceError(
+                        f"{prefix}.result_kind is outside its reserved contract"
+                    )
+                if not _is_supervisor_hex_token(record.get("result_digest"), 64):
+                    raise SupervisorPersistenceError(
+                        f"{prefix}.result_digest is invalid"
+                    )
+            elif phase in {"result_conflict", "outcome_unknown"}:
+                if record.get("outcome") != "outcome_unknown":
+                    raise SupervisorPersistenceError(
+                        f"{prefix}.outcome must be outcome_unknown"
+                    )
+                if (
+                    not isinstance(record.get("conflict_reason"), str)
+                    or not record["conflict_reason"]
+                ):
+                    raise SupervisorPersistenceError(
+                        f"{prefix}.conflict_reason is invalid"
+                    )
+                received = record.get("received_result_digest")
+                if (
+                    received is not None
+                    and not _is_supervisor_hex_token(received, 64)
+                ):
+                    raise SupervisorPersistenceError(
+                        f"{prefix}.received_result_digest is invalid"
+                    )
+
+    holds = value.get("operation_holds")
+    if isinstance(holds, dict):
+        for hold_key, hold in holds.items():
+            prefix = f"{source}.operation_holds[{hold_key!r}]"
+            if not isinstance(hold_key, str) or not hold_key:
+                raise SupervisorPersistenceError(
+                    f"{source}.operation_holds key is invalid"
+                )
+            if not isinstance(hold, dict):
+                raise SupervisorPersistenceError(f"{prefix} must be a JSON object")
+            operation_id = hold.get("operation_id")
+            if not _is_supervisor_hex_token(operation_id, 32):
+                raise SupervisorPersistenceError(f"{prefix}.operation_id is invalid")
+            if (
+                not isinstance(hold.get("action_kind"), str)
+                or not hold["action_kind"]
+            ):
+                raise SupervisorPersistenceError(f"{prefix}.action_kind is invalid")
+            if hold.get("outcome") != "outcome_unknown":
+                raise SupervisorPersistenceError(
+                    f"{prefix}.outcome must be outcome_unknown"
+                )
+            if not isinstance(hold.get("reason"), str) or not hold["reason"]:
+                raise SupervisorPersistenceError(f"{prefix}.reason is invalid")
+            record = (
+                operations.get(operation_id)
+                if isinstance(operations, dict) else None
+            )
+            if not isinstance(record, dict):
+                raise SupervisorPersistenceError(
+                    f"{prefix} has no matching operation record"
+                )
+            expected_key = (
+                f"{record.get('target_kind')}:{record.get('target')}"
+            )
+            if hold_key != expected_key:
+                raise SupervisorPersistenceError(
+                    f"{prefix} does not match its operation target"
+                )
+
+
 def _validate_supervisor_state(value: object, *, source: str) -> dict:
     if not isinstance(value, dict):
         raise SupervisorPersistenceError(f"{source} must be a JSON object")
-    for field in ("agents", "ephemeral_reviewers"):
-        nested = value.get(field)
-        if nested is not None and not isinstance(nested, dict):
+    schema_version = value.get("schema_version")
+    if (
+        "schema_version" in value
+        and (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version != _SUPERVISOR_STATE_SCHEMA_VERSION
+        )
+    ):
+        raise SupervisorPersistenceError(
+            f"{source}.schema_version is unsupported"
+        )
+    for field in ("agents", "ephemeral_reviewers", "operations", "operation_holds"):
+        if field in value and not isinstance(value[field], dict):
             raise SupervisorPersistenceError(f"{source}.{field} must be a JSON object")
+    instance_id = value.get("state_instance_id")
+    if "state_instance_id" in value and (
+        not isinstance(instance_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", instance_id) is None
+    ):
+        raise SupervisorPersistenceError(
+            f"{source}.state_instance_id must be 32 lowercase hexadecimal characters"
+        )
+    generation = value.get("generation")
+    if "generation" in value and (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
+        raise SupervisorPersistenceError(
+            f"{source}.generation must be a non-negative integer"
+        )
+    _validate_supervisor_operation_journal(value, source=source)
     return value
 
 
@@ -282,8 +507,12 @@ def load_supervisor_state(path: Path) -> dict:
     raise SupervisorPersistenceError("; ".join(problems) or "supervisor state is unavailable")
 
 
-def save_supervisor_state(path: Path, state: dict) -> None:
-    """Durably replace state after preserving a validated previous generation."""
+def _save_supervisor_state_locked(path: Path, state: dict, *, token: object) -> None:
+    """Persist one state generation while the supervisor-state lock is held."""
+    if token is not _SUPERVISOR_STATE_WRITE_TOKEN:
+        raise RuntimeError(
+            "whole supervisor-state persistence requires the state-operation owner"
+        )
     path = Path(path)
     state = _validate_supervisor_state(state, source="supervisor state")
     _supervisor_json_text(state, source="supervisor state")
@@ -317,6 +546,742 @@ def save_supervisor_state(path: Path, state: dict) -> None:
                 backup_problem or "supervisor state backup is invalid"
             )
     _atomic_write_supervisor_json(path, state, source="supervisor state")
+
+
+def _canonical_supervisor_value(value: object) -> bytes:
+    try:
+        text = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise SupervisorPersistenceError(
+            f"supervisor state operation is not JSON serializable: {type(exc).__name__}"
+        ) from exc
+    return text.encode("utf-8")
+
+
+def _supervisor_digest(value: object) -> str:
+    return hashlib.sha256(_canonical_supervisor_value(value)).hexdigest()
+
+
+def _require_operation_token(value: object, *, field: str, length: int) -> str:
+    if not isinstance(value, str) or re.fullmatch(
+        rf"[0-9a-f]{{{length}}}", value
+    ) is None:
+        raise ValueError(
+            f"supervisor state operation {field} must be {length} lowercase "
+            "hexadecimal characters"
+        )
+    return value
+
+
+def _supervisor_target_container(state: dict, target_kind: str) -> tuple[dict, str]:
+    if target_kind == "agent":
+        field = "agents"
+        container = state.setdefault(field, {})
+    elif target_kind == "ephemeral":
+        field = "ephemeral_reviewers"
+        root = state.setdefault(field, {})
+        if not isinstance(root, dict):
+            raise SupervisorPersistenceError(
+                "supervisor state.ephemeral_reviewers must be a JSON object"
+            )
+        container = root.setdefault("active", {})
+        field = "ephemeral_reviewers.active"
+    else:
+        raise ValueError("supervisor state operation target_kind must be agent or ephemeral")
+    if not isinstance(container, dict):
+        raise SupervisorPersistenceError(f"supervisor state.{field} must be a JSON object")
+    return container, field
+
+
+def supervisor_state_target_digest(
+    state: dict,
+    target_kind: str,
+    target: str,
+) -> str:
+    """Digest one independently-owned target, including missing-vs-present."""
+    if target_kind == "agent":
+        raw = state.get("agents")
+        container = raw if isinstance(raw, dict) else {}
+    elif target_kind == "ephemeral":
+        root = state.get("ephemeral_reviewers")
+        active = root.get("active") if isinstance(root, dict) else None
+        container = active if isinstance(active, dict) else {}
+    else:
+        raise ValueError("supervisor state operation target_kind must be agent or ephemeral")
+    return _supervisor_digest({
+        "present": target in container,
+        "value": container.get(target),
+    })
+
+
+def encode_supervisor_state_operation(operation: dict) -> str:
+    """Encode one data-only checked operation for opaque PowerShell transport."""
+    raw = _canonical_supervisor_value(operation)
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_supervisor_state_operation(token: str) -> dict:
+    """Decode and minimally validate one opaque operation transport token."""
+    if not isinstance(token, str) or not token or re.fullmatch(
+        r"[A-Za-z0-9_-]+", token
+    ) is None:
+        raise ValueError("invalid supervisor state operation token")
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("invalid supervisor state operation token") from exc
+    if not isinstance(value, dict):
+        raise ValueError("supervisor state operation must be a JSON object")
+    return value
+
+
+def _ensure_supervisor_state_identity(state: dict) -> None:
+    state.setdefault("schema_version", _SUPERVISOR_STATE_SCHEMA_VERSION)
+    if "state_instance_id" not in state:
+        state["state_instance_id"] = uuid.uuid4().hex
+    state.setdefault("generation", 0)
+    state.setdefault("agents", {})
+    state.setdefault("ephemeral_reviewers", {})
+    state.setdefault("operations", {})
+    state.setdefault("operation_holds", {})
+    _validate_supervisor_state(state, source="supervisor state")
+
+
+def _operation_target(operation: dict) -> tuple[str, str]:
+    target_kind = operation.get("target_kind")
+    target = operation.get("target")
+    if target_kind not in {"agent", "ephemeral"}:
+        raise ValueError("supervisor state operation target_kind must be agent or ephemeral")
+    if not isinstance(target, str) or not target:
+        raise ValueError("supervisor state operation target must be a non-empty string")
+    return target_kind, target
+
+
+def _checked_target(
+    state: dict,
+    operation: dict,
+) -> tuple[dict, str, str, str]:
+    target_kind, target = _operation_target(operation)
+    expected = _require_operation_token(
+        operation.get("expected_target_digest"),
+        field="expected_target_digest",
+        length=64,
+    )
+    actual = supervisor_state_target_digest(state, target_kind, target)
+    if actual != expected:
+        raise SupervisorStateConflict(
+            f"supervisor state target {target_kind}:{target} changed before commit"
+        )
+    container, _field = _supervisor_target_container(state, target_kind)
+    return container, target_kind, target, actual
+
+
+def _operation_map(state: dict, field: str) -> dict:
+    value = state.setdefault(field, {})
+    if not isinstance(value, dict):
+        raise SupervisorPersistenceError(f"supervisor state.{field} must be a JSON object")
+    return value
+
+
+def _active_operation_for_target(
+    state: dict,
+    target_kind: str,
+    target: str,
+) -> dict | None:
+    operations = state.get("operations")
+    if not isinstance(operations, dict):
+        return None
+    for record in operations.values():
+        if (
+            isinstance(record, dict)
+            and record.get("target_kind") == target_kind
+            and record.get("target") == target
+            and record.get("phase")
+            in {"attempting", "result_conflict", "outcome_unknown"}
+        ):
+            return record
+    return None
+
+
+def _reservation_matches(record: dict, operation: dict) -> bool:
+    operation_kind = operation.get("kind")
+    if operation_kind == "reserve_action":
+        result_contract_matches = (
+            record.get("allowed_result_kinds")
+            == operation.get("allowed_result_kinds")
+        )
+    elif operation_kind == "complete_action":
+        result_contract_matches = (
+            operation.get("result_kind") in record.get("allowed_result_kinds", ())
+        )
+    else:
+        result_contract_matches = True
+    return (
+        record.get("target_kind") == operation.get("target_kind")
+        and record.get("target") == operation.get("target")
+        and record.get("action_kind") == operation.get("action_kind")
+        and record.get("intent_digest") == operation.get("intent_digest")
+        and result_contract_matches
+        and (
+            record.get("result_context_digest") is None
+            or record.get("result_context_digest")
+            == operation.get("result_context_digest")
+        )
+    )
+
+
+def _expected_operation_intent_digest(
+    *,
+    operation_id: str,
+    target_kind: str,
+    target: str,
+    action_kind: str,
+    allowed_result_kinds: list[str],
+    intent: object,
+) -> str:
+    if not isinstance(intent, dict):
+        raise ValueError("supervisor action intent must be a JSON object")
+    allowed = list(_require_allowed_result_kinds(allowed_result_kinds))
+    return _supervisor_digest({
+        "operation_id": operation_id,
+        "target_kind": target_kind,
+        "target": target,
+        "action_kind": action_kind,
+        "allowed_result_kinds": allowed,
+        "intent": intent,
+    })
+
+
+def _require_matching_intent(
+    operation: dict,
+    *,
+    operation_id: str,
+    intent_digest: str,
+) -> None:
+    target_kind, target = _operation_target(operation)
+    action_kind = operation.get("action_kind")
+    if not isinstance(action_kind, str) or not action_kind:
+        raise ValueError("supervisor action_kind must be a non-empty string")
+    allowed_result_kinds = operation.get("allowed_result_kinds")
+    expected = _expected_operation_intent_digest(
+        operation_id=operation_id,
+        target_kind=target_kind,
+        target=target,
+        action_kind=action_kind,
+        allowed_result_kinds=allowed_result_kinds,
+        intent=operation.get("intent"),
+    )
+    if intent_digest != expected:
+        raise ValueError("supervisor action intent does not match its digest")
+
+
+def _require_matching_result_digest(
+    operation: dict,
+    received_result_digest: str | None,
+) -> None:
+    result = operation.get("result")
+    if not isinstance(result, dict):
+        raise ValueError("supervisor action result must be a JSON object")
+    if received_result_digest != _supervisor_digest(result):
+        raise ValueError("supervisor action result does not match its digest")
+
+
+def _set_operation_hold(
+    state: dict,
+    record: dict,
+    *,
+    received_result_digest: str | None,
+    reason: str,
+) -> None:
+    record["phase"] = "result_conflict"
+    record["outcome"] = "outcome_unknown"
+    record["conflict_reason"] = reason
+    if received_result_digest is not None:
+        record["received_result_digest"] = received_result_digest
+    key = f"{record.get('target_kind')}:{record.get('target')}"
+    _operation_map(state, "operation_holds")[key] = {
+        "operation_id": record.get("operation_id"),
+        "action_kind": record.get("action_kind"),
+        "outcome": "outcome_unknown",
+        "reason": reason,
+    }
+
+
+def _apply_target_value(
+    state: dict,
+    *,
+    target_kind: str,
+    target: str,
+    value: object,
+    delete: bool = False,
+) -> None:
+    container, _field = _supervisor_target_container(state, target_kind)
+    if delete:
+        container.pop(target, None)
+        return
+    if not isinstance(value, dict):
+        raise ValueError("supervisor state target value must be a JSON object")
+    container[target] = copy.deepcopy(value)
+
+
+def _apply_action_result(state: dict, operation: dict) -> None:
+    result_kind = operation.get("result_kind")
+    payload = operation.get("result")
+    if not isinstance(payload, dict):
+        raise ValueError("supervisor action result must be a JSON object")
+    target_kind, target = _operation_target(operation)
+    if result_kind == "record_launch":
+        if target_kind != "agent":
+            raise ValueError("record_launch result requires an agent target")
+        record_launch(state, target, **payload)
+    elif result_kind == "record_ephemeral_launch":
+        if target_kind != "ephemeral":
+            raise ValueError("record_ephemeral_launch result requires an ephemeral target")
+        record_ephemeral_launch(state, target, **payload)
+    elif result_kind == "replace_target":
+        value = payload.get("value")
+        if not isinstance(value, dict):
+            raise ValueError("supervisor replacement result value must be a JSON object")
+        container, _field = _supervisor_target_container(state, target_kind)
+        current = container.get(target)
+        merged = copy.deepcopy(current) if isinstance(current, dict) else {}
+        merged.update(copy.deepcopy(value))
+        container[target] = merged
+    elif result_kind == "delete_target":
+        _apply_target_value(
+            state,
+            target_kind=target_kind,
+            target=target,
+            value={},
+            delete=True,
+        )
+    else:
+        raise ValueError("unknown supervisor action result_kind")
+
+
+def _apply_supervisor_state_operation_locked(
+    state: dict,
+    operation: dict,
+) -> tuple[bool, bool | None, SupervisorActionHold | None]:
+    kind = operation.get("kind")
+    if kind not in _SUPERVISOR_STATE_OPERATION_KINDS:
+        raise ValueError("unknown supervisor state operation kind")
+
+    if kind in {"commit_agent_state", "commit_ephemeral_state",
+                "delete_ephemeral_state"}:
+        container, target_kind, target, _actual = _checked_target(state, operation)
+        hold_key = f"{target_kind}:{target}"
+        if hold_key in _operation_map(state, "operation_holds"):
+            raise SupervisorActionHold(
+                f"supervisor action target {hold_key} is held for reconciliation"
+            )
+        current = container.get(target)
+        if isinstance(current, dict) and current.get("pending_operation"):
+            raise SupervisorStateConflict(
+                f"supervisor action target {hold_key} has a pending operation"
+            )
+        if _active_operation_for_target(state, target_kind, target) is not None:
+            raise SupervisorStateConflict(
+                f"supervisor action target {hold_key} has an unresolved operation"
+            )
+        if kind == "delete_ephemeral_state":
+            container.pop(target, None)
+        else:
+            value = operation.get("value")
+            if not isinstance(value, dict):
+                raise ValueError("supervisor target state must be a JSON object")
+            container[target] = copy.deepcopy(value)
+        return True, None, None
+
+    if kind == "record_launch":
+        target_kind, target = _operation_target(operation)
+        container, _field = _supervisor_target_container(
+            state, target_kind
+        )
+        if target_kind != "agent":
+            raise ValueError("record_launch operation requires an agent target")
+        hold_key = f"{target_kind}:{target}"
+        if hold_key in _operation_map(state, "operation_holds"):
+            raise SupervisorActionHold(
+                f"supervisor action target {hold_key} is held for reconciliation"
+            )
+        current = container.get(target)
+        if isinstance(current, dict) and current.get("pending_operation"):
+            raise SupervisorStateConflict(
+                f"supervisor action target {hold_key} requires its reserved result"
+            )
+        if _active_operation_for_target(state, target_kind, target) is not None:
+            raise SupervisorStateConflict(
+                f"supervisor action target {hold_key} has an unresolved operation"
+            )
+        payload = operation.get("result")
+        if not isinstance(payload, dict):
+            raise ValueError("record_launch operation result must be a JSON object")
+        record_launch(state, target, **payload)
+        return True, None, None
+
+    if kind == "record_ephemeral_launch":
+        target_kind, target = _operation_target(operation)
+        container, _field = _supervisor_target_container(
+            state, target_kind
+        )
+        if target_kind != "ephemeral":
+            raise ValueError("record_ephemeral_launch operation requires an ephemeral target")
+        hold_key = f"{target_kind}:{target}"
+        if hold_key in _operation_map(state, "operation_holds"):
+            raise SupervisorActionHold(
+                f"supervisor action target {hold_key} is held for reconciliation"
+            )
+        current = container.get(target)
+        if isinstance(current, dict) and current.get("pending_operation"):
+            raise SupervisorStateConflict(
+                f"supervisor action target {hold_key} requires its reserved result"
+            )
+        if _active_operation_for_target(state, target_kind, target) is not None:
+            raise SupervisorStateConflict(
+                f"supervisor action target {hold_key} has an unresolved operation"
+            )
+        payload = operation.get("result")
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "record_ephemeral_launch operation result must be a JSON object"
+            )
+        record_ephemeral_launch(state, target, **payload)
+        return True, None, None
+
+    operation_id = _require_operation_token(
+        operation.get("operation_id"), field="operation_id", length=32
+    )
+    intent_digest = _require_operation_token(
+        operation.get("intent_digest"), field="intent_digest", length=64
+    )
+    operations = _operation_map(state, "operations")
+
+    if kind == "reserve_action":
+        action_kind = operation.get("action_kind")
+        if not isinstance(action_kind, str) or not action_kind:
+            raise ValueError("supervisor action_kind must be a non-empty string")
+        allowed_result_kinds = list(
+            _require_allowed_result_kinds(
+                operation.get("allowed_result_kinds")
+            )
+        )
+        _require_matching_intent(
+            operation,
+            operation_id=operation_id,
+            intent_digest=intent_digest,
+        )
+        result_context = operation.get("intent", {}).get("result_context")
+        result_context_digest = operation.get("result_context_digest")
+        if result_context is None:
+            if result_context_digest is not None:
+                raise ValueError(
+                    "supervisor result_context_digest has no result_context"
+                )
+        else:
+            if not isinstance(result_context, dict):
+                raise ValueError(
+                    "supervisor action result_context must be a JSON object"
+                )
+            expected_context_digest = _supervisor_digest(result_context)
+            if result_context_digest != expected_context_digest:
+                raise ValueError(
+                    "supervisor action result_context does not match its digest"
+                )
+        existing = operations.get(operation_id)
+        if isinstance(existing, dict):
+            if (
+                existing.get("phase") == "attempting"
+                and _reservation_matches(existing, operation)
+            ):
+                return False, False, None
+            raise SupervisorStateConflict(
+                f"supervisor operation id {operation_id} is already in use"
+            )
+        container, target_kind, target, _actual = _checked_target(state, operation)
+        hold_key = f"{target_kind}:{target}"
+        if hold_key in _operation_map(state, "operation_holds"):
+            raise SupervisorActionHold(
+                f"supervisor action target {hold_key} is held for reconciliation"
+            )
+        current = container.get(target)
+        if isinstance(current, dict) and current.get("pending_operation"):
+            raise SupervisorStateConflict(
+                f"supervisor action target {hold_key} already has a pending operation"
+            )
+        if _active_operation_for_target(state, target_kind, target) is not None:
+            raise SupervisorStateConflict(
+                f"supervisor action target {hold_key} has an unresolved operation"
+            )
+        planned_state = operation.get("planned_state")
+        if planned_state is not None:
+            if not isinstance(planned_state, dict):
+                raise ValueError("supervisor planned_state must be a JSON object")
+            container[target] = copy.deepcopy(planned_state)
+        entry = container.get(target)
+        if not isinstance(entry, dict):
+            entry = {}
+            container[target] = entry
+        entry["pending_operation"] = operation_id
+        history_entry = operation.get("history_entry")
+        if target_kind == "ephemeral" and history_entry is not None:
+            if not isinstance(history_entry, dict):
+                raise ValueError("supervisor action history_entry must be a JSON object")
+            root = state.setdefault("ephemeral_reviewers", {})
+            history = root.setdefault("launch_history", [])
+            if not isinstance(history, list):
+                raise SupervisorPersistenceError(
+                    "supervisor state.ephemeral_reviewers.launch_history must be a JSON array"
+                )
+            request_id = history_entry.get("request_id")
+            history[:] = [
+                item for item in history
+                if not (
+                    isinstance(item, dict)
+                    and item.get("request_id") == request_id
+                )
+            ]
+            history.append(copy.deepcopy(history_entry))
+        record = {
+            "operation_id": operation_id,
+            "state_instance_id": state["state_instance_id"],
+            "target_kind": target_kind,
+            "target": target,
+            "action_kind": action_kind,
+            "allowed_result_kinds": allowed_result_kinds,
+            "intent_digest": intent_digest,
+            "phase": "attempting",
+        }
+        if result_context is not None:
+            record["result_context_digest"] = result_context_digest
+        operations[operation_id] = record
+        return True, True, None
+
+    record = operations.get(operation_id)
+    if not isinstance(record, dict):
+        target_kind, target = _operation_target(operation)
+        container, _field = _supervisor_target_container(state, target_kind)
+        target_entry = container.get(target)
+        pending_id = (
+            target_entry.get("pending_operation")
+            if isinstance(target_entry, dict) else None
+        )
+        pending_record = operations.get(pending_id)
+        if kind == "complete_action" and isinstance(pending_record, dict):
+            received = operation.get("result_digest")
+            received = (
+                _require_operation_token(
+                    received, field="result_digest", length=64,
+                )
+                if received is not None else None
+            )
+            _set_operation_hold(
+                state,
+                pending_record,
+                received_result_digest=received,
+                reason=(
+                    f"action result operation id {operation_id} does not match "
+                    f"active reservation {pending_id}"
+                ),
+            )
+            return True, None, SupervisorActionHold(
+                f"supervisor action result {operation_id} is superseded"
+            )
+        raise SupervisorStateConflict(
+            f"supervisor operation {operation_id} has no durable reservation"
+        )
+    if record.get("state_instance_id") != state["state_instance_id"]:
+        raise SupervisorStateConflict(
+            f"supervisor operation {operation_id} belongs to another state instance"
+        )
+    received_result_digest = operation.get("result_digest")
+    if received_result_digest is not None:
+        received_result_digest = _require_operation_token(
+            received_result_digest, field="result_digest", length=64
+        )
+    if kind == "update_reserved_target":
+        if (
+            record.get("phase") != "attempting"
+            or record.get("intent_digest") != intent_digest
+            or not _reservation_matches(record, operation)
+        ):
+            raise SupervisorStateConflict(
+                f"supervisor operation {operation_id} is not the active reservation"
+            )
+        target_kind, target = _operation_target(operation)
+        container, _field = _supervisor_target_container(
+            state, target_kind
+        )
+        target_entry = container.get(target)
+        if (
+            not isinstance(target_entry, dict)
+            or target_entry.get("pending_operation") != operation_id
+        ):
+            raise SupervisorStateConflict(
+                f"supervisor operation {operation_id} no longer owns its target"
+            )
+        value = operation.get("value")
+        if not isinstance(value, dict):
+            raise ValueError("supervisor reserved target value must be a JSON object")
+        updated = copy.deepcopy(value)
+        updated["pending_operation"] = operation_id
+        _apply_target_value(
+            state, target_kind=target_kind, target=target, value=updated
+        )
+        return True, None, None
+
+    if record.get("phase") == "completed":
+        _require_matching_result_digest(operation, received_result_digest)
+        if (
+            record.get("intent_digest") == intent_digest
+            and record.get("result_digest") == received_result_digest
+            and _reservation_matches(record, operation)
+            and record.get("result_kind") == operation.get("result_kind")
+            and record.get("outcome") == operation.get("outcome")
+        ):
+            return False, None, None
+        _set_operation_hold(
+            state,
+            record,
+            received_result_digest=received_result_digest,
+            reason="completed action received a different result",
+        )
+        return True, None, SupervisorActionHold(
+            f"supervisor operation {operation_id} result conflicts with its completion"
+        )
+
+    target_kind, target = _operation_target(operation)
+    container, _field = _supervisor_target_container(state, target_kind)
+    target_entry = container.get(target)
+    reservation_matches = (
+        record.get("phase") == "attempting"
+        and record.get("intent_digest") == intent_digest
+        and _reservation_matches(record, operation)
+        and isinstance(target_entry, dict)
+        and target_entry.get("pending_operation") == operation_id
+    )
+    if not reservation_matches:
+        _set_operation_hold(
+            state,
+            record,
+            received_result_digest=received_result_digest,
+            reason="action result does not match the active reservation",
+        )
+        return True, None, SupervisorActionHold(
+            f"supervisor operation {operation_id} result is outcome-unknown"
+        )
+    if operation.get("outcome") == "outcome_unknown":
+        _require_matching_result_digest(operation, received_result_digest)
+        _set_operation_hold(
+            state,
+            record,
+            received_result_digest=received_result_digest,
+            reason=str(operation.get("reason") or "action outcome is unknown"),
+        )
+        return True, None, SupervisorActionHold(
+            f"supervisor operation {operation_id} requires reconciliation"
+        )
+    if received_result_digest is None:
+        raise ValueError("supervisor completed action requires result_digest")
+    if operation.get("outcome") != "completed":
+        raise ValueError("supervisor completed action outcome must be completed")
+    _require_matching_result_digest(operation, received_result_digest)
+    _apply_action_result(state, operation)
+    container, _field = _supervisor_target_container(state, target_kind)
+    updated = container.get(target)
+    if isinstance(updated, dict):
+        updated.pop("pending_operation", None)
+    record["phase"] = "completed"
+    record["outcome"] = "completed"
+    record["result_kind"] = operation.get("result_kind")
+    record["result_digest"] = received_result_digest
+    record.pop("conflict_reason", None)
+    _operation_map(state, "operation_holds").pop(
+        f"{target_kind}:{target}", None
+    )
+    return True, None, None
+
+
+def apply_supervisor_state_operation(
+    store: Store,
+    path: Path,
+    operation: dict,
+    *,
+    lock_timeout: float = 10.0,
+) -> CommitResult:
+    """Apply one checked data-only operation under the sole state RMW lock."""
+    if (
+        not isinstance(lock_timeout, (int, float))
+        or isinstance(lock_timeout, bool)
+        or not math.isfinite(lock_timeout)
+        or lock_timeout <= 0
+    ):
+        raise ValueError(
+            "supervisor state lock timeout must be finite and greater than zero"
+        )
+    if not isinstance(operation, dict):
+        raise ValueError("supervisor state operation must be a JSON object")
+    path = Path(path)
+    expected_path = store.dir / "supervisor-state.json"
+    supplied_key = os.path.normcase(os.path.abspath(os.fspath(path)))
+    expected_key = os.path.normcase(os.path.abspath(os.fspath(expected_path)))
+    if supplied_key != expected_key:
+        raise ValueError(
+            "supervisor state operation requires the Store's canonical "
+            "supervisor-state.json"
+        )
+    path = expected_path
+    held_error: SupervisorActionHold | None = None
+    with store.supervisor_state_lock(timeout=lock_timeout):
+        state = load_supervisor_state(path)
+        _ensure_supervisor_state_identity(state)
+        expected_instance = operation.get("state_instance_id")
+        if expected_instance is not None and expected_instance != state["state_instance_id"]:
+            raise SupervisorStateConflict("supervisor state instance changed")
+        expected_generation = operation.get("expected_generation")
+        if expected_generation is not None and (
+            not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+            or expected_generation > int(state["generation"])
+        ):
+            raise SupervisorStateConflict(
+                "supervisor state operation has an invalid future generation"
+            )
+        changed, may_execute, held_error = _apply_supervisor_state_operation_locked(
+            state, copy.deepcopy(operation)
+        )
+        if changed:
+            state["generation"] = int(state.get("generation", 0)) + 1
+            _save_supervisor_state_locked(
+                path, state, token=_SUPERVISOR_STATE_WRITE_TOKEN
+            )
+            if may_execute is True:
+                # A reservation grants authority for an external side effect.
+                # Do not return that authority until both validated recovery
+                # generations contain the reservation; otherwise primary
+                # corruption could roll back to a state that authorizes replay.
+                _atomic_write_supervisor_json(
+                    supervisor_state_backup_path(path),
+                    state,
+                    source="supervisor state reservation backup",
+                )
+        result = CommitResult(
+            state_instance_id=state["state_instance_id"],
+            generation=int(state["generation"]),
+            changed=changed,
+            may_execute=may_execute,
+        )
+    if held_error is not None:
+        raise held_error
+    return result
 
 
 def load_supervisor_config(path: Path) -> dict:
@@ -5063,6 +6028,12 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
     for rid, entry in state_active.items():
         if not isinstance(entry, dict):
             continue
+        held = _action_hold_plan(state, "ephemeral", rid)
+        if held is not None:
+            held["request_id"] = rid
+            held["agent"] = entry.get("agent")
+            out[rid] = held
+            continue
         rpt_entry = rpt_active.get(rid) if isinstance(rpt_active.get(rid), dict) else {}
         completion = rpt_entry.get("completion") if isinstance(rpt_entry.get("completion"), dict) else {}
         if completion.get("terminal") is True:
@@ -5140,6 +6111,280 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
     return out
 
 
+def _operation_identity(
+    *,
+    target_kind: str,
+    target: str,
+    action_kind: str,
+    allowed_result_kinds: list[str],
+    expected_target_digest: str,
+    now_epoch: float,
+    intent: dict,
+) -> tuple[str, str]:
+    allowed = list(_require_allowed_result_kinds(allowed_result_kinds))
+    operation_id = _supervisor_digest({
+        "target_kind": target_kind,
+        "target": target,
+        "action_kind": action_kind,
+        "allowed_result_kinds": allowed,
+        "expected_target_digest": expected_target_digest,
+        "now_epoch": now_epoch,
+        "intent": intent,
+    })[:32]
+    intent_digest = _supervisor_digest({
+        "operation_id": operation_id,
+        "target_kind": target_kind,
+        "target": target,
+        "action_kind": action_kind,
+        "allowed_result_kinds": allowed,
+        "intent": intent,
+    })
+    return operation_id, intent_digest
+
+
+def _state_operation_binding(state: dict) -> dict:
+    binding = {"expected_generation": int(state.get("generation", 0))}
+    instance_id = state.get("state_instance_id")
+    if isinstance(instance_id, str):
+        binding["state_instance_id"] = instance_id
+    return binding
+
+
+def _launch_result_context(config: dict, cfg_agent: dict) -> dict:
+    raw_grace = config.get("launch_grace_seconds")
+    grace_seconds = (
+        float(raw_grace)
+        if (
+            isinstance(raw_grace, (int, float))
+            and not isinstance(raw_grace, bool)
+        )
+        else None
+    )
+    provenance_fields = (
+        "cli",
+        "requires_brain_pid",
+        "brain_pattern",
+        "codex_home_isolation",
+        "windows_sandbox",
+        "allow_launcher_self",
+        "wrapped",
+    )
+    return {
+        "schema_version": 1,
+        "grace_seconds": grace_seconds,
+        "cfg_agent": {
+            field: copy.deepcopy(cfg_agent[field])
+            for field in provenance_fields
+            if field in cfg_agent
+        },
+    }
+
+
+def _decorate_agent_state_operation(
+    state: dict,
+    name: str,
+    plan: dict,
+    config: dict,
+    cfg_agent: dict,
+    *,
+    now_epoch: float,
+) -> dict:
+    next_state = plan.get("next_state")
+    if not isinstance(next_state, dict):
+        return plan
+    expected = supervisor_state_target_digest(state, "agent", name)
+    action = plan.get("action")
+    if action in {RELAUNCH, STUCK_RECOVER}:
+        allowed_result_kinds = ["record_launch"]
+        result_context = _launch_result_context(config, cfg_agent)
+        result_context_digest = _supervisor_digest(result_context)
+        execution_spec = {
+            "backend_profile": cfg_agent.get("backend_profile"),
+            "launch": copy.deepcopy(cfg_agent.get("launch") or {}),
+            "cwd": cfg_agent.get("cwd"),
+            "env": copy.deepcopy(cfg_agent.get("env") or {}),
+        }
+        base_intent = {
+            "kill_first": bool(plan.get("kill_first")),
+            "kill_orphans": bool(plan.get("kill_orphans")),
+            "kill_targets": copy.deepcopy(plan.get("kill_targets") or []),
+            "cli": plan.get("cli"),
+            "launch_mode": plan.get("launch_mode"),
+            "session_args": copy.deepcopy(plan.get("session_args") or []),
+            "execution_spec": execution_spec,
+            "result_context": result_context,
+        }
+        operation_id, _unused = _operation_identity(
+            target_kind="agent",
+            target=name,
+            action_kind=str(action),
+            allowed_result_kinds=allowed_result_kinds,
+            expected_target_digest=expected,
+            now_epoch=now_epoch,
+            intent=base_intent,
+        )
+        launcher_nonce = operation_id
+        planned_session_id = None
+        if (
+            plan.get("launch_mode") == "fresh"
+            and "{SESSION_ID}" in (plan.get("session_args") or [])
+        ):
+            planned_session_id = str(uuid.UUID(hex=operation_id))
+        intent = {
+            **base_intent,
+            "launcher_nonce": launcher_nonce,
+            "planned_session_id": planned_session_id,
+        }
+        operation_id, intent_digest = _operation_identity(
+            target_kind="agent",
+            target=name,
+            action_kind=str(action),
+            allowed_result_kinds=allowed_result_kinds,
+            expected_target_digest=expected,
+            now_epoch=now_epoch,
+            intent=intent,
+        )
+        operation = {
+            "kind": "reserve_action",
+            **_state_operation_binding(state),
+            "operation_id": operation_id,
+            "intent_digest": intent_digest,
+            "action_kind": action,
+            "allowed_result_kinds": allowed_result_kinds,
+            "target_kind": "agent",
+            "target": name,
+            "expected_target_digest": expected,
+            "planned_state": next_state,
+            "intent": intent,
+            "result_context_digest": result_context_digest,
+        }
+        plan["operation_id"] = operation_id
+        plan["operation_intent_digest"] = intent_digest
+        plan["launcher_nonce"] = launcher_nonce
+        plan["planned_session_id"] = planned_session_id
+        plan["execution_spec"] = execution_spec
+        plan["launch_result_context"] = encode_supervisor_state_operation(
+            result_context
+        )
+        plan["result_context_digest"] = result_context_digest
+        plan["reserve_state_operation"] = encode_supervisor_state_operation(operation)
+        unknown_result = {
+            "operation_id": operation_id,
+            "status": "executor_result_unavailable",
+        }
+        plan["outcome_unknown_state_operation"] = encode_supervisor_state_operation({
+            "kind": "complete_action",
+            **_state_operation_binding(state),
+            "operation_id": operation_id,
+            "intent_digest": intent_digest,
+            "action_kind": action,
+            "target_kind": "agent",
+            "target": name,
+            "result_kind": "record_launch",
+            "result_context_digest": result_context_digest,
+            "result": unknown_result,
+            "result_digest": _supervisor_digest(unknown_result),
+            "outcome": "outcome_unknown",
+            "reason": "executor side effects began without a committed typed result",
+        })
+    else:
+        plan["commit_state_operation"] = encode_supervisor_state_operation({
+            "kind": "commit_agent_state",
+            **_state_operation_binding(state),
+            "target_kind": "agent",
+            "target": name,
+            "expected_target_digest": expected,
+            "value": next_state,
+        })
+    return plan
+
+
+def _action_hold_plan(state: dict, target_kind: str, target: str) -> dict | None:
+    key = f"{target_kind}:{target}"
+    hold = state.get("operation_holds")
+    hold = hold.get(key) if isinstance(hold, dict) else None
+    if target_kind == "agent":
+        raw = state.get("agents")
+        container = raw if isinstance(raw, dict) else {}
+    else:
+        root = state.get("ephemeral_reviewers")
+        active = root.get("active") if isinstance(root, dict) else None
+        container = active if isinstance(active, dict) else {}
+    entry = container.get(target)
+    pending_id = entry.get("pending_operation") if isinstance(entry, dict) else None
+    unresolved = _active_operation_for_target(state, target_kind, target)
+    if hold is None and not pending_id and unresolved is None:
+        return None
+    operation = None
+    if pending_id and isinstance(state.get("operations"), dict):
+        operation = state["operations"].get(pending_id)
+    detail = hold if isinstance(hold, dict) else operation or unresolved
+    return {
+        "action": NONE,
+        "state": "ACTION_OUTCOME_UNKNOWN",
+        "reason": (
+            "a prior supervisor action has an unknown outcome; HOLDING until "
+            "positive reconciliation or operator disposition"
+        ),
+        "operation_hold": copy.deepcopy(detail or {}),
+    }
+
+
+def _decorate_ephemeral_state_operations(
+    state: dict,
+    plans: dict[str, dict],
+    *,
+    now_epoch: float,
+) -> dict[str, dict]:
+    active_root = state.get("ephemeral_reviewers")
+    active = (
+        active_root.get("active")
+        if isinstance(active_root, dict) else {}
+    )
+    active = active if isinstance(active, dict) else {}
+    for request_id, plan in plans.items():
+        if plan.get("action") not in {
+            eph.ACTION_COMPLETE, eph.ACTION_TIMEOUT, eph.ACTION_FAILED,
+        }:
+            continue
+        expected = supervisor_state_target_digest(
+            state, "ephemeral", request_id,
+        )
+        intent = {
+            "kill_first": bool(plan.get("kill_first")),
+            "kill_targets": copy.deepcopy(plan.get("kill_targets") or []),
+            "terminal_state": plan.get("terminal_state"),
+            "reason": plan.get("reason"),
+            "completion": copy.deepcopy(plan.get("completion") or {}),
+        }
+        operation_id, intent_digest = _operation_identity(
+            target_kind="ephemeral",
+            target=request_id,
+            action_kind=str(plan["action"]),
+            allowed_result_kinds=["delete_target"],
+            expected_target_digest=expected,
+            now_epoch=now_epoch,
+            intent=intent,
+        )
+        operation = {
+            "kind": "reserve_action",
+            **_state_operation_binding(state),
+            "operation_id": operation_id,
+            "intent_digest": intent_digest,
+            "action_kind": plan["action"],
+            "allowed_result_kinds": ["delete_target"],
+            "target_kind": "ephemeral",
+            "target": request_id,
+            "expected_target_digest": expected,
+            "planned_state": copy.deepcopy(active.get(request_id) or {}),
+            "intent": intent,
+        }
+        plan["operation_id"] = operation_id
+        plan["operation_intent_digest"] = intent_digest
+        plan["reserve_state_operation"] = encode_supervisor_state_operation(operation)
+    return plans
+
+
 def plan_actions(report: dict, state: dict, config: dict,
                  *, now_epoch: float, snapshot: list[dict] | None = None) -> dict:
     """The SHARED decision table. Returns ``{"now_epoch", "agents": {name: plan}}``
@@ -5153,6 +6398,7 @@ def plan_actions(report: dict, state: dict, config: dict,
     targets. Wrapped agents also use it to bind the runtime record and discover
     the active CLI brain. The snapshot is an INPUT only and is never folded into
     ``next_state``."""
+    precondition_state = copy.deepcopy(state)
     cfg_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     rpt_agents = report.get("agents") or {}
     state_agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
@@ -5166,20 +6412,36 @@ def plan_actions(report: dict, state: dict, config: dict,
         rpt = rpt_agents.get(name)
         if not isinstance(rpt, dict):
             continue
+        held = _action_hold_plan(state, "agent", name)
+        if held is not None:
+            out[name] = held
+            continue
         st = state_agents.get(name) if isinstance(state_agents.get(name), dict) else {}
         liveness = _liveness(snapshot, st, cfg_agent, name, now_epoch,
                              root_key=root_key, request_id=None,
                              runtime_view=rpt.get("wrapper_runtime"))
-        out[name] = _plan_one(name, rpt, st, config, cfg_agent, liveness,
-                              now_epoch=now_epoch)
+        planned = _plan_one(name, rpt, st, config, cfg_agent, liveness,
+                            now_epoch=now_epoch)
+        out[name] = _decorate_agent_state_operation(
+            precondition_state,
+            name,
+            planned,
+            config,
+            cfg_agent,
+            now_epoch=now_epoch,
+        )
+    ephemeral_plans = _plan_ephemeral_active(
+        report, state, config, now_epoch=now_epoch, snapshot=snapshot,
+        root_key=root_key,
+    )
     return {
         "now_epoch": now_epoch,
         "agents": out,
         "launch_requests": _plan_launch_requests(report, state, config,
                                                  now_epoch=now_epoch),
-        "ephemeral_reviewers": _plan_ephemeral_active(
-            report, state, config, now_epoch=now_epoch, snapshot=snapshot,
-            root_key=root_key),
+        "ephemeral_reviewers": _decorate_ephemeral_state_operations(
+            precondition_state, ephemeral_plans, now_epoch=now_epoch,
+        ),
     }
 
 
@@ -5826,8 +7088,7 @@ $ErrorActionPreference = 'Stop'
 if ($Quiet) { $WarningPreference = 'SilentlyContinue' }
 $Root      = Split-Path -Parent $PSScriptRoot   # the project root (.agenttalk/..)
 $ConfigPath = Join-Path $PSScriptRoot 'supervisor.json'
-$StatePath  = Join-Path $PSScriptRoot 'supervisor-state.json'   # SCRIPT-owned, not the bus
-$StateBackupPath = "$StatePath.bak"
+$StatePath  = Join-Path $PSScriptRoot 'supervisor-state.json'   # Python-owned ledger
 $KillSwitchPath = Join-Path $PSScriptRoot 'supervisor.kill'
 # Resolve the project-local shim once and use it for ALL of the SUPERVISOR's
 # own bus calls, so they work PATH-independently - the console script may not be
@@ -5924,130 +7185,6 @@ function Assert-ActionsEnabled([string]$what) {
   if (-not $Quiet) { Write-Host ("supervisor: kill switch active; skipping {0}" -f $what) }
   return $false
 }
-# region state-helpers
-function Test-StateObject($state) {
-  if ($null -eq $state) { return $false }
-  if (($state -isnot [System.Management.Automation.PSCustomObject]) -and
-      ($state -isnot [hashtable])) { return $false }
-  foreach ($field in @('agents', 'ephemeral_reviewers')) {
-    $prop = $state.PSObject.Properties[$field]
-    if ($null -ne $prop -and $null -ne $prop.Value -and
-        ($prop.Value -isnot [System.Management.Automation.PSCustomObject]) -and
-        ($prop.Value -isnot [hashtable])) { return $false }
-  }
-  return $true
-}
-function Read-StateFile([string]$path) {
-  if (-not (Test-Path -LiteralPath $path)) { return $null }
-  try {
-    $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
-    $value = [System.IO.File]::ReadAllText($path, $utf8) | ConvertFrom-Json
-    if (Test-StateObject $value) { return $value }
-  } catch { }
-  return $null
-}
-function Test-IsRetryableStateWriteException($exception) {
-  $current = $exception
-  while ($null -ne $current) {
-    if ($current -is [System.IO.IOException]) {
-      $win32 = $current.HResult -band 0xFFFF
-      if ($win32 -in @(32, 33)) { return $true }
-    }
-    $current = $current.InnerException
-  }
-  return $false
-}
-function Invoke-StateFileSwapWithRetry([string]$tmp, [string]$path) {
-  $delayMs = 5
-  for ($attempt = 1; $attempt -le 8; $attempt++) {
-    $replaced = $null
-    try {
-      if (Test-Path -LiteralPath $path) {
-        $replacedName = ".at-replaced-{0}-{1}.bak" -f $PID, ([Guid]::NewGuid().ToString('N'))
-        $replaced = [System.IO.Path]::Combine(
-          [System.IO.Path]::GetDirectoryName($path), $replacedName)
-        [System.IO.File]::Replace($tmp, $path, $replaced)
-      } else {
-        [System.IO.File]::Move($tmp, $path)
-      }
-      return
-    } catch {
-      if (-not (Test-IsRetryableStateWriteException $_.Exception) -or $attempt -ge 8) { throw }
-      Start-Sleep -Milliseconds $delayMs
-      $delayMs = [Math]::Min(250, $delayMs * 2)
-    } finally {
-      if ($null -ne $replaced -and (Test-Path -LiteralPath $replaced)) {
-        Remove-Item -LiteralPath $replaced -Force
-      }
-    }
-  }
-}
-function Write-StateFileAtomic([string]$path, $state) {
-  if (-not (Test-StateObject $state)) { throw "supervisor state must be a JSON object" }
-  $json = $state | ConvertTo-Json -Depth 8
-  $utf8 = New-Object System.Text.UTF8Encoding($false)
-  $bytes = $utf8.GetBytes($json)
-  $tmpName = ".at-{0}-{1}.tmp" -f $PID, ([Guid]::NewGuid().ToString('N'))
-  $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($path), $tmpName)
-  $stream = [System.IO.FileStream]::new(
-    $tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
-    [System.IO.FileShare]::None)
-  try {
-    $stream.Write($bytes, 0, $bytes.Length)
-    $stream.Flush($true)
-  } finally {
-    $stream.Dispose()
-  }
-  try {
-    Invoke-StateFileSwapWithRetry $tmp $path
-  } finally {
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
-  }
-}
-function Set-AgentState($state, $name, $value) {
-  $state.agents | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
-}
-function Load-State {
-  $primaryExists = Test-Path -LiteralPath $StatePath
-  $backupExists = Test-Path -LiteralPath $StateBackupPath
-  $primary = Read-StateFile $StatePath
-  if ($null -ne $primary) { return $primary }
-  $backup = Read-StateFile $StateBackupPath
-  if ($null -ne $backup) { return $backup }
-  if (-not $primaryExists -and -not $backupExists) {
-    return [pscustomobject]@{ agents = [pscustomobject]@{} }
-  }
-  throw "supervisor state and backup are invalid; refusing to continue"
-}
-function Save-State($state) {
-  if (-not (Actions-Enabled)) { return }
-  if (-not (Test-StateObject $state)) { throw "supervisor state must be a JSON object" }
-  $primaryExists = Test-Path -LiteralPath $StatePath
-  $backupExists = Test-Path -LiteralPath $StateBackupPath
-  $prior = Read-StateFile $StatePath
-  if ($null -ne $prior) {
-    Write-StateFileAtomic $StateBackupPath $prior
-  } elseif ($primaryExists) {
-    $fallback = Read-StateFile $StateBackupPath
-    if ($null -eq $fallback) {
-      throw "supervisor state is invalid and no valid backup exists"
-    }
-  } elseif ($backupExists -and $null -eq (Read-StateFile $StateBackupPath)) {
-    throw "supervisor state backup is invalid"
-  }
-  Write-StateFileAtomic $StatePath $state
-}
-function Save-StateForPoll($state) {
-  try {
-    Save-State $state
-    return $true
-  } catch {
-    if (-not (Test-IsRetryableStateWriteException $_.Exception)) { throw }
-    Write-Warning "supervisor: state write failed this poll; will retry next poll"
-    return $false
-  }
-}
-# endregion state-helpers
 function Pid-Alive($procId) {
   if (-not $procId) { return $false }
   return [bool](Get-Process -Id $procId -ErrorAction SilentlyContinue)
@@ -6103,7 +7240,7 @@ function Get-ProcSnapshot($path) {
     # count; a pipe would unroll it into a {"value":..,"Count":..} wrapper. Empty
     # is written as a literal [] (an empty captured table, NOT unavailable).
     $arr = @($rows)
-    # BOM-free UTF-8 (matches Write-StateFileAtomic): Set-Content -Encoding utf8
+    # BOM-free UTF-8: Set-Content -Encoding utf8
     # emits a UTF-8 BOM under Windows PowerShell 5.1, which every JSON write in
     # this template must avoid so a strict Python reader never chokes.
     $u8 = New-Object System.Text.UTF8Encoding($false)
@@ -6211,8 +7348,8 @@ function Seed-CodexHome($name, $sandbox) {
   if (-not $ok) { Write-Warning ("supervisor: {0}: seeded CODEX_HOME missing auth/config/agenttalk-listen skill - failing closed" -f $name); return $null }
   return $isoHome
 }
-function Test-WrappedBaseCli($name) {
-  $a = $cfg.agents.$name
+function Test-WrappedBaseCli($name, $actionSpec) {
+  $a = $actionSpec
   $args = @($a.launch.windows_args)
   $sep = [array]::IndexOf($args, '--')
   if ($sep -lt 0 -or ($sep + 1) -ge $args.Count) {
@@ -6315,7 +7452,7 @@ function Preflight($name, $plan, $file, $codexHome) {
         if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
       }
       if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped preflight (AGENTTALK_PY -m agenttalk --version) exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
-      if (-not (Test-WrappedBaseCli $name)) { return $false }
+      if (-not (Test-WrappedBaseCli $name $plan.execution_spec)) { return $false }
       return $true
     }
     if ($plan.cli -eq 'codex') {
@@ -6364,13 +7501,78 @@ function Invoke-CheckedSupervisorMutation(
   Write-Warning ("supervisor: {0} failed (exit {1}); holding this poll" -f $description, $exitCode)
   return $false
 }
+function Invoke-CheckedSupervisorMutationInput(
+  [string]$description,
+  [object[]]$arguments,
+  [string]$inputText
+) {
+  if (-not $inputText) {
+    Write-Warning ("supervisor: {0} has no frozen input; holding this poll" -f $description)
+    return $false
+  }
+  $inputText | & $AgenttalkCmd @arguments | Out-Null
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -eq 0) { return $true }
+  Write-Warning ("supervisor: {0} failed (exit {1}); holding this poll" -f $description, $exitCode)
+  return $false
+}
+function Invoke-CheckedStateOperation([string]$description, [string]$token) {
+  if (-not $token) {
+    Write-Warning ("supervisor: {0} has no checked state operation; holding this poll" -f $description)
+    return $false
+  }
+  $arguments = @('--root', $Root, 'supervise', '--apply-state-operation',
+                 '--state-file', $StatePath, '--state-operation', '-')
+  $token | & $AgenttalkCmd @arguments | Out-Null
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -eq 0) { return $true }
+  Write-Warning ("supervisor: {0} failed (exit {1}); holding this poll" -f $description, $exitCode)
+  return $false
+}
+function Reserve-StateOperation([string]$description, [string]$token) {
+  if (-not $token) {
+    Write-Warning ("supervisor: {0} has no action reservation; holding this poll" -f $description)
+    return $false
+  }
+  $arguments = @('--root', $Root, 'supervise', '--apply-state-operation',
+                 '--state-file', $StatePath, '--state-operation', '-')
+  $text = $token | & $AgenttalkCmd @arguments
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -ne 0) {
+    Write-Warning ("supervisor: {0} reservation failed (exit {1}); holding this poll" -f $description, $exitCode)
+    return $false
+  }
+  $result = $null
+  try { $result = $text | ConvertFrom-Json } catch {}
+  if (($null -eq $result) -or ($result.may_execute -ne $true)) {
+    Write-Warning ("supervisor: {0} reservation was not fresh; refusing action replay" -f $description)
+    return $false
+  }
+  return $true
+}
+function Record-OutcomeUnknown([string]$description, [string]$token) {
+  if (-not $token) { return }
+  $arguments = @('--root', $Root, 'supervise', '--apply-state-operation',
+                 '--state-file', $StatePath, '--state-operation', '-')
+  $token | & $AgenttalkCmd @arguments | Out-Null
+  $exitCode = $LASTEXITCODE
+  if (($exitCode -eq 0) -or ($exitCode -eq 4)) {
+    Write-Warning ("supervisor: {0} has an unknown outcome; target is held" -f $description)
+  } else {
+    Write-Warning ("supervisor: {0} outcome HOLD could not be persisted (exit {1})" -f $description, $exitCode)
+  }
+}
 function Wait-ForNextPoll($config) {
   if (-not $Once) { Start-Sleep -Seconds ([int]$config.poll_seconds) }
 }
 # endregion checked-mutations
 function Launch($name, $plan, $codexHome) {
   if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) { return $null }
-  $a = $cfg.agents.$name
+  $a = $plan.execution_spec
+  if (-not $a) {
+    Write-Warning "supervisor: agent '$name' has no frozen execution spec; NOT launching"
+    return $null
+  }
   if ($a.backend_profile -eq 'ovh-qwen') {
     if ($env:OVH_KEY -or $env:ANTHROPIC_API_KEY) {
       Write-Warning "supervisor: agent '$name': ovh-qwen refuses ambient OVH_KEY/ANTHROPIC_API_KEY; NOT launching"
@@ -6395,7 +7597,7 @@ function Launch($name, $plan, $codexHome) {
   $sid = $plan.session_id
   $tokens = @($plan.session_args)
   if ($plan.launch_mode -eq 'fresh' -and ($tokens -contains '{SESSION_ID}')) {
-    $sid = [guid]::NewGuid().ToString()
+    $sid = if ($plan.planned_session_id) { [string]$plan.planned_session_id } else { [guid]::NewGuid().ToString() }
     $tokens = $tokens | ForEach-Object { if ($_ -eq '{SESSION_ID}') { $sid } else { $_ } }
   }
   $argv = @()
@@ -6404,7 +7606,7 @@ function Launch($name, $plan, $codexHome) {
     if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
   }
   $argv = @(Ensure-AgenttalkWrapRootArg $argv)
-  $launchNonce = [guid]::NewGuid().ToString('N')
+  $launchNonce = if ($plan.launcher_nonce) { [string]$plan.launcher_nonce } else { [guid]::NewGuid().ToString('N') }
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
   $argv = @($nonceResult.argv)
   # Apply the agent's env, launch the REAL executable directly with -PassThru,
@@ -6458,7 +7660,7 @@ function Launch-Spec($name, $spec, $codexHome) {
   $argv = @($spec.launch.windows_args)
   $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
   $argv = @(Ensure-AgenttalkWrapRootArg $argv)
-  $launchNonce = [guid]::NewGuid().ToString('N')
+  $launchNonce = if ($spec.launcher_nonce) { [string]$spec.launcher_nonce } else { [guid]::NewGuid().ToString('N') }
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
   $argv = @($nonceResult.argv)
   $saved = @{}
@@ -6506,27 +7708,13 @@ $pollNum = 0
   } catch {
     Write-Warning "supervisor: supervisor.json refresh failed; keeping last-good config"
   }
-  $state = Load-State
-  if (-not $state.agents) { $state | Add-Member agents ([pscustomobject]@{}) -Force }
-  # 1) capture the process snapshot (the executor's only OS-liveness source) +
-  #    keep the legacy pid_alive refresh for any non-forking CLI.
+  # 1) capture the process snapshot (the executor's only OS-liveness source).
+  # Supervisor state is read and written only by the pinned Python owner.
   $SnapPath = Join-Path $PSScriptRoot 'supervisor-snapshot.json'
   $snapshotArgs = @()
   if (Actions-Enabled) {
     Get-ProcSnapshot $SnapPath | Out-Null
     $snapshotArgs = @('--snapshot-file', $SnapPath)
-  }
-  foreach ($name in $cfg.agents.PSObject.Properties.Name) {
-    $st = $state.agents.$name
-    if (-not $st) {
-      $st = [pscustomobject]@{}
-      Set-AgentState $state $name $st
-    }
-    $st | Add-Member pid_alive (Pid-Alive $st.pid) -Force
-  }
-  if (-not (Save-StateForPoll $state)) {
-    Wait-ForNextPoll $cfg
-    continue supervisorPoll
   }
   # 2) ask Python for the safe action plan (it interprets the snapshot)
   # MUST be a UTC epoch: heartbeats are stamped in UTC (...Z), and the Python
@@ -6566,6 +7754,10 @@ $pollNum = 0
     $lastLogged[$name] = $p.state
     switch ($p.action) {
       { $_ -in 'relaunch','stuck_recover' } {
+        if (-not (Reserve-StateOperation ("reserve-action {0}" -f $name) $p.reserve_state_operation)) {
+          Wait-ForNextPoll $cfg
+          continue supervisorPoll
+        }
         # Kill FIRST when the plan says so: a leaves-first, start-time-guarded
         # process-TREE kill of the recorded targets (brain + managed descendants
         # + any orphan wait). The launcher pid is long dead - we never rely on it.
@@ -6584,7 +7776,7 @@ $pollNum = 0
           $why = if ($barrier -and $barrier.reason) { $barrier.reason } else { 'launch_barrier_unavailable' }
           $n = if ($barrier -and $barrier.survivor_count) { [int]$barrier.survivor_count } else { 0 }
           Write-Warning ("supervisor: {0}: launch barrier held ({1}; survivors={2}) - skipping relaunch this tick" -f $name, $why, $n)
-          if ($p.barrier_state) { Set-AgentState $state $name $p.barrier_state } else { Set-AgentState $state $name $p.next_state }
+          Record-OutcomeUnknown ("launch-barrier {0}" -f $name) $p.outcome_unknown_state_operation
           continue
         }
         # SEED the agent for UNATTENDED launch (blocker #2). Codex: a per-agent
@@ -6598,7 +7790,12 @@ $pollNum = 0
           $homeEnv = Seed-CodexHome $name $p.windows_sandbox
           if (-not $homeEnv) { $seedOk = $false }
         }
-        $a = $cfg.agents.$name
+        $a = $p.execution_spec
+        if (-not $a) {
+          Write-Warning ("supervisor: {0}: plan has no frozen execution spec; holding" -f $name)
+          Record-OutcomeUnknown ("execution-spec {0}" -f $name) $p.outcome_unknown_state_operation
+          continue
+        }
         if ($p.cli -eq 'claude') {
           $launchDir = if ($a.cwd) { $a.cwd } else { $Root }
           if (-not (Assert-ActionsEnabled ("seed-claude-settings {0}" -f $name))) { continue }
@@ -6609,17 +7806,8 @@ $pollNum = 0
         if ($seedOk -and -not (Preflight $name $p $file $homeEnv)) { $seedOk = $false }
         if (-not $seedOk) {
           Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
-          Set-AgentState $state $name $p.next_state
+          Record-OutcomeUnknown ("seed/preflight {0}" -f $name) $p.outcome_unknown_state_operation
         } else {
-          # Reserve the relaunch before Start-Process.  The planner state carries
-          # launching/grace and consumes a manual restart id, so a failed
-          # post-spawn PID record cannot make the next poll launch a second
-          # legacy-direct process from the old state.
-          Set-AgentState $state $name $p.next_state
-          if (-not (Save-StateForPoll $state)) {
-            Wait-ForNextPoll $cfg
-            continue supervisorPoll
-          }
           $preLaunchPath = Join-Path $PSScriptRoot ("supervisor-prelaunch-{0}.json" -f $name)
           $postLaunchPath = Join-Path $PSScriptRoot ("supervisor-postlaunch-{0}.json" -f $name)
           Get-ProcSnapshot $preLaunchPath | Out-Null
@@ -6637,31 +7825,44 @@ $pollNum = 0
             }
             if (-not (Assert-ActionsEnabled ("record-launch {0}" -f $name))) { continue }
             $recordArgs = @('--root', $Root, 'supervise', '--record-launch',
-              '--for', $name, '--cli', $p.cli, '--pid', [string]$res.pid) + $extra + @(
+              '--for', $name, '--cli', $p.cli, '--pid', [string]$res.pid,
+              '--operation-id', $p.operation_id,
+              '--operation-intent-digest', $p.operation_intent_digest,
+              '--action-kind', $p.action,
+              '--launch-result-context', '-') + $extra + @(
               '--pre-snapshot-file', $preLaunchPath, '--post-snapshot-file', $postLaunchPath,
               '--now', [string]$now, '--state-file', $StatePath)
-            if (-not (Invoke-CheckedSupervisorMutation ("record-launch {0}" -f $name) $recordArgs)) {
+            if (-not (Invoke-CheckedSupervisorMutationInput ("record-launch {0}" -f $name) $recordArgs $p.launch_result_context)) {
               Wait-ForNextPoll $cfg
               continue supervisorPoll
             }
-            $state = Load-State
             # Manual restart markers clear on a later readiness-seen plan tick, not on PID return.
             if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
           } else {
             Write-Warning ("supervisor: {0}: {1} FAILED (no PID) - keeping marker/state for retry" -f $name, $p.action)
+            Record-OutcomeUnknown ("launch {0}" -f $name) $p.outcome_unknown_state_operation
           }
         }
       }
-      'clear_marker' { if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
-      'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
+      'clear_marker' {
+        if (-not (Invoke-CheckedStateOperation ("commit-state {0}" -f $name) $p.commit_state_operation)) { Wait-ForNextPoll $cfg; continue supervisorPoll }
+        if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
+      }
+      'refuse_protected' {
+        if (-not (Invoke-CheckedStateOperation ("commit-state {0}" -f $name) $p.commit_state_operation)) { Wait-ForNextPoll $cfg; continue supervisorPoll }
+        Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
+        if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
+      }
       { $_ -in 'warn_only','suspect_warn','snapshot_unavailable','readiness_gave_up' } {
+        if (-not (Invoke-CheckedStateOperation ("commit-state {0}" -f $name) $p.commit_state_operation)) { Wait-ForNextPoll $cfg; continue supervisorPoll }
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
         if ($p.notify -and $cfg.notify_sender -and $cfg.notify_to -and (Assert-ActionsEnabled ("notify {0}" -f $name))) {
           & $AgenttalkCmd --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null
         }
-        Set-AgentState $state $name $p.next_state
       }
-      default { Set-AgentState $state $name $p.next_state }
+      default {
+        if ($p.commit_state_operation -and -not (Invoke-CheckedStateOperation ("commit-state {0}" -f $name) $p.commit_state_operation)) { Wait-ForNextPoll $cfg; continue supervisorPoll }
+      }
     }
   }
   foreach ($rid in $plan.launch_requests.PSObject.Properties.Name) {
@@ -6679,7 +7880,6 @@ $pollNum = 0
           Wait-ForNextPoll $cfg
           continue supervisorPoll
         }
-        $state = Load-State
       }
       'ephemeral_launch' {
         if (-not (Assert-ActionsEnabled ("prepare-launch-request {0}" -f $rid))) { continue }
@@ -6696,12 +7896,14 @@ $pollNum = 0
             if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
             $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
               '--request-id', $rid, '--terminal-state', 'failed', '--reason',
-              'codex home seed failed', '--state-file', $StatePath, '--now', [string]$now)
+              'codex home seed failed', '--state-file', $StatePath, '--now', [string]$now,
+              '--operation-id', $prep.operation_id,
+              '--operation-intent-digest', $prep.operation_intent_digest,
+              '--action-kind', 'ephemeral_launch')
             if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
               Wait-ForNextPoll $cfg
               continue supervisorPoll
             }
-            $state = Load-State
             continue
           }
         }
@@ -6719,7 +7921,10 @@ $pollNum = 0
           }
           if (-not (Assert-ActionsEnabled ("record-ephemeral-launch {0}" -f $rid))) { continue }
           $recordArgs = @('--root', $Root, 'supervise', '--record-ephemeral-launch',
-            '--request-id', $rid, '--pid', [string]$res.pid) + $extra + @(
+            '--request-id', $rid, '--pid', [string]$res.pid,
+            '--operation-id', $prep.operation_id,
+            '--operation-intent-digest', $prep.operation_intent_digest,
+            '--action-kind', 'ephemeral_launch') + $extra + @(
             '--pre-snapshot-file', $preLaunchPath, '--post-snapshot-file', $postLaunchPath,
             '--timeout-seconds', [string]$prep.timeout_seconds, '--state-file', $StatePath,
             '--now', [string]$now)
@@ -6727,17 +7932,8 @@ $pollNum = 0
             Wait-ForNextPoll $cfg
             continue supervisorPoll
           }
-          $state = Load-State
         } else {
-          if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
-          $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
-            '--request-id', $rid, '--terminal-state', 'failed', '--reason',
-            'launch returned no pid', '--state-file', $StatePath, '--now', [string]$now)
-          if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
-            Wait-ForNextPoll $cfg
-            continue supervisorPoll
-          }
-          $state = Load-State
+          Record-OutcomeUnknown ("ephemeral-launch {0}" -f $rid) $prep.outcome_unknown_state_operation
         }
       }
     }
@@ -6748,6 +7944,10 @@ $pollNum = 0
     if (($p.action -ne 'none') -and (-not (Assert-ActionsEnabled ("ephemeral {0} {1}" -f $rid, $p.action)))) { continue }
     switch ($p.action) {
       { $_ -in 'ephemeral_complete','ephemeral_timeout','ephemeral_failed' } {
+        if (-not (Reserve-StateOperation ("reserve-ephemeral-action {0}" -f $rid) $p.reserve_state_operation)) {
+          Wait-ForNextPoll $cfg
+          continue supervisorPoll
+        }
         if ($p.kill_first -and $p.kill_targets) { Stop-Tree $p.kill_targets }
         $completionJson = '{}'
         if ($p.completion) { $completionJson = ($p.completion | ConvertTo-Json -Compress -Depth 8) }
@@ -6755,12 +7955,13 @@ $pollNum = 0
         $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
           '--request-id', $rid, '--terminal-state', $p.terminal_state, '--reason', $p.reason,
           '--completion-json', $completionJson, '--state-file', $StatePath,
-          '--now', [string]$now)
+          '--now', [string]$now, '--operation-id', $p.operation_id,
+          '--operation-intent-digest', $p.operation_intent_digest,
+          '--action-kind', $p.action)
         if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
           Wait-ForNextPoll $cfg
           continue supervisorPoll
         }
-        $state = Load-State
       }
       'ephemeral_janitor' {
         if ($p.agent -and (Assert-ActionsEnabled ("janitor-ephemeral {0}" -f $p.agent))) { & $AgenttalkCmd --root $Root supervise --janitor-ephemeral --for $p.agent | Out-Null }
@@ -6776,12 +7977,6 @@ $pollNum = 0
   # is polling (every 10th poll, normal non-quiet runs only).
   if (-not $Quiet -and -not $DryRun -and $total -gt 0 -and ($pollNum % 10 -eq 0)) {
     Write-Host ("supervisor: poll {0} - {1}/{2} agents healthy" -f $pollNum, $healthy, $total)
-  }
-  if (-not $DryRun) {
-    if (-not (Save-StateForPoll $state)) {
-      Wait-ForNextPoll $cfg
-      continue supervisorPoll
-    }
   }
   Wait-ForNextPoll $cfg
 } while (-not $Once)

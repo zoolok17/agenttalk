@@ -11521,6 +11521,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     # `--observe-kill-switch` is intentionally absent: it is the one checked,
     # field-owned observation writer allowed while the emergency brake is set.
     supervisor_mutations = (
+        "apply_state_operation",
         "archive_launch_request",
         "claim_instance",
         "clear_restart",
@@ -11883,11 +11884,6 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             return {"agents": {}}
         return sup.load_supervisor_state(Path(args.state_file))
 
-    def _write_state(state: dict) -> None:
-        if not args.state_file:
-            raise ValueError("need --state-file <path>")
-        sup.save_supervisor_state(Path(args.state_file), state)
-
     def _read_snapshot_file(path_value: str | None) -> list[dict] | None:
         if path_value and Path(path_value).exists():
             try:
@@ -11896,6 +11892,41 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             except (ValueError, OSError):
                 return None
         return None
+
+    if args.apply_state_operation:
+        if not args.state_file or not args.state_operation:
+            sys.stderr.write(
+                "agenttalk supervise --apply-state-operation: need --state-file "
+                "<path> and --state-operation <token>\n"
+            )
+            return 2
+        try:
+            encoded_operation = args.state_operation
+            if encoded_operation == "-":
+                encoded_operation = sys.stdin.read().strip()
+            operation = sup.decode_supervisor_state_operation(encoded_operation)
+            result = sup.apply_supervisor_state_operation(
+                store, Path(args.state_file), operation,
+                lock_timeout=args.state_lock_timeout,
+            )
+        except sup.SupervisorActionHold as exc:
+            sys.stderr.write(
+                "agenttalk supervise --apply-state-operation: "
+                f"durable action HOLD: {exc}\n"
+            )
+            return 4
+        except (ValueError, sup.SupervisorStateConflict) as exc:
+            sys.stderr.write(
+                f"agenttalk supervise --apply-state-operation: {exc}\n"
+            )
+            return 3
+        print(json.dumps({
+            "state_instance_id": result.state_instance_id,
+            "generation": result.generation,
+            "changed": result.changed,
+            "may_execute": result.may_execute,
+        }, indent=2))
+        return 0
 
     if args.prepare_launch_request:
         if not args.request_id or not args.state_file:
@@ -11911,7 +11942,114 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         except eph.EphemeralError as e:
             sys.stderr.write(f"agenttalk supervise --prepare-launch-request: {e}\n")
             return 3
-        _write_state(state)
+        root = state.get("ephemeral_reviewers")
+        active = root.get("active") if isinstance(root, dict) else None
+        prepared = active.get(args.request_id) if isinstance(active, dict) else None
+        if not isinstance(prepared, dict):
+            sys.stderr.write(
+                "agenttalk supervise --prepare-launch-request: prepared state is absent\n"
+            )
+            return 3
+        durable_state = sup.load_supervisor_state(Path(args.state_file))
+        expected = sup.supervisor_state_target_digest(
+            durable_state,
+            "ephemeral",
+            args.request_id,
+        )
+        intent = {
+            "request_id": args.request_id,
+            "agent": spec.get("agent"),
+            "launch": spec.get("launch") or {},
+            "cwd": spec.get("cwd"),
+            "env": spec.get("env") or {},
+        }
+        provisional_id, _unused_digest = sup._operation_identity(
+            target_kind="ephemeral",
+            target=args.request_id,
+            action_kind="ephemeral_launch",
+            allowed_result_kinds=[
+                "delete_target",
+                "record_ephemeral_launch",
+            ],
+            expected_target_digest=expected,
+            now_epoch=now,
+            intent=intent,
+        )
+        launcher_nonce = provisional_id
+        intent = {**intent, "launcher_nonce": launcher_nonce}
+        operation_id, intent_digest = sup._operation_identity(
+            target_kind="ephemeral",
+            target=args.request_id,
+            action_kind="ephemeral_launch",
+            allowed_result_kinds=[
+                "delete_target",
+                "record_ephemeral_launch",
+            ],
+            expected_target_digest=expected,
+            now_epoch=now,
+            intent=intent,
+        )
+        try:
+            result = sup.apply_supervisor_state_operation(
+                store,
+                Path(args.state_file),
+                {
+                    "kind": "reserve_action",
+                    **sup._state_operation_binding(durable_state),
+                    "operation_id": operation_id,
+                    "intent_digest": intent_digest,
+                    "action_kind": "ephemeral_launch",
+                    "allowed_result_kinds": [
+                        "delete_target",
+                        "record_ephemeral_launch",
+                    ],
+                    "target_kind": "ephemeral",
+                    "target": args.request_id,
+                    "expected_target_digest": expected,
+                    "planned_state": prepared,
+                    "history_entry": {
+                        "request_id": args.request_id,
+                        "agent": spec.get("agent"),
+                        "at_epoch": now,
+                    },
+                    "intent": intent,
+                },
+            )
+        except sup.SupervisorStateConflict as exc:
+            sys.stderr.write(
+                f"agenttalk supervise --prepare-launch-request: {exc}\n"
+            )
+            return 3
+        if result.may_execute is not True:
+            sys.stderr.write(
+                "agenttalk supervise --prepare-launch-request: launch reservation "
+                "already exists; refusing to replay\n"
+            )
+            return 3
+        spec["operation_id"] = operation_id
+        spec["operation_intent_digest"] = intent_digest
+        spec["launcher_nonce"] = launcher_nonce
+        unknown_result = {
+            "operation_id": operation_id,
+            "status": "executor_result_unavailable",
+        }
+        spec["outcome_unknown_state_operation"] = (
+            sup.encode_supervisor_state_operation({
+                "kind": "complete_action",
+                "state_instance_id": result.state_instance_id,
+                "expected_generation": result.generation,
+                "operation_id": operation_id,
+                "intent_digest": intent_digest,
+                "action_kind": "ephemeral_launch",
+                "target_kind": "ephemeral",
+                "target": args.request_id,
+                "result_kind": "record_ephemeral_launch",
+                "result": unknown_result,
+                "result_digest": sup._supervisor_digest(unknown_result),
+                "outcome": "outcome_unknown",
+                "reason": "ephemeral launch did not produce a committed typed result",
+            })
+        )
         print(json.dumps(spec, indent=2))
         return 0
 
@@ -11920,21 +12058,54 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --record-ephemeral-launch: need "
                              "--request-id <rid> and --state-file <path>\n")
             return 2
-        state = _read_state()
         root_key = sup._root_key(str(store.root.resolve()))
-        sup.record_ephemeral_launch(
-            state, args.request_id, pid=args.pid, pid_start=args.pid_start,
-            now_epoch=(args.now if args.now is not None else time.time()),
-            timeout_seconds=args.timeout_seconds,
-            pre_snapshot=_read_snapshot_file(args.pre_snapshot_file),
-            post_snapshot=_read_snapshot_file(args.post_snapshot_file),
-            root_key=root_key,
-            launcher_nonce=args.launcher_nonce,
-            launcher_nonce_injected=bool(args.launcher_nonce_injected),
-            launcher_nonce_source=args.launcher_nonce_source,
-            launcher_nonce_missing_reason=args.launcher_nonce_missing_reason,
-        )
-        _write_state(state)
+        result_payload = {
+            "pid": args.pid,
+            "pid_start": args.pid_start,
+            "now_epoch": args.now if args.now is not None else time.time(),
+            "timeout_seconds": args.timeout_seconds,
+            "pre_snapshot": _read_snapshot_file(args.pre_snapshot_file),
+            "post_snapshot": _read_snapshot_file(args.post_snapshot_file),
+            "root_key": root_key,
+            "launcher_nonce": args.launcher_nonce,
+            "launcher_nonce_injected": bool(args.launcher_nonce_injected),
+            "launcher_nonce_source": args.launcher_nonce_source,
+            "launcher_nonce_missing_reason": args.launcher_nonce_missing_reason,
+        }
+        operation = {
+            "kind": "record_ephemeral_launch",
+            "target_kind": "ephemeral",
+            "target": args.request_id,
+            "result": result_payload,
+        }
+        if args.operation_id or args.operation_intent_digest:
+            if not args.operation_id or not args.operation_intent_digest:
+                sys.stderr.write(
+                    "agenttalk supervise --record-ephemeral-launch: --operation-id "
+                    "and --operation-intent-digest must be supplied together\n"
+                )
+                return 2
+            operation = {
+                "kind": "complete_action",
+                "operation_id": args.operation_id,
+                "intent_digest": args.operation_intent_digest,
+                "action_kind": args.action_kind or "ephemeral_launch",
+                "target_kind": "ephemeral",
+                "target": args.request_id,
+                "result_kind": "record_ephemeral_launch",
+                "result": result_payload,
+                "result_digest": sup._supervisor_digest(result_payload),
+                "outcome": "completed",
+            }
+        try:
+            sup.apply_supervisor_state_operation(
+                store, Path(args.state_file), operation,
+            )
+        except sup.SupervisorStateConflict as exc:
+            sys.stderr.write(
+                f"agenttalk supervise --record-ephemeral-launch: {exc}\n"
+            )
+            return 3
         return 0
 
     if args.archive_launch_request:
@@ -11956,6 +12127,9 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                                  "--completion-json must be a JSON object\n")
                 return 2
         state = _read_state()
+        expected = sup.supervisor_state_target_digest(
+            state, "ephemeral", args.request_id,
+        )
         sup.archive_ephemeral_request(
             store, state, args.request_id,
             terminal_state=args.terminal_state,
@@ -11963,7 +12137,46 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             now_epoch=(args.now if args.now is not None else time.time()),
             completion=completion,
         )
-        _write_state(state)
+        result_payload = {
+            "terminal_state": args.terminal_state,
+            "reason": args.reason or "",
+            "now_epoch": args.now if args.now is not None else time.time(),
+            "completion": completion or {},
+        }
+        operation: dict = {
+            "kind": "delete_ephemeral_state",
+            "target_kind": "ephemeral",
+            "target": args.request_id,
+            "expected_target_digest": expected,
+        }
+        if args.operation_id or args.operation_intent_digest:
+            if not args.operation_id or not args.operation_intent_digest:
+                sys.stderr.write(
+                    "agenttalk supervise --archive-launch-request: --operation-id "
+                    "and --operation-intent-digest must be supplied together\n"
+                )
+                return 2
+            operation = {
+                "kind": "complete_action",
+                "operation_id": args.operation_id,
+                "intent_digest": args.operation_intent_digest,
+                "action_kind": args.action_kind or "ephemeral_terminal",
+                "target_kind": "ephemeral",
+                "target": args.request_id,
+                "result_kind": "delete_target",
+                "result": result_payload,
+                "result_digest": sup._supervisor_digest(result_payload),
+                "outcome": "completed",
+            }
+        try:
+            sup.apply_supervisor_state_operation(
+                store, Path(args.state_file), operation,
+            )
+        except sup.SupervisorStateConflict as exc:
+            sys.stderr.write(
+                f"agenttalk supervise --archive-launch-request: {exc}\n"
+            )
+            return 3
         return 0
 
     if args.launch_barrier:
@@ -12013,27 +12226,124 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --record-launch: need --for "
                              "<agent> and --state-file <path>\n")
             return 2
-        state = _read_state()
-        rl_cfg = _load_supervisor_config(store)
-        grace = rl_cfg.get("launch_grace_seconds")
-        grace = float(grace) if isinstance(grace, (int, float)) else None
-        cfg_agent = {}
-        if isinstance(rl_cfg.get("agents"), dict):
-            raw_cfg_agent = rl_cfg["agents"].get(args.agent)
-            cfg_agent = raw_cfg_agent if isinstance(raw_cfg_agent, dict) else {}
-        sup.record_launch(state, args.agent, cli=args.cli or "claude",
-                          pid=args.pid, pid_start=args.pid_start,
-                          now_epoch=(args.now if args.now is not None else time.time()),
-                          grace_seconds=grace, session_id=args.session_id,
-                          pre_snapshot=_read_snapshot_file(args.pre_snapshot_file),
-                          post_snapshot=_read_snapshot_file(args.post_snapshot_file),
-                          cfg_agent=cfg_agent,
-                          root_key=sup._root_key(str(store.root.resolve())),
-                          launcher_nonce=args.launcher_nonce,
-                          launcher_nonce_injected=bool(args.launcher_nonce_injected),
-                          launcher_nonce_source=args.launcher_nonce_source,
-                          launcher_nonce_missing_reason=args.launcher_nonce_missing_reason)
-        _write_state(state)
+        result_context = None
+        if args.launch_result_context:
+            encoded_context = args.launch_result_context
+            if encoded_context == "-":
+                encoded_context = sys.stdin.read().strip()
+            try:
+                result_context = sup.decode_supervisor_state_operation(
+                    encoded_context
+                )
+            except ValueError as exc:
+                sys.stderr.write(
+                    "agenttalk supervise --record-launch: invalid frozen "
+                    f"result context: {exc}\n"
+                )
+                return 2
+            raw_grace = result_context.get("grace_seconds")
+            cfg_agent = result_context.get("cfg_agent")
+            if (
+                result_context.get("schema_version") != 1
+                or (
+                    raw_grace is not None
+                    and (
+                        not isinstance(raw_grace, (int, float))
+                        or isinstance(raw_grace, bool)
+                    )
+                )
+                or not isinstance(cfg_agent, dict)
+            ):
+                sys.stderr.write(
+                    "agenttalk supervise --record-launch: frozen result "
+                    "context is invalid\n"
+                )
+                return 2
+            grace = float(raw_grace) if raw_grace is not None else None
+            frozen_cli = cfg_agent.get("cli")
+            if (
+                frozen_cli is not None
+                and frozen_cli != (args.cli or "claude")
+            ):
+                sys.stderr.write(
+                    "agenttalk supervise --record-launch: frozen result "
+                    "context CLI does not match --cli\n"
+                )
+                return 2
+        else:
+            if args.operation_id or args.operation_intent_digest:
+                sys.stderr.write(
+                    "agenttalk supervise --record-launch: checked action "
+                    "completion requires --launch-result-context\n"
+                )
+                return 2
+            rl_cfg = _load_supervisor_config(store)
+            raw_grace = rl_cfg.get("launch_grace_seconds")
+            grace = (
+                float(raw_grace)
+                if (
+                    isinstance(raw_grace, (int, float))
+                    and not isinstance(raw_grace, bool)
+                )
+                else None
+            )
+            cfg_agent = {}
+            if isinstance(rl_cfg.get("agents"), dict):
+                raw_cfg_agent = rl_cfg["agents"].get(args.agent)
+                cfg_agent = (
+                    raw_cfg_agent if isinstance(raw_cfg_agent, dict) else {}
+                )
+        result_payload = {
+            "cli": args.cli or "claude",
+            "pid": args.pid,
+            "pid_start": args.pid_start,
+            "now_epoch": args.now if args.now is not None else time.time(),
+            "grace_seconds": grace,
+            "session_id": args.session_id,
+            "pre_snapshot": _read_snapshot_file(args.pre_snapshot_file),
+            "post_snapshot": _read_snapshot_file(args.post_snapshot_file),
+            "cfg_agent": cfg_agent,
+            "root_key": sup._root_key(str(store.root.resolve())),
+            "launcher_nonce": args.launcher_nonce,
+            "launcher_nonce_injected": bool(args.launcher_nonce_injected),
+            "launcher_nonce_source": args.launcher_nonce_source,
+            "launcher_nonce_missing_reason": args.launcher_nonce_missing_reason,
+        }
+        operation = {
+            "kind": "record_launch",
+            "target_kind": "agent",
+            "target": args.agent,
+            "result": result_payload,
+        }
+        if args.operation_id or args.operation_intent_digest:
+            if not args.operation_id or not args.operation_intent_digest:
+                sys.stderr.write(
+                    "agenttalk supervise --record-launch: --operation-id and "
+                    "--operation-intent-digest must be supplied together\n"
+                )
+                return 2
+            operation = {
+                "kind": "complete_action",
+                "operation_id": args.operation_id,
+                "intent_digest": args.operation_intent_digest,
+                "action_kind": args.action_kind or "launch",
+                "target_kind": "agent",
+                "target": args.agent,
+                "result_context_digest": sup._supervisor_digest(
+                    result_context
+                ),
+                "result_kind": "record_launch",
+                "result": result_payload,
+                "result_digest": sup._supervisor_digest(result_payload),
+                "outcome": "completed",
+            }
+        try:
+            sup.apply_supervisor_state_operation(
+                store, Path(args.state_file), operation,
+            )
+        except sup.SupervisorStateConflict as exc:
+            sys.stderr.write(f"agenttalk supervise --record-launch: {exc}\n")
+            return 3
         return 0
     if args.clear_restart:
         if not args.agent or not args.request_id:
@@ -13866,6 +14176,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(script use) Apply launch-success state for --for: "
                            "Claude pins --session-id; Codex marks launched + no "
                            "pinned id. Needs --state-file.")
+    gsup.add_argument("--apply-state-operation", dest="apply_state_operation",
+                      action="store_true", help=argparse.SUPPRESS)
     gsup.add_argument("--prepare-launch-request", dest="prepare_launch_request",
                       action="store_true",
                       help="(script use) Claim an ephemeral launch request, roster "
@@ -13950,6 +14262,16 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(--drain-intents) maximum queued intents to claim in one tick.")
     psup.add_argument("--session-id", dest="session_id",
                       help="(--record-launch) the minted session id (Claude).")
+    psup.add_argument("--state-operation", dest="state_operation",
+                      help="Opaque checked supervisor-state operation token.")
+    psup.add_argument("--state-lock-timeout", dest="state_lock_timeout",
+                      type=float, default=10.0, help=argparse.SUPPRESS)
+    psup.add_argument("--operation-id", dest="operation_id", help=argparse.SUPPRESS)
+    psup.add_argument("--operation-intent-digest", dest="operation_intent_digest",
+                      help=argparse.SUPPRESS)
+    psup.add_argument("--action-kind", dest="action_kind", help=argparse.SUPPRESS)
+    psup.add_argument("--launch-result-context", dest="launch_result_context",
+                      help=argparse.SUPPRESS)
     psup.add_argument("--timeout-seconds", dest="timeout_seconds", type=int,
                       help="(--record-ephemeral-launch) ephemeral timeout.")
     psup.add_argument("--terminal-state", dest="terminal_state",

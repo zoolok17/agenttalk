@@ -28,6 +28,86 @@ from agenttalk.store import Store
 _SUCCESSFUL_CONFIG_LOCK_TIMEOUT = 5.0
 
 
+def _named_lock(store: Store, name: str):
+    locks = {
+        "lifecycle": store._supervisor_lifecycle_lock,
+        "powershell": store._powershell_selection_lock,
+        "operation": store._operation_publication_lock,
+        "retirement": store._retirement_lock,
+        "config": store._config_lock,
+        "message": store._message_publication_lock,
+        "state": store.supervisor_state_lock,
+    }
+    return locks[name](timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005)
+
+
+def test_named_store_locks_accept_the_declared_total_order(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha"])
+
+    with contextlib.ExitStack() as stack:
+        for name in (
+            "lifecycle", "powershell", "operation", "retirement",
+            "config", "message", "state",
+        ):
+            stack.enter_context(_named_lock(store, name))
+
+
+@pytest.mark.parametrize(
+    ("earlier", "later"),
+    [
+        ("lifecycle", "powershell"),
+        ("powershell", "operation"),
+        ("operation", "retirement"),
+        ("retirement", "config"),
+        ("config", "message"),
+        ("message", "state"),
+    ],
+)
+def test_named_store_locks_reject_each_adjacent_inversion(
+    tmp_path: Path,
+    earlier: str,
+    later: str,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha"])
+
+    with _named_lock(store, later):
+        with pytest.raises(store_mod.LockOrderViolation, match="increasing rank"):
+            with _named_lock(store, earlier):
+                pass
+
+
+def test_named_lock_order_is_shared_across_store_instances(tmp_path: Path) -> None:
+    first = Store(tmp_path)
+    first.init(["alpha"])
+    second = Store(tmp_path)
+
+    with first.supervisor_state_lock():
+        with pytest.raises(store_mod.LockOrderViolation, match="supervisor state lock"):
+            with second.supervisor_state_lock():
+                pass
+
+
+def test_lock_inversion_fails_before_filesystem_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha"])
+
+    with store._powershell_selection_lock():
+        @contextlib.contextmanager
+        def should_not_wait(*_args, **_kwargs):
+            raise AssertionError("filesystem lock was entered")
+            yield
+
+        monkeypatch.setattr(store, "_exclusive_lock", should_not_wait)
+        with pytest.raises(store_mod.LockOrderViolation):
+            with store._supervisor_lifecycle_lock():
+                pass
+
+
 def test_concurrent_threads_send_no_loss(tmp_path: Path) -> None:
     """N threads each sending in a tight loop: every send lands on its own
     file and is delivered exactly once (exercises the within-process lock)."""

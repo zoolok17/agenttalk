@@ -8,6 +8,7 @@ fixtures. The generated PS/bash scripts are thin executors (documented-manual).
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import os
@@ -46,6 +47,28 @@ def _team(tmp_path: Path, agents: str = "lead,worker") -> Store:
     s = Store(tmp_path)
     s.init(agents.split(","))
     return s
+
+
+def _commit_agent_state(
+    store: Store,
+    state_file: Path,
+    agent: str,
+    value: dict,
+) -> sup.CommitResult:
+    state = sup.load_supervisor_state(state_file)
+    return sup.apply_supervisor_state_operation(
+        store,
+        state_file,
+        {
+            "kind": "commit_agent_state",
+            "target_kind": "agent",
+            "target": agent,
+            "expected_target_digest": sup.supervisor_state_target_digest(
+                state, "agent", agent,
+            ),
+            "value": value,
+        },
+    )
 
 
 NOW = 1_000_000.0
@@ -576,6 +599,127 @@ def test_scenario_iii_manual_marker_relaunches_and_waits_for_readiness() -> None
     assert p["next_state"]["restart_request_state"] == "applied_pending_readiness"
 
 
+def test_action_reservation_and_executor_share_one_frozen_launch_spec() -> None:
+    config = copy.deepcopy(_CONFIG)
+    config["agents"]["worker"].update({
+        "backend_profile": "standard",
+        "cwd": r"D:\planned-cwd",
+        "env": {"PROFILE": "planned"},
+        "launch": {
+            "windows_file": r"D:\planned\agent.exe",
+            "windows_args": ["--root", "{ROOT}"],
+        },
+    })
+    plan = _plan(
+        _report(restart_request=_auth_marker("rr-frozen")),
+        {"agents": {"worker": _ready(backoff_next_epoch=0)}},
+        snapshot=_snap(),
+        config=config,
+    )
+    expected = {
+        "backend_profile": "standard",
+        "cwd": r"D:\planned-cwd",
+        "env": {"PROFILE": "planned"},
+        "launch": {
+            "windows_file": r"D:\planned\agent.exe",
+            "windows_args": ["--root", "{ROOT}"],
+        },
+    }
+    reservation = sup.decode_supervisor_state_operation(
+        plan["reserve_state_operation"],
+    )
+
+    assert plan["execution_spec"] == expected
+    assert reservation["allowed_result_kinds"] == ["record_launch"]
+    assert reservation["intent"]["execution_spec"] == expected
+    launch_body = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Launch($name, $plan, $codexHome)"):
+        sup.PS_TEMPLATE.index("function Launch-Spec")
+    ]
+    assert "$a = $plan.execution_spec" in launch_body
+    assert "$cfg.agents.$name" not in launch_body
+
+
+def test_record_launch_completion_uses_reserved_result_context_not_new_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _team(tmp_path)
+    config = {
+        **copy.deepcopy(_CONFIG),
+        "root": str(tmp_path),
+        "launch_grace_seconds": 75,
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "codex",
+                "brain_pattern": "planned-brain",
+            },
+        },
+    }
+    state = {"agents": {"worker": _ready(backoff_next_epoch=0)}}
+    plan = sup.plan_actions(
+        _report(restart_request=_auth_marker("rr-context")),
+        copy.deepcopy(state),
+        config,
+        now_epoch=NOW,
+        snapshot=_snap(),
+    )["agents"]["worker"]
+    state_file = store.dir / "supervisor-state.json"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    reserve = sup.decode_supervisor_state_operation(
+        plan["reserve_state_operation"],
+    )
+    assert sup.apply_supervisor_state_operation(
+        store, state_file, reserve,
+    ).may_execute is True
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({
+            "launch_grace_seconds": 999,
+            "agents": {
+                "worker": {
+                    "auto_restart": True,
+                    "cli": "claude",
+                    "brain_pattern": "new-brain",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(plan["launch_result_context"] + "\n"),
+    )
+
+    assert _run([
+        "supervise",
+        "--record-launch",
+        "--for",
+        "worker",
+        "--cli",
+        "codex",
+        "--pid",
+        "777",
+        "--state-file",
+        str(state_file),
+        "--now",
+        str(NOW),
+        "--operation-id",
+        plan["operation_id"],
+        "--operation-intent-digest",
+        plan["operation_intent_digest"],
+        "--action-kind",
+        plan["action"],
+        "--launch-result-context",
+        "-",
+    ], tmp_path) == 0
+
+    persisted = sup.load_supervisor_state(state_file)
+    assert persisted["agents"]["worker"]["launch_grace_until"] == NOW + 75
+    assert persisted["operations"][plan["operation_id"]]["phase"] == "completed"
+
+
 def test_scenario_iv_protected_stale_heartbeat_is_warn_only() -> None:
     p = _plan(_report(protected=True, heartbeat_stale=True),
               {"agents": {"worker": _ready()}}, snapshot=[],
@@ -992,7 +1136,91 @@ def test_supervisor_report_surfaces_kill_switch_and_mutations_refuse(
     assert report["kill_switch_active"] is True
 
 
-def test_ps_template_kill_switch_guards_mutating_boundaries() -> None:
+def test_kill_switch_blocks_generic_supervisor_state_operation(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
+    token = sup.encode_supervisor_state_operation({
+        "kind": "commit_agent_state",
+        "target_kind": "agent",
+        "target": "worker",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            {"agents": {}}, "agent", "worker",
+        ),
+        "value": {"pid": 123},
+    })
+    (store.dir / "supervisor.kill").write_text("hold", encoding="utf-8")
+
+    assert _run([
+        "supervise",
+        "--apply-state-operation",
+        "--state-file",
+        str(state_file),
+        "--state-operation",
+        token,
+    ], tmp_path) == 3
+    assert not state_file.exists()
+
+
+def test_supervisor_state_operation_accepts_token_on_stdin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
+    token = sup.encode_supervisor_state_operation({
+        "kind": "commit_agent_state",
+        "target_kind": "agent",
+        "target": "worker",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            {"agents": {}}, "agent", "worker",
+        ),
+        "value": {"pid": 123},
+    })
+    monkeypatch.setattr(sys, "stdin", io.StringIO(token + "\n"))
+
+    assert _run([
+        "supervise",
+        "--apply-state-operation",
+        "--state-file",
+        str(state_file),
+        "--state-operation",
+        "-",
+    ], tmp_path) == 0
+    assert sup.load_supervisor_state(state_file)["agents"]["worker"]["pid"] == 123
+
+
+@pytest.mark.parametrize("timeout", ["nan", "inf", "-inf", "0", "-1"])
+def test_supervisor_state_operation_rejects_invalid_lock_timeout(
+    tmp_path: Path,
+    timeout: str,
+) -> None:
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
+    token = sup.encode_supervisor_state_operation({
+        "kind": "commit_agent_state",
+        "target_kind": "agent",
+        "target": "worker",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            {"agents": {}}, "agent", "worker",
+        ),
+        "value": {"pid": 123},
+    })
+
+    assert _run([
+        "supervise",
+        "--apply-state-operation",
+        "--state-file",
+        str(state_file),
+        "--state-operation",
+        token,
+        f"--state-lock-timeout={timeout}",
+    ], tmp_path) == 3
+    assert not state_file.exists()
+
+
+def test_ps_template_routes_state_mutations_to_the_checked_python_owner() -> None:
     ps = sup.PS_TEMPLATE
     assert "$KillSwitchPath" in ps
     assert "function Sync-KillSwitchObservation" in ps
@@ -1000,22 +1228,32 @@ def test_ps_template_kill_switch_guards_mutating_boundaries() -> None:
     assert "Scheduled Task hosting retries it" in ps
     assert "function Actions-Enabled" in ps
     assert "function Assert-ActionsEnabled" in ps
-    assert "function Save-State($state)" in ps
-    assert "if (-not (Actions-Enabled)) { return }" in ps
     assert "Get-ProcSnapshot $SnapPath" in ps
     assert "if (Actions-Enabled)" in ps
     assert "Assert-ActionsEnabled (\"agent {0} {1}\"" in ps
     assert "Assert-ActionsEnabled (\"launch-request {0} {1}\"" in ps
     assert "Assert-ActionsEnabled (\"ephemeral {0} {1}\"" in ps
+    assert "'--apply-state-operation'" in ps
+    assert "Reserve-StateOperation" in ps
+    for forbidden in (
+        "$StateBackupPath",
+        "Write-StateFileAtomic",
+        "Save-StateForPoll",
+        "function Save-State",
+        "Set-AgentState",
+        "Read-StateFile",
+        "Load-State",
+    ):
+        assert forbidden not in ps
     assert "supervisor.kill" in ps
 
 
 def test_python_supervisor_state_recovers_only_from_validated_backup(tmp_path: Path) -> None:
-    path = tmp_path / "supervisor-state.json"
-    first = {"agents": {"worker": {"pid": 101}}}
-    second = {"agents": {"worker": {"pid": 202}}}
-    sup.save_supervisor_state(path, first)
-    sup.save_supervisor_state(path, second)
+    store = _team(tmp_path)
+    path = store.dir / "supervisor-state.json"
+    _commit_agent_state(store, path, "worker", {"pid": 101})
+    first = sup.load_supervisor_state(path)
+    _commit_agent_state(store, path, "worker", {"pid": 202})
 
     path.write_text('{"agents":', encoding="utf-8")
     assert sup.load_supervisor_state(path) == first
@@ -1028,10 +1266,10 @@ def test_python_supervisor_state_recovers_only_from_validated_backup(tmp_path: P
 def test_python_supervisor_state_interrupted_replace_preserves_primary(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    path = tmp_path / "supervisor-state.json"
-    first = {"agents": {"worker": {"pid": 101}}}
-    second = {"agents": {"worker": {"pid": 202}}}
-    sup.save_supervisor_state(path, first)
+    store = _team(tmp_path)
+    path = store.dir / "supervisor-state.json"
+    _commit_agent_state(store, path, "worker", {"pid": 101})
+    first = sup.load_supervisor_state(path)
     real_replace = sup.os.replace
 
     def fail_primary_replace(src, dst) -> None:
@@ -1041,7 +1279,7 @@ def test_python_supervisor_state_interrupted_replace_preserves_primary(
 
     monkeypatch.setattr(sup.os, "replace", fail_primary_replace)
     with pytest.raises(OSError, match="injected primary replace failure"):
-        sup.save_supervisor_state(path, second)
+        _commit_agent_state(store, path, "worker", {"pid": 202})
 
     assert sup.load_supervisor_state(path) == first
 
@@ -1195,6 +1433,808 @@ def test_supervise_record_launch_creates_missing_state_with_atomic_codec(
     assert state["agents"]["worker"]["launcher_pid"] == 777
 
 
+def test_concurrent_record_launch_preserves_both_agent_updates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _team(tmp_path, "lead,alpha,beta")
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({
+            "agents": {
+                "alpha": {"auto_restart": True, "cli": "codex"},
+                "beta": {"auto_restart": True, "cli": "codex"},
+            },
+        }),
+        encoding="utf-8",
+    )
+    state_file = store.dir / "supervisor-state.json"
+    both_read_generation = threading.Barrier(2, timeout=5)
+    real_load_config = cli._load_supervisor_config
+
+    def release_after_unlocked_state_read(current_store: Store) -> dict:
+        both_read_generation.wait()
+        return real_load_config(current_store)
+
+    monkeypatch.setattr(cli, "_load_supervisor_config", release_after_unlocked_state_read)
+    results: dict[str, int] = {}
+
+    def record(agent: str, pid: int) -> None:
+        results[agent] = _run([
+            "supervise", "--record-launch", "--for", agent, "--cli", "codex",
+            "--pid", str(pid), "--state-file", str(state_file), "--now", str(NOW),
+        ], tmp_path)
+
+    workers = [
+        threading.Thread(target=record, args=("alpha", 701), daemon=True),
+        threading.Thread(target=record, args=("beta", 702), daemon=True),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert all(not worker.is_alive() for worker in workers), "concurrent writers hung"
+    assert results == {"alpha": 0, "beta": 0}
+    state = sup.load_supervisor_state(state_file)
+    assert state["agents"]["alpha"]["launcher_pid"] == 701
+    assert state["agents"]["beta"]["launcher_pid"] == 702
+
+
+def test_supervisor_state_lock_serializes_spawned_processes(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path, "lead,alpha,beta")
+    state_file = store.dir / "supervisor-state.json"
+    ready = tmp_path / "state-lock-ready"
+    release = tmp_path / "state-lock-release"
+    helper = tmp_path / "state-lock-worker.py"
+    helper.write_text(
+        "\n".join([
+            "from pathlib import Path",
+            "import sys",
+            "import time",
+            "from agenttalk import supervisor as sup",
+            "from agenttalk.store import Store",
+            "root = Path(sys.argv[1])",
+            "mode = sys.argv[2]",
+            "store = Store(root)",
+            "state_file = store.dir / 'supervisor-state.json'",
+            "ready = root / 'state-lock-ready'",
+            "release = root / 'state-lock-release'",
+            "def commit(agent, pid):",
+            "    state = sup.load_supervisor_state(state_file)",
+            "    sup.apply_supervisor_state_operation(store, state_file, {",
+            "        'kind': 'commit_agent_state',",
+            "        'target_kind': 'agent',",
+            "        'target': agent,",
+            "        'expected_target_digest': sup.supervisor_state_target_digest(",
+            "            state, 'agent', agent),",
+            "        'value': {'pid': pid},",
+            "    })",
+            "if mode == 'holder':",
+            "    with store.supervisor_state_lock():",
+            "        ready.write_text('ready', encoding='utf-8')",
+            "        deadline = time.monotonic() + 10",
+            "        while not release.exists():",
+            "            if time.monotonic() >= deadline:",
+            "                raise TimeoutError('release signal did not arrive')",
+            "            time.sleep(0.01)",
+            "    commit('alpha', 701)",
+            "elif mode == 'timeout':",
+            "    try:",
+            "        with store.supervisor_state_lock(timeout=0.1, poll=0.01):",
+            "            raise AssertionError('contended lock was acquired')",
+            "    except TimeoutError:",
+            "        print('timed-out')",
+            "elif mode == 'commit':",
+            "    commit('beta', 702)",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    env = _checkout_runtime_env()
+    holder = subprocess.Popen(
+        [sys.executable, str(helper), str(tmp_path), "holder"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and holder.poll() is None:
+        if time.monotonic() >= deadline:
+            pytest.fail("spawned lock holder did not become ready")
+        time.sleep(0.01)
+    assert ready.read_text(encoding="utf-8") == "ready"
+
+    blocked = subprocess.run(
+        [sys.executable, str(helper), str(tmp_path), "timeout"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    assert blocked.returncode == 0, blocked.stderr
+    assert blocked.stdout.strip() == "timed-out"
+
+    release.write_text("release", encoding="utf-8")
+    concurrent = subprocess.Popen(
+        [sys.executable, str(helper), str(tmp_path), "commit"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    holder_out, holder_err = holder.communicate(timeout=15)
+    concurrent_out, concurrent_err = concurrent.communicate(timeout=15)
+    assert holder.returncode == 0, f"{holder_out}{holder_err}"
+    assert concurrent.returncode == 0, f"{concurrent_out}{concurrent_err}"
+    state = sup.load_supervisor_state(state_file)
+    assert state["agents"]["alpha"]["pid"] == 701
+    assert state["agents"]["beta"]["pid"] == 702
+
+
+@pytest.mark.parametrize(
+    ("action_kind", "result_kind", "result"),
+    [
+        ("kill", "delete_target", {"reason": "process tree stopped"}),
+        (
+            "launch",
+            "record_launch",
+            {"cli": "codex", "pid": 703, "now_epoch": NOW},
+        ),
+    ],
+)
+def test_action_operation_conflicts_never_replay_an_already_taken_action(
+    tmp_path: Path,
+    action_kind: str,
+    result_kind: str,
+    result: dict,
+) -> None:
+    store = _team(tmp_path, "lead,target,other,stale,superseded")
+    state_file = store.dir / "supervisor-state.json"
+    _commit_agent_state(store, state_file, "target", {"stable": "before"})
+    before_stale = sup.load_supervisor_state(state_file)
+    stale_intent = {"action_kind": action_kind}
+    stale_operation = {
+        "kind": "reserve_action",
+        "operation_id": "0" * 32,
+        "intent_digest": sup._expected_operation_intent_digest(
+            operation_id="0" * 32,
+            target_kind="agent",
+            target="stale",
+            action_kind=action_kind,
+            allowed_result_kinds=[result_kind],
+            intent=stale_intent,
+        ),
+        "action_kind": action_kind,
+        "allowed_result_kinds": [result_kind],
+        "target_kind": "agent",
+        "target": "stale",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            before_stale, "agent", "stale",
+        ),
+        "planned_state": {"stable": "attempting"},
+        "intent": stale_intent,
+    }
+    _commit_agent_state(store, state_file, "stale", {"changed": True})
+    with pytest.raises(sup.SupervisorStateConflict, match="changed before commit"):
+        sup.apply_supervisor_state_operation(
+            store, state_file, stale_operation,
+        )
+
+    state = sup.load_supervisor_state(state_file)
+    operation_id = ("1" if action_kind == "kill" else "2") * 32
+    intent = {"action_kind": action_kind}
+    intent_digest = sup._expected_operation_intent_digest(
+        operation_id=operation_id,
+        target_kind="agent",
+        target="target",
+        action_kind=action_kind,
+        allowed_result_kinds=[result_kind],
+        intent=intent,
+    )
+    reservation = {
+        "kind": "reserve_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": action_kind,
+        "allowed_result_kinds": [result_kind],
+        "target_kind": "agent",
+        "target": "target",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            state, "agent", "target",
+        ),
+        "planned_state": {"stable": "planned"},
+        "intent": intent,
+    }
+
+    action_count = 0
+    first = sup.apply_supervisor_state_operation(store, state_file, reservation)
+    if first.may_execute:
+        action_count += 1
+    duplicate = sup.apply_supervisor_state_operation(store, state_file, reservation)
+    if duplicate.may_execute:
+        action_count += 1
+    assert action_count == 1
+    assert duplicate.may_execute is False
+
+    with pytest.raises(
+        sup.SupervisorStateConflict,
+        match="requires its reserved result",
+    ):
+        sup.apply_supervisor_state_operation(
+            store,
+            state_file,
+            {
+                "kind": "record_launch",
+                "target_kind": "agent",
+                "target": "target",
+                "result": {
+                    "cli": "codex",
+                    "pid": 999,
+                    "now_epoch": NOW,
+                },
+            },
+        )
+
+    _commit_agent_state(store, state_file, "other", {"contribution": "survives"})
+    completion = {
+        "kind": "complete_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": action_kind,
+        "target_kind": "agent",
+        "target": "target",
+        "result_kind": result_kind,
+        "result": result,
+        "result_digest": sup._supervisor_digest(result),
+        "outcome": "completed",
+    }
+    committed = sup.apply_supervisor_state_operation(
+        store, state_file, completion,
+    )
+    repeated = sup.apply_supervisor_state_operation(
+        store, state_file, completion,
+    )
+    assert committed.changed is True
+    assert repeated.changed is False
+    state = sup.load_supervisor_state(state_file)
+    if action_kind == "launch":
+        assert state["agents"]["target"]["stable"] == "planned"
+        assert state["agents"]["target"]["launcher_pid"] == 703
+    else:
+        assert "target" not in state["agents"]
+    assert state["agents"]["other"] == {"contribution": "survives"}
+
+    stale_state = sup.load_supervisor_state(state_file)
+    superseded_operation_id = "3" * 32
+    superseded_intent_digest = sup._expected_operation_intent_digest(
+        operation_id=superseded_operation_id,
+        target_kind="agent",
+        target="superseded",
+        action_kind=action_kind,
+        allowed_result_kinds=[result_kind],
+        intent=intent,
+    )
+    stale_reservation = {
+        **reservation,
+        "operation_id": superseded_operation_id,
+        "intent_digest": superseded_intent_digest,
+        "target": "superseded",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            stale_state, "agent", "superseded",
+        ),
+        "planned_state": {"stable": "attempting"},
+    }
+    assert sup.apply_supervisor_state_operation(
+        store, state_file, stale_reservation,
+    ).may_execute is True
+    action_count += 1
+    wrong_result = {
+        **completion,
+        "operation_id": "4" * 32,
+        "target": "superseded",
+    }
+    before_conflict = copy.deepcopy(
+        sup.load_supervisor_state(state_file)["agents"]["superseded"]
+    )
+    with pytest.raises(sup.SupervisorActionHold, match="superseded"):
+        sup.apply_supervisor_state_operation(
+            store, state_file, wrong_result,
+        )
+    after = sup.load_supervisor_state(state_file)
+    assert after["agents"]["superseded"] == before_conflict
+    assert after["operations"][superseded_operation_id]["phase"] == "result_conflict"
+    assert after["operations"][superseded_operation_id]["outcome"] == "outcome_unknown"
+    assert after["operation_holds"]["agent:superseded"]["outcome"] == "outcome_unknown"
+    assert action_count == 2
+
+
+@pytest.mark.parametrize(
+    (
+        "action_kind",
+        "allowed_result_kind",
+        "attempted_result_kind",
+        "attempted_result",
+    ),
+    [
+        (
+            "launch",
+            "record_launch",
+            "delete_target",
+            {"reason": "wrongly reported as stopped"},
+        ),
+        (
+            "kill",
+            "delete_target",
+            "record_launch",
+            {"cli": "codex", "pid": 704, "now_epoch": NOW},
+        ),
+    ],
+)
+def test_action_completion_rejects_result_kind_outside_reserved_contract(
+    tmp_path: Path,
+    action_kind: str,
+    allowed_result_kind: str,
+    attempted_result_kind: str,
+    attempted_result: dict,
+) -> None:
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
+    _commit_agent_state(store, state_file, "worker", {"stable": "before"})
+    state = sup.load_supervisor_state(state_file)
+    operation_id = ("5" if action_kind == "launch" else "6") * 32
+    intent = {"action_kind": action_kind}
+    intent_digest = sup._expected_operation_intent_digest(
+        operation_id=operation_id,
+        target_kind="agent",
+        target="worker",
+        action_kind=action_kind,
+        allowed_result_kinds=[allowed_result_kind],
+        intent=intent,
+    )
+    reservation = {
+        "kind": "reserve_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": action_kind,
+        "allowed_result_kinds": [allowed_result_kind],
+        "target_kind": "agent",
+        "target": "worker",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            state, "agent", "worker",
+        ),
+        "planned_state": {"stable": "planned"},
+        "intent": intent,
+    }
+    assert sup.apply_supervisor_state_operation(
+        store, state_file, reservation,
+    ).may_execute is True
+
+    with pytest.raises(sup.SupervisorActionHold, match="outcome-unknown"):
+        sup.apply_supervisor_state_operation(
+            store,
+            state_file,
+            {
+                "kind": "complete_action",
+                "operation_id": operation_id,
+                "intent_digest": intent_digest,
+                "action_kind": action_kind,
+                "target_kind": "agent",
+                "target": "worker",
+                "result_kind": attempted_result_kind,
+                "result": attempted_result,
+                "result_digest": sup._supervisor_digest(attempted_result),
+                "outcome": "completed",
+            },
+        )
+
+    durable = sup.load_supervisor_state(state_file)
+    assert durable["agents"]["worker"] == {
+        "stable": "planned",
+        "pending_operation": operation_id,
+    }
+    assert durable["operations"][operation_id]["phase"] == "result_conflict"
+    assert durable["operations"][operation_id]["outcome"] == "outcome_unknown"
+    assert durable["operation_holds"]["agent:worker"]["outcome"] == "outcome_unknown"
+
+
+def test_state_operation_protocol_rejects_unbound_digests_and_stale_ownership(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
+    _commit_agent_state(store, state_file, "worker", {"stable": "before"})
+    state = sup.load_supervisor_state(state_file)
+    operation_id = "a" * 32
+    intent = {"action_kind": "launch", "launcher_nonce": "nonce"}
+    intent_digest = sup._expected_operation_intent_digest(
+        operation_id=operation_id,
+        target_kind="agent",
+        target="worker",
+        action_kind="launch",
+        allowed_result_kinds=["replace_target"],
+        intent=intent,
+    )
+    reservation = {
+        "kind": "reserve_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": "launch",
+        "allowed_result_kinds": ["replace_target"],
+        "target_kind": "agent",
+        "target": "worker",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            state, "agent", "worker",
+        ),
+        "planned_state": {"stable": "planned"},
+        "intent": intent,
+    }
+
+    with pytest.raises(ValueError, match="intent does not match"):
+        sup.apply_supervisor_state_operation(
+            store,
+            state_file,
+            {**reservation, "intent_digest": "b" * 64},
+        )
+    with pytest.raises(ValueError, match="intent does not match"):
+        sup.apply_supervisor_state_operation(
+            store,
+            state_file,
+            {**reservation, "allowed_result_kinds": ["delete_target"]},
+        )
+    assert sup.apply_supervisor_state_operation(
+        store, state_file, reservation,
+    ).may_execute is True
+
+    result = {"value": {"action_result": "launch"}}
+    completion = {
+        "kind": "complete_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": "launch",
+        "target_kind": "agent",
+        "target": "worker",
+        "result_kind": "replace_target",
+        "result": result,
+        "result_digest": "c" * 64,
+        "outcome": "completed",
+    }
+    with pytest.raises(ValueError, match="result does not match"):
+        sup.apply_supervisor_state_operation(store, state_file, completion)
+    after_bad_result = sup.load_supervisor_state(state_file)
+    assert after_bad_result["agents"]["worker"]["pending_operation"] == operation_id
+    assert after_bad_result["agents"]["worker"]["stable"] == "planned"
+
+    inconsistent = copy.deepcopy(after_bad_result)
+    inconsistent["agents"]["worker"].pop("pending_operation")
+    state_file.write_text(json.dumps(inconsistent), encoding="utf-8")
+    hold_plan = sup._action_hold_plan(inconsistent, "agent", "worker")
+    assert hold_plan is not None
+    assert hold_plan["state"] == "ACTION_OUTCOME_UNKNOWN"
+    with pytest.raises(
+        sup.SupervisorStateConflict,
+        match="no longer owns its target",
+    ):
+        sup.apply_supervisor_state_operation(
+            store,
+            state_file,
+            {
+                "kind": "update_reserved_target",
+                "operation_id": operation_id,
+                "intent_digest": intent_digest,
+                "action_kind": "launch",
+                "target_kind": "agent",
+                "target": "worker",
+                "value": {"stable": "updated"},
+            },
+        )
+    assert sup.load_supervisor_state(state_file)["agents"]["worker"] == {
+        "stable": "planned",
+    }
+    new_operation_id = "d" * 32
+    new_intent_digest = sup._expected_operation_intent_digest(
+        operation_id=new_operation_id,
+        target_kind="agent",
+        target="worker",
+        action_kind="launch",
+        allowed_result_kinds=["replace_target"],
+        intent=intent,
+    )
+    current = sup.load_supervisor_state(state_file)
+    with pytest.raises(
+        sup.SupervisorStateConflict,
+        match="unresolved operation",
+    ):
+        sup.apply_supervisor_state_operation(
+            store,
+            state_file,
+            {
+                **reservation,
+                "operation_id": new_operation_id,
+                "intent_digest": new_intent_digest,
+                "expected_target_digest": sup.supervisor_state_target_digest(
+                    current, "agent", "worker",
+                ),
+            },
+        )
+
+
+def test_completed_action_replay_is_bound_to_original_target_and_result_kind(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path, "lead,alpha,beta")
+    state_file = store.dir / "supervisor-state.json"
+    _commit_agent_state(store, state_file, "alpha", {"stable": "alpha"})
+    _commit_agent_state(store, state_file, "beta", {"stable": "beta"})
+    state = sup.load_supervisor_state(state_file)
+    operation_id = "e" * 32
+    intent = {"action_kind": "launch"}
+    intent_digest = sup._expected_operation_intent_digest(
+        operation_id=operation_id,
+        target_kind="agent",
+        target="alpha",
+        action_kind="launch",
+        allowed_result_kinds=["replace_target"],
+        intent=intent,
+    )
+    reservation = {
+        "kind": "reserve_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": "launch",
+        "allowed_result_kinds": ["replace_target"],
+        "target_kind": "agent",
+        "target": "alpha",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            state, "agent", "alpha",
+        ),
+        "planned_state": {"stable": "planned"},
+        "intent": intent,
+    }
+    assert sup.apply_supervisor_state_operation(
+        store, state_file, reservation,
+    ).may_execute is True
+    result = {"value": {"launch_result": "recorded"}}
+    completion = {
+        "kind": "complete_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": "launch",
+        "target_kind": "agent",
+        "target": "alpha",
+        "result_kind": "replace_target",
+        "result": result,
+        "result_digest": sup._supervisor_digest(result),
+        "outcome": "completed",
+    }
+    sup.apply_supervisor_state_operation(store, state_file, completion)
+    before = copy.deepcopy(sup.load_supervisor_state(state_file)["agents"])
+
+    with pytest.raises(sup.SupervisorActionHold, match="conflicts"):
+        sup.apply_supervisor_state_operation(
+            store,
+            state_file,
+            {
+                **completion,
+                "target": "beta",
+                "result_kind": "delete_target",
+            },
+        )
+
+    after = sup.load_supervisor_state(state_file)
+    assert after["agents"] == before
+    assert after["operations"][operation_id]["phase"] == "result_conflict"
+    assert after["operation_holds"]["agent:alpha"]["outcome"] == "outcome_unknown"
+
+
+def test_action_completion_is_fenced_to_reserved_state_instance(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
+    _commit_agent_state(store, state_file, "worker", {"stable": "before"})
+    state = sup.load_supervisor_state(state_file)
+    operation_id = "f" * 32
+    intent = {"action_kind": "launch"}
+    intent_digest = sup._expected_operation_intent_digest(
+        operation_id=operation_id,
+        target_kind="agent",
+        target="worker",
+        action_kind="launch",
+        allowed_result_kinds=["replace_target"],
+        intent=intent,
+    )
+    sup.apply_supervisor_state_operation(
+        store,
+        state_file,
+        {
+            "kind": "reserve_action",
+            "operation_id": operation_id,
+            "intent_digest": intent_digest,
+            "action_kind": "launch",
+            "allowed_result_kinds": ["replace_target"],
+            "target_kind": "agent",
+            "target": "worker",
+            "expected_target_digest": sup.supervisor_state_target_digest(
+                state, "agent", "worker",
+            ),
+            "planned_state": {"stable": "planned"},
+            "intent": intent,
+        },
+    )
+    replaced = sup.load_supervisor_state(state_file)
+    replaced["state_instance_id"] = "0" * 32
+    state_file.write_text(json.dumps(replaced), encoding="utf-8")
+    before = state_file.read_bytes()
+    result = {"value": {"launch_result": "recorded"}}
+
+    with pytest.raises(
+        sup.SupervisorStateConflict,
+        match="another state instance",
+    ):
+        sup.apply_supervisor_state_operation(
+            store,
+            state_file,
+            {
+                "kind": "complete_action",
+                "operation_id": operation_id,
+                "intent_digest": intent_digest,
+                "action_kind": "launch",
+                "target_kind": "agent",
+                "target": "worker",
+                "result_kind": "replace_target",
+                "result": result,
+                "result_digest": sup._supervisor_digest(result),
+                "outcome": "completed",
+            },
+        )
+
+    assert state_file.read_bytes() == before
+
+
+def test_action_reservation_survives_primary_corruption_without_replay(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
+    _commit_agent_state(store, state_file, "worker", {"stable": "before"})
+    state = sup.load_supervisor_state(state_file)
+    operation_id = "9" * 32
+    intent = {"action_kind": "launch"}
+    intent_digest = sup._expected_operation_intent_digest(
+        operation_id=operation_id,
+        target_kind="agent",
+        target="worker",
+        action_kind="launch",
+        allowed_result_kinds=["record_launch"],
+        intent=intent,
+    )
+    reservation = {
+        "kind": "reserve_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": "launch",
+        "allowed_result_kinds": ["record_launch"],
+        "target_kind": "agent",
+        "target": "worker",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            state, "agent", "worker",
+        ),
+        "planned_state": {"stable": "planned"},
+        "intent": intent,
+    }
+
+    first = sup.apply_supervisor_state_operation(
+        store, state_file, reservation,
+    )
+    assert first.may_execute is True
+    backup = sup.supervisor_state_backup_path(state_file)
+    backup_state = json.loads(backup.read_text(encoding="utf-8"))
+    assert backup_state["operations"][operation_id]["phase"] == "attempting"
+    assert (
+        backup_state["agents"]["worker"]["pending_operation"]
+        == operation_id
+    )
+
+    state_file.write_text('{"agents":', encoding="utf-8")
+    recovered = sup.load_supervisor_state(state_file)
+    assert recovered["operations"][operation_id]["phase"] == "attempting"
+    repeated = sup.apply_supervisor_state_operation(
+        store, state_file, reservation,
+    )
+    assert repeated.changed is False
+    assert repeated.may_execute is False
+
+
+def test_state_operation_owner_rejects_noncanonical_ledger_path(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    other_path = store.dir / "other-state.json"
+
+    with pytest.raises(ValueError, match="canonical supervisor-state.json"):
+        sup.apply_supervisor_state_operation(
+            store,
+            other_path,
+            {
+                "kind": "commit_agent_state",
+                "target_kind": "agent",
+                "target": "worker",
+                "expected_target_digest": sup.supervisor_state_target_digest(
+                    {"agents": {}}, "agent", "worker",
+                ),
+                "value": {"pid": 1},
+            },
+        )
+
+    assert not other_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("invalid_field", "invalid_value", "message"),
+    [
+        ("schema_version", 999, "schema_version is unsupported"),
+        ("schema_version", None, "schema_version is unsupported"),
+        ("schema_version", 2.0, "schema_version is unsupported"),
+        ("schema_version", True, "schema_version is unsupported"),
+        ("state_instance_id", None, "state_instance_id must be"),
+        ("generation", None, "generation must be"),
+        ("operations", None, "operations must be a JSON object"),
+        (
+            "operations",
+            {
+                "a" * 32: {
+                    "operation_id": "a" * 32,
+                    "state_instance_id": "1" * 32,
+                    "target_kind": "agent",
+                    "target": "worker",
+                    "action_kind": "launch",
+                    "allowed_result_kinds": ["record_launch"],
+                    "intent_digest": "b" * 64,
+                    "intent": {},
+                    "phase": "atempting",
+                },
+            },
+            "phase is invalid",
+        ),
+        (
+            "operation_holds",
+            {
+                "agent:worker": {
+                    "operation_id": "a" * 32,
+                    "action_kind": "launch",
+                    "outcome": "outcome_unknown",
+                    "reason": "unknown",
+                },
+            },
+            "has no matching operation record",
+        ),
+    ],
+)
+def test_state_operation_rejects_invalid_metadata_without_rewriting(
+    tmp_path: Path,
+    invalid_field: str,
+    invalid_value: object,
+    message: str,
+) -> None:
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
+    state_file.write_text(
+        json.dumps({"agents": {}, invalid_field: invalid_value}),
+        encoding="utf-8",
+    )
+    before = state_file.read_bytes()
+
+    with pytest.raises(
+        sup.SupervisorPersistenceError,
+        match=message,
+    ):
+        _commit_agent_state(store, state_file, "worker", {"pid": 1})
+
+    assert state_file.read_bytes() == before
+
+
 def test_record_launch_authoritatively_persists_launch_clock_and_grace(
     tmp_path: Path,
 ) -> None:
@@ -1229,7 +2269,8 @@ def test_supervisor_state_writer_retries_retryable_windows_replace_error(
     monkeypatch: pytest.MonkeyPatch,
     winerror: int,
 ) -> None:
-    state_file = tmp_path / "supervisor-state.json"
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
     real_replace = os.replace
     attempts = 0
 
@@ -1244,10 +2285,7 @@ def test_supervisor_state_writer_retries_retryable_windows_replace_error(
 
     monkeypatch.setattr(sup.os, "replace", contended_replace)
 
-    sup.save_supervisor_state(
-        state_file,
-        {"agents": {"worker": {"launcher_pid": 777}}},
-    )
+    _commit_agent_state(store, state_file, "worker", {"launcher_pid": 777})
 
     assert attempts == 3
     assert sup.load_supervisor_state(state_file)["agents"]["worker"]["launcher_pid"] == 777
@@ -1257,6 +2295,7 @@ def test_supervisor_state_writer_does_not_retry_permanent_io_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    store = _team(tmp_path)
     attempts = 0
 
     def disk_full_replace(source: str, destination: str) -> None:
@@ -1267,59 +2306,66 @@ def test_supervisor_state_writer_does_not_retry_permanent_io_error(
     monkeypatch.setattr(sup.os, "replace", disk_full_replace)
 
     with pytest.raises(OSError, match="disk full"):
-        sup.save_supervisor_state(
-            tmp_path / "supervisor-state.json",
-            {"agents": {"worker": {}}},
+        _commit_agent_state(
+            store, store.dir / "supervisor-state.json", "worker", {},
         )
 
     assert attempts == 1
 
 
-def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
+def test_ps_has_no_independent_supervisor_state_persistence_channel() -> None:
     ps = sup.PS_TEMPLATE
-    block = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
+    state_path_lines = [
+        line.strip() for line in ps.splitlines() if "$StatePath" in line
+    ]
+    assert state_path_lines[0] == (
+        "$StatePath  = Join-Path $PSScriptRoot 'supervisor-state.json'   "
+        "# Python-owned ledger"
+    )
+    assert len(state_path_lines) == 12
+    assert all("--state-file" in line for line in state_path_lines[1:])
     mutations = ps[
         ps.index("# region checked-mutations"):
         ps.index("# endregion checked-mutations")
     ]
     poll_loop = ps[ps.index("$pollNum = 0\n:supervisorPoll do {"):ps.index("} while (-not $Once)")]
-    assert "$StateBackupPath" in ps
-    assert "[System.IO.FileStream]" in block
-    assert ".Flush($true)" in block
-    assert "[System.IO.File]::Replace" in block
-    assert "[System.IO.File]::Move" in block
-    assert "function Invoke-StateFileSwapWithRetry" in block
-    assert "Test-IsRetryableStateWriteException $_.Exception" in block
-    assert "for ($attempt = 1; $attempt -le 8; $attempt++)" in block
-    assert "$delayMs = [Math]::Min(250, $delayMs * 2)" in block
-    assert "function Save-StateForPoll" in block
-    assert "state write failed this poll; will retry next poll" in block
-    assert poll_loop.count("Save-StateForPoll $state") == 3
-    assert poll_loop.count("if (-not (Save-StateForPoll $state))") == 3
-    assert poll_loop.count("continue supervisorPoll") >= 3
-    reserve = "Set-AgentState $state $name $p.next_state\n          if (-not (Save-StateForPoll $state))"
+    for forbidden in (
+        "$StateBackupPath",
+        "Write-StateFileAtomic",
+        "Save-StateForPoll",
+        "function Save-State",
+        "Set-AgentState",
+        "Read-StateFile",
+        "Load-State",
+        "[System.IO.File]::Replace",
+        "[System.IO.File]::Move",
+    ):
+        assert forbidden not in ps
     launch_index = poll_loop.index("$res = Launch $name $p $homeEnv")
     record_index = poll_loop.index("$recordArgs = @('--root', $Root, 'supervise', '--record-launch'")
-    assert reserve in poll_loop
-    assert poll_loop.index(reserve) < launch_index
-    assert "Save-StateForPoll $state" not in poll_loop[launch_index:record_index]
+    reserve_index = poll_loop.index("Reserve-StateOperation (\"reserve-action {0}\"")
+    assert reserve_index < poll_loop.index("Stop-Tree $p.kill_targets") < launch_index
+    assert launch_index < record_index
     assert "$LASTEXITCODE" in mutations
+    assert "function Invoke-CheckedStateOperation" in mutations
+    assert "function Reserve-StateOperation" in mutations
+    assert "'--state-operation', '-'" in mutations
+    assert "$token | & $AgenttalkCmd @arguments" in mutations
+    assert "'--state-operation', $token" not in mutations
     assert poll_loop.count(
-        'Invoke-CheckedSupervisorMutation ("record-launch {0}"'
+        'Invoke-CheckedSupervisorMutationInput ("record-launch {0}"'
     ) == 1
     assert poll_loop.count(
         'Invoke-CheckedSupervisorMutation ("record-ephemeral-launch {0}"'
     ) == 1
     assert poll_loop.count(
         'Invoke-CheckedSupervisorMutation ("archive-launch-request {0}"'
-    ) == 4
+    ) == 3
     assert "& $AgenttalkCmd --root $Root supervise --record-launch" not in poll_loop
     assert "& $AgenttalkCmd --root $Root supervise --record-ephemeral-launch" not in poll_loop
     assert "& $AgenttalkCmd --root $Root supervise --archive-launch-request" not in poll_loop
-    assert "Save-State $state" not in poll_loop
-    assert "function Test-StateObject" in block
-    assert "throw" in block
-    assert "Set-Content $StatePath" not in ps
+    assert "'--operation-id', $p.operation_id" in poll_loop
+    assert "'--operation-id', $prep.operation_id" in poll_loop
 
 
 def test_supervisor_hosting_doc_covers_degraded_mode_and_services() -> None:
@@ -1978,8 +3024,8 @@ def test_record_launch_codex_marks_launched_no_fake_id(tmp_path: Path) -> None:
     --record-launch command) — Codex gets launched=true + NO pinned id; Claude
     pins the minted id. Tested through the real command, not a hand-injected
     planner input."""
-    _team(tmp_path)
-    sf = tmp_path / "state.json"
+    store = _team(tmp_path)
+    sf = store.dir / "supervisor-state.json"
     sf.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
     # codex launch success: no --session-id passed
     assert _run(["supervise", "--record-launch", "--for", "worker", "--cli", "codex",
@@ -4193,20 +5239,15 @@ def test_generated_ps1_survives_malformed_config_poll_with_last_good(
             lambda: _state_has_agent(state_path, "lead")
             and _log_contains(log_path, "supervisor: lead:"),
         )
-        time.sleep(0.25)
-        _replace_text_when_unlocked(
-            state_path,
-            json.dumps({"agents": {}}),
-        )
         (store.dir / "supervisor.json").write_text("{", encoding="utf-8")
 
         _wait_for_live_supervisor(
             proc,
             log_path,
-            lambda: _log_occurrences(log_path, warning) >= 2
-            and _state_has_agent(state_path, "lead"),
+            lambda: _log_occurrences(log_path, warning) >= 2,
         )
         assert proc.poll() is None
+        assert _state_has_agent(state_path, "lead")
     finally:
         _stop_live_supervisor(proc)
         log_handle.close()
@@ -4244,424 +5285,181 @@ def test_generated_ps1_hot_adds_agent_across_live_polls(tmp_path: Path) -> None:
         )
         assert proc.poll() is None
         state = json.loads(state_path.read_text(encoding="utf-8-sig"))
-        assert state["agents"]["hot-added"]["pid_alive"] is False
+        assert "pid_alive" not in state["agents"]["hot-added"]
     finally:
         _stop_live_supervisor(proc)
         log_handle.close()
 
 
 @pytest.mark.source_layout
-def test_generated_ps1_holds_poll_when_preplan_state_save_is_contended(
+def test_generated_powershell_reservation_streams_large_token_and_refuses_replay(
     tmp_path: Path,
 ) -> None:
     shell = _pick_powershell()
     if not shell:
         return
     store = _team(tmp_path)
-    config = {
-        "agents": {
-            "worker": {
-                "activity_hook": True,
-                "auto_restart": True,
-                "cli": "claude",
-            },
-        },
-        "backoff": {
-            "base_seconds": 30,
-            "cap_seconds": 900,
-            "reset_after_seconds": 180,
-        },
-        "launch_grace_seconds": 120,
-        "poll_seconds": 1,
-    }
-    (store.dir / "supervisor.json").write_text(
-        json.dumps(config),
-        encoding="utf-8",
-    )
     assert _run(["supervise", "--init"], tmp_path) == 0
-    _select_test_powershell(tmp_path, shell)
     state_path = store.dir / "supervisor-state.json"
-    initial = {"agents": {"worker": _ready(backoff_next_epoch=0)}}
-    state_path.write_text(json.dumps(initial), encoding="utf-8")
-    wrapper = tmp_path / "run-supervisor-with-state-lock.ps1"
+    operation_id = "8" * 32
+    secret_marker = "task115-secret-marker-" + ("x" * 12_000)
+    intent = {"action_kind": "launch", "env": {"TOKEN": secret_marker}}
+    intent_digest = sup._expected_operation_intent_digest(
+        operation_id=operation_id,
+        target_kind="agent",
+        target="worker",
+        action_kind="launch",
+        allowed_result_kinds=["record_launch"],
+        intent=intent,
+    )
+    token = sup.encode_supervisor_state_operation({
+        "kind": "reserve_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": "launch",
+        "allowed_result_kinds": ["record_launch"],
+        "target_kind": "agent",
+        "target": "worker",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            {"agents": {}}, "agent", "worker",
+        ),
+        "planned_state": {"stable": "planned"},
+        "intent": intent,
+    })
+    unknown_result = {
+        "operation_id": operation_id,
+        "status": "executor_result_unavailable",
+    }
+    unknown_token = sup.encode_supervisor_state_operation({
+        "kind": "complete_action",
+        "operation_id": operation_id,
+        "intent_digest": intent_digest,
+        "action_kind": "launch",
+        "target_kind": "agent",
+        "target": "worker",
+        "result_kind": "record_launch",
+        "result": unknown_result,
+        "result_digest": sup._supervisor_digest(unknown_result),
+        "outcome": "outcome_unknown",
+        "reason": "test outcome is unknown",
+    })
+    assert len(token) > 8_191
+    region_start = sup.PS_TEMPLATE.index("# region checked-mutations")
+    region_end = (
+        sup.PS_TEMPLATE.index("# endregion checked-mutations")
+        + len("# endregion checked-mutations")
+    )
+    checked_helpers = sup.PS_TEMPLATE[region_start:region_end]
+    wrapper = tmp_path / "exercise-generated-state-helpers.ps1"
     wrapper.write_text(
         "\n".join([
             "$ErrorActionPreference = 'Stop'",
+            f"$Root = {_pslit(str(tmp_path))}",
             f"$StatePath = {_pslit(str(state_path))}",
-            f"$Supervisor = {_pslit(str(store.dir / 'supervisor.ps1'))}",
-            "$lock = [IO.FileStream]::new($StatePath, [IO.FileMode]::Open, "
-            "[IO.FileAccess]::Read, [IO.FileShare]::Read)",
-            "try { & $Supervisor -Once } finally { $lock.Dispose() }",
+            f"$AgenttalkCmd = {_pslit(str(store.dir / 'bin' / 'agenttalk.cmd'))}",
+            checked_helpers,
+            "$executions = 0",
+            "if (Reserve-StateOperation 'first' $env:AGENTTALK_TASK115_TOKEN) {",
+            "  $executions++",
+            "}",
+            "if (Reserve-StateOperation 'duplicate' $env:AGENTTALK_TASK115_TOKEN) {",
+            "  $executions++",
+            "}",
+            "if ($executions -ne 1) { exit 17 }",
+            "Record-OutcomeUnknown 'unknown-result' $env:AGENTTALK_TASK115_UNKNOWN",
+            "exit 0",
+        ]),
+        encoding="utf-8-sig",
+    )
+    env = _checkout_runtime_env()
+    env["AGENTTALK_TASK115_TOKEN"] = token
+    env["AGENTTALK_TASK115_UNKNOWN"] = unknown_token
+
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-File", str(wrapper)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(tmp_path),
+        env=env,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}{completed.stderr}"
+    assert "target is held" in completed.stdout + completed.stderr
+    state_text = state_path.read_text(encoding="utf-8")
+    assert secret_marker not in state_text
+    state = json.loads(state_text)
+    assert state["operations"][operation_id]["phase"] == "result_conflict"
+    assert state["operation_holds"]["agent:worker"]["outcome"] == "outcome_unknown"
+    assert state["agents"]["worker"]["pending_operation"] == operation_id
+
+
+@pytest.mark.source_layout
+def test_generated_powershell_checked_operation_uses_python_state_lock(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path, "lead,alpha,beta")
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    state_path = store.dir / "supervisor-state.json"
+    _commit_agent_state(store, state_path, "alpha", {"pid": 101})
+    state = sup.load_supervisor_state(state_path)
+    token = sup.encode_supervisor_state_operation({
+        "kind": "commit_agent_state",
+        "target_kind": "agent",
+        "target": "beta",
+        "expected_target_digest": sup.supervisor_state_target_digest(
+            state, "agent", "beta",
+        ),
+        "value": {"pid": 202},
+    })
+    wrapper = tmp_path / "invoke-checked-state-operation.ps1"
+    wrapper.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$AgenttalkCmd = {_pslit(str(store.dir / 'bin' / 'agenttalk.cmd'))}",
+            "$argv = @(",
+            f"  '--root', {_pslit(str(tmp_path))}, 'supervise', '--apply-state-operation',",
+            f"  '--state-file', {_pslit(str(state_path))},",
+            "  '--state-operation', '-'",
+            ")",
+            "if ($env:AGENTTALK_TEST_SHORT_LOCK_TIMEOUT) {",
+            "  $argv += @('--state-lock-timeout', '0.1')",
+            "}",
+            f"{_pslit(token)} | & $AgenttalkCmd @argv | Out-Null",
+            "exit $LASTEXITCODE",
         ]),
         encoding="utf-8-sig",
     )
 
-    result = subprocess.run(
+    blocked_env = _checkout_runtime_env()
+    blocked_env["AGENTTALK_TEST_SHORT_LOCK_TIMEOUT"] = "1"
+    with store.supervisor_state_lock():
+        blocked = subprocess.run(
+            [shell, "-NoProfile", "-File", str(wrapper)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            cwd=str(tmp_path),
+            env=blocked_env,
+        )
+    assert blocked.returncode != 0
+    assert "beta" not in sup.load_supervisor_state(state_path)["agents"]
+
+    committed = subprocess.run(
         [shell, "-NoProfile", "-File", str(wrapper)],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=30,
         cwd=str(tmp_path),
         env=_checkout_runtime_env(),
     )
-
-    combined = f"{result.stdout}{result.stderr}"
-    assert result.returncode == 0, combined
-    assert "state write failed this poll; will retry next poll" in combined
-    assert "supervisor: worker:" not in combined
-    persisted = sup.load_supervisor_state(state_path)["agents"]["worker"]
-    assert persisted["backoff_next_epoch"] == 0
-    assert persisted.get("launching") is False
-
-
-_STATE_WRITE_LOCK_CSHARP = r"""
-using System;
-using System.IO;
-using System.Threading;
-
-public static class AgenttalkStateWriteLock
-{
-    private static bool RetryObserved(string path)
-    {
-        try
-        {
-            return File.Exists(path) && new FileInfo(path).Length > 0;
-        }
-        catch (IOException)
-        {
-            return false;
-        }
-    }
-
-    private static void WaitForRetry(string retryPath)
-    {
-        DateTime deadline = DateTime.UtcNow.AddSeconds(5);
-        while (DateTime.UtcNow < deadline && !RetryObserved(retryPath))
-        {
-            Thread.Sleep(1);
-        }
-    }
-
-    public static Thread LockExistingUntilRetry(
-        string path, string readyPath, string retryPath)
-    {
-        Thread thread = new Thread(() =>
-        {
-            using (FileStream stream = new FileStream(
-                path, FileMode.Open, FileAccess.Read, FileShare.Read))
-            {
-                File.WriteAllText(readyPath, "ready");
-                WaitForRetry(retryPath);
-            }
-        });
-        thread.IsBackground = true;
-        thread.Start();
-        return thread;
-    }
-
-    public static Thread LockExistingUntilSignaled(
-        string path, EventWaitHandle readySignal, EventWaitHandle releaseSignal)
-    {
-        Thread thread = new Thread(() =>
-        {
-            using (FileStream stream = new FileStream(
-                path, FileMode.Open, FileAccess.Read, FileShare.Read))
-            {
-                readySignal.Set();
-                if (!releaseSignal.WaitOne(TimeSpan.FromSeconds(30)))
-                {
-                    throw new TimeoutException("state write lock release was not signaled");
-                }
-            }
-        });
-        thread.IsBackground = true;
-        thread.Start();
-        return thread;
-    }
-
-    public static Thread LockNextTempUntilRetry(
-        string directory, string readyPath, string retryPath)
-    {
-        Thread thread = new Thread(() =>
-        {
-            DateTime deadline = DateTime.UtcNow.AddSeconds(5);
-            FileStream stream = null;
-            while (DateTime.UtcNow < deadline && stream == null)
-            {
-                foreach (string candidate in Directory.GetFiles(directory, ".at-*.tmp"))
-                {
-                    try
-                    {
-                        stream = new FileStream(
-                            candidate, FileMode.Open, FileAccess.Read, FileShare.None);
-                        break;
-                    }
-                    catch (IOException)
-                    {
-                    }
-                }
-                if (stream == null)
-                {
-                    Thread.Sleep(1);
-                }
-            }
-            if (stream == null)
-            {
-                File.WriteAllText(readyPath, "timeout");
-                return;
-            }
-            using (stream)
-            {
-                File.WriteAllText(readyPath, "ready");
-                WaitForRetry(retryPath);
-            }
-        });
-        thread.IsBackground = true;
-        thread.Start();
-        return thread;
-    }
-}
-""".strip()
-
-
-def _state_write_contention_harness_prefix(
-    *,
-    state_path: Path,
-    ready_path: Path,
-    retry_path: Path,
-) -> list[str]:
-    ps = sup.PS_TEMPLATE
-    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
-    return [
-        "$ErrorActionPreference = 'Stop'",
-        f"$StatePath = {_pslit(str(state_path))}",
-        "$StateBackupPath = \"$StatePath.bak\"",
-        "$KillSwitchPath = Join-Path (Split-Path -Parent $StatePath) 'supervisor.kill'",
-        f"$ReadyPath = {_pslit(str(ready_path))}",
-        f"$RetryPath = {_pslit(str(retry_path))}",
-        "function Actions-Enabled { return $true }",
-        "Add-Type -TypeDefinition @'",
-        _STATE_WRITE_LOCK_CSHARP,
-        "'@",
-        "function Start-Sleep {",
-        "  param([int]$Milliseconds)",
-        "  [IO.File]::AppendAllText($RetryPath, \"$Milliseconds`n\")",
-        "  Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds $Milliseconds",
-        "}",
-        helpers,
-    ]
-
-
-@pytest.mark.parametrize("swap_path", ["replace", "move"])
-def test_ps_state_atomic_swap_retries_windows_sharing_violation(
-    tmp_path: Path,
-    swap_path: str,
-) -> None:
-    if os.name != "nt":
-        return
-    shell = _pick_powershell()
-    if not shell:
-        return
-    state_path = tmp_path / "supervisor-state.json"
-    ready_path = tmp_path / "lock-ready.txt"
-    retry_path = tmp_path / "retry-observed.txt"
-    result_path = tmp_path / "state-swap-result.json"
-    if swap_path == "replace":
-        state_path.write_text(
-            json.dumps({"agents": {"worker": {"pid": 101}}}),
-            encoding="utf-8",
-        )
-
-    harness = _state_write_contention_harness_prefix(
-        state_path=state_path,
-        ready_path=ready_path,
-        retry_path=retry_path,
-    )
-    if swap_path == "replace":
-        harness += [
-            "$locker = [AgenttalkStateWriteLock]::LockExistingUntilRetry(",
-            "  $StatePath, $ReadyPath, $RetryPath)",
-            "while (-not (Microsoft.PowerShell.Management\\Test-Path "
-            "-LiteralPath $ReadyPath)) {",
-            "  Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 1",
-            "}",
-        ]
-    else:
-        harness += [
-            "$locker = [AgenttalkStateWriteLock]::LockNextTempUntilRetry(",
-            "  (Split-Path -Parent $StatePath), $ReadyPath, $RetryPath)",
-            "$script:MoveGateWaited = $false",
-            "function Test-Path {",
-            "  param([string]$LiteralPath)",
-            "  $exists = Microsoft.PowerShell.Management\\Test-Path "
-            "-LiteralPath $LiteralPath",
-            "  if (-not $script:MoveGateWaited -and $LiteralPath -eq $StatePath "
-            "-and -not $exists) {",
-            "    while (-not (Microsoft.PowerShell.Management\\Test-Path "
-            "-LiteralPath $ReadyPath)) {",
-            "      Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 1",
-            "    }",
-            "    if ([IO.File]::ReadAllText($ReadyPath) -ne 'ready') {",
-            "      throw 'temp lock did not become ready'",
-            "    }",
-            "    $script:MoveGateWaited = $true",
-            "  }",
-            "  return $exists",
-            "}",
-        ]
-    harness += [
-        "$next = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
-        "[pscustomobject]@{ pid = 202 } } }",
-        "Write-StateFileAtomic $StatePath $next",
-        "$null = $locker.Join(5000)",
-        "$retryCount = @(Get-Content -LiteralPath $RetryPath).Count",
-        "$saved = Read-StateFile $StatePath",
-        "@{ pid = $saved.agents.worker.pid; retries = $retryCount } | "
-        f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
-    ]
-    script = tmp_path / f"state-swap-{swap_path}.ps1"
-    script.write_text("\n".join(harness), encoding="utf-8-sig")
-
-    result = subprocess.run(
-        [shell, "-NoProfile", "-File", str(script)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-
-    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
-    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
-    assert payload["pid"] == 202
-    assert payload["retries"] >= 1
-
-
-def test_ps_poll_state_save_warns_and_survives_persistent_contention(
-    tmp_path: Path,
-) -> None:
-    if os.name != "nt":
-        return
-    shell = _pick_powershell()
-    if not shell:
-        return
-    state_path = tmp_path / "supervisor-state.json"
-    state_path.write_text(
-        json.dumps({"agents": {"worker": {"pid": 101}}}),
-        encoding="utf-8",
-    )
-    ready_path = tmp_path / "persistent-lock-ready.txt"
-    retry_path = tmp_path / "persistent-retries.txt"
-    result_path = tmp_path / "poll-save-result.json"
-    harness = _state_write_contention_harness_prefix(
-        state_path=state_path,
-        ready_path=ready_path,
-        retry_path=retry_path,
-    )
-    harness += [
-        "$readySignal = [Threading.ManualResetEvent]::new($false)",
-        "$releaseSignal = [Threading.ManualResetEvent]::new($false)",
-        "$locker = [AgenttalkStateWriteLock]::LockExistingUntilSignaled(",
-        "  $StatePath, $readySignal, $releaseSignal)",
-        "if (-not $readySignal.WaitOne(10000)) {",
-        "  throw 'state write lock did not become ready'",
-        "}",
-        "try {",
-        "  $next = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
-        "[pscustomobject]@{ pid = 202 } } }",
-        "  $results = @()",
-        "  for ($poll = 0; $poll -lt 2; $poll++) {",
-        "    $results += [bool](Save-StateForPoll $next)",
-        "  }",
-        "} finally {",
-        "  $null = $releaseSignal.Set()",
-        "}",
-        "if (-not $locker.Join(10000)) {",
-        "  throw 'state write lock did not release'",
-        "}",
-        "$readySignal.Dispose()",
-        "$releaseSignal.Dispose()",
-        "$primary = Read-StateFile $StatePath",
-        "@{ polls = $results.Count; saved = @($results | Where-Object { $_ }).Count; "
-        "pid = $primary.agents.worker.pid } | ConvertTo-Json | "
-        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
-    ]
-    script = tmp_path / "poll-save-contention.ps1"
-    script.write_text("\n".join(harness), encoding="utf-8-sig")
-
-    result = subprocess.run(
-        [shell, "-NoProfile", "-File", str(script)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-
-    combined = f"{result.stdout}{result.stderr}"
-    assert result.returncode == 0, combined
-    assert combined.count(
-        "supervisor: state write failed this poll; will retry next poll"
-    ) >= 2
-    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
-    assert payload == {"polls": 2, "saved": 0, "pid": 101}
-
-
-def test_ps_poll_state_save_only_softens_sharing_and_lock_violations(
-    tmp_path: Path,
-) -> None:
-    shell = _pick_powershell()
-    if not shell:
-        return
-    ps = sup.PS_TEMPLATE
-    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
-    result_path = tmp_path / "poll-save-error-classification.json"
-    state_path = tmp_path / "supervisor-state.json"
-    harness = "\n".join([
-        "$ErrorActionPreference = 'Stop'",
-        f"$StatePath = {_pslit(str(state_path))}",
-        "$StateBackupPath = \"$StatePath.bak\"",
-        "$KillSwitchPath = Join-Path (Split-Path -Parent $StatePath) 'supervisor.kill'",
-        "function Actions-Enabled { return $true }",
-        helpers,
-        "$script:Failure = ''",
-        "function Save-State($state) {",
-        "  switch ($script:Failure) {",
-        "    'sharing' { throw [IO.IOException]::new('sharing', -2147024864) }",
-        "    'lock' { throw [IO.IOException]::new('lock', -2147024863) }",
-        "    'disk_full' { throw [IO.IOException]::new('disk full', -2147024784) }",
-        "    'unauthorized' { throw [UnauthorizedAccessException]::new('denied') }",
-        "  }",
-        "}",
-        "$next = [pscustomobject]@{ agents = [pscustomobject]@{} }",
-        "$script:Failure = 'sharing'",
-        "$sharingSoft = -not [bool](Save-StateForPoll $next)",
-        "$script:Failure = 'lock'",
-        "$lockSoft = -not [bool](Save-StateForPoll $next)",
-        "$script:Failure = 'disk_full'",
-        "$diskFullPropagated = $false",
-        "try { Save-StateForPoll $next | Out-Null } catch { $diskFullPropagated = $true }",
-        "$script:Failure = 'unauthorized'",
-        "$unauthorizedPropagated = $false",
-        "try { Save-StateForPoll $next | Out-Null } catch { $unauthorizedPropagated = $true }",
-        "@{ sharing_soft = $sharingSoft; lock_soft = $lockSoft; "
-        "disk_full_propagated = $diskFullPropagated; "
-        "unauthorized_propagated = $unauthorizedPropagated } | ConvertTo-Json | "
-        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
-    ])
-    script = tmp_path / "poll-save-error-classification.ps1"
-    script.write_text(harness, encoding="utf-8-sig")
-
-    result = subprocess.run(
-        [shell, "-NoProfile", "-File", str(script)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-
-    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
-    assert json.loads(result_path.read_text(encoding="utf-8-sig")) == {
-        "sharing_soft": True,
-        "lock_soft": True,
-        "disk_full_propagated": True,
-        "unauthorized_propagated": True,
-    }
+    assert committed.returncode == 0, f"{committed.stdout}{committed.stderr}"
+    persisted = sup.load_supervisor_state(state_path)["agents"]
+    assert persisted["alpha"]["pid"] == 101
+    assert persisted["beta"]["pid"] == 202
 
 
 def test_spawned_launch_is_not_acknowledged_when_record_launch_cannot_commit(
@@ -4756,336 +5554,12 @@ def test_spawned_launch_is_not_acknowledged_when_record_launch_cannot_commit(
     assert persisted["last_launch_epoch"] == NOW - 100
 
 
-@pytest.mark.parametrize("wrapped", [False, True], ids=["legacy-direct", "wrapped"])
-@pytest.mark.source_layout
-def test_generated_ps1_two_polls_do_not_duplicate_launch_after_postspawn_contention(
-    tmp_path: Path,
-    wrapped: bool,
-) -> None:
-    shell = _pick_powershell()
-    if not shell:
-        return
-    store = _team(tmp_path)
-    store.set_role("lead", "lead")
-    store.set_operator_facing("lead")
-    state_path = store.dir / "supervisor-state.json"
-    launch_log = tmp_path / "postspawn-launches.txt"
-    lock_ready = tmp_path / "postspawn-lock-ready.txt"
-    stop_path = tmp_path / "postspawn-stop.txt"
-    fake_modules = tmp_path / "fake-launch-modules"
-    fake_modules.mkdir()
-    child_source = "\n".join([
-        "import os",
-        "import time",
-        "from pathlib import Path",
-        "launch_log = Path(os.environ['AGENTTALK_TEST_LAUNCH_LOG'])",
-        "with launch_log.open('a', encoding='utf-8') as stream:",
-        "    stream.write(f'{os.getpid()}\\n')",
-        "stop = Path(os.environ['AGENTTALK_TEST_STOP'])",
-        "while not stop.exists():",
-        "    time.sleep(0.02)",
-        "",
-    ])
-    (fake_modules / "legacy_agent.py").write_text(child_source, encoding="utf-8")
-    fake_agenttalk = fake_modules / "agenttalk"
-    fake_agenttalk.mkdir()
-    (fake_agenttalk / "__init__.py").write_text("", encoding="utf-8")
-    (fake_agenttalk / "__main__.py").write_text(child_source, encoding="utf-8")
-
-    if wrapped:
-        launch_args = [
-            "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "worker",
-            "--cli", "claude", "--loop", "--", sys.executable,
-        ]
-    else:
-        launch_args = ["-m", "legacy_agent", "{SESSION_ARGS}"]
-    config = {
-        "agents": {
-            "worker": {
-                "auto_restart": True,
-                "cli": "claude",
-                "wrapped": wrapped,
-                "cwd": str(tmp_path),
-                "env": {
-                    "AGENTTALK_TEST_LAUNCH_LOG": str(launch_log),
-                    "AGENTTALK_TEST_STOP": str(stop_path),
-                    "PYTHONPATH": str(fake_modules),
-                },
-                "launch": {
-                    "windows_file": sys.executable,
-                    "windows_args": launch_args,
-                },
-            },
-        },
-        "backoff": {
-            "base_seconds": 30,
-            "cap_seconds": 900,
-            "reset_after_seconds": 180,
-        },
-        "launch_grace_seconds": 120,
-        "poll_seconds": 1,
-    }
-    (store.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
-    assert _run(["supervise", "--init"], tmp_path) == 0
-    _select_test_powershell(tmp_path, shell)
-    state_path.write_text(
-        json.dumps({
-            "agents": {
-                "worker": {
-                    "backoff_next_epoch": 0,
-                    "launching": False,
-                    "last_launch_epoch": 0,
-                    "readiness_seen": True,
-                    "resume_available": True,
-                    "session_id": "abc",
-                },
-            },
-        }),
-        encoding="utf-8",
-    )
-    store.write_restart_request("worker", _auth_marker("rr-postspawn"))
-
-    supervisor_path = store.dir / "supervisor.ps1"
-    runner_script = tmp_path / "run-supervisor-with-postspawn-lock.ps1"
-    runner_script.write_text(
-        "\n".join([
-            "param(",
-            "  [Parameter(Mandatory=$true)][string]$SupervisorPath,",
-            "  [Parameter(Mandatory=$true)][string]$TestStatePath,",
-            "  [Parameter(Mandatory=$true)][string]$LaunchLogPath,",
-            "  [Parameter(Mandatory=$true)][string]$LockReadyPath,",
-            "  [switch]$InjectStateLock",
-            ")",
-            "$ErrorActionPreference = 'Stop'",
-            "$script:InjectedStateLock = $null",
-            "function Start-Process {",
-            "  [CmdletBinding()]",
-            "  param(",
-            "    [Parameter(Mandatory=$true)][string]$FilePath,",
-            "    [string[]]$ArgumentList,",
-            "    [string]$WorkingDirectory,",
-            "    [System.Diagnostics.ProcessWindowStyle]$WindowStyle,",
-            "    [switch]$PassThru",
-            "  )",
-            "  $startArgs = @{",
-            "    FilePath = $FilePath",
-            "    WorkingDirectory = $WorkingDirectory",
-            "    WindowStyle = $WindowStyle",
-            "    PassThru = [bool]$PassThru",
-            "  }",
-            "  if ($PSBoundParameters.ContainsKey('ArgumentList')) {",
-            "    $startArgs.ArgumentList = $ArgumentList",
-            "  }",
-            "  $proc = Microsoft.PowerShell.Management\\Start-Process @startArgs",
-            "  if ($InjectStateLock) {",
-            "    $script:InjectedStateLock = [IO.FileStream]::new(",
-            "      $TestStatePath, [IO.FileMode]::Open, [IO.FileAccess]::Read,",
-            "      [IO.FileShare]::Read)",
-            "    [IO.File]::WriteAllText($LockReadyPath, 'ready')",
-            "  }",
-            "  $deadline = [DateTime]::UtcNow.AddSeconds(15)",
-            "  $logged = $false",
-            "  do {",
-            "    if (Test-Path -LiteralPath $LaunchLogPath) {",
-            "      $logged = [IO.File]::ReadAllLines($LaunchLogPath) -contains [string]$proc.Id",
-            "    }",
-            "    if (-not $logged) {",
-            "      Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 10",
-            "    }",
-            "  } until ($logged -or [DateTime]::UtcNow -ge $deadline)",
-            "  if (-not $logged) { throw \"launched pid $($proc.Id) was not logged\" }",
-            "  return $proc",
-            "}",
-            "try {",
-            "  . $SupervisorPath -Once",
-            "} finally {",
-            "  if ($null -ne $script:InjectedStateLock) {",
-            "    $script:InjectedStateLock.Dispose()",
-            "  }",
-            "}",
-        ]),
-        encoding="utf-8-sig",
-    )
-    command = [
-        shell, "-NoProfile", "-File", str(runner_script),
-        "-SupervisorPath", str(supervisor_path),
-        "-TestStatePath", str(state_path),
-        "-LaunchLogPath", str(launch_log),
-        "-LockReadyPath", str(lock_ready),
-    ]
-    env = _checkout_runtime_env()
-    launched_pids: list[int] = []
-    try:
-        first = subprocess.run(
-            [*command, "-InjectStateLock"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(tmp_path),
-            env=env,
-        )
-        first_output = f"{first.stdout}{first.stderr}"
-        assert first.returncode == 0, first_output
-        assert lock_ready.read_text(encoding="utf-8") == "ready"
-        assert (
-            "state write failed this poll" in first_output
-            or "record-launch worker failed" in first_output
-        ), first_output
-        first_pids = [
-            int(line)
-            for line in launch_log.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        assert len(first_pids) == 1
-        reserved = sup.load_supervisor_state(state_path)["agents"]["worker"]
-
-        second = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(tmp_path),
-            env=env,
-        )
-        assert second.returncode == 0, f"{second.stdout}{second.stderr}"
-        launched_pids = [
-            int(line)
-            for line in launch_log.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        persisted = sup.load_supervisor_state(state_path)["agents"]["worker"]
-        assert len(launched_pids) == 1
-        assert "record-launch worker failed" in first_output
-        assert reserved["launching"] is True
-        assert "rr-postspawn" in reserved["consumed_rids"]
-        assert reserved["pending_restart_request_id"] == "rr-postspawn"
-        assert reserved.get("launcher_pid") is None
-        assert persisted["launching"] is True
-        assert "rr-postspawn" in persisted["consumed_rids"]
-    finally:
-        stop_path.write_text("stop", encoding="utf-8")
-        if launch_log.exists():
-            launched_pids = [
-                int(line)
-                for line in launch_log.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-        for pid in set(launched_pids):
-            subprocess.run(
-                [
-                    shell, "-NoProfile", "-Command",
-                    f"Wait-Process -Id {pid} -Timeout 5 -ErrorAction SilentlyContinue; "
-                    f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-
-
-def test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies(tmp_path: Path) -> None:
-    shell = _pick_powershell()
-    if not shell:
-        return
-    ps = sup.PS_TEMPLATE
-    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
-    state_path = tmp_path / "supervisor-state.json"
-    result_path = tmp_path / "state-helper-result.json"
-    harness = "\n".join([
-        "$ErrorActionPreference = 'Stop'",
-        f"$StatePath = {_pslit(str(state_path))}",
-        "$StateBackupPath = \"$StatePath.bak\"",
-        "$KillSwitchPath = Join-Path (Split-Path -Parent $StatePath) 'supervisor.kill'",
-        "function Actions-Enabled { return $true }",
-        helpers,
-        "$first = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
-        "[pscustomobject]@{ pid = 101 } } }",
-        "$second = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
-        "[pscustomobject]@{ pid = 202 } } }",
-        "Save-State $first",
-        "Save-State $second",
-        "[IO.File]::WriteAllText($StatePath, '{broken')",
-        "$recovered = Load-State",
-        "[IO.File]::WriteAllText($StateBackupPath, '[]')",
-        "$failedClosed = $false",
-        "try { $null = Load-State } catch { $failedClosed = $true }",
-        "@{ recoveredPid = $recovered.agents.worker.pid; failedClosed = $failedClosed } | "
-        f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
-    ])
-    script = tmp_path / "state-helper-test.ps1"
-    script.write_text(harness, encoding="utf-8-sig")
-
-    result = subprocess.run(
-        [shell, "-NoProfile", "-File", str(script)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-
-    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
-    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
-    assert payload == {"recoveredPid": 101, "failedClosed": True}
-
-
-def test_ps_set_agent_state_adds_new_agent_to_fresh_and_reloaded_state(
-    tmp_path: Path,
-) -> None:
-    """The poll must create state for an agent added after the supervisor starts."""
-    shell = _pick_powershell()
-    if not shell:
-        return
-    ps = sup.PS_TEMPLATE
-    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
-    result_path = tmp_path / "set-agent-state-result.json"
-    harness = "\n".join([
-        "$ErrorActionPreference = 'Stop'",
-        "$fresh = [pscustomobject]@{ agents = [pscustomobject]@{} }",
-        "$reloaded = '{\"agents\":{}}' | ConvertFrom-Json",
-        helpers,
-        "Set-AgentState $fresh 'new-agent' ([pscustomobject]@{ state = 'FRESH' })",
-        "Set-AgentState $reloaded 'new-agent' ([pscustomobject]@{ state = 'RELOADED' })",
-        "@{ fresh = $fresh.agents.'new-agent'.state; "
-        "reloaded = $reloaded.agents.'new-agent'.state } | ConvertTo-Json | "
-        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
-    ])
-    script = tmp_path / "set-agent-state-test.ps1"
-    script.write_text(harness, encoding="utf-8-sig")
-
-    result = subprocess.run(
-        [shell, "-NoProfile", "-File", str(script)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-
-    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
-    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
-    assert payload == {"fresh": "FRESH", "reloaded": "RELOADED"}
-
-
 def _replace_proc_start(ps1: Path, body: str) -> None:
     text = ps1.read_text(encoding="utf-8-sig")
     start = text.index("function Proc-Start($procId) {")
     end = text.index("function Get-ProcSnapshot", start)
     ps1.write_text(
         text[:start] + "function Proc-Start($procId) {\n" + body + "\n}\n" + text[end:],
-        encoding="utf-8-sig",
-    )
-
-
-def _replace_proc_snapshot_with_empty(ps1: Path) -> None:
-    """Keep generated-script tests independent of the host process table."""
-    text = ps1.read_text(encoding="utf-8-sig")
-    start = text.index("function Get-ProcSnapshot($path) {")
-    end = text.index("function Stop-Tree", start)
-    replacement = """function Get-ProcSnapshot($path) {
-  $u8 = New-Object System.Text.UTF8Encoding($false)
-  [System.IO.File]::WriteAllText($path, '[]', $u8)
-  return $true
-}
-"""
-    ps1.write_text(
-        text[:start] + replacement + text[end:],
         encoding="utf-8-sig",
     )
 
@@ -8897,27 +9371,26 @@ def test_supervise_launch_barrier_cli_reports_block_and_records_event(
 
 def test_ps_template_rechecks_launch_barrier_after_stop_tree_before_launch() -> None:
     ps = sup.PS_TEMPLATE
+    reserve = ps.index('Reserve-StateOperation ("reserve-action {0}"')
     block_start = ps.index("if (($p.kill_first -or $p.kill_orphans)")
     block_end = ps.index("# SEED the agent", block_start)
     block = ps[block_start:block_end]
+    assert reserve < block_start
     assert block.index("Stop-Tree $p.kill_targets") < block.index("--launch-barrier")
     assert "Get-ProcSnapshot $barrierPath" in block
     assert "Write-Warning" in block
-    if "Set-AgentState $state $name $p.barrier_state" not in block:
-        pytest.fail("launch-barrier state update bypasses Set-AgentState")
+    assert "Record-OutcomeUnknown" in block
     assert "continue" in block
     launch_idx = ps.index("$res = Launch $name", block_end)
     assert block_end < launch_idx
 
 
-def test_ps_template_routes_dynamic_agent_state_writes_through_helper() -> None:
+def test_ps_template_has_no_dynamic_whole_state_writer() -> None:
     ps = sup.PS_TEMPLATE
-    if "function Set-AgentState($state, $name, $value)" not in ps:
-        pytest.fail("generated supervisor has no Set-AgentState helper")
-    if "$state.agents.$name =" in ps:
-        pytest.fail("generated supervisor still dot-assigns dynamic agent state")
-    if ps.count("$state.agents | Add-Member") != 1:
-        pytest.fail("agent-state properties must be created only by Set-AgentState")
+    assert "$state.agents.$name =" not in ps
+    assert "$state.agents | Add-Member" not in ps
+    assert "Set-AgentState" not in ps
+    assert "'--apply-state-operation'" in ps
 
 
 def test_ps_template_refreshes_config_before_each_poll() -> None:
@@ -8926,12 +9399,13 @@ def test_ps_template_refreshes_config_before_each_poll() -> None:
     refresh = "$nextCfg = Read-SupervisorConfig"
     if refresh not in loop:
         pytest.fail("poll uses stale supervisor config for hot-added agents")
-    if loop.index(refresh) > loop.index("$state = Load-State"):
-        pytest.fail("supervisor config must refresh before poll state initialization")
-    before_state = loop[:loop.index("$state = Load-State")]
-    if "try {" not in before_state or "catch {" not in before_state:
+    plan = "$plan = (& $AgenttalkCmd --root $Root supervise --plan"
+    if loop.index(refresh) > loop.index(plan):
+        pytest.fail("supervisor config must refresh before the Python state owner plans")
+    before_plan = loop[:loop.index(plan)]
+    if "try {" not in before_plan or "catch {" not in before_plan:
         pytest.fail("per-poll config refresh is not guarded")
-    if "keeping last-good config" not in before_state:
+    if "keeping last-good config" not in before_plan:
         pytest.fail("config refresh failure does not preserve last-good behavior")
 
 
@@ -9103,7 +9577,10 @@ def test_preflight_wrapped_codex_validates_python_not_codex_sandbox(tmp_path: Pa
     harness = "\n".join([
         helpers, *preamble,
         # wrapped codex: $file is the python wrapper stub; launch_mode 'wrap'
-        f"$wrapOk = Preflight 'wrapped-codex' (@{{ cli='codex'; launch_mode='wrap' }}) {_pslit(str(wstub))} $null",
+        f"$wrapOk = Preflight 'wrapped-codex' "
+        f"(@{{ cli='codex'; launch_mode='wrap'; "
+        f"execution_spec=$cfg.agents.'wrapped-codex' }}) "
+        f"{_pslit(str(wstub))} $null",
         # non-wrapped codex (0.31.1): must NOT call `$file sandbox ...` - it runs the
         # AGENTTALK_PY gate, so the $file stub is never invoked as a codex CLI
         # (its log stays empty / has no 'sandbox').

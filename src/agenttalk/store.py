@@ -17,6 +17,7 @@ the invariant ``messages_for`` / dashboard rendering relies on.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import errno
 import hashlib
 import json
@@ -87,6 +88,21 @@ _LOCK_OWNERLESS_CONFIRM_SECONDS = 0.05
 _LOCK_PID_PREFIX_RE = re.compile(rb'"pid"\s*:\s*([0-9]+)')
 _LOCK_GENERATION_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 _CONFIG_LOCK_TOKEN_PREFIX = b"\0agenttalk-config-lock-generation-v1:"
+
+_LOCK_RANK_SUPERVISOR_LIFECYCLE = 1
+_LOCK_RANK_POWERSHELL_SELECTION = 2
+_LOCK_RANK_OPERATION_PUBLICATION = 3
+_LOCK_RANK_RETIREMENT = 4
+_LOCK_RANK_CONFIG = 5
+_LOCK_RANK_MESSAGE_PUBLICATION = 6
+_LOCK_RANK_SUPERVISOR_STATE = 7
+_HELD_NAMED_LOCKS: contextvars.ContextVar[
+    tuple[tuple[str, int, str], ...]
+] = contextvars.ContextVar("agenttalk_held_named_locks", default=())
+
+
+class LockOrderViolation(RuntimeError):
+    """A named store lock was requested outside the enforced total order."""
 
 _AWAIT_SCHEMA_VERSION = 1
 _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION = 1
@@ -1523,6 +1539,25 @@ class Store:
                             f"could not release the {what} at {lock}: {last_error}"
                         ) from last_error
 
+    @contextlib.contextmanager
+    def _ranked_lock(self, rank: int, name: str, lock_context):
+        """Enforce the per-root named-lock order before any filesystem wait."""
+        root_key = os.path.normcase(str(self.root.resolve()))
+        held = _HELD_NAMED_LOCKS.get()
+        same_root = [entry for entry in held if entry[0] == root_key]
+        if same_root and rank <= same_root[-1][1]:
+            held_name = same_root[-1][2]
+            raise LockOrderViolation(
+                f"cannot acquire {name} while holding {held_name}; "
+                "named store locks must be acquired in increasing rank order"
+            )
+        token = _HELD_NAMED_LOCKS.set((*held, (root_key, rank, name)))
+        try:
+            with lock_context as value:
+                yield value
+        finally:
+            _HELD_NAMED_LOCKS.reset(token)
+
     def _advance_config_lock_generation(
         self,
         lock: Path,
@@ -1565,11 +1600,16 @@ class Store:
             what="AgentTalk runtime lock directory",
         )
         lock = self.dir / "config.lock"
-        with self._exclusive_lock(
+        physical_lock = self._exclusive_lock(
             lock,
             timeout=timeout,
             poll=poll,
             what="config lock (another agent may be mid roster-admin)",
+        )
+        with self._ranked_lock(
+            _LOCK_RANK_CONFIG,
+            "config lock",
+            physical_lock,
         ):
             yield self._advance_config_lock_generation(
                 lock,
@@ -1677,21 +1717,43 @@ class Store:
         acquire ``lifecycle -> PowerShell selection -> config`` in that order.
         These helpers are intentionally non-reentrant.
         """
-        return self._exclusive_lock(
-            self.dir / "supervisor-lifecycle.lock",
-            timeout=timeout,
-            poll=poll,
-            what="supervisor lifecycle lock",
+        return self._ranked_lock(
+            _LOCK_RANK_SUPERVISOR_LIFECYCLE,
+            "supervisor lifecycle lock",
+            self._exclusive_lock(
+                self.dir / "supervisor-lifecycle.lock",
+                timeout=timeout,
+                poll=poll,
+                what="supervisor lifecycle lock",
+            ),
         )
 
     def _powershell_selection_lock(self, *, timeout: float = 10.0,
                                    poll: float = 0.05):
         """Serialize reads/writes that linearize PowerShell host use."""
-        return self._exclusive_lock(
-            self.dir / "powershell-host.lock",
-            timeout=timeout,
-            poll=poll,
-            what="PowerShell host selection lock",
+        return self._ranked_lock(
+            _LOCK_RANK_POWERSHELL_SELECTION,
+            "PowerShell host selection lock",
+            self._exclusive_lock(
+                self.dir / "powershell-host.lock",
+                timeout=timeout,
+                poll=poll,
+                what="PowerShell host selection lock",
+            ),
+        )
+
+    def _operation_publication_lock(self, *, timeout: float = 10.0,
+                                    poll: float = 0.05):
+        """Serialize one wrapper operation publication."""
+        return self._ranked_lock(
+            _LOCK_RANK_OPERATION_PUBLICATION,
+            "operation publication lock",
+            self._exclusive_lock(
+                self.state_dir / "operation-publication.lock",
+                timeout=timeout,
+                poll=poll,
+                what="wrapper operation publication",
+            ),
         )
 
     def _retirement_lock(self, *, timeout: float = 10.0, poll: float = 0.005):
@@ -1701,11 +1763,15 @@ class Store:
         creation, metadata fsync, or unlink cost. The durable payload is already
         prepared before this narrow critical section begins.
         """
-        return self._lock_generation_guard(
-            self.dir / "retirement",
-            deadline=time.monotonic() + timeout,
-            poll=poll,
-            what="retirement/message publication",
+        return self._ranked_lock(
+            _LOCK_RANK_RETIREMENT,
+            "retirement lock",
+            self._lock_generation_guard(
+                self.dir / "retirement",
+                deadline=time.monotonic() + timeout,
+                poll=poll,
+                what="retirement/message publication",
+            ),
         )
 
     def _message_publication_lock(
@@ -1715,11 +1781,29 @@ class Store:
         poll: float = 0.005,
     ):
         """Linearize every canonical message publication with dispatch replay."""
-        return self._lock_generation_guard(
-            self.dir / "message-publication",
-            deadline=time.monotonic() + timeout,
-            poll=poll,
-            what="message publication",
+        return self._ranked_lock(
+            _LOCK_RANK_MESSAGE_PUBLICATION,
+            "message publication lock",
+            self._lock_generation_guard(
+                self.dir / "message-publication",
+                deadline=time.monotonic() + timeout,
+                poll=poll,
+                what="message publication",
+            ),
+        )
+
+    def supervisor_state_lock(self, *, timeout: float = 10.0,
+                              poll: float = 0.05):
+        """Serialize one supervisor-state read-modify-write transaction."""
+        return self._ranked_lock(
+            _LOCK_RANK_SUPERVISOR_STATE,
+            "supervisor state lock",
+            self._exclusive_lock(
+                self.dir / "supervisor-state.lock",
+                timeout=timeout,
+                poll=poll,
+                what="supervisor state read-modify-write",
+            ),
         )
 
     @property
@@ -3459,12 +3543,7 @@ class Store:
             if self._operation_digest_for_intent(operation_intent, body) != operation_digest:
                 raise ValueError("operation intent does not match the operation digest")
             intent_digest = self._operation_intent_digest(operation_intent)
-        lock = self.state_dir / "operation-publication.lock"
-        with self._exclusive_lock(
-            lock,
-            timeout=10.0,
-            what="wrapper operation publication",
-        ):
+        with self._operation_publication_lock():
             _path, intent = self._record_operation_intent_locked(
                 sender=sender,
                 operation_nonce=operation_nonce,
@@ -3507,12 +3586,7 @@ class Store:
         if self._operation_digest_for_intent(operation_intent, body) != operation_digest:
             raise ValueError("operation intent does not match the operation digest")
         intent_digest = self._operation_intent_digest(operation_intent)
-        lock = self.state_dir / "operation-publication.lock"
-        with self._exclusive_lock(
-            lock,
-            timeout=10.0,
-            what="wrapper operation publication",
-        ):
+        with self._operation_publication_lock():
             intent_path, intent = self._record_operation_intent_locked(
                 sender=sender,
                 operation_nonce=operation_nonce,

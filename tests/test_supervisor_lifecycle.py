@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -1150,13 +1151,21 @@ def test_lifecycle_barrier_blocks_claim_select_and_refresh_without_mutation(
     start = _process_start_token(os.getpid())
     assert start is not None
 
-    with outer:
-        with pytest.raises(OSError, match="supervisor lifecycle lock"):
-            lifecycle.select_powershell_host(store, explicit_path=PWSH)
-        with pytest.raises(OSError, match="supervisor lifecycle lock"):
-            sup.refresh_artifacts(store, python_exe=r"C:\PythonB\python.exe")
-        with pytest.raises(OSError, match="supervisor lifecycle lock"):
-            store.claim_supervisor_instance(pid=os.getpid(), pid_start=start)
+    competing_calls = (
+        lambda: lifecycle.select_powershell_host(store, explicit_path=PWSH),
+        lambda: sup.refresh_artifacts(
+            store, python_exe=r"C:\PythonB\python.exe",
+        ),
+        lambda: store.claim_supervisor_instance(
+            pid=os.getpid(), pid_start=start,
+        ),
+    )
+    with outer, concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+    ) as executor:
+        for call in competing_calls:
+            with pytest.raises(OSError, match="supervisor lifecycle lock"):
+                executor.submit(call).result(timeout=1.0)
 
     assert not lifecycle.selection_path(store).exists()
     assert not store.supervisor_instance_path().exists()
