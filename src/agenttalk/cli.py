@@ -36,6 +36,7 @@ from agenttalk.store import (
     LEAD_LOOP_REMINDER_AFTER_DEFAULT,
     OPENER_KINDS,
     Store,
+    _owner_identity_gone,
     find_root,
     find_stores_upward,
     validate_agent_name,
@@ -59,6 +60,7 @@ from agenttalk import threads as th
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle as supervisor_lifecycle
+from agenttalk import wrapper_runtime as runtime_obs
 
 # Hard ceiling on cumulative deadline extension from `composing` pings,
 # regardless of how many arrive. Prevents a misbehaving (or stuck) peer
@@ -6197,6 +6199,12 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
         items += A.config_blocked_items(holds)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("config_blocked", str(e)))
+    # supervisor-owned process-tree HOLDs are global: they must remain visible
+    # even when no liaison/sole lead can be resolved.
+    try:
+        items += A.process_tree_hold_items(_read_supervisor_state(store))
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("process_tree_hold", str(e)))
     # dead-letter (ALL; build_queue hides resolved via the resolve_dead_letter disposition)
     try:
         items += A.dead_letter_items(store.list_dead_letters())
@@ -11794,6 +11802,162 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 return None
         return None
 
+    if args.reset_process_tree_ownership:
+        if (
+            not args.agent
+            or not args.hold_source_hash
+            or not args.verified_launch_nonce
+            or not args.reason
+            or not args.acknowledge_no_live_supervisor
+            or not args.acknowledge_owned_processes_stopped
+        ):
+            sys.stderr.write(
+                "agenttalk supervise --reset-process-tree-ownership requires "
+                "--for, --hold-source-hash, --verified-launch-nonce, --reason, "
+                "--acknowledge-no-live-supervisor, and "
+                "--acknowledge-owned-processes-stopped\n"
+            )
+            return 2
+        state_path = store.dir / "supervisor-state.json"
+        if (
+            args.state_file
+            and Path(args.state_file).resolve() != state_path.resolve()
+        ):
+            sys.stderr.write(
+                "agenttalk supervise --reset-process-tree-ownership: "
+                "--state-file must be the official .agenttalk/supervisor-state.json\n"
+            )
+            return 2
+        now = args.now if args.now is not None else time.time()
+        try:
+            with store._supervisor_lifecycle_lock():
+                marker_status, _marker, marker_detail = (
+                    store._read_supervisor_instance_strict_locked()
+                )
+                if marker_status != "absent":
+                    raise ValueError(
+                        "supervisor instance marker is "
+                        f"{marker_status}: {marker_detail or 'a supervisor may be live'}"
+                    )
+                if store.supervisor_kill_switch() is not True:
+                    raise ValueError("supervisor.kill must remain present")
+                with store._config_lock():
+                    actor = _resolve_disposition_actor(store, args)
+                    if actor is None:
+                        raise ValueError(
+                            "--from must resolve to the operator-facing liaison "
+                            "or sole lead"
+                        )
+                    marker_status, _marker, marker_detail = (
+                        store._read_supervisor_instance_strict_locked()
+                    )
+                    if marker_status != "absent":
+                        raise ValueError(
+                            "supervisor instance marker changed to "
+                            f"{marker_status}: "
+                            f"{marker_detail or 'a supervisor may be live'}"
+                        )
+                    if store.supervisor_kill_switch() is not True:
+                        raise ValueError("supervisor.kill was removed during reset")
+
+                    state = sup.load_supervisor_state(state_path)
+                    from agenttalk import attention as A
+
+                    current_items = []
+                    for item in A.process_tree_hold_items(state):
+                        refs = item.get("source_refs")
+                        if (
+                            isinstance(refs, list)
+                            and len(refs) == 1
+                            and isinstance(refs[0], dict)
+                            and refs[0].get("kind") == "supervisor_state"
+                            and refs[0].get("agent") == args.agent
+                        ):
+                            current_items.append(item)
+                    if len(current_items) != 1:
+                        raise ValueError(
+                            f"no unique configured process-tree HOLD exists for "
+                            f"{args.agent!r}"
+                        )
+                    current_item = current_items[0]
+                    if current_item.get("source_hash") != args.hold_source_hash:
+                        raise ValueError(
+                            "HOLD source hash is stale; read `agenttalk attention` again"
+                        )
+
+                    runtime_view = runtime_obs.read_runtime(
+                        store.state_dir,
+                        args.agent,
+                        now_epoch=now,
+                    )
+                    if runtime_view.get("status") != runtime_obs.STATUS_VALID:
+                        raise ValueError(
+                            "strict wrapper runtime record is not valid: "
+                            f"{runtime_view.get('error') or runtime_view.get('status')}"
+                        )
+                    evidence = sup.process_tree_ownership_reset_evidence(
+                        state,
+                        args.agent,
+                        expected_root=store.root,
+                        verified_launch_nonce=args.verified_launch_nonce,
+                        runtime_record=runtime_view["record"],
+                        now_epoch=now,
+                    )
+                    live_identities = [
+                        row
+                        for row in evidence["identities"]
+                        if not _owner_identity_gone(row["pid"], row["start"])
+                    ]
+                    if live_identities:
+                        raise ValueError(
+                            "recorded process identities are still live or cannot be "
+                            "distinguished from pid reuse: "
+                            + ", ".join(
+                                f"{row['pid']}/{row['start']}"
+                                for row in live_identities[:8]
+                            )
+                        )
+
+                    marker_status, _marker, marker_detail = (
+                        store._read_supervisor_instance_strict_locked()
+                    )
+                    if marker_status != "absent":
+                        raise ValueError(
+                            "supervisor instance marker changed before commit: "
+                            f"{marker_status}: "
+                            f"{marker_detail or 'a supervisor may be live'}"
+                        )
+                    if store.supervisor_kill_switch() is not True:
+                        raise ValueError(
+                            "supervisor.kill was removed before reset commit"
+                        )
+                    sup.reset_process_tree_ownership_after_attended_teardown(
+                        state,
+                        args.agent,
+                        hold_source_hash=args.hold_source_hash,
+                        acknowledged_by=actor,
+                        verified_launch_nonce=args.verified_launch_nonce,
+                        expected_root=store.root,
+                        runtime_record=runtime_view["record"],
+                        recorded_identities_gone=True,
+                        reason=args.reason,
+                        now_epoch=now,
+                    )
+                    sup.save_supervisor_state(state_path, state)
+        except (
+            OSError,
+            ValueError,
+            sup.SupervisorPersistenceError,
+            runtime_obs.RuntimeRecordError,
+        ) as exc:
+            sys.stderr.write(
+                "agenttalk supervise --reset-process-tree-ownership: "
+                f"{exc}\n"
+            )
+            return 3
+        print(json.dumps(state["process_tree_resets"][-1], indent=2))
+        return 0
+
     if args.prepare_launch_request:
         if not args.request_id or not args.state_file:
             sys.stderr.write("agenttalk supervise --prepare-launch-request: need "
@@ -11877,6 +12041,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             config,
             args.agent,
             root_key=sup._root_key(str(store.root.resolve())),
+            request_id=args.request_id,
         )
         if result.get("blocked") and getattr(args, "record_events", False):
             with contextlib.suppress(Exception):
@@ -13143,9 +13308,10 @@ def build_parser() -> argparse.ArgumentParser:
         "attention",
         description="Operator attention queue: a derived, ranked, deduped read-only view "
                     "over pending escalations, config-blocked holds, dead letters, gate "
-                    "HOLDs, and lead-loop-unarmed signals, plus operator dispositions. "
+                    "HOLDs, process-tree HOLDs, and lead-loop-unarmed signals, plus "
+                    "allowed operator dispositions (blocking sources are nondismissible). "
                     "Creates no work objects; mutates only the disposition log.",
-        help="Ranked operator attention queue + dispositions (defer/dismiss/answered).")
+        help="Ranked operator attention queue + source-appropriate dispositions.")
     pattn.add_argument("--for", dest="for_agent",
                        help="Whose queue (default: the operator-facing liaison, else the sole lead).")
     pattn.add_argument("--json", action="store_true", help="Machine-readable output.")
@@ -13757,6 +13923,14 @@ def build_parser() -> argparse.ArgumentParser:
                            "Claude/Codex launch invariants, and fresh heartbeats.")
     gsup.add_argument("--plan", action="store_true",
                       help="Emit the action plan (the shared decision table) as JSON.")
+    gsup.add_argument(
+        "--reset-process-tree-ownership",
+        dest="reset_process_tree_ownership",
+        action="store_true",
+        help="Operator-attended reset of a configured agent's invalid/truncated "
+             "owned-process-tree HOLD after exact identity teardown verification. "
+             "Never kills or launches a process.",
+    )
     gsup.add_argument("--clear-restart", dest="clear_restart", action="store_true",
                       help="Clear a restart-request marker by --for + --request-id.")
     gsup.add_argument("--record-launch", dest="record_launch", action="store_true",
@@ -13835,7 +14009,33 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(--repair-instance-marker) move the invalid marker aside.")
     psup.add_argument("--acknowledge-no-live-supervisor",
                       dest="acknowledge_no_live_supervisor", action="store_true",
-                      help="(--repair-instance-marker) acknowledge no supervisor is live.")
+                      help="Acknowledge no supervisor is live for an attended "
+                           "instance-marker repair or process-tree reset.")
+    psup.add_argument(
+        "--acknowledge-owned-processes-stopped",
+        dest="acknowledge_owned_processes_stopped",
+        action="store_true",
+        help="(--reset-process-tree-ownership) acknowledge the attended teardown, "
+             "including any identities omitted by a truncated record.",
+    )
+    psup.add_argument(
+        "--hold-source-hash",
+        dest="hold_source_hash",
+        help="(--reset-process-tree-ownership) exact current process-tree Attention "
+             "source hash.",
+    )
+    psup.add_argument(
+        "--verified-launch-nonce",
+        dest="verified_launch_nonce",
+        help="(--reset-process-tree-ownership) launch nonce read from the live "
+             "wrapper command line before attended teardown.",
+    )
+    psup.add_argument(
+        "--from",
+        dest="sender",
+        help="(--reset-process-tree-ownership) operator-facing liaison or sole lead "
+             "recording the attended reset.",
+    )
     psup.add_argument("--instance-token", dest="instance_token",
                       help="(--release-instance/--drain-intents) supervisor instance token.")
     psup.add_argument("--max-per-tick", dest="max_per_tick", type=int, default=25,
@@ -13848,13 +14048,17 @@ def build_parser() -> argparse.ArgumentParser:
                       choices=[eph.STATE_COMPLETED, eph.STATE_DENIED,
                                eph.STATE_FAILED, eph.STATE_TIMED_OUT],
                       help="(--archive-launch-request) terminal state.")
-    psup.add_argument("--reason", help="(--archive-launch-request) terminal reason.")
+    psup.add_argument(
+        "--reason",
+        help="Terminal archive reason or attended process-tree reset audit reason.",
+    )
     psup.add_argument("--completion-json", dest="completion_json",
                       help="(--archive-launch-request) JSON review-result "
                            "completion evidence from the supervisor plan.")
     psup.add_argument("--snapshot-file", dest="snapshot_file", default=None,
                       help="(--plan) the executor's process snapshot JSON (list of "
-                           "{pid,parent_pid,name,command_line,start_time}). Missing "
+                           "{pid,parent_pid,name,command_line,start_time,"
+                           "start_filetime}). Missing "
                            "or unreadable => UNAVAILABLE (brain-required CLI fails closed).")
     psup.add_argument("--pre-snapshot-file", dest="pre_snapshot_file", default=None,
                       help="(--record-launch/--record-ephemeral-launch) process snapshot "
@@ -13897,7 +14101,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(--plan) the supervisor's local state JSON (pids/backoff).")
     psup.add_argument("--record-events", dest="record_events", action="store_true",
                       help="(--plan, script use) append bounded redacted decision events.")
-    psup.add_argument("--for", dest="agent", help="(--clear-restart) agent name.")
+    psup.add_argument(
+        "--for",
+        dest="agent",
+        help="Agent name for --clear-restart or --reset-process-tree-ownership.",
+    )
     psup.add_argument("--request-id", dest="request_id", help="(--clear-restart) rid to clear.")
     psup.set_defaults(func=cmd_supervise)
 

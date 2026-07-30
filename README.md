@@ -1101,8 +1101,9 @@ mirroring.
 
 `agenttalk attention` is one ranked, read-only view of everything that
 currently needs a human: pending `needs_operator` escalations,
-config-blocked holds, dead letters, gate/close HOLDs, and unarmed
-lead-loops. It **derives** the view from cheap state reads — it creates no
+config-blocked holds, dead letters, gate/close HOLDs, unarmed lead-loops,
+and nondismissible configured/ephemeral process-tree HOLDs. It **derives**
+the view from cheap state reads — it creates no
 work object and adds no message kind — so a degraded source becomes a
 bounded warning row rather than blanking the queue, and the default path
 does no `git`/lane recompute. `agenttalk attention --stats` (add `--json`
@@ -1296,6 +1297,78 @@ listening, wrapping is the documented default. Manual
 chat window is a tolerable supervised-by-human stopgap, but it is not a
 daemon.
 
+Owned-tree validation runs before restart-marker and child-liveness policy.
+Therefore, an invalid or truncated owned tree is
+`PROCESS_TREE_INVALID`/`PROCESS_TREE_TRUNCATED`, not
+`CLI_CHILD_UNKNOWN`, and the pending restart marker remains unconsumed.
+
+Each supervisor poll also projects the wrapper's owned process tree into a
+strict, 64-entry state record. The wrapper PID/start, runtime generation, and
+launch nonce must agree across supervisor state, `wrapper-runtime.json`, and
+the live wrapper; the nonce is re-read from the live command line. Parent/start
+edges establish descendant ownership, while process names only label the roles
+`wrapper`, `cli_launcher`, `cli_brain`, and `tool_descendant`. Only a complete
+tree feeds the existing leaves-first `Stop-Tree`. An invalid or truncated tree
+holds all automatic teardown and creates a nondismissible item in
+`agenttalk attention` and the dashboard. That item tells the operator to
+inspect the complete tree and verify every PID/start identity plus the live
+launch nonce before an attended teardown. Invalid/truncated evidence is sticky:
+an ordinary smaller poll cannot clear it; only an operator-attended ownership
+reset can revoke it, and the following launch must earn a new wrapper
+generation and complete tree. One-shot ephemeral reviewers use this same
+authority path and persist the freshly revalidated tree before `Stop-Tree`.
+
+On Windows, `cli_launcher_lifetime` is a nullable all-or-nothing certificate.
+When present, it contains positive decimal creation/exit FILETIMEs from
+`GetProcessTimes`, with creation strictly before exit. A tree entry's
+`start_filetime` is also nullable; null supplies no exact FILETIME proof, so
+PID/start remains required. If a prior identity recorded an exact FILETIME, a
+current row with that field missing is ambiguous. A complete prior tree can
+bridge an exited intermediate process only for the same wrapper generation and
+launch nonce, using the exact previously recorded child identity and parent
+edge. New or reparented descendants make the tree invalid.
+
+If a snapshot proves every identity from a previously complete tree absent or
+definitively recycled, the supervisor retains those rows as a generation-bound
+`absent` certificate with no kill authority. Unreadable identity evidence or a
+late child edge rooted at any recorded PID blocks relaunch. Upgrading an older
+wrapped state is operator-attended. Leave `supervisor.kill` present, stop the
+supervisor, verify the strict instance marker is absent, and verify/stop the
+complete old wrapper tree by PID/start. Before stopping the wrapper, re-read
+`--supervisor-launch-nonce` from its live command line and verify it matches the
+recorded nonce. If the wrapper is no longer live enough to re-read that nonce,
+do not supply the acknowledgement; use manual repair. Copy the current source
+hash from `agenttalk attention`, then run:
+
+```powershell
+agenttalk supervise --reset-process-tree-ownership --from <liaison> `
+  --for <agent> --hold-source-hash <64hex> `
+  --verified-launch-nonce <verified-launch-nonce> `
+  --acknowledge-no-live-supervisor `
+  --acknowledge-owned-processes-stopped `
+  --reason "attended owned-tree migration"
+```
+
+The command refuses a stale hash, missing/mismatched nonce, live or
+unverifiable recorded identity, invalid/mismatched strict runtime wrapper
+PID/start/generation, non-liaison actor, live instance marker, missing kill
+switch, or noncanonical state path. It only revokes stale ownership evidence
+and writes a bounded audit record; it never kills or launches. The same atomic
+state update records the exact retired runtime digest plus its
+PID/start/generation/nonce boundary. The unchanged sidecar therefore cannot
+recreate the old HOLD before restart; any changed or new-generation runtime
+record still follows normal fail-closed adoption. If a replacement launcher is
+recorded before its new runtime observation appears, the old sidecar cannot
+hide it: a live or unprovable replacement identity remains HOLD. Keep the
+supervisor host stopped, remove `supervisor.kill`, refresh and validate
+generated scripts, queue the restart, then resume the supervisor so the next
+launch earns a new generation and tree. (`--refresh-scripts` deliberately
+refuses while the kill switch exists.) If the hold has no nonce or reset
+evidence, the command refuses and manual state repair is required. Legacy
+`managed_pids` and brain identities remain bounded diagnostic evidence in the
+nondismissible HOLD until the attended reset commits. Automatic teardown
+authority returns only after the new generation earns a complete tree.
+
 **Bounded work heartbeat (wrapped Claude).** The wrapper still runs a
 bounded ticker during each turn for coordination visibility. Those timer
 ticks do not advance `progress_sequence` and therefore cannot make a
@@ -1379,7 +1452,7 @@ still has a fresh heartbeat, the operator-facing requester must also pass
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
 | `agenttalk release --from A (--to B \| --to-group G \| --all) [-m reason]` | Signal an agent (or team) to **stand down and exit its listen loop** — distinct from `end`: no transcript export, and the agent may be restarted later. A listener exits ONLY on `kind=release` or `kind=end`; a prose "done for now" never stops it. A single `--to` opens no thread (no `request_id`/`broadcast_id`); `--to-group`/`--all` fan out the same signal (re-run to retry any missed — no `--resume`). Authoritative only from the `operator_facing`/sole-`lead` sender; the command warns otherwise and the listen skill reports-and-ignores an unauthorized release. |
 | `agenttalk reset [--archive]` | Clear **active bus and compact-resume state** (messages + cursors + heartbeats + checkpoints); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + checkpoints + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
-| `agenttalk supervise (--init \| --refresh-scripts \| --select-pwsh \| --repair-instance-marker \| --report \| --plan \| --bootstrap-check \| --install-activity-hook \| --clear-restart)` | Thin support for the **external agent supervisor** (24/7 outage auto-restart + stuck-recovery). `--init` scaffolds the operator config plus four generated Windows artifacts; `--refresh-scripts` regenerates only those artifacts and preserves config/runtime state. `--select-pwsh [--pwsh ABSOLUTE_PATH]` records the validated PowerShell Core 7+ host used by start/task/watchdog boundaries. `--repair-instance-marker --quarantine --acknowledge-no-live-supervisor` is the explicit invalid-marker recovery. `--report`/`--plan` emit the read-only liveness JSON and shared action plan; `--bootstrap-check` verifies the roster, operator-facing lead, supervisor config, wrapped launch invariants, explicit wrapped `--root`, and fresh heartbeats. Manual listeners use heartbeat freshness; wrapped listeners additionally require a strict runtime phase plus an independently discovered CLI brain and real adapter progress. `--install-activity-hook` merges Claude's identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` project hooks; Codex modes write only the heartbeat hook to `.codex/hooks.json`. Protected agents are never auto-killed. |
+| `agenttalk supervise (--init \| --refresh-scripts \| --select-pwsh \| --repair-instance-marker \| --reset-process-tree-ownership \| --report \| --plan \| --bootstrap-check \| --install-activity-hook \| --clear-restart)` | Thin support for the **external agent supervisor** (24/7 outage auto-restart + stuck-recovery). `--init` scaffolds the operator config plus four generated Windows artifacts; `--refresh-scripts` regenerates only those artifacts and preserves config/runtime state. `--select-pwsh [--pwsh ABSOLUTE_PATH]` records the validated PowerShell Core 7+ host used by start/task/watchdog boundaries. `--repair-instance-marker --quarantine --acknowledge-no-live-supervisor` is the explicit invalid-marker recovery. `agenttalk supervise --reset-process-tree-ownership --from L --for A --hold-source-hash HASH --verified-launch-nonce NONCE --acknowledge-no-live-supervisor --acknowledge-owned-processes-stopped --reason TEXT` records an attended ownership boundary only for the liaison/sole lead, with the kill switch present, no live marker, a current Attention hash/nonce, and every recorded PID/start proven gone or recycled; it never kills or launches. `--report`/`--plan` emit the read-only liveness JSON and shared action plan; `--bootstrap-check` verifies the roster, operator-facing lead, supervisor config, wrapped launch invariants, explicit wrapped `--root`, and fresh heartbeats. Manual listeners use heartbeat freshness; wrapped listeners additionally require a strict runtime phase plus an independently discovered CLI brain and real adapter progress. `--install-activity-hook` merges Claude's identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` project hooks; Codex modes write only the heartbeat hook to `.codex/hooks.json`. Protected agents are never auto-killed. |
 | `agenttalk checkpoint (save\|resume) [--for A]` / `checkpoint show [--for A] [--json]` | Preserve, reload, or inspect deterministic external state around context compaction. Claude hook installation saves on `PreCompact` and injects the latest summary on `SessionStart/compact`; latest state is under `.agenttalk/checkpoints/` and `reset` clears it. See the user manual for hook and identity contracts. |
 | `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] [--from S] [--min-interval N] -- <real-exe> <base-args>` | Run agent `A` through the **progress wrapper** (0.30.0): a per-CLI structured-stream adapter giving **visibility** (echoes the agent's stream — token/thinking deltas for Claude, item-level events for Codex; `--no-render` to silence), a **working-turn heartbeat** (stays fresh while the agent works, not just idles), and **degraded-output detection** (confirmed garble-then-silence can request a self-restart, recorded as `--from`). `--loop` makes it the long-running **supervised** wrapper: it owns the idle bus-wait + heartbeat and drives the CLI **one turn per inbound message**, persisting+reloading the Codex `thread_id`/Claude `session-id` so a relaunch reload-resumes. Each inbound wrapped turn also receives matching accepted lessons as advisory prompt context and records pointer-only exposure telemetry after prompt handoff. The real CLI exe + its base args go after `--`; the wrapper appends the per-turn session/stream args. For durable unattended listening, this is the documented default; manual `/agenttalk.listen` is best-effort for interactive use. |
 | `agenttalk request-restart --for A [--from L] [--reason ...] [--force-protected] [--acknowledge-live-protected-kill]` | Queue a **manual** restart of agent `A`: writes an atomic, request-id-scoped `state/<A>.restart-request` marker the supervisor relaunches (resuming the session) from and clears. Healthy idle agents are eligible for manual restart at the next supervisor poll. Restarting a protected agent requires `--force-protected`; if that protected agent still has a fresh heartbeat, the operator-facing requester must also pass `--acknowledge-live-protected-kill`. |

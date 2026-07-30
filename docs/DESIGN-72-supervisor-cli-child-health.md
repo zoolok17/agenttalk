@@ -172,7 +172,7 @@ schema. Suggested fields:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "agent": "worker",
   "wrapper_pid": 4100,
   "wrapper_start": "2026-07-24T15:00:00.000000Z",
@@ -183,12 +183,31 @@ schema. Suggested fields:
   "message_id": "20260724-...",
   "cli_launcher_pid": 4200,
   "cli_launcher_start": "2026-07-24T15:03:00.000000Z",
+  "cli_launcher_lifetime": {
+    "source": "windows_get_process_times_v1",
+    "creation_filetime": "134141725800000000",
+    "exit_filetime": "134141725850000000"
+  },
   "progress_sequence": 9,
   "last_progress_at": "2026-07-24T15:03:08.000000Z",
   "last_outcome": "success|failed|dead_letter|null",
   "updated_at": "2026-07-24T15:03:08.000000Z"
 }
 ```
+
+`cli_launcher_lifetime` is normally `null` while the launcher is live and on
+platforms without the retained-handle certificate. On Windows, after the
+retained `Popen` handle signals, the wrapper records exact creation/exit
+FILETIMEs from `GetProcessTimes`; a descendant behind an already-exited
+launcher is admissible only when its exact `start_filetime` lies strictly
+between those bounds. The lifetime object is all-or-nothing: its source and both
+positive decimal FILETIMEs are required, and creation must precede exit.
+Owned-tree `start_filetime` fields are independently nullable. Null carries no
+exact FILETIME proof, so PID/start remains required; if prior proof recorded an
+exact FILETIME, a current row with that field missing is ambiguous. Schema-v1
+files remain read-compatible and are normalized to schema v2 with a null
+lifetime, but all new writes are v2. Booleans are not accepted as
+schema-version integers.
 
 The record contains no prompt, model output, command, or tool output. Writes
 use a same-directory temporary file, flush and `fsync` the file, then replace
@@ -290,7 +309,10 @@ sequence regression.
 ### 4. Verdict table
 
 The wrapped classifier returns from this table and never falls through to the
-legacy fresh-heartbeat classifier. It is deliberately total:
+legacy fresh-heartbeat classifier. This table applies only after the owned-tree
+gate passes: invalid/truncated tree evidence returns
+`PROCESS_TREE_INVALID`/`PROCESS_TREE_TRUNCATED` before runtime parsing or
+restart-marker consumption. The runtime table is deliberately total:
 
 | Runtime phase | CLI brain | Progress | Verdict | Automatic action |
 | --- | --- | --- | --- | --- |
@@ -322,14 +344,18 @@ green. Only the first row reaches `HEALTHY_IDLE`.
 
 The implementation order is normative:
 
-1. strictly parse and bind the complete runtime record; on any failure, return
+1. evaluate the strict bounded owned tree. Invalid or truncated evidence
+   returns `WARN_ONLY` with `PROCESS_TREE_INVALID` or
+   `PROCESS_TREE_TRUNCATED`; do not consume a restart marker and do not enter
+   child-liveness policy;
+2. strictly parse and bind the complete runtime record; on any failure, return
    `CLI_CHILD_UNKNOWN`;
-2. for `idle`, run the existing wrapper/heartbeat sub-classifier and return its
+3. for `idle`, run the existing wrapper/heartbeat sub-classifier and return its
    result;
-3. for `starting`, `active`, or `terminal`, return a matching row above; and
-4. otherwise return `CLI_CHILD_UNKNOWN`.
+4. for `starting`, `active`, or `terminal`, return a matching row above; and
+5. otherwise return `CLI_CHILD_UNKNOWN`.
 
-There is no continuation from steps 3 or 4 into the legacy fresh-heartbeat
+There is no continuation from steps 4 or 5 into the legacy fresh-heartbeat
 branch.
 
 ### 5. Death, wedge, and restart policy
@@ -396,6 +422,7 @@ recovery authority has been established. The inventory is rechecked with
 | Row | Condition | Authority branch | Inputs consulted | Verdict and action | Regression |
 | --- | --- | --- | --- | --- | --- |
 | A0 | `auto_restart` false or report missing | planner exclusion | configuration/report presence | no plan, no action | `test_plan_ignores_unsupervised_or_unreported_agents` |
+| A0T | wrapped owned tree is invalid or truncated | process-authority HOLD before restart/runtime policy | strict owned-tree status, counts, reason, Attention projection | `PROCESS_TREE_INVALID` or `PROCESS_TREE_TRUNCATED`; `WARN_ONLY`, no kill, no marker consumption | `test_owned_process_tree_bound_holds_and_escalates_when_truncated`, `test_owned_process_tree_unreadable_live_wrapper_nonce_is_hold` |
 | A1 | restart marker lacks current authority | manual denial | marker authority and revalidation | `RESTART_UNAUTHORIZED`; none | `test_unauthorized_restart_marker_refuses_and_stays_visible` |
 | A2 | protected marker lacks force/live-kill acknowledgement, or marker is cooling down | manual denial | protected status, explicit acknowledgements, cooldown | `REFUSE_PROTECTED`, `LIVE_PROTECTED_REFUSED`, or `RESTART_COOLDOWN`; none | `test_protected_marker_without_force_is_refused_and_stays_visible`, `test_fresh_protected_force_requires_second_live_kill_ack`, `test_restart_cooldown_defers_without_consuming_marker` |
 | A3 | marker is fully authorized | manual override | marker authority, protected acknowledgements, cooldown | `MANUAL_RESTART`; `RELAUNCH` bypasses autonomous backoff | `test_scenario_iii_manual_marker_relaunches_and_waits_for_readiness` |
@@ -517,6 +544,48 @@ reports `CLI_CHILD_UNKNOWN`, with no kill or relaunch, and gives an exact
 restart/refresh remediation. It must not silently fall back to heartbeat-only
 green. The first `idle` observation from the refreshed wrapper establishes the
 new baseline.
+
+The bounded owned-tree channel adds an attended migration boundary. Legacy
+`managed_pids`, launcher, and brain identities are retained only as bounded
+diagnostic evidence and cannot authorize teardown. Stop the supervisor, verify
+the complete old wrapper tree by PID/start, re-read the launch nonce from the
+live wrapper command line before stopping it, and keep `supervisor.kill`
+present. If the live wrapper is unavailable for that re-read, this reset is not
+authorized and manual repair is required. With the strict instance marker
+absent, use the current nondismissible Attention item's source hash and that
+verified nonce:
+
+```powershell
+agenttalk supervise --reset-process-tree-ownership --from <liaison> `
+  --for <agent> --hold-source-hash <64hex> `
+  --verified-launch-nonce <verified-launch-nonce> `
+  --acknowledge-no-live-supervisor `
+  --acknowledge-owned-processes-stopped `
+  --reason "attended owned-tree migration"
+```
+
+Under lifecycle-then-config locking, this command rechecks operator-facing
+liaison/sole-lead authority, canonical state, kill-switch level, absent strict
+instance marker, current Attention hash, matching nonce, strict runtime
+agreement on wrapper PID/start/generation, and that each recorded PID/start is
+dead or confidently recycled. It never kills or launches. It revokes stale
+evidence, records a bounded audit row, and atomically retires the exact old
+runtime digest plus its PID/start/generation/nonce boundary. Only that unchanged
+sidecar is ignored; changed or new-generation evidence still takes the normal
+fail-closed adoption path. The next generation must earn a fresh tree. Missing
+nonce/reset evidence refuses and requires manual repair.
+Keep the supervisor host stopped, remove `supervisor.kill`, refresh/validate
+generated artifacts (`--refresh-scripts` refuses under the kill switch), queue
+the restart, then resume the supervisor. Unprovable legacy evidence remains a
+nondismissible process-tree HOLD until the attended reset commits; automatic
+teardown authority returns only after the new generation earns a complete tree.
+
+A previously complete strict tree can bridge an exited intermediate only in
+the same wrapper generation and launch nonce, using the exact prior child
+identity and parent edge; new or reparented descendants invalidate it. When all
+recorded identities are definitively gone, it becomes an `absent` no-kill
+certificate. Unreadable identity or a late child edge rooted at a recorded PID
+blocks relaunch.
 
 ## Failing regression
 

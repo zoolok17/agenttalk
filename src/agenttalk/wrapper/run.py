@@ -1515,6 +1515,94 @@ def run_wrapper(
     return rc
 
 
+def _start_windows_launcher_exit_observer(
+    proc: subprocess.Popen,
+    launcher_start: str | None,
+    *,
+    turn_generation: int,
+    publish: Callable[..., object],
+) -> threading.Thread | None:
+    """Publish exact Windows creation/exit FILETIMEs from the retained handle.
+
+    ``ParentProcessId`` survives creator exit on Windows and may later name a
+    recycled PID. The exact lifetime of this handle is therefore the only safe
+    first-poll bridge for a native launcher that hands off and exits. Failure to
+    obtain it is deliberately quiet: the supervisor then has no certificate
+    and refuses teardown.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        handle_value = int(proc._handle)  # type: ignore[attr-defined]  # noqa: SLF001
+        if handle_value <= 0:
+            return None
+        pid = int(proc.pid)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    def observe() -> None:
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.WaitForSingleObject.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            handle = wintypes.HANDLE(handle_value)
+            if kernel32.WaitForSingleObject(handle, 0xFFFFFFFF) != 0:
+                return
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return
+            creation_ticks = (
+                (int(creation.dwHighDateTime) << 32)
+                | int(creation.dwLowDateTime)
+            )
+            exit_ticks = (
+                (int(exit_time.dwHighDateTime) << 32)
+                | int(exit_time.dwLowDateTime)
+            )
+            if creation_ticks <= 0 or exit_ticks <= creation_ticks:
+                return
+            publish(
+                pid,
+                launcher_start,
+                str(creation_ticks),
+                str(exit_ticks),
+                turn_generation=turn_generation,
+            )
+        except Exception:  # noqa: BLE001 - missing proof must fail closed, not crash turn
+            return
+
+    thread = threading.Thread(
+        target=observe,
+        name=f"agenttalk-launcher-exit-{pid}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 class _ProcStream:
     """Default make_drive spawner: spawn the CLI for one turn (prompt on STDIN, to
     dodge quoting), yield its stdout lines, and expose the child EXIT CODE as
@@ -1530,7 +1618,8 @@ class _ProcStream:
                  work_heartbeat=None, work_heartbeat_stamp=None,
                  work_heartbeat_status=None,
                  child_env: dict[str, str] | None = None,
-                 on_spawn: Callable[[int, str | None], None] | None = None,
+                 on_spawn: Callable[[int, str | None], object] | None = None,
+                 on_launcher_exit: Callable[..., object] | None = None,
                  lease_lost_exceptions: tuple = ()) -> None:
         # argv is the operator-provided launch command; never shell=True.
         # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
@@ -1557,6 +1646,7 @@ class _ProcStream:
         self._watchdog_stream_interrupted = False
         self._watchdog_stream_done = False
         self._watchdog_root_waiter: threading.Thread | None = None
+        self._launcher_exit_observer = None
         self.work_heartbeat_result: dict | None = None
         self._work_hb = None
         try:
@@ -1568,7 +1658,26 @@ class _ProcStream:
                 from agenttalk.wrapper_runtime import process_start_token
 
                 self.pid_start = process_start_token(self.pid)
-                on_spawn(self.pid, self.pid_start)
+                active_record = on_spawn(self.pid, self.pid_start)
+                turn_generation = (
+                    active_record.get("turn_generation")
+                    if isinstance(active_record, dict)
+                    else None
+                )
+                if (
+                    on_launcher_exit is not None
+                    and isinstance(turn_generation, int)
+                    and not isinstance(turn_generation, bool)
+                    and turn_generation > 0
+                ):
+                    self._launcher_exit_observer = (
+                        _start_windows_launcher_exit_observer(
+                            self._proc,
+                            self.pid_start,
+                            turn_generation=turn_generation,
+                            publish=on_launcher_exit,
+                        )
+                    )
             if self._proc.stdin is not None:
                 if stdin_text is not None:
                     self._proc.stdin.write(stdin_text)
@@ -1667,6 +1776,11 @@ class _ProcStream:
                     # result or allowing the next turn to start.
                     self._watchdog.join()
                     self.watchdog_result = self._watchdog.result
+            if self._launcher_exit_observer is not None:
+                # #112 owns the wait/watchdog ordering above. #120's retained
+                # handle observer is joined only after that flow has confirmed
+                # root exit, so neither feature weakens the other's boundary.
+                self._launcher_exit_observer.join(timeout=5.0)
 
     def _interrupt_watchdog_stream(self) -> None:
         with self._watchdog_stream_condition:
@@ -1759,11 +1873,16 @@ class _ProcStream:
     def _cleanup_after_constructor_error(self) -> None:
         # Best-effort only: preserve the original constructor failure so make_drive
         # keeps its existing spawn/exec classification.
-        for worker in (self._work_hb, self._watchdog):
+        for worker in (
+            self._work_hb,
+            self._watchdog,
+            self._launcher_exit_observer,
+        ):
             if worker is None:
                 continue
             try:
-                worker.stop()
+                if hasattr(worker, "stop"):
+                    worker.stop()
                 worker.join(timeout=10.0)
             except Exception as exc:
                 _ = exc
@@ -2161,6 +2280,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                                child_env=child_env,
                                on_spawn=(
                                    runtime_writer.active
+                                   if runtime_writer is not None
+                                   else None
+                               ),
+                               on_launcher_exit=(
+                                   runtime_writer.launcher_exited
                                    if runtime_writer is not None
                                    else None
                                ),
@@ -2665,6 +2789,11 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                                work_heartbeat_status=_whb_status,
                                on_spawn=(
                                    runtime_writer.active
+                                   if runtime_writer is not None
+                                   else None
+                               ),
+                               on_launcher_exit=(
+                                   runtime_writer.launcher_exited
                                    if runtime_writer is not None
                                    else None
                                ),

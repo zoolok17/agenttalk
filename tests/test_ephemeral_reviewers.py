@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from agenttalk import attention as att
 from agenttalk import ephemeral as eph
 from agenttalk import cli
 from agenttalk import lanes
@@ -97,6 +98,61 @@ def _report(marker: dict | None = None, *, orphan: bool = False, active: dict | 
         },
         "launch_requests": [marker] if marker is not None else [],
         "ephemeral_reviewers": {"active": active or {}, "orphan_agents": ["adversary-orphan"] if orphan else []},
+    }
+
+
+def _runtime_view(
+    agent: str,
+    *,
+    wrapper_pid: int = 10,
+    wrapper_start: str = "1970-01-01T00:10:00Z",
+    wrapper_generation: str = "wrapper-1",
+    phase: str = "idle",
+    launcher_pid: int | None = None,
+    launcher_start: str | None = None,
+) -> dict:
+    active = phase == "active"
+    return {
+        "status": "valid",
+        "record": {
+            "schema_version": 1,
+            "agent": agent,
+            "wrapper_pid": wrapper_pid,
+            "wrapper_start": wrapper_start,
+            "wrapper_generation": wrapper_generation,
+            "phase": phase,
+            "turn_generation": 1,
+            "turn_id": "turn-1" if active else None,
+            "message_id": "msg-1" if active else None,
+            "cli_launcher_pid": launcher_pid if active else None,
+            "cli_launcher_start": launcher_start if active else None,
+            "progress_sequence": 1 if active else 0,
+            "last_progress_at": "1970-01-01T00:16:38Z" if active else None,
+            "last_outcome": None,
+            "updated_at": "1970-01-01T00:16:39Z",
+        },
+        "error": None,
+    }
+
+
+def _wrapper_row(
+    agent: str,
+    *,
+    pid: int = 10,
+    start: str = "1970-01-01T00:10:00Z",
+    parent_pid: int = 1,
+) -> dict:
+    return {
+        "pid": pid,
+        "parent_pid": parent_pid,
+        "name": "python.exe",
+        "command_line": (
+            "python -m agenttalk "
+            f"--supervisor-launch-nonce {SUPERVISOR_NONCE} "
+            f"--root {TEST_ROOT} wrap --for {agent} --loop"
+        ),
+        "start_time": start,
+        "start_filetime": None,
     }
 
 
@@ -351,14 +407,49 @@ def test_prepare_rosters_unique_identity_sends_request_and_completion_retires(tm
     assert req.kind == "review-request"
     assert req.meta["evidence_only"] == "true"
     assert req.meta["counted_signoff"] == "false"
+    assert state["ephemeral_reviewers"]["active"]["lr-prep"]["cli"] == "codex"
+
+    wrapper_start = "1970-01-01T00:10:00Z"
+    sup.record_ephemeral_launch(
+        state,
+        "lr-prep",
+        pid=10,
+        pid_start=wrapper_start,
+        now_epoch=NOW,
+        launcher_nonce=SUPERVISOR_NONCE,
+        launcher_nonce_injected=True,
+        launcher_nonce_source="agenttalk_global_arg",
+    )
 
     s.send(sender=agent, recipient="lead", kind="review-result", body="reject",
            meta={"request_id": "lr-prep", "status": "rejected"})
     report = sup.build_report(s, now_epoch=NOW + 1, state=state, supervisor_config=_cfg())
-    plan = sup.plan_actions(report, state, _cfg(), now_epoch=NOW + 1, snapshot=[])
+    report["root_key"] = sup._root_key(TEST_ROOT)
+    report["ephemeral_reviewers"]["active"]["lr-prep"]["wrapper_runtime"] = (
+        _runtime_view(agent, wrapper_start=wrapper_start)
+    )
+    snapshot = [_wrapper_row(agent, start=wrapper_start)]
+    adoption = sup.plan_actions(
+        report,
+        state,
+        _cfg(),
+        now_epoch=NOW + 1,
+        snapshot=snapshot,
+    )["ephemeral_reviewers"]["lr-prep"]
+    assert adoption["action"] == eph.ACTION_NONE
+    assert adoption["state"] == "process_tree_hold"
+    state["ephemeral_reviewers"]["active"]["lr-prep"] = adoption["next_entry"]
+    plan = sup.plan_actions(
+        report,
+        state,
+        _cfg(),
+        now_epoch=NOW + 2,
+        snapshot=snapshot,
+    )
     done = plan["ephemeral_reviewers"]["lr-prep"]
     assert done["action"] == eph.ACTION_COMPLETE
     assert done["completion"]["counter"] is True
+    assert [target["pid"] for target in done["kill_targets"]] == [10]
 
     sup.archive_ephemeral_request(
         s, state, "lr-prep", terminal_state=eph.STATE_COMPLETED,
@@ -488,7 +579,7 @@ def test_retired_name_is_not_reused(tmp_path: Path) -> None:
     assert name.startswith("adversary-lr-repeat-")
 
 
-def test_launched_exit_without_result_fails_without_restart() -> None:
+def test_launched_exit_without_fresh_tree_holds_without_restart_or_archive() -> None:
     state = {"ephemeral_reviewers": {"active": {
         "lr-dead": {"agent": "adversary-lr-dead", "requested_by": "lead",
                     "phase": eph.STATE_LAUNCHED, "launcher_pid": 10,
@@ -498,43 +589,259 @@ def test_launched_exit_without_result_fails_without_restart() -> None:
         "completion": {"status": eph.COMPLETION_NONE, "terminal": False, "hold": True}
     }})
     plan = sup.plan_actions(report, state, _cfg(), now_epoch=NOW, snapshot=[])
-    failed = plan["ephemeral_reviewers"]["lr-dead"]
-    assert failed["action"] == eph.ACTION_FAILED
-    assert failed["kill_targets"] == []
-    assert failed["reason"].endswith("no auto-restart")
+    held = plan["ephemeral_reviewers"]["lr-dead"]
+    assert held["action"] == eph.ACTION_NONE
+    assert held["state"] == "process_tree_hold"
+    assert held["kill_targets"] == []
+    assert held["retire"] is False
+    assert held["archive"] is False
+    assert held["auto_restart"] is False
+    attention_items = att.process_tree_hold_items({
+        "ephemeral_reviewers": {
+            "active": {"lr-dead": held["next_entry"]},
+        },
+    })
+    assert [item["item_id"] for item in attention_items] == [
+        "process_tree_hold:ephemeral:lr-dead",
+    ]
+    assert (
+        held["next_entry"]["process_tree_hold_reason"]
+        in attention_items[0]["why_it_matters"]
+    )
+
+
+@pytest.mark.parametrize("agent", [None, {}, "", "bad/agent"])
+def test_invalid_ephemeral_agent_identity_holds_and_surfaces_attention(
+    agent: object,
+) -> None:
+    state = {
+        "ephemeral_reviewers": {
+            "active": {
+                "lr-invalid-agent": {
+                    "request_id": "lr-invalid-agent",
+                    "agent": agent,
+                    "requested_by": "lead",
+                    "phase": eph.STATE_LAUNCHED,
+                    "launcher_pid": 10,
+                    "launcher_start": "t-start",
+                    "deadline_epoch": NOW - 1,
+                },
+            },
+        },
+    }
+    report = _report(active={"lr-invalid-agent": {
+        "completion": {
+            "status": eph.COMPLETION_NONE,
+            "terminal": False,
+            "hold": True,
+        },
+    }})
+
+    held = sup.plan_actions(
+        report,
+        state,
+        _cfg(),
+        now_epoch=NOW,
+        snapshot=[],
+    )["ephemeral_reviewers"]["lr-invalid-agent"]
+
+    assert held["action"] == eph.ACTION_NONE
+    assert held["state"] == "process_tree_hold"
+    assert held["kill_targets"] == []
+    assert held["archive"] is False
+    assert "owned_process_tree" not in held["next_entry"]
+    assert held["next_entry"]["process_tree_hold_reason"] == (
+        "ephemeral_agent_identity_missing"
+    )
+
+    items = att.process_tree_hold_items({
+        "ephemeral_reviewers": {
+            "active": {"lr-invalid-agent": held["next_entry"]},
+        },
+    })
+    assert len(items) == 1
+    assert items[0]["item_id"] == (
+        "process_tree_hold:ephemeral:lr-invalid-agent"
+    )
+    assert items[0]["affected"] == ["lr-invalid-agent"]
+    assert items[0]["source_refs"][0]["agent"] == "lr-invalid-agent"
+    assert items[0]["advisory"] is False
 
 
 def test_timeout_plans_process_tree_kill_targets() -> None:
-    launcher_start = "2026-07-04T07:20:31.1000000+00:00"
-    child_start = "2026-07-04T07:20:31.2000000+00:00"
+    wrapper_start = "1970-01-01T00:10:00Z"
+    launcher_start = "1970-01-01T00:11:00Z"
     state = {"ephemeral_reviewers": {"active": {
         "lr-timeout": {"agent": "adversary-lr-timeout", "requested_by": "lead",
                        "phase": eph.STATE_LAUNCHED, "launcher_pid": 10,
-                       "launcher_start": launcher_start, "launched_epoch": NOW - 100,
+                       "launcher_start": wrapper_start, "launched_epoch": NOW - 100,
                        "deadline_epoch": NOW - 1,
+                       "cli": "codex",
                        "launcher_nonce": SUPERVISOR_NONCE,
                        "launcher_nonce_injected": True,
                        "launcher_nonce_source": "agenttalk_global_arg"}
     }}}
     report = _report(active={"lr-timeout": {
-        "completion": {"status": eph.COMPLETION_NONE, "terminal": False, "hold": True}
+        "completion": {
+            "status": eph.COMPLETION_NONE,
+            "terminal": False,
+            "hold": True,
+        },
+        "wrapper_runtime": _runtime_view(
+            "adversary-lr-timeout",
+            wrapper_start=wrapper_start,
+            phase="active",
+            launcher_pid=11,
+            launcher_start=launcher_start,
+        ),
     }})
     report["root_key"] = sup._root_key(TEST_ROOT)
     snap = [
-        {"pid": 10, "parent_pid": 1, "name": "python.exe",
-         "command_line": (
-             "python -m agenttalk "
-             f"--supervisor-launch-nonce {SUPERVISOR_NONCE} "
-             f"--root {TEST_ROOT} wrap --for adversary-lr-timeout --loop"
-         ),
-         "start_time": launcher_start},
-        {"pid": 11, "parent_pid": 10, "name": "codex.exe", "command_line": "codex exec",
-         "start_time": child_start},
+        _wrapper_row("adversary-lr-timeout", start=wrapper_start),
+        {
+            "pid": 11,
+            "parent_pid": 10,
+            "name": "codex.exe",
+            "command_line": "codex exec",
+            "start_time": launcher_start,
+            "start_filetime": None,
+        },
+        {
+            "pid": 12,
+            "parent_pid": 11,
+            "name": "codex.exe",
+            "command_line": "codex tui",
+            "start_time": "1970-01-01T00:12:00Z",
+            "start_filetime": None,
+        },
+        {
+            "pid": 13,
+            "parent_pid": 12,
+            "name": "pwsh.exe",
+            "command_line": "pwsh -File tool.ps1",
+            "start_time": "1970-01-01T00:13:00Z",
+            "start_filetime": None,
+        },
+        {
+            "pid": 14,
+            "parent_pid": 13,
+            "name": "node.exe",
+            "command_line": "node build.js",
+            "start_time": "1970-01-01T00:14:00Z",
+            "start_filetime": None,
+        },
     ]
-    plan = sup.plan_actions(report, state, _cfg(), now_epoch=NOW, snapshot=snap)
-    timeout = plan["ephemeral_reviewers"]["lr-timeout"]
+    adoption = sup.plan_actions(
+        report,
+        state,
+        _cfg(),
+        now_epoch=NOW,
+        snapshot=snap,
+    )["ephemeral_reviewers"]["lr-timeout"]
+    assert adoption["action"] == eph.ACTION_NONE
+    assert adoption["state"] == "process_tree_hold"
+    state["ephemeral_reviewers"]["active"]["lr-timeout"] = adoption["next_entry"]
+
+    timeout = sup.plan_actions(
+        report,
+        state,
+        _cfg(),
+        now_epoch=NOW + 1,
+        snapshot=snap,
+    )["ephemeral_reviewers"]["lr-timeout"]
     assert timeout["action"] == eph.ACTION_TIMEOUT
-    assert {t["pid"] for t in timeout["kill_targets"]} == {10, 11}
+    assert [t["pid"] for t in timeout["kill_targets"]] == [10, 11, 12, 13, 14]
+    assert [
+        entry["role"]
+        for entry in timeout["next_entry"]["owned_process_tree"]["entries"]
+    ] == [
+        "wrapper",
+        "cli_launcher",
+        "cli_brain",
+        "tool_descendant",
+        "tool_descendant",
+    ]
+
+
+def test_ephemeral_cap_exceeded_holds_archive_and_escalates_attention() -> None:
+    agent = "adversary-lr-cap"
+    boot = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    wrapper_start = f"linux:{boot}:100"
+    launcher_start = f"linux:{boot}:200"
+    state = {"ephemeral_reviewers": {"active": {
+        "lr-cap": {
+            "request_id": "lr-cap",
+            "agent": agent,
+            "requested_by": "lead",
+            "phase": eph.STATE_LAUNCHED,
+            "launcher_pid": 10,
+            "launcher_start": wrapper_start,
+            "deadline_epoch": NOW - 1,
+            "cli": "codex",
+            "launcher_nonce": SUPERVISOR_NONCE,
+            "launcher_nonce_injected": True,
+            "launcher_nonce_source": "agenttalk_global_arg",
+        }
+    }}}
+    report = _report(active={"lr-cap": {
+        "completion": {
+            "status": eph.COMPLETION_NONE,
+            "terminal": False,
+            "hold": True,
+        },
+        "wrapper_runtime": _runtime_view(
+            agent,
+            wrapper_start=wrapper_start,
+            phase="active",
+            launcher_pid=11,
+            launcher_start=launcher_start,
+        ),
+    }})
+    report["root_key"] = sup._root_key(TEST_ROOT)
+    snapshot = [_wrapper_row(agent, start=wrapper_start)]
+    parent = 10
+    for pid in range(11, 75):
+        snapshot.append({
+            "pid": pid,
+            "parent_pid": parent,
+            "name": "codex.exe" if pid in {11, 12} else "node.exe",
+            "command_line": "codex exec" if pid == 11 else f"tool {pid}",
+            "start_time": f"linux:{boot}:{(pid - 9) * 100}",
+            "start_filetime": None,
+        })
+        parent = pid
+
+    adoption = sup.plan_actions(
+        report,
+        state,
+        _cfg(),
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["ephemeral_reviewers"]["lr-cap"]
+    state["ephemeral_reviewers"]["active"]["lr-cap"] = adoption["next_entry"]
+    held = sup.plan_actions(
+        report,
+        state,
+        _cfg(),
+        now_epoch=NOW + 1,
+        snapshot=snapshot,
+    )["ephemeral_reviewers"]["lr-cap"]
+
+    assert held["action"] == eph.ACTION_NONE
+    assert held["state"] == "process_tree_hold"
+    assert held["archive"] is False
+    assert held["kill_targets"] == []
+    assert held["next_entry"]["owned_process_tree"]["status"] == "truncated"
+    assert held["next_entry"]["owned_process_tree"]["observed_count"] == 65
+
+    attention_state = {
+        "ephemeral_reviewers": {"active": {"lr-cap": held["next_entry"]}}
+    }
+    items = att.process_tree_hold_items(attention_state)
+    assert [item["item_id"] for item in items] == [
+        "process_tree_hold:ephemeral:lr-cap"
+    ]
+    assert "observed 65 identities over cap 64" in items[0]["why_it_matters"]
 
 
 def test_invalid_review_result_stays_hold_and_janitor_retires_orphan(tmp_path: Path) -> None:

@@ -442,13 +442,14 @@ def ensure_state(state: dict) -> dict:
 
 def record_prepared(state: dict, *, request_id: str, agent: str, requested_by: str,
                     profile: str, timeout_seconds: int, now_epoch: float,
-                    review_request_id: str) -> dict:
+                    review_request_id: str, cli: str = "codex") -> dict:
     root = ensure_state(state)
     root["active"][request_id] = {
         "request_id": request_id,
         "agent": agent,
         "requested_by": requested_by,
         "profile": profile,
+        "cli": cli if isinstance(cli, str) and cli else "codex",
         "phase": STATE_REQUESTED,
         "prepared_epoch": now_epoch,
         "timeout_seconds": int(timeout_seconds),

@@ -1873,6 +1873,14 @@
     if (item.agent) detailRow.appendChild(el('span', 'tc-attn-agent', item.agent));
     detailRow.appendChild(el('span', 'tc-attn-detail', item.detail || ''));
     body.appendChild(detailRow);
+    if (item.recommendation && !(actionSession.enabled && item.answerable)) {
+      body.appendChild(el('div', 'tc-attn-detail', item.recommendation));
+    }
+    if (item.operator_command) {
+      var command = el('code', 'tc-attn-detail', item.operator_command);
+      command.setAttribute('aria-label', 'Operator command');
+      body.appendChild(command);
+    }
     if (actionSession.enabled && item.answerable) {
       body.appendChild(attentionAnswerComposer(item));
     }

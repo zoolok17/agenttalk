@@ -92,7 +92,52 @@ While the kill switch exists, read-only commands such as `supervise --report`,
 `supervise --plan`, `deadman`, `status`, `threads`, `sync`, and `wait` remain
 usable. The supervisor refuses kills, relaunches, seeding, launch-request
 claim/archive, marker clearing, bus notify, and supervisor-state reconciliation
-writes. Remove the file to re-enable automation.
+writes. The sole operator-write exception is the attended process-tree
+ownership reset below; it requires the kill switch as a safety precondition.
+Remove the file to re-enable automation.
+
+### Recover an owned-process-tree HOLD
+
+An invalid or truncated wrapped process tree takes precedence over restart
+markers and child-liveness verdicts. It authorizes no partial kill and remains
+visible as a nondismissible item in `agenttalk attention` and the dashboard.
+
+1. Keep `supervisor.kill` present. Stop the supervisor and confirm its strict
+   instance marker is absent.
+2. Read the current Attention item's `source_hash` and recorded launch nonce.
+   Inventory the complete owned tree. Before stopping the wrapper, re-read
+   `--supervisor-launch-nonce` from its live command line and verify it matches
+   the recorded nonce; after teardown, verify every recorded PID/start identity
+   is absent or definitely recycled. If the wrapper is no longer live enough
+   to re-read its nonce, use manual repair instead of this reset.
+3. As the operator-facing liaison (or sole lead), run:
+
+```powershell
+agenttalk supervise --reset-process-tree-ownership --from <liaison> `
+  --for <agent> --hold-source-hash <64hex> `
+  --verified-launch-nonce <verified-launch-nonce> `
+  --acknowledge-no-live-supervisor `
+  --acknowledge-owned-processes-stopped `
+  --reason "attended owned-tree recovery"
+```
+
+The command uses the canonical supervisor state and rechecks the lifecycle and
+config preconditions while locked. It refuses a stale Attention hash, a missing
+or mismatched nonce, an invalid or mismatched strict runtime wrapper
+PID/start/generation, any recorded PID/start that is live or unverifiable, a
+live/invalid instance marker, a missing kill switch, or an unauthorized actor.
+If the HOLD has no nonce/reset evidence, manual repair is required. The command
+never kills or launches; it revokes stale ownership evidence and writes a
+bounded audit entry. The same atomic state update records the exact retired
+runtime digest and PID/start/generation/nonce boundary. The unchanged sidecar
+therefore cannot recreate the old HOLD before restart; any changed or new
+runtime generation still follows normal fail-closed adoption.
+
+4. Keep the supervisor host stopped, remove `supervisor.kill`, and run
+   `agenttalk supervise --refresh-scripts` to regenerate and validate artifacts.
+   (`--refresh-scripts` refuses while the kill switch is present.) Queue
+   `agenttalk request-restart --for <agent>`, then resume the supervisor. The
+   new wrapper generation must earn a fresh complete tree.
 
 ## Deadman
 
