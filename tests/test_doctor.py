@@ -1686,6 +1686,37 @@ def test_doctor_config_blocked_holds_warns_separately_and_ignores_malformed(tmp_
     assert any(c.name == "config_blocked_holds" for c in doctor.run(tmp_path).checks)
 
 
+def test_doctor_quota_blocked_holds_warns_never_errors_and_shows_reset_instant(
+    tmp_path: Path,
+) -> None:
+    """#126: a provider quota/billing refusal must read `warn`, NEVER `error` - it
+    self-heals on the provider's own reset instant, no operator repair needed."""
+    s = Store(tmp_path)
+    s.init(["worker", "other"])
+    s.write_quota_blocked_hold("worker", summary="usage limit hit",
+                              reset_at="2026-08-05T06:10:00Z")
+    bad = s.quota_blocked_hold_path("other")
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text(json.dumps({"agent": "other", "state": "wrong"}), encoding="utf-8")
+
+    chk = doctor._check_quota_blocked_holds(s)
+    assert chk.status == "warn"
+    assert chk.name == "quota_blocked_holds"
+    assert "worker" in chk.details
+    assert "2026-08-05T06:10:00Z" in chk.details
+    assert "usage limit hit" in chk.details
+    assert "no operator action needed" in chk.fix
+    assert [h["agent"] for h in chk.data["holds"]] == ["worker"]
+    assert any(c.name == "quota_blocked_holds" for c in doctor.run(tmp_path).checks)
+
+
+def test_doctor_quota_blocked_holds_absent_when_no_hold_exists(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["worker"])
+    assert doctor._check_quota_blocked_holds(s) is None
+    assert not any(c.name == "quota_blocked_holds" for c in doctor.run(tmp_path).checks)
+
+
 def test_check_codex_config_warns_on_duplicate_tables(tmp_path: Path, monkeypatch) -> None:
     """`doctor` must WARN (with a repair hint) when a codex config.toml holds duplicate
     [projects] tables — invalid TOML the codex CLI rejects — instead of returning ok as

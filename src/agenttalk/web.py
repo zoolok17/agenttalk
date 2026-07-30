@@ -2324,6 +2324,10 @@ def build_onboarding(desc: RootDescriptor, *,
 _ATTENTION_SOURCE_MAP: dict[str, tuple[str, str, str]] = {
     _attention.SOURCE_NEEDS_OPERATOR: ("escalation", "ESCALATION", "high"),
     _attention.SOURCE_CONFIG_BLOCKED: ("gate", "GATE HOLD", "high"),
+    # Distinct from GATE HOLD (#126): no operator repair clears this - only the
+    # provider's own reset instant does. "low" severity, its own label, so it never
+    # reads as urgent/actionable the way a config-blocked gate hold does.
+    _attention.SOURCE_QUOTA_BLOCKED: ("quota_blocked", "QUOTA BLOCKED", "low"),
     _attention.SOURCE_GATE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_CLOSE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_DEAD_LETTER: ("deadletter", "DEAD LETTER", "med"),
@@ -2362,6 +2366,11 @@ def _collect_web_attention_items(store: Store, roster: list[str],
         items += A.config_blocked_items(holds)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("config_blocked", str(e)))
+    try:
+        quota_holds = [h for a in roster if (h := store.read_quota_blocked_hold(a))]
+        items += A.quota_blocked_items(quota_holds)
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("quota_blocked", str(e)))
     try:
         items += A.dead_letter_items(store.list_dead_letters())
     except Exception as e:  # noqa: BLE001

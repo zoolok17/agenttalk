@@ -42,6 +42,18 @@ CLASS_INFRA_RETRY_EXHAUSTED = "infra_retry_exhausted"
 # ceiling trips -> NEVER dead-lettered) yet re-drives every poll, so the worker self-heals the
 # instant the operator clears the hold. See _hold_park + the failed-turn branch below (#62).
 CLASS_GATEWAY_HELD = "gateway_held"
+# A provider quota/billing refusal (task #126): the account-level wall a relaunch or a
+# retry cannot clear (retrying burns attempts toward K_escalate and dead-letters valid
+# work; a relaunched agent fails identically in seconds). Distinct from CLASS_INFRA
+# (a transient outage that DOES clear with retry) and CLASS_GATEWAY_HELD (a mint-time,
+# no-child-spawned hold): a quota refusal only reveals itself after a real turn ran and
+# the provider refused. Like gateway_held, the write-ahead attempt is cleared (no
+# counter climbs -> never dead-lettered) and the head stays UNCOMMITTED so it
+# self-heals - but unlike gateway_held (cheap to recheck every poll), re-driving means
+# spawning the real CLI again, so a DURABLE per-agent hold (store.write_quota_blocked_hold)
+# gates re-driving until the parsed reset instant passes, rather than hammering the
+# provider every poll. See _quota_park + the failed-turn/pre-drive branches below.
+CLASS_QUOTA_BLOCKED = "quota_blocked"
 
 
 @dataclass(frozen=True)
@@ -58,6 +70,9 @@ class DriveOutcome:
     bus_action_attempted: bool = False
     bus_action_infra: bool = False
     bus_action_rejected: bool = False
+    # The provider's own stated reset instant (ISO UTC), when CLASS_QUOTA_BLOCKED and the
+    # refusal text carried one (see run.py's _parse_quota_refusal). None otherwise.
+    quota_reset_at: str | None = None
 
 
 def _as_outcome(ret: object) -> DriveOutcome:
@@ -553,6 +568,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
 
     config_blocked_ids: set[str] = set()
     gateway_held_escalated: set[str] = set()
+    quota_blocked_escalated: set[str] = set()
 
     def _park_config_blocked(record: dict, *, reason_code: str = "config_blocked") -> None:
         """Hold a deterministic local config denial (e.g. a held gateway, an exec-denied bus
@@ -611,6 +627,37 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     on_escalate(_info(record, {}, CLASS_GATEWAY_HELD))
             except Exception:  # noqa: BLE001, S110  # nosec
                 pass
+        store.clear_attempt(agent, head_id)
+        stamp()                          # blocked != dead: keep heartbeat + lead-loop lease fresh
+        last_hb = clock()
+        sleep(fail_sleep)
+        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+
+    def _quota_park(record: dict, *, reset_at: str | None, summary: str) -> None:
+        """Blocked-but-alive park for a PROVIDER QUOTA/BILLING REFUSAL (CLASS_QUOTA_BLOCKED,
+        #126): the turn ran and the provider refused with an account-level wall that a retry
+        cannot clear. CLEAR the write-ahead attempt (mirrors _hold_park) so no failure counter
+        climbs and attempts_started never reaches K_escalate -> never dead-lettered. Write a
+        DURABLE per-agent hold (reset_at when the provider's text stated one) so status/doctor/
+        web/console surface "quota-blocked until <instant>" instead of the self-report's
+        cheerful/errored guess, and so the PRE-DRIVE check below (unlike gateway_held's cheap
+        mint-time recheck) can skip re-driving - spawning the real CLI again - until that
+        instant passes, rather than hammering the provider every poll. The heartbeat is
+        re-stamped (blocked != dead), so the supervisor does not restart it. Health is surfaced
+        by drive()'s health_writer.failure (STATE_RATE_LIMITED_OR_OUTAGE + 'quota_blocked'), so
+        this park does not also write health. Escalate ONCE per head, same dedup shape as
+        _hold_park (gateway_held_escalated) but keyed on quota_blocked_escalated - a silent
+        20-retry-then-dead-letter loop is exactly the incident this exists to stop."""
+        nonlocal last_hb, fail_sleep
+        head_id = record.get("id")
+        if isinstance(head_id, str) and head_id not in quota_blocked_escalated:
+            quota_blocked_escalated.add(head_id)
+            try:                              # a notification must never crash the loop
+                if on_escalate is not None:
+                    on_escalate(_info(record, {}, CLASS_QUOTA_BLOCKED))
+            except Exception:  # noqa: BLE001, S110  # nosec
+                pass
+        store.write_quota_blocked_hold(agent, summary=summary, reset_at=reset_at)
         store.clear_attempt(agent, head_id)
         stamp()                          # blocked != dead: keep heartbeat + lead-loop lease fresh
         last_hb = clock()
@@ -1096,6 +1143,19 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 config_blocked_ids.add(head_id)
             _park_config_blocked(record)
             continue
+        # PRE-DRIVE quota check (#126): unlike gateway_held (cheap to recheck every poll
+        # inside the mint call, no child spawned), re-driving a quota-blocked head means
+        # spawning the real CLI again - so gate on the DURABLE hold's reset instant instead
+        # of blind per-poll retry. `read_quota_blocked_hold` self-expires (returns None once
+        # the instant passes), so this naturally stops firing the moment quota clears - no
+        # explicit clear, no operator action. Checked BEFORE record_attempt_start: never
+        # consumes an attempt while blocked.
+        now_epoch = datetime.fromisoformat(now_iso().replace("Z", "+00:00")).timestamp()
+        quota_hold = store.read_quota_blocked_hold(agent, now_epoch=now_epoch)
+        if quota_hold is not None:
+            _quota_park(record, reset_at=quota_hold.get("reset_at"),
+                       summary=quota_hold.get("summary") or "")
+            continue
         # AUTO-DISPOSE WITHOUT DRIVE if a cap is already reached on entry (covers the
         # relaunch/crash-accumulation path - test #3).
         if rec.get("last_failure_class") != CLASS_CONFIG_BLOCKED:
@@ -1264,6 +1324,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             # clears. Must precede record_attempt_result so gateway_held is never written to the
             # ledger (and so it can never reach a dispose ceiling). See _hold_park.
             _hold_park(record)
+            continue
+        if outcome.failure_class == CLASS_QUOTA_BLOCKED:
+            # PROVIDER QUOTA/BILLING REFUSAL (#126): do NOT persist an attempt result - the
+            # account-level wall a retry cannot clear would otherwise climb toward K_escalate
+            # and dead-letter valid work (the exact incident this exists to stop). Must precede
+            # record_attempt_result so quota_blocked is never written to the ledger. See
+            # _quota_park.
+            _quota_park(record, reset_at=outcome.quota_reset_at, summary=outcome.summary)
             continue
         # record the classified failure (clears in_progress), then decide.
         store.record_attempt_result(agent, head_id, failure_class=outcome.failure_class,

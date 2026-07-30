@@ -15,6 +15,7 @@ from .loop import (
     CLASS_GATEWAY_HELD,
     CLASS_INFRA,
     CLASS_POISON,
+    CLASS_QUOTA_BLOCKED,
 )
 
 
@@ -196,6 +197,13 @@ def classify_failure(sig: dict[str, Any], failure_class: str | None) -> tuple[st
         # blocked-on-a-held-gateway (that will self-heal on clear), not a frozen or dead one.
         # Checked before the sig["error"] branch below, which the hold also sets.
         return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "gateway_held"
+    if failure_class == CLASS_QUOTA_BLOCKED:
+        # Provider quota/billing refusal (#126): a pure billing condition, NOT a crashed or
+        # stuck agent - honestly rate-limited/outage-like and self-healing on the provider's
+        # own reset instant. Distinct reason_code so status/doctor never render this as
+        # errored_ambiguous (the #126 incident: a wrapper burned 20 retries and got
+        # dead-lettered while surfacing as a crashed agent).
+        return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "quota_blocked"
     if sig.get("error"):
         return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "spawn_exec_error"
     rc = sig.get("rc")

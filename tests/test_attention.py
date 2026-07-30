@@ -425,6 +425,51 @@ def test_needs_operator_item_carries_typed_fields_and_surfaces_malformed() -> No
     assert bad[0]["item_id"] == "needs_operator:esc-2"          # still surfaces
 
 
+def test_quota_blocked_items_shape_has_no_operator_remedy() -> None:
+    # #126: unlike config_blocked, nothing an operator does clears this early - only the
+    # provider's own reset instant does.
+    items = att.quota_blocked_items([{
+        "agent": "codex-agenttalk-developer-4",
+        "summary": "provider quota/billing refusal: usage limit",
+        "reset_at": "2026-08-05T06:10:00Z",
+        "at": "2026-07-30T20:36:01Z",
+    }])
+    assert len(items) == 1
+    it = items[0]
+    assert it["source"] == att.SOURCE_QUOTA_BLOCKED
+    assert it["human_can_unblock_now"] is False
+    assert it["priority"] == "normal"
+    assert it["risk_severity"] == "low"
+    assert "codex-agenttalk-developer-4" in it["title"]
+    assert "2026-08-05T06:10:00Z" in it["title"]
+    assert it["why_it_matters"] == "provider quota/billing refusal: usage limit"
+
+
+def test_quota_blocked_items_without_reset_at_still_surfaces() -> None:
+    items = att.quota_blocked_items([{"agent": "beta", "summary": "usage limit hit",
+                                      "reset_at": None, "at": "2026-07-30T20:36:01Z"}])
+    assert len(items) == 1
+    assert "reset time unknown" in items[0]["title"]
+
+
+def test_build_queue_dedupes_quota_blocked_holds_for_the_same_agent() -> None:
+    # Mirrors config_blocked's own dedup test: two quota-blocked notices for the same
+    # agent+window collapse to one representative + one duplicate ref (gate 1).
+    holds = att.quota_blocked_items([{"agent": "beta", "summary": "usage limit hit",
+                                      "reset_at": "2026-08-05T06:10:00Z"}])
+    dup = att.quota_blocked_items([{"agent": "beta", "summary": "usage limit hit",
+                                    "reset_at": "2026-08-05T06:10:00Z"}])
+    q = att.build_queue(holds + dup, [], now_iso=_now())
+    qb = [i for i in q["items"] if i["source"] == att.SOURCE_QUOTA_BLOCKED]
+    assert len(qb) == 1 and len(qb[0]["duplicates"]) == 1   # one rep, one duplicate ref
+
+    # A DIFFERENT reset window is content-DIFFERENT (source_hash differs), so a prior
+    # disposition on the first window does not silently carry over to it.
+    later = att.quota_blocked_items([{"agent": "beta", "summary": "usage limit hit again",
+                                      "reset_at": "2026-08-06T09:00:00Z"}])[0]
+    assert later["source_hash"] != qb[0]["source_hash"]
+
+
 def test_build_queue_dedupes_display_keeps_all_ids() -> None:
     # two config_blocked notices for the same agent+summary collapse to one representative
     holds = att.config_blocked_items([{"agent": "beta", "summary": "python not found"}])

@@ -5147,6 +5147,82 @@ class Store:
             except (FileNotFoundError, OSError):
                 pass
 
+    # ------------------------------------------- durable quota-blocked hold
+    #
+    # A provider quota/billing refusal (task #126) is a distinct terminal class
+    # from ambiguous_or_unknown: retrying against a wall that cannot clear burns
+    # attempts and dead-letters valid work. Unlike config_blocked (which sticky-
+    # parks until an operator repairs/restarts), this hold SELF-EXPIRES once the
+    # stated reset instant passes - `read_quota_blocked_hold` returns None past
+    # that instant, with no explicit clear required, so the wrapper naturally
+    # re-drives and the operator surfaces naturally stop showing it.
+
+    def quota_blocked_hold_path(self, agent: str) -> Path:
+        return self.state_dir / "quota-blocked-hold" / f"{validate_agent_name(agent)}.json"
+
+    def write_quota_blocked_hold(self, agent: str, *, summary: str = "",
+                                 reset_at: str | None = None) -> None:
+        """Atomically record that ``agent`` is blocked on a provider quota/billing
+        refusal. ``reset_at`` is the parsed reset instant (ISO UTC) when the
+        provider's own text stated one, else None (still a hold, just with an
+        unknown clear time - the caller falls back to bounded backoff)."""
+        payload = {
+            "agent": validate_agent_name(agent),
+            "state": "quota_blocked",
+            "summary": str(summary or ""),
+            "reset_at": reset_at if isinstance(reset_at, str) else None,
+            "at": _now_iso(),
+        }
+        with self._config_lock():
+            p = self.quota_blocked_hold_path(agent)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(p, json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def read_quota_blocked_hold(self, agent: str, *,
+                                now_epoch: float | None = None) -> dict | None:
+        """Return the validated quota-blocked hold marker, or None if absent,
+        invalid, or SELF-EXPIRED (``now_epoch`` at/after ``reset_at``) - the
+        expiry check that lets a quota hold clear without operator action."""
+        expected = validate_agent_name(agent)
+        p = self.quota_blocked_hold_path(agent)
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8").strip() or "null")
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("agent") != expected or data.get("state") != "quota_blocked":
+            return None
+        summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+        at = data.get("at") if isinstance(data.get("at"), str) else None
+        reset_at = data.get("reset_at") if isinstance(data.get("reset_at"), str) else None
+        if reset_at is not None:
+            from agenttalk.health import parse_iso
+            parsed = parse_iso(reset_at)
+            if parsed is None:
+                reset_at = None  # torn/unparseable - keep the hold, drop the stale instant
+            else:
+                now = time.time() if now_epoch is None else float(now_epoch)
+                if now >= parsed.timestamp():
+                    return None  # self-expired: the reset instant has passed
+        return {
+            "agent": expected,
+            "state": "quota_blocked",
+            "summary": summary,
+            "reset_at": reset_at,
+            "at": at,
+        }
+
+    def clear_quota_blocked_hold(self, agent: str) -> None:
+        """Remove the quota-blocked hold marker (best-effort; never raises)."""
+        with self._config_lock():
+            try:
+                self.quota_blocked_hold_path(agent).unlink()
+            except (FileNotFoundError, OSError):
+                pass
+
     # ----------------------------------------- managed lead-loop (Slice 1)
     #
     # A managed lead-loop identity is a wrapped controller that OWNS its team

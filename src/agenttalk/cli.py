@@ -6197,6 +6197,12 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
         items += A.config_blocked_items(holds)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("config_blocked", str(e)))
+    # quota_blocked holds (per roster agent, task #126)
+    try:
+        quota_holds = [h for a in roster if (h := store.read_quota_blocked_hold(a))]
+        items += A.quota_blocked_items(quota_holds)
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("quota_blocked", str(e)))
     # dead-letter (ALL; build_queue hides resolved via the resolve_dead_letter disposition)
     try:
         items += A.dead_letter_items(store.list_dead_letters())

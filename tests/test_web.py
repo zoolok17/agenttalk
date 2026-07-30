@@ -5096,6 +5096,26 @@ def test_api_attention_hides_resolved_dead_letter_and_keeps_unresolved(
     assert f"dead_letter:beta:{unresolved_id}" in dead_letters
 
 
+def test_api_attention_surfaces_quota_blocked_hold(tmp_path: Path) -> None:
+    # #126: a provider quota/billing refusal reaches /api/attention the same way a
+    # config_blocked hold does, with the reset instant visible and no operator remedy.
+    s = _make_store(tmp_path)
+    s.write_quota_blocked_hold("alpha", summary="usage limit hit",
+                              reset_at="2026-08-05T06:10:00Z")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    quota_items = [i for i in payload["items"] if i["source"] == "quota_blocked"]
+    assert len(quota_items) == 1
+    assert quota_items[0]["human_can_unblock_now"] is False
+    assert "2026-08-05T06:10:00Z" in quota_items[0]["title"]
+
+
 def test_api_attention_shape_and_gate_hold(tmp_path: Path) -> None:
     """§4a: /api/attention returns the ranked envelope, and a gate HOLD surfaces
     with the frozen wire fields. Envelope-only — no raw body leaks."""

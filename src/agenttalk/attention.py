@@ -53,6 +53,7 @@ _MAX_AFFECTED = 20
 # --- sources ---
 SOURCE_NEEDS_OPERATOR = "needs_operator"
 SOURCE_CONFIG_BLOCKED = "config_blocked"
+SOURCE_QUOTA_BLOCKED = "quota_blocked"
 SOURCE_DEAD_LETTER = "dead_letter"
 SOURCE_GATE_HOLD = "gate_hold"
 SOURCE_CLOSE_HOLD = "close_hold"
@@ -65,6 +66,7 @@ SOURCE_ERROR = "source_error"
 _SOURCE_WEIGHT = {
     SOURCE_NEEDS_OPERATOR: 100,
     SOURCE_CONFIG_BLOCKED: 90,
+    SOURCE_QUOTA_BLOCKED: 88,
     SOURCE_COORDINATION_STALL: 85,
     SOURCE_DEAD_LETTER: 80,
     SOURCE_GATE_HOLD: 70,
@@ -80,6 +82,7 @@ _SOURCE_WEIGHT = {
 _ALWAYS_BLOCKING = frozenset({SOURCE_NEEDS_OPERATOR, SOURCE_DEAD_LETTER})
 _ADVISORY_CAPABLE = frozenset({
     SOURCE_CONFIG_BLOCKED,
+    SOURCE_QUOTA_BLOCKED,
     SOURCE_GATE_HOLD,
     SOURCE_CLOSE_HOLD,
     SOURCE_LEAD_UNARMED,
@@ -674,6 +677,30 @@ def config_blocked_items(holds: list[dict]) -> list[dict]:
                               "priority": "high", "risk_severity": "high"},
                       source_refs=[{"kind": "config_blocked", "agent": ag}])
         it["dedupe_key"] = dedupe_key(SOURCE_CONFIG_BLOCKED, identity=ag)
+        out.append(it)
+    return out
+
+
+def quota_blocked_items(holds: list[dict]) -> list[dict]:
+    """Each hold: {agent, summary, reset_at, at} (task #126). Content-bound on
+    summary+reset_at, so a NEW quota window for the same agent resurfaces despite
+    a prior disposition. ``human_can_unblock_now=False``: unlike config_blocked,
+    there is no operator repair - only the provider's own reset instant clears it."""
+    out = []
+    for h in holds:
+        ag = h.get("agent", "")
+        reset_at = h.get("reset_at")
+        why = h.get("summary") or "provider quota/billing refusal"
+        title = (f"quota-blocked: {ag} (until {reset_at})" if reset_at
+                else f"quota-blocked: {ag} (reset time unknown)")
+        it = _mk_item(SOURCE_QUOTA_BLOCKED, item_id(SOURCE_QUOTA_BLOCKED, ag),
+                      title=title,
+                      ident_content={"agent": ag, "summary": why, "reset_at": reset_at},
+                      human_can_unblock_now=False,
+                      fields={"why_it_matters": why, "priority": "normal",
+                              "risk_severity": "low"},
+                      source_refs=[{"kind": "quota_blocked", "agent": ag}])
+        it["dedupe_key"] = dedupe_key(SOURCE_QUOTA_BLOCKED, identity=ag)
         out.append(it)
     return out
 
