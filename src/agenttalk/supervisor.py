@@ -6132,24 +6132,68 @@ function Stop-Tree($targets) {
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
-function Test-AgenttalkExecutionModeToken([string]$token) {
-  # THE closed, checked terminal set for "does this prefix token stop
-  # CPython from ever reaching a later declared position" - derived from
-  # CPython's own documented invocation grammar (`python --help`):
-  #   usage: python [option] ... [-c cmd | -m mod | file | -] [arg] ...
-  # Every one of those four forms terminates option scanning and
-  # dispatches immediately. This function is the single source of truth
-  # for that set - see test_supervisor_execution_mode_terminal_set_is_closed,
-  # which enumerates it and asserts each form is classified true, so a
-  # missed fifth spelling fails a test instead of shipping as a comment
-  # that says "closed" without checking it. (I2, 4th leak: '-' - the
-  # documented stdin dispatch - is not "a dash-prefixed non-execution-mode
-  # flag"; a prior version of this check treated it as one.)
-  if ($token -eq '-') { return $true }                              # stdin
-  if ($token -eq '-c' -or $token.StartsWith('-c')) { return $true } # command (attached forms too)
-  if ($token -eq '-m' -or $token.StartsWith('-m')) { return $true } # module (attached forms too)
-  if ($token -eq '--') { return $true }                             # end of options
-  if (-not $token.StartsWith('-')) { return $true }                 # script path
+function Test-AgenttalkAllowedInterpreterPrefixToken([string]$token) {
+  # ALLOWLIST, not a reject list. (I2, 5th leak: --version/-V/-h/-?/--help*
+  # ran NO program at all - CPython prints and exits before ever reaching
+  # -m - which a REJECT list closed over "which tokens change execution
+  # mode" can never catch, because refusing NO-program tokens is a
+  # different property than refusing WRONG-program tokens, and a reject
+  # list accepts anything it does not specifically know to be dangerous.
+  # The property that actually matters is "does CPython reach the
+  # declared module", and the only check that can never leak by omission
+  # is refusing everything not affirmatively known-safe.)
+  #
+  # Each entry justified against what THIS project actually needs in a
+  # declared prefix, not "seems safe in the abstract":
+  #   -u  unbuffered stdout/stderr - serves #117 directly: an unbuffered
+  #       child flushes into BoundedStreamTee promptly instead of sitting
+  #       in CPython's own buffer.
+  #   -I  isolated mode (implies -E -P -S) - hardening; does not change
+  #       WHICH module CPython reaches, only what environment it sees
+  #       once there.
+  #   -S  skip implicit 'import site' - hardening. NOTE: can break
+  #       resolving `agenttalk` itself if it is installed via
+  #       site-packages rather than reachable without site processing -
+  #       a launch-configuration footgun for the operator to own, not a
+  #       security bypass of this check (CPython still reaches -m
+  #       agenttalk, or fails loudly with ModuleNotFoundError).
+  #   -B  never write .pyc files - no execution-mode or security effect.
+  #   -E  ignore PYTHON* environment variables - hardening. NOTE: can
+  #       break a dev checkout relying on PYTHONPATH (SrcOnPyPath) - same
+  #       kind of launch-configuration caveat as -S, not a check gap.
+  #   -P  don't prepend a possibly-unsafe path to sys.path - hardening.
+  #   -X  implementation-specific options, ATTACHED form only (e.g.
+  #       -Xutf8) - CPython's own scanner always continues past -X to the
+  #       next token; it never changes or suppresses execution by itself.
+  #       The bare, separate-token form (-X utf8) is refused: a value
+  #       token dangling after a bare -X is indistinguishable from a
+  #       script-path token without knowing -X consumes a value, which is
+  #       exactly the "which flags consume a value" problem this
+  #       mechanism declines to solve (round 4).
+  #
+  # Deliberately excluded despite looking superficially safe:
+  #   -O/-OO strips `assert` statements, and this codebase has already
+  #     been bitten once by code that relied on asserts silently
+  #     vanishing under an optimized launch (814b645) - no reason to
+  #     reopen that class here.
+  #   -i (inspect after running) does not bypass -m, but parks the
+  #     process at an interactive prompt afterward instead of exiting -
+  #     a different failure mode this project has no use for.
+  # Anything else - known CPython flag or novel spelling, safe-looking or
+  # not - is refused. An option CPython adds in a future release fails
+  # closed by default instead of shipping.
+  # -ceq/-cstartswith throughout: PowerShell's default -eq is
+  # case-INSENSITIVE, which would silently equate e.g. -i with -I - two
+  # DIFFERENT CPython flags (-i inspects after running; -I is isolated
+  # mode) - and let the deliberately-excluded lowercase form through the
+  # allowlist by accident.
+  if ($token -ceq '-u' -or $token -ceq '-I' -or $token -ceq '-S' -or
+      $token -ceq '-B' -or $token -ceq '-E' -or $token -ceq '-P') {
+    return $true
+  }
+  if ($token.Length -gt 2 -and $token.StartsWith('-X', [StringComparison]::Ordinal)) {
+    return $true
+  }
   return $false
 }
 function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom = $null) {
@@ -6187,14 +6231,16 @@ function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom 
   # same-named formal parameter, and the function then sees an empty list
   # regardless of what the caller passed.
   #
-  # (I2, FINAL gap.) Declaring WHERE '-m agenttalk' sits proves the
-  # POSITION, not that CPython ever REACHES it: an execution-mode token in
-  # the declared prefix dispatches before scanning gets to the declared
-  # index, and the position check above would still pass. This is a
-  # REJECT list, not an accept list - anything in the prefix that
-  # Test-AgenttalkExecutionModeToken classifies as a terminal dispatch is
-  # refused, and that function (not this comment) is the checked source
-  # of truth for which tokens those are.
+  # (I2, FINAL gap - narrower each of five rounds, closed by inversion
+  # this time.) Declaring WHERE '-m agenttalk' sits proves the POSITION,
+  # not that CPython ever REACHES it. Every REJECT-list attempt at this
+  # (which flags are safe / which consume a value / which change
+  # execution mode) accepted anything it did not specifically know to be
+  # dangerous, so each novel prefix shape shipped once before the next
+  # round caught it. This is now an ALLOW list - anything in the prefix
+  # that Test-AgenttalkAllowedInterpreterPrefixToken does not affirmatively
+  # recognize is refused, and that function (not this comment) is the
+  # checked source of truth for which tokens those are.
   #
   # module_args_from is an operator-declared config value, not argv - a
   # malformed one ("1x") must not throw under $ErrorActionPreference =
@@ -6212,11 +6258,16 @@ function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom 
   }
   if ($index -lt 0 -or $index -ge $argTokens.Count) { return -1 }
   for ($p = 0; $p -lt $index; $p++) {
-    if (Test-AgenttalkExecutionModeToken ([string]$argTokens[$p])) { return -1 }
+    if (-not (Test-AgenttalkAllowedInterpreterPrefixToken ([string]$argTokens[$p]))) {
+      return -1
+    }
   }
+  # Case-sensitive: CPython's own option parsing is case-sensitive (-m is
+  # not -M; PowerShell's default -eq is not), and the module name argument
+  # is an exact string CPython passes to the import system verbatim.
   if ($index + 1 -lt $argTokens.Count -and
-      [string]$argTokens[$index] -eq '-m' -and
-      [string]$argTokens[$index + 1] -eq 'agenttalk') {
+      [string]$argTokens[$index] -ceq '-m' -and
+      [string]$argTokens[$index + 1] -ceq 'agenttalk') {
     return $index
   }
   return -1
@@ -6699,6 +6750,24 @@ namespace Agenttalk {
         stdinHandle = OpenInherited("NUL", GENERIC_READ, OPEN_EXISTING);
         stdoutHandle = OpenOutputOrNull(stdoutPath, out stdoutDegraded);
         stderrHandle = OpenOutputOrNull(stderrPath, out stderrDegraded);
+        if (stdoutDegraded && stderrDegraded) {
+          // The both-degraded decision must be made HERE, before the child
+          // is created - not left to the caller to notice after the fact.
+          // CreateProcess+ResumeThread below would start the child with the
+          // caller's already-applied wrapper-log capability env vars
+          // (nonce, AGENTTALK_WRAPPER_STDOUT_LOG/STDERR_LOG) inherited
+          // regardless of which handles it actually got, so a child
+          // launched past this point would authenticate against those
+          // vars and have BoundedStreamTee recreate the generation
+          // directory on its own - even though the caller, seeing
+          // Redirected=false, already discarded it. Throwing before
+          // CreateProcess routes through the SAME catch below that an
+          // exact-handle failure already uses, which falls back to an
+          // unredirected launch that strips the capability env vars first.
+          throw new IOException(
+            "both wrapper log targets are unavailable; refusing to launch " +
+            "an authenticated child with neither stream genuinely redirected");
+        }
 
         handleArray = Marshal.AllocHGlobal(IntPtr.Size * 3);
         Marshal.WriteIntPtr(handleArray, 0, stdinHandle);
@@ -6849,17 +6918,18 @@ function Start-WrapperProcess([hashtable]$startArgs) {
           Write-Warning (
             "supervisor: wrapper stderr log is unavailable; redirected to NUL")
         }
-        # I1, 2nd leak: OpenOutputOrNull degrades EACH side independently by
-        # substituting NUL and continuing - it never throws, so ::Start
-        # returns normally even when BOTH sides degraded, and the caller
-        # (Launch/Launch-Spec) commits the generation on Redirected=true
-        # alone. Redirected is a predicate over the RESULT, not over whether
-        # ::Start threw: true only if at least one advertised base log is
-        # genuinely pointed at by an inherited stream. A one-side-degraded
-        # launch still commits (the other side IS real evidence); a
-        # both-degraded launch - no inherited stream points at either
-        # advertised file - must not, matching the invariant that already
-        # governs the exact-handle-unavailable fallback path below.
+        # I1, 2nd leak, closed at the source rather than after the fact:
+        # ::Start now throws BEFORE CreateProcess when both sides degrade
+        # (the child must never inherit the authenticated wrapper-log env
+        # vars if it is about to run with neither stream genuinely
+        # redirected), so this line only ever runs with at most one side
+        # degraded. Redirected is still a predicate over the RESULT, not
+        # over whether ::Start threw - true only if at least one advertised
+        # base log is genuinely pointed at by an inherited stream. A
+        # one-side-degraded launch still commits (the other side IS real
+        # evidence); the both-degraded shape can no longer reach here at
+        # all, matching the invariant that already governs the
+        # exact-handle-unavailable fallback path below.
         return [pscustomobject]@{
           Process = $launchResult.Process
           Redirected = -not ($launchResult.StdoutDegraded -and $launchResult.StderrDegraded)

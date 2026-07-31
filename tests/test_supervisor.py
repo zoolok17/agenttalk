@@ -6062,37 +6062,53 @@ def _pslit(v: str) -> str:
     return "'" + str(v).replace("'", "''") + "'"
 
 
-def test_supervisor_execution_mode_terminal_set_is_closed(tmp_path: Path) -> None:
-    """I2, 4th leak (PR 98 connector re-review): a literal bare '-' (CPython's
-    documented stdin dispatch) passed the old prefix filter - it starts with
-    '-', so 'not StartsWith(-)' was false, and it matched none of -m/-c/--.
-    Test-AgenttalkExecutionModeToken is now the single, named, checked source
-    of truth for the terminal set (derived from `python --help`'s own
-    [-c cmd | -m mod | file | -] grammar) - enumerate it directly here so a
-    missed fifth spelling fails THIS test, not a future round of findings."""
+def test_supervisor_allowed_interpreter_prefix_token_is_exhaustive(tmp_path: Path) -> None:
+    """I2, 5th leak (PR 98 connector re-review of 0c3179d): --version/-V/-h/
+    -?/--help* run NO program at all - CPython prints and exits before ever
+    reaching -m - which the prior REJECT list (closed over "which tokens
+    change execution mode") could never catch: refusing NO-program tokens
+    is a different property than refusing WRONG-program tokens, and a
+    reject list accepts anything it does not specifically know is
+    dangerous. Inverted to an ALLOW list:
+    Test-AgenttalkAllowedInterpreterPrefixToken is now the single, named,
+    checked source of truth for which prefix tokens are accepted -
+    enumerate the accepted set directly here (so a missed member fails a
+    test), and assert a sample of terminating options, execution-mode
+    tokens, and invented spellings are all refused."""
     shell = _pick_powershell()
     if not shell:
         return
     helpers = _exec_helpers(tmp_path)
-    out = tmp_path / "execution_mode_terminal_set.json"
-    terminal = [
+    out = tmp_path / "allowed_prefix_tokens.json"
+    allowed = ["-u", "-I", "-S", "-B", "-E", "-P", "-Xutf8", "-Xdev", "-X3"]
+    refused = [
+        # execution-mode tokens (I2, rounds 1-4)
         "-", "-m", "-mfoo", "-magenttalk", "-c", "-cprint(1)", "--",
         "script.py", "helper.py", "agenttalk",
+        # terminating options - run NO program at all (I2, 5th leak, this round)
+        "--version", "-V", "-h", "-?", "--help", "--help-env",
+        "--help-xoptions", "--help-all",
+        # -X's own separate-token form (no attached value) is not supported
+        "-X",
+        # deliberately excluded despite looking superficially safe
+        "-O", "-OO", "-i",
+        # invented / never-real spellings
+        "-Z", "-3", "-Q", "-Wignore",
     ]
-    non_terminal = ["-u", "-X", "-Xutf8", "-P", "-O", "-B", "-E", "-s", "-S", "-Z", "-3"]
     harness = "\n".join([
         "$ErrorActionPreference = 'Stop'",
         helpers,
-        "$terminal = @(" + ",".join(_pslit(t) for t in terminal) + ")",
-        "$nonTerminal = @(" + ",".join(_pslit(t) for t in non_terminal) + ")",
-        "$terminalResults = @($terminal | ForEach-Object { Test-AgenttalkExecutionModeToken $_ })",
-        "$nonTerminalResults = @($nonTerminal | ForEach-Object { "
-        "Test-AgenttalkExecutionModeToken $_ })",
-        "@{ terminal = $terminalResults; non_terminal = $nonTerminalResults } | "
+        "$allowed = @(" + ",".join(_pslit(t) for t in allowed) + ")",
+        "$refused = @(" + ",".join(_pslit(t) for t in refused) + ")",
+        "$allowedResults = @($allowed | ForEach-Object { "
+        "Test-AgenttalkAllowedInterpreterPrefixToken $_ })",
+        "$refusedResults = @($refused | ForEach-Object { "
+        "Test-AgenttalkAllowedInterpreterPrefixToken $_ })",
+        "@{ allowed = $allowedResults; refused = $refusedResults } | "
         "ConvertTo-Json -Depth 3 | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
-    script = tmp_path / "execution-mode-terminal-set.ps1"
+    script = tmp_path / "allowed-prefix-tokens.ps1"
     script.write_text(harness, encoding="utf-8-sig")
     result = subprocess.run(
         [shell, "-NoProfile", "-File", str(script)],
@@ -6100,8 +6116,8 @@ def test_supervisor_execution_mode_terminal_set_is_closed(tmp_path: Path) -> Non
     )
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
     data = json.loads(out.read_text(encoding="utf-8-sig"))
-    assert data["terminal"] == [True] * len(terminal), data
-    assert data["non_terminal"] == [False] * len(non_terminal), data
+    assert data["allowed"] == [True] * len(allowed), data
+    assert data["refused"] == [False] * len(refused), data
 
 
 def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> None:
@@ -6156,6 +6172,13 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         # whole poll down over one agent's typo.
         "$malformedDeclared = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-u','-m','agenttalk','--root','R','wrap') $nonce '1x'",
+        # Same round: PowerShell's default -eq is case-INSENSITIVE, so the
+        # position check itself must be case-sensitive too, not just the
+        # prefix allowlist - CPython's -m is not -M, and the module name it
+        # passes to the import system is exact. '-M','AGENTTALK' must not
+        # be treated as '-m','agenttalk'.
+        "$wrongCaseModule = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-M','AGENTTALK','--root','R','wrap') $nonce",
         "$declaredOutOfRange = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-m','agenttalk','--root','R','wrap') $nonce 99",
         "$optionTerminator = Add-SupervisorLaunchNonce 'python.exe' "
@@ -6176,6 +6199,7 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "attached_command_declared = $attachedCommandDeclared; "
         "bare_stdin_declared = $bareStdinDeclared; "
         "malformed_declared = $malformedDeclared; "
+        "wrong_case_module = $wrongCaseModule; "
         "declared_out_of_range = $declaredOutOfRange; "
         "option_terminator = $optionTerminator; "
         "py_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $py.argv $py); "
@@ -6259,11 +6283,12 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "-P", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
         "--root", "R", "wrap",
     ]
-    assert data["generic_unknown_flag_declared"]["injected"] is True
-    assert data["generic_unknown_flag_declared"]["argv"] == [
-        "-Z", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
-        "--root", "R", "wrap",
-    ]
+    # I2, 5th leak: the mechanism inverted from a reject list to an allow
+    # list this round - an unrecognized flag is refused by default now,
+    # not accepted by default. -Z was never a real CPython flag; it is not
+    # on the allowlist, so it is refused like any other unrecognized token.
+    assert data["generic_unknown_flag_declared"]["injected"] is False
+    assert data["generic_unknown_flag_declared"]["missing_reason"] == "unsupported_launch_argv"
     # I2, FINAL gap: declaring WHERE '-m agenttalk' sits proves the position,
     # not that CPython ever reaches it. An attached -c'...' form in the
     # declared prefix dispatches command-mode before scanning gets to the
@@ -6279,6 +6304,10 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     # rather than throwing and taking the whole supervisor poll down.
     assert data["malformed_declared"]["injected"] is False
     assert data["malformed_declared"]["missing_reason"] == "unsupported_launch_argv"
+    # PowerShell's default -eq is case-insensitive; '-M','AGENTTALK' is not
+    # '-m','agenttalk' to CPython and must not be treated as if it were.
+    assert data["wrong_case_module"]["injected"] is False
+    assert data["wrong_case_module"]["missing_reason"] == "unsupported_launch_argv"
     # A declared index that doesn't actually land on '-m agenttalk' (here,
     # out of range) still fails closed - the declaration is verified, not
     # blindly trusted.
@@ -6707,6 +6736,107 @@ def test_ps_start_wrapper_process_reports_redirected_when_one_side_degrades(
         "one side is a genuine inherited stream - it is real evidence, so the "
         "generation still commits"
     )
+
+
+def test_ps_start_wrapper_process_strips_env_before_both_degraded_fallback(
+    tmp_path: Path,
+) -> None:
+    """I1, 2nd leak (PR 98 connector re-review of 0c3179d): Redirected was a
+    correct predicate computed too LATE - by the time it returned false,
+    ::Start had already CreateProcess+ResumeThread'd the child with the
+    caller's already-applied wrapper-log capability env vars (nonce,
+    AGENTTALK_WRAPPER_STDOUT_LOG/STDERR_LOG) inherited regardless of which
+    handles it actually got. A child that inherits those authenticates
+    and has BoundedStreamTee recreate the generation directory on its own,
+    even after the caller discards the pending record - a markerless
+    directory retention preserves forever.
+
+    Fixed at the source: ::Start now throws BEFORE CreateProcess when both
+    sides degrade, routing through the SAME catch that an exact-handle
+    failure already uses - which strips the env vars before falling back.
+    Drive the REAL exact-handle launcher (not stubbed) with both target
+    paths inside a directory that is never created, and confirm the env
+    vars a would-be child inherits are ALREADY stripped by the time the
+    fallback runs - not just that Redirected ends up false."""
+    # NOTE: this must NOT shadow Start-Process with a PowerShell function
+    # (unlike the fallback-strip test above) - Start-WrapperProcess gates
+    # the exact-handle attempt on `Get-Command Start-Process).CommandType
+    # -eq 'Cmdlet'`, so shadowing it would skip the real ::Start call
+    # entirely and always take the already-unavailable branch, passing
+    # regardless of whether the fix under test exists. Instead, let the
+    # REAL fallback Start-Process run for real (a harmless `-c pass`), and
+    # check THIS process's own environment afterward - the fallback path
+    # mutates it in place before spawning, so it is directly observable
+    # without intercepting the spawn call.
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / "both-degraded-env-strip.json"
+    missing_dir = tmp_path / "no-such-directory"
+    env_keys = [
+        "AGENTTALK_WRAPPER_STDOUT_LOG", "AGENTTALK_WRAPPER_STDERR_LOG",
+        "AGENTTALK_WRAPPER_LOG_MAX_BYTES", "AGENTTALK_WRAPPER_LOG_SEGMENTS",
+        "AGENTTALK_WRAPPER_LOG_NONCE",
+    ]
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        "$WrapperLogEnvKeys = @(" + ",".join(_pslit(k) for k in env_keys) + ")",
+        # Simulate what Launch already did before calling here: apply the
+        # capability env vars to THIS process's environment.
+        f"$env:AGENTTALK_WRAPPER_STDOUT_LOG = {_pslit(str(tmp_path / 'advertised-stdout.log'))}",
+        f"$env:AGENTTALK_WRAPPER_STDERR_LOG = {_pslit(str(tmp_path / 'advertised-stderr.log'))}",
+        "$env:AGENTTALK_WRAPPER_LOG_MAX_BYTES = '1048576'",
+        "$env:AGENTTALK_WRAPPER_LOG_SEGMENTS = '4'",
+        "$env:AGENTTALK_WRAPPER_LOG_NONCE = ('a' * 32)",
+        # A REAL, launchable executable - not a nonexistent filename - so
+        # the only thing that can make ::Start throw is the both-degraded
+        # check itself, not an unrelated CreateProcess failure.
+        "$startArgs = @{ FilePath = "
+        f"{_pslit(sys.executable)}; ArgumentList = "
+        f"{_pslit(subprocess.list2cmdline(['-c', 'pass']))}; "
+        "WorkingDirectory = "
+        f"{_pslit(str(tmp_path))}; "
+        "WindowStyle = 'Hidden'; PassThru = $true; "
+        "RedirectStandardOutput = "
+        f"{_pslit(str(missing_dir / 'stdout.log'))}; "
+        "RedirectStandardError = "
+        f"{_pslit(str(missing_dir / 'stderr.log'))} }}",
+        "$launch = Start-WrapperProcess $startArgs",
+        "$launch.Process.WaitForExit()",
+        "$strippedEnv = @{}",
+        "foreach ($k in $WrapperLogEnvKeys) { "
+        "$strippedEnv[$k] = [Environment]::GetEnvironmentVariable($k) }",
+        "@{ procId = $launch.Process.Id; "
+        "reportedRedirected = [bool]$launch.Redirected; "
+        "strippedEnv = $strippedEnv } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "both-degraded-env-strip.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    assert not missing_dir.exists(), "the missing directory must never get created"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["procId"]
+    assert payload["reportedRedirected"] is False
+    stripped = payload["strippedEnv"]
+    for key in env_keys:
+        assert stripped.get(key) is None, (
+            f"{key} survived into the both-degraded fallback child - it would "
+            "authenticate and have BoundedStreamTee recreate the discarded "
+            "generation directory on its own"
+        )
 
 
 def test_ps_launch_discards_targets_when_fallback_is_unredirected(
