@@ -6849,9 +6849,20 @@ function Start-WrapperProcess([hashtable]$startArgs) {
           Write-Warning (
             "supervisor: wrapper stderr log is unavailable; redirected to NUL")
         }
+        # I1, 2nd leak: OpenOutputOrNull degrades EACH side independently by
+        # substituting NUL and continuing - it never throws, so ::Start
+        # returns normally even when BOTH sides degraded, and the caller
+        # (Launch/Launch-Spec) commits the generation on Redirected=true
+        # alone. Redirected is a predicate over the RESULT, not over whether
+        # ::Start threw: true only if at least one advertised base log is
+        # genuinely pointed at by an inherited stream. A one-side-degraded
+        # launch still commits (the other side IS real evidence); a
+        # both-degraded launch - no inherited stream points at either
+        # advertised file - must not, matching the invariant that already
+        # governs the exact-handle-unavailable fallback path below.
         return [pscustomobject]@{
           Process = $launchResult.Process
-          Redirected = $true
+          Redirected = -not ($launchResult.StdoutDegraded -and $launchResult.StderrDegraded)
         }
       } catch {
         Write-Warning (

@@ -6591,6 +6591,124 @@ def test_ps_start_wrapper_process_fallback_strips_logging_env_vars(
         )
 
 
+def test_ps_start_wrapper_process_reports_unredirected_when_both_sides_degrade(
+    tmp_path: Path,
+) -> None:
+    """I1, 2nd leak (PR 98 connector re-review of fccb376): OpenOutputOrNull
+    substitutes NUL for EITHER side independently and never throws, so
+    ::Start returns normally even when BOTH stdout and stderr degraded to
+    NUL - the caller only checked whether ::Start THREW, not what it
+    actually opened, so Redirected was unconditionally true. Drive the
+    REAL exact-handle launcher (not stubbed) with both target paths inside
+    a directory that is never created, forcing CreateFile to fail for both
+    sides exactly like a stranded/unavailable log root would."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / "both-degraded.json"
+    missing_dir = tmp_path / "no-such-directory"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        "$startArgs = @{ FilePath = "
+        f"{_pslit(sys.executable)}; ArgumentList = "
+        f"{_pslit(subprocess.list2cmdline(['-c', 'pass']))}; "
+        "WorkingDirectory = "
+        f"{_pslit(str(tmp_path))}; PassThru = $true; "
+        "RedirectStandardOutput = "
+        f"{_pslit(str(missing_dir / 'stdout.log'))}; "
+        "RedirectStandardError = "
+        f"{_pslit(str(missing_dir / 'stderr.log'))} }}",
+        "$launch = Start-WrapperProcess $startArgs",
+        "$launch.Process.WaitForExit()",
+        "@{ procId = $launch.Process.Id; "
+        "reportedRedirected = [bool]$launch.Redirected } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "both-degraded.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    assert not missing_dir.exists(), "the missing directory must never get created"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["procId"]
+    assert payload["reportedRedirected"] is False, (
+        "both stdout and stderr degraded to NUL - no inherited stream points at "
+        "either advertised file, so Redirected must be false or the caller "
+        "commits an empty generation as real evidence"
+    )
+
+
+def test_ps_start_wrapper_process_reports_redirected_when_one_side_degrades(
+    tmp_path: Path,
+) -> None:
+    """Companion to the both-degraded case above: when only ONE side
+    degrades to NUL, the OTHER side is still a genuine inherited stream
+    pointed at its advertised file - real, if partial, evidence. Per the
+    stated invariant ("committable iff at least one advertised base log is
+    genuinely pointed at"), Redirected stays true and the generation is
+    still committed. Documented here rather than left implicit: a
+    one-side-degraded generation DOES commit and DOES participate in
+    retention like any other completed generation - only the both-degraded
+    (zero real streams) case is refused."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / "one-side-degraded.json"
+    missing_dir = tmp_path / "no-such-directory"
+    good_stdout = tmp_path / "stdout.log"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        "$startArgs = @{ FilePath = "
+        f"{_pslit(sys.executable)}; ArgumentList = "
+        f"{_pslit(subprocess.list2cmdline(['-c', 'pass']))}; "
+        "WorkingDirectory = "
+        f"{_pslit(str(tmp_path))}; PassThru = $true; "
+        "RedirectStandardOutput = "
+        f"{_pslit(str(good_stdout))}; "
+        "RedirectStandardError = "
+        f"{_pslit(str(missing_dir / 'stderr.log'))} }}",
+        "$launch = Start-WrapperProcess $startArgs",
+        "$launch.Process.WaitForExit()",
+        "@{ procId = $launch.Process.Id; "
+        "reportedRedirected = [bool]$launch.Redirected } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "one-side-degraded.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    assert not missing_dir.exists(), "the missing directory must never get created"
+    assert good_stdout.exists(), "the genuinely-open side must actually be written"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["procId"]
+    assert payload["reportedRedirected"] is True, (
+        "one side is a genuine inherited stream - it is real evidence, so the "
+        "generation still commits"
+    )
+
+
 def test_ps_launch_discards_targets_when_fallback_is_unredirected(
     tmp_path: Path,
 ) -> None:
