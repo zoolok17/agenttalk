@@ -1,31 +1,39 @@
 # Design 87-A module: owned-childless wrapper authority
 
-**Status:** Proposed, Revision 6; normative authority module of 87-A. This file
+**Status:** Proposed, Revision 7; normative authority module of 87-A. This file
 and
 [`DESIGN-87A-supervisor-classifier-authority.md`](DESIGN-87A-supervisor-classifier-authority.md)
 at the same commit form one specification. Neither is conforming alone.
 
 **Mode:** Reference.
 
-**Audience:** Contributors implementing tasks #78, #115, and #120, and
-reviewers checking teardown authority.
+**Audience:** Contributors implementing tasks #78, #115, and #120, the
+closure successor defined below, and reviewers checking teardown authority.
 
 ## Boundary and placement decision
 
 This module adds one authority case:
 `PROVABLY_CHILDLESS_OWNED_WRAPPER`. The authority rule belongs in 87-A because
-87-A owns the recovery combiner. The Windows tree-observation and closure
-mechanism does not: task #120 must receive a separate, independently reviewable
-mechanism design before implementation. 87-A defines the exact typed contract
-that design must satisfy.
+87-A owns the recovery combiner. The Windows tree-observation mechanism and
+post-kill launch barrier do not: task #120 owns those surfaces. The
+action-scoped child-creation closure and its effect-linearized
+acquire/reconcile/release adapters also do not belong to 87-A, but task #120
+does not implement them. This document assigns that missing mechanism to an
+explicit **closure successor**: a separately reviewed extension to #120 or a
+successor task whose final task ID is assigned outside this design. 87-A
+defines the exact typed contracts and adapter joins both dependencies must
+satisfy.
 
 This is a normative seam, not hand-waving:
 
 ```text
 87-A observes and classifies
-  -> #120 returns COMPLETE tree / HELD closure or a closed refusal
+  -> #120 publishes a bounded owned-tree snapshot or a closed refusal
+  -> the closure successor declares AVAILABLE or CAPABILITY_UNAVAILABLE
+  -> only AVAILABLE may acquire HELD closure or a transient closed refusal
   -> 87-A constructs or refuses authority
   -> existing Stop-Tree is the sole target-kill primitive
+  -> #120's post-kill barrier may block, but never authorize, a launch
 ```
 
 The core's independently approved operand convention, 96-cell dominant
@@ -41,7 +49,7 @@ normative location. It is audit evidence, not a third 87-A specification.
 
 ## Safety decision
 
-**ENFORCED after tasks #115 and #120:** An owned wrapper whose CLI child is
+**ENFORCED after tasks #115 and #120 and the closure successor:** An owned wrapper whose CLI child is
 positively absent in two independent complete observations may be torn down
 only after the same-turn nonrenewable `ChildEstablishmentGuardV1` is
 `CLOSED`. Once closed, such a wrapper has no brain and no progressing CLI turn
@@ -59,7 +67,7 @@ complete `ABSENT` samples for the same guarded owner and guard object. Changing
 completeness, establishment state, owner, or confirmation count changes
 authority deterministically from the named case to none.
 
-**ENFORCED after task #120:** Ownership is never inferred from a process name,
+**ENFORCED after merged, reviewed task #120:** Ownership is never inferred from a process name,
 executable basename, image substring, or command-line pattern. The wrapper
 must match the persisted PID, exact start guard, and launch nonce. Every tree
 target carries that same owner nonce through a complete #120 ownership proof.
@@ -71,10 +79,58 @@ races, partial teardown, crash/reload, and retry fade-out. It does not defend
 against a malicious same-user process that can alter supervisor state or
 directly terminate arbitrary processes.
 
-## Closed #120 contract
+## Published #120 snapshot and closure-successor contracts
+
+**STATED #120 integration status (2026-07-31):** task #120 head
+`28f663fce694fd72f311bda7590ced53abfab528` is **UNMERGED**, exists only on
+`origin/codex/task120-owned-process-tree-final`, and has no completed review in
+open PR 102. Its contract may move under review; this specification maps that
+exact head and does not call it shipped or delivered.
+
+At that head, #120 persists `owned_process_tree_v2` in existing supervisor
+state. It records at most 64 parent-first entries with PID, start,
+`start_filetime`, role, parent PID, discovery time, wrapper generation, and one
+top-level launch nonce. The 87-A adapter maps it as follows:
+
+| #120 value | 87-A mapping |
+| --- | --- |
+| `status=complete`, `limit=64`, internally consistent counts, no omission/truncation, and valid generation/nonce | Candidate input to `OwnedWrapperTreeObservationV1.COMPLETE`; the adapter still performs the positive owner join and validates every live target against the same fresh complete raw process capture. |
+| `status=absent` | No-kill absence/barrier evidence only; never an initial owned-tree teardown authority. |
+| `status=truncated|invalid`, a non-64 limit, inconsistent counts, omitted entries, or an unreadable binding | `INCOMPLETE`; no teardown authority. |
+| Live `entries[].pid/start` | `OwnedTreeTargetV1.pid/start_guard` after exact live validation. `start_filetime`, when present, must corroborate the fresh row. The adapter derives and validates `parent_start_guard` and `depth` from the accepted live parent chain and projects the validated top-level owner nonce onto each target; it may not privately default any missing fact. |
+| Non-live virtual ancestry bridge | Admissible only when copied exactly from a prior complete record with unchanged wrapper generation, launch nonce, and parent chain. It is validation provenance only: exclude it from `root_first_targets`, every target digest, and `Stop-Tree`. A live child whose immediate owned parent is such a bridge uses the module's existing positively proven orphan form: null owned-parent fields and depth one. |
+
+`role` and `discovered_at` are validated bounded metadata but are excluded from
+owner identity, target tuples, and target digests. The unique live wrapper
+entry becomes depth zero with null internal parent fields; its external
+supervisor/console parent is never an owned edge. The reserved
+`detached_gate_runner` role never grants ownership by itself.
+
+#120 also implements a post-kill launch barrier. It rechecks recorded
+PID/start identities and fresh descendant edges rooted at any recorded PID.
+Planning and `Stop-Tree` are separated by process scheduling, so #120
+explicitly permits a recorded parent to create a late descendant after the
+plan; that descendant may survive the planned `Stop-Tree` because it was never
+a kill target, and the barrier catches it only to block launch. The barrier
+never adds a kill target, proves teardown effect, or supplies closure evidence.
+
+The closure successor owns `OwnedTreeClosureV1`,
+`OwnedTreeClosureReconciliationV1`, action-scoped creation freeze, and the
+synchronous acquire/reconcile/release and effect-linearization adapters below.
+**No such extension or successor exists or has been reviewed as of
+2026-07-31.** Until one is implemented, independently reviewed, and available
+inside the absolute dependency-plane constraint below, a static
+pre-reservation capability gate returns
+`ClosureCapabilityV1.CAPABILITY_UNAVAILABLE` without creating a reservation,
+consuming an attempt, or making an external call. No closure-dependent named
+teardown proceeds, and dependent recovery remains `POLICY_HELD` pending a
+human. Only `ClosureCapabilityV1.AVAILABLE` may reach acquisition. Once a
+conforming provider advertises availability, a synchronous transient acquire
+failure follows the ordinary closure-veto/attempt rules; structural inability
+never does.
 
 ```text
-MAX_OWNED_TREE_TARGETS_V1 = 256
+MAX_OWNED_TREE_TARGETS_V1 = 64
 AUTOMATIC_CHILDLESS_ATTEMPT_CAP_V1 = 3
 
 ProcStartGuardV1 =
@@ -169,7 +225,6 @@ OwnedWrapperTreeObservationV1 =
       | LAUNCH_NONCE_MISMATCH
       | TREE_MEMBER_IDENTITY_UNREADABLE
       | TREE_MEMBERSHIP_AMBIGUOUS
-      | TREE_CREATION_NOT_CLOSED
       | TREE_TARGET_LIMIT_EXCEEDED
     ] in displayed order
   )
@@ -180,7 +235,7 @@ OwnedWrapperTreeObservationV1 =
       owner: OwnedWrapperIdentityV1
       owner_identity_id: Hex64
       root_first_targets:
-        tuple[OwnedTreeTargetV1] of length 1..256
+        tuple[OwnedTreeTargetV1] of length 1..64
       target_digest: Hex64
     }
 
@@ -197,7 +252,6 @@ OwnedDebtResidualObservationV1 =
       | RESIDUAL_MEMBERSHIP_UNPROVEN
       | RESIDUAL_NOT_AUTHORIZED_SUBSET
       | NEW_OWNER_MEMBER_OBSERVED
-      | TREE_CREATION_NOT_CLOSED
       | TREE_TARGET_LIMIT_EXCEEDED
     ] in displayed order
   )
@@ -218,15 +272,31 @@ OwnedDebtResidualObservationV1 =
       debt_id: Hex64
       debt_generation: strict positive integer
       ordered_targets:
-        tuple[OwnedTreeTargetV1] of length 1..256
+        tuple[OwnedTreeTargetV1] of length 1..64
       target_digest: Hex64
     }
+
+ClosureProviderVersionV1 =
+  nonempty NFC UTF-8 string of at most 128 bytes
+
+ClosureCapabilityV1 =
+  AVAILABLE {
+    closure_provider_version: ClosureProviderVersionV1
+  }
+  | CAPABILITY_UNAVAILABLE(
+      ordered deduplicated nonempty tuple[
+        SUCCESSOR_MISSING
+        | SUCCESSOR_UNREVIEWED
+        | PROVIDER_INCOMPATIBLE
+        | CONTRACT_UNPROVABLE
+        | FORBIDDEN_MECHANISM_REQUIRED
+      ] in displayed order
+    )
 
 OwnedTreeClosureV1 =
   BLOCKED(
     ordered deduplicated nonempty tuple[
-      CAPABILITY_UNAVAILABLE
-      | OWNER_CHANGED
+      OWNER_CHANGED
       | CHILD_OBSERVATION_CHANGED
       | DEBT_BINDING_CHANGED
       | CLOSURE_ACQUIRE_FAILED
@@ -236,6 +306,7 @@ OwnedTreeClosureV1 =
     ] in displayed order
   )
   | HELD {
+      closure_provider_version: ClosureProviderVersionV1
       closure_id: lowercase hyphenated UUID
       acquisition_id: lowercase hyphenated UUID
       mode: INITIAL | DEBT_COMPLETION
@@ -246,15 +317,17 @@ OwnedTreeClosureV1 =
       raw_process_observation: ProcessObservationV1
       coverage: OwnedTreeCoverageV1
       ordered_targets:
-        tuple[OwnedTreeTargetV1] of length 1..256
+        tuple[OwnedTreeTargetV1] of length 1..64
       target_digest: Hex64
     }
 
 OwnedTreeClosureReconciliationV1 =
   NEVER_ACQUIRED {
+    closure_provider_version: ClosureProviderVersionV1
     acquisition_id: lowercase hyphenated UUID
   }
   | RELEASED {
+      closure_provider_version: ClosureProviderVersionV1
       acquisition_id: lowercase hyphenated UUID
       closure_id: lowercase hyphenated UUID
     }
@@ -277,6 +350,7 @@ ChildlessContinuationOwnerV1 =
       action_latch_epoch: uint64 | null
       continuation_id: lowercase hyphenated UUID
       role: ISSUER | RECONCILER
+      closure_provider_version: ClosureProviderVersionV1
       attempt_id: lowercase hyphenated UUID
       attempt_revision: uint64
       operation:
@@ -321,9 +395,11 @@ subset differs from the immutable authorized tuple.
 `agenttalk.supervisor.owned-tree-coverage-source.v1\0` plus the exact
 `CanonicalJsonV1` bytes of the core's `ObserverCoverageSignatureV1`; it
 identifies coverage semantics, not changing process contents.
-Task #120 owns `observer_version`: it changes whenever the platform tree
-enumeration, ownership, or closure-membership semantics change and is persisted
-and compared as the exact bounded string. 87-A fixes the
+The 87-A adapter owns `observer_version`. For the mapping pinned above it is
+exactly `win-tree/v1`, which binds task #120's `schema_version`,
+`attribution_model`, enumeration/ownership algorithm, and pinned
+implementation revision. Any change to those inputs requires a different
+version value and renewed vectors/review. 87-A fixes the
 `ownership_rule_version`; neither value may be omitted or privately defaulted.
 
 `parent_pid`/`parent_start_guard` record only an owned-parent edge at initial
@@ -334,7 +410,7 @@ guarded live owned parent is in the set records that parent and has parent
 depth plus one. A positively proven owned orphan whose owned parent exited
 before the initial capture has null parent fields and depth one. Any other
 non-root live OS parent outside the owned set, a cycle, conflicting parent
-rows, a duplicate guarded identity, or more than 256 targets is incomplete.
+rows, a duplicate guarded identity, or more than 64 targets is incomplete.
 The initial tuple sorts by depth, then PID, then ordinal start guard. Image and
 command-line text do not participate.
 
@@ -387,8 +463,9 @@ target.start_guard}` in root-first order. The existing primitive reverses that
 list, so leaves are attempted before the wrapper and its live PID/start check
 still skips reuse.
 
-`COMPLETE_RESIDUAL` is not an initial tree with its root omitted. Task #120
-must positively prove that every still-live owner member is an exact
+`COMPLETE_RESIDUAL` is not an initial tree with its root omitted. The 87-A
+residual adapter over #120's retained snapshot and one fresh complete process
+capture must positively prove that every still-live owner member is an exact
 order-preserving subset of the debt's immutable authorized tuple, that every
 omitted authorized PID/start is gone, and that no new owner member exists. Its
 recorded owner and nonce come from the checked debt; every live target retains
@@ -398,17 +475,18 @@ authorized parent and grandparent exited keeps its original guarded parent
 fields and depth even though those ancestor targets are omitted. The initial
 orphan/depth and outside-parent rules therefore do not rewrite a residual
 tuple. The wrapper may be absent. `COMPLETE_GONE` proves the same universe
-empty. If task #120 cannot retain or reconstruct that ownership fact after the
-root exits, it returns `INCOMPLETE`.
+empty. If the adapter cannot retain or reconstruct that ownership fact after
+the root exits, it returns `INCOMPLETE`.
 
 ### Meaning of COMPLETE and HELD
 
-**ENFORCED after task #120:** `COMPLETE` means the capture accounts for every
+**ENFORCED after merged, reviewed task #120 and the 87-A adapter:**
+`COMPLETE` means the capture accounts for every
 process the guarded wrapper owns under one explicit coverage signature. It is
 not “all rows that happened to be readable.” An implementation that cannot
 prove its universe complete returns `INCOMPLETE`.
 
-**ENFORCED after task #120:** `HELD` is an action-scoped, non-destructive
+**ENFORCED after the closure successor:** `HELD` is an action-scoped, non-destructive
 closure, idempotently acquired/reconciled by its caller-supplied
 `acquisition_id`, with one linearization point before its capture. `INITIAL`
 has null debt fields and the complete wrapper-rooted tuple.
@@ -424,8 +502,26 @@ release:
 - acquiring, holding, or releasing the closure never terminates an authority
   target.
 
-The #120 seam exposes acquire, reconcile, and release keyed by
-`acquisition_id`; release additionally requires the exact `closure_id`.
+The closure-successor seam exposes one process-version-stable
+`ClosureCapabilityV1` before reservation, then acquire, reconcile, and release
+keyed by `acquisition_id`; release additionally requires the exact
+`closure_id`. `AVAILABLE` exposes one exact `ClosureProviderVersionV1` and is
+well formed only for an installed, independently reviewed implementation that
+can prove this contract inside the absolute dependency-plane constraint for
+every case it accepts. `CAPABILITY_UNAVAILABLE` is structural and may appear
+only before reservation. The caller persists an available version in
+`ChildlessContinuationOwnerV1` before acquisition;
+every `HELD`, `NEVER_ACQUIRED`, `RELEASED`, reconcile result, release request,
+and held refresh must match it byte-for-byte. A provider contract change
+requires a new version. Missing or mismatched versions normalize to `UNKNOWN`,
+retain every fence, and grant no authority. A provider with no available
+version is rejected by the static pre-reservation capability gate.
+An acquisition result that claims `CAPABILITY_UNAVAILABLE` is malformed rather
+than a transient closure veto: retain every persisted fence, emit continuous
+`CAPABILITY_UNAVAILABLE`, and perform no teardown, retry, or exhaustion
+transition. `UNKNOWN(CAPABILITY_UNAVAILABLE)` during reconciliation likewise
+describes cleanup uncertainty, not permission to reclassify the issued attempt
+as an ordinary failure.
 Repeated acquisition returns the same closure or a closed refusal. A
 reconciliation result always requires its acquisition ID to equal the
 persisted attempt ID. While `TREE_CLOSURE_ACQUIRING` has no persisted closure
@@ -438,7 +534,7 @@ persisted pair. Missing, null, changed, or conflicting IDs normalize to
 `UNKNOWN`, retain the reservation and any debt/current attempt, and forbid
 kill and launch. `NEVER_ACQUIRED` is terminal for that acquisition ID: the
 same checked transaction appends it to `retired_childless_attempt_ids`, and
-task #120 must not later acquire it. An unexpected late `HELD` for a retired
+the closure successor must not later acquire it. An unexpected late `HELD` for a retired
 ID is never authority; it is accepted only to perform exact idempotent release
 under the effect guard, after which the tombstone remains.
 
@@ -456,19 +552,25 @@ target tuple, or digest cannot stand in for it. Reconciliation `HELD` by itself
 never authorizes a new termination; a caller needing current evidence obtains
 a fresh held-refresh result under the same exact closure.
 
-Task #120 may choose the Windows mechanism, but it may not weaken those
-semantics or the core's unqualified no-daemon/no-persistence-plane/no-runtime-
-dependency invariant. Its separate design must name the process-universe
-mechanism, synchronous action-scoped linearization primitive, crash/release
-behavior, compatibility evidence, and failure injection. It may use only
-existing checked supervisor state and transient caller-owned synchronization;
-it may not add a daemon/service, detached or bundled helper, new durable
-file/database/registry/journal, or independently durable named OS object. If a
-platform cannot meet the contract inside that boundary, 87-A requires
-`CAPABILITY_UNAVAILABLE`; it does not authorize a project-promise exception.
-This is the fail-closed baseline while delta-panel item M5 awaits the
-operator's project-promise decision; task #120 cannot infer an exception from
-draft mechanism prose.
+The closure successor may choose a Windows mechanism only if it preserves
+those semantics and the core's absolute dependency-plane constraint. Its
+separate design must name the process-universe mechanism, synchronous
+action-scoped linearization primitive, crash/release behavior, compatibility
+evidence, and failure injection. It may use only existing checked supervisor
+state and transient caller-owned synchronization that leaves no durable helper
+or OS object. It may not add a daemon/service, durable helper, new durable
+file/database/registry/journal, durable named OS object, package, or runtime
+dependency.
+
+The operator resolved delta-panel item M5 as Option A on 2026-07-31: this
+constraint is absolute, with no mechanism-specific or separately versioned
+exception. If a platform cannot prove the contract inside the boundary, 87-A
+requires `CAPABILITY_UNAVAILABLE`, no closure-dependent named teardown
+proceeds, and dependent recovery remains `POLICY_HELD` pending a human. An
+implementation that discovers an unprovable case opens or updates a task; it
+must not introduce a mechanism as an implementation detail.
+This deliberately accepts that some recoveries may never become automatic;
+the operator preferred that availability loss to stale-authority risk.
 
 ## Two independent complete child-absence captures
 
@@ -611,7 +713,7 @@ ChildlessTeardownAuthorityV1 =
       runtime_child_dead_basis_digest: Hex64 | null
       active_child_config_digest: Hex64 | null
       child_establishment_guard: ChildEstablishmentGuardV1.CLOSED | null
-      targets: tuple[OwnedTreeTargetV1] of length 1..256
+      targets: tuple[OwnedTreeTargetV1] of length 1..64
       target_digest: Hex64
       debt_id: Hex64 | null
       debt_generation: strict positive integer | null
@@ -631,7 +733,7 @@ ChildlessReservationEvidenceV1 {
   runtime_child_dead_basis_digest: Hex64 | null
   active_child_config_digest: Hex64 | null
   child_establishment_guard: ChildEstablishmentGuardV1.CLOSED | null
-  targets: tuple[OwnedTreeTargetV1] of length 1..256
+  targets: tuple[OwnedTreeTargetV1] of length 1..64
   target_digest: Hex64
   debt_id: Hex64 | null
   debt_generation: strict positive integer | null
@@ -642,6 +744,7 @@ ChildlessClosureEvidenceV1 {
   authority_id: Hex64
   basis_id: Hex64
   acquisition_id: lowercase hyphenated UUID
+  closure_provider_version: ClosureProviderVersionV1
   closure_id: lowercase hyphenated UUID
   closure_capture_id: CaptureIdV1
   owner_identity_id: Hex64
@@ -653,7 +756,7 @@ ChildlessClosureEvidenceV1 {
   current_active_child_config_digest: Hex64 | null
   current_child_establishment_guard:
     ChildEstablishmentGuardV1.CLOSED | null
-  targets: tuple[OwnedTreeTargetV1] of length 1..256
+  targets: tuple[OwnedTreeTargetV1] of length 1..64
   target_digest: Hex64
   debt_id: Hex64 | null
   debt_generation: strict positive integer | null
@@ -728,11 +831,12 @@ The core copies every displayed proof field into its checked reservation.
 Neither an authority hash, the generic targetability digest, nor a
 command-line match is decoded or substituted for the target tuple.
 
-`ChildlessClosureEvidenceV1` is the 87-A join over the #120 result and current
-checked state; #120 does not decide authority. It is valid only when the
+`ChildlessClosureEvidenceV1` is the 87-A join over the closure-successor result
+and current checked state; the successor does not decide authority. It is valid only when the
 closure acquisition ID equals the persisted attempt ID; its mode,
 owner/coverage/targets/digest/debt fields exactly equal both the reservation
-and `OwnedTreeClosureV1.HELD`; authority/basis IDs equal the reservation; and
+and `OwnedTreeClosureV1.HELD`; its closure-provider version equals the
+persisted continuation owner; authority/basis IDs equal the reservation; and
 every target digest equals a fresh `OwnedTargetDigestV1` recomputation.
 
 For `INITIAL`, all debt fields are null and all three childless/runtime/config
@@ -798,13 +902,15 @@ childless/runtime/config/establishment basis fields are null; current checked
 debt still has the reserved ID/generation/owner/immutable authorized tuple.
 Every other
 well-formed but unequal current observation is an action-time veto. A
-structurally invalid persisted state or malformed #120 value is
+structurally invalid persisted state, malformed #120 snapshot, or malformed
+closure-successor value is
 `POLICY_HELD`; neither class grants authority.
 
 ## Action-time closure and sole teardown path
 
-**ENFORCED effect linearization after tasks #115 and #120:** State CAS alone
-does not own an external call. Every childless #120 call, `Stop-Tree` call, and
+**ENFORCED effect linearization after task #115 and the closure successor:**
+State CAS alone does not own an external call. Every childless
+closure-successor call, `Stop-Tree` call, and
 action capture therefore runs under one exclusive transient per-agent effect
 guard and one checked `ChildlessContinuationOwnerV1`. Lock order is fixed:
 configuration snapshot, action latch, effect guard, then the short #115
@@ -842,7 +948,7 @@ values still equal a fresh gate capture. Any mismatch is a veto before a new
 external call, not permission to continue under the older owner.
 
 `role=RECONCILER` can be written only by the takeover CAS below. It may invoke
-only idempotent #120 reconcile/release operations. In particular,
+only idempotent closure-successor reconcile/release operations. In particular,
 an inherited `STOP_TREE/ARMED/ISSUER` tombstone is transformed atomically to
 `TREE_CLOSURE_RELEASING/EFFECT_UNPROVEN` plus
 `CLOSURE_RELEASE/ARMED/RECONCILER`; a
@@ -869,12 +975,12 @@ attempt ID,
 `ChildlessContinuationOwnerV1(CLOSURE_ACQUIRE, ARMED, ISSUER)`, and
 `TREE_CLOSURE_ACQUIRING` in one task #115 transaction. Automatic origin also
 creates or increments its cycle in that transaction. Only that checked owner
-may synchronously invoke task #120 with the attempt ID. It retains the effect
+may synchronously invoke the closure successor with the attempt ID. It retains the effect
 guard through the returned-result CAS. Acquisition and crash reconciliation
 are idempotently keyed by the attempt ID. 87-A must then construct
 `ChildlessClosureEvidenceV1`; the closure object alone never supplies
 authority. A well-formed current equality mismatch is a closure veto and
-follows exact release. Malformed #120 output or structurally invalid checked
+follows exact release. Malformed closure-successor output or structurally invalid checked
 state is `POLICY_HELD`; if an exact closure pair is known, only its
 non-destructive release/reconciliation may proceed. Neither case kills or
 launches.
@@ -908,6 +1014,7 @@ ChildlessPostTeardownObservationV1 =
       | AUTHORIZED_IDENTITY_UNREADABLE
       | NEW_OR_UNOWNED_CLOSURE_MEMBER
       | RESIDUAL_NOT_AUTHORIZED_SUBSET
+      | POST_KILL_LAUNCH_BARRIER_BLOCKED
     ] in displayed order
   )
   | COMPLETE_GONE {
@@ -924,20 +1031,29 @@ ChildlessPostTeardownObservationV1 =
       owner_identity_id: Hex64
       authorized_target_digest: Hex64
       live_targets:
-        tuple[OwnedTreeTargetV1] of length 1..256
+        tuple[OwnedTreeTargetV1] of length 1..64
       residual_target_digest: Hex64
     }
 ```
 
 A complete result requires the exact held closure/owner/authorized digest,
-complete process and closure-membership coverage, and a capture with the same
+complete process and closure-membership coverage, an unblocked fresh #120
+post-kill launch-barrier result over the same captured process rows, and a
+capture with the same
 state epoch, agent, and ordinary poll sequence whose ordinal is strictly
 greater than the action-ready closure capture. `COMPLETE_GONE` means every
-authorized PID/start is positively absent and closure membership is empty.
+authorized PID/start is positively absent, closure membership is empty, and
+the #120 barrier finds neither a recorded-identity survivor nor a fresh
+descendant edge rooted at a recorded PID.
 `COMPLETE_RESIDUAL.live_targets` is the exact order-preserving live subset of
 the immutable authorized tuple and its digest is a recomputed
 `OwnedTargetDigestV1`; any omitted target is positively absent. Any other fact
-is `INCOMPLETE`.
+is `INCOMPLETE`. An unavailable or ambiguous barrier is incomplete. A barrier
+blocked only by a late descendant that was absent from the planned target set
+maps to `INCOMPLETE(POST_KILL_LAUNCH_BARRIER_BLOCKED)` and therefore
+`EFFECT_UNPROVEN`; that edge blocks launch but never becomes a target, proves
+`COMPLETE_GONE`, or clears debt. An unblocked barrier alone also cannot prove
+`COMPLETE_GONE`; the typed closure/identity absence proof remains mandatory.
 
 The failure mapping is total: a residual containing the authorized tuple's
 depth-zero wrapper target is `SAME_OWNER_SURVIVED`; a nonempty residual without
@@ -959,7 +1075,7 @@ TeardownDebtV1 =
       owner: OwnedWrapperIdentityV1
       owner_identity_id: Hex64
       authorized_targets:
-        tuple[OwnedTreeTargetV1] of length 1..256
+        tuple[OwnedTreeTargetV1] of length 1..64
       authorized_target_digest: Hex64
       generation: strict positive integer
       current_attempt_id: lowercase hyphenated UUID | null
@@ -1103,8 +1219,8 @@ known prior owner. The current ordinary capture must have ordinal zero,
 current epoch/agent/sequence, complete ownership coverage, the replacement
 root positively present, and the prior root plus every possible nonce-owned
 rootless residual positively absent. If the prior physical owner is `UNKNOWN`,
-or task #120
-cannot completely prove the old owner and all possible rootless residuals
+or the 87-A adapter over #120 cannot completely prove the old owner and all
+possible rootless residuals
 gone, the second transition is impossible and quarantine remains
 indefinitely. This is intentional: lost provenance after a partial
 `Stop-Tree` cannot be laundered into launch authority.
@@ -1152,16 +1268,20 @@ transition is only `NONE -> 1` or same-owner
 `POLICY_HELD`.
 
 An automatic attempt is consumed by the checked transition that records
-`TREE_CLOSURE_ACQUIRING` with its attempt ID immediately before invoking task
-#120. Planning, policy holds, and a statically blocked proof consume zero;
-closure failure therefore cannot loop outside the cap. This bounded cycle does
-not read or mutate generic `consecutive_fails`, recovery-backoff deadline, or
-backoff exponent fields. After a typed failure on attempts one or two, the next
+`TREE_CLOSURE_ACQUIRING` with its attempt ID immediately before invoking the
+closure successor after exact `ClosureCapabilityV1.AVAILABLE`. Planning,
+policy holds, and structural `CAPABILITY_UNAVAILABLE` consume zero. A
+post-reservation claim of structural unavailability is malformed and retains
+the issued fence/cycle without becoming `CLOSURE_VETOED`, a retryable outcome,
+or exhaustion. Only the displayed transient closure failures enter the bounded
+cycle, so they cannot loop outside the cap. This cycle does not read or mutate
+generic `consecutive_fails`, recovery-backoff deadline, or backoff exponent
+fields. After a typed transient failure on attempts one or two, the next
 attempt may be reserved only by the next eligible ordinary poll after the
 same-poll terminal clears; all ordinary gates are reevaluated. It is neither
 scheduled by nor hidden behind exponential backoff. Attempt three plus any
-failure becomes sticky `EXHAUSTED`: it schedules no fourth automatic
-reservation.
+displayed transient failure becomes sticky `EXHAUSTED`: it schedules no fourth
+automatic reservation.
 
 `EXHAUSTED` emits `AUTOMATIC_CHILDLESS_RETRY_EXHAUSTED` and mandatory action
 attention on every poll until a successful childless cleanup, a
@@ -1240,6 +1360,7 @@ ChildlessActionResultV1 =
 
 ChildlessAttentionCodeV1 =
   CHILDLESS_STATE_PROVENANCE_LOST
+  | CAPABILITY_UNAVAILABLE
   | CHILDLESS_OWNER_CHILD_TREE_OR_CLOSURE_INCOMPLETE
   | CHILDLESS_TEARDOWN_DEBT
   | AUTOMATIC_CHILDLESS_RETRY_ACTIVE
@@ -1250,7 +1371,7 @@ TeardownDebtSummaryV1 =
   | OUTSTANDING {
       debt_id: Hex64
       owner_identity_id: Hex64
-      authorized_target_count: integer 1..256
+      authorized_target_count: integer 1..64
       generation: strict positive integer
       last_outcome:
         ISSUED | SAME_OWNER_SURVIVED | MEMBER_SURVIVED | EFFECT_UNPROVEN
@@ -1274,13 +1395,19 @@ Attention codes appear in displayed order for every true predicate:
 CHILDLESS_STATE_PROVENANCE_LOST iff
   StateLossQuarantineV1 is UNRESOLVED
 
+CAPABILITY_UNAVAILABLE iff
+  ClosureCapabilityV1 is CAPABILITY_UNAVAILABLE
+  or a post-reservation closure-successor value illegally claims structural
+     unavailability
+  or applicable reconciliation is UNKNOWN(CAPABILITY_UNAVAILABLE)
+
 CHILDLESS_OWNER_CHILD_TREE_OR_CLOSURE_INCOMPLETE iff
   the relevant owner/child/tree/debt-residual constructor is BLOCKED/INCOMPLETE
   or a named childless acquisition reconciliation is UNKNOWN
   or a release reconciliation is HELD or UNKNOWN
   or an existing named childless phase is retained because safety
      reconciliation is not eligible
-  or checked childless state/#120 output is structurally invalid
+  or checked childless state, #120 snapshot, or closure-successor output is structurally invalid
 
 CHILDLESS_TEARDOWN_DEBT iff teardown_debt is OUTSTANDING
 
@@ -1336,15 +1463,15 @@ ChildlessSafetyReconciliationGateV1 =
     otherwise
 ```
 
-`RETAIN_DRY_RUN` performs no #120 call and no persistence.
+`RETAIN_DRY_RUN` performs no closure-successor call and no persistence.
 `RETAIN_STATE_PROVENANCE_LOST` performs no cleanup that depends on erased
 attempt/debt provenance.
-`RETAIN_NO_CURRENT_SUPERVISOR` performs no #120 call and no state mutation
+`RETAIN_NO_CURRENT_SUPERVISOR` performs no closure-successor call and no state mutation
 because the invocation does not own the executor claim.
 `MAY_RELEASE_PRE_BARRIER` needs no effect guard because no external operation
 or attempt pair has been armed. It permits one state-only #115 CAS that releases
 the reservation, writes `BARRIER_VETOED` and the same-poll terminal, and
-performs no #120 call, teardown, launch, marker consumption, attempt/cycle
+performs no closure-successor call, teardown, launch, marker consumption, attempt/cycle
 mutation, or debt clear.
 `RETAIN_LIVE_CONTINUATION` and `RETAIN_EFFECT_GUARD_UNAVAILABLE` close both
 commit/effect gaps without inferring that an external call did or did not
@@ -1377,9 +1504,9 @@ loser reloads the gate. The winner must recompute as `MAY_RECONCILE`; it cannot
 continue directly from `MAY_TAKEOVER`.
 `MAY_RECONCILE` authorizes only checked non-destructive cleanup of an
 already-persisted named external-effect phase under the effect guard: call
-#120 reconcile/release by persisted attempt/closure IDs, capture post-action
+closure-successor reconcile/release by persisted attempt/closure IDs, capture post-action
 or residual evidence after an already-issued teardown, and finalize the
-persisted disposition. Before each #120 operation it commits its exact new
+persisted disposition. Before each closure-successor operation it commits its exact new
 `ChildlessContinuationOwnerV1`; it retains the guard through the returned
 result CAS. The `STOP_TREE/CALL_RETURNED` read-only capture instead retains
 that exact owner until its atomic transition to releasing. It may do so while
@@ -1437,15 +1564,16 @@ exhaustive:
 | --- | --- | --- | --- |
 | Quarantine is `UNRESOLVED` and the exact checked `ProvablyDifferentPhysicalOwnerV1` clear predicate succeeds | Atomically retire quarantine, install the already-present replacement owner, clear unknowable old debt/cycle/execution fences only because the complete extinction proof makes them physically inactionable, and write the terminal. Perform no OS action and prohibit launch for this poll. | `NOT_ATTEMPTED` | Quarantine-retired audit fact; childless codes recompute on the next ordinary poll. |
 | `StateLossQuarantineV1` is `UNRESOLVED` | Retain quarantine and every recoverable fence; deny every kill, launch, closure acquisition, attempt/debt mutation, identity commit, and manual override. | `POLICY_HELD` | `CHILDLESS_STATE_PROVENANCE_LOST` continuously; any recoverable debt/cycle codes also remain visible. |
-| Structurally invalid persisted state or malformed #120 value | No destructive mutation; retain every owned fence. If an exact known closure exists and the safety-reconciliation gate is `MAY_RECONCILE`, only its non-destructive release/reconciliation may proceed. | `POLICY_HELD` | Incomplete code; plus debt/cycle codes by predicate. |
+| Structurally invalid persisted state, malformed #120 snapshot, or malformed closure-successor value, including a post-reservation claim of structural `CAPABILITY_UNAVAILABLE` | No destructive mutation; retain every owned fence. If an exact known closure exists and the safety-reconciliation gate is `MAY_RECONCILE`, only its non-destructive release/reconciliation may proceed. Do not finalize `CLOSURE_VETOED`, retry, or exhaust. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` for the structural claim, incomplete code otherwise; plus debt/cycle codes by predicate; pending a human. |
 | Well-formed owner/child/tree/debt proof is incomplete before reservation | No reservation and no attempt consumed. | `POLICY_HELD` | Incomplete code; plus debt/cycle codes by predicate. |
+| `ClosureCapabilityV1` is `CAPABILITY_UNAVAILABLE` before reservation | Static capability refusal: create no reservation or continuation, consume no attempt, and make no external call. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` continuously pending a human; plus debt/cycle codes by predicate. |
 | `ExecutionEligibilityV1 == ELIGIBLE`, `recovery_execution == IDLE`, no named reservation/closure/pending disposition/current attempt exists, and ordinary observation-only debt reconciliation is `COMPLETE_GONE` | Clear debt and old-owner cycle, remain `IDLE`, write terminal; construct no authority and do not launch. | `NOT_ATTEMPTED` | No childless code after the atomic clear. |
 | No in-flight childless phase and a global/policy gate holds or no named candidate exists; cycle is `NONE` | No module mutation or terminal write. | `NOT_ATTEMPTED` | Debt/incomplete code only when its predicate independently applies. |
 | No in-flight childless phase and a global/policy gate holds or no named candidate exists; cycle is `ACTIVE` with a prior typed failure | Preserve the cycle; no attempt, backoff, or terminal mutation. | `NOT_ATTEMPTED` | Active code; debt/incomplete code by predicate. |
 | No in-flight childless phase and a global/policy gate holds or no otherwise-eligible automatic named proof exists; cycle is `EXHAUSTED` | Preserve the cycle; no attempt, backoff, or terminal mutation. | `NOT_ATTEMPTED` | Exhausted code; debt/incomplete code by predicate. |
 | Automatic named proof is otherwise eligible, no eligible manual origin wins, and its cycle was already `EXHAUSTED` before this poll | No reservation, attempt, backoff, or terminal mutation. | `AUTOMATIC_RETRY_EXHAUSTED` | Exhausted code; debt code if applicable. |
 | An existing external-effect childless phase has gate `MAY_TAKEOVER` | Apply exactly the no-call phase mapping above in one CAS, then reload state and recompute the gate/table while retaining the effect guard. A CAS loser reloads without mutation. | No terminal module result yet. | Existing debt/cycle/incomplete codes by predicate. |
-| An existing external-effect childless phase has any `RETAIN_*` safety-reconciliation gate | Retain reservation/phase, closure, pending disposition, debt/current attempt, cycle, continuation owner, and terminal byte-identically; perform no #120 call. | `POLICY_HELD` | Incomplete code; plus debt/cycle codes by predicate. |
+| An existing external-effect childless phase has any `RETAIN_*` safety-reconciliation gate | Retain reservation/phase, closure, pending disposition, debt/current attempt, cycle, continuation owner, and terminal byte-identically; perform no closure-successor call. | `POLICY_HELD` | Incomplete code; plus debt/cycle codes by predicate. |
 | A named `PRE_BARRIER` reservation is vetoed or reloaded before closure acquisition begins and its gate is `MAY_RELEASE_PRE_BARRIER` | Release that reservation by the state-only CAS, consume no automatic attempt, preserve debt/cycle and marker semantics, and write the terminal. | `BARRIER_VETOED` | Debt/cycle/incomplete code by predicate. |
 | Live acquisition returns a well-formed `HELD` and the full joined evidence is valid | Persist `TREE_CLOSURE_HELD`; no outcome or terminal is finalized. | No terminal module result yet. | Codes from preexisting debt/cycle only. |
 | Any well-formed matching `HELD` returned by acquisition/reconciliation is not action-ready, or recaptured evidence/gates make a persisted `TREE_CLOSURE_HELD` non-action-ready | Bind/retain its closure ID, persist `TREE_CLOSURE_RELEASING/CLOSURE_VETOED`, and request release; no outcome is finalized yet. The earlier live-valid row alone may continue toward teardown. | No terminal module result yet. | Incomplete code while release remains held; debt code if applicable. |
@@ -1466,6 +1594,9 @@ release finalizes that failure. Manual origin never consults the automatic
 attempt ordinal: its veto is always `BARRIER_VETOED`, its teardown failure is
 always `TEARDOWN_FAILED`, and its cycle is byte-identical. Reload finalization
 uses the persisted origin and the same mapping.
+`CLOSURE_VETOED` never means structural `CAPABILITY_UNAVAILABLE`: the latter is
+either the zero-attempt pre-reservation row or a malformed/unknown retained
+fence pending a human, and it never reaches automatic retry/exhaustion.
 Rows marked “no terminal module result yet” are internal same-invocation
 transitions and do not emit an action-resolution record at that point. The
 invocation either reaches a later final row or returns with retained checked
@@ -1478,7 +1609,7 @@ Normal execution is:
 | Transition | Checked effect |
 | --- | --- |
 | Reserve named proof | Require core execution `IDLE`, no same-poll terminal, and no outstanding current attempt. Store origin, proof fields, target tuple, and execution-gate snapshot. Manual-wins stores its manual authority ID separately. |
-| Begin closure acquisition | Acquire the effect guard; live-recompute the reserved bindings; persist `TREE_CLOSURE_ACQUIRING` with a fresh attempt ID/revision and exact `CLOSURE_ACQUIRE/ARMED` continuation; recheck ownership; synchronously invoke task #120; and retain the guard through the returned-result CAS. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin does not change the cycle. |
+| Begin closure acquisition | Acquire the effect guard; live-recompute the reserved bindings; persist `TREE_CLOSURE_ACQUIRING` with a fresh attempt ID/revision and exact `CLOSURE_ACQUIRE/ARMED` continuation; recheck ownership; synchronously invoke the closure successor; and retain the guard through the returned-result CAS. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin does not change the cycle. |
 | Acquire valid closure | Require the full joined live-basis/capture/target equality, then persist `TREE_CLOSURE_HELD`, the exact closure ID, and the acquire/reconcile owner at `CALL_RETURNED` while retaining the effect guard. The same checked live chain must next replace it atomically with teardown arm or release arm. Do not increment the attempt again. |
 | Veto after `HELD` | Under the effect guard, persist `TREE_CLOSURE_RELEASING/CLOSURE_VETOED` and exact `CLOSURE_RELEASE/ARMED`; request release by exact pair; persist `CALL_RETURNED`; and finalize only after matching `RELEASED`. |
 | Arm teardown | Under the effect guard, atomically enter `TEARDOWN_IN_FLIGHT`, create/update origin-neutral debt, and persist exact `STOP_TREE/ARMED`. Recheck owner, call only `Stop-Tree`, and persist `CALL_RETURNED` before any observation. |
@@ -1547,13 +1678,14 @@ transaction; no executor branch may save a cached whole state.
 2. Permute process rows and add name/command-line false positives. Only exact
    guarded ownership and complete coverage may affect the result. Recycled PID,
     duplicate/malformed nonce, missing descendant, live foreign parent, cycle,
-    truncation, and more than 256 targets refuse. Prove the depth-zero
+    truncation, and more than 64 targets refuse. Prove the depth-zero
     wrapper's live external supervisor/console parent is excluded from owned
     parent fields and does not refuse an otherwise complete initial tree.
-3. Execute task #120's separate mechanism suite. Prove closure linearization,
+3. Execute the closure successor's separate mechanism suite. Prove closure linearization,
    complete membership, no post-closure creation, no target termination by the
    closure, attempt-keyed acquire/reconcile/release, crash safety, and
-   activated-platform compatibility. Until all pass, capability is unavailable.
+   activated-platform compatibility. Until all pass, the static capability
+   gate refuses before reservation with zero attempt and zero external call.
 4. Revalidate after reservation. Owner, coverage, and target digest must match;
    initial mode additionally requires a fresh post-linearization nonordinary
    raw capture, same-capture complete child absence, exact current matcher
@@ -1591,6 +1723,13 @@ transaction; no executor branch may save a cached whole state.
     must still refuse a fourth attempt. Every case leaves generic backoff
     byte-identical. The same deadline must still hold a non-childless automatic
     candidate.
+    Independently cross every `ClosureCapabilityV1` reason before reservation:
+    require zero reservation, attempt, continuation, external call, teardown,
+    retry, and exhaustion; emit continuous `CAPABILITY_UNAVAILABLE` and remain
+    `POLICY_HELD` pending a human. Inject an illegal post-reservation structural
+    unavailability claim and reconciliation
+    `UNKNOWN(CAPABILITY_UNAVAILABLE)`; both must retain their exact fences,
+    avoid `CLOSURE_VETOED`/retry/exhaustion, and require task visibility.
 8. After every finalized childless reservation/attempt outcome and
    observation-only debt reconciliation, attempt a second reservation in the
    same ordinary poll; the terminal must refuse it. Prove pure refusal,
@@ -1624,7 +1763,7 @@ transaction; no executor branch may save a cached whole state.
     complete-gone cleanup emits `NOT_ATTEMPTED`, writes the terminal, and never
     launches. Cross every persisted named phase with every execution gate:
     dry run and a non-current supervisor retain state byte-identically and make
-    no #120 call; a current supervisor under kill switch, disabled action
+    no closure-successor call; a current supervisor under kill switch, disabled action
     latch, missing report membership, or disabled auto-restart may only
     reconcile/release/finalize the old fence and never acquire, kill, launch,
     consume a marker, increment an attempt, or change backoff/readiness.
@@ -1656,7 +1795,7 @@ transaction; no executor branch may save a cached whole state.
     nonce without both retained provenance fields is malformed, never a
     substitute.
 16. Run two pollers at both commit/effect gaps. Pause P1 after
-    `CLOSURE_ACQUIRE/ARMED` and before #120; P2 must retain while P1 can resume.
+    `CLOSURE_ACQUIRE/ARMED` and before the closure successor; P2 must retain while P1 can resume.
     Then prove P1 unable to resume, reconcile under P2, and cross
     `NEVER_ACQUIRED`, `HELD`, `RELEASED`, and `UNKNOWN`; `NEVER_ACQUIRED` must
     retire the ID and a forced late `HELD` must be release-only. Repeat with P1
@@ -1693,28 +1832,48 @@ transaction; no executor branch may save a cached whole state.
     ordinary sequence, exact attempt binding, and no reuse/wrap. Pair an
     ordinal-zero ordinary residual with a nonzero reload residual and prove
     each is accepted only in its stated context.
-22. Inspect task #120's implementation/package/state diff and activated
-    platform evidence. Any daemon/service, detached or bundled helper, new
-    durable file/database/registry/journal, independently durable named OS
-    object, or nonempty runtime dependency makes the capability unavailable
-    absent a separate operator-approved project-promise change.
+22. Inspect task #120's and the closure successor's implementation, package,
+    state, and activated-platform diffs. Any daemon/service, durable helper,
+    new durable file/database/registry/journal, durable named OS object,
+    nonempty runtime dependency, or mechanism-specific exception is
+    nonconforming and makes the capability unavailable. Prove that an
+    unprovable closure returns pre-reservation `CAPABILITY_UNAVAILABLE`, makes
+    zero external calls, performs no named teardown, remains `POLICY_HELD`
+    pending a human, and creates a task rather than an implementation-detail
+    mechanism.
+23. Adapt task #120 candidate `28f663f` byte-for-byte. Accept only
+    `owned_process_tree_v2`, schema 2, status `complete|absent|truncated|invalid`,
+    exact limit 64, consistent counts, generation/nonce, and the stated field
+    projection. Freshly validate every live PID/start/filetime. Admit a
+    non-live ancestry bridge only from an exact prior complete
+    generation/nonce/parent chain, exclude it from target tuples/digests and
+    `Stop-Tree`, and normalize a live child behind it to the stated orphan
+    form. Validate but exclude role/discovery metadata from authority. Race
+    planning against a recorded parent that creates a late descendant and
+    exits: the descendant must miss the planned kill set, survive that
+    `Stop-Tree`, be found only by #120's fresh barrier, block launch, map the
+    post-action result to `EFFECT_UNPROVEN`, and never become a kill target,
+    prove `COMPLETE_GONE`, or clear debt. A clear barrier without the typed
+    closure/absence proof must also refuse debt clear.
 
 ## Dependencies and release order
 
 | Property | Classification | Owner |
 | --- | --- | --- |
-| Two same-owner post-establishment complete child absences | ENFORCED after #115/#120 | 87-A reducer |
-| PID/start/nonce ownership; never pattern ownership | ENFORCED after #120 | 87-A/#120 contract |
-| Complete tree and action-scoped creation closure | ENFORCED after #120 | Separate #120 mechanism design and implementation |
+| Two same-owner post-establishment complete child absences | ENFORCED after #115 and merged/reviewed #120 | 87-A reducer plus #120 snapshot adapter |
+| PID/start/nonce ownership; never pattern ownership | ENFORCED after merged/reviewed #120 | 87-A adapter over `owned_process_tree_v2` |
+| Complete 64-entry tree observation | ENFORCED after merged/reviewed #120 | #120 snapshot plus 87-A adapter |
+| Action-scoped creation closure | CURRENTLY UNAVAILABLE; ENFORCED after a conforming closure successor | No reviewed successor exists as of 2026-07-31; otherwise `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human |
 | Atomic reservation/debt/cycle/terminal state | ENFORCED after #115 | Task #115 checked state owner |
-| External-call continuation/effect linearization | ENFORCED after #115/#120 | Checked state plus synchronous adapters |
+| External-call continuation/effect linearization | ENFORCED after #115 and the closure successor | Checked state plus successor-owned synchronous adapters |
 | Fail-closed state-loss quarantine | ENFORCED after #115 | Task #115 checked state owner |
-| No daemon, persistence plane, or runtime dependency | STATED fail-closed baseline; M5 operator confirmation pending | Project/package boundary |
+| No daemon, persistence plane, durable helper or OS object, or runtime dependency | DECIDED ABSOLUTE by operator on 2026-07-31 (M5 Option A) | Project/package boundary; no mechanism-specific exception |
 | Sole leaves-first guarded kill | ENFORCED | Existing `Stop-Tree` |
 | Three-attempt automatic cap and continuous typed attention | ENFORCED after #115 | 87-A state/output |
 | Durable human delivery and receipt | STATED out of scope | Future 87-B |
 
-Task #78 consumes the named authority only after #115 and #120. Task #116
-remains blocked only on #115 and independently stageable: an already-absent
-wrapper needs neither a target tree nor task #120's closure. This preserves the
+Task #78 consumes the named authority only after #115, merged/reviewed #120,
+and the closure successor. Task #116 remains blocked only on #115 and
+independently stageable: an already-absent wrapper needs neither a target tree
+nor the closure successor. This preserves the
 task #94 ordering and #107's single contained kill site.

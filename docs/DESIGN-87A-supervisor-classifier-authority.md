@@ -1,6 +1,6 @@
 # Design 87-A: Supervisor classifier and recovery-authority totality
 
-**Status:** Proposed, Revision 6 with the operator-directed owned-childless
+**Status:** Proposed, Revision 7 with the operator-directed owned-childless
 wrapper authority; design only. This core and its
 [normative owned-childless module](DESIGN-87A-owned-childless-wrapper-authority.md)
 at the same commit constitute 87-A; neither is conforming alone.
@@ -63,13 +63,23 @@ not erase mandatory escalation.
   mechanically blocked on task #115, explicitly not blocked on Design 87, and
   is scheduled immediately after #115 and before 87-A implementation. It
   remains independently stageable.
-- Task #120 owns complete nonce-anchored tree observation and an action-scoped
-  non-destructive tree closure. It is an implementation prerequisite for
-  owned-childless teardown. Its Windows mechanism requires a separate
-  design/review before implementation; 87-A defines only the closed
-  authority-facing contract. Task #78 consumes the constructor/cap after
-  #115/#120. Task #116 remains independent because an absent wrapper needs no
-  teardown target.
+- Task #120 candidate `28f663fce694fd72f311bda7590ced53abfab528`
+  owns a bounded 64-entry nonce-anchored tree snapshot and a deny-only
+  post-kill launch barrier. As of 2026-07-31 it is **UNMERGED**, has no
+  completed review, exists only on
+  `origin/codex/task120-owned-process-tree-final`, and may move under open PR
+  102 review. It does not implement action-scoped child-creation closure or
+  attempt-keyed acquire/reconcile/release.
+- The **closure successor**—a separately reviewed extension to #120 or a
+  successor task—owns that missing closure and the synchronous adapters needed
+  to linearize its external effects with #115 checked state. No reviewed
+  successor exists as of 2026-07-31. Until one exists, a static
+  pre-reservation `ClosureCapabilityV1` returns `CAPABILITY_UNAVAILABLE`
+  without an attempt or external call, and the dependent recovery remains
+  `POLICY_HELD` pending a human. Task #78 consumes the
+  constructor/cap only after #115, merged/reviewed #120, and that successor.
+  Task #116 remains independent because an absent wrapper needs no teardown
+  target.
 - Existing guarded `Stop-Tree` is the sole kill site, preserving #107.
 - The task #81 recovery umbrella preceding Design 87 is consistent with the
   task #94 umbrella-first release policy. 87-A does not challenge that order.
@@ -82,8 +92,9 @@ core combiner/output. Authority initiation overlays the child-death-sourced
 runtime subset; subsequent module debt and cycle are global safety constraints
 over later different-owner, relaunch-only, automatic-selection, result, and
 attention decisions. Banked mechanics do not move. The split bounds the newly
-reviewed delta and keeps task #120's platform mechanism out of 87-A. A future
-#120 mechanism design is a prerequisite, not a third 87-A conformance file.
+reviewed delta and keeps task #120's platform mechanism and the closure
+successor out of 87-A. A reviewed #120 mapping and closure-successor mechanism
+are prerequisites, not additional 87-A conformance files.
 
 **STATED frozen delta-panel input at `44b3787` (whitespace-token count, UTF-8
 bytes):** core
@@ -94,35 +105,38 @@ bytes):** core
 `2223` / `13431` / `113215` core, the atomic specification grows by
 `1569` lines / `10436` words / `87433` bytes
 (`77.70%` words). This cost is accepted for the fresh authority,
-closure, debt, and cap contract; splitting task #120's mechanism separately
-keeps platform implementation detail out without separating 87-A's authority.
+closure, debt, and cap contract; splitting task #120's snapshot/barrier and
+the closure-successor mechanism separately keeps platform implementation
+detail out without separating 87-A's authority.
 These independently reverified figures remain frozen historical panel
-evidence; Revision 6 does not recompute or replace them.
+evidence; Revision 7 does not recompute or replace them.
 
 **STATED non-goals:** 87-A does not specify notification routes, human receipt,
 incident retention, state-extension compatibility, executor capability
 activation, migration, rollback, wrapper-writer generations, or a rollout
 runbook. Those concerns must not be reintroduced here.
 
-**STATED dependency-plane constraint:** Implementation adds no daemon,
-persistence plane, or runtime dependency; `pyproject.toml:13` remains
-`dependencies = []`. It may add pure code and fields to the existing checked
-supervisor state after task #115. Task #120 does not relax this promise: if a
-platform cannot supply complete observation and synchronous action-scoped
-closure within existing code/state and transient caller-owned synchronization,
-it must return `CAPABILITY_UNAVAILABLE`. A daemon, service, detached or bundled
-helper, new database/file/registry/journal, or independently durable named OS
-object requires a separate operator-approved project-promise change and is not
-authorized by 87-A.
+**DECIDED dependency-plane constraint (operator, 2026-07-31; M5 Option A):**
+Implementation adds no daemon, new persistence plane, durable helper or
+durable OS object, or runtime dependency; `pyproject.toml:13` remains
+`dependencies = []`. It may add only pure code and fields to the existing
+checked supervisor state after task #115 plus transient caller-owned
+synchronization that leaves no durable helper or OS object. Neither task #120
+nor the closure successor relaxes this absolute promise. There is no
+mechanism-specific or separately versioned exception.
 
-**STATED pending project-promise decision (M5):** The preceding unqualified
-constraint is the fail-closed project baseline while the delta-panel finding
-awaits operator disposition; this author revision neither authorizes nor
-silently assumes an exception for task #120. The operator must either confirm
-that baseline as the final #120 boundary or separately approve a versioned
-exception that closes lifetime, ownership, cleanup, and crash semantics. Until
-that decision is recorded, `CAPABILITY_UNAVAILABLE` is mandatory whenever the
-baseline cannot satisfy the contract.
+If a platform cannot prove synchronous action-scoped closure inside that
+boundary, `ClosureCapabilityV1` is `CAPABILITY_UNAVAILABLE`. The successor does
+not exist as of 2026-07-31, so that static pre-reservation refusal remains
+mandatory: create no reservation, consume no attempt, make no external call,
+perform no closure-dependent named teardown, and keep the dependent recovery
+`POLICY_HELD` with `CAPABILITY_UNAVAILABLE` pending a human. Structural
+unavailability is never an ordinary closure veto, retry, or exhaustion.
+Finding an unprovable case during implementation creates a task; it never
+authorizes an implementation-detail mechanism.
+This is an intentional availability cost: some recoveries may never become
+automatic. The operator accepted that outcome rather than permit stale
+authority.
 
 The companion
 [`DESIGN-87A-revision-2-disposition.md`](DESIGN-87A-revision-2-disposition.md)
@@ -566,7 +580,7 @@ only reconcile/release. `PRE_BARRIER` and all non-childless phases require
 owner `NONE`. Every other phase/owner pairing is invalid and `POLICY_HELD`.
 
 The attempt revision is the post-commit state revision immediately before
-invoking task #120 closure acquisition. Automatic origin in any childless
+invoking closure-successor acquisition. Automatic origin in any childless
 closure/teardown phase requires a matching `ACTIVE/ISSUED` childless cycle
 with the same attempt ID/revision until verified release finalizes the outcome.
 `TREE_CLOSURE_ACQUIRING` and `TREE_CLOSURE_HELD` require no debt current attempt
@@ -596,7 +610,7 @@ transaction that finally releases its reservation. No external childless
 adapter may acquire, terminate, capture, or release using a retired ID except
 the module's release-only handling of an unexpected late `HELD` result.
 Eviction follows checked commit-revision order and is permitted only after
-task #120 proves the evicted ID terminally `NEVER_ACQUIRED` or `RELEASED`;
+the closure successor proves the evicted ID terminally `NEVER_ACQUIRED` or `RELEASED`;
 otherwise the set is full and named recovery holds.
 
 Every normal or reload result first requires the returned acquisition ID to
@@ -1159,12 +1173,14 @@ big-endian length plus bytes.
 ### Complete owned-wrapper tree
 
 **ENFORCED by the
-[normative module](DESIGN-87A-owned-childless-wrapper-authority.md):** Task
-#120 supplies exact PID/start/nonce ownership, complete guarded tree
-observation, an action-scoped non-destructive closure, and the lossless
-`$t.start` adapter. Missing or unverifiable capability produces
-`OwnedWrapperTreeObservationV1.INCOMPLETE`; a name or pattern never supplies
-ownership.
+[normative module](DESIGN-87A-owned-childless-wrapper-authority.md):** The
+87-A adapter maps task #120 candidate `owned_process_tree_v2` into at most 64
+exact PID/start/nonce-owned targets and rejects every incomplete or incompatible
+snapshot. The closure successor separately supplies the action-scoped
+non-destructive creation closure and effect-linearized adapters. Missing or
+unverifiable observation produces `OwnedWrapperTreeObservationV1.INCOMPLETE`;
+an unavailable successor produces `CAPABILITY_UNAVAILABLE`; a name or pattern
+never supplies ownership.
 
 ## Physical absence and launch timing
 
@@ -1536,14 +1552,14 @@ a no-call takeover CAS, or `MAY_RECONCILE` only under the module's exact
 conditions. External cleanup requires that this is not dry run, state-loss
 quarantine is `NONE`, the freshly captured supervisor instance is `CURRENT`,
 and the module's exclusive continuation/effect guard is held by this
-invocation. It may then invoke only task #120's attempt-keyed
+invocation. It may then invoke only the closure successor's attempt-keyed
 reconcile/release operations, capture the effect of an already-issued
 teardown, and compare-and-swap the persisted disposition even when kill
 switch, action latch, report membership, or auto-restart blocks new recovery.
 It cannot acquire a new closure, reserve/increment an attempt, call
 `Stop-Tree`, launch, consume a marker, or change generic backoff/readiness.
 Dry run and a non-current/unreadable supervisor retain the complete fence
-byte-identically and make no #120 call. This exception is non-destructive
+byte-identically and make no closure-successor call. This exception is non-destructive
 fence cleanup, not recovery authority.
 
 These are population/executor gates and manual origin cannot override them.
@@ -2021,15 +2037,16 @@ bookkeeping during a later launch cannot make its consumed request ID reusable.
 | --- | --- |
 | Refused/held | Retain marker/revision. Do not reserve, consume, kill, launch, reset readiness, or mutate automatic backoff. |
 | Irrecoverable checked-state loss | Create a new epoch only with `StateLossQuarantineV1.UNRESOLVED`; select `STATE_PROVENANCE_LOST`, emit mandatory attention, and deny every automatic/manual kill or launch, closure acquisition, attempt/debt mutation, marker consumption, identity commit, and grace recovery. Do not initialize usable debt/cycle values or a fresh childless attempt budget. The only exit is the module's checked complete different-owner/extinction retirement CAS, which performs no OS action or same-poll launch; a valid backup is not restoration proof. |
+| Named childless closure capability unavailable | When `ClosureCapabilityV1` is `CAPABILITY_UNAVAILABLE`, retain marker and checked recovery state, create no reservation/continuation, consume no attempt, make no external call, and emit continuous `CAPABILITY_UNAVAILABLE`; remain `POLICY_HELD` pending a human. Structural unavailability never becomes `CLOSURE_VETOED`, retry, or exhaustion. |
 | Reserve selected authority | Record the complete origin-specific `RESERVED/PRE_BARRIER` value, including current execution-gate snapshot ID and the complete module reservation evidence when applicable, with null spawn guard/deadline/childless attempt ID/revision/closure ID/pending disposition. Consume a selected whole-wrapper absence proof; retain the separate module confirmation for live action-time equality. Do not add a manual request ID to the committed consumed set. |
-| Begin childless closure acquisition | Acquire the module's exclusive effect guard, live-recompute the reservation, generate an attempt/continuation ID, and commit `TREE_CLOSURE_ACQUIRING` plus `ChildlessContinuationOwnerV1(CLOSURE_ACQUIRE, ARMED)` immediately before synchronously invoking task #120 with that ID. Retain the guard through the call and result CAS. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin leaves the cycle byte-identical. Preserve existing debt. |
-| Childless closure absent/blocked | Under the same guard, terminal matching `NEVER_ACQUIRED`, or matching `RELEASED` while still acquiring, retires the attempt and finalizes `CLOSURE_VETOED`. A reload-held closure, live joined-evidence mismatch, or late execution/manual/policy veto commits `TREE_CLOSURE_RELEASING/CLOSURE_VETOED`; exact release/reconcile calls each use the effect guard and finalize only after matching `RELEASED`. `HELD`, `UNKNOWN`, or a live foreign continuation retains every fence. No kill or launch occurs. |
+| Begin childless closure acquisition | Require exact `ClosureCapabilityV1.AVAILABLE`, acquire the module's exclusive effect guard, live-recompute the reservation, generate an attempt/continuation ID, and commit `TREE_CLOSURE_ACQUIRING` plus `ChildlessContinuationOwnerV1(CLOSURE_ACQUIRE, ARMED)` immediately before synchronously invoking the closure successor with that ID. Retain the guard through the call and result CAS. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin leaves the cycle byte-identical. Preserve existing debt. |
+| Childless closure transiently absent/blocked | Under the same guard, a conforming transient refusal plus terminal matching `NEVER_ACQUIRED`, or matching `RELEASED` while still acquiring, retires the attempt and finalizes `CLOSURE_VETOED`. A reload-held closure, live joined-evidence mismatch, or late execution/manual/policy veto commits `TREE_CLOSURE_RELEASING/CLOSURE_VETOED`; exact release/reconcile calls each use the effect guard and finalize only after matching `RELEASED`. `HELD`, `UNKNOWN`, or a live foreign continuation retains every fence. A post-reservation structural-unavailability claim is malformed, remains `POLICY_HELD` with exact fences, and never reaches this row. No kill or launch occurs. |
 | Childless closure held | Only the module's fresh raw-capture/live-basis/target-equality join may commit `TREE_CLOSURE_HELD`, its exact closure ID, and the acquire/reconcile continuation at `CALL_RETURNED` while the effect guard remains held. The same checked live chain must replace it atomically with `STOP_TREE/ARMED` or `CLOSURE_RELEASE/ARMED`. Preserve existing debt and automatic-cycle count. |
 | Childless teardown action-ready | Acquire and retain the effect guard. In one transaction enter `TEARDOWN_IN_FLIGHT`, create/update origin-neutral debt with the immutable tuple, and persist `ChildlessContinuationOwnerV1(STOP_TREE, ARMED)`. Recheck that owner under the guard, invoke only existing `Stop-Tree`, then atomically change the same owner to `CALL_RETURNED`. A stale/nonowner continuation cannot call. |
 | Childless post-action observation | Only `STOP_TREE/CALL_RETURNED` may reserve a fresh nonzero capture ordinal and observe the effect. Map it to `COMPLETE_GONE`, `SAME_OWNER_SURVIVED`, `MEMBER_SURVIVED`, or `EFFECT_UNPROVEN`; atomically enter `TREE_CLOSURE_RELEASING` with that disposition and update the same continuation ID to `CLOSURE_RELEASE/ARMED` while retaining debt/current attempt and automatic `ISSUED`. Request exact release under the retained effect guard and persist its returned stage. |
 | Childless exact-release finalization | Apply the module's exhaustive event table while holding the effect guard. Only matching `RELEASED` may clear debt current-attempt fields, record failure/exhaustion, retire the attempt, release the reservation, clear the continuation owner, or clear debt/cycle. Live `COMPLETE_GONE` with the same checked continuation chain alone normalizes to `PRE_BARRIER` and returns `CONDITIONAL_POST_TEARDOWN`; reload cleanup enters `IDLE` without launch. Every finalized branch writes the same-poll terminal. |
 | Non-childless teardown or final-barrier veto after no closure remains | Release the reservation directly. Retain any marker and leave launch/readiness/backoff fields unchanged. A reserved no-kill absence proof remains consumed. |
-| Barrier passed, immediately before spawn | Increment `consecutive_fails`; compute normal future automatic backoff while bypassing it for this attempt; clear `healthy_since`; set readiness fields to false/zero and `launching=true`; reset both banked child confirmations and the separate module overlay; commit `phase=SPAWN_IN_FLIGHT`, null childless attempt ID/revision/closure ID/pending disposition, null `spawned_guard`, and `pending_attempt_deadline_epoch=decision_now_epoch + resolved_launch_grace_seconds`. Preserve prior guarded identity. The pending deadline is never heartbeat freshness. Only after this commit may `Start-Process` run. |
+| Barrier passed, immediately before spawn | When #120 owned-tree state or post-kill provenance applies, first require its fresh deny-only launch barrier to be unblocked and unambiguous. A blocked/ambiguous result retains the launch hold, never retargets the survivor, never proves `COMPLETE_GONE`, and never clears debt. Then increment `consecutive_fails`; compute normal future automatic backoff while bypassing it for this attempt; clear `healthy_since`; set readiness fields to false/zero and `launching=true`; reset both banked child confirmations and the separate module overlay; commit `phase=SPAWN_IN_FLIGHT`, null childless attempt ID/revision/closure ID/pending disposition, null `spawned_guard`, and `pending_attempt_deadline_epoch=decision_now_epoch + resolved_launch_grace_seconds`. Preserve prior guarded identity. The pending deadline is never heartbeat freshness. Only after this commit may `Start-Process` run. |
 | Proven no-spawn failure | Only an OS/API result that positively proves no child was created may set `launching=false`, release reservation, retain any marker and attempt/backoff bookkeeping, preserve prior guarded identity, clear the pending deadline, and record the typed failure result. Timeout, exception, lost return, or any uncertain post-issuance effect enters `AMBIGUOUS_LAUNCH` instead. |
 | Spawn returned but guarded identity is ambiguous | Persist `AMBIGUOUS_LAUNCH` with the complete reservation, null pending deadline, and `ambiguity_boundary_poll_sequence=ordinary_poll_sequence`; reset `absence_confirmation` to `EMPTY`. For `IDENTITY_COMMIT_FAILED`, copy the returned non-null `SpawnGuardV1` identically into `reservation.spawned_guard` and `evidence.observed_guard`; for `START_RETURNED_WITHOUT_GUARD`, keep both null. Do not release authority ownership or permit another launch. |
 | New guarded identity commits | In one checked transaction replace the managed identity, clear stale brain identity, reset the establishment guard to `NOT_APPLICABLE`, set `launching=true`, `readiness_seen=false`, `launch_grace_until=decision_now_epoch + resolved_launch_grace_seconds`, and `recovery_execution=IDLE`. Debt must already be `NONE` and no closure may remain. A debt-free childless cycle for a different old owner is cleared. Manual origin also adds the request ID to the consumed set and sets `manual_readiness=APPLIED_PENDING_READINESS` for this exact generation. If an automatic commit supersedes a different pending manual generation, it records `manual_readiness_superseded`, sets `manual_readiness=NONE`, and leaves that marker untouched; otherwise it preserves the bookkeeping. |
@@ -2047,7 +2064,7 @@ For the named childless phases, the following release/reconciliation bullets
 run only after the module's `ChildlessSafetyReconciliationGateV1` has either
 selected the state-only `MAY_RELEASE_PRE_BARRIER` path or converged through a
 no-call `MAY_TAKEOVER` CAS to `MAY_RECONCILE`. Any `RETAIN_*` variant keeps the
-complete fence byte-identical, makes no #120 call, emits module `POLICY_HELD`,
+complete fence byte-identical, makes no closure-successor call, emits module `POLICY_HELD`,
 and returns. This condition does not change the preexisting non-childless
 ambiguity rules.
 
@@ -2056,7 +2073,7 @@ ambiguity rules.
   continuation owner, effect guard, or spawn exists. Any consumed absence proof
   stays consumed. For the named childless case it records `BARRIER_VETOED`,
   consumes no automatic attempt, and writes the same-poll terminal.
-- Reload of `RESERVED/TREE_CLOSURE_ACQUIRING` invokes only task #120's
+- Reload of `RESERVED/TREE_CLOSURE_ACQUIRING` invokes only the closure successor's
   attempt-keyed `OwnedTreeClosureReconciliationV1`. Matching
   `NEVER_ACQUIRED` finalizes `CLOSURE_VETOED`; matching `RELEASED` binds its
   returned closure ID and finalizes the same veto; matching `HELD` is persisted
@@ -2435,8 +2452,10 @@ RecoveryActionResolutionV1 {
   teardown_debt: module TeardownDebtSummaryV1
   automatic_childless_cycle: module AutomaticChildlessCycleSummaryV1
   action_attention_required: bool
-  action_attention_codes: ordered tuple of length 0..4[
-    "CHILDLESS_OWNER_CHILD_TREE_OR_CLOSURE_INCOMPLETE"
+  action_attention_codes: ordered tuple of length 0..6[
+    "CHILDLESS_STATE_PROVENANCE_LOST"
+    | "CAPABILITY_UNAVAILABLE"
+    | "CHILDLESS_OWNER_CHILD_TREE_OR_CLOSURE_INCOMPLETE"
     | "CHILDLESS_TEARDOWN_DEBT"
     | "AUTOMATIC_CHILDLESS_RETRY_ACTIVE"
     | "AUTOMATIC_CHILDLESS_RETRY_EXHAUSTED"
@@ -2512,16 +2531,28 @@ granting authority from known-foreign rows.
    still matches;
 4. run one fresh post-teardown/no-kill capture through the shared observer;
 5. require that capture to classify `ABSENT`;
-6. recapture execution/manual/policy authority under the action-time fence; and
-7. only then call `Start-Process`.
+6. when #120 owned-tree state or post-kill provenance applies, run its fresh
+   deny-only launch barrier and require an unblocked, unambiguous result;
+7. recapture execution/manual/policy authority under the action-time fence; and
+8. only then call `Start-Process`.
 
 For `PROVABLY_CHILDLESS_OWNED_WRAPPER`, the normative module replaces step 3
-with task #120's action-time tree closure, exact reserved-target digest check,
+with the closure successor's action-time tree closure, exact reserved-target digest check,
 checked debt/attempt commit, sole `Stop-Tree` adapter, and typed complete-gone
 proof. It rejoins step 4 only after origin-neutral debt is cleared. Module debt
 forces every unrelated launch proof to `NONE` while permitting only its
 debt-bound residual cleanup, so neither manual nor automatic absence can
 bypass a partial kill.
+
+#120's barrier is not the closure successor. At candidate `28f663f`, planning
+and `Stop-Tree` are separated by process scheduling: a recorded parent may
+create a late descendant after planning and then exit, leaving a process that
+was never in the planned target set and may survive `Stop-Tree`. The barrier
+catches that descendant only to block launch. It never adds a kill target,
+proves `COMPLETE_GONE`, clears debt, or substitutes for the successor's
+pre-effect creation closure. For the named childless path, the module consumes
+the first such result in its typed post-action observation; step 6 performs the
+fresh final recheck immediately before spawn.
 
 For `CONDITIONAL_POST_TEARDOWN`, the fresh post-teardown capture is also the
 final barrier. A survivor, unavailable/incomplete capture, or ambiguous
@@ -2778,6 +2809,24 @@ without all of this executed evidence:
     `RELAUNCH_ONLY`; outstanding debt suppresses both. Recompute the module's
     chained seven-domain vector and race nonordinary capture-ordinal
     allocation as required by its conformance section.
+36. Integrate the module's exact #120 candidate adapter and post-kill barrier
+    control. Race a recorded parent that creates a descendant after planning
+    and exits during `Stop-Tree`; require the late descendant to miss the
+    planned target set, survive, and be detected only by the fresh deny-only
+    barrier before `SPAWN_IN_FLIGHT`. The barrier must hold launch without
+    retargeting the descendant, proving `COMPLETE_GONE`, clearing debt, or
+    substituting for the closure successor. An unavailable/ambiguous barrier
+    also holds, and an unblocked barrier without the typed post-action proof
+    cannot clear debt or launch.
+37. Integrate every `ClosureCapabilityV1` reason before reservation and require
+    zero reservation, attempt, continuation, external call, teardown, retry,
+    and exhaustion with continuous `CAPABILITY_UNAVAILABLE`/`POLICY_HELD`
+    pending a human. Inject a post-reservation structural-unavailability claim
+    and `UNKNOWN(CAPABILITY_UNAVAILABLE)` reconciliation; retain every exact
+    fence and forbid `CLOSURE_VETOED`, retry, exhaustion, kill, and launch.
+    Export all applicable module attention codes in their exact order,
+    including `CHILDLESS_STATE_PROVENANCE_LOST` and
+    `CAPABILITY_UNAVAILABLE`, and require `action_attention_required=true`.
 
 ## Mechanism inventory
 
@@ -2806,15 +2855,15 @@ without all of this executed evidence:
 | 87-B receives durable evidence rather than only a hash | ENFORCED | Typed canonical condition, action resolution, and bounded diagnostic candidate export. |
 | No launch on stale proof or observer disagreement | ENFORCED | Shared final barrier after reservation. |
 | Strict barrier is not silently partially activated | STATED for 87-C | Same-generation 87-B incident projection is an activation prerequisite. |
-| No daemon, persistence plane, or runtime dependency | STATED fail-closed baseline; M5 operator confirmation pending | Pure code, existing checked state, and transient caller-owned synchronization only; task #120 returns `CAPABILITY_UNAVAILABLE` if that boundary cannot meet its contract; project dependency list remains empty. |
+| No daemon, persistence plane, durable helper or OS object, or runtime dependency | DECIDED ABSOLUTE by operator on 2026-07-31 (M5 Option A) | Pure code, existing checked state, and transient caller-owned synchronization only; there is no mechanism-specific exception, and the nonexistent closure successor remains `CAPABILITY_UNAVAILABLE` when that boundary cannot prove its contract. |
 | Earlier fresh-but-confirmed-absent recovery | STATED out of scope | Task #116, blocked on #115 but not #87, scheduled before 87-A implementation. |
 | Durable incident visibility/delivery | STATED out of scope | Future 87-B, dependent on tasks #114/#115. |
 | Migration and rollback | STATED out of scope | Future 87-C after 87-A/87-B. |
 | Raw discovery stops flapping | STATED not promised | Process-discovery behavior is unchanged. |
-| Owned-childless teardown requires a nonce-owned complete tree and action-time closure | ENFORCED after tasks #115/#120 | Normative owned-childless module, checked state owner, separately reviewed #120 closure mechanism, and sole guarded `Stop-Tree` adapter. |
-| Child-establishment grace cannot be sampled away | ENFORCED after tasks #115/#120 | Nonrenewable same-turn closed guard in observation, confirmation, reservation, and action equality. |
-| External childless calls cannot outlive their authority owner | ENFORCED after tasks #115/#120 | Exclusive effect guard, checked continuation owner/stage, stable attempt tombstones, and synchronous adapters. |
-| Partial owned-childless teardown cannot be laundered into launch | ENFORCED after tasks #115/#120 | Origin-neutral durable teardown debt and debt-bound completion authority. |
+| Owned-childless teardown requires a nonce-owned complete tree and action-time closure | CURRENTLY UNAVAILABLE; ENFORCED after #115, merged/reviewed #120, and a conforming closure successor | No reviewed closure successor exists as of 2026-07-31, so the named path is `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human. |
+| Child-establishment grace cannot be sampled away | ENFORCED after #115, merged/reviewed #120, and the closure successor | Nonrenewable same-turn closed guard in observation, confirmation, reservation, and action equality. |
+| External childless calls cannot outlive their authority owner | ENFORCED after #115 and the closure successor | Exclusive effect guard, checked continuation owner/stage, stable attempt tombstones, and successor-owned synchronous adapters. |
+| Partial owned-childless teardown cannot be laundered into launch | ENFORCED after #115, merged/reviewed #120, and the closure successor | Origin-neutral durable teardown debt and debt-bound completion authority. |
 | Automatic owned-childless retry stops at three without fading from attention | ENFORCED after tasks #78/#115 | Durable childless-only cycle, hard cap, and independent action-attention output. |
 | State loss cannot reset a cap or erase teardown debt | ENFORCED after task #115 | Fail-closed quarantine until complete different-owner/extinction proof; no exact-restoration or valid-backup escape exists in this revision. |
 
