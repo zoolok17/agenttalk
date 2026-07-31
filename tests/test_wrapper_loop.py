@@ -1360,7 +1360,8 @@ def _patch_procstream_popen(monkeypatch, lines, *, close_exc: OSError | None = N
         def poll(self):
             return None
 
-        def wait(self):
+        def wait(self, timeout=None):
+            _ = timeout
             return 0
 
     monkeypatch.setattr(run.subprocess, "Popen", _Popen)

@@ -1676,21 +1676,30 @@ class _ProcStream:
                 except Exception:  # noqa: BLE001, S110 - preserve the consumer's failure  # nosec B110
                     pass
             try:
-                if self._watchdog_stream_interrupted:
-                    if consumer_aborted:
+                if consumer_aborted:
+                    # I5: bounded, with a kill fallback, regardless of
+                    # watchdog config - terminate() (above) is a REQUEST
+                    # (SIGTERM on POSIX), not a guarantee. A child that
+                    # ignores or SIG_IGNs it would otherwise wedge an
+                    # unbounded wait() here forever: the exact class of
+                    # wrapper-hang #117 exists to fix, just moved from "no
+                    # terminate() call at all" to "terminate() with no
+                    # bound on what follows it." This is the SAME fallback
+                    # the watchdog-interrupted branch already had - it must
+                    # not depend on a watchdog being configured at all.
+                    try:
+                        self.returncode = self._proc.wait(timeout=10.0)
+                    except subprocess.TimeoutExpired:
                         try:
-                            self.returncode = self._proc.wait(timeout=10.0)
-                        except subprocess.TimeoutExpired:
-                            try:
-                                self._proc.kill()
-                                self.returncode = self._proc.wait(timeout=5.0)
-                            except Exception:  # noqa: BLE001 - cleanup must preserve owner failure
-                                self.returncode = self._proc.poll()
-                    else:
-                        # A watchdog wake is an exit confirmation, never merely a signal
-                        # report. Fail closed if that invariant is ever violated.
-                        self.returncode = self._proc.wait()
+                            self._proc.kill()
+                            self.returncode = self._proc.wait(timeout=5.0)
+                        except Exception:  # noqa: BLE001 - cleanup must preserve owner failure
+                            self.returncode = self._proc.poll()
                 else:
+                    # Natural completion (stream exhausted) or a watchdog
+                    # wake: an exit confirmation, never merely a signal
+                    # report - the watchdog's own kill pass has already run.
+                    # Fail closed if that invariant is ever violated.
                     self.returncode = self._proc.wait()
             finally:
                 if self._watchdog is not None and not consumer_aborted:
