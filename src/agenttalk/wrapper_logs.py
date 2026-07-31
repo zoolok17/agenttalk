@@ -279,6 +279,15 @@ class BoundedStreamTee:
             # segment_bytes by up to another chunk.
             self._tail_size += len(chunk)
             tail.write(chunk)
+            # I4 (cold review, round 3): once the base segment's forwarding
+            # budget is spent, EVERY further diagnostic write lands only
+            # here - the tail ring is the sole surviving copy at that
+            # point, so it needs the same durability guarantee the base
+            # segment's own flush-on-newline fix gives the original
+            # stream. tail is a raw binary file (no line-buffering concept
+            # to replicate); flush unconditionally rather than trying to
+            # infer "was that a diagnostic line" from raw bytes.
+            tail.flush()
             remaining = remaining[len(chunk):]
 
     def _write_original(self, text: str, *, bounded: bool) -> None:

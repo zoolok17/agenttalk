@@ -10623,7 +10623,26 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                 # provide. Skipped when a signal already reported the
                 # termination - that is an intentional exit, not a crash.
                 traceback.print_exc(file=sys.stderr)
-            raise
+            # New area (cold review): a bare re-raise here still reaches
+            # main()'s own KeyboardInterrupt/OSError one-liners, or Python's
+            # own default top-level traceback printer for anything else -
+            # ALL of which run after this "with" block's own finally has
+            # already restored the raw stream, writing straight to the
+            # unbounded underlying file. SystemExit is the one exception
+            # type nothing above prints a traceback for at the true top
+            # level, so replicate whatever main() would have written here
+            # (while stderr is still bounded) and convert to one, with the
+            # matching exit code, instead of letting the original exception
+            # type escape this block.
+            if isinstance(exc, SystemExit):
+                raise
+            if isinstance(exc, KeyboardInterrupt):
+                sys.stderr.write("\nagenttalk: interrupted\n")
+                raise SystemExit(130) from exc
+            if isinstance(exc, (ValueError, FileNotFoundError, OSError)):
+                sys.stderr.write(f"agenttalk: {exc}\n")
+                raise SystemExit(2) from exc
+            raise SystemExit(1) from exc
         finally:
             del args._wrapper_lifecycle_log
         if not lifecycle_log.terminal_emitted:

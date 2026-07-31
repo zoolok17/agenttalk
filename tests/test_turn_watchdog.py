@@ -861,6 +861,31 @@ def test_proc_stream_no_watchdog_aborted_consumption_bounds_wait_after_terminate
     assert stream.returncode is not None
 
 
+def test_proc_stream_constructor_cleanup_reports_confirmed_exit() -> None:
+    """New area (PR 98 cold review): _cleanup_after_constructor_error runs
+    when __init__ itself fails partway (after the child has already been
+    spawned) - it terminates and reaps the child, but never told on_exit
+    about it, unlike __iter__'s own finally block which does. A child that
+    WAS confirmed dead here left no child_exited record at all, and the
+    cleanup's wait()/kill() result was never even captured into
+    self.returncode in the first place."""
+    exits: list[tuple[int, str | None, int | None]] = []
+
+    def boom(pid: int, start: str | None) -> None:
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run._ProcStream(
+            [sys.executable, "-u", "-c", "import time; time.sleep(5)"],
+            None,
+            on_spawn=boom,
+            on_exit=lambda pid, start, rc: exits.append((pid, start, rc)),
+        )
+
+    assert len(exits) == 1, "on_exit did not fire from constructor cleanup"
+    assert exits[0][2] is not None, "child_exited fired with an unconfirmed return code"
+
+
 def test_proc_stream_aborted_consumption_never_reports_unconfirmed_exit() -> None:
     """Finding 2 (PR 98 connector re-review, head 2297ce10): when consumption is
     aborted and the child never confirms its exit (wait keeps timing out, poll

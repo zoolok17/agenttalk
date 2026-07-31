@@ -1799,11 +1799,17 @@ class _ProcStream:
                 continue
             if chunk == b"":
                 pending += decoder.decode(b"", final=True)
+                # I5 remnant (cold review, round 3): deliver the final
+                # fragment BEFORE declaring the stream done - marking done
+                # and waking anyone checking it while that fragment is
+                # still only sitting in a local variable, not yet handed to
+                # the consumer, asserts a completeness that hasn't actually
+                # happened yet.
+                if pending:
+                    yield pending
                 with self._watchdog_stream_condition:
                     self._watchdog_stream_done = True
                     self._watchdog_stream_condition.notify_all()
-                if pending:
-                    yield pending
                 return
             pending += decoder.decode(chunk)
             while "\n" in pending:
@@ -1832,15 +1838,26 @@ class _ProcStream:
         try:
             if self._proc.poll() is None:
                 self._proc.terminate()
-            self._proc.wait(timeout=10.0)
+            self.returncode = self._proc.wait(timeout=10.0)
         except subprocess.TimeoutExpired:
             try:
                 self._proc.kill()
-                self._proc.wait(timeout=5.0)
+                self.returncode = self._proc.wait(timeout=5.0)
             except Exception as exc:
                 _ = exc
         except OSError as exc:
             _ = exc
+        # New area (cold review): this cleanup path terminates and reaps the
+        # child but - unlike __iter__'s own finally block - never told
+        # on_exit about it, so a child that WAS confirmed dead here left no
+        # child_exited record at all. Skip, not fabricate, if the double-
+        # exception fallback above still left returncode unconfirmed - the
+        # same invariant _ProcStream.__iter__ already holds elsewhere.
+        if self._on_exit is not None and self.returncode is not None:
+            try:
+                self._on_exit(self.pid, self.pid_start, self.returncode)
+            except Exception as exc:
+                _ = exc
 
 
 def _ovh_qwen_failure_text(sig: dict) -> str:

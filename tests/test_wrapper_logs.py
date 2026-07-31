@@ -181,6 +181,34 @@ def test_bounded_stream_tee_line_buffered_original_flushes_on_newline(
     assert "final diagnostic before SIGKILL" in on_disk
 
 
+def test_bounded_stream_tee_tail_flushes_after_each_write(tmp_path: Path) -> None:
+    """I4 remnant (PR 98 cold review, round 3): the sibling test above fixed
+    the ORIGINAL stream's flush - the tail ring's own files are raw binary
+    BufferedWriters with no per-write flush of their own. Once the base
+    segment's forwarding budget is spent, every further diagnostic write
+    lands ONLY in the tail ring, so a small write can sit in that
+    BufferedWriter's own internal buffer and never reach disk until an
+    explicit flush()/close() or the buffer filling completely - the exact
+    same durability gap, just one layer over. Read back through a SEPARATE
+    file handle with zero explicit flush() calls anywhere in this test."""
+    original = io.StringIO()
+    base = tmp_path / "stderr.log"
+    tee = wrapper_logs.BoundedStreamTee(
+        original,
+        base,
+        max_bytes=4096,
+        segment_count=4,
+    )
+
+    tee.write("tail diagnostic\n")
+    tail_path = tmp_path / "stderr.log.1"
+    on_disk = tail_path.read_text(encoding="utf-8")
+
+    tee.close()
+
+    assert "tail diagnostic" in on_disk
+
+
 def test_bounded_stream_tee_failure_discards_excess_without_breaking_wrapper(
     tmp_path: Path,
 ) -> None:
@@ -553,8 +581,15 @@ def test_cmd_wrap_records_setup_exception_before_loop_exists(
     monkeypatch.setattr(cli, "_cmd_wrap_with_logging", fail_setup)
     args = argparse.Namespace(agent="worker", supervisor_launch_nonce=nonce)
 
-    with pytest.raises(RuntimeError, match="setup failed"):
+    # New area (cold review): a bare re-raise here used to let the original
+    # RuntimeError reach main()'s uncaught-exception path, which prints its
+    # OWN traceback AFTER streams are restored - straight to the unbounded
+    # raw file. cmd_wrap now converts to SystemExit(1) after capturing the
+    # diagnostic through the bounded stream, since nothing above prints a
+    # traceback for an uncaught SystemExit.
+    with pytest.raises(SystemExit) as exc_info:
         cli.cmd_wrap(args)
+    assert exc_info.value.code == 1
 
     tail = "".join(
         path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
@@ -634,8 +669,9 @@ def test_cmd_wrap_uncaught_exception_traceback_is_bounded_and_in_tail(
     monkeypatch.setattr(cli, "_cmd_wrap_with_logging", blow_up)
     args = argparse.Namespace(agent="worker", supervisor_launch_nonce=nonce)
 
-    with pytest.raises(RuntimeError, match="TRACEBACK-SENTINEL-BOOM"):
+    with pytest.raises(SystemExit) as exc_info:
         cli.cmd_wrap(args)
+    assert exc_info.value.code == 1
 
     files = sorted(tmp_path.glob("stderr.log*"))
     assert all(path.stat().st_size <= 1024 for path in files)
