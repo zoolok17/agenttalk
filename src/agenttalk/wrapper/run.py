@@ -1625,6 +1625,7 @@ class _ProcStream:
 
     def __iter__(self) -> Iterator[str]:
         consumer_aborted = False
+        stream_exhausted = False
         try:
             if self._watchdog is None:
                 yield from _iter_suppressing_benign_pipe_teardown(
@@ -1632,9 +1633,22 @@ class _ProcStream:
                 )
             else:
                 yield from self._iter_until_watchdog_or_eof()
+            # Reached only on natural EOF - a GeneratorExit (an early consumer
+            # break/close, INCLUDING one driven by a termination signal's
+            # SystemExit unwinding through this generator) jumps straight to
+            # finally below without ever setting this.
+            stream_exhausted = True
         finally:
             if self._watchdog is not None:
                 consumer_aborted = self._cancel_watchdog_stream_after_consumer_exit()
+            elif not stream_exhausted:
+                # No watchdog configured (the default for a continuous loop
+                # wrapper) is not license to skip the same abort handling: an
+                # aborted iteration must still terminate a possibly-still-
+                # running child before the wait below, or a termination
+                # signal would leave the wrapper hanging on it instead of
+                # exiting - the opposite of what the signal asked for.
+                consumer_aborted = True
             # Stop the work-heartbeat ticker FIRST - before this stream reads as
             # exhausted to the caller - so drive()'s failed-turn clear_heartbeat
             # (which runs after stream exhaustion) can never be overwritten by a

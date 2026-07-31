@@ -6243,15 +6243,52 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
   }
   $stem = File-StemLower ([string]$file)
   if ($stem -in @('python','python3','py')) {
-    # Accept only the canonical module-entry argv. Searching for `-m
-    # agenttalk` later in the command would misclassify
-    # `python helper.py -m agenttalk ...`: Python runs helper.py, so that
-    # process never installs the cooperative stream bound.
-    if ($args.Count -ge 2 -and
-        $args[0] -eq '-m' -and
-        $args[1] -eq 'agenttalk') {
-      $out = @($args[0], $args[1], '--supervisor-launch-nonce', $nonce)
-      if ($args.Count -gt 2) { $out += @($args[2..($args.Count - 1)]) }
+    # Accept the canonical module-entry argv, optionally preceded by
+    # recognized no-op-for-us interpreter options (`-u`, `-X utf8`, ...) -
+    # a real launch config commonly adds these. Anything else before `-m`
+    # stops the scan rather than being skipped: searching for `-m agenttalk`
+    # anywhere in the command would misclassify `python helper.py -m
+    # agenttalk ...` (Python runs helper.py, so that process never installs
+    # the cooperative stream bound), and an unrecognized flag carries the
+    # same risk - fail closed on it rather than guess.
+    $boolFlags = @(
+      '-b', '-bb', '-B', '-d', '-E', '-i', '-I', '-O', '-OO',
+      '-q', '-s', '-S', '-t', '-tt', '-u', '-v'
+    )
+    $i = 0
+    while ($i -lt $args.Count) {
+      $token = [string]$args[$i]
+      if ($token -eq '-m') { break }
+      if ($boolFlags -contains $token) {
+        $i += 1
+        continue
+      }
+      if ($token -eq '-X' -or $token -eq '-W') {
+        $i += 2
+        continue
+      }
+      if ($token -like '-X?*' -or $token -like '-W?*') {
+        $i += 1
+        continue
+      }
+      break
+    }
+    if ($i + 1 -lt $args.Count -and
+        $args[$i] -eq '-m' -and
+        $args[$i + 1] -eq 'agenttalk') {
+      # A direct assignment inside a plain `if` STATEMENT preserves the
+      # array type; capturing an if/else USED AS AN EXPRESSION does not -
+      # PowerShell enumerates a one-element array flowing through that
+      # pipeline and collapses it back to a bare scalar, which silently
+      # turns the eventual argv into a single glued-together string.
+      $prefix = @()
+      if ($i -gt 0) { $prefix = @($args[0..($i - 1)]) }
+      $out = @($prefix + @(
+        $args[$i], $args[$i + 1], '--supervisor-launch-nonce', $nonce
+      ))
+      if ($args.Count -gt ($i + 2)) {
+        $out = @($out + @($args[($i + 2)..($args.Count - 1)]))
+      }
       return [pscustomobject]@{
         argv = $out
         injected = $true
@@ -6859,6 +6896,13 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
   }
   return $seq + 1L
 }
+function New-WrapperLogPendingMarker([string]$attempt) {
+  [IO.File]::WriteAllText(
+    (Join-Path $attempt '.pending'),
+    '',
+    (New-Object Text.UTF8Encoding($false))
+  )
+}
 function New-WrapperLogTargets([string]$name, [string]$nonce) {
   # Agent names are already roster-validated. Re-check here because these paths
   # are later used by bounded cleanup; never let a config string select a parent.
@@ -6905,11 +6949,7 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
         Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
         continue
       }
-      [IO.File]::WriteAllText(
-        (Join-Path $attempt '.pending'),
-        '',
-        (New-Object Text.UTF8Encoding($false))
-      )
+      New-WrapperLogPendingMarker $attempt
       try {
         [IO.File]::WriteAllText(
           (Join-Path $attempt '.sequence'),
@@ -6924,6 +6964,17 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
       $generationDir = $attempt
       break
     } catch {
+      # A failure here can land AFTER the generation directory was already
+      # created (e.g. the .pending write itself fails) - without cleanup that
+      # directory is left behind with neither a .pending nor a .committed
+      # marker, and retention preserves EVERY markerless directory forever
+      # because it cannot tell an orphan from a genuinely interrupted launch.
+      # Best-effort delete it now, while this attempt is still reachable -
+      # Complete-WrapperLogTargets is never even told about a candidate this
+      # loop abandoned, so nothing downstream can ever clean it up otherwise.
+      if ($attempt -and (Test-Path -LiteralPath $attempt)) {
+        Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
+      }
       Write-Warning (
         ("supervisor: cannot create wrapper log generation under '{0}' ({1}); " +
          "trying fallback") -f

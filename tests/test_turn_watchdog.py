@@ -741,6 +741,56 @@ def test_proc_stream_watchdog_enabled_consumer_close_is_bounded() -> None:
     assert stream.returncode is not None
 
 
+def test_proc_stream_no_watchdog_aborted_consumption_terminates_hung_child() -> None:
+    """Finding A (PR 98 connector re-review, head ee177af): without an
+    enabled turn watchdog - the default for a continuous Claude wrapper -
+    _ProcStream's cleanup gated its "consumer aborted early" detection (and
+    the child-terminate that follows) entirely behind watchdog presence, so
+    an aborted iteration fell straight through to an unbounded wait() with
+    the child never told to stop. A termination signal's SystemExit unwinds
+    through this same generator cleanup (a GeneratorExit closing it early is
+    the same code path), so that gap meant a signal telling the wrapper to
+    exit could instead leave it hanging on a still-running child - the
+    opposite of the pre-#117 default disposition. The sibling
+    watchdog-enabled test above proves close() is bounded WITH a watchdog;
+    this proves it is bounded WITHOUT one too."""
+    stream = run._ProcStream(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "import time\nprint('output', flush=True)\ntime.sleep(60)",
+        ],
+        None,
+    )
+    iterator = iter(stream)
+    assert next(iterator) == "output\n"
+    close_done = threading.Event()
+    close_errors: list[BaseException] = []
+
+    def close_owner() -> None:
+        try:
+            iterator.close()
+        except BaseException as exc:  # noqa: BLE001 - report cleanup failures on test thread
+            close_errors.append(exc)
+        finally:
+            close_done.set()
+
+    closer = threading.Thread(target=close_owner, daemon=True)
+    closer.start()
+    try:
+        assert close_done.wait(10.0), "no-watchdog aborted consumer cleanup wedged"
+    finally:
+        if stream._proc.poll() is None:
+            stream._proc.kill()
+            stream._proc.wait(timeout=5.0)
+        closer.join(5.0)
+
+    assert not closer.is_alive()
+    assert close_errors == []
+    assert stream.returncode is not None
+
+
 def test_proc_stream_aborted_consumption_never_reports_unconfirmed_exit() -> None:
     """Finding 2 (PR 98 connector re-review, head 2297ce10): when consumption is
     aborted and the child never confirms its exit (wait keeps timing out, poll

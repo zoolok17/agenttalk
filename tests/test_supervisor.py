@@ -5024,18 +5024,24 @@ def test_ps_wrapper_log_prune_survives_backward_clock_correction(
     }
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows ACL-based write denial")
 def test_ps_wrapper_log_sequence_survives_failover_to_fallback_root(
     tmp_path: Path,
 ) -> None:
     """Finding A (PR 98 connector re-review, head 4323e20): the previous
     round's launch-sequence fix computed its counter per-root, which is not a
     global ordering key either - the exact defect class it was meant to fix,
-    surviving in a narrower window. Primary is built up to sequence 3, then
-    write access to its agent dir is denied (its history stays READABLE, only
-    new-generation creation fails) so the next launch must fail over to
-    fallback. That fallback generation must still record sequence 4, not
-    restart at 1."""
+    surviving in a narrower window. Primary is rejected (a reparse point -
+    the SAME privilege-independent mechanism
+    test_ps_wrapper_log_root_reparse_is_rejected_before_traversal already
+    proves works on CI; an ACL deny does not, since the CI runner account
+    owns the directory) while fallback is built up to sequence 3, then
+    primary becomes available again. The next launch lands on primary but
+    must still record sequence 4, not restart at 1 for a root it has never
+    used before.
+
+    The precondition (primary genuinely rejected during build-up) is
+    asserted explicitly below, not assumed - a silently-unmet precondition
+    here would exercise no failover at all and still report a false pass."""
     shell = _pick_powershell()
     if not shell:
         return
@@ -5044,38 +5050,36 @@ def test_ps_wrapper_log_sequence_survives_failover_to_fallback_root(
         ps.index("# region wrapper-log-helpers"):
         ps.index("# endregion wrapper-log-helpers")
     ]
-    primary = tmp_path / "primary"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    primary = tmp_path / "primary-junction"
     fallback = tmp_path / "fallback"
     result_path = tmp_path / "sequence-failover.json"
-    agent_leaf = _wrapper_log_agent_dir("worker")
     rows: list[str] = [
         "$ErrorActionPreference = 'Stop'",
+        f"$null = New-Item -ItemType Junction -Path {_pslit(str(primary))} "
+        f"-Target {_pslit(str(victim))}",
         f"$WrapperLogRoot = {_pslit(str(primary))}",
         f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
         "$WrapperLogGenerations = 10",
         helpers,
-        # Build primary's history up to sequence 3.
+        # Primary is a reparse point and must be rejected for all three of
+        # these - the precondition this test depends on.
+        "$preBuildup = @()",
         "1..3 | ForEach-Object {",
         "  $t = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
         "  Complete-WrapperLogTargets $t",
+        "  $preBuildup += [string]$t.generation_dir",
         "}",
-        f"$primaryAgentDir = Join-Path {_pslit(str(primary))} {_pslit(agent_leaf)}",
-        "$aclUser = \"$env:USERDOMAIN\\$env:USERNAME\"",
-        # Deny write access on primary's agent dir - existing generations stay
-        # readable (scanning for the global max must still see them), but
-        # creating a NEW generation there fails, forcing this launch onto the
-        # fallback root exactly like a real "root unavailable" condition.
-        "icacls $primaryAgentDir /deny \"${aclUser}:(AD,WD)\" | Out-Null",
-        "try {",
-        "  $t2 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
-        "  Complete-WrapperLogTargets $t2",
-        "  $seqFile = Join-Path $t2.generation_dir '.sequence'",
-        "  @{ selected = $t2.generation_dir; "
+        # Primary becomes available again - remove the junction (the target
+        # directory's own contents are untouched; only the redirect goes).
+        f"Remove-Item -LiteralPath {_pslit(str(primary))} -Force",
+        "$t2 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "Complete-WrapperLogTargets $t2",
+        "$seqFile = Join-Path $t2.generation_dir '.sequence'",
+        "@{ preBuildup = @($preBuildup); selected = [string]$t2.generation_dir; "
         "sequence = [IO.File]::ReadAllText($seqFile).Trim() } | "
         f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
-        "} finally {",
-        "  icacls $primaryAgentDir /remove:d \"${aclUser}\" | Out-Null",
-        "}",
     ]
     script = tmp_path / "sequence-failover.ps1"
     script.write_text("\n".join(rows), encoding="utf-8-sig")
@@ -5089,8 +5093,73 @@ def test_ps_wrapper_log_sequence_survives_failover_to_fallback_root(
 
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
     payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
-    assert Path(payload["selected"]).is_relative_to(fallback)
+    pre_buildup = payload["preBuildup"]
+    assert len(pre_buildup) == 3, f"expected 3 build-up launches, got {pre_buildup!r}"
+    for selected in pre_buildup:
+        assert Path(selected).is_relative_to(fallback), (
+            "precondition unmet: primary's reparse point did not force this "
+            f"build-up launch onto fallback - {selected!r} is not under {fallback}"
+        )
+    assert Path(payload["selected"]).is_relative_to(primary)
     assert payload["sequence"] == "4"
+
+
+def test_ps_wrapper_log_attempt_cleaned_up_when_pending_marker_write_fails(
+    tmp_path: Path,
+) -> None:
+    """Finding C (PR 98 connector re-review, head ee177af): a failure writing
+    the .pending marker AFTER the generation directory was already created
+    used to leave that directory behind with neither a .pending nor a
+    .committed marker - retention preserves every markerless directory
+    forever (it cannot tell an orphan from a genuinely interrupted launch),
+    so a persistent write failure would accumulate directories outside the
+    quota with no way to ever clean them up.
+
+    New-WrapperLogPendingMarker is redefined here (a privilege-independent,
+    deterministic fault injection - no ACL trick that CI's runner account
+    could bypass) to simulate exactly that failure mode."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    root = tmp_path / "logs"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    result_path = tmp_path / "pending-failure.json"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(root))}",
+        "$WrapperLogGenerations = 10",
+        helpers,
+        "function New-WrapperLogPendingMarker([string]$attempt) { "
+        "throw 'simulated .pending write failure' }",
+        "$target = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        f"$agentDir = Join-Path {_pslit(str(root))} {_pslit(agent_leaf)}",
+        "$leftover = if (Test-Path -LiteralPath $agentDir) { "
+        "@(Get-ChildItem -LiteralPath $agentDir -Directory).Count } else { 0 }",
+        "@{ targetIsNull = ($null -eq $target); leftover = $leftover } | "
+        f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "pending-failure.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["targetIsNull"] is True
+    assert payload["leftover"] == 0, (
+        "an orphaned, markerless generation directory was left behind after "
+        "the .pending write failed"
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
@@ -5751,6 +5820,14 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "@('helper.py','-m','agenttalk','--root','R','wrap') $nonce",
         "$commandPrefix = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-c','pass','-m','agenttalk','--root','R','wrap') $nonce",
+        "$unbuffered = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-u','-m','agenttalk','--root','R','wrap') $nonce",
+        "$xOption = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-X','utf8','-m','agenttalk','--root','R','wrap') $nonce",
+        "$xAttached = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-Xutf8','-m','agenttalk','--root','R','wrap') $nonce",
+        "$unknownFlag = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-Z','-m','agenttalk','--root','R','wrap') $nonce",
         "$duplicate = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-m','agenttalk','--supervisor-launch-nonce','old','wrap') $nonce",
         "$duplicateEq = Add-SupervisorLaunchNonce 'python.exe' "
@@ -5758,6 +5835,8 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "$native = Add-SupervisorLaunchNonce 'codex.exe' @('exec') $nonce",
         "@{ py = $py; console = $console; native = $native; "
         "duplicate = $duplicate; duplicate_eq = $duplicateEq; "
+        "unbuffered = $unbuffered; x_option = $xOption; "
+        "x_attached = $xAttached; unknown_flag = $unknownFlag; "
         "py_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $py.argv $py); "
         "console_wrap = (Test-AgenttalkWrapInvocation 'agenttalk.exe' $console.argv $console); "
         "wait_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $wait.argv $wait); "
@@ -5800,6 +5879,28 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     assert data["script_prefix_wrap"] is False
     assert data["command_prefix"]["injected"] is False
     assert data["command_prefix_wrap"] is False
+    # Finding B (PR 98 connector re-review, head ee177af): a recognized
+    # interpreter option before -m must not disable nonce injection for an
+    # otherwise-canonical `python -u -m agenttalk ...` / `python -X utf8 -m
+    # agenttalk ...` launch - the exact configs the finding named.
+    assert data["unbuffered"]["injected"] is True
+    assert data["unbuffered"]["argv"] == [
+        "-u", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
+        "--root", "R", "wrap",
+    ]
+    assert data["x_option"]["injected"] is True
+    assert data["x_option"]["argv"] == [
+        "-X", "utf8", "-m", "agenttalk", "--supervisor-launch-nonce",
+        SUPERVISOR_NONCE, "--root", "R", "wrap",
+    ]
+    assert data["x_attached"]["injected"] is True
+    assert data["x_attached"]["argv"] == [
+        "-Xutf8", "-m", "agenttalk", "--supervisor-launch-nonce",
+        SUPERVISOR_NONCE, "--root", "R", "wrap",
+    ]
+    # An unrecognized flag must still fail closed rather than guess past it.
+    assert data["unknown_flag"]["injected"] is False
+    assert data["unknown_flag"]["missing_reason"] == "unsupported_launch_argv"
 
 
 def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
