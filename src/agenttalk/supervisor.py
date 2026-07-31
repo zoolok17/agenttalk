@@ -6734,6 +6734,12 @@ namespace Agenttalk {
   }
 }
 function Start-WrapperProcess([hashtable]$startArgs) {
+  # Returns [pscustomobject]@{ Process = <process>; Redirected = <bool> } -
+  # NEVER the bare process object. I1: logging capability (the env vars,
+  # the nonce, AND the caller's eventual Complete-WrapperLogTargets call)
+  # is granted if and only if the child's output is ACTUALLY redirected.
+  # This is the ONE place that knows the true outcome; every caller must
+  # use .Redirected rather than inferring it from a PID alone.
   $redirected = (
     $startArgs.ContainsKey('RedirectStandardOutput') -and
     $startArgs.ContainsKey('RedirectStandardError'))
@@ -6770,7 +6776,10 @@ function Start-WrapperProcess([hashtable]$startArgs) {
           Write-Warning (
             "supervisor: wrapper stderr log is unavailable; redirected to NUL")
         }
-        return $launchResult.Process
+        return [pscustomobject]@{
+          Process = $launchResult.Process
+          Redirected = $true
+        }
       } catch {
         Write-Warning (
           ("supervisor: exact-handle wrapper logging failed ({0}); " +
@@ -6791,19 +6800,25 @@ function Start-WrapperProcess([hashtable]$startArgs) {
     # nonce to THIS process's environment before calling here (they must be
     # present ahead of Start-Process for a successfully-redirected launch to
     # inherit them). Falling back to an unredirected launch must strip them
-    # again right here - this is the ONE place that knows redirection did
-    # NOT happen, and the invariant is structural: a child must never
-    # authenticate against wrapper_logs._authenticated_environment() unless
-    # its output is actually going to the files those env vars name. Left in
-    # place, the child would install a bounded tee over its INHERITED
-    # CONSOLE instead of a redirected file - forwarding is capped at a few
-    # hundred KiB, so the operator's visible window goes silent forever once
-    # that budget is spent, while still looking healthy otherwise.
+    # again right here - a child must never authenticate against
+    # wrapper_logs._authenticated_environment() unless its output is
+    # actually going to the files those env vars name. Left in place, the
+    # child would install a bounded tee over its INHERITED CONSOLE instead
+    # of a redirected file - forwarding is capped at a few hundred KiB, so
+    # the operator's visible window goes silent forever once that budget is
+    # spent, while still looking healthy otherwise.
     foreach ($key in $WrapperLogEnvKeys) {
       Remove-Item -Path ("Env:" + $key) -ErrorAction SilentlyContinue
     }
+    return [pscustomobject]@{
+      Process = (Start-Process @startArgs)
+      Redirected = $false
+    }
   }
-  return Start-Process @startArgs
+  return [pscustomobject]@{
+    Process = (Start-Process @startArgs)
+    Redirected = $redirected
+  }
 }
 function Get-SafeWrapperLogAgentDir(
   [string]$candidate,
@@ -7275,7 +7290,7 @@ function Launch($name, $plan, $codexHome) {
       $startArgs['ArgumentList'] = $argline
     }
     try {
-      $proc = Start-WrapperProcess $startArgs
+      $launch = Start-WrapperProcess $startArgs
     } catch {
       Discard-PendingWrapperLogTargets $logTargets
       throw
@@ -7286,8 +7301,18 @@ function Launch($name, $plan, $codexHome) {
       else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
     }
   }
+  $proc = $launch.Process
   if ($proc -and $proc.Id) {
-    Complete-WrapperLogTargets $logTargets
+    # I1: a completed generation is committed evidence, weighed in future
+    # retention decisions - it must never be committed for a launch that
+    # never actually redirected into it. A PID alone does not prove that;
+    # $launch.Redirected is Start-WrapperProcess's own report of what
+    # actually happened.
+    if ($null -ne $logTargets -and -not $launch.Redirected) {
+      Discard-PendingWrapperLogTargets $logTargets
+    } else {
+      Complete-WrapperLogTargets $logTargets
+    }
     $out = @{ pid = $proc.Id; session_id = $sid; start = (Proc-Start $proc.Id);
               launcher_nonce_injected = [bool]$nonceResult.injected;
               launcher_nonce_source = $nonceResult.source;
@@ -7360,7 +7385,7 @@ function Launch-Spec($name, $spec, $codexHome) {
       $startArgs['ArgumentList'] = $argline
     }
     try {
-      $proc = Start-WrapperProcess $startArgs
+      $launch = Start-WrapperProcess $startArgs
     } catch {
       Discard-PendingWrapperLogTargets $logTargets
       throw
@@ -7371,8 +7396,13 @@ function Launch-Spec($name, $spec, $codexHome) {
       else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
     }
   }
+  $proc = $launch.Process
   if ($proc -and $proc.Id) {
-    Complete-WrapperLogTargets $logTargets
+    if ($null -ne $logTargets -and -not $launch.Redirected) {
+      Discard-PendingWrapperLogTargets $logTargets
+    } else {
+      Complete-WrapperLogTargets $logTargets
+    }
     $out = @{ pid = $proc.Id; start = (Proc-Start $proc.Id);
               launcher_nonce_injected = [bool]$nonceResult.injected;
               launcher_nonce_source = $nonceResult.source;

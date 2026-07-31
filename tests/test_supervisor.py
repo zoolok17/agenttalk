@@ -4930,7 +4930,7 @@ def test_ps_wrapper_log_targets_preserve_output_and_prune_old_generations(
             f"{_pslit(str(tmp_path))}; PassThru = $true; "
             "RedirectStandardOutput = $target.stdout; "
             "RedirectStandardError = $target.stderr }",
-            "$p = Start-WrapperProcess $startArgs",
+            "$p = (Start-WrapperProcess $startArgs).Process",
             "$p.WaitForExit()",
             "Complete-WrapperLogTargets $target",
         ])
@@ -5331,7 +5331,7 @@ def test_ps_wrapper_log_cleanup_failure_uses_new_generation_and_still_launches(
             f"{_pslit(str(tmp_path))}; PassThru = $true; "
             "RedirectStandardOutput = $target.stdout; "
             "RedirectStandardError = $target.stderr }",
-            "$p = Start-WrapperProcess $startArgs",
+            "$p = (Start-WrapperProcess $startArgs).Process",
             "$p.WaitForExit()",
             "Complete-WrapperLogTargets $target",
             "@{ pid = $p.Id; output = [IO.File]::ReadAllText($target.stdout); "
@@ -5754,7 +5754,7 @@ def test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit(
             f"WorkingDirectory = {_pslit(str(tmp_path))}; PassThru = $true; "
             "RedirectStandardOutput = $target.stdout; "
             "RedirectStandardError = $target.stderr }",
-            "$p = Start-WrapperProcess $startArgs",
+            "$p = (Start-WrapperProcess $startArgs).Process",
             "@{ pid = $p.Id; stdout = $target.stdout; stderr = $target.stderr } | "
             f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
         ]),
@@ -6038,7 +6038,10 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "    stdout_capability = [Environment]::GetEnvironmentVariable("
         "'AGENTTALK_WRAPPER_STDOUT_LOG')",
         "  }",
-        "  return [pscustomobject]@{ Id = 4242 }",
+        "  return [pscustomobject]@{ "
+        "Process = [pscustomobject]@{ Id = 4242 }; Redirected = "
+        "($startArgs.ContainsKey('RedirectStandardOutput') -and "
+        "$startArgs.ContainsKey('RedirectStandardError')) }",
         "}",
         launchers,
         "function Invoke-RegularCase("
@@ -6229,10 +6232,11 @@ def test_ps_start_wrapper_process_fallback_strips_logging_env_vars(
         "WindowStyle = 'Hidden'; PassThru = $true; "
         f"RedirectStandardOutput = {_pslit(str(tmp_path / 'stdout.log'))}; "
         f"RedirectStandardError = {_pslit(str(tmp_path / 'stderr.log'))} }}",
-        "$proc = Start-WrapperProcess $startArgs",
+        "$launch = Start-WrapperProcess $startArgs",
         "@{ capturedEnv = $script:capturedEnv; "
         "capturedRedirected = $script:capturedRedirected; "
-        "procId = $proc.Id } | ConvertTo-Json | "
+        "procId = $launch.Process.Id; "
+        "reportedRedirected = [bool]$launch.Redirected } | ConvertTo-Json | "
         f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
     ]
     script = tmp_path / "fallback-env-strip.ps1"
@@ -6251,6 +6255,10 @@ def test_ps_start_wrapper_process_fallback_strips_logging_env_vars(
     assert payload["capturedRedirected"] is False, (
         "the fallback launch still passed redirection to Start-Process"
     )
+    assert payload["reportedRedirected"] is False, (
+        "Start-WrapperProcess reported Redirected=true for a fallback launch "
+        "- callers rely on this to decide whether to commit or discard"
+    )
     captured = payload["capturedEnv"]
     for key in (
         "AGENTTALK_WRAPPER_STDOUT_LOG",
@@ -6264,6 +6272,91 @@ def test_ps_start_wrapper_process_fallback_strips_logging_env_vars(
             "authenticate and install the bounded tee over the inherited "
             "console instead of a redirected file"
         )
+
+
+def test_ps_launch_discards_targets_when_fallback_is_unredirected(
+    tmp_path: Path,
+) -> None:
+    """I1's third face (PR 98 cold review): Launch's post-launch check only
+    looked for a PID, not whether redirection actually happened, so a
+    fallback (unredirected) launch still committed its generation as real
+    evidence - an empty, never-written-to directory that participates in
+    future retention decisions and can outrank (and evict) a genuinely
+    real generation. Launch must discard the pending generation instead of
+    completing it whenever Start-WrapperProcess reports Redirected=false."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    # One contiguous slice: exec-helpers (argv parsing, nonce injection) through
+    # Launch/Launch-Spec themselves - Resolve-AgenttalkModuleFlagIndex,
+    # Add-SupervisorLaunchNonce, and Test-AgenttalkWrapInvocation all live in
+    # exec-helpers, BEFORE the wrapper-log-helpers region starts.
+    helpers = ps[
+        ps.index("# region exec-helpers"):
+        ps.index("# Console action log")
+    ]
+    log_root = tmp_path / "logs"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    result_path = tmp_path / "fallback-commit.json"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        "$AgenttalkPython = 'python.exe'",
+        "$SrcOnPyPath = $false",
+        f"$WrapperLogRoot = {_pslit(str(log_root))}",
+        f"$WrapperLogFallbackRoot = {_pslit(str(tmp_path / 'fallback'))}",
+        f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+        f"$WrapperLogMaxBytes = {sup.WRAPPER_LOG_MAX_BYTES}",
+        f"$WrapperLogSegments = {sup.WRAPPER_LOG_SEGMENT_COUNT}",
+        helpers,
+        # Force the exact-handle launcher unavailable, so Start-WrapperProcess
+        # falls back to a real, unredirected Start-Process (faked here only
+        # to avoid an actual spawn).
+        "function Initialize-WrapperLogLauncherType { return $false }",
+        "function Start-Process {",
+        "  param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle,",
+        "        [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)",
+        "  return [pscustomobject]@{ Id = 4242 }",
+        "}",
+        "function Proc-Start($id) { return '1' }",
+        "function Quote-Arg([string]$arg) { return $arg }",
+        "function Assert-ActionsEnabled([string]$what) { return $true }",
+        "$agent = [pscustomobject]@{ backend_profile = $null; wrapped = $true; "
+        "cwd = $Root; env = $null; launch = [pscustomobject]@{ "
+        "windows_file = 'python.exe'; windows_args = @('-m','agenttalk','wrap') } }",
+        "$cfg = [pscustomobject]@{ agents = [pscustomobject]@{ worker = $agent } }",
+        "$plan = [pscustomobject]@{ launch_mode = 'wrap'; window_style = 'Hidden'; "
+        "window_style_warning = $null; session_id = $null; session_args = @() }",
+        "$out = Launch 'worker' $plan $null",
+        f"$agentDir = Join-Path {_pslit(str(log_root))} {_pslit(agent_leaf)}",
+        "$dirs = if (Test-Path -LiteralPath $agentDir) { "
+        "@(Get-ChildItem -LiteralPath $agentDir -Directory) } else { @() }",
+        "$committed = @($dirs | Where-Object { "
+        "Test-Path -LiteralPath (Join-Path $_.FullName '.committed') })",
+        "@{ pid = $out.pid; dirCount = $dirs.Count; committedCount = $committed.Count } | "
+        f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "fallback-commit.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["pid"] == 4242
+    assert payload["committedCount"] == 0, (
+        "an empty generation was committed as real evidence for a fallback "
+        "launch that never actually redirected into it"
+    )
+    assert payload["dirCount"] == 0, (
+        "the discarded pending generation directory was left behind on disk"
+    )
 
 
 def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_path: Path) -> None:
