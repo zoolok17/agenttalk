@@ -10620,6 +10620,18 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             with capture_termination_signals(lifecycle_log):
                 result = _cmd_wrap_with_logging(args)
         except BaseException as exc:
+            # A SystemExit reaching here was ALREADY a deliberate exit with
+            # its own diagnostic already written (e.g. _get_store's "not
+            # initialized" message before sys.exit(2)), or a termination
+            # signal already recorded structurally via lifecycle.defer_signal
+            # before capture_termination_signals raised it. Recording it
+            # again via wrapper_exception and printing a synthetic Python
+            # traceback on top is not a crash report, it is noise over an
+            # already-explained, intentional exit - exactly the regression
+            # #117 exists to prevent. Handle it BEFORE the crash-reporting
+            # path below, not after, so it never reaches it.
+            if isinstance(exc, SystemExit):
+                raise
             if not lifecycle_log.terminal_emitted:
                 lifecycle_log.wrapper_exception(exc)
                 # Print the traceback here, while sys.stderr is still the
@@ -10628,22 +10640,18 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                 # reaches whatever eventually reports it, which would
                 # otherwise let the one diagnostic anyone actually wants
                 # bypass the cap and the tail rotation #117 exists to
-                # provide. Skipped when a signal already reported the
-                # termination - that is an intentional exit, not a crash.
+                # provide.
                 traceback.print_exc(file=sys.stderr)
             # New area (cold review): a bare re-raise here still reaches
             # main()'s own KeyboardInterrupt/OSError one-liners, or Python's
             # own default top-level traceback printer for anything else -
             # ALL of which run after this "with" block's own finally has
             # already restored the raw stream, writing straight to the
-            # unbounded underlying file. SystemExit is the one exception
-            # type nothing above prints a traceback for at the true top
-            # level, so replicate whatever main() would have written here
-            # (while stderr is still bounded) and convert to one, with the
-            # matching exit code, instead of letting the original exception
-            # type escape this block.
-            if isinstance(exc, SystemExit):
-                raise
+            # unbounded underlying file. SystemExit (handled above) is the
+            # one exception type nothing above prints a traceback for at the
+            # true top level; everything else still needs converting to one,
+            # with the matching exit code, instead of letting the original
+            # exception type escape this block.
             if isinstance(exc, KeyboardInterrupt):
                 sys.stderr.write("\nagenttalk: interrupted\n")
                 raise SystemExit(130) from exc

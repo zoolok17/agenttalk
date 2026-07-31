@@ -603,6 +603,51 @@ def test_cmd_wrap_records_setup_exception_before_loop_exists(
     assert "Traceback (most recent call last)" in tail
 
 
+def test_cmd_wrap_routine_system_exit_skips_crash_reporting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # cli._get_store's "not initialized" path writes its own actionable
+    # diagnostic and calls sys.exit(2) directly - a routine, already-
+    # explained exit, not a crash. Before the fix, cmd_wrap's except block
+    # recorded wrapper_exception and printed a full Python traceback on top
+    # of it regardless of exception type, turning a one-line diagnostic
+    # into crash-report noise - a regression #117 introduced into exactly
+    # the diagnostics path it exists to improve.
+    out_path = tmp_path / "stdout.log"
+    err_path = tmp_path / "stderr.log"
+    nonce = "e" * 32
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+
+    def not_initialized(_args: argparse.Namespace) -> int:
+        import sys
+
+        sys.stderr.write(
+            "agenttalk: not initialized at X\n"
+            "Run `agenttalk init --here` from the project root.\n"
+        )
+        raise SystemExit(2)
+
+    monkeypatch.setattr(cli, "_cmd_wrap_with_logging", not_initialized)
+    args = argparse.Namespace(agent="worker", supervisor_launch_nonce=nonce)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cmd_wrap(args)
+    assert exc_info.value.code == 2
+
+    tail = "".join(
+        path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
+    )
+    rows = [json.loads(line) for line in tail.splitlines() if line.startswith("{")]
+    assert rows == []
+    assert "not initialized" in tail
+    assert "Traceback (most recent call last)" not in tail
+
+
 def test_cmd_wrap_entry_bounds_python_level_wrapper_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
