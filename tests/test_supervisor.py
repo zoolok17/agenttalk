@@ -4777,6 +4777,61 @@ def test_generated_proc_snapshot_emits_exact_live_filetime(tmp_path: Path) -> No
     assert "foreach ($liveProc in @(Get-Process" in helpers
 
 
+def test_stop_tree_rejects_rounded_start_collision_by_exact_filetime(
+    tmp_path: Path,
+) -> None:
+    """An exact FILETIME mismatch must veto a rounded-start match."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "stop-tree-exact-filetime.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        "$script:roundedStart = '2026-07-04T07:20:31.5767870+00:00'",
+        "$script:liveTicks = [long]133960872315767870",
+        "$script:liveProcess = [pscustomobject]@{ Id = 4321; "
+        "StartTime = [datetime]::FromFileTimeUtc($script:liveTicks); Marker = 'live' }",
+        "$script:stops = @()",
+        "function Proc-Start { param($procId) return $script:roundedStart }",
+        "function Get-Process { param($Id, $ErrorAction) return $script:liveProcess }",
+        "function Stop-Process { param($Id, $InputObject, [switch]$Force, $ErrorAction); "
+        "$script:stops += [pscustomobject]@{ id = $Id; "
+        "via_input = ($null -ne $InputObject); marker = $InputObject.Marker } }",
+        "$wrong = @(@{ pid = 4321; start = $script:roundedStart; "
+        "start_filetime = ([long]($script:liveTicks + 10)).ToString("
+        "[Globalization.CultureInfo]::InvariantCulture) })",
+        "Stop-Tree $wrong",
+        "$mismatchStops = $script:stops.Count",
+        "$right = @(@{ pid = 4321; start = $script:roundedStart; "
+        "start_filetime = $script:liveTicks.ToString("
+        "[Globalization.CultureInfo]::InvariantCulture) })",
+        "Stop-Tree $right",
+        "@{ mismatch_stops = $mismatchStops; total_stops = $script:stops.Count; "
+        "via_input = [bool]$script:stops[-1].via_input; "
+        "marker = $script:stops[-1].marker } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    hp = tmp_path / "stop-tree-exact-filetime.ps1"
+    hp.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(hp)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    assert json.loads(out.read_text(encoding="utf-8-sig")) == {
+        "mismatch_stops": 0,
+        "total_stops": 1,
+        "via_input": True,
+        "marker": "live",
+    }
+
+
 def test_generated_ps1_tamper_refuses_before_claim(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
@@ -7869,6 +7924,32 @@ def test_owned_process_tree_crosses_shell_hosts_and_feeds_stop_tree_parent_first
     ]
 
 
+def test_owned_process_tree_kill_targets_retain_exact_start_filetime() -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            WRAP_LAUNCHER_PID,
+            "codex.exe",
+            "codex exec --json",
+            WRAP_CHILD_START,
+        ),
+        _proc(302, WRAP_CHILD_PID, "node.exe", "node tool.js", _ps_iso(700000)),
+    ]
+
+    plan = _owned_tree_plan(snapshot, request_id="rr-exact-kill-target")
+    entries = {
+        entry["pid"]: entry
+        for entry in plan["next_state"]["owned_process_tree"]["entries"]
+    }
+
+    assert plan["kill_targets"]
+    assert all(
+        target["start_filetime"] == entries[target["pid"]]["start_filetime"]
+        for target in plan["kill_targets"]
+    )
+
+
 def test_owned_process_tree_reserves_detached_gate_runner_without_name_inference() -> None:
     snapshot = [
         _wrap_snap()[0],
@@ -10249,6 +10330,66 @@ def test_launch_barrier_blocks_unrecorded_post_plan_descendant_closure(
         item["kind"] == "owned_descendant_edge"
         for item in result["survivors"]
     )
+
+
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_launch_barrier_excludes_definitively_recycled_closure_seed(
+    ephemeral: bool,
+) -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            WRAP_LAUNCHER_PID,
+            "codex.exe",
+            "codex exec --json",
+            WRAP_CHILD_START,
+        ),
+        _proc(302, WRAP_CHILD_PID, "node.exe", "node tool.js", _ps_iso(700000)),
+    ]
+    entry = _owned_tree_plan(
+        snapshot,
+        request_id="rr-barrier-recycled-seed",
+    )["next_state"]
+    state = (
+        {"ephemeral_reviewers": {"active": {"lr-barrier": entry}}}
+        if ephemeral
+        else {"agents": {"worker": entry}}
+    )
+    recorded = entry["owned_process_tree"]["entries"][-1]
+    recycled = _proc(
+        recorded["pid"],
+        1,
+        "unrelated.exe",
+        "unrelated replacement",
+        recorded["start"],
+        start_filetime=str(int(recorded["start_filetime"]) + 10),
+    )
+    foreign_child = _proc(
+        303,
+        recycled["pid"],
+        "foreign.exe",
+        "foreign child",
+        _ps_iso(800000),
+    )
+
+    result = sup.evaluate_launch_barrier(
+        [recycled, foreign_child],
+        state,
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+        request_id="lr-barrier" if ephemeral else None,
+    )
+
+    assert result == {
+        "allow_launch": True,
+        "blocked": False,
+        "reason": "clear",
+        "snapshot_available": True,
+        "survivor_count": 0,
+        "survivors": [],
+    }
 
 
 def test_owned_process_absence_certificate_requires_definite_identity_result() -> None:

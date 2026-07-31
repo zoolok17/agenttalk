@@ -3118,12 +3118,16 @@ def _owned_process_tree(
             node = owned[pid]
             if not node["live"]:
                 continue
-            kill_targets.append({
+            target = {
                 "pid": pid,
                 "start": _start_of(node["row"]),
                 "reason": "owned_process_tree",
                 "source": "owned_process_tree",
-            })
+            }
+            start_filetime = _filetime_of(node["row"])
+            if start_filetime is not None:
+                target["start_filetime"] = start_filetime
+            kill_targets.append(target)
     return tree, kill_targets, invalid_reason
 
 
@@ -4064,6 +4068,7 @@ def evaluate_launch_barrier(
     idx = _snap_index(snapshot)
     if isinstance(tree, dict):
         tree_entries = tree.get("entries", [])
+        closure_seed_pids: set[int] = set()
         for entry in tree_entries:
             row = idx.get(entry.get("pid"))
             identity_state = _recorded_process_identity_state(
@@ -4071,6 +4076,17 @@ def evaluate_launch_barrier(
                 expected_start=entry.get("start"),
                 expected_filetime=entry.get("start_filetime"),
             )
+            pid = entry.get("pid")
+            if (
+                identity_state != "different"
+                and isinstance(pid, int)
+                and not isinstance(pid, bool)
+            ):
+                # An absent recorded parent remains a conservative closure
+                # root: on Windows it may have exited after spawning a child.
+                # A definitively different exact identity is a recycled PID,
+                # however, and grants no ownership of its current children.
+                closure_seed_pids.add(pid)
             if identity_state in {"absent", "different"}:
                 continue
             add_survivor({
@@ -4090,13 +4106,7 @@ def evaluate_launch_barrier(
         # leaving a child that was never a kill target. Treat every current
         # descendant edge rooted at a recorded PID as survivor evidence. This
         # graph relation only blocks launch; it never authorizes killing.
-        recorded_pids = {
-            entry["pid"]
-            for entry in tree_entries
-            if isinstance(entry, dict)
-            and isinstance(entry.get("pid"), int)
-            and not isinstance(entry.get("pid"), bool)
-        }
+        recorded_pids = closure_seed_pids
         closure_seen = set(recorded_pids)
         frontier = list(recorded_pids)
         children = _children_map(idx)
@@ -5949,12 +5959,16 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             if not include_launcher and target.get("reason") == "confirmed_launcher":
                 continue
             if isinstance(target.get("pid"), int) and isinstance(target.get("start"), str) and target.get("start"):
-                out.append({
+                item = {
                     "pid": target["pid"],
                     "start": target["start"],
                     "reason": target.get("reason") or target.get("source") or "live_chain",
                     "source": target.get("source") or target.get("reason") or "live_chain",
-                })
+                }
+                start_filetime = target.get("start_filetime")
+                if isinstance(start_filetime, str) and start_filetime:
+                    item["start_filetime"] = start_filetime
+                out.append(item)
         return out
 
     def _result(action, *, state, kill_first=False, kill_orphans=False,
@@ -8212,6 +8226,23 @@ function Stop-Tree($targets) {
     $live = Proc-Start $t.pid
     if ($null -eq $live) { continue }                 # already gone
     if ($live -ne $t.start) { continue }              # pid reused - DO NOT kill
+    $exact = [string]$t.start_filetime
+    if ($exact) {
+      # The CIM-rendered timestamp above is rounded. When the planner retained
+      # an exact FILETIME, bind the destructive action to one live process
+      # object and verify that exact identity before killing through the same
+      # object. A rounded collision therefore grants no kill authority.
+      try {
+        $liveProcess = Get-Process -Id ([int]$t.pid) -ErrorAction Stop
+        $liveFiletime = ([datetimeoffset]$liveProcess.StartTime).UtcDateTime.ToFileTimeUtc().ToString(
+          [Globalization.CultureInfo]::InvariantCulture)
+        if ($liveFiletime -ne $exact) { continue }
+        Stop-Process -InputObject $liveProcess -Force -ErrorAction SilentlyContinue
+      } catch {}
+      continue
+    }
+    # Legacy persisted targets have no exact FILETIME. Retain their existing
+    # rounded-start guard rather than silently making them unkillable.
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
