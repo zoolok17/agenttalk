@@ -6915,20 +6915,25 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
   # relocated to the offline-root window: retention would then rank the
   # unreadable root's stale generations ahead of genuinely newer ones once
   # it becomes readable again, and PRUNE the newer evidence. So this also
-  # reports whether any CONFIGURED, EXISTING root could not be scanned -
-  # the caller must treat that launch's ordering as unreliable and skip
-  # pruning entirely THIS cycle rather than act on it, per the same
-  # fail-closed posture as an unresolved/pending generation. A root that
-  # has simply never been used (does not exist yet) is not uncertain -
-  # there is nothing there to miss.
+  # reports whether any CONFIGURED root holding THIS AGENT'S OWN directory
+  # could not be scanned - the caller must treat that launch's ordering as
+  # unreliable and skip pruning entirely THIS cycle rather than act on it,
+  # per the same fail-closed posture as an unresolved/pending generation.
+  # I3: the root existing is NOT the right test - a fallback root the
+  # operator configured but this agent has simply never used (no per-agent
+  # directory there yet) is absent, not unscannable, and there is nothing
+  # to miss; testing the ROOT's existence instead of the AGENT DIR's own
+  # flagged that ordinary, permanent situation as uncertain on every single
+  # launch, turning "refuse this cycle" into "never prune again."
   $seq = 0L
   $uncertain = $false
   foreach ($scanRoot in $roots) {
     try {
-      $rootExists = Test-Path -LiteralPath $scanRoot -PathType Container
+      $candidateAgentDir = Join-Path $scanRoot $name
+      $agentDirExists = Test-Path -LiteralPath $candidateAgentDir
       $scanAgentDir = Get-SafeWrapperLogAgentDir $scanRoot $name $false
       if ($null -eq $scanAgentDir) {
-        if ($rootExists) { $uncertain = $true }
+        if ($agentDirExists) { $uncertain = $true }
         continue
       }
       foreach ($existing in @(
@@ -7071,21 +7076,6 @@ function Complete-WrapperLogTargets($targets) {
       $generationDir, $_.Exception.Message)
     return
   }
-  if ([bool]$targets.sequence_uncertain) {
-    # This launch's own sequence could not be established as a true global
-    # max - some configured root existed but could not be scanned. Pruning
-    # now would rank whatever we CAN see against an incomplete picture, and
-    # could evict a genuinely newer generation living on the root we could
-    # not read. Commit (above) already happened - only pruning is skipped,
-    # and only for this one cycle; it resumes normally once every root is
-    # reachable again on a later launch.
-    Write-Warning (
-      ("supervisor: wrapper log launch sequence is unreliable for '{0}' " +
-       "(a configured root could not be scanned); skipping prune this cycle") -f
-      $generationDir)
-    return
-  }
-
   $name = [string]$targets.agent_name
   $roots = @($WrapperLogRoot, $WrapperLogFallbackRoot) |
     Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
@@ -7149,6 +7139,30 @@ function Complete-WrapperLogTargets($targets) {
         "supervisor: cannot inspect wrapper log root '{0}' ({1})" -f
         $agentDir, $_.Exception.Message)
     }
+  }
+
+  if ([bool]$targets.sequence_uncertain) {
+    # I3: refusing to prune under an unreliable ordering must be BOUNDED - a
+    # persistently (not just transiently) unscannable root must not let
+    # generations for this agent accumulate forever. Skip pruning while the
+    # total is still within a generous multiple of the configured quota
+    # (this self-heals normally once every root becomes reachable again on
+    # a later launch); once the total is FAR past quota, prune anyway using
+    # whatever ordering IS available - imperfect, but bounded is better
+    # than leaking disk space indefinitely.
+    $uncertainBound = [Math]::Max($WrapperLogGenerations * 3, $WrapperLogGenerations + 2)
+    if ($owned.Count -le $uncertainBound) {
+      Write-Warning (
+        ("supervisor: wrapper log launch sequence is unreliable for '{0}' " +
+         "(a configured root could not be scanned); skipping prune this cycle") -f
+        $generationDir)
+      return
+    }
+    Write-Warning (
+      ("supervisor: wrapper log launch sequence remains unreliable for '{0}' " +
+       "but the generation count ({1}) exceeds the safety bound ({2}); " +
+       "pruning anyway rather than accumulating indefinitely") -f
+      $generationDir, $owned.Count, $uncertainBound)
   }
 
   $keep = @($generationDir)

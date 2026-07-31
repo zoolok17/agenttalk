@@ -5245,6 +5245,144 @@ def test_ps_wrapper_log_prune_refuses_when_root_scan_is_uncertain(
     )
 
 
+def test_ps_wrapper_log_sequence_not_uncertain_when_root_has_no_agent_dir(
+    tmp_path: Path,
+) -> None:
+    """I3 (PR 98 cold review): a configured root the operator set up but this
+    agent has simply never used - no per-agent directory there yet - is
+    absent, not unscannable. There is nothing on that root to miss.
+    Flagging it uncertain anyway (testing the ROOT's existence instead of
+    the AGENT DIR's) turns the previous round's "refuse this cycle" into
+    "never prune again": the fallback root exists (an operator configured
+    it) for the ENTIRE lifetime of an agent that never happens to use it,
+    so every single launch would be marked uncertain forever, and quota
+    would never be enforced at all."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    primary = tmp_path / "primary"
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()  # the root exists; this agent has never used it
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    result_path = tmp_path / "absent-agent-dir.json"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(primary))}",
+        f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+        "$WrapperLogGenerations = 2",
+        helpers,
+        "$results = @()",
+        "1..3 | ForEach-Object {",
+        "  $t = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "  Complete-WrapperLogTargets $t",
+        "  $results += [pscustomobject]@{ uncertain = [bool]$t.sequence_uncertain }",
+        "}",
+        f"$primaryAgentDir = Join-Path {_pslit(str(primary))} {_pslit(agent_leaf)}",
+        "$dirCount = @(Get-ChildItem -LiteralPath $primaryAgentDir -Directory).Count",
+        "@{ results = @($results); dirCount = $dirCount } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "absent-agent-dir.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    results = payload["results"]
+    assert len(results) == 3
+    for row in results:
+        assert row["uncertain"] is False, (
+            "a fallback root this agent has never used was wrongly flagged "
+            "uncertain just because the root itself exists"
+        )
+    assert payload["dirCount"] == 2, (
+        "retention never pruned - the absent-agent-dir false uncertainty "
+        "turned 'refuse this cycle' into 'never prune again'"
+    )
+
+
+def test_ps_wrapper_log_prune_bound_recovers_from_persistent_uncertainty(
+    tmp_path: Path,
+) -> None:
+    """I3's bound: refusing to prune under uncertainty is honest, but it must
+    not be able to accumulate forever if a root stays genuinely unscannable
+    for its entire lifetime (a real, if rare, operator misconfiguration -
+    not the transient case the mechanism is meant for). Primary is a
+    reparse point from before the FIRST launch and stays one throughout;
+    every launch lands on fallback and is marked uncertain every time.
+    Pruning must still resume once fallback's own count is far enough past
+    quota - imperfect ordering is better than unbounded accumulation."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    fallback = tmp_path / "fallback"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    result_path = tmp_path / "bounded-uncertainty.json"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(primary))}",
+        f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+        "$WrapperLogGenerations = 2",
+        helpers,
+        f"$primaryAgentDir = Join-Path {_pslit(str(primary))} {_pslit(agent_leaf)}",
+        "$null = New-Item -ItemType Junction -Path $primaryAgentDir -Target "
+        f"{_pslit(str(victim))}",
+        "$uncertainFlags = @()",
+        "1..8 | ForEach-Object {",
+        "  $t = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "  Complete-WrapperLogTargets $t",
+        "  $uncertainFlags += [bool]$t.sequence_uncertain",
+        "}",
+        f"$fallbackAgentDir = Join-Path {_pslit(str(fallback))} {_pslit(agent_leaf)}",
+        "$finalCount = @(Get-ChildItem -LiteralPath $fallbackAgentDir -Directory).Count",
+        "@{ uncertainFlags = @($uncertainFlags); finalCount = $finalCount } | "
+        f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "bounded-uncertainty.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert all(payload["uncertainFlags"]), (
+        "primary was expected to stay unscannable for every one of the 8 "
+        "launches - the bound test is meaningless if it ever became certain"
+    )
+    assert payload["finalCount"] < 8, (
+        "8 launches with permanent uncertainty left all 8 generations on "
+        "disk - the refuse-to-prune escape valve has no bound"
+    )
+    assert payload["finalCount"] <= 6, (
+        f"final count {payload['finalCount']} exceeds the intended bound"
+    )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
 def test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker(
     tmp_path: Path,
