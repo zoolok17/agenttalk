@@ -6787,6 +6787,21 @@ function Start-WrapperProcess([hashtable]$startArgs) {
     # inherited handles or risk a duplicate child.
     $null = $startArgs.Remove('RedirectStandardOutput')
     $null = $startArgs.Remove('RedirectStandardError')
+    # The caller already applied the wrapper-log capability env vars and
+    # nonce to THIS process's environment before calling here (they must be
+    # present ahead of Start-Process for a successfully-redirected launch to
+    # inherit them). Falling back to an unredirected launch must strip them
+    # again right here - this is the ONE place that knows redirection did
+    # NOT happen, and the invariant is structural: a child must never
+    # authenticate against wrapper_logs._authenticated_environment() unless
+    # its output is actually going to the files those env vars name. Left in
+    # place, the child would install a bounded tee over its INHERITED
+    # CONSOLE instead of a redirected file - forwarding is capped at a few
+    # hundred KiB, so the operator's visible window goes silent forever once
+    # that budget is spent, while still looking healthy otherwise.
+    foreach ($key in $WrapperLogEnvKeys) {
+      Remove-Item -Path ("Env:" + $key) -ErrorAction SilentlyContinue
+    }
   }
   return Start-Process @startArgs
 }

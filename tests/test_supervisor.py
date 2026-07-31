@@ -6164,6 +6164,108 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         assert bool(row["stdout_capability"]) is should_log, row
 
 
+def test_ps_start_wrapper_process_fallback_strips_logging_env_vars(
+    tmp_path: Path,
+) -> None:
+    """Cold-review finding on a51639d..ee177af, rated HIGH: Launch applies the
+    wrapper-log capability env vars (AGENTTALK_WRAPPER_STDOUT_LOG etc. + the
+    nonce) to the process environment BEFORE calling Start-WrapperProcess -
+    they must be present ahead of time for a successfully-redirected launch
+    to inherit them. But when the exact-handle launcher fails (Constrained
+    Language Mode, a missing C# compiler, Start-Process shadowed by a
+    non-Cmdlet proxy) and Start-WrapperProcess falls back to an unredirected
+    Start-Process, those env vars used to survive into that child untouched.
+    The child would then authenticate against
+    wrapper_logs._authenticated_environment() and install BoundedStreamTee
+    over its INHERITED CONSOLE instead of a redirected file - forwarding is
+    capped at a few hundred KiB, so the operator's visible window goes
+    silent forever once that budget is spent, while the record still looks
+    healthy otherwise.
+
+    Fixed structurally in Start-WrapperProcess itself - the ONE place that
+    knows redirection did not happen - rather than requiring every caller
+    (Launch, Launch-Spec) to remember to clear the keys themselves."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / "fallback-env-strip.json"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        # Force the exact-handle path unavailable, exactly like Constrained
+        # Language Mode or a missing C# compiler would.
+        "function Initialize-WrapperLogLauncherType { return $false }",
+        "$script:capturedEnv = $null",
+        "$script:capturedRedirected = $null",
+        "function Start-Process {",
+        "  param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle,",
+        "        [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)",
+        "  $script:capturedEnv = @{}",
+        "  foreach ($k in $WrapperLogEnvKeys) {",
+        "    $script:capturedEnv[$k] = [Environment]::GetEnvironmentVariable($k)",
+        "  }",
+        "  $script:capturedRedirected = (",
+        "    [bool]$RedirectStandardOutput -or [bool]$RedirectStandardError)",
+        "  return [pscustomobject]@{ Id = 4242 }",
+        "}",
+        "$WrapperLogEnvKeys = @("
+        "'AGENTTALK_WRAPPER_STDOUT_LOG','AGENTTALK_WRAPPER_STDERR_LOG',"
+        "'AGENTTALK_WRAPPER_LOG_MAX_BYTES','AGENTTALK_WRAPPER_LOG_SEGMENTS',"
+        "'AGENTTALK_WRAPPER_LOG_NONCE')",
+        # Simulate what Launch already did before calling here: apply the
+        # capability env vars to THIS process's environment.
+        f"$env:AGENTTALK_WRAPPER_STDOUT_LOG = {_pslit(str(tmp_path / 'stdout.log'))}",
+        f"$env:AGENTTALK_WRAPPER_STDERR_LOG = {_pslit(str(tmp_path / 'stderr.log'))}",
+        "$env:AGENTTALK_WRAPPER_LOG_MAX_BYTES = '1048576'",
+        "$env:AGENTTALK_WRAPPER_LOG_SEGMENTS = '4'",
+        "$env:AGENTTALK_WRAPPER_LOG_NONCE = ('a' * 32)",
+        "$startArgs = @{ FilePath = 'fake.exe'; "
+        f"WorkingDirectory = {_pslit(str(tmp_path))}; "
+        "WindowStyle = 'Hidden'; PassThru = $true; "
+        f"RedirectStandardOutput = {_pslit(str(tmp_path / 'stdout.log'))}; "
+        f"RedirectStandardError = {_pslit(str(tmp_path / 'stderr.log'))} }}",
+        "$proc = Start-WrapperProcess $startArgs",
+        "@{ capturedEnv = $script:capturedEnv; "
+        "capturedRedirected = $script:capturedRedirected; "
+        "procId = $proc.Id } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "fallback-env-strip.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["procId"] == 4242
+    assert payload["capturedRedirected"] is False, (
+        "the fallback launch still passed redirection to Start-Process"
+    )
+    captured = payload["capturedEnv"]
+    for key in (
+        "AGENTTALK_WRAPPER_STDOUT_LOG",
+        "AGENTTALK_WRAPPER_STDERR_LOG",
+        "AGENTTALK_WRAPPER_LOG_MAX_BYTES",
+        "AGENTTALK_WRAPPER_LOG_SEGMENTS",
+        "AGENTTALK_WRAPPER_LOG_NONCE",
+    ):
+        assert captured.get(key) is None, (
+            f"{key} survived into the unredirected fallback child - it would "
+            "authenticate and install the bounded tee over the inherited "
+            "console instead of a redirected file"
+        )
+
+
 def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
