@@ -8,6 +8,7 @@ from __future__ import annotations
 import errno
 import gc
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import sys
@@ -412,6 +413,24 @@ def test_loop_idle_stamps_heartbeat(tmp_path) -> None:
     assert s.read_heartbeat("beta") is not None   # idle kept the heartbeat fresh
 
 
+def test_loop_survives_a_non_iso_now_iso_placeholder(tmp_path) -> None:
+    # PR #104 CI regression: `now_iso` is used elsewhere in this loop purely as an
+    # OPAQUE stamp (never parsed back) - test_dead_letter.py's own default injects a
+    # bare "t" placeholder, not a real ISO string. The #126 pre-drive quota check
+    # parsed it unconditionally and crashed every dev-gate leg (0/13, deterministic
+    # across every OS/Python version) despite this exact scenario being green in
+    # every file this task's own targeted runs touched - the break was in a file none
+    # of them imported at module scope. Must fall back to the real wall clock instead
+    # of raising.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="task")
+    turns = loop.run_loop(
+        s, "beta", lambda rec: True, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=2, now_iso=lambda: "t",
+    )
+    assert turns == 1
+
+
 # ------------------------------------------- #58: config-blocked park visibility + re-probe
 
 def _config_blocked_drive():
@@ -535,6 +554,362 @@ def test_gateway_held_escalates_exactly_once_across_a_long_hold(tmp_path) -> Non
         on_escalate=lambda info: escalations.append(info.get("msg_id")) or True,
     )
     assert len(escalations) == 1                  # one-shot, not once-per-poll
+
+
+# ------------------------------------- #126: provider quota/billing refusal = durable park
+
+def _epoch(iso: str) -> float:
+    from datetime import datetime
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _quota_blocked_drive(reset_at: str | None = "2026-01-01T00:00:10Z") -> "loop.DriveOutcome":
+    return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_QUOTA_BLOCKED,
+                             summary="provider quota/billing refusal: usage limit",
+                             quota_reset_at=reset_at)
+
+
+def test_quota_blocked_parks_without_consuming_an_attempt_or_dead_lettering(tmp_path) -> None:
+    # #126: unlike gateway_held (cheap to recheck every poll, no child spawned), re-driving a
+    # quota-blocked head means spawning the real CLI again, so it must drive ONCE (discovering
+    # the refusal), then the PRE-DRIVE hold check parks every subsequent poll WITHOUT driving -
+    # never hammering the provider. No attempt is ever persisted (K_poison=K_escalate=1 would
+    # dispose an ordinary failure on the very next poll).
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        return _quota_blocked_drive()
+
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=5, k_poison=1, k_escalate=1,
+        now_iso=lambda: "2026-01-01T00:00:00Z",   # frozen, well before reset_at
+    )
+    assert turns == 0
+    assert drives["n"] == 1                       # driven ONCE; later polls park without driving
+    assert s.dead_lettered_count("beta") == 0     # NEVER dead-lettered
+    assert s.cursor("beta") == ""                 # head never consumed
+    rec = s.attempt_record("beta", m.id)
+    assert rec in (None, {}) or int(rec.get("attempts_started") or 0) <= 1
+    assert s.read_heartbeat("beta") is not None   # blocked != dead: heartbeat stays fresh
+    hold = s.read_quota_blocked_hold("beta", now_epoch=_epoch("2026-01-01T00:00:00Z"))
+    assert hold is not None
+    assert hold["reset_at"] == "2026-01-01T00:00:10Z"
+
+
+def test_quota_blocked_self_heals_once_the_reset_instant_passes(tmp_path) -> None:
+    # #126: no operator action clears this - the hold SELF-EXPIRES once now passes the
+    # provider's own stated reset instant, and the very next drive succeeds and commits.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        if drives["n"] == 1:
+            return _quota_blocked_drive(reset_at="2026-01-01T00:00:10Z")
+        return loop.DriveOutcome(ok=True)
+
+    # Poll 1: drives, discovers the refusal, parks with a durable hold.
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=1, k_poison=1, k_escalate=1,
+        now_iso=lambda: "2026-01-01T00:00:00Z",
+    )
+    assert turns == 0 and drives["n"] == 1
+    assert s.read_quota_blocked_hold(
+        "beta", now_epoch=_epoch("2026-01-01T00:00:00Z")) is not None
+
+    # Poll 2: still before the reset instant -> pre-drive check parks, no new drive.
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=1, k_poison=1, k_escalate=1,
+        now_iso=lambda: "2026-01-01T00:00:05Z",
+    )
+    assert drives["n"] == 1                       # NOT re-driven while still blocked
+
+    # Poll 3: now past the reset instant -> the hold has self-expired -> drives again.
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=1, k_poison=1, k_escalate=1,
+        now_iso=lambda: "2026-01-01T00:00:15Z",
+    )
+    assert drives["n"] == 2                       # self-healed: re-drove once expired
+    assert turns == 1
+    assert s.cursor("beta") == m.id               # committed
+    assert s.read_quota_blocked_hold(
+        "beta", now_epoch=_epoch("2026-01-01T00:00:15Z")) is None  # cleared (self-expired)
+
+
+def test_quota_blocked_never_disposes_under_tight_ceilings_across_many_polls(tmp_path) -> None:
+    # A hold that never clears must NEVER dead-letter the head, no matter how many polls
+    # elapse - even under tight poison/escalate ceilings that WOULD dispose an ordinary
+    # failure. The pre-drive check means only the FIRST poll actually drives; every later
+    # poll parks for free (no CLI spawn, no ledger write).
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        return _quota_blocked_drive()             # held forever (same reset_at each time)
+
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=20, k_poison=1, k_escalate=1,
+        now_iso=lambda: "2026-01-01T00:00:00Z",   # frozen, well before reset_at, for all 20 polls
+    )
+    assert turns == 0
+    assert drives["n"] == 1                       # driven ONCE across all 20 polls
+    assert s.dead_lettered_count("beta") == 0
+
+
+def test_quota_blocked_escalates_exactly_once_across_a_long_hold(tmp_path) -> None:
+    # A silent 20-retry-then-dead-letter loop is the #126 incident; the operator must be
+    # notified ONCE on first entering the blocked state, not stormed every poll.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="task")
+
+    def drive(rec):
+        return _quota_blocked_drive()             # held for the whole run
+
+    escalations: list = []
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=15, k_poison=0, k_escalate=0,
+        now_iso=lambda: "2026-01-01T00:00:00Z",
+        on_escalate=lambda info: escalations.append(info.get("msg_id")) or True,
+    )
+    assert len(escalations) == 1                  # one-shot, not once-per-poll
+
+
+def test_quota_blocked_hold_survives_a_process_restart_and_gates_the_next_run(tmp_path) -> None:
+    # The hold is a DURABLE file (state/quota-blocked-hold/<agent>.json), not in-memory: a
+    # fresh run_loop invocation (simulating a wrapper restart) must still see it and refuse
+    # to re-drive before the reset instant, and must self-heal after - proving the hold, not
+    # some in-process cache, is what gates re-driving.
+    s = _store(tmp_path)
+    s.write_quota_blocked_hold("beta", summary="provider quota/billing refusal",
+                               reset_at="2026-01-01T00:00:10Z")
+    s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        return loop.DriveOutcome(ok=True)
+
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=1, now_iso=lambda: "2026-01-01T00:00:05Z",
+    )
+    assert turns == 0 and drives["n"] == 0        # pre-existing hold blocks the very first poll
+
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=1, now_iso=lambda: "2026-01-01T00:00:15Z",
+    )
+    assert turns == 1 and drives["n"] == 1        # self-healed once the reset instant passed
+
+
+def test_quota_blocked_hold_restores_health_after_a_simulated_restart(tmp_path) -> None:
+    # #126 connector P2: run_loop's own startup unconditionally resets health to
+    # idle_waiting (on_health_idle) BEFORE the pre-drive park ever runs. Since a quota
+    # park deliberately does NOT re-drive (unlike gateway_held, whose re-drive-every-
+    # poll design lets a fresh failed drive() re-write health for free), nothing else
+    # would correct that idle_waiting for the rest of the hold - the worker would
+    # report cheerful idle health despite doctor/attention seeing the quota marker.
+    from agenttalk.wrapper.health import WrapperHealthWriter
+
+    s = _store(tmp_path)
+    s.write_quota_blocked_hold("beta", summary="provider quota/billing refusal",
+                               reset_at="2026-01-01T00:00:10Z")
+    s.send(sender="alpha", recipient="beta", body="task")
+    health_writer = WrapperHealthWriter(s, "beta", cli="codex", mode="wrapper-loop")
+
+    loop.run_loop(
+        s, "beta", lambda rec: loop.DriveOutcome(ok=True),
+        clock=lambda: 0.0, sleep=lambda d: None, max_polls=1,
+        now_iso=lambda: "2026-01-01T00:00:05Z",   # still before the reset instant
+        on_health_idle=health_writer.idle, on_health_parked=health_writer.parked,
+    )
+    health = s.read_health("beta")
+    assert health.get("state") == "rate_limited_or_outage"  # NOT idle_waiting
+    assert health.get("reason_code") == "quota_blocked"
+
+
+# --------------------------------------------------- store: durable quota-blocked hold
+
+def test_quota_blocked_hold_store_roundtrip_and_expiry(tmp_path) -> None:
+    s = _store(tmp_path)
+    assert s.read_quota_blocked_hold("beta") is None      # absent -> None, never raises
+
+    s.write_quota_blocked_hold("beta", summary="usage limit hit",
+                               reset_at="2026-06-01T12:00:00Z")
+    fresh = s.read_quota_blocked_hold("beta", now_epoch=_epoch("2026-06-01T11:59:59Z"))
+    assert fresh == {
+        "agent": "beta", "state": "quota_blocked", "summary": "usage limit hit",
+        "reset_at": "2026-06-01T12:00:00Z", "at": fresh["at"],
+    }
+    # exactly-at and past the reset instant both self-expire (>=, not >)
+    assert s.read_quota_blocked_hold("beta", now_epoch=_epoch("2026-06-01T12:00:00Z")) is None
+    assert s.read_quota_blocked_hold("beta", now_epoch=_epoch("2026-06-01T13:00:00Z")) is None
+
+    s.clear_quota_blocked_hold("beta")
+    assert s.read_quota_blocked_hold("beta", now_epoch=_epoch("2026-06-01T11:59:59Z")) is None
+    s.clear_quota_blocked_hold("beta")            # idempotent, never raises when already absent
+
+
+def test_quota_blocked_hold_without_a_reset_instant_still_holds_briefly(tmp_path) -> None:
+    # The reset instant is retained "when present" (#126 ask) - when the provider's text
+    # gave none, the hold is still valid immediately after being written (reads it back
+    # honestly as reset_at=None rather than fabricating one) - it just falls back to a
+    # BOUNDED re-probe window rather than holding forever (connector P1 on PR #104: an
+    # unknown-reset hold with no expiry mechanism at all permanently wedges the mailbox).
+    from agenttalk.store import Store as _StoreCls
+    import time as _time
+
+    s = _store(tmp_path)
+    s.write_quota_blocked_hold("beta", summary="usage limit hit, no stated reset time")
+    now = _time.time()
+    hold = s.read_quota_blocked_hold("beta", now_epoch=now + 60.0)
+    assert hold is not None
+    assert hold["reset_at"] is None
+    # ...but it MUST eventually re-probe rather than wedge forever.
+    reprobe = _StoreCls.QUOTA_UNKNOWN_RESET_REPROBE_SECONDS
+    assert s.read_quota_blocked_hold("beta", now_epoch=now + reprobe + 1.0) is None
+
+
+def test_quota_blocked_hold_is_scoped_to_its_own_agent(tmp_path) -> None:
+    s = _store(tmp_path)
+    s.write_quota_blocked_hold("beta", summary="x", reset_at="2030-01-01T00:00:00Z")
+    assert s.read_quota_blocked_hold("alpha") is None     # a different agent sees nothing
+    assert s.read_quota_blocked_hold("beta") is not None
+
+
+# ------------------------------------------- run.py: quota-refusal text/instant parsing
+
+def test_parse_quota_refusal_recognizes_the_real_dead_letter_template() -> None:
+    # The exact real template observed 13 times across 4 agents.
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+    got = run._parse_quota_refusal(
+        "You've hit your usage limit. Visit "
+        "https://chatgpt.com/codex/settings/usage to purchase more credits "
+        "or try again at Aug 5th, 2026 6:10 AM.",
+        now=now,
+    )
+    assert got is not None
+    assert got["reset_at"] == "2026-08-05T06:10:00Z"
+
+
+def test_parse_quota_refusal_handles_the_time_only_variant_and_rolls_to_tomorrow() -> None:
+    now = datetime(2026, 7, 10, 20, 30, tzinfo=timezone.utc)
+    got = run._parse_quota_refusal(
+        "You've hit your usage limit. Visit "
+        "https://chatgpt.com/codex/settings/usage to purchase more credits "
+        "or try again at 7:55 PM.",
+        now=now,
+    )
+    assert got is not None
+    assert got["reset_at"] == "2026-07-11T19:55:00Z"      # already past today -> tomorrow
+
+
+def test_parse_quota_refusal_same_day_time_only_does_not_roll_forward() -> None:
+    now = datetime(2026, 7, 10, 16, 30, tzinfo=timezone.utc)
+    got = run._parse_quota_refusal(
+        "You've hit your usage limit or try again at 7:55 PM.", now=now)
+    assert got is not None
+    assert got["reset_at"] == "2026-07-10T19:55:00Z"      # still ahead today -> today
+
+
+def test_parse_quota_refusal_none_for_unrelated_infra_text() -> None:
+    # Direction control: a generic infra string must NOT be swept into quota_blocked.
+    assert run._parse_quota_refusal("connection refused by upstream") is None
+    assert run._parse_quota_refusal("HTTP 503 service unavailable") is None
+    assert run._parse_quota_refusal(None) is None
+
+
+def test_parse_quota_refusal_without_a_reset_clause_still_classifies() -> None:
+    # "when present" (#126 ask): a quota refusal with no parseable reset instant is
+    # still recognized - it just retains no reset_at, falling back to bounded backoff.
+    got = run._parse_quota_refusal("You have hit your usage limit for this billing period.")
+    assert got is not None
+    assert got["reset_at"] is None
+
+
+def test_parse_quota_reset_instant_rejects_an_implausibly_far_out_or_past_parse() -> None:
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+    # 15 days out is a plausible quota window - accepted.
+    assert run._parse_quota_reset_instant("Jul 25th, 2026 12:00 PM", now=now) is not None
+    # 40/82 days out is far beyond any real quota window - treat as a parse/timezone mistake.
+    assert run._parse_quota_reset_instant("Aug 19th, 2026 12:00 PM", now=now) is None
+    assert run._parse_quota_reset_instant("Sep 30th, 2026 12:00 PM", now=now) is None
+    # A stated instant already in the past (e.g. a timezone mismatch) is discarded, not
+    # trusted as "already clear".
+    assert run._parse_quota_reset_instant("Jul 1st, 2026 12:00 PM", now=now) is None
+
+
+# ------------------------------------------ supervisor: never renders errored/stuck
+
+def test_quota_blocked_wrapper_reads_healthy_idle_to_the_supervisor(tmp_path) -> None:
+    # #126 requirement 4 ("NEVER as errored or stuck"): a wrapper parked on a quota hold
+    # must resolve to HEALTHY_IDLE for the supervisor's own decision - not TURN_FAILED (the
+    # wrapper-runtime record's phase would otherwise sit at terminal/failed for the ENTIRE
+    # hold, unlike a normal failure which retries within one backoff cycle and quickly moves
+    # phase off "terminal"). Drives through the real run.make_drive path (not a hand-built
+    # DriveOutcome) so the runtime_writer.idle() reset is exercised for real.
+    from agenttalk import supervisor as sup
+    from agenttalk import wrapper_runtime as _rt
+    from agenttalk.wrapper.health import WrapperHealthWriter
+
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    real_text = (
+        "You've hit your usage limit. Visit "
+        "https://chatgpt.com/codex/settings/usage to purchase more credits "
+        "or try again at Aug 5th, 2026 6:10 AM."
+    )
+
+    def fake_spawn(argv, stdin):
+        return _failed_turn_lines(real_text)
+
+    runtime_writer = _rt.WrapperRuntimeWriter(
+        s.state_dir, "beta", "test-wrapper-1", wrapper_pid=4242,
+        wrapper_start="2020-01-01T00:00:00.000000Z", clock=lambda: 0.0)
+    health_writer = WrapperHealthWriter(s, "beta", cli="codex", mode="wrapper-loop")
+    frozen_now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+                           clock=lambda: 0.0, render=False,
+                           runtime_writer=runtime_writer, health_writer=health_writer,
+                           now_wall=lambda: frozen_now)
+    rec = {"id": "msg-1", "from": "a", "kind": "message", "body": "hi",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    outcome = drive(rec)
+    assert outcome.failure_class == loop.CLASS_QUOTA_BLOCKED
+
+    runtime = _rt.read_runtime(s.state_dir, "beta", now_epoch=0.0)
+    assert runtime["status"] == _rt.STATUS_VALID
+    assert runtime["record"]["phase"] == _rt.PHASE_IDLE   # NOT stuck at terminal/failed
+
+    s.write_heartbeat("beta")
+    now = 1000.0
+    report = sup.build_report(s, now_epoch=now, state={},
+                              supervisor_config={"agents": {"beta": {"wrapped": True}}})
+    plan = sup.plan_actions(
+        report, {}, {"agents": {"beta": {"wrapped": True, "auto_restart": True}}},
+        now_epoch=now, snapshot=[])
+    # No real process snapshot is injected here (that is #105's CLI-child-binding
+    # machinery, out of #126's scope), so the decision cannot positively confirm
+    # the child - CLI_CHILD_UNKNOWN is the correct, honest answer for THAT reason.
+    # What #126 actually prevents is TURN_FAILED: without the runtime_writer.idle()
+    # reset, the wrapper-runtime record would sit at phase=terminal/outcome=failed
+    # for the ENTIRE hold (unlike a normal failure, which retries within one backoff
+    # cycle and quickly moves phase off "terminal"), and _plan_one turns a fresh-
+    # heartbeat terminal/failed tuple directly into state=TURN_FAILED.
+    decision_state = plan["agents"]["beta"]["state"]
+    assert decision_state != "TURN_FAILED"
 
 
 # --------------------------------------------- make_drive (run.py, injected spawn)
@@ -909,6 +1284,46 @@ def test_make_drive_resume_first_failure_does_not_mark_unavailable(tmp_path) -> 
     assert st.resume_available is True                 # first failure only records the ledger
     assert st.resume_failure_count == 1
     assert st.turns == 0                               # a failed turn does not advance
+
+
+# --------------------------------------------- #126: provider quota/billing refusal
+
+def test_make_drive_classifies_real_provider_quota_refusal_text(tmp_path) -> None:
+    """#126: the EXACT real dead-letter text (13 occurrences across 4 agents, all the
+    same Codex template) must classify as CLASS_QUOTA_BLOCKED with its stated reset
+    instant retained - never ambiguous_or_unknown (the incident: 20 retries burned
+    over 65 minutes, then valid work dead-lettered). Uses the real provider text, not
+    a hand-built record - a fix tested against a synthetic shape that happens to have
+    the field proves nothing (#60 lesson)."""
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    real_text = (
+        "You've hit your usage limit. Visit "
+        "https://chatgpt.com/codex/settings/usage to purchase more credits "
+        "or try again at Aug 5th, 2026 6:10 AM."
+    )
+
+    def fake_spawn(argv, stdin):
+        return _failed_turn_lines(real_text)
+
+    # A frozen "now" well before the fixture's stated reset instant - without this,
+    # `_parse_quota_refusal` defaults to the REAL wall clock, and this date-bombs the
+    # instant real time passes 2026-08-05T06:10Z (connector P1 catch on PR #104).
+    frozen_now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+                           clock=lambda: 0.0, render=False, now_wall=lambda: frozen_now)
+    rec = {"id": "msg-1", "from": "a", "kind": "message", "body": "hi",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+
+    outcome = drive(rec)
+
+    assert outcome.ok is False
+    assert outcome.failure_class == loop.CLASS_QUOTA_BLOCKED
+    assert outcome.quota_reset_at == "2026-08-05T06:10:00Z"
+    assert "usage limit" in outcome.summary.lower()
+    health = s.read_health("beta")
+    assert health.get("state") == "rate_limited_or_outage"  # never errored_ambiguous
+    assert health.get("reason_code") == "quota_blocked"
 
 
 def test_make_drive_resume_structured_infra_failures_do_not_consume_b4_ceiling(

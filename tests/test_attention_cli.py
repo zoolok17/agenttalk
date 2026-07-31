@@ -274,6 +274,46 @@ def test_config_blocked_defer_then_different_fault_resurfaces_via_cli(tmp_path: 
     assert row and row[0]["state"] == "active"
 
 
+def test_quota_blocked_hold_surfaces_via_collect_attention_items(tmp_path: Path) -> None:
+    # #126: a provider quota/billing refusal must reach the SAME operator-attention
+    # aggregator config_blocked uses, so it is visible without needing a for-agent.
+    s = Store(tmp_path)
+    s.init(["beta", "claude"])
+    s.write_quota_blocked_hold("beta", summary="usage limit hit",
+                              reset_at="2026-08-05T06:10:00Z")
+    items = cli._collect_attention_items(s, for_agent=None, roster=["beta", "claude"])
+    quota_items = [i for i in items if i["source"] == "quota_blocked"]
+    assert len(quota_items) == 1
+    assert quota_items[0]["human_can_unblock_now"] is False
+
+
+def test_quota_blocked_defer_then_new_window_resurfaces_via_cli(tmp_path: Path) -> None:
+    # Mirrors the config_blocked defer/resurface test: a quota-blocked hold is deferred,
+    # then the SAME agent hits a NEW refusal (a later reset window). The content-bound
+    # disposition (gate 1) must not hide the new window - it resurfaces in the queue.
+    s = _team(tmp_path)
+    s.write_quota_blocked_hold("beta", summary="usage limit hit",
+                              reset_at="2026-08-05T06:10:00Z")
+    from agenttalk import attention as A
+    items = cli._collect_attention_items(s, for_agent="claude", roster=["beta", "claude"])
+    item = [i for i in items if i["source"] == "quota_blocked"][0]["item_id"]
+    assert cli.main([*_root(tmp_path), "attention", "defer", "--from", "claude",
+                     "--item", item, "--until", "2099-01-01T00:00:00Z",
+                     "--reason", "self-heals on the reset instant"]) == 0
+
+    disps, _ = A.read_dispositions(s)
+    q = A.build_queue(items, disps, now_iso="2026-06-01T00:00:00Z")
+    assert not [i for i in q["items"] if i["item_id"] == item]  # deferred -> hidden
+
+    # a NEW reset window for the same agent -> new content hash -> resurfaces
+    s.write_quota_blocked_hold("beta", summary="usage limit hit again",
+                              reset_at="2026-08-06T09:00:00Z")
+    items2 = cli._collect_attention_items(s, for_agent="claude", roster=["beta", "claude"])
+    q2 = A.build_queue(items2, disps, now_iso="2026-06-01T00:00:00Z")
+    row = [i for i in q2["items"] if i["item_id"] == item]
+    assert row and row[0]["state"] == "active"
+
+
 def test_resolved_dead_letter_absent_from_attention_queue(tmp_path: Path) -> None:
     # a resolved dead-letter must not resurface in the operator attention queue (CLI).
     from agenttalk.wrapper import recv_api

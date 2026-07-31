@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .turn_watchdog import TurnWatchdogConfig
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agenttalk import health as health_model
 from agenttalk.redaction import normalize_child_output_tail
@@ -1196,6 +1196,95 @@ def _looks_like_infra(text: str | None) -> bool:
     return any(m in t for m in _INFRA_ERROR_MARKERS)
 
 
+# Provider quota/billing refusal (task #126): a distinct terminal class from
+# ambiguous_or_unknown - retrying against a wall that cannot clear burns
+# attempts and dead-letters valid work. Confirmed against 13 REAL dead-letter
+# records (4 agents), all the identical Codex template: "You've hit your usage
+# limit. Visit https://chatgpt.com/codex/settings/usage to purchase more
+# credits or try again at <TIME>." Narrow, high-confidence markers only - this
+# must never fire on an unrelated infra string that happens to share a word.
+_QUOTA_REFUSAL_MARKERS = (
+    "usage limit",
+    "quota exceeded",
+    "insufficient quota",
+    "purchase more credits",
+)
+_QUOTA_RESET_RE = re.compile(r"try again at\s+(.+?)\s*\.?\s*$", re.IGNORECASE)
+_QUOTA_FULL_DATE_RE = re.compile(
+    r"^([A-Za-z]{3,})\s+(\d{1,2})(?:st|nd|rd|th)?,\s*(\d{4})\s+"
+    r"(\d{1,2}):(\d{2})\s*([AP]M)$",
+    re.IGNORECASE,
+)
+_QUOTA_TIME_ONLY_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*([AP]M)$", re.IGNORECASE)
+_QUOTA_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+# A parsed instant further out than this is far more likely a parse/timezone
+# mistake than a genuine quota window - discard it rather than stranding the
+# hold near-indefinitely on a misread.
+_QUOTA_MAX_HOLD_SECONDS = 30 * 24 * 3600.0
+
+
+def _parse_quota_reset_instant(raw: str, *, now: datetime) -> str | None:
+    """Best-effort parse of the provider's own "try again at <TIME>" text into
+    an ISO UTC instant. Returns None (never raises) on anything ambiguous,
+    unparseable, in the past, or implausibly far out - the caller still
+    classifies as quota_blocked without a reset instant; it just falls back
+    to bounded backoff instead of a known clear time. The provider's text
+    carries NO timezone marker, so this is a best-effort UTC-clock assumption,
+    bounded by ``_QUOTA_MAX_HOLD_SECONDS`` against a bad guess."""
+    raw = raw.strip()
+    m = _QUOTA_FULL_DATE_RE.match(raw)
+    if m:
+        month_name, day, year, hour, minute, meridiem = m.groups()
+        month = _QUOTA_MONTHS.get(month_name[:3].lower())
+        if month is None:
+            return None
+        hour_i = int(hour) % 12
+        if meridiem.upper() == "PM":
+            hour_i += 12
+        try:
+            dt = datetime(int(year), month, int(day), hour_i, int(minute),
+                          tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    else:
+        m = _QUOTA_TIME_ONLY_RE.match(raw)
+        if not m:
+            return None
+        hour, minute, meridiem = m.groups()
+        hour_i = int(hour) % 12
+        if meridiem.upper() == "PM":
+            hour_i += 12
+        # No date stated - the provider means the NEXT occurrence of this
+        # time-of-day. If that time-of-day has already passed today, it must
+        # mean tomorrow.
+        candidate = now.replace(hour=hour_i, minute=int(minute), second=0, microsecond=0)
+        dt = candidate if candidate > now else candidate + timedelta(days=1)
+    if dt <= now or (dt - now).total_seconds() > _QUOTA_MAX_HOLD_SECONDS:
+        return None
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_quota_refusal(text: str | None, *, now: datetime | None = None) -> dict | None:
+    """Recognize a provider quota/billing refusal and retain its stated reset
+    instant when present. Returns None when ``text`` is not a quota refusal."""
+    t = text or ""
+    tl = t.lower()
+    if not any(marker in tl for marker in _QUOTA_REFUSAL_MARKERS):
+        return None
+    reset_at = None
+    m = _QUOTA_RESET_RE.search(t)
+    if m:
+        reset_at = _parse_quota_reset_instant(
+            m.group(1), now=now or datetime.now(timezone.utc))
+    return {
+        "reason": f"provider quota/billing refusal: {t[:160]}",
+        "reset_at": reset_at,
+    }
+
+
 def _int_status(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -1973,7 +2062,9 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                wrapper_generation: str | None = None,
                backend_profile: str | None = None,
                profile_env: dict[str, str] | None = None,
-               lease_lost_exceptions: tuple = ()) -> Callable[[dict], object]:
+               lease_lost_exceptions: tuple = (),
+               now_wall: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+               ) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
     CLASS on failure, for dead-letter). A turn fails if it produced no progress event or
@@ -2006,6 +2097,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     from .loop import (
         CLASS_AMBIGUOUS,
         CLASS_CONFIG_BLOCKED,
+        CLASS_QUOTA_BLOCKED,
         DriveOutcome,
     )
 
@@ -2458,6 +2550,36 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             turn_id=lesson_turn_id,
             after_spawn=_record_lesson_exposure,
         )
+        if not sig["ok"] and sig.get("terminal"):
+            quota = _parse_quota_refusal(sig.get("terminal_text"), now=now_wall())
+            if quota is not None:
+                # A provider quota/billing refusal (#126) is a distinct terminal class,
+                # not session-continuity or dead-letter material - short-circuit BEFORE
+                # the resume-continuity branch below (a quota wall has nothing to do with
+                # whether THIS session is broken) and before the generic ambiguous
+                # classifier (which would otherwise bucket it as "terminal ambiguous
+                # infra-like text" - the #126 incident).
+                if attempted_resume:
+                    _session.clear_resume_attempt(session_state)
+                    if persist is not None:
+                        persist(session_state)
+                health_writer.failure(sig, CLASS_QUOTA_BLOCKED)
+                if runtime_writer is not None:
+                    # _run_one already finalized this turn's runtime record to
+                    # phase=terminal/outcome=failed. A quota park suppresses
+                    # retries for potentially hours (unlike a normal failure,
+                    # which retries again within one backoff cycle and quickly
+                    # moves phase off "terminal"), so left as terminal/failed
+                    # it reads to #105's supervisor decision as TURN_FAILED -
+                    # exactly the "errored/stuck" rendering #126 forbids. The
+                    # wrapper genuinely IS idle while parked (not mid-turn), so
+                    # reflect that honestly.
+                    runtime_writer.idle()
+                return DriveOutcome(
+                    ok=False, failure_class=CLASS_QUOTA_BLOCKED,
+                    summary=quota["reason"], quota_reset_at=quota["reset_at"],
+                    child_output_tail=sig.get("child_output_tail"),
+                )
         if not sig["ok"] and attempted_resume:
             try:
                 resume_failure_class, resume_summary = _classify(sig)

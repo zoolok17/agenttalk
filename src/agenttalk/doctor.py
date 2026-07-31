@@ -174,6 +174,9 @@ def run(project_root: Path | None = None) -> Report:
         holds = _check_config_blocked_holds(store)
         if holds is not None:  # additive: absent unless a valid config-blocked hold exists
             report.checks.append(holds)
+        quota_holds = _check_quota_blocked_holds(store)
+        if quota_holds is not None:  # additive: absent unless a valid quota-blocked hold exists
+            report.checks.append(quota_holds)
         report.checks.append(_check_detection_commit_gate(store))
         external_gate = _check_external_worker_commit_gate(store)
         if external_gate is not None:
@@ -2256,5 +2259,40 @@ def _check_config_blocked_holds(store: Store) -> Check | None:
              "where supported, explicitly opt in to the pinned Python directory with Codex --add-dir "
              "<python-dir> / writable_roots if workspace-write denies it, then run "
              "`agenttalk request-restart --for <agent>`."),
+        data={"holds": holds},
+    )
+
+
+def _check_quota_blocked_holds(store: Store) -> Check | None:
+    """Surface a provider quota/billing refusal distinctly (task #126): `warn`,
+    NEVER `error` - the block self-heals on the provider's own reset instant, no
+    operator repair needed, so this must never read as a crashed/stuck agent."""
+    try:
+        cfg = store.load_config()
+    except Exception:  # noqa: BLE001 - init check owns corrupt config
+        return None
+    holds: list[dict] = []
+    for agent in cfg.get("agents", []) or []:
+        try:
+            hold = store.read_quota_blocked_hold(str(agent))
+        except Exception:  # noqa: BLE001 - doctor never crashes on state files
+            hold = None
+        if hold is not None:
+            holds.append(hold)
+    if not holds:
+        return None
+    details = "; ".join(
+        f"{h['agent']}: quota-blocked"
+        f"{' until ' + h['reset_at'] if h.get('reset_at') else ' (reset time unknown)'}"
+        f" ({h.get('summary') or 'provider quota/billing refusal'})"
+        for h in holds
+    )
+    return Check(
+        name="quota_blocked_holds",
+        status="warn",
+        details=details,
+        fix=("no operator action needed - this self-heals once the provider's stated "
+             "reset instant passes. If it does not, run `agenttalk dead-letter list` to "
+             "confirm the provider is actually still refusing before restarting anything."),
         data={"holds": holds},
     )

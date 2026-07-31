@@ -6197,6 +6197,12 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
         items += A.config_blocked_items(holds)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("config_blocked", str(e)))
+    # quota_blocked holds (per roster agent, task #126)
+    try:
+        quota_holds = [h for a in roster if (h := store.read_quota_blocked_hold(a))]
+        items += A.quota_blocked_items(quota_holds)
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("quota_blocked", str(e)))
     # dead-letter (ALL; build_queue hides resolved via the resolve_dead_letter disposition)
     try:
         items += A.dead_letter_items(store.list_dead_letters())
@@ -9886,6 +9892,30 @@ def _dead_letter_notifier(store, agent: str):
                                  "config_blocked": "true",
                                  "dl_msg_id": str(mid),
                                  "dl_disposed": "false",
+                                 "request_id": "esc-" + uuid.uuid4().hex[:12]})
+                return True
+            if info.get("failure_class") == "quota_blocked":
+                # #126: a quota park is NOT a dead-letter (nothing was dead-lettered,
+                # committed, or even disposed) and NEEDS no operator action - it
+                # self-heals on the provider's own reset instant. The generic
+                # dead-letter-notice branch below would otherwise send "repeatedly
+                # FAILING... Inspect: agenttalk dead-letter show" for a message that
+                # has no dead-letter entry at all (connector P2 on PR #104).
+                summary = str(info.get("summary") or "provider quota/billing refusal")
+                reset_at = info.get("reset_at")
+                until = f" until {reset_at}" if reset_at else " (reset time unknown)"
+                body = (
+                    f"[wrapper-quota-blocked] agent {ag} is PARKED on message {mid} "
+                    f"from {info.get('from')} (kind={info.get('kind')}). Cursor is "
+                    "unchanged; the message was NOT committed, dead-lettered, or "
+                    f"disposed - it is valid work waiting on the provider{until}. "
+                    f"{summary}. No operator action needed - this self-heals once the "
+                    "provider's reset instant passes (see `agenttalk doctor` / "
+                    "`agenttalk attention` for the live hold)."
+                )
+                store.send(sender=agent, recipient=target, kind="note",
+                           subject="wrapper quota-blocked", body=body,
+                           meta={"quota_blocked": "true", "dl_msg_id": str(mid),
                                  "request_id": "esc-" + uuid.uuid4().hex[:12]})
                 return True
             state = A.dead_letter_notice_state(info, disposed=disposed)
