@@ -1873,16 +1873,22 @@ class _ProcStream:
     def _cleanup_after_constructor_error(self) -> None:
         # Best-effort only: preserve the original constructor failure so make_drive
         # keeps its existing spawn/exec classification.
-        for worker in (
-            self._work_hb,
-            self._watchdog,
-            self._launcher_exit_observer,
-        ):
+        stoppable_workers = (self._work_hb, self._watchdog)
+        # Stop every stoppable worker before joining any one of them. The
+        # Windows launcher-exit observer is intentionally not stoppable: its
+        # retained process handle unblocks only after the child exits.
+        for worker in stoppable_workers:
             if worker is None:
                 continue
             try:
                 if hasattr(worker, "stop"):
                     worker.stop()
+            except Exception as exc:
+                _ = exc
+        for worker in stoppable_workers:
+            if worker is None:
+                continue
+            try:
                 worker.join(timeout=10.0)
             except Exception as exc:
                 _ = exc
@@ -1891,18 +1897,26 @@ class _ProcStream:
                 _close_pipe_suppressing_benign_pipe_teardown(pipe)
             except OSError as exc:
                 _ = exc
+        child_reaped = False
         try:
             if self._proc.poll() is None:
                 self._proc.terminate()
             self._proc.wait(timeout=10.0)
+            child_reaped = True
         except subprocess.TimeoutExpired:
             try:
                 self._proc.kill()
                 self._proc.wait(timeout=5.0)
+                child_reaped = True
             except Exception as exc:
                 _ = exc
-        except OSError as exc:
+        except Exception as exc:
             _ = exc
+        if child_reaped and self._launcher_exit_observer is not None:
+            try:
+                self._launcher_exit_observer.join(timeout=10.0)
+            except Exception as exc:
+                _ = exc
 
 
 def _ovh_qwen_failure_text(sig: dict) -> str:
