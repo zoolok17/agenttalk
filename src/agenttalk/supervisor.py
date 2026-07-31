@@ -3950,6 +3950,34 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                 _bootstrap_add(checks, "supervisor_agent_launch_args_set", "ok",
                                "launch.windows_args is filled", agent=name)
 
+            module_args_from = launch.get("module_args_from")
+            if module_args_from is not None:
+                if not isinstance(module_args_from, int) or isinstance(module_args_from, bool):
+                    _bootstrap_add(
+                        checks, "supervisor_agent_launch_module_args_from_invalid", "error",
+                        "launch.module_args_from must be an integer",
+                        agent=name,
+                        facts={"module_args_from": module_args_from},
+                        suggestion="set module_args_from to the index of '-m' in windows_args, "
+                                   "or remove it",
+                    )
+                elif isinstance(windows_args, list) and not (
+                    0 <= module_args_from < len(windows_args)
+                ):
+                    _bootstrap_add(
+                        checks, "supervisor_agent_launch_module_args_from_out_of_range", "error",
+                        "launch.module_args_from is out of range for windows_args",
+                        agent=name,
+                        facts={"module_args_from": module_args_from,
+                               "windows_args_len": len(windows_args)},
+                        suggestion="point module_args_from at the index of '-m' in windows_args",
+                    )
+                else:
+                    _bootstrap_add(
+                        checks, "supervisor_agent_launch_module_args_from_valid", "ok",
+                        "launch.module_args_from is a valid index", agent=name,
+                    )
+
             if wrapped and isinstance(windows_args, list):
                 if "wrap" not in windows_args:
                     _bootstrap_add(
@@ -6104,6 +6132,26 @@ function Stop-Tree($targets) {
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
+function Test-AgenttalkExecutionModeToken([string]$token) {
+  # THE closed, checked terminal set for "does this prefix token stop
+  # CPython from ever reaching a later declared position" - derived from
+  # CPython's own documented invocation grammar (`python --help`):
+  #   usage: python [option] ... [-c cmd | -m mod | file | -] [arg] ...
+  # Every one of those four forms terminates option scanning and
+  # dispatches immediately. This function is the single source of truth
+  # for that set - see test_supervisor_execution_mode_terminal_set_is_closed,
+  # which enumerates it and asserts each form is classified true, so a
+  # missed fifth spelling fails a test instead of shipping as a comment
+  # that says "closed" without checking it. (I2, 4th leak: '-' - the
+  # documented stdin dispatch - is not "a dash-prefixed non-execution-mode
+  # flag"; a prior version of this check treated it as one.)
+  if ($token -eq '-') { return $true }                              # stdin
+  if ($token -eq '-c' -or $token.StartsWith('-c')) { return $true } # command (attached forms too)
+  if ($token -eq '-m' -or $token.StartsWith('-m')) { return $true } # module (attached forms too)
+  if ($token -eq '--') { return $true }                             # end of options
+  if (-not $token.StartsWith('-')) { return $true }                 # script path
+  return $false
+}
 function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom = $null) {
   # THE ONE place that recognizes a `python -m agenttalk` invocation - nonce
   # injection, the bounded-logging eligibility check, and the legacy --root
@@ -6141,28 +6189,30 @@ function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom 
   #
   # (I2, FINAL gap.) Declaring WHERE '-m agenttalk' sits proves the
   # POSITION, not that CPython ever REACHES it: an execution-mode token in
-  # the declared prefix (`-c'print(1)'`, or a bare/positional token that
-  # CPython treats as a script path) dispatches before scanning gets to
-  # the declared index, and the position check above would still pass.
-  # Unlike "which flags are safe" (open-ended) or "which flags consume a
-  # value" (open-ended, and deliberately NOT solved here), "which tokens
-  # change execution mode" is closed: -c, -m (plus their attached forms,
-  # e.g. -cprint(1)), and a bare token that isn't itself a flag (CPython's
-  # third dispatch: run-this-as-a-script). This is a REJECT list, not an
-  # accept list - anything in the prefix that is not affirmatively a
-  # dash-prefixed, non-execution-mode flag token is refused, so an
-  # unrecognized/novel prefix shape fails closed rather than being
-  # silently accepted.
-  $index = if ($null -ne $moduleArgsFrom) { [int]$moduleArgsFrom } else { 0 }
-  if ($index -lt 0 -or $index -ge $argTokens.Count) { return -1 }
-  for ($p = 0; $p -lt $index; $p++) {
-    $prefixToken = [string]$argTokens[$p]
-    if ($prefixToken -eq '-m' -or $prefixToken.StartsWith('-m') -or
-        $prefixToken -eq '-c' -or $prefixToken.StartsWith('-c') -or
-        $prefixToken -eq '--' -or
-        -not $prefixToken.StartsWith('-')) {
+  # the declared prefix dispatches before scanning gets to the declared
+  # index, and the position check above would still pass. This is a
+  # REJECT list, not an accept list - anything in the prefix that
+  # Test-AgenttalkExecutionModeToken classifies as a terminal dispatch is
+  # refused, and that function (not this comment) is the checked source
+  # of truth for which tokens those are.
+  #
+  # module_args_from is an operator-declared config value, not argv - a
+  # malformed one ("1x") must not throw under $ErrorActionPreference =
+  # 'Stop' and take the whole supervisor poll down over one agent's typo;
+  # fail soft to -1 like every other "not recognized" case. The bootstrap
+  # config validator is the loud, load-time check; this is defense in
+  # depth for whatever reaches here anyway.
+  $index = 0
+  if ($null -ne $moduleArgsFrom) {
+    try {
+      $index = [int]$moduleArgsFrom
+    } catch {
       return -1
     }
+  }
+  if ($index -lt 0 -or $index -ge $argTokens.Count) { return -1 }
+  for ($p = 0; $p -lt $index; $p++) {
+    if (Test-AgenttalkExecutionModeToken ([string]$argTokens[$p])) { return -1 }
   }
   if ($index + 1 -lt $argTokens.Count -and
       [string]$argTokens[$index] -eq '-m' -and

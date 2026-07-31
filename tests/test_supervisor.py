@@ -2127,6 +2127,45 @@ def test_supervise_bootstrap_check_accepts_wrapped_claude_and_codex(
     assert ("Ramanujan", "claude") in by_agent_cli
 
 
+def test_supervise_bootstrap_check_validates_module_args_from(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    # PR 98 connector re-review: [int]$moduleArgsFrom is a direct cast at the
+    # PowerShell call site under $ErrorActionPreference = 'Stop' - a typo
+    # like "1x" there throws and takes the whole supervisor poll down
+    # instead of just disabling nonce injection for that one agent. The
+    # bootstrap validator is the loud, load-time check that catches both a
+    # wrong-typed and an out-of-range value BEFORE either ever reaches that
+    # cast, with the offending agent named.
+    s = _team(tmp_path, "Polaris,Zeno,Ramanujan")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    for name in ("Polaris", "Zeno", "Ramanujan"):
+        s.write_heartbeat(name)
+    bad_type = _wrapped_supervisor_agent("Zeno", "codex")
+    bad_type["launch"]["module_args_from"] = "1x"
+    out_of_range = _wrapped_supervisor_agent("Ramanujan", "claude")
+    out_of_range["launch"]["module_args_from"] = 99
+    _write_supervisor_config(s, {"Zeno": bad_type, "Ramanujan": out_of_range})
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
+    assert ("supervisor_agent_launch_module_args_from_invalid", "Zeno") in by_id_agent
+    assert ("supervisor_agent_launch_module_args_from_out_of_range", "Ramanujan") in by_id_agent
+
+    valid = _wrapped_supervisor_agent("Zeno", "codex")
+    valid["launch"]["windows_args"].insert(0, "-u")
+    valid["launch"]["module_args_from"] = 1
+    _write_supervisor_config(s, {"Zeno": valid})
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+    payload = json.loads(capsys.readouterr().out)
+    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
+    assert ("supervisor_agent_launch_module_args_from_valid", "Zeno") in by_id_agent
+
+
 def test_supervise_bootstrap_check_accepts_constrained_ovh_qwen_profile(
     tmp_path: Path,
     capsys: pytest.CaptureFixture,
@@ -6023,6 +6062,48 @@ def _pslit(v: str) -> str:
     return "'" + str(v).replace("'", "''") + "'"
 
 
+def test_supervisor_execution_mode_terminal_set_is_closed(tmp_path: Path) -> None:
+    """I2, 4th leak (PR 98 connector re-review): a literal bare '-' (CPython's
+    documented stdin dispatch) passed the old prefix filter - it starts with
+    '-', so 'not StartsWith(-)' was false, and it matched none of -m/-c/--.
+    Test-AgenttalkExecutionModeToken is now the single, named, checked source
+    of truth for the terminal set (derived from `python --help`'s own
+    [-c cmd | -m mod | file | -] grammar) - enumerate it directly here so a
+    missed fifth spelling fails THIS test, not a future round of findings."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "execution_mode_terminal_set.json"
+    terminal = [
+        "-", "-m", "-mfoo", "-magenttalk", "-c", "-cprint(1)", "--",
+        "script.py", "helper.py", "agenttalk",
+    ]
+    non_terminal = ["-u", "-X", "-Xutf8", "-P", "-O", "-B", "-E", "-s", "-S", "-Z", "-3"]
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        "$terminal = @(" + ",".join(_pslit(t) for t in terminal) + ")",
+        "$nonTerminal = @(" + ",".join(_pslit(t) for t in non_terminal) + ")",
+        "$terminalResults = @($terminal | ForEach-Object { Test-AgenttalkExecutionModeToken $_ })",
+        "$nonTerminalResults = @($nonTerminal | ForEach-Object { "
+        "Test-AgenttalkExecutionModeToken $_ })",
+        "@{ terminal = $terminalResults; non_terminal = $nonTerminalResults } | "
+        "ConvertTo-Json -Depth 3 | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    script = tmp_path / "execution-mode-terminal-set.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert data["terminal"] == [True] * len(terminal), data
+    assert data["non_terminal"] == [False] * len(non_terminal), data
+
+
 def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
@@ -6064,6 +6145,17 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "@('-Z','-m','agenttalk','--root','R','wrap') $nonce 1",
         "$attachedCommandDeclared = Add-SupervisorLaunchNonce 'python.exe' "
         "@(\"-cprint(1)\",'-m','agenttalk','--root','R','wrap') $nonce 1",
+        # I2, 4th leak (connector re-review of 943cc28): a literal bare '-'
+        # (CPython's documented stdin dispatch) passed the old prefix
+        # filter - it starts with '-', so it matched none of -m/-c/--/bare.
+        "$bareStdinDeclared = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-','-m','agenttalk','--root','R','wrap') $nonce 1",
+        # Same round: module_args_from is operator-declared config, not
+        # argv - a malformed value ("1x") must fail soft (return -1) rather
+        # than throw under $ErrorActionPreference = 'Stop' and take the
+        # whole poll down over one agent's typo.
+        "$malformedDeclared = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-u','-m','agenttalk','--root','R','wrap') $nonce '1x'",
         "$declaredOutOfRange = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-m','agenttalk','--root','R','wrap') $nonce 99",
         "$optionTerminator = Add-SupervisorLaunchNonce 'python.exe' "
@@ -6082,6 +6174,8 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "future_flag_declared = $futureFlagDeclared; "
         "generic_unknown_flag_declared = $genericUnknownFlagDeclared; "
         "attached_command_declared = $attachedCommandDeclared; "
+        "bare_stdin_declared = $bareStdinDeclared; "
+        "malformed_declared = $malformedDeclared; "
         "declared_out_of_range = $declaredOutOfRange; "
         "option_terminator = $optionTerminator; "
         "py_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $py.argv $py); "
@@ -6177,6 +6271,14 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     # prefix must also contain no execution-mode token - this is refused.
     assert data["attached_command_declared"]["injected"] is False
     assert data["attached_command_declared"]["missing_reason"] == "unsupported_launch_argv"
+    # I2, 4th leak: '-' is CPython's documented stdin dispatch, not "a
+    # dash-prefixed non-execution-mode flag" - refused like -c/-m/--.
+    assert data["bare_stdin_declared"]["injected"] is False
+    assert data["bare_stdin_declared"]["missing_reason"] == "unsupported_launch_argv"
+    # A malformed module_args_from ("1x") fails soft to "not recognized"
+    # rather than throwing and taking the whole supervisor poll down.
+    assert data["malformed_declared"]["injected"] is False
+    assert data["malformed_declared"]["missing_reason"] == "unsupported_launch_argv"
     # A declared index that doesn't actually land on '-m agenttalk' (here,
     # out of range) still fails closed - the declaration is verified, not
     # blindly trusted.
