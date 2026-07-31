@@ -308,6 +308,27 @@ Key differences for a wrapped agent:
 > silently coerced; a threshold below a live watchdog's hard floor cannot
 > authorize autonomous stall recovery.
 
+> **An interpreter-option prefix before `-m agenttalk` (wrapped agents
+> only).** If `windows_args` needs a Python interpreter flag ahead of
+> `-m agenttalk` (e.g. `-u` for unbuffered output), declare exactly how
+> many tokens that prefix occupies with `"launch": {"module_args_from": N}`
+> — the supervisor never infers this from the argv text. Each prefix token
+> must be a single dash-prefixed flag; **attached-value forms are
+> accepted, separate-token values are refused**:
+>
+> ```jsonc
+> "launch": {
+>   "windows_args": ["-Xutf8", "-m", "agenttalk", "--root", "{ROOT}", "wrap", "..."],
+>   "module_args_from": 1
+> }
+> ```
+>
+> `-Xutf8` (attached) works; `-X utf8` (separate tokens) does not — the
+> bare value token `utf8` is indistinguishable from a script path and is
+> refused along with it. If a flag has no attached-value form, put it
+> after `-m agenttalk` instead, or omit `module_args_from` entirely for
+> the common case (no interpreter prefix, the default).
+
 ---
 
 ## 5. Install the project hooks
