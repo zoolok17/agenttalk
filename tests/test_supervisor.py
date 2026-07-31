@@ -5909,8 +5909,12 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "@('-X','utf8','-m','agenttalk','--root','R','wrap') $nonce",
         "$xAttached = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-Xutf8','-m','agenttalk','--root','R','wrap') $nonce",
-        "$unknownFlag = Add-SupervisorLaunchNonce 'python.exe' "
+        "$futureFlag = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-P','-m','agenttalk','--root','R','wrap') $nonce",
+        "$genericUnknownFlag = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-Z','-m','agenttalk','--root','R','wrap') $nonce",
+        "$optionTerminator = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('--','-m','agenttalk','--root','R','wrap') $nonce",
         "$duplicate = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-m','agenttalk','--supervisor-launch-nonce','old','wrap') $nonce",
         "$duplicateEq = Add-SupervisorLaunchNonce 'python.exe' "
@@ -5919,7 +5923,9 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "@{ py = $py; console = $console; native = $native; "
         "duplicate = $duplicate; duplicate_eq = $duplicateEq; "
         "unbuffered = $unbuffered; x_option = $xOption; "
-        "x_attached = $xAttached; unknown_flag = $unknownFlag; "
+        "x_attached = $xAttached; future_flag = $futureFlag; "
+        "generic_unknown_flag = $genericUnknownFlag; "
+        "option_terminator = $optionTerminator; "
         "py_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $py.argv $py); "
         "console_wrap = (Test-AgenttalkWrapInvocation 'agenttalk.exe' $console.argv $console); "
         "wait_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $wait.argv $wait); "
@@ -5981,9 +5987,26 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "-Xutf8", "-m", "agenttalk", "--supervisor-launch-nonce",
         SUPERVISOR_NONCE, "--root", "R", "wrap",
     ]
-    # An unrecognized flag must still fail closed rather than guess past it.
-    assert data["unknown_flag"]["injected"] is False
-    assert data["unknown_flag"]["missing_reason"] == "unsupported_launch_argv"
+    # I2 (PR 98 cold review, 3rd round on this parser): -P is Python 3.11's
+    # -m-compatible isolation flag - the "fourth" flag the lead predicted an
+    # allowlist would always be one step behind. The inverted parser accepts
+    # it, and any other single-dash token, without needing to name it.
+    assert data["future_flag"]["injected"] is True
+    assert data["future_flag"]["argv"] == [
+        "-P", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
+        "--root", "R", "wrap",
+    ]
+    assert data["generic_unknown_flag"]["injected"] is True
+    assert data["generic_unknown_flag"]["argv"] == [
+        "-Z", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
+        "--root", "R", "wrap",
+    ]
+    # A shape that DETERMINES execution mode must still fail closed rather
+    # than be guessed past - `--` ends interpreter-option parsing, so
+    # everything after it (including this "-m agenttalk") is never reached
+    # as an interpreter option.
+    assert data["option_terminator"]["injected"] is False
+    assert data["option_terminator"]["missing_reason"] == "unsupported_launch_argv"
 
 
 def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(

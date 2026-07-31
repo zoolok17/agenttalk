@@ -6105,46 +6105,50 @@ function Stop-Tree($targets) {
   }
 }
 function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens) {
-  # THE ONE place that recognizes a `python -m agenttalk` invocation past a
-  # bounded allowlist of interpreter options (`-u`, `-X utf8`, ...) - nonce
+  # THE ONE place that recognizes a `python -m agenttalk` invocation - nonce
   # injection, the bounded-logging eligibility check, and the legacy --root
   # backfill all need this SAME recognition, and three independent copies is
   # exactly how a valid `-u`/`-X` launch silently lost the logging capability
   # while nonce injection (the one copy that had been patched) kept working.
+  #
+  # I2: this used to be a hand-maintained allowlist of "safe" interpreter
+  # options - it needed a new entry for -u, then -X, then -P, and would need
+  # a fourth. Inverted instead: walk forward accepting ANY token until one
+  # of the few shapes that DETERMINE Python's execution mode is seen -
+  # `-c <command>`, `--` (ends option parsing), `-m <module>`, or a bare
+  # (non-dash) token, which is a script path or `-` for stdin. Those are
+  # mutually exclusive with `-m agenttalk` by CPython's own argument
+  # grammar: whichever of them appears first is what actually runs, and
+  # nothing after it is a further interpreter option. `-X`/`-W` are the
+  # only two flags known to consume a SEPARATE value token; skip both.
+  # Every other single-dash token is treated as a bare modifier (true for
+  # every option flag CPython has ever added) and skipped by itself - if
+  # some future flag turns out to consume a value it doesn't advertise
+  # here, that only misaligns the scan and fails the match. That is a safe
+  # failure: it rejects a valid config, it can never accept an unsafe one,
+  # since none of the modal/terminal tokens above can be produced by an
+  # accidental misalignment.
+  #
   # Returns the index of `-m` itself, or -1 if the argv does not have that
-  # shape - an unrecognized token before it stops the scan rather than being
-  # skipped, matching the existing `python helper.py -m agenttalk` and
-  # `python -c pass -m agenttalk` rejections: guessing past an unknown flag
-  # risks misclassifying a process that never actually runs the agenttalk
-  # module. NOTE: the parameter is NOT named $args - PowerShell's automatic
+  # shape. NOTE: the parameter is NOT named $args - PowerShell's automatic
   # $args variable silently shadows a same-named formal parameter, and the
   # function then sees an empty list regardless of what the caller passed.
-  $boolFlags = @(
-    '-b', '-bb', '-B', '-d', '-E', '-i', '-I', '-O', '-OO',
-    '-q', '-s', '-S', '-t', '-tt', '-u', '-v'
-  )
   $i = 0
   while ($i -lt $argTokens.Count) {
     $token = [string]$argTokens[$i]
-    if ($token -eq '-m') { break }
-    if ($boolFlags -contains $token) {
-      $i += 1
-      continue
+    if ($token -eq '-m') {
+      if ($i + 1 -lt $argTokens.Count -and $argTokens[$i + 1] -eq 'agenttalk') {
+        return $i
+      }
+      return -1
     }
+    if ($token -eq '-c' -or $token -eq '--') { return -1 }
+    if (-not $token.StartsWith('-')) { return -1 }
     if ($token -eq '-X' -or $token -eq '-W') {
       $i += 2
       continue
     }
-    if ($token -like '-X?*' -or $token -like '-W?*') {
-      $i += 1
-      continue
-    }
-    return -1
-  }
-  if ($i + 1 -lt $argTokens.Count -and
-      $argTokens[$i] -eq '-m' -and
-      $argTokens[$i + 1] -eq 'agenttalk') {
-    return $i
+    $i += 1
   }
   return -1
 }
