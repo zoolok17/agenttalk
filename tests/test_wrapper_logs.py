@@ -603,17 +603,25 @@ def test_cmd_wrap_records_setup_exception_before_loop_exists(
     assert "Traceback (most recent call last)" in tail
 
 
-def test_cmd_wrap_routine_system_exit_skips_crash_reporting(
+def test_cmd_wrap_routine_system_exit_emits_exited_fact_without_traceback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # cli._get_store's "not initialized" path writes its own actionable
     # diagnostic and calls sys.exit(2) directly - a routine, already-
-    # explained exit, not a crash. Before the fix, cmd_wrap's except block
-    # recorded wrapper_exception and printed a full Python traceback on top
-    # of it regardless of exception type, turning a one-line diagnostic
-    # into crash-report noise - a regression #117 introduced into exactly
-    # the diagnostics path it exists to improve.
+    # explained exit, not a crash. Two regressions, in sequence:
+    # (1) cmd_wrap's except block used to record wrapper_exception and
+    # print a full Python traceback on top of it regardless of exception
+    # type, turning a one-line diagnostic into crash-report noise; fixing
+    # that by bare-raising on any SystemExit (2) overcorrected into
+    # emitting NO lifecycle fact at all for this shape - no deferred signal
+    # exists to have recorded one, unlike the signal-driven SystemExit
+    # case - so the trail ended with no termination fact whatsoever,
+    # indistinguishable from an OOM or a hard kill when reading the JSON
+    # lines. Every termination path must emit exactly one termination
+    # fact: here, a normalized wrapper_exited - not wrapper_exception,
+    # since this was never an unexplained exception - and still no
+    # traceback.
     out_path = tmp_path / "stdout.log"
     err_path = tmp_path / "stderr.log"
     nonce = "e" * 32
@@ -643,7 +651,9 @@ def test_cmd_wrap_routine_system_exit_skips_crash_reporting(
         path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
     )
     rows = [json.loads(line) for line in tail.splitlines() if line.startswith("{")]
-    assert rows == []
+    assert [row["event"] for row in rows] == ["wrapper_exited"]
+    assert rows[0]["exit_code"] == 2
+    assert rows[0]["reason"] == "system_exit"
     assert "not initialized" in tail
     assert "Traceback (most recent call last)" not in tail
 

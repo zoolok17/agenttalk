@@ -10630,7 +10630,25 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             # already-explained, intentional exit - exactly the regression
             # #117 exists to prevent. Handle it BEFORE the crash-reporting
             # path below, not after, so it never reaches it.
+            #
+            # But skipping wrapper_exception must not also skip EVERY
+            # lifecycle fact: a signal-driven SystemExit already recorded
+            # wrapper_signal_received (terminal_emitted is already True by
+            # the time it gets here), but a non-signal SystemExit - like
+            # _get_store's - has no deferred signal for anything to have
+            # recorded, so terminal_emitted is still False. Without an
+            # explicit wrapper_exited here, the trail ends with no
+            # termination fact at all, and a cleanly explained
+            # configuration error becomes indistinguishable from an OOM or
+            # a hard kill when reading the JSON lines - a worse defect than
+            # the traceback this branch exists to suppress. Every
+            # termination path must emit exactly one termination fact.
             if isinstance(exc, SystemExit):
+                if not lifecycle_log.terminal_emitted:
+                    code = exc.code if isinstance(exc.code, int) else (
+                        0 if exc.code is None else 1
+                    )
+                    lifecycle_log.wrapper_exited(code, reason="system_exit")
                 raise
             if not lifecycle_log.terminal_emitted:
                 lifecycle_log.wrapper_exception(exc)
