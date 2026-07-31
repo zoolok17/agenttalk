@@ -982,6 +982,14 @@ def claim_powershell_supervisor(
                         )
                     _revalidate_process_image(host, final)
                     _require_process_active(host)
+                    # Linearize the emergency brake as late as possible in the
+                    # checked claim, after the outer CLI's fast precheck.
+                    kill_switch = store.supervisor_kill_switch()
+                    if kill_switch is not False:
+                        state = "present" if kill_switch else "unreadable"
+                        raise SupervisorLifecycleError(
+                            f"supervisor.kill is {state}; refusing supervisor claim"
+                        )
                     return store._claim_supervisor_instance_locked(
                         pid=pid,
                         pid_start=pid_start,

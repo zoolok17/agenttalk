@@ -749,6 +749,43 @@ def test_claim_rechecks_selection_before_marker_write(
     assert not store.supervisor_instance_path().exists()
 
 
+def test_claim_rechecks_kill_switch_before_marker_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    selected = _selected(store)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current = _observation(
+        os.getpid(), parent=100, path=r"C:\Python\python.exe", ticks=200,
+    )
+    kill_switch = store.dir / "supervisor.kill"
+    monkeypatch.setattr(
+        lifecycle, "_read_valid_selection_locked", lambda store: selected,
+    )
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
+    monkeypatch.setattr(lifecycle, "_require_process_active", lambda observed: None)
+    monkeypatch.setattr(psh, "native_file_identity", lambda path: host.identity)
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match=r"supervisor\.kill is present",
+    ):
+        lifecycle.claim_powershell_supervisor(
+            store,
+            pid=host.pid,
+            pid_start=host.creation_token,
+            validate_artifacts=lambda: kill_switch.write_text(
+                "appeared-after-precheck",
+                encoding="utf-8",
+            ),
+        )
+
+    assert kill_switch.exists()
+    assert not store.supervisor_instance_path().exists()
+
+
 def test_claim_revalidates_image_identity_after_config_lock_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

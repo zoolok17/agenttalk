@@ -516,6 +516,80 @@ def test_invalid_observation_cannot_hold_supervisor_after_switch_is_absent(
     assert status["kill_switch"]["warnings"]
 
 
+def test_status_warns_on_oversized_runtime_epoch(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["kill_switch"]["observations"]["startup"]["observed_at_epoch"] = 10**400
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert _run(["status", "--json"], tmp_path) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    projected = payload["supervisor_runtime"]["kill_switch"]
+    assert projected["observed"] is False
+    assert any(
+        "observed_at_epoch must be a finite epoch" in warning
+        for warning in projected["warnings"]
+    )
+
+
+def test_status_warns_on_runtime_integer_beyond_json_conversion_limit(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    s = _team(tmp_path)
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"epoch":' + ("1" * 5000) + "}", encoding="utf-8")
+
+    assert _run(["status", "--json"], tmp_path) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    warnings = payload["supervisor_runtime"]["kill_switch"]["warnings"]
+    assert any(
+        "runtime observation is malformed: ValueError" in warning
+        for warning in warnings
+    )
+
+
+def test_runtime_reader_warns_when_json_nesting_exceeds_decoder_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}", encoding="utf-8")
+
+    def reject_nesting(raw: str) -> object:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(runtime_control.json, "loads", reject_nesting)
+
+    record, warnings = runtime_control.read_runtime_observation(s)
+
+    assert record is None
+    assert any(
+        "runtime observation is malformed: RecursionError" in warning
+        for warning in warnings
+    )
+
+
 # ---- snapshot-model fixtures (the 8-state classifier reads a process snapshot) ----
 BRAIN_PID, LAUNCHER_PID, WAIT_PID = 200, 199, 400
 

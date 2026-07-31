@@ -56,13 +56,17 @@ def _utc_text(epoch: float) -> str:
 
 
 def _require_epoch(value: object, field: str) -> float:
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(float(value))
-    ):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise SupervisorRuntimeObservationError(f"{field} must be a finite epoch")
-    return float(value)
+    try:
+        epoch = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise SupervisorRuntimeObservationError(
+            f"{field} must be a finite epoch"
+        ) from exc
+    if not math.isfinite(epoch):
+        raise SupervisorRuntimeObservationError(f"{field} must be a finite epoch")
+    return epoch
 
 
 def _require_timestamp(value: object, field: str) -> str:
@@ -208,7 +212,7 @@ def _read_strict(store: Store) -> dict | None:
         raise SupervisorRuntimeObservationError("runtime observation exceeds its size cap")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, RecursionError, ValueError) as exc:
         raise SupervisorRuntimeObservationError(
             f"runtime observation is malformed: {type(exc).__name__}"
         ) from exc
