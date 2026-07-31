@@ -4791,26 +4791,31 @@ def test_stop_tree_rejects_rounded_start_collision_by_exact_filetime(
         helpers,
         "$script:roundedStart = '2026-07-04T07:20:31.5767870+00:00'",
         "$script:liveTicks = [long]133960872315767870",
-        "$script:liveProcess = [pscustomobject]@{ Id = 4321; "
-        "StartTime = [datetime]::FromFileTimeUtc($script:liveTicks); Marker = 'live' }",
-        "$script:stops = @()",
+        "$script:stops = @(); $script:closed = @()",
         "function Proc-Start { param($procId) return $script:roundedStart }",
-        "function Get-Process { param($Id, $ErrorAction) return $script:liveProcess }",
-        "function Stop-Process { param($Id, $InputObject, [switch]$Force, $ErrorAction); "
-        "$script:stops += [pscustomobject]@{ id = $Id; "
-        "via_input = ($null -ne $InputObject); marker = $InputObject.Marker } }",
-        "$wrong = @(@{ pid = 4321; start = $script:roundedStart; "
+        "function Open-AgenttalkProcessHandle { param($procId); "
+        "return ('handle-' + [string]$procId) }",
+        "function Get-AgenttalkProcessHandleStartFiletime { param($handle); "
+        "return $script:liveTicks.ToString("
+        "[Globalization.CultureInfo]::InvariantCulture) }",
+        "function Stop-AgenttalkProcessHandle { param($handle); "
+        "$script:stops += $handle; return $true }",
+        "function Close-AgenttalkProcessHandle { param($handle); "
+        "$script:closed += $handle }",
+        "$wrong = @(@{ pid = 4321; source = 'owned_process_tree'; "
+        "start = $script:roundedStart; "
         "start_filetime = ([long]($script:liveTicks + 10)).ToString("
         "[Globalization.CultureInfo]::InvariantCulture) })",
         "Stop-Tree $wrong",
         "$mismatchStops = $script:stops.Count",
-        "$right = @(@{ pid = 4321; start = $script:roundedStart; "
+        "$right = @(@{ pid = 4321; source = 'owned_process_tree'; "
+        "start = $script:roundedStart; "
         "start_filetime = $script:liveTicks.ToString("
         "[Globalization.CultureInfo]::InvariantCulture) })",
         "Stop-Tree $right",
         "@{ mismatch_stops = $mismatchStops; total_stops = $script:stops.Count; "
-        "via_input = [bool]$script:stops[-1].via_input; "
-        "marker = $script:stops[-1].marker } | ConvertTo-Json | "
+        "stopped_handle = $script:stops[-1]; "
+        "closed_handles = $script:closed } | ConvertTo-Json -Depth 4 | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
     hp = tmp_path / "stop-tree-exact-filetime.ps1"
@@ -4827,8 +4832,69 @@ def test_stop_tree_rejects_rounded_start_collision_by_exact_filetime(
     assert json.loads(out.read_text(encoding="utf-8-sig")) == {
         "mismatch_stops": 0,
         "total_stops": 1,
-        "via_input": True,
-        "marker": "live",
+        "stopped_handle": "handle-4321",
+        "closed_handles": ["handle-4321", "handle-4321"],
+    }
+
+
+def test_stop_tree_verifies_and_terminates_through_one_native_handle(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "stop-tree-native-handle.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        "$script:ticks = '133960872315767870'",
+        "$script:opened = @(); $script:verified = @(); "
+        "$script:terminated = @(); $script:closed = @(); "
+        "$script:stopProcessCalls = 0",
+        "function Proc-Start { param($procId) return "
+        "'2026-07-04T07:20:31.5767870+00:00' }",
+        "function Open-AgenttalkProcessHandle { param($procId); "
+        "$h = 'handle-' + [string]$procId; $script:opened += $h; return $h }",
+        "function Get-AgenttalkProcessHandleStartFiletime { param($handle); "
+        "$script:verified += $handle; return $script:ticks }",
+        "function Stop-AgenttalkProcessHandle { param($handle); "
+        "$script:terminated += $handle; return $true }",
+        "function Close-AgenttalkProcessHandle { param($handle); "
+        "$script:closed += $handle }",
+        "function Get-Process { param($Id, $ErrorAction); "
+        "return [pscustomobject]@{ Id = $Id; "
+        "StartTime = [datetime]::FromFileTimeUtc([long]$script:ticks) } }",
+        "function Stop-Process { param($Id, $InputObject, [switch]$Force, "
+        "$ErrorAction); $script:stopProcessCalls++ }",
+        "$target = @(@{ pid = 4321; source = 'owned_process_tree'; "
+        "start = '2026-07-04T07:20:31.5767870+00:00'; "
+        "start_filetime = $script:ticks })",
+        "Stop-Tree $target",
+        "@{ opened = $script:opened; verified = $script:verified; "
+        "terminated = $script:terminated; closed = $script:closed; "
+        "stop_process_calls = $script:stopProcessCalls } | "
+        "ConvertTo-Json -Depth 4 | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    hp = tmp_path / "stop-tree-native-handle.ps1"
+    hp.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(hp)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "opened": ["handle-4321"],
+        "verified": ["handle-4321"],
+        "terminated": ["handle-4321"],
+        "closed": ["handle-4321"],
+        "stop_process_calls": 0,
     }
 
 
@@ -7948,6 +8014,29 @@ def test_owned_process_tree_kill_targets_retain_exact_start_filetime() -> None:
         target["start_filetime"] == entries[target["pid"]]["start_filetime"]
         for target in plan["kill_targets"]
     )
+
+
+def test_owned_process_tree_holds_when_windows_filetime_is_unavailable() -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            WRAP_LAUNCHER_PID,
+            "codex.exe",
+            "codex exec --json",
+            WRAP_CHILD_START,
+        ),
+        _proc(302, WRAP_CHILD_PID, "node.exe", "node tool.js", _ps_iso(700000)),
+    ]
+    snapshot[-1]["start_filetime"] = None
+
+    plan = _owned_tree_plan(snapshot, request_id="rr-missing-exact-filetime")
+
+    assert plan["next_state"]["owned_process_tree"]["status"] == "invalid"
+    assert plan["next_state"]["owned_process_tree"]["reason_code"] == (
+        "process_tree_invalid_exact_start_filetime_unavailable"
+    )
+    assert plan["kill_targets"] == []
 
 
 def test_owned_process_tree_reserves_detached_gate_runner_without_name_inference() -> None:

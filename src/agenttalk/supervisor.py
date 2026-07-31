@@ -2788,6 +2788,7 @@ def _owned_process_tree(
         nonlocal invalid_reason
         pid = row.get("pid")
         start = _start_of(row)
+        start_key = _start_order_key(start)
         start_filetime = _filetime_of(row)
         parent_pid = row.get("parent_pid")
         if (
@@ -2799,10 +2800,19 @@ def _owned_process_tree(
             or parent_pid < 0
             or not isinstance(start, str)
             or not start
-            or _start_order_key(start) is None
+            or start_key is None
         ):
             invalid_reason = invalid_reason or "invalid_process_row"
             return False
+        if start_key[0] == "iso" and start_filetime is None:
+            # Windows' CIM timestamp is rounded. It can identify graph edges,
+            # but it cannot authorize a destructive action after planning.
+            # A live Windows row without the exact kernel FILETIME therefore
+            # invalidates the whole owned tree rather than producing a target
+            # that can only be guarded by the rounded timestamp.
+            invalid_reason = (
+                invalid_reason or "exact_start_filetime_unavailable"
+            )
         existing = owned.get(pid)
         if existing is not None:
             if (
@@ -8496,6 +8506,63 @@ function Quote-Arg([string]$a) {
 }
 # endregion quote-arg
 # region exec-helpers  (extracted verbatim by the test harness with kill-switch stubs)
+if (-not ('AgenttalkSupervisorNativeV1' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class AgenttalkSupervisorNativeV1 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(
+        UInt32 desiredAccess, bool inheritHandle, UInt32 processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetProcessTimes(
+        IntPtr processHandle, out long creationTime, out long exitTime,
+        out long kernelTime, out long userTime);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool TerminateProcess(
+        IntPtr processHandle, UInt32 exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseHandle(IntPtr handle);
+}
+'@
+}
+function Open-AgenttalkProcessHandle($procId) {
+  if (-not $procId) { return $null }
+  # PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION. The one returned
+  # handle is both the identity certificate and the destructive capability.
+  $handle = [AgenttalkSupervisorNativeV1]::OpenProcess(
+    [uint32]0x1001, $false, [uint32]$procId)
+  if ($handle -eq [IntPtr]::Zero) { return $null }
+  return $handle
+}
+function Get-AgenttalkProcessHandleStartFiletime($handle) {
+  if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $null }
+  [long]$creation = 0
+  [long]$exit = 0
+  [long]$kernel = 0
+  [long]$user = 0
+  if (-not [AgenttalkSupervisorNativeV1]::GetProcessTimes(
+      $handle, [ref]$creation, [ref]$exit, [ref]$kernel, [ref]$user)) {
+    return $null
+  }
+  return $creation.ToString([Globalization.CultureInfo]::InvariantCulture)
+}
+function Stop-AgenttalkProcessHandle($handle) {
+  if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $false }
+  return [AgenttalkSupervisorNativeV1]::TerminateProcess($handle, [uint32]1)
+}
+function Close-AgenttalkProcessHandle($handle) {
+  if ($null -ne $handle -and $handle -ne [IntPtr]::Zero) {
+    [void][AgenttalkSupervisorNativeV1]::CloseHandle($handle)
+  }
+}
 function Proc-Start($procId) {
   # The live start-time of a pid in the SAME ISO format Get-ProcSnapshot emits,
   # so recorded start-times compare exactly (anti-pid-reuse). $null if gone.
@@ -8578,26 +8645,34 @@ function Stop-Tree($targets) {
   foreach ($t in $arr) {
     if (-not $t.pid) { continue }
     if (-not $t.start) { continue }
+    $exact = [string]$t.start_filetime
+    if ($exact) {
+      # The CIM timestamp is rounded. Verify the kernel FILETIME and terminate
+      # through ONE native handle, so PID reuse cannot occur between the check
+      # and the destructive action.
+      $processHandle = $null
+      try {
+        $processHandle = Open-AgenttalkProcessHandle ([int]$t.pid)
+        if ($null -eq $processHandle) { continue }
+        $liveFiletime = Get-AgenttalkProcessHandleStartFiletime $processHandle
+        if ($null -eq $liveFiletime -or $liveFiletime -ne $exact) { continue }
+        [void](Stop-AgenttalkProcessHandle $processHandle)
+      } catch {
+      } finally {
+        if ($null -ne $processHandle) {
+          Close-AgenttalkProcessHandle $processHandle
+        }
+      }
+      continue
+    }
+    # New owned-tree targets must always carry exact Windows identity. Refuse
+    # any malformed/drifted target even if the Python planner was bypassed.
+    if ([string]$t.source -eq 'owned_process_tree') { continue }
+    # Legacy persisted targets have no exact FILETIME. Retain their existing
+    # rounded-start guard rather than silently making them unkillable.
     $live = Proc-Start $t.pid
     if ($null -eq $live) { continue }                 # already gone
     if ($live -ne $t.start) { continue }              # pid reused - DO NOT kill
-    $exact = [string]$t.start_filetime
-    if ($exact) {
-      # The CIM-rendered timestamp above is rounded. When the planner retained
-      # an exact FILETIME, bind the destructive action to one live process
-      # object and verify that exact identity before killing through the same
-      # object. A rounded collision therefore grants no kill authority.
-      try {
-        $liveProcess = Get-Process -Id ([int]$t.pid) -ErrorAction Stop
-        $liveFiletime = ([datetimeoffset]$liveProcess.StartTime).UtcDateTime.ToFileTimeUtc().ToString(
-          [Globalization.CultureInfo]::InvariantCulture)
-        if ($liveFiletime -ne $exact) { continue }
-        Stop-Process -InputObject $liveProcess -Force -ErrorAction SilentlyContinue
-      } catch {}
-      continue
-    }
-    # Legacy persisted targets have no exact FILETIME. Retain their existing
-    # rounded-start guard rather than silently making them unkillable.
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
