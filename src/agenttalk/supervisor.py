@@ -6867,6 +6867,32 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
         '',
         (New-Object Text.UTF8Encoding($false))
       )
+      try {
+        # The generation NAME is still wall-clock-derived (for human
+        # readability), but pruning must not rely on it as the sole age key -
+        # an operator-corrected clock can make an old launch look permanently
+        # newest. Stamp a monotonic per-agent launch sequence alongside it;
+        # a failure here is best-effort and falls back to name-only ordering
+        # for this one generation in Complete-WrapperLogTargets.
+        $seqPath = Join-Path $agentDir '.sequence-counter'
+        $seq = 0L
+        if (Test-Path -LiteralPath $seqPath) {
+          $seq = [int64]([IO.File]::ReadAllText($seqPath).Trim())
+        }
+        $seq = $seq + 1L
+        [IO.File]::WriteAllText(
+          $seqPath, [string]$seq, (New-Object Text.UTF8Encoding($false))
+        )
+        [IO.File]::WriteAllText(
+          (Join-Path $attempt '.sequence'),
+          [string]$seq,
+          (New-Object Text.UTF8Encoding($false))
+        )
+      } catch {
+        Write-Warning (
+          "supervisor: cannot record wrapper log launch sequence under '{0}' ({1})" -f
+          $agentDir, $_.Exception.Message)
+      }
       $generationDir = $attempt
       break
     } catch {
@@ -6946,7 +6972,25 @@ function Complete-WrapperLogTargets($targets) {
             $old.FullName)
           continue
         }
-        $owned += [pscustomobject]@{ item = $old }
+        # Prefer the monotonic launch sequence recorded at creation time over
+        # the wall-clock name: a backward clock correction must not make a
+        # stale generation look permanently newest. A missing/corrupt record
+        # (pre-upgrade generations never wrote one) falls back to the name -
+        # it never blocks pruning, it only loses skew-safety for that one
+        # legacy entry.
+        $sortKey = '0-' + $old.Name
+        $seqFile = Join-Path $old.FullName '.sequence'
+        if (Test-Path -LiteralPath $seqFile) {
+          try {
+            $seqValue = [int64]([IO.File]::ReadAllText($seqFile).Trim())
+            $sortKey = '1-' + $seqValue.ToString('D20')
+          } catch {
+            Write-Warning (
+              "supervisor: unreadable wrapper log launch sequence '{0}' ({1})" -f
+              $seqFile, $_.Exception.Message)
+          }
+        }
+        $owned += [pscustomobject]@{ item = $old; sort_key = $sortKey }
       }
     } catch {
       Write-Warning (
@@ -6963,7 +7007,7 @@ function Complete-WrapperLogTargets($targets) {
         Where-Object {
           [IO.Path]::GetFullPath($_.item.FullName) -ne $generationDir
         } |
-        Sort-Object { $_.item.Name } -Descending |
+        Sort-Object { $_.sort_key } -Descending |
         Select-Object -First $keepPrior |
         ForEach-Object { [IO.Path]::GetFullPath($_.item.FullName) }
     )

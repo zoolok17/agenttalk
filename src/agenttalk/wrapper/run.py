@@ -1688,11 +1688,15 @@ class _ProcStream:
                     # result or allowing the next turn to start.
                     self._watchdog.join()
                     self.watchdog_result = self._watchdog.result
-            # After returncode is finalized (every branch above sets it) and any
-            # watchdog kill pass has finished either way - a diagnostic sink must
-            # never race the authoritative watchdog/abort handling above it, and
-            # must never change the child result or strand its cleanup.
-            if self._on_exit is not None:
+            # After returncode is finalized (when the double-exception fallback
+            # above did not leave it None) and any watchdog kill pass has
+            # finished either way - a diagnostic sink must never race the
+            # authoritative watchdog/abort handling above it, and must never
+            # change the child result or strand its cleanup. A None returncode
+            # means the exit was never actually confirmed - reporting it as one
+            # would assert a fact we do not have, so skip the callback instead
+            # of inventing a synthetic exit code.
+            if self._on_exit is not None and self.returncode is not None:
                 try:
                     self._on_exit(self.pid, self.pid_start, self.returncode)
                 except Exception as exc:

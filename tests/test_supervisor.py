@@ -4961,6 +4961,68 @@ def test_ps_wrapper_log_targets_preserve_output_and_prune_old_generations(
     assert "ACTUAL-STDOUT" in payload["preserved"]
 
 
+def test_ps_wrapper_log_prune_survives_backward_clock_correction(
+    tmp_path: Path,
+) -> None:
+    """Finding 3 (PR 98 connector re-review, head 2297ce10): pruning must not
+    trust the wall-clock generation name as the sole age key. G1 is renamed to
+    a deceptive far-future name (simulating a generation created while the
+    clock was skewed ahead) but keeps its true (oldest) launch sequence; G2 is
+    created afterwards with a real, "older-looking" name but is genuinely the
+    newer launch. Once a third generation forces a prune, G2 - not the
+    deceptively-named G1 - must be the one retained."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    log_root = tmp_path / "wrapper logs"
+    result_path = tmp_path / "clock-skew-retention.json"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(log_root))}",
+        "$WrapperLogGenerations = 2",
+        helpers,
+        "$g1 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "Complete-WrapperLogTargets $g1",
+        "$g1Dir = $g1.generation_dir",
+        "$g1Parent = Split-Path $g1Dir -Parent",
+        "$futureName = '22991231T235959000Z-' + ('f' * 32)",
+        "$g1Future = Join-Path $g1Parent $futureName",
+        "Move-Item -LiteralPath $g1Dir -Destination $g1Future",
+        "$g2 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "Complete-WrapperLogTargets $g2",
+        "$g2Dir = $g2.generation_dir",
+        "$g3 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "Complete-WrapperLogTargets $g3",
+        "$g3Dir = $g3.generation_dir",
+        "@{ future_exists = (Test-Path -LiteralPath $g1Future); "
+        "g2_exists = (Test-Path -LiteralPath $g2Dir); "
+        "g3_exists = (Test-Path -LiteralPath $g3Dir) } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "clock-skew-retention.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "future_exists": False,
+        "g2_exists": True,
+        "g3_exists": True,
+    }
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
 def test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker(
     tmp_path: Path,

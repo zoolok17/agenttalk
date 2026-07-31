@@ -13,6 +13,7 @@ wrapper process and proves both recovery and the old no-wake failure direction.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import multiprocessing
 import os
@@ -738,6 +739,77 @@ def test_proc_stream_watchdog_enabled_consumer_close_is_bounded() -> None:
     assert not closer.is_alive()
     assert close_errors == []
     assert stream.returncode is not None
+
+
+def test_proc_stream_aborted_consumption_never_reports_unconfirmed_exit() -> None:
+    """Finding 2 (PR 98 connector re-review, head 2297ce10): when consumption is
+    aborted and the child never confirms its exit (wait keeps timing out, poll
+    keeps reporting alive), the double-exception fallback used to leave
+    ``self.returncode`` at None and still fire the ``child_exited`` callback -
+    asserting an exit that was never observed."""
+    from agenttalk import wrapper_logs
+
+    stream = run._ProcStream(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "while True:\n print('output', flush=True)",
+        ],
+        None,
+        watchdog=TurnWatchdogConfig(
+            enabled=True,
+            turn_elapsed_seconds=30.0,
+            poll_seconds=1.0,
+        ),
+        watchdog_snapshot_fn=lambda: None,
+    )
+    log_stream = io.StringIO()
+    lifecycle = wrapper_logs.WrapperLifecycleLog(
+        "worker", stream=log_stream, clock=lambda: 1_800_000_000.0
+    )
+    stream._on_exit = lifecycle.child_exited
+    real_wait = stream._proc.wait
+    real_kill = stream._proc.kill
+
+    def never_confirms_exit(timeout=None):
+        raise subprocess.TimeoutExpired("child", timeout or 0.0)
+
+    iterator = iter(stream)
+    assert next(iterator) == "output\n"
+    stream._proc.wait = never_confirms_exit
+    stream._proc.kill = lambda: None
+    stream._proc.poll = lambda: None
+
+    close_done = threading.Event()
+    close_errors: list[BaseException] = []
+
+    def close_owner() -> None:
+        try:
+            iterator.close()
+        except BaseException as exc:  # noqa: BLE001 - report cleanup failures on test thread
+            close_errors.append(exc)
+        finally:
+            close_done.set()
+
+    closer = threading.Thread(target=close_owner, daemon=True)
+    closer.start()
+    try:
+        assert close_done.wait(5.0), "aborted consumer cleanup wedged"
+    finally:
+        stream._proc.wait = real_wait
+        stream._proc.kill = real_kill
+        real_kill()
+        real_wait(timeout=5.0)
+        closer.join(5.0)
+
+    assert close_errors == []
+    assert stream.returncode is None
+    events = [
+        json.loads(line)["event"]
+        for line in log_stream.getvalue().splitlines()
+    ]
+    assert "child_exited" not in events
 
 
 class _ObservedWatchdogProcStream(run._ProcStream):

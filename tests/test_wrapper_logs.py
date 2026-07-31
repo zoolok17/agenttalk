@@ -444,13 +444,16 @@ def test_cmd_wrap_records_setup_exception_before_loop_exists(
     with pytest.raises(RuntimeError, match="setup failed"):
         cli.cmd_wrap(args)
 
-    rows = [
-        json.loads(line)
-        for path in tmp_path.glob("stderr.log*")
-        for line in path.read_text(encoding="utf-8").splitlines()
-    ]
+    tail = "".join(
+        path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
+    )
+    rows = [json.loads(line) for line in tail.splitlines() if line.startswith("{")]
     assert [row["event"] for row in rows] == ["wrapper_exception"]
     assert rows[0]["exception_type"] == "RuntimeError"
+    # The traceback itself must also survive - it is captured through the
+    # bounded stream before cmd_wrap's context manager restores raw streams.
+    assert "setup failed before run_loop" in tail
+    assert "Traceback (most recent call last)" in tail
 
 
 def test_cmd_wrap_entry_bounds_python_level_wrapper_output(
@@ -488,6 +491,48 @@ def test_cmd_wrap_entry_bounds_python_level_wrapper_output(
     assert "FINAL-SENTINEL" in "".join(
         path.read_text(encoding="utf-8") for path in files
     )
+
+
+def test_cmd_wrap_uncaught_exception_traceback_is_bounded_and_in_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_path = tmp_path / "stdout.log"
+    err_path = tmp_path / "stderr.log"
+    out_path.write_text("", encoding="utf-8")
+    err_path.write_text("E" * 1024, encoding="utf-8")
+    nonce = "d" * 32
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
+    monkeypatch.setenv(wrapper_logs.ENV_MAX_BYTES, "4096")
+    monkeypatch.setenv(wrapper_logs.ENV_SEGMENT_COUNT, "4")
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+
+    def blow_up(_args: argparse.Namespace) -> int:
+        import sys
+
+        # The initial segment is already full; more chatter before the crash
+        # forces several rotations, so the eventual traceback lands in a
+        # tail segment rather than the (already-evicted) first one.
+        sys.stderr.write("x" * 20_000)
+        raise RuntimeError("TRACEBACK-SENTINEL-BOOM")
+
+    monkeypatch.setattr(cli, "_cmd_wrap_with_logging", blow_up)
+    args = argparse.Namespace(agent="worker", supervisor_launch_nonce=nonce)
+
+    with pytest.raises(RuntimeError, match="TRACEBACK-SENTINEL-BOOM"):
+        cli.cmd_wrap(args)
+
+    files = sorted(tmp_path.glob("stderr.log*"))
+    assert all(path.stat().st_size <= 1024 for path in files)
+    assert sum(path.stat().st_size for path in files) <= 4096
+    tail = "".join(
+        path.read_text(encoding="utf-8", errors="replace") for path in files
+    )
+    assert "TRACEBACK-SENTINEL-BOOM" in tail
+    assert "Traceback (most recent call last)" in tail
 
 
 def test_cmd_wrap_records_terminating_signal_without_exception_duplicate(

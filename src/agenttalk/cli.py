@@ -15,6 +15,7 @@ import stat
 import subprocess  # nosec B404
 import sys
 import time
+import traceback
 import unicodedata
 import uuid
 import webbrowser
@@ -10613,6 +10614,15 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         except BaseException as exc:
             if not lifecycle_log.terminal_emitted:
                 lifecycle_log.wrapper_exception(exc)
+                # Print the traceback here, while sys.stderr is still the
+                # bounded tee installed above - the "finally" of that context
+                # manager restores the raw stream before this exception
+                # reaches whatever eventually reports it, which would
+                # otherwise let the one diagnostic anyone actually wants
+                # bypass the cap and the tail rotation #117 exists to
+                # provide. Skipped when a signal already reported the
+                # termination - that is an intentional exit, not a crash.
+                traceback.print_exc(file=sys.stderr)
             raise
         finally:
             del args._wrapper_lifecycle_log
