@@ -6820,6 +6820,45 @@ function Protect-WrapperLogPaths(
     return $false
   }
 }
+function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
+  # The generation NAME is still wall-clock-derived (for human readability),
+  # but pruning must not rely on it as the sole age key - an operator-
+  # corrected clock can make an old launch look permanently newest. A launch
+  # sequence fixes that, but ONLY if it is a global ordering key: a counter
+  # scoped to whichever root happened to accept THIS launch is not global -
+  # a persistent root reaching a high count and then going unavailable would
+  # let a fallback root's fresh, low count look oldest even though its
+  # launches are the genuinely newer ones. Scanning every configured root's
+  # existing generations for their recorded sequence, every time, makes the
+  # next value correct regardless of which root ends up accepting it - and a
+  # root that is unreadable this launch just contributes nothing to the max
+  # rather than failing the launch; it self-heals once reachable again.
+  $seq = 0L
+  foreach ($scanRoot in $roots) {
+    try {
+      $scanAgentDir = Get-SafeWrapperLogAgentDir $scanRoot $name $false
+      if ($null -eq $scanAgentDir) { continue }
+      foreach ($existing in @(
+        Get-ChildItem -LiteralPath $scanAgentDir -Directory -ErrorAction Stop
+      )) {
+        $seqFile = Join-Path $existing.FullName '.sequence'
+        if (-not (Test-Path -LiteralPath $seqFile)) { continue }
+        try {
+          $existingSeq = [int64]([IO.File]::ReadAllText($seqFile).Trim())
+          if ($existingSeq -gt $seq) { $seq = $existingSeq }
+        } catch {
+          # Corrupt/unreadable record does not veto this generation's own
+          # sequence; it just cannot contribute to the max.
+        }
+      }
+    } catch {
+      Write-Warning (
+        "supervisor: cannot scan wrapper log root '{0}' for launch sequence ({1})" -f
+        $scanRoot, $_.Exception.Message)
+    }
+  }
+  return $seq + 1L
+}
 function New-WrapperLogTargets([string]$name, [string]$nonce) {
   # Agent names are already roster-validated. Re-check here because these paths
   # are later used by bounded cleanup; never let a config string select a parent.
@@ -6843,6 +6882,10 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
   $roots = @($WrapperLogRoot, $WrapperLogFallbackRoot) |
     Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
     Select-Object -Unique
+  # Computed ONCE, across every configured root, before the create attempts
+  # below - so the recorded sequence reflects true global launch order no
+  # matter which candidate root ends up accepting this generation.
+  $seq = Get-NextWrapperLogSequence $roots $name
 
   # Create the immutable destination before pruning any prior evidence. If the
   # persistent root cannot accept it, no old persistent evidence is removed
@@ -6868,21 +6911,6 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
         (New-Object Text.UTF8Encoding($false))
       )
       try {
-        # The generation NAME is still wall-clock-derived (for human
-        # readability), but pruning must not rely on it as the sole age key -
-        # an operator-corrected clock can make an old launch look permanently
-        # newest. Stamp a monotonic per-agent launch sequence alongside it;
-        # a failure here is best-effort and falls back to name-only ordering
-        # for this one generation in Complete-WrapperLogTargets.
-        $seqPath = Join-Path $agentDir '.sequence-counter'
-        $seq = 0L
-        if (Test-Path -LiteralPath $seqPath) {
-          $seq = [int64]([IO.File]::ReadAllText($seqPath).Trim())
-        }
-        $seq = $seq + 1L
-        [IO.File]::WriteAllText(
-          $seqPath, [string]$seq, (New-Object Text.UTF8Encoding($false))
-        )
         [IO.File]::WriteAllText(
           (Join-Path $attempt '.sequence'),
           [string]$seq,

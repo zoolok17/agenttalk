@@ -117,6 +117,34 @@ def test_bounded_stream_tee_keeps_each_file_and_generation_within_cap(
     )
 
 
+def test_bounded_stream_tee_newline_heavy_stream_stays_within_cap_on_disk(
+    tmp_path: Path,
+) -> None:
+    """Finding B (PR 98 connector re-review, head 4323e20): the budget must be
+    measured against what actually lands on disk, not the pre-translation
+    UTF-8 length. A REAL text-mode file (unlike io.StringIO, used elsewhere in
+    this file) applies the platform's newline translation on write - on
+    Windows each accounted "\\n" becomes two bytes ("\\r\\n") on disk, so a
+    newline-heavy stream could blow the per-file cap by nearly 2x while the
+    accounting still believed it was exactly at the cap."""
+    original_path = tmp_path / "original-stdout.txt"
+    original = original_path.open("w", encoding="utf-8", newline=None)
+    base = tmp_path / "stdout.log"
+    tee = wrapper_logs.BoundedStreamTee(
+        original,
+        base,
+        max_bytes=4096,
+        segment_count=4,
+    )
+
+    tee.write("x\n" * 3000)
+    tee.flush()
+    tee.close()
+    original.close()
+
+    assert original_path.stat().st_size <= tee.segment_bytes
+
+
 def test_bounded_stream_tee_failure_discards_excess_without_breaking_wrapper(
     tmp_path: Path,
 ) -> None:

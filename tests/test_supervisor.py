@@ -5024,6 +5024,75 @@ def test_ps_wrapper_log_prune_survives_backward_clock_correction(
     }
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL-based write denial")
+def test_ps_wrapper_log_sequence_survives_failover_to_fallback_root(
+    tmp_path: Path,
+) -> None:
+    """Finding A (PR 98 connector re-review, head 4323e20): the previous
+    round's launch-sequence fix computed its counter per-root, which is not a
+    global ordering key either - the exact defect class it was meant to fix,
+    surviving in a narrower window. Primary is built up to sequence 3, then
+    write access to its agent dir is denied (its history stays READABLE, only
+    new-generation creation fails) so the next launch must fail over to
+    fallback. That fallback generation must still record sequence 4, not
+    restart at 1."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    primary = tmp_path / "primary"
+    fallback = tmp_path / "fallback"
+    result_path = tmp_path / "sequence-failover.json"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(primary))}",
+        f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+        "$WrapperLogGenerations = 10",
+        helpers,
+        # Build primary's history up to sequence 3.
+        "1..3 | ForEach-Object {",
+        "  $t = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "  Complete-WrapperLogTargets $t",
+        "}",
+        f"$primaryAgentDir = Join-Path {_pslit(str(primary))} {_pslit(agent_leaf)}",
+        "$aclUser = \"$env:USERDOMAIN\\$env:USERNAME\"",
+        # Deny write access on primary's agent dir - existing generations stay
+        # readable (scanning for the global max must still see them), but
+        # creating a NEW generation there fails, forcing this launch onto the
+        # fallback root exactly like a real "root unavailable" condition.
+        "icacls $primaryAgentDir /deny \"${aclUser}:(AD,WD)\" | Out-Null",
+        "try {",
+        "  $t2 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "  Complete-WrapperLogTargets $t2",
+        "  $seqFile = Join-Path $t2.generation_dir '.sequence'",
+        "  @{ selected = $t2.generation_dir; "
+        "sequence = [IO.File]::ReadAllText($seqFile).Trim() } | "
+        f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        "} finally {",
+        "  icacls $primaryAgentDir /remove:d \"${aclUser}\" | Out-Null",
+        "}",
+    ]
+    script = tmp_path / "sequence-failover.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert Path(payload["selected"]).is_relative_to(fallback)
+    assert payload["sequence"] == "4"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
 def test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker(
     tmp_path: Path,

@@ -275,10 +275,23 @@ class BoundedStreamTee:
             prefix = _utf8_prefix(text, self._forward_remaining)
             if not prefix:
                 return
-            self._forward_remaining -= len(prefix.encode("utf-8", "replace"))
             text = prefix
+        encoded = text.encode("utf-8", "replace")
+        if bounded:
+            self._forward_remaining -= len(encoded)
         try:
-            self._original.write(text)
+            # Writing through self._original's own .write() would let its text
+            # mode translate "\n" to the platform line separator (CRLF on
+            # Windows) before it hits disk - the actual bytes written would
+            # then exceed the pre-translation length just budgeted above,
+            # letting a newline-heavy stream blow the cap by nearly 2x. Write
+            # the already-UTF-8-encoded bytes straight to the underlying
+            # buffer instead, so the accounted length is the written length.
+            buffer = getattr(self._original, "buffer", None)
+            if buffer is not None:
+                buffer.write(encoded)
+            else:
+                self._original.write(text)
         except (OSError, ValueError):
             pass
 
