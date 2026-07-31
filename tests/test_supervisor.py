@@ -517,6 +517,180 @@ def test_invalid_observation_cannot_hold_supervisor_after_switch_is_absent(
     assert status["kill_switch"]["warnings"]
 
 
+@pytest.mark.parametrize(
+    "invalid_record",
+    [
+        b"{broken",
+        json.dumps({
+            "schema_version": runtime_control.RUNTIME_OBSERVATION_SCHEMA + 1,
+        }).encode("utf-8"),
+    ],
+    ids=["malformed", "future-schema"],
+)
+def test_invalid_inactive_observation_is_preserved_and_activation_recovers(
+    tmp_path: Path,
+    monkeypatch,
+    invalid_record: bytes,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(invalid_record)
+
+    inactive = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="mid_poll",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    assert inactive == {"active": False, "changed": False, "observation": None}
+    assert path.read_bytes() == invalid_record
+
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    activated = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="mid_poll",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW + 1,
+        validate_artifacts=lambda: None,
+    )
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+    assert warnings == []
+    assert observed == activated["observation"]
+    assert observed is not None
+    assert observed["kill_switch"]["active"] is True
+    preserved = list(path.parent.glob(f"{path.name}.quarantine-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == invalid_record
+
+
+def test_invalid_active_observation_preservation_failure_keeps_original(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_record = b"{broken"
+    path.write_bytes(invalid_record)
+
+    def fail_preservation(source: object, destination: object) -> None:
+        del source, destination
+        raise PermissionError("preservation denied")
+
+    monkeypatch.setattr(runtime_control.os, "replace", fail_preservation)
+
+    with pytest.raises(
+        runtime_control.SupervisorRuntimeObservationError,
+        match="could not be preserved: PermissionError",
+    ):
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=NOW,
+            validate_artifacts=lambda: None,
+        )
+
+    assert path.read_bytes() == invalid_record
+    assert list(path.parent.glob(f"{path.name}.quarantine-*")) == []
+
+
+def test_active_unreadable_observation_stays_fail_closed_without_quarantine(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    preservation_attempted = False
+
+    def unreadable(store: Store) -> dict | None:
+        del store
+        raise runtime_control._RuntimeObservationUnreadableError("sharing violation")
+
+    def preserve(store: Store) -> None:
+        nonlocal preservation_attempted
+        del store
+        preservation_attempted = True
+
+    monkeypatch.setattr(runtime_control, "_read_strict", unreadable)
+    monkeypatch.setattr(runtime_control, "_preserve_invalid_observation", preserve)
+
+    with pytest.raises(
+        runtime_control.SupervisorRuntimeObservationError,
+        match="sharing violation",
+    ):
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=NOW,
+            validate_artifacts=lambda: None,
+        )
+
+    assert preservation_attempted is False
+
+
+def test_invalid_active_observation_write_failure_retries_from_preserved_copy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_record = b"{broken"
+    path.write_bytes(invalid_record)
+    real_write = runtime_control._atomic_write_text
+
+    def fail_write(destination: Path, text: str) -> None:
+        del destination, text
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runtime_control, "_atomic_write_text", fail_write)
+    with pytest.raises(OSError, match="disk full"):
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=NOW,
+            validate_artifacts=lambda: None,
+        )
+
+    assert not path.exists()
+    preserved = list(path.parent.glob(f"{path.name}.quarantine-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == invalid_record
+
+    monkeypatch.setattr(runtime_control, "_atomic_write_text", real_write)
+    recovered = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW + 1,
+        validate_artifacts=lambda: None,
+    )
+
+    assert recovered["changed"] is True
+    observed, warnings = runtime_control.read_runtime_observation(s)
+    assert warnings == []
+    assert observed == recovered["observation"]
+    assert preserved[0].read_bytes() == invalid_record
+
+
 def test_status_warns_on_oversized_runtime_epoch(
     tmp_path: Path,
     capsys,

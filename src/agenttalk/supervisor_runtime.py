@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import re
 import time
 import uuid
@@ -45,6 +46,10 @@ _PHASE_FIELDS = frozenset({
 
 class SupervisorRuntimeObservationError(RuntimeError):
     """A checked supervisor runtime observation could not be trusted or written."""
+
+
+class _RuntimeObservationUnreadableError(SupervisorRuntimeObservationError):
+    """The observation could not be inspected, so it must not be quarantined."""
 
 
 def runtime_observation_path(store: Store) -> Path:
@@ -262,7 +267,7 @@ def _read_strict(store: Store) -> dict | None:
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise SupervisorRuntimeObservationError(
+        raise _RuntimeObservationUnreadableError(
             f"runtime observation is unreadable: {type(exc).__name__}"
         ) from exc
     if len(raw) > RUNTIME_OBSERVATION_MAX_BYTES:
@@ -335,6 +340,25 @@ def _new_active_record(
     }
 
 
+def _preserve_invalid_observation(store: Store) -> None:
+    source = runtime_observation_path(store)
+    suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    preserved = source.with_name(
+        f"{source.name}.quarantine-{suffix}-{uuid.uuid4().hex}"
+    )
+    if os.path.lexists(preserved):
+        raise SupervisorRuntimeObservationError(
+            "invalid runtime observation quarantine already exists"
+        )
+    try:
+        os.replace(source, preserved)
+    except OSError as exc:
+        raise SupervisorRuntimeObservationError(
+            "invalid runtime observation could not be preserved: "
+            f"{type(exc).__name__}"
+        ) from exc
+
+
 def observe_powershell_kill_switch(
     store: Store,
     *,
@@ -385,12 +409,17 @@ def observe_powershell_kill_switch(
         )
         try:
             record = _read_strict(store)
-        except SupervisorRuntimeObservationError:
+        except SupervisorRuntimeObservationError as exc:
             # This sidecar is evidence, never authority.  Preserve malformed or
-            # future-schema bytes for diagnosis, but do not let them keep a
-            # supervisor disabled after the raw emergency switch is absent.
+            # future-schema bytes in place while inactive so status keeps the
+            # diagnostic visible.  Once the raw switch activates, move those
+            # exact bytes aside before publishing fresh trusted evidence.  An
+            # unreadable record may be transient and was never inspected, so it
+            # remains fail-closed rather than being mislabeled as corrupt.
             if active:
-                raise
+                if isinstance(exc, _RuntimeObservationUnreadableError):
+                    raise
+                _preserve_invalid_observation(store)
             record = None
         if active:
             if record is None or record["kill_switch"]["active"] is False:
