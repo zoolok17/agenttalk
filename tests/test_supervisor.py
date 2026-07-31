@@ -6145,11 +6145,16 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     ]
     assert data["unbuffered_undeclared"]["injected"] is False
     assert data["unbuffered_undeclared"]["missing_reason"] == "unsupported_launch_argv"
-    assert data["x_option_declared"]["injected"] is True
-    assert data["x_option_declared"]["argv"] == [
-        "-X", "utf8", "-m", "agenttalk", "--supervisor-launch-nonce",
-        SUPERVISOR_NONCE, "--root", "R", "wrap",
-    ]
+    # I2, FINAL gap: a bare/non-dash token in the declared prefix (here,
+    # -X's separate-token value "utf8") is CPython's third execution-mode
+    # dispatch too - a positional token makes CPython run it as a script
+    # and never reach -m, exactly like -c/-m do. It cannot be told apart
+    # from a genuine script-path hijack without re-solving "which flags
+    # consume a value" (round 4, deliberately not solved here), so it is
+    # refused. The attached form (x_attached_declared, below) is the
+    # supported way to declare a value-taking flag in the prefix.
+    assert data["x_option_declared"]["injected"] is False
+    assert data["x_option_declared"]["missing_reason"] == "unsupported_launch_argv"
     assert data["x_attached_declared"]["injected"] is True
     assert data["x_attached_declared"]["argv"] == [
         "-Xutf8", "-m", "agenttalk", "--supervisor-launch-nonce",
@@ -6165,15 +6170,13 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "-Z", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
         "--root", "R", "wrap",
     ]
-    # The exact new finding: an attached -c'...' command form. Under the old
-    # mechanism this needed to be RECOGNIZED as dangerous; under the new one
-    # it is simply whatever the operator declared lives before the
-    # module_args_from index - never interpreted, so there is nothing to miss.
-    assert data["attached_command_declared"]["injected"] is True
-    assert data["attached_command_declared"]["argv"] == [
-        "-cprint(1)", "-m", "agenttalk", "--supervisor-launch-nonce",
-        SUPERVISOR_NONCE, "--root", "R", "wrap",
-    ]
+    # I2, FINAL gap: declaring WHERE '-m agenttalk' sits proves the position,
+    # not that CPython ever reaches it. An attached -c'...' form in the
+    # declared prefix dispatches command-mode before scanning gets to the
+    # declared index, and the position check alone would still pass. The
+    # prefix must also contain no execution-mode token - this is refused.
+    assert data["attached_command_declared"]["injected"] is False
+    assert data["attached_command_declared"]["missing_reason"] == "unsupported_launch_argv"
     # A declared index that doesn't actually land on '-m agenttalk' (here,
     # out of range) still fails closed - the declaration is verified, not
     # blindly trusted.
@@ -6339,12 +6342,18 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
     # fix for `-u`/`-X utf8` was applied to Add-SupervisorLaunchNonce but not
     # to Test-AgenttalkWrapInvocation, so a valid `python -u -m agenttalk
     # wrap` config got a nonce but no bounded log generation at all -
-    # regular_unbuffered_wrap/regular_xoption_wrap drive that decision
-    # through the REAL Launch function, not just the nonce helper directly.
+    # regular_unbuffered_wrap drives that decision through the REAL Launch
+    # function, not just the nonce helper directly.
+    #
+    # I2, FINAL gap: regular_xoption_wrap's prefix ('-X','utf8', declared
+    # index 2) is now REFUSED, not logged - "utf8" is a bare/non-dash token,
+    # indistinguishable from a script-path execution-mode hijack without
+    # re-solving "which flags consume a value" (round 4, not solved here).
+    # See test_supervisor_launch_nonce_injection_powershell_helper's
+    # x_option_declared case for the same call.
     expected_logged = {
         "regular_python_wrap",
         "regular_unbuffered_wrap",
-        "regular_xoption_wrap",
         "ephemeral_python_wrap",
         "ephemeral_console_wrap",
     }

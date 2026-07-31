@@ -6138,8 +6138,32 @@ function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom 
   # named $args - PowerShell's automatic $args variable silently shadows a
   # same-named formal parameter, and the function then sees an empty list
   # regardless of what the caller passed.
+  #
+  # (I2, FINAL gap.) Declaring WHERE '-m agenttalk' sits proves the
+  # POSITION, not that CPython ever REACHES it: an execution-mode token in
+  # the declared prefix (`-c'print(1)'`, or a bare/positional token that
+  # CPython treats as a script path) dispatches before scanning gets to
+  # the declared index, and the position check above would still pass.
+  # Unlike "which flags are safe" (open-ended) or "which flags consume a
+  # value" (open-ended, and deliberately NOT solved here), "which tokens
+  # change execution mode" is closed: -c, -m (plus their attached forms,
+  # e.g. -cprint(1)), and a bare token that isn't itself a flag (CPython's
+  # third dispatch: run-this-as-a-script). This is a REJECT list, not an
+  # accept list - anything in the prefix that is not affirmatively a
+  # dash-prefixed, non-execution-mode flag token is refused, so an
+  # unrecognized/novel prefix shape fails closed rather than being
+  # silently accepted.
   $index = if ($null -ne $moduleArgsFrom) { [int]$moduleArgsFrom } else { 0 }
   if ($index -lt 0 -or $index -ge $argTokens.Count) { return -1 }
+  for ($p = 0; $p -lt $index; $p++) {
+    $prefixToken = [string]$argTokens[$p]
+    if ($prefixToken -eq '-m' -or $prefixToken.StartsWith('-m') -or
+        $prefixToken -eq '-c' -or $prefixToken.StartsWith('-c') -or
+        $prefixToken -eq '--' -or
+        -not $prefixToken.StartsWith('-')) {
+      return -1
+    }
+  }
   if ($index + 1 -lt $argTokens.Count -and
       [string]$argTokens[$index] -eq '-m' -and
       [string]$argTokens[$index + 1] -eq 'agenttalk') {
