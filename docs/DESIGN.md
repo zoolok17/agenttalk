@@ -919,6 +919,16 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   race; atomic task rebind/multi-binding migration and executable signer/ACL attestation
   are also outside this release.
 
+  **2026-07-31 authority correction:** selected-host/image ancestry is not proof
+  that `supervisor.ps1` made a runtime observation. A passing test on the held
+  #114 branch explicitly authorizes an arbitrary console harness, and a caller
+  can also invoke the generated shim manually with the public PID/start
+  locators. PR 107 is held pending the design-first authorization change in
+  [`DESIGN-supervisor-observation-authorization.md`](DESIGN-supervisor-observation-authorization.md).
+  That design treats direct and console ancestry as insufficient, binds the
+  live host to the canonical `-File supervisor.ps1` launch plus generated-shim
+  shape and artifact generation, and preserves the same-user trust ceiling.
+
 ## 6. How we work (process)
 
 - **Per-phase cadence:** architect designs → lead gates the design → builder
