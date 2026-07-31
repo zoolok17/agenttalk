@@ -11989,10 +11989,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                             args.request_id,
                         )
                         if pending is not None:
+                            # ``actor`` is authorized against the current
+                            # liaison configuration above. Do not require it
+                            # to equal the original acknowledger: a durable
+                            # retry must survive legitimate liaison turnover,
+                            # while the journal keeps the original audit fact.
                             if (
                                 pending["hold_source_hash"]
                                 != args.hold_source_hash
-                                or pending["acknowledged_by"] != actor
                                 or pending["reason"] != attended_reason
                                 or pending["verified_launch_nonce"]
                                 != args.verified_launch_nonce

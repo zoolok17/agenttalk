@@ -1172,6 +1172,62 @@ def test_cli_attended_ephemeral_archive_recovers_after_final_state_save_failure(
     ] == request_id
 
 
+def test_cli_attended_ephemeral_archive_recovery_allows_liaison_turnover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    args = [
+        "--root",
+        str(tmp_path),
+        "supervise",
+        "--reset-process-tree-ownership",
+        "--request-id",
+        request_id,
+        "--hold-source-hash",
+        source_hash,
+        "--acknowledge-no-live-supervisor",
+        "--acknowledge-owned-processes-stopped",
+        "--reason",
+        "operator verified the terminal request can be archived",
+        "--from",
+        "lead",
+        "--now",
+        str(NOW),
+    ]
+    real_save = sup.save_supervisor_state
+    save_calls = 0
+
+    def fail_final_save(path: Path, state: dict) -> None:
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise sup.SupervisorPersistenceError("injected final save failure")
+        real_save(path, state)
+
+    monkeypatch.setattr(sup, "save_supervisor_state", fail_final_save)
+
+    assert cli.main(args) == 3
+    assert agent in store.retired_agents()
+
+    monkeypatch.setattr(sup, "save_supervisor_state", real_save)
+    store.add_agent("newlead")
+    store.set_operator_facing("newlead")
+    retry_args = list(args)
+    retry_args[retry_args.index("--from") + 1] = "newlead"
+    retry_args[-1] = str(NOW + 1)
+
+    assert cli.main(retry_args) == 0
+    recovered = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    history = recovered["ephemeral_reviewers"]["attended_archive_history"]
+    assert history[-1]["acknowledged_by"] == "lead"
+    assert request_id not in recovered["ephemeral_reviewers"].get(
+        "attended_archive_pending", {}
+    )
+
+
 def test_invalid_review_result_stays_hold_and_janitor_retires_orphan(tmp_path: Path) -> None:
     s = _store(tmp_path)
     s.add_agent("adversary-lr-hold", role="reviewer", groups=["ephemeral-reviewers"])
