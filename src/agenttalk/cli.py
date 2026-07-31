@@ -9894,6 +9894,30 @@ def _dead_letter_notifier(store, agent: str):
                                  "dl_disposed": "false",
                                  "request_id": "esc-" + uuid.uuid4().hex[:12]})
                 return True
+            if info.get("failure_class") == "quota_blocked":
+                # #126: a quota park is NOT a dead-letter (nothing was dead-lettered,
+                # committed, or even disposed) and NEEDS no operator action - it
+                # self-heals on the provider's own reset instant. The generic
+                # dead-letter-notice branch below would otherwise send "repeatedly
+                # FAILING... Inspect: agenttalk dead-letter show" for a message that
+                # has no dead-letter entry at all (connector P2 on PR #104).
+                summary = str(info.get("summary") or "provider quota/billing refusal")
+                reset_at = info.get("reset_at")
+                until = f" until {reset_at}" if reset_at else " (reset time unknown)"
+                body = (
+                    f"[wrapper-quota-blocked] agent {ag} is PARKED on message {mid} "
+                    f"from {info.get('from')} (kind={info.get('kind')}). Cursor is "
+                    "unchanged; the message was NOT committed, dead-lettered, or "
+                    f"disposed - it is valid work waiting on the provider{until}. "
+                    f"{summary}. No operator action needed - this self-heals once the "
+                    "provider's reset instant passes (see `agenttalk doctor` / "
+                    "`agenttalk attention` for the live hold)."
+                )
+                store.send(sender=agent, recipient=target, kind="note",
+                           subject="wrapper quota-blocked", body=body,
+                           meta={"quota_blocked": "true", "dl_msg_id": str(mid),
+                                 "request_id": "esc-" + uuid.uuid4().hex[:12]})
+                return True
             state = A.dead_letter_notice_state(info, disposed=disposed)
             generation = str(
                 info.get("requeue_generation")

@@ -122,17 +122,29 @@ class WrapperHealthWriter:
         )
 
     def parked(self, record: dict[str, Any] | None, reason_code: str = "config_blocked") -> None:
-        """The loop is HOLDING a config-blocked head without driving it (deterministic local
-        exec/config denial - e.g. a held gateway, an exec-denied bus write). Surface it as a
-        distinct advisory state carrying the parked head's ids, so ``status``/``doctor`` show
-        the worker as blocked-on-a-message instead of a frozen last state (the health-freeze
-        that hid the wedge, #58). Not forced: the first park is a state change (written at once)
-        and repeats throttle, so a long park is one visible transition, not a write storm."""
+        """The loop is HOLDING a head without driving it. Surface it as a distinct advisory
+        state carrying the parked head's ids, so ``status``/``doctor`` show the worker as
+        blocked-on-a-message instead of a frozen last state (the health-freeze that hid the
+        wedge, #58). Not forced: the first park is a state change (written at once) and
+        repeats throttle, so a long park is one visible transition, not a write storm.
+
+        ``reason_code == "quota_blocked"`` (#126) writes STATE_RATE_LIMITED_OR_OUTAGE, never
+        errored: a provider quota/billing refusal is a pure billing condition, not a crashed
+        or deterministically-denied agent (config_blocked's own default). This re-asserts the
+        quota state on EVERY park cycle, including the first poll after a wrapper restart -
+        unlike gateway_held (which re-drives every poll and so re-writes health via a fresh
+        failed drive() naturally), a quota park explicitly does NOT re-drive, so nothing else
+        would refresh this health past the loop's own startup on_health_idle() reset."""
         record = record if isinstance(record, dict) else {}
         request_id = resolve_request_id(record)
         msg_id = record.get("id")
+        state = (
+            health_model.STATE_RATE_LIMITED_OR_OUTAGE
+            if reason_code == "quota_blocked"
+            else health_model.STATE_ERRORED_AMBIGUOUS
+        )
         self._write(
-            health_model.STATE_ERRORED_AMBIGUOUS,
+            state,
             reason_code=reason_code,
             request_id=request_id if isinstance(request_id, str) else None,
             msg_id=msg_id if isinstance(msg_id, str) else None,

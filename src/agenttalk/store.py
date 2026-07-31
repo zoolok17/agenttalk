@@ -5157,6 +5157,13 @@ class Store:
     # that instant, with no explicit clear required, so the wrapper naturally
     # re-drives and the operator surfaces naturally stop showing it.
 
+    # A refusal with no parseable reset instant (or one the parser rejected as
+    # implausible) must still eventually re-probe the provider - without this, an
+    # unknown-reset hold would return non-None FOREVER and permanently wedge the
+    # mailbox (connector P1 on PR #104: an "insufficient quota" refusal, or a
+    # rejected timestamp, has reset_at=None with no other expiry mechanism).
+    QUOTA_UNKNOWN_RESET_REPROBE_SECONDS = 1800.0
+
     def quota_blocked_hold_path(self, agent: str) -> Path:
         return self.state_dir / "quota-blocked-hold" / f"{validate_agent_name(agent)}.json"
 
@@ -5198,15 +5205,21 @@ class Store:
         summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
         at = data.get("at") if isinstance(data.get("at"), str) else None
         reset_at = data.get("reset_at") if isinstance(data.get("reset_at"), str) else None
+        now = time.time() if now_epoch is None else float(now_epoch)
+        from agenttalk.health import parse_iso
         if reset_at is not None:
-            from agenttalk.health import parse_iso
             parsed = parse_iso(reset_at)
             if parsed is None:
                 reset_at = None  # torn/unparseable - keep the hold, drop the stale instant
-            else:
-                now = time.time() if now_epoch is None else float(now_epoch)
-                if now >= parsed.timestamp():
-                    return None  # self-expired: the reset instant has passed
+            elif now >= parsed.timestamp():
+                return None  # self-expired: the reset instant has passed
+        if reset_at is None:
+            # No known clear time (never stated, or dropped above): bounded re-probe
+            # anchored to when this hold was first written, so an unknown-reset
+            # refusal still eventually re-drives rather than wedging the mailbox.
+            written = parse_iso(at) if at is not None else None
+            if written is None or now - written.timestamp() >= self.QUOTA_UNKNOWN_RESET_REPROBE_SECONDS:
+                return None
         return {
             "agent": expected,
             "state": "quota_blocked",

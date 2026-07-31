@@ -714,6 +714,32 @@ def test_quota_blocked_hold_survives_a_process_restart_and_gates_the_next_run(tm
     assert turns == 1 and drives["n"] == 1        # self-healed once the reset instant passed
 
 
+def test_quota_blocked_hold_restores_health_after_a_simulated_restart(tmp_path) -> None:
+    # #126 connector P2: run_loop's own startup unconditionally resets health to
+    # idle_waiting (on_health_idle) BEFORE the pre-drive park ever runs. Since a quota
+    # park deliberately does NOT re-drive (unlike gateway_held, whose re-drive-every-
+    # poll design lets a fresh failed drive() re-write health for free), nothing else
+    # would correct that idle_waiting for the rest of the hold - the worker would
+    # report cheerful idle health despite doctor/attention seeing the quota marker.
+    from agenttalk.wrapper.health import WrapperHealthWriter
+
+    s = _store(tmp_path)
+    s.write_quota_blocked_hold("beta", summary="provider quota/billing refusal",
+                               reset_at="2026-01-01T00:00:10Z")
+    s.send(sender="alpha", recipient="beta", body="task")
+    health_writer = WrapperHealthWriter(s, "beta", cli="codex", mode="wrapper-loop")
+
+    loop.run_loop(
+        s, "beta", lambda rec: loop.DriveOutcome(ok=True),
+        clock=lambda: 0.0, sleep=lambda d: None, max_polls=1,
+        now_iso=lambda: "2026-01-01T00:00:05Z",   # still before the reset instant
+        on_health_idle=health_writer.idle, on_health_parked=health_writer.parked,
+    )
+    health = s.read_health("beta")
+    assert health.get("state") == "rate_limited_or_outage"  # NOT idle_waiting
+    assert health.get("reason_code") == "quota_blocked"
+
+
 # --------------------------------------------------- store: durable quota-blocked hold
 
 def test_quota_blocked_hold_store_roundtrip_and_expiry(tmp_path) -> None:
@@ -736,15 +762,24 @@ def test_quota_blocked_hold_store_roundtrip_and_expiry(tmp_path) -> None:
     s.clear_quota_blocked_hold("beta")            # idempotent, never raises when already absent
 
 
-def test_quota_blocked_hold_without_a_reset_instant_still_holds(tmp_path) -> None:
+def test_quota_blocked_hold_without_a_reset_instant_still_holds_briefly(tmp_path) -> None:
     # The reset instant is retained "when present" (#126 ask) - when the provider's text
-    # gave none, the hold is still valid (falls back to bounded backoff, never expires on
-    # its own), and reads it back honestly as reset_at=None rather than fabricating one.
+    # gave none, the hold is still valid immediately after being written (reads it back
+    # honestly as reset_at=None rather than fabricating one) - it just falls back to a
+    # BOUNDED re-probe window rather than holding forever (connector P1 on PR #104: an
+    # unknown-reset hold with no expiry mechanism at all permanently wedges the mailbox).
+    from agenttalk.store import Store as _StoreCls
+    import time as _time
+
     s = _store(tmp_path)
     s.write_quota_blocked_hold("beta", summary="usage limit hit, no stated reset time")
-    hold = s.read_quota_blocked_hold("beta", now_epoch=_epoch("2030-01-01T00:00:00Z"))
+    now = _time.time()
+    hold = s.read_quota_blocked_hold("beta", now_epoch=now + 60.0)
     assert hold is not None
     assert hold["reset_at"] is None
+    # ...but it MUST eventually re-probe rather than wedge forever.
+    reprobe = _StoreCls.QUOTA_UNKNOWN_RESET_REPROBE_SECONDS
+    assert s.read_quota_blocked_hold("beta", now_epoch=now + reprobe + 1.0) is None
 
 
 def test_quota_blocked_hold_is_scoped_to_its_own_agent(tmp_path) -> None:
@@ -844,9 +879,11 @@ def test_quota_blocked_wrapper_reads_healthy_idle_to_the_supervisor(tmp_path) ->
         s.state_dir, "beta", "test-wrapper-1", wrapper_pid=4242,
         wrapper_start="2020-01-01T00:00:00.000000Z", clock=lambda: 0.0)
     health_writer = WrapperHealthWriter(s, "beta", cli="codex", mode="wrapper-loop")
+    frozen_now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
     drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
                            clock=lambda: 0.0, render=False,
-                           runtime_writer=runtime_writer, health_writer=health_writer)
+                           runtime_writer=runtime_writer, health_writer=health_writer,
+                           now_wall=lambda: frozen_now)
     rec = {"id": "msg-1", "from": "a", "kind": "message", "body": "hi",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
     outcome = drive(rec)
@@ -1269,8 +1306,12 @@ def test_make_drive_classifies_real_provider_quota_refusal_text(tmp_path) -> Non
     def fake_spawn(argv, stdin):
         return _failed_turn_lines(real_text)
 
+    # A frozen "now" well before the fixture's stated reset instant - without this,
+    # `_parse_quota_refusal` defaults to the REAL wall clock, and this date-bombs the
+    # instant real time passes 2026-08-05T06:10Z (connector P1 catch on PR #104).
+    frozen_now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
     drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
-                           clock=lambda: 0.0, render=False)
+                           clock=lambda: 0.0, render=False, now_wall=lambda: frozen_now)
     rec = {"id": "msg-1", "from": "a", "kind": "message", "body": "hi",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
 

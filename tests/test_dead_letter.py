@@ -705,6 +705,42 @@ def test_config_blocked_notice_includes_command_error_and_remediation(tmp_path: 
     assert "dead-lettered" not in notice.body.lower()
 
 
+def test_quota_blocked_notice_is_not_mislabeled_as_a_dead_letter(tmp_path: Path) -> None:
+    # #126 connector P2 on PR #104: a quota park has NO dead-letter entry at all (nothing
+    # was committed, dead-lettered, or disposed) and needs no operator action - the generic
+    # dead-letter-notice branch would otherwise send "repeatedly FAILING... Inspect:
+    # agenttalk dead-letter show" for a message that `dead-letter show` cannot find.
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    p = _send(s, "valid work")
+    notifier = cli._dead_letter_notifier(s, "beta")
+    routed = notifier(
+        {
+            "agent": "beta",
+            "msg_id": p.id,
+            "from": "lead",
+            "kind": "message",
+            "attempts": 0,
+            "failure_class": "quota_blocked",
+            "summary": "provider quota/billing refusal: usage limit hit",
+            "reset_at": "2026-08-05T06:10:00Z",
+        },
+        disposed=False,
+    )
+    assert routed is True
+    notice = s.messages_for("lead")[-1]
+    assert notice.subject == "wrapper quota-blocked"
+    assert "2026-08-05T06:10:00Z" in notice.body
+    assert "usage limit hit" in notice.body
+    assert "No operator action needed" in notice.body
+    # NEVER mislabeled as an actual disposition (the generic branch's own verb for a
+    # real dead-letter) or pointed at a command that would find nothing.
+    assert "DEAD-LETTERED message" not in notice.body
+    assert "dead-letter show" not in notice.body.lower()
+    assert notice.meta.get("dead_letter") != "true"
+    assert notice.meta.get("needs_operator") != "true"
+
+
 def test_29_f2_doctor_loud_on_unrouted_escalation(tmp_path: Path) -> None:
     # F2/codex-P2: an escalated-but-UNROUTED backstop record makes doctor go LOUD ERROR -
     # a known-infra message can't silently loop with no operator signal.

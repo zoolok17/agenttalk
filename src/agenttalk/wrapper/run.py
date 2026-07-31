@@ -1883,7 +1883,9 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                wrapper_generation: str | None = None,
                backend_profile: str | None = None,
                profile_env: dict[str, str] | None = None,
-               lease_lost_exceptions: tuple = ()) -> Callable[[dict], object]:
+               lease_lost_exceptions: tuple = (),
+               now_wall: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+               ) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
     CLASS on failure, for dead-letter). A turn fails if it produced no progress event or
@@ -2356,7 +2358,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             after_spawn=_record_lesson_exposure,
         )
         if not sig["ok"] and sig.get("terminal"):
-            quota = _parse_quota_refusal(sig.get("terminal_text"))
+            quota = _parse_quota_refusal(sig.get("terminal_text"), now=now_wall())
             if quota is not None:
                 # A provider quota/billing refusal (#126) is a distinct terminal class,
                 # not session-continuity or dead-letter material - short-circuit BEFORE

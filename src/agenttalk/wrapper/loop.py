@@ -464,7 +464,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             return
 
     def _info(record: dict, rec: dict, failure_class: str, *,
-              infra_exhausted: bool = False, quarantined: bool = False) -> dict:
+              infra_exhausted: bool = False, quarantined: bool = False,
+              reset_at: str | None = None) -> dict:
         attempts = _safe_int((rec or {}).get("attempts_started"))
         bucket = "below_backstop"
         if quarantined:
@@ -473,17 +474,20 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             bucket = "infra_exhausted"
         elif k_escalate > 0 and attempts >= k_escalate:
             bucket = "escalate_backstop"
-        return {"agent": agent, "msg_id": record.get("id"), "from": record.get("from"),
-                "subject": record.get("subject"), "kind": record.get("kind"),
-                "request_id": record.get("request_id"),
-                "attempts": attempts,  # degrade-low
-                "attempts_bucket": bucket,
-                "first_started_at": (rec or {}).get("first_started_at"),
-                "requeue_generation": (rec or {}).get("requeue_generation"),
-                "infra_exhausted": infra_exhausted,
-                "quarantined": quarantined,
-                "failure_class": failure_class,
-                "summary": (rec or {}).get("last_failure_summary") or ""}
+        out = {"agent": agent, "msg_id": record.get("id"), "from": record.get("from"),
+               "subject": record.get("subject"), "kind": record.get("kind"),
+               "request_id": record.get("request_id"),
+               "attempts": attempts,  # degrade-low
+               "attempts_bucket": bucket,
+               "first_started_at": (rec or {}).get("first_started_at"),
+               "requeue_generation": (rec or {}).get("requeue_generation"),
+               "infra_exhausted": infra_exhausted,
+               "quarantined": quarantined,
+               "failure_class": failure_class,
+               "summary": (rec or {}).get("last_failure_summary") or ""}
+        if reset_at is not None:  # #126: the provider's own stated clear time, when known
+            out["reset_at"] = reset_at
+        return out
 
     def _dispose(record: dict, *, failure_class: str, reason: str | None,
                  infra_exhausted: bool = False,
@@ -643,22 +647,34 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         cheerful/errored guess, and so the PRE-DRIVE check below (unlike gateway_held's cheap
         mint-time recheck) can skip re-driving - spawning the real CLI again - until that
         instant passes, rather than hammering the provider every poll. The heartbeat is
-        re-stamped (blocked != dead), so the supervisor does not restart it. Health is surfaced
-        by drive()'s health_writer.failure (STATE_RATE_LIMITED_OR_OUTAGE + 'quota_blocked'), so
-        this park does not also write health. Escalate ONCE per head, same dedup shape as
-        _hold_park (gateway_held_escalated) but keyed on quota_blocked_escalated - a silent
-        20-retry-then-dead-letter loop is exactly the incident this exists to stop."""
+        re-stamped (blocked != dead), so the supervisor does not restart it.
+
+        Health is re-asserted via ``on_health_parked`` on EVERY park cycle (connector P2 on
+        PR #104): unlike gateway_held (which re-drives every poll, so a fresh failed drive()
+        naturally re-writes health), a quota park deliberately does NOT re-drive - so nothing
+        else refreshes health after the loop's own startup on_health_idle() reset, and a
+        wrapper restart mid-hold would otherwise report cheerful idle health for the rest of
+        the hold despite doctor/attention seeing the quota marker underneath. Escalate ONCE
+        per head, same dedup shape as _hold_park (gateway_held_escalated) but keyed on
+        quota_blocked_escalated - a silent 20-retry-then-dead-letter loop is exactly the
+        incident this exists to stop."""
         nonlocal last_hb, fail_sleep
         head_id = record.get("id")
         if isinstance(head_id, str) and head_id not in quota_blocked_escalated:
             quota_blocked_escalated.add(head_id)
             try:                              # a notification must never crash the loop
                 if on_escalate is not None:
-                    on_escalate(_info(record, {}, CLASS_QUOTA_BLOCKED))
+                    on_escalate(_info(record, {"last_failure_summary": summary},
+                                     CLASS_QUOTA_BLOCKED, reset_at=reset_at))
             except Exception:  # noqa: BLE001, S110  # nosec
                 pass
         store.write_quota_blocked_hold(agent, summary=summary, reset_at=reset_at)
         store.clear_attempt(agent, head_id)
+        if on_health_parked is not None:
+            try:  # advisory health must never break loop progress
+                on_health_parked(record, "quota_blocked")
+            except Exception:  # noqa: BLE001, S110  # nosec
+                pass
         stamp()                          # blocked != dead: keep heartbeat + lead-loop lease fresh
         last_hb = clock()
         sleep(fail_sleep)
