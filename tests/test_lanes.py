@@ -1225,6 +1225,41 @@ def test_m12_git_write_env_timeout_and_allowlist(monkeypatch: pytest.MonkeyPatch
     assert seen["killed"] is True
 
 
+def test_m12_git_write_kills_and_reaps_on_base_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # A termination signal (or any other BaseException) firing while
+    # communicate() is blocked previously skipped straight past the
+    # TimeoutExpired-only cleanup above and left the child git process
+    # running, unreaped.
+    seen = {}
+
+    class SignaledProc:
+        def __init__(self) -> None:
+            self.calls = 0
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            seen["killed"] = True
+            self._returncode = -9
+
+        def communicate(self, timeout=None):  # noqa: ANN001
+            self.calls += 1
+            if self.calls == 1:
+                raise SystemExit(143)
+            return "", ""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: SignaledProc())
+    with pytest.raises(SystemExit):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt3"), "a" * 40])
+    assert seen["killed"] is True
+
+
 def test_s2_failed_add_cleanup_removes_branch_after_lock_release(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)

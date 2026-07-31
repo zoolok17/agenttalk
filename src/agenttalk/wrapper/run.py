@@ -1522,7 +1522,18 @@ def run_wrapper(
             health_writer.turn_start(None)
         lines = _iter_suppressing_benign_pipe_teardown(proc.stdout or [])
         engine.run(_health_events(parse_lines(lines, mapper)), clock)
-    finally:
+    except BaseException:
+        _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5.0)
+        raise
+    else:
         _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
     rc = proc.wait()
     if health_writer is not None:
@@ -1619,7 +1630,7 @@ class _ProcStream:
                         lease_lost_exceptions=lease_lost_exceptions,
                         on_status=work_heartbeat_status)
                     self._work_hb.start()
-        except Exception:
+        except BaseException:
             self._cleanup_after_constructor_error()
             raise
 

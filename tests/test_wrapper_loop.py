@@ -1467,6 +1467,36 @@ def test_procstream_constructor_write_error_closes_pipes_and_child(monkeypatch) 
     assert proc.wait_calls == [10.0]
 
 
+def test_procstream_constructor_termination_signal_closes_pipes_and_child(
+    monkeypatch,
+) -> None:
+    # wrapper_logs.capture_termination_signals converts SIGTERM/SIGBREAK into a
+    # raised SystemExit - a BaseException, not an Exception. A termination
+    # signal arriving during construction (here: the stdin write) must reach
+    # _cleanup_after_constructor_error exactly like an OSError does above;
+    # `except Exception:` alone does not catch it.
+    created: list[_TrackedPopen] = []
+
+    class _Popen(_TrackedPopen):
+        def __init__(self, argv, **kwargs):
+            super().__init__(argv, **kwargs)
+            self.stdin = _TrackedPipe(write_exc=SystemExit(143))
+            created.append(self)
+
+    monkeypatch.setattr(run.subprocess, "Popen", _Popen)
+
+    with pytest.raises(SystemExit):
+        run._ProcStream(["codex"], "prompt")
+
+    proc = created[0]
+    assert proc.stdin.closed is True
+    assert proc.stdin.close_count == 1
+    assert proc.stdout.closed is True
+    assert proc.stdout.close_count == 1
+    assert proc.terminated is True
+    assert proc.wait_calls == [10.0]
+
+
 def test_procstream_success_closes_stdout_once(monkeypatch) -> None:
     lines = _codex_turn_lines()
     created: list[_TrackedPopen] = []

@@ -503,6 +503,14 @@ def _run_probe(path: str, *, timeout: float) -> subprocess.CompletedProcess[str]
                 stdout, stderr = proc.communicate()
             raise PowerShellHostError(f"probe timed out after {timeout:g}s") from None
         return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass
+        raise
     finally:
         close_job()
 

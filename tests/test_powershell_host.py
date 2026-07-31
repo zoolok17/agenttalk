@@ -412,3 +412,49 @@ def test_path_diagnostics_do_not_recommend_windowsapps_alias(tmp_path: Path) -> 
     windowsapps.mkdir(parents=True)
     (windowsapps / "pwsh.exe").write_bytes(b"")
     assert psh.path_candidate_remediations({"PATH": str(windowsapps)}) == ()
+
+
+def test_run_probe_kills_and_reaps_child_on_base_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # _run_probe already kills+reaps on an OSError from job-attach and on a
+    # communicate() timeout. A termination signal (or any other
+    # BaseException, e.g. SystemExit/KeyboardInterrupt) arriving while
+    # communicate() is blocked skipped both of those paths entirely and left
+    # the probe child running, unreaped.
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.killed = False
+            self.communicate_calls = 0
+            self._returncode: int | None = None
+            self.args = ["pwsh"]
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            self.killed = True
+            self._returncode = -9
+
+        def communicate(self, timeout=None):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise SystemExit(143)
+            return "", ""
+
+    created: list[_FakeProc] = []
+
+    def _fake_popen(*args, **kwargs):
+        proc = _FakeProc()
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(psh.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(psh, "_attach_kill_on_close_job", lambda proc: (None, lambda: None))
+
+    with pytest.raises(SystemExit):
+        psh._run_probe("pwsh", timeout=5.0)
+
+    proc = created[0]
+    assert proc.killed is True
+    assert proc.communicate_calls == 2

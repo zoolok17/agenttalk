@@ -2066,6 +2066,14 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
         raise GitWriteError(
             f"mutating git timed out after {timeout:g}s and was killed: {err or out or e}"
         ) from e
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        raise
     return proc.returncode, out or "", err or ""
 
 

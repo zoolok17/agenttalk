@@ -389,6 +389,77 @@ def test_run_wrapper_suppresses_benign_pipe_teardown(
     ) == 0
 
 
+def test_run_wrapper_terminates_child_on_base_exception(monkeypatch) -> None:
+    # wrapper_logs.capture_termination_signals converts SIGTERM/SIGBREAK into a
+    # raised SystemExit while this Popen call is in scope (cmd_wrap wraps the
+    # caller of run_wrapper). Before the fix, the `finally` only closed the
+    # stdout pipe - the child was left running, orphaned, and `rc = proc.wait()`
+    # (the reap) was skipped entirely because it sits after the try/finally.
+    lines = [json.dumps(o) for o in CATALOG_TOOL]
+
+    class _Stdout:
+        closed = False
+
+        def __iter__(self):
+            def stream():
+                yield lines[0]
+                raise SystemExit(143)
+
+            return stream()
+
+        def close(self):
+            self.closed = True
+
+    class _Popen:
+        def __init__(self, argv, **kwargs):
+            _ = argv, kwargs
+            self.stdout = _Stdout()
+            self.terminated = False
+            self.killed = False
+            self.wait_calls: list[float | None] = []
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def terminate(self):
+            self.terminated = True
+            self._returncode = -15
+
+        def kill(self):
+            self.killed = True
+            self._returncode = -9
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            return self._returncode
+
+    created: list[_Popen] = []
+
+    class _TrackingPopen(_Popen):
+        def __init__(self, argv, **kwargs):
+            super().__init__(argv, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(run.subprocess, "Popen", _TrackingPopen)
+
+    with pytest.raises(SystemExit):
+        run.run_wrapper(
+            cli="codex",
+            agent="worker",
+            argv=["codex"],
+            render=False,
+            heartbeat_fn=lambda _event, _now: None,
+            restart_fn=lambda _signal: None,
+            info_fn=lambda _signal: None,
+        )
+
+    proc = created[0]
+    assert proc.stdout.closed is True
+    assert proc.terminated is True
+    assert proc.wait_calls == [10.0]
+
+
 def test_run_wrapper_degraded_codex_message_escalates_when_enabled() -> None:
     # a synthetic codex stream whose agent_message TEXT leaks markup, across two
     # turns; with escalation enabled (telemetry_only off) the wrapper requests
