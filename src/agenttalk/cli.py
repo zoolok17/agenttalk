@@ -57,6 +57,7 @@ from agenttalk import onboarding as ob
 from agenttalk import signing as _signing
 from agenttalk import threads as th
 from agenttalk import supervisor as sup
+from agenttalk import wrapper_runtime as wrapper_runtime_obs
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle as supervisor_lifecycle
 
@@ -592,6 +593,36 @@ def _gather_status(store: Store) -> dict:
             "waiting": waiting,
             "waiting_stale": waiting_stale,
         }
+        runtime_view = wrapper_runtime_obs.read_runtime(
+            store.state_dir,
+            a,
+            now_epoch=now.timestamp(),
+        )
+        if runtime_view.get("status") == wrapper_runtime_obs.STATUS_VALID:
+            runtime_record = runtime_view.get("record")
+            runtime_record = (
+                runtime_record if isinstance(runtime_record, dict) else {}
+            )
+            runtime_message_id = runtime_record.get("message_id")
+            last_started_message_id = runtime_record.get(
+                "last_started_message_id"
+            )
+            runtime_start_count = runtime_record.get(
+                "consecutive_message_turn_starts"
+            )
+            if (
+                isinstance(runtime_message_id, str)
+                and runtime_message_id
+                and runtime_message_id == last_started_message_id
+                and isinstance(runtime_start_count, int)
+                and not isinstance(runtime_start_count, bool)
+                and runtime_start_count > 0
+            ):
+                row["wrapper_runtime"] = {
+                    "phase": runtime_record.get("phase"),
+                    "message_id": runtime_message_id,
+                    "consecutive_message_turn_starts": runtime_start_count,
+                }
         sup_row = supervisor_rows.get(a)
         if isinstance(sup_row, dict):
             decision = sup_row.get("decision")
@@ -1276,6 +1307,20 @@ def cmd_status(args: argparse.Namespace) -> int:
         seen += f" health={h_state}"
         if isinstance(h_age, (int, float)):
             seen += f"/{_format_age(h_age)}"
+        runtime = (
+            a.get("wrapper_runtime")
+            if isinstance(a.get("wrapper_runtime"), dict)
+            else {}
+        )
+        same_message_starts = runtime.get(
+            "consecutive_message_turn_starts"
+        )
+        if (
+            isinstance(same_message_starts, int)
+            and not isinstance(same_message_starts, bool)
+            and same_message_starts >= 2
+        ):
+            seen += f" same-message-starts={same_message_starts}"
         sv = a.get("supervisor") if isinstance(a.get("supervisor"), dict) else {}
         dec = sv.get("decision") if isinstance(sv.get("decision"), dict) else None
         if dec:

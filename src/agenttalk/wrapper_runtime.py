@@ -71,6 +71,8 @@ RECORD_KEYS = frozenset({
     "turn_generation",
     "turn_id",
     "message_id",
+    "last_started_message_id",
+    "consecutive_message_turn_starts",
     "cli_launcher_pid",
     "cli_launcher_start",
     "progress_sequence",
@@ -78,6 +80,13 @@ RECORD_KEYS = frozenset({
     "last_outcome",
     "updated_at",
 })
+# Additive observations remain optional on read so an upgraded supervisor can
+# inspect a record written by the immediately preceding wrapper version.
+OPTIONAL_RECORD_KEYS = frozenset({
+    "last_started_message_id",
+    "consecutive_message_turn_starts",
+})
+REQUIRED_RECORD_KEYS = RECORD_KEYS - OPTIONAL_RECORD_KEYS
 
 _SAFE_GENERATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _UNSET = object()
@@ -163,7 +172,7 @@ def validate_record(
     if not isinstance(raw, dict):
         raise RuntimeRecordError("record must be an object")
     unknown = set(raw) - RECORD_KEYS
-    missing = RECORD_KEYS - set(raw)
+    missing = REQUIRED_RECORD_KEYS - set(raw)
     if unknown:
         raise RuntimeRecordError(
             "record has unknown keys: " + ", ".join(sorted(unknown))
@@ -191,6 +200,27 @@ def validate_record(
     phase = raw.get("phase")
     if phase not in PHASES:
         raise RuntimeRecordError("phase is invalid")
+    message_id = _safe_optional_text(
+        raw.get("message_id"),
+        field="message_id",
+    )
+    last_started_message_id = _safe_optional_text(
+        raw.get("last_started_message_id", message_id),
+        field="last_started_message_id",
+    )
+    consecutive_message_turn_starts = _nonnegative_int(
+        raw.get(
+            "consecutive_message_turn_starts",
+            1 if last_started_message_id is not None else 0,
+        ),
+        field="consecutive_message_turn_starts",
+    )
+    if (last_started_message_id is None) != (
+        consecutive_message_turn_starts == 0
+    ):
+        raise RuntimeRecordError(
+            "message turn start streak fields are inconsistent"
+        )
 
     normalized = {
         "schema_version": SCHEMA_VERSION,
@@ -205,7 +235,9 @@ def validate_record(
             raw.get("turn_generation"), field="turn_generation"
         ),
         "turn_id": _safe_optional_text(raw.get("turn_id"), field="turn_id"),
-        "message_id": _safe_optional_text(raw.get("message_id"), field="message_id"),
+        "message_id": message_id,
+        "last_started_message_id": last_started_message_id,
+        "consecutive_message_turn_starts": consecutive_message_turn_starts,
         "cli_launcher_pid": _positive_pid(
             raw.get("cli_launcher_pid"),
             field="cli_launcher_pid",
@@ -469,6 +501,9 @@ class WrapperRuntimeWriter:
         self._lock = threading.Lock()
         self._turn_generation = 0
         self._progress_sequence = 0
+        self._start_streak_loaded = False
+        self._last_started_message_id: str | None = None
+        self._consecutive_message_turn_starts = 0
         self._turn_id: str | None = None
         self._message_id: str | None = None
         self._launcher_pid: int | None = None
@@ -477,6 +512,28 @@ class WrapperRuntimeWriter:
         self._last_progress_write_epoch: float | None = None
         self._last_outcome: str | None = None
         self._phase = PHASE_IDLE
+
+    def _load_start_streak(self, at: float) -> None:
+        if self._start_streak_loaded:
+            return
+        self._start_streak_loaded = True
+        view = read_runtime(self.path.parent, self.agent, now_epoch=at)
+        if view.get("status") != STATUS_VALID:
+            return
+        record = view.get("record")
+        if not isinstance(record, dict):
+            return
+        message_id = record.get("last_started_message_id")
+        count = record.get("consecutive_message_turn_starts")
+        if (
+            isinstance(message_id, str)
+            and message_id
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+        ):
+            self._last_started_message_id = message_id
+            self._consecutive_message_turn_starts = count
 
     def _record(self, at: float) -> dict:
         return {
@@ -489,6 +546,10 @@ class WrapperRuntimeWriter:
             "turn_generation": self._turn_generation,
             "turn_id": self._turn_id,
             "message_id": self._message_id,
+            "last_started_message_id": self._last_started_message_id,
+            "consecutive_message_turn_starts": (
+                self._consecutive_message_turn_starts
+            ),
             "cli_launcher_pid": self._launcher_pid,
             "cli_launcher_start": self._launcher_start,
             "progress_sequence": self._progress_sequence,
@@ -506,6 +567,7 @@ class WrapperRuntimeWriter:
     def idle(self) -> dict:
         with self._lock:
             now = float(self._clock())
+            self._load_start_streak(now)
             self._phase = PHASE_IDLE
             self._turn_id = None
             self._message_id = None
@@ -521,10 +583,19 @@ class WrapperRuntimeWriter:
     ) -> dict:
         with self._lock:
             now = float(self._clock())
+            self._load_start_streak(now)
             self._turn_generation += 1
             self._turn_id = turn_id or f"turn-{uuid.uuid4().hex[:12]}"
             _safe_optional_text(self._turn_id, field="turn_id")
-            self._message_id = _safe_optional_text(message_id, field="message_id")
+            self._message_id = _safe_optional_text(
+                message_id, field="message_id"
+            )
+            if self._message_id is not None:
+                if self._message_id == self._last_started_message_id:
+                    self._consecutive_message_turn_starts += 1
+                else:
+                    self._last_started_message_id = self._message_id
+                    self._consecutive_message_turn_starts = 1
             self._launcher_pid = None
             self._launcher_start = None
             self._last_progress_at = None
@@ -598,6 +669,7 @@ class WrapperRuntimeWriter:
         than requiring a preceding ``starting`` transition.
         """
         with self._lock:
+            self._load_start_streak(float(self._clock()))
             if self._phase == PHASE_IDLE:
                 self._turn_generation += 1
                 self._turn_id = f"disposition-{uuid.uuid4().hex[:12]}"

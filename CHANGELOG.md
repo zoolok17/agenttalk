@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Repeated head-of-queue processing is now visible after the second turn
+  start.** The strict wrapper-runtime record tracks consecutive starts for the
+  same inbound message across wrapper recovery, resets the count when a
+  different message starts, and preserves it across ordinary lifecycle
+  transitions. `agenttalk status --json` projects the current message and
+  count, while human `agenttalk status` adds a `same-message-starts=<count>`
+  marker at two or more starts.
+
 - **Coverage evidence now preserves the zero-runtime-dependency boundary without taking
   custody of report files.** Attestation accepts only a recognized coverage.py/pytest-cov
   terminal summary from stdout; it no longer parses root JSON or XML reports. A scan

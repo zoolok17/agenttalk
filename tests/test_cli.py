@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, health as hm
+from agenttalk import cli, health as hm, wrapper_runtime as wr
 from agenttalk.store import Store
 
 
@@ -385,6 +385,55 @@ def test_status_json_schema(
     # beta got the message, so beta is unread=1
     beta = next(a for a in payload["agents"] if a["name"] == "beta")
     assert beta["unread"] == 1
+
+
+def _publish_repeated_message_runtime(store_root: Path) -> None:
+    store = Store(store_root)
+    writer = wr.WrapperRuntimeWriter(
+        store.state_dir,
+        "alpha",
+        "generation-status",
+        wrapper_pid=123,
+        wrapper_start="start-123",
+    )
+    writer.starting(message_id="msg-stuck", turn_id="turn-1")
+    writer.active(456, "start-456")
+    writer.starting(message_id="msg-stuck", turn_id="turn-2")
+    writer.active(457, "start-457")
+
+
+def test_status_json_surfaces_same_message_turn_start_count(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    _publish_repeated_message_runtime(store_root)
+
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["wrapper_runtime"] == {
+        "phase": wr.PHASE_ACTIVE,
+        "message_id": "msg-stuck",
+        "consecutive_message_turn_starts": 2,
+    }
+
+
+def test_status_human_surfaces_same_message_turn_start_count(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    _publish_repeated_message_runtime(store_root)
+
+    rc = _run(["status"], store_root)
+
+    assert rc == 0
+    alpha_line = next(
+        line for line in capsys.readouterr().out.splitlines()
+        if line.lstrip().startswith("alpha")
+    )
+    assert "same-message-starts=2" in alpha_line
 
 
 def test_status_json_includes_heartbeat_when_set(
