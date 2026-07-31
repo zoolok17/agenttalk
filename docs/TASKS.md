@@ -31,7 +31,7 @@ These are the ones being worked right now, and the ones most likely to be cited 
 | 56 | Wrapped ovh-qwen env allowlist strips `HOME`/`LOCALAPPDATA`, so `agenttalk reply` crashes in the child shell. The gate on Qwen becoming a usable third provider. |
 | ~11 | Qwen-on-OVH as a first-class wrapped team member (design → PoC → trial). |
 | 131 | **Launch-provenance authorization for the checked observer.** The ancestry check proves selected-host/image ancestry, not execution of `supervisor.ps1` — so a caller supplying the same hidden identity args can mint a trusted `startup` observation. An existing test *asserts* the permissive behaviour. Design-first; **PR 107 (#114) is held on this.** |
-| 133 | **Cold diff review as a gate.** `agenttalk request-launch` already spawns a fresh SHA-bound adversarial reviewer, but `ephemeral_reviewers` is `enabled:false` and unconfigured. Delta: line-anchored typed findings, a PR renderer, two vendor profiles, and a merge gate bound to the head SHA. Scored 2026-07-31 against a real baseline — see the logbook. |
+| 132 | **Cold diff review as a gate.** `agenttalk request-launch` already spawns a fresh SHA-bound adversarial reviewer, but `ephemeral_reviewers` is `enabled:false` and unconfigured. Delta: line-anchored typed findings, a PR renderer, two vendor profiles, and a merge gate bound to the head SHA. Scored 2026-07-31 against a real baseline — see the logbook. |
 
 ## Full list
 
@@ -160,8 +160,8 @@ These are the ones being worked right now, and the ones most likely to be cited 
 | 129 |   | A refused restart-request is never retired, so it retries every tick forever |
 | 130 |   | `web.py /api/attention` has a private source allowlist that SILENTLY DROPS unlisted sources |
 | 131 |   | **Launch-provenance authorization for the checked observer** — prerequisite for #114 |
-| 132 |   | Runtime-observation quarantine files are not status-indexed and have no retention cap |
-| 133 |   | **Cold diff review as a gate** — ephemeral reviewer bound to a PR head, findings line-anchored |
+| 132 |   | **Cold diff review as a gate** — ephemeral reviewer bound to a PR head, findings line-anchored |
+| 133 |   | Runtime-observation quarantine files are not status-indexed and have no retention cap |
 
 ## A caveat worth stating
 
