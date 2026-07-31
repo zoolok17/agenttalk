@@ -6041,16 +6041,31 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "@('helper.py','-m','agenttalk','--root','R','wrap') $nonce",
         "$commandPrefix = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-c','pass','-m','agenttalk','--root','R','wrap') $nonce",
-        "$unbuffered = Add-SupervisorLaunchNonce 'python.exe' "
+        # I2, mechanism change: the boundary between an interpreter-option
+        # prefix and the canonical module invocation is now a DECLARED FACT
+        # (module_args_from), not something inferred from the tokens. Two
+        # independent attempts to bound CPython's own grammar from argv text
+        # alone (a safe-flag allowlist, then an inverted unsafe-shape
+        # denylist) both leaked - -u/-X/-P undetected by the first, attached
+        # -c'...' forms and separate-value flags like --check-hash-based-pycs
+        # undetected by the second. Declaring the index sidesteps needing to
+        # recognize ANY interpreter flag, safe or unsafe, at all.
+        "$unbufferedDeclared = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-u','-m','agenttalk','--root','R','wrap') $nonce 1",
+        "$unbufferedUndeclared = Add-SupervisorLaunchNonce 'python.exe' "
         "@('-u','-m','agenttalk','--root','R','wrap') $nonce",
-        "$xOption = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-X','utf8','-m','agenttalk','--root','R','wrap') $nonce",
-        "$xAttached = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-Xutf8','-m','agenttalk','--root','R','wrap') $nonce",
-        "$futureFlag = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-P','-m','agenttalk','--root','R','wrap') $nonce",
-        "$genericUnknownFlag = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-Z','-m','agenttalk','--root','R','wrap') $nonce",
+        "$xOptionDeclared = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-X','utf8','-m','agenttalk','--root','R','wrap') $nonce 2",
+        "$xAttachedDeclared = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-Xutf8','-m','agenttalk','--root','R','wrap') $nonce 1",
+        "$futureFlagDeclared = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-P','-m','agenttalk','--root','R','wrap') $nonce 1",
+        "$genericUnknownFlagDeclared = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-Z','-m','agenttalk','--root','R','wrap') $nonce 1",
+        "$attachedCommandDeclared = Add-SupervisorLaunchNonce 'python.exe' "
+        "@(\"-cprint(1)\",'-m','agenttalk','--root','R','wrap') $nonce 1",
+        "$declaredOutOfRange = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-m','agenttalk','--root','R','wrap') $nonce 99",
         "$optionTerminator = Add-SupervisorLaunchNonce 'python.exe' "
         "@('--','-m','agenttalk','--root','R','wrap') $nonce",
         "$duplicate = Add-SupervisorLaunchNonce 'python.exe' "
@@ -6060,9 +6075,14 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "$native = Add-SupervisorLaunchNonce 'codex.exe' @('exec') $nonce",
         "@{ py = $py; console = $console; native = $native; "
         "duplicate = $duplicate; duplicate_eq = $duplicateEq; "
-        "unbuffered = $unbuffered; x_option = $xOption; "
-        "x_attached = $xAttached; future_flag = $futureFlag; "
-        "generic_unknown_flag = $genericUnknownFlag; "
+        "unbuffered_declared = $unbufferedDeclared; "
+        "unbuffered_undeclared = $unbufferedUndeclared; "
+        "x_option_declared = $xOptionDeclared; "
+        "x_attached_declared = $xAttachedDeclared; "
+        "future_flag_declared = $futureFlagDeclared; "
+        "generic_unknown_flag_declared = $genericUnknownFlagDeclared; "
+        "attached_command_declared = $attachedCommandDeclared; "
+        "declared_out_of_range = $declaredOutOfRange; "
         "option_terminator = $optionTerminator; "
         "py_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $py.argv $py); "
         "console_wrap = (Test-AgenttalkWrapInvocation 'agenttalk.exe' $console.argv $console); "
@@ -6074,7 +6094,11 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "command_prefix_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
         "$commandPrefix.argv $commandPrefix); "
         "root_value_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
-        "$rootNamedWrap.argv $rootNamedWrap) } | ConvertTo-Json -Depth 6 | "
+        "$rootNamedWrap.argv $rootNamedWrap); "
+        "unbuffered_declared_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
+        "$unbufferedDeclared.argv $unbufferedDeclared 1); "
+        "unbuffered_undeclared_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
+        "$unbufferedUndeclared.argv $unbufferedUndeclared) } | ConvertTo-Json -Depth 6 | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
     hp = tmp_path / "nonce_injection.ps1"
@@ -6106,45 +6130,65 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     assert data["script_prefix_wrap"] is False
     assert data["command_prefix"]["injected"] is False
     assert data["command_prefix_wrap"] is False
-    # Finding B (PR 98 connector re-review, head ee177af): a recognized
-    # interpreter option before -m must not disable nonce injection for an
-    # otherwise-canonical `python -u -m agenttalk ...` / `python -X utf8 -m
-    # agenttalk ...` launch - the exact configs the finding named.
-    assert data["unbuffered"]["injected"] is True
-    assert data["unbuffered"]["argv"] == [
+    # I2, mechanism change (2 leaked attempts at re-deriving CPython's own
+    # option grammar from argv text: a safe-flag allowlist missed -u, -X,
+    # -P; the inverted unsafe-shape scan that replaced it missed attached
+    # -c'...' forms and separate-value flags). module_args_from is now a
+    # DECLARED fact from supervisor.json, not inferred - so -u/-X/-P/an
+    # arbitrary never-real flag/an attached -c form are all accepted when
+    # declared, with NO per-flag logic anywhere, and all REJECTED when not
+    # declared (proving inference is genuinely gone, not just widened).
+    assert data["unbuffered_declared"]["injected"] is True
+    assert data["unbuffered_declared"]["argv"] == [
         "-u", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
         "--root", "R", "wrap",
     ]
-    assert data["x_option"]["injected"] is True
-    assert data["x_option"]["argv"] == [
+    assert data["unbuffered_undeclared"]["injected"] is False
+    assert data["unbuffered_undeclared"]["missing_reason"] == "unsupported_launch_argv"
+    assert data["x_option_declared"]["injected"] is True
+    assert data["x_option_declared"]["argv"] == [
         "-X", "utf8", "-m", "agenttalk", "--supervisor-launch-nonce",
         SUPERVISOR_NONCE, "--root", "R", "wrap",
     ]
-    assert data["x_attached"]["injected"] is True
-    assert data["x_attached"]["argv"] == [
+    assert data["x_attached_declared"]["injected"] is True
+    assert data["x_attached_declared"]["argv"] == [
         "-Xutf8", "-m", "agenttalk", "--supervisor-launch-nonce",
         SUPERVISOR_NONCE, "--root", "R", "wrap",
     ]
-    # I2 (PR 98 cold review, 3rd round on this parser): -P is Python 3.11's
-    # -m-compatible isolation flag - the "fourth" flag the lead predicted an
-    # allowlist would always be one step behind. The inverted parser accepts
-    # it, and any other single-dash token, without needing to name it.
-    assert data["future_flag"]["injected"] is True
-    assert data["future_flag"]["argv"] == [
+    assert data["future_flag_declared"]["injected"] is True
+    assert data["future_flag_declared"]["argv"] == [
         "-P", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
         "--root", "R", "wrap",
     ]
-    assert data["generic_unknown_flag"]["injected"] is True
-    assert data["generic_unknown_flag"]["argv"] == [
+    assert data["generic_unknown_flag_declared"]["injected"] is True
+    assert data["generic_unknown_flag_declared"]["argv"] == [
         "-Z", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
         "--root", "R", "wrap",
     ]
-    # A shape that DETERMINES execution mode must still fail closed rather
-    # than be guessed past - `--` ends interpreter-option parsing, so
-    # everything after it (including this "-m agenttalk") is never reached
-    # as an interpreter option.
+    # The exact new finding: an attached -c'...' command form. Under the old
+    # mechanism this needed to be RECOGNIZED as dangerous; under the new one
+    # it is simply whatever the operator declared lives before the
+    # module_args_from index - never interpreted, so there is nothing to miss.
+    assert data["attached_command_declared"]["injected"] is True
+    assert data["attached_command_declared"]["argv"] == [
+        "-cprint(1)", "-m", "agenttalk", "--supervisor-launch-nonce",
+        SUPERVISOR_NONCE, "--root", "R", "wrap",
+    ]
+    # A declared index that doesn't actually land on '-m agenttalk' (here,
+    # out of range) still fails closed - the declaration is verified, not
+    # blindly trusted.
+    assert data["declared_out_of_range"]["injected"] is False
+    assert data["declared_out_of_range"]["missing_reason"] == "unsupported_launch_argv"
+    # Without a declared index, a shape that determines execution mode is
+    # still correctly rejected too (index 0 is '--', never '-m') - not
+    # because it is specially recognized as unsafe anymore, but because it
+    # simply isn't '-m agenttalk' at the (default) position checked.
     assert data["option_terminator"]["injected"] is False
     assert data["option_terminator"]["missing_reason"] == "unsupported_launch_argv"
+    # The logging-eligibility helper must honor the SAME declared index as
+    # nonce injection - this is I1's third face again if it doesn't.
+    assert data["unbuffered_declared_wrap"] is True
+    assert data["unbuffered_undeclared_wrap"] is False
 
 
 def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
@@ -6207,7 +6251,7 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         launchers,
         "function Invoke-RegularCase("
         "[string]$label, [string]$file, [object[]]$argv, "
-        "[bool]$wrapped, [string]$mode) {",
+        "[bool]$wrapped, [string]$mode, $moduleArgsFrom = $null) {",
         "  $script:caseName = $label",
         "  $agent = [pscustomobject]@{",
         "    backend_profile = $null",
@@ -6217,6 +6261,7 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "    launch = [pscustomobject]@{",
         "      windows_file = $file",
         "      windows_args = @($argv)",
+        "      module_args_from = $moduleArgsFrom",
         "    }",
         "  }",
         "  $script:cfg = [pscustomobject]@{",
@@ -6251,9 +6296,9 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "Invoke-RegularCase 'regular_python_wrap' 'python.exe' "
         "@('-m','agenttalk','wrap') $true 'wrap'",
         "Invoke-RegularCase 'regular_unbuffered_wrap' 'python.exe' "
-        "@('-u','-m','agenttalk','wrap') $true 'wrap'",
+        "@('-u','-m','agenttalk','wrap') $true 'wrap' 1",
         "Invoke-RegularCase 'regular_xoption_wrap' 'python.exe' "
-        "@('-X','utf8','-m','agenttalk','wrap') $true 'wrap'",
+        "@('-X','utf8','-m','agenttalk','wrap') $true 'wrap' 2",
         "Invoke-RegularCase 'regular_no_args' 'python.exe' @() $true 'wrap'",
         "Invoke-RegularCase 'regular_script_prefix' 'python.exe' "
         "@('helper.py','-m','agenttalk','wrap') $true 'wrap'",

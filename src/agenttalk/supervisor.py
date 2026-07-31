@@ -6104,55 +6104,50 @@ function Stop-Tree($targets) {
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
-function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens) {
+function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom = $null) {
   # THE ONE place that recognizes a `python -m agenttalk` invocation - nonce
   # injection, the bounded-logging eligibility check, and the legacy --root
   # backfill all need this SAME recognition, and three independent copies is
   # exactly how a valid `-u`/`-X` launch silently lost the logging capability
   # while nonce injection (the one copy that had been patched) kept working.
   #
-  # I2: this used to be a hand-maintained allowlist of "safe" interpreter
-  # options - it needed a new entry for -u, then -X, then -P, and would need
-  # a fourth. Inverted instead: walk forward accepting ANY token until one
-  # of the few shapes that DETERMINE Python's execution mode is seen -
-  # `-c <command>`, `--` (ends option parsing), `-m <module>`, or a bare
-  # (non-dash) token, which is a script path or `-` for stdin. Those are
-  # mutually exclusive with `-m agenttalk` by CPython's own argument
-  # grammar: whichever of them appears first is what actually runs, and
-  # nothing after it is a further interpreter option. `-X`/`-W` are the
-  # only two flags known to consume a SEPARATE value token; skip both.
-  # Every other single-dash token is treated as a bare modifier (true for
-  # every option flag CPython has ever added) and skipped by itself - if
-  # some future flag turns out to consume a value it doesn't advertise
-  # here, that only misaligns the scan and fails the match. That is a safe
-  # failure: it rejects a valid config, it can never accept an unsafe one,
-  # since none of the modal/terminal tokens above can be produced by an
-  # accidental misalignment.
+  # I2, mechanism change (2nd attempt at bounding CPython's grammar leaked
+  # too - `-c'...'` attached-command forms, and `--check-hash-based-pycs
+  # always`'s separate value, were both missed by the inverted scan).
+  # `python --help` is not a specification safe to re-derive from argv
+  # text, in either direction (an allowlist of safe flags, or a denylist
+  # of unsafe ones) - CPython's option grammar is larger than either
+  # attempt bounded, and stays a moving target.
   #
-  # Returns the index of `-m` itself, or -1 if the argv does not have that
-  # shape. NOTE: the parameter is NOT named $args - PowerShell's automatic
-  # $args variable silently shadows a same-named formal parameter, and the
-  # function then sees an empty list regardless of what the caller passed.
-  $i = 0
-  while ($i -lt $argTokens.Count) {
-    $token = [string]$argTokens[$i]
-    if ($token -eq '-m') {
-      if ($i + 1 -lt $argTokens.Count -and $argTokens[$i + 1] -eq 'agenttalk') {
-        return $i
-      }
-      return -1
-    }
-    if ($token -eq '-c' -or $token -eq '--') { return -1 }
-    if (-not $token.StartsWith('-')) { return -1 }
-    if ($token -eq '-X' -or $token -eq '-W') {
-      $i += 2
-      continue
-    }
-    $i += 1
+  # STOPPED INFERRING. The boundary between an interpreter-option prefix
+  # and the canonical module invocation is now a DECLARED FACT -
+  # agents.<name>.launch.module_args_from in supervisor.json, defaulting
+  # to 0 (the overwhelmingly common "no interpreter prefix" case, so every
+  # existing config needs zero changes). Whoever configures a launch with
+  # `-u`/`-X .../-P/...` already knows, at config-authoring time, exactly
+  # how many tokens their own prefix occupies - the supervisor no longer
+  # has to reverse-engineer it from the tokens themselves. All that
+  # remains here is a cheap, exact, grammar-independent sanity check: does
+  # the DECLARED position actually hold the literal tokens '-m' 'agenttalk'?
+  # That check can never leak by omission, because it never has to
+  # recognize a single interpreter flag - safe or unsafe - to do its job.
+  #
+  # Returns the declared index if it holds '-m agenttalk', or -1 otherwise
+  # (including an out-of-range declaration - fail closed on a
+  # misconfigured index rather than guess). NOTE: the parameter is NOT
+  # named $args - PowerShell's automatic $args variable silently shadows a
+  # same-named formal parameter, and the function then sees an empty list
+  # regardless of what the caller passed.
+  $index = if ($null -ne $moduleArgsFrom) { [int]$moduleArgsFrom } else { 0 }
+  if ($index -lt 0 -or $index -ge $argTokens.Count) { return -1 }
+  if ($index + 1 -lt $argTokens.Count -and
+      [string]$argTokens[$index] -eq '-m' -and
+      [string]$argTokens[$index + 1] -eq 'agenttalk') {
+    return $index
   }
   return -1
 }
-function Ensure-AgenttalkWrapRootArg($argv) {
+function Ensure-AgenttalkWrapRootArg($argv, $moduleArgsFrom = $null) {
   # Older supervisor.json files launched wrappers as:
   #   python.exe -m agenttalk wrap --for NAME --loop ...
   # and relied on AGENTTALK_ROOT in the environment. Win32_Process exposes only
@@ -6162,7 +6157,7 @@ function Ensure-AgenttalkWrapRootArg($argv) {
   $args = @($argv)
   if ($args.Count -eq 0) { return $args }
   $scan = 0
-  $flagIndex = Resolve-AgenttalkModuleFlagIndex $args
+  $flagIndex = Resolve-AgenttalkModuleFlagIndex $args $moduleArgsFrom
   if ($flagIndex -ge 0) { $scan = $flagIndex + 2 }
   $rootPresent = $false
   $wrapIndex = -1
@@ -6266,7 +6261,7 @@ function File-StemLower([string]$path) {
   try { return ([IO.Path]::GetFileNameWithoutExtension($path)).ToLowerInvariant() }
   catch { return ([string]$path).ToLowerInvariant() }
 }
-function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
+function Add-SupervisorLaunchNonce($file, $argv, $nonce, $moduleArgsFrom = $null) {
   $args = @($argv)
   $unsupported = [pscustomobject]@{
     argv = $args
@@ -6290,7 +6285,7 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
   }
   $stem = File-StemLower ([string]$file)
   if ($stem -in @('python','python3','py')) {
-    $i = Resolve-AgenttalkModuleFlagIndex $args
+    $i = Resolve-AgenttalkModuleFlagIndex $args $moduleArgsFrom
     if ($i -ge 0) {
       # A direct assignment inside a plain `if` STATEMENT preserves the
       # array type; capturing an if/else USED AS AN EXPRESSION does not -
@@ -6330,13 +6325,13 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
   }
   return $unsupported
 }
-function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult) {
+function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFrom = $null) {
   if (-not $nonceResult.injected) { return $false }
   $args = @($argv)
   $index = 0
   $stem = File-StemLower ([string]$file)
   if ($stem -in @('python','python3','py')) {
-    $flagIndex = Resolve-AgenttalkModuleFlagIndex $args
+    $flagIndex = Resolve-AgenttalkModuleFlagIndex $args $moduleArgsFrom
     if ($flagIndex -lt 0) { return $false }
     $index = $flagIndex + 2
   } else {
@@ -7246,14 +7241,15 @@ function Launch($name, $plan, $codexHome) {
   foreach ($x in @($a.launch.windows_args)) {
     if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
   }
-  $argv = @(Ensure-AgenttalkWrapRootArg $argv)
+  $moduleArgsFrom = $a.launch.module_args_from
+  $argv = @(Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom)
   $launchNonce = [guid]::NewGuid().ToString('N')
-  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
+  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
   $argv = @($nonceResult.argv)
   $shouldLog = (
     [bool]$a.wrapped -and
     $plan.launch_mode -eq 'wrap' -and
-    (Test-AgenttalkWrapInvocation $file $argv $nonceResult)
+    (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom)
   )
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
@@ -7353,11 +7349,12 @@ function Launch-Spec($name, $spec, $codexHome) {
   $specCwdToken = if ($spec.cwd) { [string]$spec.cwd } else { '' }
   $argv = @($spec.launch.windows_args)
   $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
-  $argv = @(Ensure-AgenttalkWrapRootArg $argv)
+  $moduleArgsFrom = $spec.launch.module_args_from
+  $argv = @(Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom)
   $launchNonce = [guid]::NewGuid().ToString('N')
-  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
+  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
   $argv = @($nonceResult.argv)
-  $shouldLog = Test-AgenttalkWrapInvocation $file $argv $nonceResult
+  $shouldLog = Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
   } else { $null }
