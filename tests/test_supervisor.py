@@ -5162,6 +5162,89 @@ def test_ps_wrapper_log_attempt_cleaned_up_when_pending_marker_write_fails(
     )
 
 
+def test_ps_wrapper_log_prune_refuses_when_root_scan_is_uncertain(
+    tmp_path: Path,
+) -> None:
+    """Finding B (PR 98 connector re-review, head 6495534): the global launch
+    sequence, round 3 on the same ordering defect. A root that EXISTS but
+    cannot be scanned (unreadable, disconnected, rejected) might be hiding a
+    higher true sequence than the reachable roots show - silently treating
+    it as contributing nothing to the max reintroduces the exact
+    not-a-global-ordering-key defect this whole mechanism exists to close,
+    just relocated to the offline-root window.
+
+    Structural answer chosen: option (ii) from the lead's brief - retention
+    REFUSES TO PRUNE for a launch whose own sequence could not be
+    established as reliable, rather than pruning on an ordering it knows
+    might be wrong. It resumes normally once every root is reachable again.
+
+    Primary's agent directory is turned into a reparse point (the same
+    privilege-independent mechanism proven on CI elsewhere in this suite,
+    applied to the agent dir rather than the root) so it EXISTS but cannot
+    be scanned - the real generations underneath are untouched and restored
+    afterward to verify none were pruned."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    primary = tmp_path / "primary"
+    fallback = tmp_path / "fallback"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    result_path = tmp_path / "uncertain-prune.json"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(primary))}",
+        f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+        "$WrapperLogGenerations = 2",
+        helpers,
+        # Build primary's history - quota=2 legitimately prunes down to the
+        # 2 newest during this normal build-up.
+        "1..3 | ForEach-Object {",
+        "  $t = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "  Complete-WrapperLogTargets $t",
+        "}",
+        f"$primaryAgentDir = Join-Path {_pslit(str(primary))} {_pslit(agent_leaf)}",
+        "$before = @(Get-ChildItem -LiteralPath $primaryAgentDir -Directory).Count",
+        # Primary's agent dir EXISTS but cannot be scanned - the real
+        # generations move aside untouched, reachable again once restored.
+        "Rename-Item -LiteralPath $primaryAgentDir -NewName 'worker-real'",
+        f"$victimReal = Join-Path {_pslit(str(primary))} 'worker-real'",
+        "$null = New-Item -ItemType Junction -Path $primaryAgentDir -Target $victimReal",
+        "$t2 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "Complete-WrapperLogTargets $t2",
+        "Remove-Item -LiteralPath $primaryAgentDir -Force",
+        f"Rename-Item -LiteralPath $victimReal -NewName {_pslit(agent_leaf)}",
+        "$after = @(Get-ChildItem -LiteralPath $primaryAgentDir -Directory).Count",
+        "@{ before = $before; after = $after; "
+        "uncertain = [bool]$t2.sequence_uncertain; "
+        "selected = [string]$t2.generation_dir } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "uncertain-prune.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["before"] == 2, "quota=2 did not settle primary to 2 during build-up"
+    assert payload["uncertain"] is True
+    assert Path(payload["selected"]).is_relative_to(fallback)
+    assert payload["after"] == 2, (
+        "primary lost a generation to pruning during a launch whose ordering "
+        "was known to be unreliable"
+    )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
 def test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker(
     tmp_path: Path,
@@ -6003,6 +6086,10 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "$env:AGENTTALK_WRAPPER_STDOUT_LOG = 'ambient-stdout'",
         "Invoke-RegularCase 'regular_python_wrap' 'python.exe' "
         "@('-m','agenttalk','wrap') $true 'wrap'",
+        "Invoke-RegularCase 'regular_unbuffered_wrap' 'python.exe' "
+        "@('-u','-m','agenttalk','wrap') $true 'wrap'",
+        "Invoke-RegularCase 'regular_xoption_wrap' 'python.exe' "
+        "@('-X','utf8','-m','agenttalk','wrap') $true 'wrap'",
         "Invoke-RegularCase 'regular_no_args' 'python.exe' @() $true 'wrap'",
         "Invoke-RegularCase 'regular_script_prefix' 'python.exe' "
         "@('helper.py','-m','agenttalk','wrap') $true 'wrap'",
@@ -6039,13 +6126,23 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
 
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
     rows = json.loads(out.read_text(encoding="utf-8-sig"))
+    # Finding A (PR 98 connector re-review, head 6495534): the nonce-injection
+    # fix for `-u`/`-X utf8` was applied to Add-SupervisorLaunchNonce but not
+    # to Test-AgenttalkWrapInvocation, so a valid `python -u -m agenttalk
+    # wrap` config got a nonce but no bounded log generation at all -
+    # regular_unbuffered_wrap/regular_xoption_wrap drive that decision
+    # through the REAL Launch function, not just the nonce helper directly.
     expected_logged = {
         "regular_python_wrap",
+        "regular_unbuffered_wrap",
+        "regular_xoption_wrap",
         "ephemeral_python_wrap",
         "ephemeral_console_wrap",
     }
     assert {row["name"] for row in rows} == {
         "regular_python_wrap",
+        "regular_unbuffered_wrap",
+        "regular_xoption_wrap",
         "regular_no_args",
         "regular_script_prefix",
         "regular_command_prefix",

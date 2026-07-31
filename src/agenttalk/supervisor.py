@@ -6104,6 +6104,50 @@ function Stop-Tree($targets) {
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
+function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens) {
+  # THE ONE place that recognizes a `python -m agenttalk` invocation past a
+  # bounded allowlist of interpreter options (`-u`, `-X utf8`, ...) - nonce
+  # injection, the bounded-logging eligibility check, and the legacy --root
+  # backfill all need this SAME recognition, and three independent copies is
+  # exactly how a valid `-u`/`-X` launch silently lost the logging capability
+  # while nonce injection (the one copy that had been patched) kept working.
+  # Returns the index of `-m` itself, or -1 if the argv does not have that
+  # shape - an unrecognized token before it stops the scan rather than being
+  # skipped, matching the existing `python helper.py -m agenttalk` and
+  # `python -c pass -m agenttalk` rejections: guessing past an unknown flag
+  # risks misclassifying a process that never actually runs the agenttalk
+  # module. NOTE: the parameter is NOT named $args - PowerShell's automatic
+  # $args variable silently shadows a same-named formal parameter, and the
+  # function then sees an empty list regardless of what the caller passed.
+  $boolFlags = @(
+    '-b', '-bb', '-B', '-d', '-E', '-i', '-I', '-O', '-OO',
+    '-q', '-s', '-S', '-t', '-tt', '-u', '-v'
+  )
+  $i = 0
+  while ($i -lt $argTokens.Count) {
+    $token = [string]$argTokens[$i]
+    if ($token -eq '-m') { break }
+    if ($boolFlags -contains $token) {
+      $i += 1
+      continue
+    }
+    if ($token -eq '-X' -or $token -eq '-W') {
+      $i += 2
+      continue
+    }
+    if ($token -like '-X?*' -or $token -like '-W?*') {
+      $i += 1
+      continue
+    }
+    return -1
+  }
+  if ($i + 1 -lt $argTokens.Count -and
+      $argTokens[$i] -eq '-m' -and
+      $argTokens[$i + 1] -eq 'agenttalk') {
+    return $i
+  }
+  return -1
+}
 function Ensure-AgenttalkWrapRootArg($argv) {
   # Older supervisor.json files launched wrappers as:
   #   python.exe -m agenttalk wrap --for NAME --loop ...
@@ -6114,9 +6158,8 @@ function Ensure-AgenttalkWrapRootArg($argv) {
   $args = @($argv)
   if ($args.Count -eq 0) { return $args }
   $scan = 0
-  if ($args.Count -ge 2 -and [string]$args[0] -eq '-m' -and [string]$args[1] -eq 'agenttalk') {
-    $scan = 2
-  }
+  $flagIndex = Resolve-AgenttalkModuleFlagIndex $args
+  if ($flagIndex -ge 0) { $scan = $flagIndex + 2 }
   $rootPresent = $false
   $wrapIndex = -1
   $i = $scan
@@ -6243,39 +6286,8 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
   }
   $stem = File-StemLower ([string]$file)
   if ($stem -in @('python','python3','py')) {
-    # Accept the canonical module-entry argv, optionally preceded by
-    # recognized no-op-for-us interpreter options (`-u`, `-X utf8`, ...) -
-    # a real launch config commonly adds these. Anything else before `-m`
-    # stops the scan rather than being skipped: searching for `-m agenttalk`
-    # anywhere in the command would misclassify `python helper.py -m
-    # agenttalk ...` (Python runs helper.py, so that process never installs
-    # the cooperative stream bound), and an unrecognized flag carries the
-    # same risk - fail closed on it rather than guess.
-    $boolFlags = @(
-      '-b', '-bb', '-B', '-d', '-E', '-i', '-I', '-O', '-OO',
-      '-q', '-s', '-S', '-t', '-tt', '-u', '-v'
-    )
-    $i = 0
-    while ($i -lt $args.Count) {
-      $token = [string]$args[$i]
-      if ($token -eq '-m') { break }
-      if ($boolFlags -contains $token) {
-        $i += 1
-        continue
-      }
-      if ($token -eq '-X' -or $token -eq '-W') {
-        $i += 2
-        continue
-      }
-      if ($token -like '-X?*' -or $token -like '-W?*') {
-        $i += 1
-        continue
-      }
-      break
-    }
-    if ($i + 1 -lt $args.Count -and
-        $args[$i] -eq '-m' -and
-        $args[$i + 1] -eq 'agenttalk') {
+    $i = Resolve-AgenttalkModuleFlagIndex $args
+    if ($i -ge 0) {
       # A direct assignment inside a plain `if` STATEMENT preserves the
       # array type; capturing an if/else USED AS AN EXPRESSION does not -
       # PowerShell enumerates a one-element array flowing through that
@@ -6320,12 +6332,9 @@ function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult) {
   $index = 0
   $stem = File-StemLower ([string]$file)
   if ($stem -in @('python','python3','py')) {
-    if ($args.Count -lt 2 -or
-        $args[0] -ne '-m' -or
-        $args[1] -ne 'agenttalk') {
-      return $false
-    }
-    $index = 2
+    $flagIndex = Resolve-AgenttalkModuleFlagIndex $args
+    if ($flagIndex -lt 0) { return $false }
+    $index = $flagIndex + 2
   } else {
     $leaf = File-LeafLower ([string]$file)
     if ($leaf -notin @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
@@ -6861,20 +6870,33 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
   # The generation NAME is still wall-clock-derived (for human readability),
   # but pruning must not rely on it as the sole age key - an operator-
   # corrected clock can make an old launch look permanently newest. A launch
-  # sequence fixes that, but ONLY if it is a global ordering key: a counter
-  # scoped to whichever root happened to accept THIS launch is not global -
-  # a persistent root reaching a high count and then going unavailable would
-  # let a fallback root's fresh, low count look oldest even though its
-  # launches are the genuinely newer ones. Scanning every configured root's
-  # existing generations for their recorded sequence, every time, makes the
-  # next value correct regardless of which root ends up accepting it - and a
-  # root that is unreadable this launch just contributes nothing to the max
-  # rather than failing the launch; it self-heals once reachable again.
+  # sequence fixes that, but ONLY if it is a global ordering key. Scanning
+  # every configured root's existing generations for their recorded
+  # sequence, every time, makes the next value correct regardless of which
+  # root ends up accepting it - EXCEPT that a root which EXISTS but could
+  # not be scanned (unreadable, disconnected, rejected) might be hiding a
+  # higher true sequence than the reachable roots show. Silently treating
+  # that root as contributing nothing to the max reintroduces the exact
+  # not-a-global-ordering-key defect this function exists to close, just
+  # relocated to the offline-root window: retention would then rank the
+  # unreadable root's stale generations ahead of genuinely newer ones once
+  # it becomes readable again, and PRUNE the newer evidence. So this also
+  # reports whether any CONFIGURED, EXISTING root could not be scanned -
+  # the caller must treat that launch's ordering as unreliable and skip
+  # pruning entirely THIS cycle rather than act on it, per the same
+  # fail-closed posture as an unresolved/pending generation. A root that
+  # has simply never been used (does not exist yet) is not uncertain -
+  # there is nothing there to miss.
   $seq = 0L
+  $uncertain = $false
   foreach ($scanRoot in $roots) {
     try {
+      $rootExists = Test-Path -LiteralPath $scanRoot -PathType Container
       $scanAgentDir = Get-SafeWrapperLogAgentDir $scanRoot $name $false
-      if ($null -eq $scanAgentDir) { continue }
+      if ($null -eq $scanAgentDir) {
+        if ($rootExists) { $uncertain = $true }
+        continue
+      }
       foreach ($existing in @(
         Get-ChildItem -LiteralPath $scanAgentDir -Directory -ErrorAction Stop
       )) {
@@ -6889,12 +6911,13 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
         }
       }
     } catch {
+      $uncertain = $true
       Write-Warning (
         "supervisor: cannot scan wrapper log root '{0}' for launch sequence ({1})" -f
         $scanRoot, $_.Exception.Message)
     }
   }
-  return $seq + 1L
+  return [pscustomobject]@{ next_sequence = ($seq + 1L); uncertain = $uncertain }
 }
 function New-WrapperLogPendingMarker([string]$attempt) {
   [IO.File]::WriteAllText(
@@ -6929,7 +6952,8 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
   # Computed ONCE, across every configured root, before the create attempts
   # below - so the recorded sequence reflects true global launch order no
   # matter which candidate root ends up accepting this generation.
-  $seq = Get-NextWrapperLogSequence $roots $name
+  $seqResult = Get-NextWrapperLogSequence $roots $name
+  $seq = $seqResult.next_sequence
 
   # Create the immutable destination before pruning any prior evidence. If the
   # persistent root cannot accept it, no old persistent evidence is removed
@@ -6991,6 +7015,7 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
     stderr = Join-Path $generationDir 'stderr.log'
     generation_dir = $generationDir
     agent_name = $name
+    sequence_uncertain = $seqResult.uncertain
   }
 }
 function Complete-WrapperLogTargets($targets) {
@@ -7010,6 +7035,20 @@ function Complete-WrapperLogTargets($targets) {
     Write-Warning (
       "supervisor: cannot commit wrapper log generation '{0}' ({1}); skipping prune" -f
       $generationDir, $_.Exception.Message)
+    return
+  }
+  if ([bool]$targets.sequence_uncertain) {
+    # This launch's own sequence could not be established as a true global
+    # max - some configured root existed but could not be scanned. Pruning
+    # now would rank whatever we CAN see against an incomplete picture, and
+    # could evict a genuinely newer generation living on the root we could
+    # not read. Commit (above) already happened - only pruning is skipped,
+    # and only for this one cycle; it resumes normally once every root is
+    # reachable again on a later launch.
+    Write-Warning (
+      ("supervisor: wrapper log launch sequence is unreliable for '{0}' " +
+       "(a configured root could not be scanned); skipping prune this cycle") -f
+      $generationDir)
     return
   }
 
