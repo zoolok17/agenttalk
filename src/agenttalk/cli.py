@@ -748,6 +748,19 @@ def _read_supervisor_snapshot(store: Store, path_value: str | None = None) -> li
     return raw if isinstance(raw, list) else None
 
 
+def _runtime_kill_switch_warnings(runtime_status: object) -> list[str]:
+    if not isinstance(runtime_status, dict):
+        return []
+    kill_switch = runtime_status.get("kill_switch")
+    if not isinstance(kill_switch, dict):
+        return []
+    return [
+        warning
+        for warning in kill_switch.get("warnings") or []
+        if isinstance(warning, str)
+    ]
+
+
 def _status_supervisor_summaries(store: Store, now_epoch: float,
                                  sup_cfg: dict) -> tuple[
                                      dict[str, dict], list[str], dict
@@ -766,7 +779,10 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
     except Exception as exc:
         return (
             {},
-            [f"supervisor_assessment_unavailable:{type(exc).__name__}"],
+            [
+                f"supervisor_assessment_unavailable:{type(exc).__name__}",
+                *_runtime_kill_switch_warnings(runtime_status),
+            ],
             runtime_status,
         )
     observed_runtime = obs.get("supervisor_runtime")
@@ -796,11 +812,7 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
     for warning in ring.get("warnings") or []:
         if isinstance(warning, str):
             warnings.append(warning)
-    kill_switch = runtime_status.get("kill_switch")
-    if isinstance(kill_switch, dict):
-        for warning in kill_switch.get("warnings") or []:
-            if isinstance(warning, str):
-                warnings.append(warning)
+    warnings.extend(_runtime_kill_switch_warnings(runtime_status))
     return rows, warnings, runtime_status
 
 

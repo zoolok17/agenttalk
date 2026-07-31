@@ -33,6 +33,7 @@ from agenttalk import (
     ephemeral as eph,
     health as hm,
     powershell_host as psh,
+    store as store_module,
     supervisor as sup,
     supervisor_lifecycle as lifecycle,
     supervisor_runtime as runtime_control,
@@ -546,6 +547,173 @@ def test_status_warns_on_oversized_runtime_epoch(
         "observed_at_epoch must be a finite epoch" in warning
         for warning in projected["warnings"]
     )
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement", "resolved"),
+    [
+        (
+            ("kill_switch", "observations", "startup", "observed_at"),
+            "garbage",
+            False,
+        ),
+        (
+            ("kill_switch", "first_observed_at"),
+            _iso(NOW + 1),
+            False,
+        ),
+        (
+            ("kill_switch", "resolved_at"),
+            _iso(NOW + 2),
+            True,
+        ),
+    ],
+    ids=["unparseable-phase", "mismatched-first", "mismatched-resolution"],
+)
+def test_status_rejects_runtime_timestamp_that_does_not_match_epoch(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    field_path: tuple[str, ...],
+    replacement: str,
+    resolved: bool,
+) -> None:
+    s = _team(tmp_path)
+    kill_switch = s.dir / "supervisor.kill"
+    kill_switch.write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    if resolved:
+        kill_switch.unlink()
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="mid_poll",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=NOW + 1,
+            validate_artifacts=lambda: None,
+        )
+    path = runtime_control.runtime_observation_path(s)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    target = record
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = replacement
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert _run(["status"], tmp_path) == 0
+
+    rendered = capsys.readouterr().out
+    assert "supervisor_runtime_observation_invalid:" in rendered
+    assert "startup observed garbage" not in rendered
+
+
+def test_status_rejects_first_observed_pair_not_backed_by_phase(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["kill_switch"]["first_observed_at"] = _iso(NOW + 1)
+    record["kill_switch"]["first_observed_at_epoch"] = NOW + 1
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert _run(["status"], tmp_path) == 0
+
+    assert "supervisor_runtime_observation_invalid:" in capsys.readouterr().out
+
+
+def test_default_observation_clock_is_sampled_after_lifecycle_lock_wait(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    kill_switch = s.dir / "supervisor.kill"
+    _allow_checked_kill_switch_observer(monkeypatch)
+    real_lock = s._supervisor_lifecycle_lock
+    attempted = threading.Event()
+    real_store_time = store_module.time
+
+    class ObservedLockWaitTime:
+        monotonic = staticmethod(real_store_time.monotonic)
+        time = staticmethod(real_store_time.time)
+
+        @staticmethod
+        def sleep(seconds: float) -> None:
+            attempted.set()
+            real_store_time.sleep(seconds)
+
+    class SwitchAwareClock:
+        @staticmethod
+        def time() -> float:
+            return NOW + 1 if kill_switch.exists() else NOW
+
+    monkeypatch.setattr(runtime_control, "time", SwitchAwareClock)
+
+    def observe() -> dict:
+        return runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=None,
+            validate_artifacts=lambda: None,
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with real_lock():
+            monkeypatch.setattr(store_module, "time", ObservedLockWaitTime)
+            future = pool.submit(observe)
+            assert attempted.wait(timeout=10)
+            kill_switch.write_text("appeared-during-lock-wait", encoding="utf-8")
+        result = future.result(timeout=10)
+
+    record = result["observation"]["kill_switch"]
+    assert record["first_observed_at_epoch"] == NOW + 1
+    assert record["observations"]["startup"]["observed_at_epoch"] == NOW + 1
+
+
+def test_kill_switch_observer_rejects_datetime_unrepresentable_epoch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+
+    with pytest.raises(
+        runtime_control.SupervisorRuntimeObservationError,
+        match="representable in UTC",
+    ):
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=1e300,
+            validate_artifacts=lambda: None,
+        )
+
+    assert not runtime_control.runtime_observation_path(s).exists()
 
 
 def test_status_warns_on_runtime_integer_beyond_json_conversion_limit(

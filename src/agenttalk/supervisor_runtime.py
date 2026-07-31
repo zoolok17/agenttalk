@@ -66,13 +66,33 @@ def _require_epoch(value: object, field: str) -> float:
         ) from exc
     if not math.isfinite(epoch):
         raise SupervisorRuntimeObservationError(f"{field} must be a finite epoch")
+    try:
+        datetime.fromtimestamp(epoch, timezone.utc)
+    except (OSError, OverflowError, ValueError) as exc:
+        raise SupervisorRuntimeObservationError(
+            f"{field} must be a finite epoch representable in UTC"
+        ) from exc
     return epoch
 
 
-def _require_timestamp(value: object, field: str) -> str:
+def _require_timestamp(value: object, field: str, *, epoch: float) -> str:
     if not isinstance(value, str) or not value or len(value) > 64:
         raise SupervisorRuntimeObservationError(f"{field} must be a bounded timestamp")
-    return value
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        expected = datetime.fromtimestamp(epoch, timezone.utc)
+    except (OSError, OverflowError, ValueError) as exc:
+        raise SupervisorRuntimeObservationError(
+            f"{field} must match its epoch"
+        ) from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed != expected
+    ):
+        raise SupervisorRuntimeObservationError(f"{field} must match its epoch")
+    return expected.isoformat().replace("+00:00", "Z")
 
 
 def _validate_phase_observation(phase: str, value: object) -> dict:
@@ -85,12 +105,14 @@ def _validate_phase_observation(phase: str, value: object) -> dict:
         raise SupervisorRuntimeObservationError(
             f"kill_switch.observations.{phase} has missing or extra fields"
         )
-    observed_at = _require_timestamp(
-        value.get("observed_at"), f"kill_switch.observations.{phase}.observed_at"
-    )
     observed_at_epoch = _require_epoch(
         value.get("observed_at_epoch"),
         f"kill_switch.observations.{phase}.observed_at_epoch",
+    )
+    observed_at = _require_timestamp(
+        value.get("observed_at"),
+        f"kill_switch.observations.{phase}.observed_at",
+        epoch=observed_at_epoch,
     )
     observer_pid = value.get("observer_pid")
     if (
@@ -156,12 +178,14 @@ def _validate_record(store: Store, value: object) -> dict:
         activation_id
     ):
         raise SupervisorRuntimeObservationError("kill_switch.activation_id is invalid")
-    first_observed_at = _require_timestamp(
-        kill_switch.get("first_observed_at"), "kill_switch.first_observed_at"
-    )
     first_observed_at_epoch = _require_epoch(
         kill_switch.get("first_observed_at_epoch"),
         "kill_switch.first_observed_at_epoch",
+    )
+    first_observed_at = _require_timestamp(
+        kill_switch.get("first_observed_at"),
+        "kill_switch.first_observed_at",
+        epoch=first_observed_at_epoch,
     )
     observations = kill_switch.get("observations")
     if (
@@ -176,6 +200,14 @@ def _validate_record(store: Store, value: object) -> dict:
         phase: _validate_phase_observation(phase, observation)
         for phase, observation in observations.items()
     }
+    if not any(
+        observation["observed_at"] == first_observed_at
+        and observation["observed_at_epoch"] == first_observed_at_epoch
+        for observation in clean_observations.values()
+    ):
+        raise SupervisorRuntimeObservationError(
+            "kill_switch.first_observed_at must match a phase observation"
+        )
     clean_kill_switch = {
         "active": active,
         "activation_id": activation_id,
@@ -184,12 +216,15 @@ def _validate_record(store: Store, value: object) -> dict:
         "observations": clean_observations,
     }
     if active is False:
-        clean_kill_switch["resolved_at"] = _require_timestamp(
-            kill_switch.get("resolved_at"), "kill_switch.resolved_at"
-        )
-        clean_kill_switch["resolved_at_epoch"] = _require_epoch(
+        resolved_at_epoch = _require_epoch(
             kill_switch.get("resolved_at_epoch"), "kill_switch.resolved_at_epoch"
         )
+        clean_kill_switch["resolved_at"] = _require_timestamp(
+            kill_switch.get("resolved_at"),
+            "kill_switch.resolved_at",
+            epoch=resolved_at_epoch,
+        )
+        clean_kill_switch["resolved_at_epoch"] = resolved_at_epoch
     return {
         "schema_version": RUNTIME_OBSERVATION_SCHEMA,
         "kind": _RUNTIME_KIND,
@@ -302,9 +337,8 @@ def observe_powershell_kill_switch(
         not isinstance(observer_pid_start, str) or len(observer_pid_start) > 256
     ):
         raise ValueError("observer_pid_start must be a bounded string or null")
-    observed_epoch = _require_epoch(
-        time.time() if now_epoch is None else now_epoch,
-        "now_epoch",
+    provided_epoch = (
+        None if now_epoch is None else _require_epoch(now_epoch, "now_epoch")
     )
 
     with supervisor_lifecycle.checked_powershell_supervisor_observer(
@@ -319,6 +353,11 @@ def observe_powershell_kill_switch(
             raise SupervisorRuntimeObservationError(
                 "supervisor.kill state is unreadable"
             )
+        observed_epoch = (
+            _require_epoch(time.time(), "now_epoch")
+            if provided_epoch is None
+            else provided_epoch
+        )
         try:
             record = _read_strict(store)
         except SupervisorRuntimeObservationError:
