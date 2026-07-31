@@ -6049,7 +6049,7 @@ class Store:
     # ------------------------------------------- dashboard intent queue (0.59.0)
     #
     # The web console can ONLY append a typed intent envelope here (architecture
-    # C, docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md): `state/intents/active/<id>.json`
+    # C, docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md): `state/intents/active/<id>.json`
     # holds queued/claimed/recent-terminal intents (reset-CLEARED - a queued
     # intent references current-session state, so firing it into a fresh session
     # would be wrong), while `.agenttalk/control-audit/intents/` holds the

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The lead skill now requires reading the code host's AUTOMATED review findings as a gate
+  step, in both the Claude and Codex editions.** Automated reviewers typically post findings
+  as INLINE comments on changed lines rather than in the review body, so a lead who reads
+  only the body sees an empty review and concludes there is nothing to act on. The step also
+  covers the two traps that make these findings easy to misread: an automated reviewer can be
+  hours ahead of a peer reviewer on the same defect, and inline comments re-anchor onto new
+  commits, so the anchor alone does not distinguish a new finding from a carried-over one.
+  Each finding now requires a per-finding disposition citing code.
+
 ### Fixed
 
 - **A kill switch present before supervisor startup is now durably visible.**

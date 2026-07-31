@@ -1,6 +1,6 @@
 """Dashboard intent queue: typed schema + the EXECUTOR (v0.59.0 write spine).
 
-Architecture C (docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md): the web tier can only
+Architecture C (docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md): the web tier can only
 APPEND a typed intent envelope (``store.write_intent``); this module is the
 other half - the supervised executor (``agenttalk supervise --drain-intents``)
 that claims queued intents, RE-RESOLVES ALL AUTHORITY SERVER-SIDE, and performs

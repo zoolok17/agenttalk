@@ -1,13 +1,15 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-18
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-30
 **Audience:** maintainers, operators, and agents deciding what to build next.
 **Horizon:** pragmatic next 2-3 quarters + a labeled "later" tier.
-**Current shipped baseline:** v0.74.1 (2026-07-12); runtime hardening has continued since (supervisor crash/durability fixes). `CHANGELOG.md` remains the release-history source of truth.
+**Current shipped baseline:** v0.79.1; runtime hardening has continued since v0.74.1 (supervisor crash/durability fixes, PowerShell baseline enforcement, publication-order guards). `CHANGELOG.md` remains the release-history source of truth.
 
 **Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus/store/CLI/wrapper) is already cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The **supervisor is the open platform gap** — it currently requires PowerShell Core 7+ and Windows-only `Win32_Process`; a POSIX supervisor path is an unbuilt follow-up (see §6 cross-cutting and §8).
 
-Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/TEST-COVERAGE-REPORT.md` (test inventory, coverage, and tooling recommendations) · `docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md` (dashboard control-plane design history) · `CHANGELOG.md`.
+Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/TEST-COVERAGE-REPORT.md` (test inventory, coverage, and tooling recommendations) · `docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md` (dashboard control-plane design history) · `docs/ROADMAP-ARCHIVE-2026-06.md` (**archived** early roadmap/working notes through v0.24.0 — do not plan from it) · `CHANGELOG.md`.
+
+**This file is the only current roadmap.** Two other files carry "roadmap" in their history: the archive above, and the dashboard design history. Both were renamed on 2026-07-30 so the current one is unambiguous.
 
 ---
 
@@ -185,6 +187,61 @@ Legacy adoption remains a flagship workflow, but it is no longer the whole roadm
 ---
 
 ## 6. Roadmap
+
+### 6.0 Near-term release plan
+
+The quarterly view below sets direction. This subsection is the *executable* near-term plan, and it follows
+the release discipline the team adopted: **one theme per release, at most four items, and an umbrella ships
+before its instances.** Anything not listed here is deliberately unscheduled — the backlog tail is large and
+most of it should not be planned yet.
+
+Sequencing note added 2026-07-30 after a production day in which a single wrapper defect consumed most of the
+fleet's implementation throughput: **the runtime must survive a long turn before anything else gets cheaper to
+build.** Every item below marked *(runtime)* exists because it was measured failing in the field, not
+predicted.
+
+#### v0.80.0 — "supervisor state has integrity" *(next; two items already complete)*
+
+| Item | What | State |
+|---|---|---|
+| Kill-switch startup persistence | A kill switch present at *startup* currently produces no state, no projection and no operator-visible record: the generated supervisor exits before the instance claim. Adds a switch-present observational mode with a durable record projected through `status`/`status --json` independent of `event_limit`. | implementation in review |
+| Supervisor-state lock + single checked owner | `load_supervisor_state`/`save_supervisor_state` hold no lock across the read-modify-write, so two writers lose an update. Introduces one data-only checked owner, an enforced lock order with state as the terminal leaf, and removes the second (PowerShell) writer entirely rather than trying to synchronise two implementations. | complete, blocked on the item above |
+| Watchdog kill must fail the turn *(runtime)* | When the per-turn watchdog kills a hung tool tree the wrapper freezes at `phase=active` with no terminal outcome, so the turn is never failed, never reported and never released. The wrapper's *shutdown* path already writes the correct terminal record — the watchdog path simply skips it. Small fix, highest value on the board. | scoped |
+| Wrapper stdout/stderr capture *(runtime)* | Wrappers launch with a hidden window and no output redirection, so a dying wrapper's traceback is destroyed by construction. Adds bounded, rotated per-agent capture plus factual lifecycle-event lines (never self-assessed health). | partially implemented |
+
+#### v0.81.0 — "a wrapped agent never dies silently" *(runtime)*
+
+| Item | What |
+|---|---|
+| Gate execution outside the turn envelope | Running the project's own gate inside a wrapped turn *guarantees* a watchdog kill: the source pytest leg caps at 2700s while the watchdog tolerates a 600s tool descendant inside a 1800s turn. The practice half (targeted tests in-turn, CI as the gate) is already in force; this ships the durable half — an owned, bounded, start-guarded detached runner that outlives the turn and writes SHA-bound evidence. |
+| Same-message livelock visibility | A message whose processing wedges the wrapper is retried forever, and every later instruction — including the one that would fix it — is starved behind it. The runtime record already carries `message_id`; nothing compares it across turns. Surface consecutive same-message turn starts, and park a repeatedly-wedging message rather than starving the queue. |
+| Strict health reaches operator surfaces | The strict child verdict never reached `status`, `doctor` or the console, so a wrapper with a dead child reads green. A verdict must not be presented where an observation belongs. |
+| Provision the `.agenttalk/` ignore rule | `ASSURANCE.md` asserts the state directory is gitignored as a *structural* property, but nothing provisions the rule on `init`. |
+
+#### v0.82.0 — "recovery actually recovers"
+
+Umbrella first, per the release discipline.
+
+| Item | What |
+|---|---|
+| Define + gate the recovery-actually-recovers invariant | The umbrella. Recovery currently *attempts* and reports success while nothing recovers. Make the invariant explicit and gated. |
+| Owned process tree per agent | Ownership traversal stops at shell hosts, so the tool descendant that actually wedges a wrapper appears in no durable record. Evolve the existing per-poll projection into a bounded, role-tagged owned tree, anchored on `(pid, start)` + generation + launch nonce, and feed the existing start-guarded kill primitive. Names and command lines may *label* an owned row, never establish ownership. |
+| Terminate an orphaned wrapper; bound the retry | Recovery is defined as "launch a replacement", which the launch barrier correctly refuses while the incumbent survives — so the cycle backs off exponentially and fades into silence. Something must own terminating a *provably childless* wrapper, and the retry cycle needs a hard cap that escalates instead of going quiet. |
+| Absence is not staleness | A twice-confirmed-absent wrapper waits out the per-CLI heartbeat threshold (up to 2400s for Codex) before relaunch. The heartbeat answers "is this agent still working?"; a complete process snapshot answers "does this process exist?" — conflating them is the defect. Independently stageable, and must not wait for the rest of the recovery-authority design. |
+
+#### v0.83.0 and beyond — recovery-authority design, implemented in slices
+
+The supervisor recovery-authority design was split after two review rounds produced a *growing* finding count:
+a single document was specifying a state machine, a persistence/delivery promise and a migration plan at once.
+The slices ship separately — classifier/authority core first, then the incident/delivery contract (which
+depends on the state-lock work in v0.80.0), then migration/rollback. Nothing merges without a fresh
+independent panel.
+
+#### Deliberately unscheduled
+
+CI determinism and the security-stack pin; the wall-clock flake family; the earned-green invariant; the
+assurance/DoD authentication and waiver-expiry items; bus/knowledge resolution and vocabulary items; and the
+alternative-worker evaluations. These are tracked, not planned.
 
 ### Quarter 1 - prove the delivery spine
 
