@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -29,7 +30,7 @@ from agenttalk import (
     supervisor as sup,
     wrapper_runtime as wrt,
 )
-from agenttalk.store import Store
+from agenttalk.store import Store, _process_alive
 
 
 def _run(argv: list[str], root: Path) -> int:
@@ -5546,6 +5547,23 @@ def test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit(
         text=True,
     )
     try:
+        # A cold Windows PowerShell 5.1 host under a loaded runner can take
+        # a while just to START - that startup latency has nothing to do
+        # with the property under test (pipe inheritance) and must not
+        # share a budget with it. Wait for the deterministic signal that
+        # the PS parent finished its own work (it wrote the result JSON
+        # right after the async launch returned) before timing the pipe
+        # closure itself, so a slow start can never masquerade as either a
+        # timeout OR a false "pipes stayed open" report.
+        startup_deadline = time.monotonic() + 60
+        while time.monotonic() < startup_deadline and not result_path.exists():
+            if proc.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert result_path.exists(), (
+            f"PS parent never reached its result-write instruction: "
+            f"{proc.poll()}"
+        )
         try:
             stdout, stderr = proc.communicate(timeout=15)
         except subprocess.TimeoutExpired:
@@ -5568,19 +5586,9 @@ def test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit(
         # interpreter child executes this code with a different PID (#50).
         # Pipe closure depends on the launcher staying live and the worker's
         # output reaching only the selected files, not on PID equality.
-        alive = subprocess.run(
-            [
-                shell,
-                "-NoProfile",
-                "-Command",
-                f"if (Get-Process -Id {payload['pid']} -ErrorAction SilentlyContinue) "
-                "{ exit 0 } else { exit 1 }",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        assert alive.returncode == 0
+        # Checked in-process (no auxiliary PowerShell spawn, no extra
+        # wall-clock budget to share with the property under test).
+        assert _process_alive(int(payload["pid"]))
         deadline = time.monotonic() + 5
         captured_stdout = ""
         captured_stderr = ""
@@ -5603,22 +5611,15 @@ def test_ps_wrapper_redirect_closes_supervisor_capture_pipes_before_child_exit(
         assert "PIPE-CLOSURE-STDERR" in captured_stderr
     finally:
         stop_path.write_text("stop", encoding="utf-8")
+        # Best-effort teardown only: kill in-process (no auxiliary PowerShell
+        # spawn to add its own timeout risk) and never let cleanup fail a
+        # test that already passed its actual assertions.
         if pid_path.exists():
-            child_pid = int(pid_path.read_text(encoding="utf-8"))
-            subprocess.run(
-                [
-                    shell,
-                    "-NoProfile",
-                    "-Command",
-                    f"Wait-Process -Id {child_pid} -Timeout 5 "
-                    "-ErrorAction SilentlyContinue; "
-                    f"Stop-Process -Id {child_pid} -Force "
-                    "-ErrorAction SilentlyContinue",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            )
+            try:
+                child_pid = int(pid_path.read_text(encoding="utf-8"))
+                os.kill(child_pid, signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
 
 
 def test_manual_restart_marker_clears_only_after_readiness(tmp_path: Path) -> None:
