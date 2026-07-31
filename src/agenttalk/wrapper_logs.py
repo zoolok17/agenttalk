@@ -5,6 +5,14 @@ directory.  Once ``agenttalk wrap`` is running, this module keeps the redirected
 bootstrap stream bounded and mirrors the newest output through a fixed segment
 ring.  The lifecycle JSONL is diagnostic output only: it is never read by the
 supervisor and carries no health or restart authority.
+
+The bound is Python-level only: it wraps ``sys.stdout``/``sys.stderr`` and
+bounds whatever text is written through those objects.  A write that reaches
+file descriptor 1/2 directly - bypassing the Python stream objects entirely -
+is not intercepted. No such writer exists in this project today (no third-party
+dependencies, no direct ``os.write(1/2, ...)`` call, and the wrapped model
+child's own stdout/stderr are piped rather than inherited), so the gap is
+tracked but not yet closed.
 """
 
 from __future__ import annotations
