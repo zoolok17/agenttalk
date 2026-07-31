@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.80.0] - 2026-07-31
+
+Theme: **a watchdog kill must fail the turn.** Scoped down from four items to one during the release
+round: the three supervisor items originally declared for 0.80.0 (kill-switch startup persistence,
+the supervisor-state lock, wrapper stdout/stderr capture) each produced a *growing* count of confirmed
+independent-review findings rather than a shrinking one, so they ship in 0.81.0 after they converge
+instead of half-converged here. The same split discipline already applied to the recovery-authority
+design. The item that did ship is the one measured to cost the most in the field.
+
+### Fixed
+
+- **A watchdog-killed turn now unwinds into a terminal outcome instead of wedging the wrapper it
+  was protecting.** When the per-turn watchdog killed a hung tool tree, the wrapper froze at
+  `phase=active` with no terminal record: the turn was never failed, never reported and never
+  released, so the agent stayed silently unavailable until an operator noticed and reset it by
+  hand. The shutdown path already wrote the correct terminal record; the watchdog path simply
+  skipped it. Measured ten times in production before the fix, each identifiable by
+  `last_progress_at - cli_launcher_start` landing within a few seconds of the 1800s turn cap.
+  Two defects found by independent review during the fix are included: a *reported* kill is no
+  longer treated as an exit confirmation (the wake now waits for confirmed root exit), and the
+  watchdog stays armed through that confirmation, so a root that closes stdout while remaining
+  alive and hung can still be reached.
+
 ### Changed
 
 - **The lead skill now requires reading the code host's AUTOMATED review findings as a gate
@@ -17,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hours ahead of a peer reviewer on the same defect, and inline comments re-anchor onto new
   commits, so the anchor alone does not distinguish a new finding from a carried-over one.
   Each finding now requires a per-finding disposition citing code.
+
+- **CI supersedes stale runs instead of queueing an additional full matrix per push**
+  (contributor-facing; no runtime effect). Both workflows now declare a concurrency group keyed
+  on workflow and ref. `master` is deliberately exempt from cancellation so that a release-gating
+  or version-ratchet run is never killed by a following push.
 
 ### Fixed
 

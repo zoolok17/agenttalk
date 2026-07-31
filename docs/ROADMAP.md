@@ -200,16 +200,27 @@ fleet's implementation throughput: **the runtime must survive a long turn before
 build.** Every item below marked *(runtime)* exists because it was measured failing in the field, not
 predicted.
 
-#### v0.80.0 — "supervisor state has integrity" *(next; two items already complete)*
+#### v0.80.0 — "a watchdog kill must fail the turn" *(SHIPPED 2026-07-31)*
+
+| Item | What | State |
+|---|---|---|
+| Watchdog kill must fail the turn *(runtime)* | When the per-turn watchdog kills a hung tool tree the wrapper freezes at `phase=active` with no terminal outcome, so the turn is never failed, never reported and never released. The wrapper's *shutdown* path already writes the correct terminal record — the watchdog path simply skips it. Small fix, highest value on the board. | **shipped** |
+
+Scoped down from four items to one during the release round. The three supervisor items originally declared
+here were moved to v0.81.0 because each produced a *growing* count of confirmed independent-review findings
+rather than a shrinking one — the same signal that split the recovery-authority design below. Every finding
+the implementers checked was real, so the code was improving; it was simply not converging on a release
+clock. Shipping the one measured-highest-value item beat shipping four half-converged ones.
+
+#### v0.81.0 — "supervisor state has integrity" *(deferred from v0.80.0; all three have implementations in review)*
 
 | Item | What | State |
 |---|---|---|
 | Kill-switch startup persistence | A kill switch present at *startup* currently produces no state, no projection and no operator-visible record: the generated supervisor exits before the instance claim. Adds a switch-present observational mode with a durable record projected through `status`/`status --json` independent of `event_limit`. | implementation in review |
-| Supervisor-state lock + single checked owner | `load_supervisor_state`/`save_supervisor_state` hold no lock across the read-modify-write, so two writers lose an update. Introduces one data-only checked owner, an enforced lock order with state as the terminal leaf, and removes the second (PowerShell) writer entirely rather than trying to synchronise two implementations. | complete, blocked on the item above |
-| Watchdog kill must fail the turn *(runtime)* | When the per-turn watchdog kills a hung tool tree the wrapper freezes at `phase=active` with no terminal outcome, so the turn is never failed, never reported and never released. The wrapper's *shutdown* path already writes the correct terminal record — the watchdog path simply skips it. Small fix, highest value on the board. | scoped |
-| Wrapper stdout/stderr capture *(runtime)* | Wrappers launch with a hidden window and no output redirection, so a dying wrapper's traceback is destroyed by construction. Adds bounded, rotated per-agent capture plus factual lifecycle-event lines (never self-assessed health). | partially implemented |
+| Supervisor-state lock + single checked owner | `load_supervisor_state`/`save_supervisor_state` hold no lock across the read-modify-write, so two writers lose an update. Introduces one data-only checked owner, an enforced lock order with state as the terminal leaf, and removes the second (PowerShell) writer entirely rather than trying to synchronise two implementations. | complete, never gated; ports cleanly onto the item above |
+| Wrapper stdout/stderr capture *(runtime)* | Wrappers launch with a hidden window and no output redirection, so a dying wrapper's traceback is destroyed by construction. Adds bounded, rotated per-agent capture plus factual lifecycle-event lines (never self-assessed health). | implementation in review |
 
-#### v0.81.0 — "a wrapped agent never dies silently" *(runtime)*
+#### v0.82.0 — "a wrapped agent never dies silently" *(runtime)*
 
 | Item | What |
 |---|---|
@@ -218,7 +229,7 @@ predicted.
 | Strict health reaches operator surfaces | The strict child verdict never reached `status`, `doctor` or the console, so a wrapper with a dead child reads green. A verdict must not be presented where an observation belongs. |
 | Provision the `.agenttalk/` ignore rule | `ASSURANCE.md` asserts the state directory is gitignored as a *structural* property, but nothing provisions the rule on `init`. |
 
-#### v0.82.0 — "recovery actually recovers"
+#### v0.83.0 — "recovery actually recovers"
 
 Umbrella first, per the release discipline.
 
@@ -229,12 +240,12 @@ Umbrella first, per the release discipline.
 | Terminate an orphaned wrapper; bound the retry | Recovery is defined as "launch a replacement", which the launch barrier correctly refuses while the incumbent survives — so the cycle backs off exponentially and fades into silence. Something must own terminating a *provably childless* wrapper, and the retry cycle needs a hard cap that escalates instead of going quiet. |
 | Absence is not staleness | A twice-confirmed-absent wrapper waits out the per-CLI heartbeat threshold (up to 2400s for Codex) before relaunch. The heartbeat answers "is this agent still working?"; a complete process snapshot answers "does this process exist?" — conflating them is the defect. Independently stageable, and must not wait for the rest of the recovery-authority design. |
 
-#### v0.83.0 and beyond — recovery-authority design, implemented in slices
+#### v0.84.0 and beyond — recovery-authority design, implemented in slices
 
 The supervisor recovery-authority design was split after two review rounds produced a *growing* finding count:
 a single document was specifying a state machine, a persistence/delivery promise and a migration plan at once.
 The slices ship separately — classifier/authority core first, then the incident/delivery contract (which
-depends on the state-lock work in v0.80.0), then migration/rollback. Nothing merges without a fresh
+depends on the state-lock work in v0.81.0), then migration/rollback. Nothing merges without a fresh
 independent panel.
 
 #### Deliberately unscheduled
