@@ -14,10 +14,10 @@ TWO-FACTOR and BOTH are required:
 Pure reasoning has no live tool descendant, so factor 2 never fires on it. On fire the
 watchdog kills ONLY the per-turn root's process tree (descendants first, start-time
 guarded against pid reuse, then the root); never ancestors/siblings. It NEVER kills on
-a missing/failed snapshot or a root start-time mismatch (FAIL-OPEN). The kill closes
-the child's stdout, so ``_ProcStream``'s stream ends and the turn is classified
-``CLASS_AMBIGUOUS`` (never poison) - the inbound message stays pending and rides the
-high ``K_escalate`` ceiling.
+a missing/failed snapshot or a root start-time mismatch (FAIL-OPEN). A confirmed root
+kill explicitly wakes ``_ProcStream`` rather than assuming every inherited stdout
+writer also disappeared, so the turn is classified ``CLASS_AMBIGUOUS`` (never poison) -
+the inbound message stays pending and rides the high ``K_escalate`` ceiling.
 
 Layering: the discriminator + target selection are PURE (a snapshot dict in, a decision
 out) and fully unit-tested with fake snapshots; only the thin OS adapter
@@ -391,7 +391,8 @@ class TurnWatchdog:
                  snapshot_fn: Callable[[], Snapshot | None] | None = None,
                  kill_fn: Callable[[list[int]], list[int]] | None = None,
                  clock: Callable[[], float] = time.monotonic,
-                 wall_clock: Callable[[], float] = time.time) -> None:
+                 wall_clock: Callable[[], float] = time.time,
+                 on_fire: Callable[[dict], None] | None = None) -> None:
         self._root_pid = root_pid
         self._root_start = root_start
         self._cfg = cfg
@@ -399,6 +400,7 @@ class TurnWatchdog:
         self._kill_fn = kill_fn or kill_targets
         self._clock = clock
         self._wall = wall_clock
+        self._on_fire = on_fire
         self._stop = threading.Event()
         self._first_seen: dict[int, float] = {}
         self.result: dict | None = None
@@ -444,7 +446,7 @@ class TurnWatchdog:
             killed = self._kill_fn(decision.kill_order)
         except Exception as e:  # noqa: BLE001 - a kill failure must not crash the daemon
             kill_error = str(e)
-        self.result = {
+        result = {
             "fired": True,
             "root_pid": self._root_pid,
             "root_start": self._root_start,
@@ -455,6 +457,12 @@ class TurnWatchdog:
             "kill_error": kill_error,
             "summary": _fire_summary(decision, elapsed),
         }
+        self.result = result
+        if self._on_fire is not None:
+            try:
+                self._on_fire(dict(result))
+            except Exception:  # noqa: BLE001, S110 - observer cannot undo the guarded kill  # nosec B110
+                pass
 
 
 def _fire_summary(decision: WatchdogDecision, elapsed: float) -> str:

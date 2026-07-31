@@ -1,3 +1,6 @@
 8d0dbb7010538d6e21b85074fd6c67b7bb12e06f:tests/test_supervisor.py:generic-api-key:775
 276a049e21285f59fc841db8acafeb6433650636:tests/test_wrapper_health.py:generic-api-key:213
 722bb9dd33ef926f9c39cf9bbae56abe19d5381f:tests/test_wrapper_health.py:generic-api-key:213
+# Public schema type used by ChildEstablishmentGuardV1.key; not a credential.
+0ae2e8858614efd2f1294e1cd2eb7a98e2564e37:docs/DESIGN-87A-supervisor-classifier-authority.md:generic-api-key:377
+0ae2e8858614efd2f1294e1cd2eb7a98e2564e37:docs/DESIGN-87A-supervisor-classifier-authority.md:generic-api-key:383

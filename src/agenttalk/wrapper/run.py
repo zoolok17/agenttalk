@@ -12,8 +12,10 @@ a restart-request marker.
 
 from __future__ import annotations
 
-import errno
+import codecs
 import contextlib
+import errno
+import io
 import json
 import os
 from pathlib import Path
@@ -22,6 +24,7 @@ import shutil
 # subprocess spawns ONLY the operator-provided CLI launch command; never shell=True.
 import subprocess  # nosec B404
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator
@@ -56,6 +59,8 @@ WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
 INBOUND_REQUEST_ID_ENV = "AGENTTALK_INBOUND_REQUEST_ID"
 OVH_QWEN_CLAUDE_MAX_OUTPUT = "4096"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
+_WATCHDOG_STREAM_POLL_SECONDS = 0.05
+_WATCHDOG_STREAM_READ_BYTES = 64 * 1024
 
 
 class _GatewayChildCapUnavailable(RuntimeError):
@@ -646,6 +651,45 @@ def _close_pipe_suppressing_benign_pipe_teardown(pipe) -> None:
     except OSError as exc:
         if not _is_benign_pipe_teardown_error(exc):
             raise
+
+
+def _read_ready_pipe_chunk(pipe) -> bytes | None:
+    """Read one available binary chunk without waiting for a line or pipe EOF.
+
+    ``None`` means the pipe is still open but has no bytes ready; ``b""`` means
+    EOF.  The watchdog stream uses this instead of a blocking TextIO iterator so
+    an inherited writer cannot strand a reader thread after the protected root
+    has exited.
+    """
+    buffered = getattr(pipe, "buffer", pipe)
+    raw = getattr(buffered, "raw", buffered)
+    fd = raw.fileno()
+    if os.name == "nt":
+        import _winapi
+        import msvcrt
+
+        try:
+            available, _message_left = _winapi.PeekNamedPipe(
+                msvcrt.get_osfhandle(fd), 0
+            )
+        except BrokenPipeError:
+            return b""
+        if available <= 0:
+            return None
+        size = min(int(available), _WATCHDOG_STREAM_READ_BYTES)
+    else:
+        import select
+
+        readable, _, _ = select.select([fd], [], [], 0.0)
+        if not readable:
+            return None
+        size = _WATCHDOG_STREAM_READ_BYTES
+    try:
+        return os.read(fd, size)
+    except OSError as exc:
+        if _is_benign_pipe_teardown_error(exc):
+            return b""
+        raise
 
 
 def _workspace_root() -> Path:
@@ -1509,6 +1553,10 @@ class _ProcStream:
         self.pid_start: str | None = None
         self.watchdog_result: dict | None = None
         self._watchdog = None
+        self._watchdog_stream_condition = threading.Condition()
+        self._watchdog_stream_interrupted = False
+        self._watchdog_stream_done = False
+        self._watchdog_root_waiter: threading.Thread | None = None
         self.work_heartbeat_result: dict | None = None
         self._work_hb = None
         try:
@@ -1525,14 +1573,16 @@ class _ProcStream:
                 if stdin_text is not None:
                     self._proc.stdin.write(stdin_text)
                 self._proc.stdin.close()
-            # Per-turn watchdog (off unless an ENABLED config is passed). A structured result
-            # lands on .watchdog_result iff it fires (the kill closes stdout -> __iter__ ends).
+            # Per-turn watchdog (off unless an ENABLED config is passed). A confirmed
+            # root kill wakes the iterator explicitly; inherited writers may keep the
+            # OS pipe open after the protected child is gone.
             if watchdog is not None and watchdog.enabled:
                 from .turn_watchdog import TurnWatchdog
                 self._watchdog = TurnWatchdog(
                     root_pid=self._proc.pid, root_start=self._root_start, cfg=watchdog,
                     snapshot_fn=watchdog_snapshot_fn, kill_fn=watchdog_kill_fn,
-                    clock=watchdog_clock, wall_clock=watchdog_wall_clock)
+                    clock=watchdog_clock, wall_clock=watchdog_wall_clock,
+                    on_fire=self._handle_watchdog_fire)
                 self._watchdog.start()
             # Bounded in-turn work heartbeat (wrapped-Claude false-STUCK fix): stamps the
             # supervisor heartbeat while THIS child is alive, capped at max_turn_seconds.
@@ -1553,9 +1603,17 @@ class _ProcStream:
             raise
 
     def __iter__(self) -> Iterator[str]:
+        consumer_aborted = False
         try:
-            yield from _iter_suppressing_benign_pipe_teardown(self._proc.stdout or [])
+            if self._watchdog is None:
+                yield from _iter_suppressing_benign_pipe_teardown(
+                    self._proc.stdout or []
+                )
+            else:
+                yield from self._iter_until_watchdog_or_eof()
         finally:
+            if self._watchdog is not None:
+                consumer_aborted = self._cancel_watchdog_stream_after_consumer_exit()
             # Stop the work-heartbeat ticker FIRST - before this stream reads as
             # exhausted to the caller - so drive()'s failed-turn clear_heartbeat
             # (which runs after stream exhaustion) can never be overwritten by a
@@ -1568,14 +1626,135 @@ class _ProcStream:
                 self.work_heartbeat_result = dict(self._work_hb.result)
             if self._proc.stdout:
                 _close_pipe_suppressing_benign_pipe_teardown(self._proc.stdout)
-            self.returncode = self._proc.wait()
-            # Stop + join the watchdog AFTER the child has exited: a normal turn completion
-            # makes the thread exit its wait immediately (no kill race), and a watchdog that
-            # already fired published its result before we read it here.
-            if self._watchdog is not None:
+            # Owner cancellation is authoritative and must stop the watchdog before
+            # it competes with abort cleanup. Natural stdout EOF is not root exit:
+            # keep the watchdog armed through the root wait so an EOF-then-hung
+            # process can still reach the two-factor kill boundary.
+            if self._watchdog is not None and consumer_aborted:
                 self._watchdog.stop()
                 self._watchdog.join(timeout=10.0)
                 self.watchdog_result = self._watchdog.result
+            if consumer_aborted:
+                try:
+                    if self._proc.poll() is None:
+                        self._proc.terminate()
+                except Exception:  # noqa: BLE001, S110 - preserve the consumer's failure  # nosec B110
+                    pass
+            try:
+                if self._watchdog_stream_interrupted:
+                    if consumer_aborted:
+                        try:
+                            self.returncode = self._proc.wait(timeout=10.0)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                self._proc.kill()
+                                self.returncode = self._proc.wait(timeout=5.0)
+                            except Exception:  # noqa: BLE001 - cleanup must preserve owner failure
+                                self.returncode = self._proc.poll()
+                    else:
+                        # A watchdog wake is an exit confirmation, never merely a signal
+                        # report. Fail closed if that invariant is ever violated.
+                        self.returncode = self._proc.wait()
+                else:
+                    self.returncode = self._proc.wait()
+            finally:
+                if self._watchdog is not None and not consumer_aborted:
+                    self._watchdog.stop()
+                    # Root exit is not enough to publish this turn while the
+                    # watchdog may still be finishing its start-guarded kill
+                    # pass.  Production snapshot/kill operations are bounded,
+                    # so wait for that pass to finish before exposing its
+                    # result or allowing the next turn to start.
+                    self._watchdog.join()
+                    self.watchdog_result = self._watchdog.result
+
+    def _interrupt_watchdog_stream(self) -> None:
+        with self._watchdog_stream_condition:
+            self._watchdog_stream_interrupted = True
+            self._watchdog_stream_condition.notify_all()
+
+    def _cancel_watchdog_stream_after_consumer_exit(self) -> bool:
+        """Cancel direct pipe reads when the owner stopped before EOF or watchdog wake."""
+        with self._watchdog_stream_condition:
+            if self._watchdog_stream_interrupted:
+                return False
+            if self._watchdog_stream_done:
+                return False
+            self._watchdog_stream_interrupted = True
+            self._watchdog_stream_condition.notify_all()
+            return True
+
+    def _handle_watchdog_fire(self, result: dict) -> None:
+        """Wake a live pipe reader once the protected root has exited."""
+        with self._watchdog_stream_condition:
+            # Natural EOF already handed root-exit confirmation to the owner wait.
+            # Starting a second Popen waiter here is unnecessary and can race the
+            # owner's reap on POSIX.
+            if self._watchdog_stream_interrupted or self._watchdog_stream_done:
+                return
+        # kill_targets reports that a start-guarded signal was requested, not that
+        # process termination has completed. Never publish an idle turn while this
+        # Popen handle can still be alive.
+        if self._proc.poll() is not None:
+            self._interrupt_watchdog_stream()
+            return
+        with self._watchdog_stream_condition:
+            if self._watchdog_root_waiter is not None:
+                return
+            self._watchdog_root_waiter = threading.Thread(
+                target=self._wake_after_watchdog_root_exit,
+                name="turn-watchdog-root-waiter",
+                daemon=True,
+            )
+            waiter = self._watchdog_root_waiter
+        waiter.start()
+
+    def _wake_after_watchdog_root_exit(self) -> None:
+        try:
+            self._proc.wait()
+        except Exception:  # noqa: BLE001 - an unconfirmed root exit must stay fail-closed
+            return
+        self._interrupt_watchdog_stream()
+
+    def _iter_until_watchdog_or_eof(self) -> Iterator[str]:
+        stdout = self._proc.stdout
+        if stdout is None:
+            with self._watchdog_stream_condition:
+                self._watchdog_stream_done = True
+            return
+        decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder("utf-8")("replace"),
+            translate=True,
+        )
+        pending = ""
+        while True:
+            with self._watchdog_stream_condition:
+                if self._watchdog_stream_interrupted:
+                    return
+            chunk = _read_ready_pipe_chunk(stdout)
+            if chunk is None:
+                with self._watchdog_stream_condition:
+                    if self._watchdog_stream_interrupted:
+                        return
+                    self._watchdog_stream_condition.wait(
+                        timeout=_WATCHDOG_STREAM_POLL_SECONDS
+                    )
+                continue
+            if chunk == b"":
+                pending += decoder.decode(b"", final=True)
+                with self._watchdog_stream_condition:
+                    self._watchdog_stream_done = True
+                    self._watchdog_stream_condition.notify_all()
+                if pending:
+                    yield pending
+                return
+            pending += decoder.decode(chunk)
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                with self._watchdog_stream_condition:
+                    if self._watchdog_stream_interrupted:
+                        return
+                yield f"{line}\n"
 
     def _cleanup_after_constructor_error(self) -> None:
         # Best-effort only: preserve the original constructor failure so make_drive
@@ -2204,12 +2383,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         # _ProcStream reports the child exit code (nonzero = failed turn).
         sig["rc"] = getattr(stream, "returncode", None)
         # A fired per-turn watchdog (hung tool descendant killed) is the AUTHORITATIVE
-        # cause of this turn's death - it closed the stream, so rc/partial-stream signals
-        # are downstream noise. Carry it for _classify to check FIRST.
+        # cause of this turn's death. Its explicit wake ended the stream, so
+        # rc/partial-stream signals are downstream noise. Carry it for _classify first.
         sig["watchdog"] = getattr(stream, "watchdog_result", None)
         _finalize_child_output()
         sig["ok"] = (
             sig["completed"]
+            and not sig.get("watchdog")
             and not sig["terminal"]
             and not sig["config_blocked"]
             and sig["bus_failure"] is None
@@ -2220,6 +2400,19 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
 
     def _classify(sig: dict) -> tuple[str, str]:
         return _classify_drive_failure(sig, backend_profile=backend_profile)
+
+    def _finish_watchdog_recovery(sig: dict) -> None:
+        if not sig.get("watchdog"):
+            return
+        if heartbeat is not None:
+            heartbeat()
+        else:
+            store.write_heartbeat(agent)
+        if runtime_writer is not None:
+            # _run_one already published terminal/failed. Release the killed
+            # turn's identity through the existing idle transition so the live
+            # wrapper can own another turn while preserving last_outcome=failed.
+            runtime_writer.idle()
 
     def drive(record: dict) -> DriveOutcome:
         nonlocal active_message_id, active_parent_request_id
@@ -2284,6 +2477,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 if persist is not None:
                     persist(session_state)
                 health_writer.failure(sig, resume_failure_class)
+                _finish_watchdog_recovery(sig)
                 return DriveOutcome(
                     ok=False,
                     failure_class=resume_failure_class,
@@ -2313,6 +2507,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 if persist is not None:
                     persist(session_state)
                 health_writer.failure(sig, CLASS_AMBIGUOUS)
+                _finish_watchdog_recovery(sig)
                 return DriveOutcome(
                     ok=False,
                     failure_class=CLASS_AMBIGUOUS,
@@ -2320,6 +2515,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     child_output_tail=sig.get("child_output_tail"),
                 )
             health_writer.failure(sig, CLASS_AMBIGUOUS if attributable else resume_failure_class)
+            _finish_watchdog_recovery(sig)
             return DriveOutcome(
                 ok=False,
                 failure_class=CLASS_AMBIGUOUS if attributable else resume_failure_class,
@@ -2384,11 +2580,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         # the clear above) - otherwise the supervisor would ALSO relaunch a healthy wrapper.
         # Ordinary failures keep the cleared heartbeat. A lost-lease raise from the injected
         # hook is NOT masked (reviewer-1 ask) - it propagates exactly like the success path.
-        if sig.get("watchdog"):
-            if heartbeat is not None:
-                heartbeat()
-            else:
-                store.write_heartbeat(agent)
+        _finish_watchdog_recovery(sig)
         return DriveOutcome(ok=False, failure_class=failure_class, summary=summary,
                             child_output_tail=sig.get("child_output_tail"),
                             bus_action_attempted=bool(sig.get("bus_action_attempted")),
