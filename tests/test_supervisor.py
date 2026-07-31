@@ -6350,6 +6350,7 @@ def test_wrapped_stalled_forked_brain_is_an_attributed_kill_target() -> None:
     assert {
         "pid": WRAP_TUI_PID,
         "start": _ps_iso(700000),
+        "start_filetime": _ps_filetime(700000),
         "reason": "owned_process_tree",
         "source": "owned_process_tree",
     } in plan["kill_targets"]
@@ -8039,6 +8040,31 @@ def test_owned_process_tree_holds_when_windows_filetime_is_unavailable() -> None
     assert plan["kill_targets"] == []
 
 
+def test_owned_process_tree_omits_absent_unexact_windows_launcher() -> None:
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=60.0,
+            progress_age=60.0,
+            progress_sequence=2,
+        ),
+    )
+    plan = _plan_wrap(
+        report,
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert [entry["pid"] for entry in tree["entries"]] == [
+        WRAP_LAUNCHER_PID,
+    ]
+    assert plan["state"] == "CLI_CHILD_MISSING"
+    assert plan["kill_targets"] == []
+
+
 def test_owned_process_tree_reserves_detached_gate_runner_without_name_inference() -> None:
     snapshot = [
         _wrap_snap()[0],
@@ -8383,6 +8409,45 @@ def test_owned_process_tree_exact_launcher_lifetime_proves_first_forked_child() 
     assert [target["pid"] for target in plan["kill_targets"]] == [
         WRAP_LAUNCHER_PID,
         WRAP_TUI_PID,
+    ]
+    assert plan["action"] == sup.RELAUNCH
+
+
+def test_owned_process_tree_recycled_launcher_ignores_foreign_children() -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            1,
+            "unrelated.exe",
+            "unrelated replacement",
+            _ps_iso(800000),
+        ),
+        _proc(
+            990,
+            WRAP_CHILD_PID,
+            "node.exe",
+            "node foreign.js",
+            _ps_iso(900000),
+        ),
+    ]
+
+    plan = _owned_tree_plan(
+        snapshot,
+        request_id="rr-recycled-exited-launcher",
+        runtime_overrides={
+            "launcher_exit_filetime": _ps_filetime(750000),
+        },
+    )
+
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert [entry["pid"] for entry in tree["entries"]] == [
+        WRAP_LAUNCHER_PID,
+        WRAP_CHILD_PID,
+    ]
+    assert [target["pid"] for target in plan["kill_targets"]] == [
+        WRAP_LAUNCHER_PID,
     ]
     assert plan["action"] == sup.RELAUNCH
 
@@ -10013,6 +10078,18 @@ def test_ephemeral_launch_uses_no_legacy_or_command_line_kill_authority() -> Non
     assert held["archive"] is False
     assert "owned_process_tree" not in held["next_entry"]
     assert held["next_entry"]["process_tree_hold_reason"] == "runtime_absent"
+    assert held["next_entry"]["held_terminal"] == {
+        "terminal_state": eph.STATE_TIMED_OUT,
+        "reason": (
+            "ephemeral reviewer timed out without a typed terminal "
+            "review-result"
+        ),
+        "completion": {
+            "status": eph.COMPLETION_NONE,
+            "terminal": False,
+            "hold": True,
+        },
+    }
 
     missing = json.loads(json.dumps(state))
     missing["ephemeral_reviewers"]["active"]["R1"].pop("launcher_nonce")

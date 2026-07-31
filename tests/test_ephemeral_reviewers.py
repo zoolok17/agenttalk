@@ -410,7 +410,9 @@ def test_prepare_rosters_unique_identity_sends_request_and_completion_retires(tm
     assert req.meta["counted_signoff"] == "false"
     assert state["ephemeral_reviewers"]["active"]["lr-prep"]["cli"] == "codex"
 
-    wrapper_start = "1970-01-01T00:10:00Z"
+    wrapper_start = (
+        "linux:12345678-1234-1234-1234-123456789abc:100"
+    )
     sup.record_ephemeral_launch(
         state,
         "lr-prep",
@@ -700,8 +702,9 @@ def test_invalid_ephemeral_agent_identity_holds_and_surfaces_attention(
 
 
 def test_timeout_plans_process_tree_kill_targets() -> None:
-    wrapper_start = "1970-01-01T00:10:00Z"
-    launcher_start = "1970-01-01T00:11:00Z"
+    boot_id = "12345678-1234-1234-1234-123456789abc"
+    wrapper_start = f"linux:{boot_id}:100"
+    launcher_start = f"linux:{boot_id}:200"
     state = {"ephemeral_reviewers": {"active": {
         "lr-timeout": {"agent": "adversary-lr-timeout", "requested_by": "lead",
                        "phase": eph.STATE_LAUNCHED, "launcher_pid": 10,
@@ -742,7 +745,7 @@ def test_timeout_plans_process_tree_kill_targets() -> None:
             "parent_pid": 11,
             "name": "codex.exe",
             "command_line": "codex tui",
-            "start_time": "1970-01-01T00:12:00Z",
+            "start_time": f"linux:{boot_id}:300",
             "start_filetime": None,
         },
         {
@@ -750,7 +753,7 @@ def test_timeout_plans_process_tree_kill_targets() -> None:
             "parent_pid": 12,
             "name": "pwsh.exe",
             "command_line": "pwsh -File tool.ps1",
-            "start_time": "1970-01-01T00:13:00Z",
+            "start_time": f"linux:{boot_id}:400",
             "start_filetime": None,
         },
         {
@@ -758,7 +761,7 @@ def test_timeout_plans_process_tree_kill_targets() -> None:
             "parent_pid": 13,
             "name": "node.exe",
             "command_line": "node build.js",
-            "start_time": "1970-01-01T00:14:00Z",
+            "start_time": f"linux:{boot_id}:500",
             "start_filetime": None,
         },
     ]

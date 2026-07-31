@@ -2063,6 +2063,17 @@ def _filetime_identity_matches(row: dict | None, expected: object) -> bool:
     return isinstance(expected, str) and _filetime_of(row) == expected
 
 
+def _has_exact_start_identity(row: dict | None) -> bool:
+    """Whether a snapshot row carries its platform's exact start identity."""
+    key = _start_order_key(_start_of(row))
+    if key is None:
+        return False
+    # Win32_Process exposes a rounded ISO timestamp, so Windows additionally
+    # needs the kernel FILETIME. Linux's boot-id/start-ticks token is already
+    # exact and intentionally has no FILETIME companion.
+    return key[0] != "iso" or _filetime_of(row) is not None
+
+
 def _iso_epoch(value) -> float | None:
     """Parse an ISO-8601 start-time to epoch seconds.
 
@@ -2804,12 +2815,12 @@ def _owned_process_tree(
         ):
             invalid_reason = invalid_reason or "invalid_process_row"
             return False
-        if start_key[0] == "iso" and start_filetime is None:
+        if not _has_exact_start_identity(row):
             # Windows' CIM timestamp is rounded. It can identify graph edges,
             # but it cannot authorize a destructive action after planning.
-            # A live Windows row without the exact kernel FILETIME therefore
-            # invalidates the whole owned tree rather than producing a target
-            # that can only be guarded by the rounded timestamp.
+            # Any retained Windows row therefore needs the exact kernel
+            # FILETIME; childless absent launchers are omitted before reaching
+            # add_node rather than persisted as future ownership authority.
             invalid_reason = (
                 invalid_reason or "exact_start_filetime_unavailable"
             )
@@ -2902,6 +2913,7 @@ def _owned_process_tree(
                     live=is_live,
                 )
 
+    recycled_parent_pids: set[int] = set()
     launcher_pid = record.get("cli_launcher_pid")
     launcher_start = record.get("cli_launcher_start")
     launcher_lifetime = record.get("cli_launcher_lifetime")
@@ -2919,6 +2931,13 @@ def _owned_process_tree(
     )
     if isinstance(launcher_pid, int) and isinstance(launcher_start, str):
         current_launcher = idx.get(launcher_pid)
+        current_launcher_identity = _recorded_process_identity_state(
+            current_launcher,
+            expected_start=launcher_start,
+            expected_filetime=launcher_creation_filetime,
+        )
+        if current_launcher_identity == "different":
+            recycled_parent_pids.add(launcher_pid)
         launcher_live = bool(
             isinstance(current_launcher, dict)
             and current_launcher.get("parent_pid") == wrapper_pid
@@ -2952,18 +2971,49 @@ def _owned_process_tree(
                 "start_time": launcher_start,
                 "start_filetime": launcher_creation_filetime,
             }
-        edge_reason = _strict_owned_child_edge(wrapper_row, launcher_row)
-        if edge_reason is not None:
-            invalid_reason = invalid_reason or edge_reason
+            prior_launcher = owned.get(launcher_pid)
+            if (
+                isinstance(prior_launcher, dict)
+                and prior_launcher.get("role") == "cli_launcher"
+                and _has_exact_start_identity(prior_launcher.get("row"))
+            ):
+                launcher_row = prior_launcher["row"]
+            elif not _has_exact_start_identity(launcher_row):
+                if current_launcher_identity == "different":
+                    # A recycled PID and its current children are unrelated to
+                    # the recorded launcher. They grant neither kill nor HOLD
+                    # authority.
+                    launcher_row = None
+                elif current_launcher is not None:
+                    invalid_reason = (
+                        invalid_reason or "exact_start_filetime_unavailable"
+                    )
+                    launcher_row = None
+                elif children.get(launcher_pid):
+                    # Windows retains PPID edges after a parent exits. Without
+                    # an exact lifetime/prior certificate those children are
+                    # ambiguous.
+                    invalid_reason = (
+                        invalid_reason or "unproven_virtual_parent_descendant"
+                    )
+                    launcher_row = None
+                else:
+                    # A childless, absent launcher cannot be killed and its
+                    # rounded identity must not be persisted as future
+                    # ownership authority.
+                    launcher_row = None
         if launcher_pid == wrapper_pid:
             invalid_reason = invalid_reason or "launcher_equals_wrapper"
-        elif add_node(
-            launcher_row,
-            role="cli_launcher",
-            depth=1,
-            live=launcher_live,
-        ):
-            pass
+        elif launcher_row is not None:
+            edge_reason = _strict_owned_child_edge(wrapper_row, launcher_row)
+            if edge_reason is not None:
+                invalid_reason = invalid_reason or edge_reason
+            add_node(
+                launcher_row,
+                role="cli_launcher",
+                depth=1,
+                live=launcher_live,
+            )
 
     queue = sorted(owned, key=lambda pid: (owned[pid]["depth"], pid))
     queued = set(queue)
@@ -2978,6 +3028,10 @@ def _owned_process_tree(
             if not isinstance(child, dict):
                 invalid_reason = invalid_reason or "missing_child_row"
                 continue
+            if child_pid in recycled_parent_pids:
+                # This numeric PID now names a different exact identity. It is
+                # neither the recorded launcher nor an ownership bridge.
+                continue
             if not parent["live"]:
                 prior_parent = prior_by_pid.get(parent_pid)
                 prior_child = prior_by_pid.get(child_pid)
@@ -2990,25 +3044,35 @@ def _owned_process_tree(
                     < int(_filetime_of(child) or "0")
                     < int(launcher_exit_filetime)
                 )
-                if not certified_launcher_child and (
-                    prior_authority is None
-                    or prior_parent is None
-                    or prior_child is None
-                    or not _start_tokens_match(
+                prior_owned_child = bool(
+                    prior_authority is not None
+                    and prior_parent is not None
+                    and prior_child is not None
+                    and _start_tokens_match(
                         _start_of(parent_row),
                         prior_parent["start"],
                     )
-                    or prior_child["parent_pid"] != parent_pid
-                    or child.get("parent_pid") != parent_pid
-                    or not _start_tokens_match(
+                    and prior_child["parent_pid"] == parent_pid
+                    and child.get("parent_pid") == parent_pid
+                    and _start_tokens_match(
                         _start_of(child),
                         prior_child["start"],
                     )
-                    or not _filetime_identity_matches(
+                    and _filetime_identity_matches(
                         child,
                         prior_child.get("start_filetime"),
                     )
+                )
+                if (
+                    parent_pid in recycled_parent_pids
+                    and not certified_launcher_child
+                    and not prior_owned_child
                 ):
+                    # Children of the replacement process are foreign. Retain
+                    # only descendants already proven by exact prior identity
+                    # or by the exited launcher's exact lifetime bounds.
+                    continue
+                if not certified_launcher_child and not prior_owned_child:
                     invalid_reason = (
                         invalid_reason
                         or "unproven_virtual_parent_descendant"
@@ -6750,7 +6814,17 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
         if not isinstance(entry, dict):
             continue
         rpt_entry = rpt_active.get(rid) if isinstance(rpt_active.get(rid), dict) else {}
-        completion = rpt_entry.get("completion") if isinstance(rpt_entry.get("completion"), dict) else {}
+        raw_completion = rpt_entry.get("completion")
+        completion = (
+            copy.deepcopy(raw_completion)
+            if isinstance(raw_completion, dict) and raw_completion
+            else {
+                "status": eph.COMPLETION_NONE,
+                "terminal": False,
+                "hold": True,
+                "reason": "no typed review-result",
+            }
+        )
         next_entry, liveness, teardown_ready = _ephemeral_owned_process_view(
             snapshot,
             entry,
