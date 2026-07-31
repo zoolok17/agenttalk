@@ -301,6 +301,18 @@ class BoundedStreamTee:
             buffer = getattr(self._original, "buffer", None)
             if buffer is not None:
                 buffer.write(encoded)
+                # I4: bypassing .write() also bypasses line buffering's own
+                # flush-on-newline - stderr is line-buffered by default, so
+                # a diagnostic line written just before an uncatchable
+                # SIGKILL would otherwise sit unflushed in the buffer's own
+                # (larger, not newline-triggered) internal buffer and never
+                # reach disk at all, defeating the reason this module
+                # exists. Replicate exactly the condition TextIOWrapper
+                # itself would have flushed on.
+                if getattr(self._original, "line_buffering", False) and (
+                    b"\n" in encoded
+                ):
+                    buffer.flush()
             else:
                 self._original.write(text)
         except (OSError, ValueError):

@@ -145,6 +145,42 @@ def test_bounded_stream_tee_newline_heavy_stream_stays_within_cap_on_disk(
     assert original_path.stat().st_size <= tee.segment_bytes
 
 
+def test_bounded_stream_tee_line_buffered_original_flushes_on_newline(
+    tmp_path: Path,
+) -> None:
+    """I4 (PR 98 cold review): writing straight to self._original.buffer
+    (added to fix the CRLF cap overrun above) bypasses TextIOWrapper's own
+    line-buffering entirely - stderr is line-buffered by default, so a
+    diagnostic line written just before an uncatchable SIGKILL would sit
+    unflushed in the underlying BufferedWriter's own (larger, not
+    newline-triggered) buffer and never reach disk, defeating the entire
+    reason this module exists. Read back through a SEPARATE file handle,
+    with no explicit flush() call anywhere in this test, to prove the bytes
+    actually reached the OS level rather than merely Python's own buffer."""
+    original_path = tmp_path / "original-stderr.txt"
+    original = original_path.open(
+        "w", encoding="utf-8", newline=None, buffering=1
+    )
+    assert original.line_buffering
+    base = tmp_path / "stderr.log"
+    tee = wrapper_logs.BoundedStreamTee(
+        original,
+        base,
+        max_bytes=4096,
+        segment_count=4,
+    )
+
+    tee.write("final diagnostic before SIGKILL\n")
+    # No tee.flush() / original.flush() here - simulating the kill landing
+    # immediately after this write, before anything explicit could flush.
+    on_disk = original_path.read_text(encoding="utf-8")
+
+    tee.close()
+    original.close()
+
+    assert "final diagnostic before SIGKILL" in on_disk
+
+
 def test_bounded_stream_tee_failure_discards_excess_without_breaking_wrapper(
     tmp_path: Path,
 ) -> None:
