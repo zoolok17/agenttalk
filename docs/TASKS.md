@@ -18,7 +18,7 @@ These are the ones being worked right now, and the ones most likely to be cited 
 
 | # | What it is |
 |---|---|
-| ~112 | **The keystone defect.** The per-turn watchdog's own kill wedged the wrapper it was protecting: the turn never failed, the wrapper hung forever at `phase=active`. Ten instances measured today, all within ~47s of 1800s. **Fixed, green 13/13 on `22b75bb`.** |
+| ~112 | **The keystone defect.** The per-turn watchdog's own kill wedged the wrapper it was protecting: the turn never failed, the wrapper hung forever at `phase=active`. Ten instances measured today, all within ~47s of 1800s. **Fixed and SHIPPED in v0.80.0** (`e0faf96`, gated 14/14 on the post-bump commit). |
 | ~121 | **Running the dev-gate inside a wrapped turn guarantees a watchdog kill.** The watchdog fires at 1800s elapsed AND 600s of a live tool descendant; the gate's pytest leg is allowed 2700s. Gating in-turn satisfies both conditions by doing the job correctly. Fix is a detached runner, not higher thresholds. |
 | ~122 | **Head-of-queue livelock.** A wrapped agent processes one message per turn, so a message whose processing wedges the wrapper blocks the instruction that would fix it. Recurred today: rescinding the head just promotes the next message into the same trap. |
 | ~87 | P0 supervisor recovery authority (Design 87-A). Round-3 delta panel returned 4 blockers + 4 majors; obligations tracked in `docs/rr87a-delta-panel-obligations.md`. |
@@ -27,9 +27,11 @@ These are the ones being worked right now, and the ones most likely to be cited 
 | ~120 | Register the whole owned process tree per agent, not just wrapper+launcher PIDs — the thing that wedges is the tool descendant. Published at `28f663f`. |
 | 126 | A provider usage-limit refusal is classified `ambiguous_or_unknown`, so it retried 20 times against a hard wall with a known reset date. Measured 80 wasted turn-starts in one outage. |
 | 127 | Parallelise the pytest legs. 96.2% of the Windows gate is pytest; this is the only change that cuts latency rather than queue contention. |
-| 125 | CI had no concurrency group, so every push queued an additional full matrix instead of superseding. PR #103. |
+| ~125 | CI had no concurrency group, so every push queued an additional full matrix instead of superseding. **Fixed, merged `99668d9`.** Note the trade-off discovered afterwards: `cancel-in-progress:false` on master means master runs now SERIALIZE (queue), not run in parallel. |
 | 56 | Wrapped ovh-qwen env allowlist strips `HOME`/`LOCALAPPDATA`, so `agenttalk reply` crashes in the child shell. The gate on Qwen becoming a usable third provider. |
 | ~11 | Qwen-on-OVH as a first-class wrapped team member (design → PoC → trial). |
+| 131 | **Launch-provenance authorization for the checked observer.** The ancestry check proves selected-host/image ancestry, not execution of `supervisor.ps1` — so a caller supplying the same hidden identity args can mint a trusted `startup` observation. An existing test *asserts* the permissive behaviour. Design-first; **PR 107 (#114) is held on this.** |
+| 133 | **Cold diff review as a gate.** `agenttalk request-launch` already spawns a fresh SHA-bound adversarial reviewer, but `ephemeral_reviewers` is `enabled:false` and unconfigured. Delta: line-anchored typed findings, a PR renderer, two vendor profiles, and a merge gate bound to the head SHA. Scored 2026-07-31 against a real baseline — see the logbook. |
 
 ## Full list
 
@@ -154,6 +156,12 @@ These are the ones being worked right now, and the ones most likely to be cited 
 | 125 |   | CI has no concurrency group, so every push queues a full superseded matrix |
 | 126 |   | A provider usage-limit refusal is classified `ambiguous_or_unknown` |
 | 127 |   | Parallelise the pytest legs — 96.2% of the Windows gate is pytest |
+| 128 |   | Build releases in CI, not on a laptop (re-gate the post-bump commit, publish provenance) |
+| 129 |   | A refused restart-request is never retired, so it retries every tick forever |
+| 130 |   | `web.py /api/attention` has a private source allowlist that SILENTLY DROPS unlisted sources |
+| 131 |   | **Launch-provenance authorization for the checked observer** — prerequisite for #114 |
+| 132 |   | Runtime-observation quarantine files are not status-indexed and have no retention cap |
+| 133 |   | **Cold diff review as a gate** — ephemeral reviewer bound to a PR head, findings line-anchored |
 
 ## A caveat worth stating
 
