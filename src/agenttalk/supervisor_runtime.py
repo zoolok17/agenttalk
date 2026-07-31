@@ -145,6 +145,19 @@ def _validate_phase_observation(phase: str, value: object) -> dict:
     return clean
 
 
+def _reject_duplicate_object_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise SupervisorRuntimeObservationError(
+                "runtime observation contains a duplicate JSON object key"
+            )
+        value[key] = item
+    return value
+
+
 def _validate_record(store: Store, value: object) -> dict:
     if not isinstance(value, dict) or set(value) != _TOP_LEVEL_FIELDS:
         raise SupervisorRuntimeObservationError(
@@ -200,13 +213,21 @@ def _validate_record(store: Store, value: object) -> dict:
         phase: _validate_phase_observation(phase, observation)
         for phase, observation in observations.items()
     }
-    if not any(
-        observation["observed_at"] == first_observed_at
-        and observation["observed_at_epoch"] == first_observed_at_epoch
-        for observation in clean_observations.values()
+    # The generated supervisor exits immediately when startup first sees an
+    # active switch.  Therefore both phases can coexist only when mid_poll
+    # observed the activation and a later restart added startup.  This causal
+    # phase order remains valid across wall-clock rollback; minimum(epoch) does
+    # not.
+    activation_source_phase = (
+        "mid_poll" if "mid_poll" in clean_observations else "startup"
+    )
+    activation_source = clean_observations[activation_source_phase]
+    if not (
+        activation_source["observed_at"] == first_observed_at
+        and activation_source["observed_at_epoch"] == first_observed_at_epoch
     ):
         raise SupervisorRuntimeObservationError(
-            "kill_switch.first_observed_at must match a phase observation"
+            "kill_switch.first_observed_at must match its activation-source phase"
         )
     clean_kill_switch = {
         "active": active,
@@ -236,17 +257,21 @@ def _validate_record(store: Store, value: object) -> dict:
 def _read_strict(store: Store) -> dict | None:
     path = runtime_observation_path(store)
     try:
-        size = path.stat().st_size
+        with path.open("rb") as stream:
+            raw = stream.read(RUNTIME_OBSERVATION_MAX_BYTES + 1)
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise SupervisorRuntimeObservationError(
             f"runtime observation is unreadable: {type(exc).__name__}"
         ) from exc
-    if size > RUNTIME_OBSERVATION_MAX_BYTES:
+    if len(raw) > RUNTIME_OBSERVATION_MAX_BYTES:
         raise SupervisorRuntimeObservationError("runtime observation exceeds its size cap")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_object_keys,
+        )
     except (OSError, UnicodeError, RecursionError, ValueError) as exc:
         raise SupervisorRuntimeObservationError(
             f"runtime observation is malformed: {type(exc).__name__}"

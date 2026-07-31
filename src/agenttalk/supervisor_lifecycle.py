@@ -362,7 +362,10 @@ def _open_process_observation(pid: int, *, parents: Mapping[int, int] | None = N
         code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
             raise SupervisorLifecycleError(f"process {pid} is not active")
-        identity, image_handle = psh.open_stable_native_file_identity(buf.value)
+        identity, image_handle = _open_stable_process_image_identity(
+            buf.value,
+            int(handle),
+        )
         parent_map = parents if parents is not None else _process_parent_map()
         ticks = _filetime_ticks(creation)
         return ProcessObservation(
@@ -449,6 +452,175 @@ def _system_cmd_path() -> str:
     return str(Path(buf.value) / "cmd.exe")
 
 
+def _process_machines(process_handle: int) -> tuple[int, int]:
+    """Return the emulated and native PE machines for one live process."""
+    if not process_handle:
+        raise SupervisorLifecycleError("cannot identify process architecture")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        is_wow64_process2 = kernel32.IsWow64Process2
+    except AttributeError:
+        try:
+            is_wow64_process = kernel32.IsWow64Process
+        except AttributeError as exc:
+            raise SupervisorLifecycleError(
+                "cannot resolve the Windows process-architecture API"
+            ) from exc
+        is_wow64_process.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        is_wow64_process.restype = wintypes.BOOL
+        emulated = wintypes.BOOL()
+        if not is_wow64_process(
+            wintypes.HANDLE(process_handle),
+            ctypes.byref(emulated),
+        ):
+            raise SupervisorLifecycleError(
+                "cannot identify process architecture "
+                f"(winerror {ctypes.get_last_error()})"
+            ) from None
+        # IsWow64Process predates multi-architecture WOW64.  On those systems
+        # its true case is the x86 guest machine.
+        return (0x014C if emulated.value else 0), 0
+    is_wow64_process2.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.WORD),
+    ]
+    is_wow64_process2.restype = wintypes.BOOL
+    process_machine = wintypes.WORD()
+    native_machine = wintypes.WORD()
+    if not is_wow64_process2(
+        wintypes.HANDLE(process_handle),
+        ctypes.byref(process_machine),
+        ctypes.byref(native_machine),
+    ):
+        raise SupervisorLifecycleError(
+            "cannot identify process architecture "
+            f"(winerror {ctypes.get_last_error()})"
+        )
+    return int(process_machine.value), int(native_machine.value)
+
+
+def _wow64_system_directory(machine: int) -> str:
+    """Return the OS-owned system directory for one emulated PE machine."""
+    library = None
+    function = None
+    for dll_name in (
+        "api-ms-win-core-wow64-l1-1-1.dll",
+        "kernelbase.dll",
+        "kernel32.dll",
+    ):
+        try:
+            candidate = ctypes.WinDLL(dll_name, use_last_error=True)
+            resolved = candidate.GetSystemWow64Directory2W
+        except (AttributeError, OSError):
+            continue
+        library = candidate
+        function = resolved
+        break
+    capacity = 32767
+    if library is not None and function is not None:
+        function.argtypes = [wintypes.LPWSTR, wintypes.UINT, wintypes.WORD]
+        function.restype = wintypes.UINT
+        buf = ctypes.create_unicode_buffer(capacity)
+        length = int(function(buf, capacity, machine))
+        if 0 < length < capacity:
+            return buf.value
+    if machine != 0x014C:
+        raise SupervisorLifecycleError(
+            "cannot resolve the Windows emulated system directory"
+        )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        legacy = kernel32.GetSystemWow64DirectoryW
+    except AttributeError as exc:
+        raise SupervisorLifecycleError(
+            "cannot resolve the Windows emulated-system-directory API"
+        ) from exc
+    legacy.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    legacy.restype = wintypes.UINT
+    buf = ctypes.create_unicode_buffer(capacity)
+    length = int(legacy(buf, capacity))
+    if length <= 0 or length >= capacity:
+        raise SupervisorLifecycleError(
+            "cannot resolve the Windows emulated system directory"
+        )
+    return buf.value
+
+
+def _windows_directory() -> str:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_windows_directory = kernel32.GetWindowsDirectoryW
+    get_windows_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    get_windows_directory.restype = wintypes.UINT
+    capacity = 32767
+    buf = ctypes.create_unicode_buffer(capacity)
+    length = int(get_windows_directory(buf, capacity))
+    if length <= 0 or length >= capacity:
+        raise SupervisorLifecycleError("cannot resolve the Windows directory")
+    return buf.value
+
+
+def _current_process_handle() -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.argtypes = []
+    get_current_process.restype = wintypes.HANDLE
+    return int(get_current_process())
+
+
+def _process_image_path_for_reopen(image_path: str, process_handle: int) -> str:
+    """Map a native System32 image through Sysnative when Python is WOW64."""
+    process_machine, _ = _process_machines(process_handle)
+    current_machine, _ = _process_machines(_current_process_handle())
+    if process_machine or not current_machine:
+        return image_path
+    windows = PureWindowsPath(_windows_directory())
+    system = windows / "System32"
+    image = PureWindowsPath(image_path)
+    system_parts = tuple(part.casefold() for part in system.parts)
+    image_parts = tuple(part.casefold() for part in image.parts)
+    if image_parts[:len(system_parts)] != system_parts:
+        return image_path
+    relative = image.parts[len(system_parts):]
+    if not relative:
+        raise SupervisorLifecycleError("process image path is not a file")
+    return str(windows / "Sysnative" / PureWindowsPath(*relative))
+
+
+def _open_stable_process_image_identity(
+    image_path: str,
+    process_handle: int,
+) -> tuple[psh.NativeFileIdentity, int]:
+    return psh.open_stable_native_file_identity(
+        _process_image_path_for_reopen(image_path, process_handle)
+    )
+
+
+def _system_cmd_path_for_observation(observation: ProcessObservation) -> str:
+    """Resolve ``cmd.exe`` for the observed process architecture.
+
+    Synthetic observations used by pure tests have no live process handle and
+    retain the same-architecture resolver.  Every production observation has a
+    held handle, so WOW64 ancestry is resolved from that process rather than
+    from the Python process performing validation.
+    """
+    if not observation.handle:
+        return _system_cmd_path()
+    process_machine, _ = _process_machines(observation.handle)
+    if process_machine:
+        return str(Path(_wow64_system_directory(process_machine)) / "cmd.exe")
+
+    current_machine, _ = _process_machines(_current_process_handle())
+    if current_machine:
+        # Sysnative is Microsoft's process-relative alias for bypassing WOW64
+        # redirection and opening the native System32 image.
+        return str(Path(_windows_directory()) / "Sysnative" / "cmd.exe")
+    return _system_cmd_path()
+
+
 def _require_observed_image(
     observation: ProcessObservation,
     expected_path: str,
@@ -486,7 +658,7 @@ def _classify_intermediate(
     if leaf == "cmd.exe":
         _require_observed_image(
             observation,
-            _system_cmd_path(),
+            _system_cmd_path_for_observation(observation),
             subject="command-interpreter ancestor",
         )
         return "cmd"

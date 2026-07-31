@@ -642,6 +642,75 @@ def test_status_rejects_first_observed_pair_not_backed_by_phase(
     assert "supervisor_runtime_observation_invalid:" in capsys.readouterr().out
 
 
+def test_runtime_reader_rejects_later_phase_as_first_observation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="mid_poll",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW + 1,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    later = record["kill_switch"]["observations"]["startup"]
+    record["kill_switch"]["first_observed_at"] = later["observed_at"]
+    record["kill_switch"]["first_observed_at_epoch"] = later[
+        "observed_at_epoch"
+    ]
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+
+    assert observed is None
+    assert any("activation-source phase" in warning for warning in warnings)
+
+
+def test_runtime_first_observation_uses_phase_order_across_clock_rollback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="mid_poll",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW + 1,
+        validate_artifacts=lambda: None,
+    )
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+
+    assert warnings == []
+    assert observed is not None
+    assert observed["kill_switch"]["first_observed_at_epoch"] == NOW + 1
+
+
 def test_default_observation_clock_is_sampled_after_lifecycle_lock_wait(
     tmp_path: Path,
     monkeypatch,
@@ -744,7 +813,7 @@ def test_runtime_reader_warns_when_json_nesting_exceeds_decoder_limit(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{}", encoding="utf-8")
 
-    def reject_nesting(raw: str) -> object:
+    def reject_nesting(raw: str, **kwargs) -> object:
         raise RecursionError("maximum recursion depth exceeded")
 
     monkeypatch.setattr(runtime_control.json, "loads", reject_nesting)
@@ -756,6 +825,73 @@ def test_runtime_reader_warns_when_json_nesting_exceeds_decoder_limit(
         "runtime observation is malformed: RecursionError" in warning
         for warning in warnings
     )
+
+
+def test_runtime_reader_bounds_bytes_from_same_open_after_stale_size_check(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + (" " * (runtime_control.RUNTIME_OBSERVATION_MAX_BYTES + 1)),
+        encoding="utf-8",
+    )
+    real_stat = Path.stat
+
+    class StaleSmallStat:
+        st_size = 1
+
+    def stale_stat(self: Path, *args, **kwargs):
+        if self == path:
+            return StaleSmallStat()
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stale_stat)
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+
+    assert observed is None
+    assert any("exceeds its size cap" in warning for warning in warnings)
+
+
+def test_runtime_reader_rejects_duplicate_json_object_keys(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    raw = path.read_text(encoding="utf-8")
+    path.write_text(
+        raw.replace('"active": true', '"active": false, "active": true', 1),
+        encoding="utf-8",
+    )
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+
+    assert observed is None
+    assert any("duplicate JSON object key" in warning for warning in warnings)
 
 
 # ---- snapshot-model fixtures (the 8-state classifier reads a process snapshot) ----

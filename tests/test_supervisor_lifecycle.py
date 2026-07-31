@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 import sys
 import sysconfig
+from ctypes import wintypes
 from pathlib import Path
 
 import pytest
@@ -273,6 +275,210 @@ def test_validate_ancestry_accepts_identified_generated_launch_classes(
         for index in reversed(range(len(intermediate_paths)))
     )
     assert lifecycle._validate_ancestry(host) == expected, name
+
+
+@WINDOWS_ONLY
+def test_validate_ancestry_accepts_verified_wow64_cmd_for_cross_arch_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _observation(
+        100,
+        parent=1,
+        path=r"C:\Program Files (x86)\PowerShell\7\pwsh.exe",
+        ticks=100,
+    )
+    native_cmd = r"C:\Windows\System32\cmd.exe"
+    wow64_cmd = r"C:\Windows\SysWOW64\cmd.exe"
+    base_python = r"C:\Python\python.exe"
+    identities = {
+        native_cmd: _identity(native_cmd, "70"),
+        wow64_cmd: _identity(wow64_cmd, "71"),
+        base_python: _identity(base_python, "72"),
+    }
+    current, (cmd,) = _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=((wow64_cmd, identities[wow64_cmd], 200),),
+        current_path=base_python,
+        current_identity=identities[base_python],
+    )
+    monkeypatch.setattr(sys, "executable", base_python)
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\Python")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(lifecycle, "_system_cmd_path", lambda: native_cmd)
+    monkeypatch.setattr(
+        lifecycle,
+        "_system_cmd_path_for_observation",
+        lambda observation: wow64_cmd,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: identities[str(path)],
+    )
+
+    assert lifecycle._validate_ancestry(host) == (current, cmd)
+
+
+@WINDOWS_ONLY
+def test_system_cmd_resolver_uses_observed_guest_architecture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cmd = _observation(
+        200,
+        parent=100,
+        path=r"C:\Windows\SysWOW64\cmd.exe",
+        ticks=200,
+    )
+    cmd.handle = 700
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_machines",
+        lambda handle: (0x014C, 0x8664),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_wow64_system_directory",
+        lambda machine: r"C:\Windows\SysWOW64" if machine == 0x014C else "",
+    )
+
+    assert lifecycle._system_cmd_path_for_observation(cmd) == (
+        r"C:\Windows\SysWOW64\cmd.exe"
+    )
+
+
+@WINDOWS_ONLY
+def test_system_cmd_resolver_uses_sysnative_for_native_ancestor_from_wow64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cmd = _observation(
+        200,
+        parent=100,
+        path=r"C:\Windows\System32\cmd.exe",
+        ticks=200,
+    )
+    cmd.handle = 700
+    monkeypatch.setattr(lifecycle, "_current_process_handle", lambda: 800)
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_machines",
+        lambda handle: (0, 0x8664) if handle == 700 else (0x014C, 0x8664),
+    )
+    monkeypatch.setattr(lifecycle, "_windows_directory", lambda: r"C:\Windows")
+
+    assert lifecycle._system_cmd_path_for_observation(cmd) == (
+        r"C:\Windows\Sysnative\cmd.exe"
+    )
+
+
+@WINDOWS_ONLY
+def test_process_image_identity_reopens_native_system_image_through_sysnative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_cmd = r"C:\Windows\System32\cmd.exe"
+    native_identity = _identity(native_cmd, "73")
+    opened: list[str] = []
+    monkeypatch.setattr(lifecycle, "_current_process_handle", lambda: 800)
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_machines",
+        lambda handle: (0, 0x8664) if handle == 700 else (0x014C, 0x8664),
+    )
+    monkeypatch.setattr(lifecycle, "_windows_directory", lambda: r"C:\Windows")
+
+    def open_identity(path: str):
+        opened.append(str(path))
+        return native_identity, 900
+
+    monkeypatch.setattr(psh, "open_stable_native_file_identity", open_identity)
+
+    identity, handle = lifecycle._open_stable_process_image_identity(
+        native_cmd,
+        700,
+    )
+
+    assert opened == [r"C:\Windows\Sysnative\cmd.exe"]
+    assert identity is native_identity
+    assert handle == 900
+
+
+@WINDOWS_ONLY
+def test_process_machine_query_falls_back_to_legacy_wow64_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LegacyIsWow64Process:
+        argtypes = None
+        restype = None
+
+        def __call__(self, handle, emulated) -> int:
+            assert int(handle.value) == 700
+            ctypes.cast(
+                emulated,
+                ctypes.POINTER(wintypes.BOOL),
+            ).contents.value = 1
+            return 1
+
+    class LegacyKernel32:
+        IsWow64Process = LegacyIsWow64Process()
+
+        def __getattr__(self, name: str):
+            raise AttributeError(name)
+
+    monkeypatch.setattr(
+        lifecycle.ctypes,
+        "WinDLL",
+        lambda name, use_last_error=True: LegacyKernel32(),
+    )
+
+    assert lifecycle._process_machines(700) == (0x014C, 0)
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("v2_mode", ["missing", "failure"])
+def test_wow64_directory_query_falls_back_to_legacy_api(
+    monkeypatch: pytest.MonkeyPatch,
+    v2_mode: str,
+) -> None:
+    class FailedDirectory2:
+        argtypes = None
+        restype = None
+
+        def __call__(self, buffer, capacity, machine) -> int:
+            assert machine == 0x014C
+            return 0
+
+    class LegacyDirectory:
+        argtypes = None
+        restype = None
+        called = 0
+
+        def __call__(self, buffer, capacity) -> int:
+            self.called += 1
+            buffer.value = r"C:\Windows\SysWOW64"
+            return len(buffer.value)
+
+    legacy = LegacyDirectory()
+
+    class LegacyKernel32:
+        GetSystemWow64DirectoryW = legacy
+
+        def __getattr__(self, name: str):
+            if name == "GetSystemWow64Directory2W" and v2_mode == "failure":
+                return FailedDirectory2()
+            raise AttributeError(name)
+
+    monkeypatch.setattr(
+        lifecycle.ctypes,
+        "WinDLL",
+        lambda name, use_last_error=True: LegacyKernel32(),
+    )
+
+    assert lifecycle._wow64_system_directory(0x014C) == (
+        r"C:\Windows\SysWOW64"
+    )
+    assert legacy.called == 1
 
 
 @WINDOWS_ONLY
