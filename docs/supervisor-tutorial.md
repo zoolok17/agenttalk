@@ -325,9 +325,16 @@ Key differences for a wrapped agent:
 >
 > `-Xutf8` (attached) works; `-X utf8` (separate tokens) does not — the
 > bare value token `utf8` is indistinguishable from a script path and is
-> refused along with it. If a flag has no attached-value form, put it
-> after `-m agenttalk` instead, or omit `module_args_from` entirely for
-> the common case (no interpreter prefix, the default).
+> refused along with it. **Separate-token forms are not supported at
+> all — do not work around this by moving the flag after `-m agenttalk`:
+> `-m mod` ends Python's own option list, so anything placed after it
+> becomes agenttalk's argv, not Python's, and agenttalk's own argument
+> parser will reject it.** Where CPython exposes an environment-variable
+> equivalent (`PYTHONUTF8`, `PYTHONHASHSEED`, `PYTHONDONTWRITEBYTECODE`,
+> etc.), set that in the agent's `env` block instead — it has the same
+> effect without occupying an argv position at all. Omit
+> `module_args_from` entirely for the common case (no interpreter
+> prefix, the default).
 
 ---
 
