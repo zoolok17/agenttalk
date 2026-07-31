@@ -6786,6 +6786,22 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
                 "ephemeral reviewer process exited without typed terminal "
                 "review-result; no auto-restart"
             )
+        persisted_terminal = eph.validate_held_terminal(
+            entry.get("held_terminal")
+        )
+        if persisted_terminal is not None:
+            # The first terminal observation is the attended disposition. A
+            # later report cannot rewrite a timeout/failure after it has been
+            # persisted and surfaced to the operator.
+            terminal_state = persisted_terminal["terminal_state"]
+            terminal_reason = persisted_terminal["reason"]
+            completion = copy.deepcopy(persisted_terminal["completion"])
+            terminal_action = {
+                eph.STATE_COMPLETED: eph.ACTION_COMPLETE,
+                eph.STATE_TIMED_OUT: eph.ACTION_TIMEOUT,
+                eph.STATE_FAILED: eph.ACTION_FAILED,
+                eph.STATE_DENIED: eph.ACTION_DENY,
+            }[terminal_state]
         if terminal_action is not None:
             # Persist the terminal facts before either the initial HOLD or the
             # executor's post-kill launch barrier can make teardown sticky.
@@ -7587,6 +7603,304 @@ def record_ephemeral_launch(state: dict, request_id: str, *, pid: int | None,
         entry["provenance_diagnostics"] = {}
         entry["last_launch_epoch"] = now
     return result
+
+
+_ATTENDED_EPHEMERAL_ARCHIVE_MODES = frozenset({
+    "strict_identity",
+    "operator_attested",
+})
+_ATTENDED_EPHEMERAL_ARCHIVE_PENDING_FIELDS = frozenset({
+    "schema_version",
+    "request_id",
+    "agent",
+    "hold_source_hash",
+    "acknowledged_by",
+    "verification_mode",
+    "verified_launch_nonce",
+    "verified_identity_count",
+    "acknowledged_at",
+    "acknowledged_at_epoch",
+    "reason",
+    "terminal",
+    "archive_payload",
+})
+
+
+def _validate_attended_ephemeral_archive_pending(
+    value: object,
+) -> dict:
+    """Validate one durable attended-archive journal without trusting extras."""
+    if (
+        not isinstance(value, dict)
+        or frozenset(value) != _ATTENDED_EPHEMERAL_ARCHIVE_PENDING_FIELDS
+        or value.get("schema_version") != 1
+    ):
+        raise ValueError("attended ephemeral archive journal is malformed")
+    request_id = value.get("request_id")
+    if not eph.is_safe_id(request_id):
+        raise ValueError("attended ephemeral archive request id is invalid")
+    agent = validate_agent_name(value.get("agent"))
+    actor = validate_agent_name(value.get("acknowledged_by"))
+    hold_source_hash = value.get("hold_source_hash")
+    if (
+        not isinstance(hold_source_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", hold_source_hash) is None
+    ):
+        raise ValueError("attended ephemeral archive source hash is invalid")
+    mode = value.get("verification_mode")
+    nonce = value.get("verified_launch_nonce")
+    identity_count = value.get("verified_identity_count")
+    if (
+        mode not in _ATTENDED_EPHEMERAL_ARCHIVE_MODES
+        or not isinstance(identity_count, int)
+        or isinstance(identity_count, bool)
+        or identity_count < 0
+        or (
+            mode == "strict_identity"
+            and (not _valid_launch_nonce(nonce) or identity_count < 1)
+        )
+        or (
+            mode == "operator_attested"
+            and (nonce is not None or identity_count != 0)
+        )
+    ):
+        raise ValueError(
+            "attended ephemeral archive verification evidence is invalid"
+        )
+    acknowledged_at = value.get("acknowledged_at")
+    acknowledged_at_epoch = value.get("acknowledged_at_epoch")
+    if (
+        _utc_epoch(acknowledged_at) is None
+        or isinstance(acknowledged_at_epoch, bool)
+        or not isinstance(acknowledged_at_epoch, (int, float))
+        or not math.isfinite(float(acknowledged_at_epoch))
+        or float(acknowledged_at_epoch) < 0
+    ):
+        raise ValueError("attended ephemeral archive timestamp is invalid")
+    reason = value.get("reason")
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or len(reason) > 500
+        or any(ord(char) < 32 for char in reason)
+    ):
+        raise ValueError("attended ephemeral archive reason is invalid")
+    terminal = eph.validate_held_terminal(value.get("terminal"))
+    if terminal is None:
+        raise ValueError("attended ephemeral archive terminal facts are invalid")
+
+    attended = {
+        "schema_version": 1,
+        "agent": agent,
+        "request_id": request_id,
+        "hold_source_hash": hold_source_hash,
+        "acknowledged_by": actor,
+        "verification_mode": mode,
+        "verified_launch_nonce": nonce,
+        "verified_identity_count": identity_count,
+        "acknowledged_at": acknowledged_at,
+        "reason": reason,
+    }
+    payload = value.get("archive_payload")
+    expected_payload_fields = {
+        "schema_version",
+        "request_id",
+        "terminal_state",
+        "reason",
+        "archived_at",
+        "archived_at_epoch",
+        "original",
+        "completion",
+        "agent",
+        "attended_teardown",
+    }
+    marker = payload.get("original") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or frozenset(payload) != expected_payload_fields
+        or payload.get("schema_version") != eph.SCHEMA_VERSION
+        or payload.get("request_id") != request_id
+        or payload.get("terminal_state") != terminal["terminal_state"]
+        or payload.get("reason") != terminal["reason"]
+        or _utc_epoch(payload.get("archived_at")) is None
+        or payload.get("archived_at_epoch") != acknowledged_at_epoch
+        or payload.get("completion") != terminal["completion"]
+        or payload.get("agent") != agent
+        or payload.get("attended_teardown") != attended
+        or not isinstance(marker, dict)
+        or marker.get("request_id") != request_id
+        or marker.get("agent") != agent
+        or marker.get("state") not in eph.ACTIVE_STATES
+        or eph.validate_marker(marker)
+    ):
+        raise ValueError("attended ephemeral archive payload is malformed")
+    return copy.deepcopy(value)
+
+
+def attended_ephemeral_archive_pending(
+    state: dict,
+    request_id: str,
+) -> dict | None:
+    """Return one validated pending attended archive, if present."""
+    if not eph.is_safe_id(request_id):
+        raise ValueError("ephemeral request id must be a safe path token")
+    root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    pending = (
+        root.get("attended_archive_pending")
+        if isinstance(root, dict)
+        else None
+    )
+    if pending is None:
+        return None
+    if not isinstance(pending, dict) or len(pending) > 64:
+        raise ValueError("attended ephemeral archive journals are malformed")
+    raw = pending.get(request_id)
+    if raw is None:
+        return None
+    record = _validate_attended_ephemeral_archive_pending(raw)
+    if record["request_id"] != request_id:
+        raise ValueError("attended ephemeral archive journal key is stale")
+    return record
+
+
+def stage_attended_ephemeral_archive(
+    state: dict,
+    request_id: str,
+    *,
+    agent: str,
+    launch_marker: dict,
+    held_terminal: dict,
+    hold_source_hash: str,
+    acknowledged_by: str,
+    verification_mode: str,
+    verified_launch_nonce: str | None,
+    verified_identity_count: int,
+    reason: str,
+    now_epoch: float,
+) -> dict:
+    """Persist all authority and payload needed for an idempotent retry."""
+    terminal = eph.validate_held_terminal(held_terminal)
+    if terminal is None:
+        raise ValueError("ephemeral HOLD has no valid terminal disposition")
+    acknowledged_at = _event_now(now_epoch)
+    attended = {
+        "schema_version": 1,
+        "agent": agent,
+        "request_id": request_id,
+        "hold_source_hash": hold_source_hash,
+        "acknowledged_by": acknowledged_by,
+        "verification_mode": verification_mode,
+        "verified_launch_nonce": verified_launch_nonce,
+        "verified_identity_count": verified_identity_count,
+        "acknowledged_at": acknowledged_at,
+        "reason": reason,
+    }
+    payload = eph.terminal_archive(
+        launch_marker,
+        terminal_state=terminal["terminal_state"],
+        reason=terminal["reason"],
+        at_epoch=now_epoch,
+        extra={
+            "completion": terminal["completion"],
+            "agent": agent,
+            "attended_teardown": attended,
+        },
+    )
+    record = _validate_attended_ephemeral_archive_pending({
+        "schema_version": 1,
+        "request_id": request_id,
+        "agent": agent,
+        "hold_source_hash": hold_source_hash,
+        "acknowledged_by": acknowledged_by,
+        "verification_mode": verification_mode,
+        "verified_launch_nonce": verified_launch_nonce,
+        "verified_identity_count": verified_identity_count,
+        "acknowledged_at": acknowledged_at,
+        "acknowledged_at_epoch": now_epoch,
+        "reason": reason,
+        "terminal": terminal,
+        "archive_payload": payload,
+    })
+    root = eph.ensure_state(state)
+    pending = root.setdefault("attended_archive_pending", {})
+    if not isinstance(pending, dict) or len(pending) > 64:
+        raise ValueError("attended ephemeral archive journals are malformed")
+    existing = pending.get(request_id)
+    if existing is not None:
+        if _validate_attended_ephemeral_archive_pending(existing) != record:
+            raise ValueError(
+                "a different attended archive is already pending for this request"
+            )
+        return record
+    if len(pending) >= 64:
+        raise ValueError("attended ephemeral archive journal cap is 64")
+    pending[request_id] = copy.deepcopy(record)
+    return record
+
+
+def finish_attended_ephemeral_archive(
+    store: Store,
+    state: dict,
+    request_id: str,
+) -> dict:
+    """Apply external effects for a staged archive, then finalize memory state."""
+    record = attended_ephemeral_archive_pending(state, request_id)
+    if record is None:
+        raise ValueError(
+            f"no attended ephemeral archive is pending for {request_id!r}"
+        )
+    root = eph.ensure_state(state)
+    active = root["active"]
+    entry = active.get(request_id)
+    if (
+        not isinstance(entry, dict)
+        or entry.get("request_id") != request_id
+        or entry.get("agent") != record["agent"]
+        or eph.validate_held_terminal(entry.get("held_terminal"))
+        != record["terminal"]
+    ):
+        raise ValueError(
+            "active ephemeral HOLD changed after its attended archive was staged"
+        )
+    if not store.complete_launch_request_archive(
+        request_id,
+        record["archive_payload"],
+    ):
+        raise eph.EphemeralError(
+            f"launch request {request_id!r} was not archived; journal retained"
+        )
+    agent = record["agent"]
+    config = store.load_config()
+    active_agents = config.get("agents") or []
+    retired_agents = store.retired_agents()
+    if agent in active_agents:
+        store.retire_agent(
+            agent,
+            reason=(
+                f"ephemeral review {request_id}: "
+                f"{record['terminal']['terminal_state']}"
+            ),
+        )
+    elif agent not in retired_agents:
+        raise ValueError(
+            f"temporary identity {agent!r} is neither active nor retired"
+        )
+
+    history = root.get("attended_archive_history")
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        **record["archive_payload"]["attended_teardown"],
+        "terminal_state": record["terminal"]["terminal_state"],
+    })
+    root["attended_archive_history"] = history[-64:]
+    active.pop(request_id, None)
+    pending = root.get("attended_archive_pending")
+    if isinstance(pending, dict):
+        pending.pop(request_id, None)
+        if not pending:
+            root.pop("attended_archive_pending", None)
+    return copy.deepcopy(record["archive_payload"]["attended_teardown"])
 
 
 def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,

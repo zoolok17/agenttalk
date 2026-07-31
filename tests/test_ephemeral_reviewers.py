@@ -900,6 +900,29 @@ def test_ephemeral_cap_exceeded_holds_archive_and_escalates_attention() -> None:
         items[0]["source_hash"]
     )
 
+    later_report = json.loads(json.dumps(report))
+    later_report["ephemeral_reviewers"]["active"]["lr-cap"]["completion"] = {
+        "status": eph.COMPLETION_APPROVED,
+        "terminal": True,
+        "hold": False,
+        "counter": False,
+        "message_id": "msg-late",
+        "evidence_only": True,
+    }
+    later_state = {
+        "ephemeral_reviewers": {"active": {"lr-cap": held["next_entry"]}}
+    }
+    held_again = sup.plan_actions(
+        later_report,
+        later_state,
+        _cfg(),
+        now_epoch=NOW + 2,
+        snapshot=snapshot,
+    )["ephemeral_reviewers"]["lr-cap"]
+    assert held_again["next_entry"]["held_terminal"] == (
+        held["next_entry"]["held_terminal"]
+    )
+
 
 def _write_attended_ephemeral_hold_fixture(
     store: Store,
@@ -1002,8 +1025,6 @@ def test_cli_attended_ephemeral_tree_hold_archives_exact_request(
         request_id,
         "--hold-source-hash",
         source_hash,
-        "--verified-launch-nonce",
-        SUPERVISOR_NONCE,
         "--acknowledge-no-live-supervisor",
         "--acknowledge-owned-processes-stopped",
         "--reason",
@@ -1030,14 +1051,125 @@ def test_cli_attended_ephemeral_tree_hold_archives_exact_request(
         "request_id": request_id,
         "hold_source_hash": source_hash,
         "acknowledged_by": "lead",
-        "verified_launch_nonce": SUPERVISOR_NONCE,
-        "verified_identity_count": 1,
+        "verification_mode": "operator_attested",
+        "verified_launch_nonce": None,
+        "verified_identity_count": 0,
         "acknowledged_at": "1970-01-01T00:16:40Z",
         "reason": "all recorded request identities verified stopped",
     }
     assert agent not in store.load_config()["agents"]
     assert agent in store.retired_agents()
     assert "dev" in store.load_config()["agents"]
+
+
+def test_cli_attended_ephemeral_hold_archives_without_strict_tree_evidence(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, _source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state_path = store.dir / "supervisor-state.json"
+    state = sup.load_supervisor_state(state_path)
+    wrt.runtime_path(store.state_dir, agent).unlink()
+    item = att.process_tree_hold_items(state)[0]
+
+    assert item["attended_disposition_mode"] == "operator_attested"
+    assert "--request-id lr-attended" in item["operator_command"]
+    assert "--verified-launch-nonce" not in item["operator_command"]
+
+    rc = cli.main([
+        "--root",
+        str(tmp_path),
+        "supervise",
+        "--reset-process-tree-ownership",
+        "--request-id",
+        request_id,
+        "--hold-source-hash",
+        item["source_hash"],
+        "--acknowledge-no-live-supervisor",
+        "--acknowledge-owned-processes-stopped",
+        "--reason",
+        "operator verified the terminal request can be archived",
+        "--from",
+        "lead",
+        "--now",
+        str(NOW),
+    ])
+
+    assert rc == 0
+    persisted = sup.load_supervisor_state(state_path)
+    assert request_id not in persisted["ephemeral_reviewers"]["active"]
+    archived = json.loads(
+        (store.launch_requests_archive_dir / f"{request_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert archived["attended_teardown"]["verification_mode"] == (
+        "operator_attested"
+    )
+    assert archived["attended_teardown"]["verified_launch_nonce"] is None
+    assert agent in store.retired_agents()
+
+
+def test_cli_attended_ephemeral_archive_recovers_after_final_state_save_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    monkeypatch.setattr(cli, "_owner_identity_gone", lambda _pid, _start: True)
+    args = [
+        "--root",
+        str(tmp_path),
+        "supervise",
+        "--reset-process-tree-ownership",
+        "--request-id",
+        request_id,
+        "--hold-source-hash",
+        source_hash,
+        "--acknowledge-no-live-supervisor",
+        "--acknowledge-owned-processes-stopped",
+        "--reason",
+        "all recorded request identities verified stopped",
+        "--from",
+        "lead",
+        "--now",
+        str(NOW),
+    ]
+    real_save = sup.save_supervisor_state
+    save_calls = 0
+
+    def fail_final_save(path: Path, state: dict) -> None:
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise sup.SupervisorPersistenceError("injected final save failure")
+        real_save(path, state)
+
+    monkeypatch.setattr(sup, "save_supervisor_state", fail_final_save)
+
+    assert cli.main(args) == 3
+    staged = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    assert request_id in staged["ephemeral_reviewers"]["active"]
+    assert request_id in staged["ephemeral_reviewers"][
+        "attended_archive_pending"
+    ]
+    assert store.read_launch_request(request_id) is None
+    assert agent in store.retired_agents()
+
+    monkeypatch.setattr(sup, "save_supervisor_state", real_save)
+    retry_args = list(args)
+    retry_args[-1] = str(NOW + 1)
+    assert cli.main(retry_args) == 0
+    recovered = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    assert request_id not in recovered["ephemeral_reviewers"]["active"]
+    assert request_id not in recovered["ephemeral_reviewers"].get(
+        "attended_archive_pending", {}
+    )
+    assert recovered["ephemeral_reviewers"]["attended_archive_history"][-1][
+        "request_id"
+    ] == request_id
 
 
 def test_invalid_review_result_stays_hold_and_janitor_retires_orphan(tmp_path: Path) -> None:

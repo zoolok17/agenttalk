@@ -6046,6 +6046,68 @@ class Store:
                 return False
             return True
 
+    def complete_launch_request_archive(
+        self,
+        request_id: str,
+        archive_payload: dict,
+    ) -> bool:
+        """Idempotently publish one exact archive and clear its active marker.
+
+        This stricter attended-recovery primitive never chooses a suffixed
+        destination. A durable journal supplies the exact payload, so a retry
+        can distinguish its own already-published archive from an unrelated
+        collision and finish clearing a marker after an interrupted unlink.
+        """
+        if not isinstance(archive_payload, dict):
+            raise ValueError("launch request archive payload must be an object")
+        active_path = self._launch_request_path(request_id)
+        archive_path = self.launch_requests_archive_dir / f"{request_id}.json"
+        with self._config_lock():
+            marker = self.read_launch_request(request_id)
+            if marker is None and active_path.exists():
+                raise ValueError(
+                    f"active launch request {request_id!r} is unreadable"
+                )
+            expected_original = archive_payload.get("original")
+            if archive_path.exists():
+                try:
+                    existing = json.loads(
+                        archive_path.read_text(encoding="utf-8-sig")
+                    )
+                except (OSError, ValueError) as exc:
+                    raise ValueError(
+                        f"launch request archive {request_id!r} is unreadable"
+                    ) from exc
+                if existing != archive_payload:
+                    raise ValueError(
+                        f"launch request archive {request_id!r} conflicts "
+                        "with the attended recovery journal"
+                    )
+                if marker is None:
+                    return True
+                if marker != expected_original:
+                    raise ValueError(
+                        f"active launch request {request_id!r} changed after "
+                        "its attended archive was published"
+                    )
+                active_path.unlink()
+                return True
+
+            if marker is None:
+                return False
+            if marker != expected_original:
+                raise ValueError(
+                    f"active launch request {request_id!r} does not match "
+                    "the attended recovery journal"
+                )
+            self.launch_requests_archive_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(
+                archive_path,
+                json.dumps(archive_payload, indent=2, ensure_ascii=False),
+            )
+            active_path.unlink()
+            return True
+
     # ------------------------------------------- dashboard intent queue (0.59.0)
     #
     # The web console can ONLY append a typed intent envelope here (architecture

@@ -11808,7 +11808,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         if (
             configured_reset == ephemeral_reset
             or not args.hold_source_hash
-            or not args.verified_launch_nonce
+            or (configured_reset and not args.verified_launch_nonce)
             or not args.reason
             or not args.acknowledge_no_live_supervisor
             or not args.acknowledge_owned_processes_stopped
@@ -11816,9 +11816,10 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 "agenttalk supervise --reset-process-tree-ownership requires "
                 "exactly one of --for or --request-id, plus "
-                "--hold-source-hash, --verified-launch-nonce, --reason, "
+                "--hold-source-hash, --reason, "
                 "--acknowledge-no-live-supervisor, and "
-                "--acknowledge-owned-processes-stopped\n"
+                "--acknowledge-owned-processes-stopped; configured-agent "
+                "resets also require --verified-launch-nonce\n"
             )
             return 2
         attended_reason = args.reason.strip()
@@ -11917,106 +11918,53 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                             "HOLD source hash is stale; read `agenttalk attention` again"
                         )
 
-                    held_terminal = None
-                    if ephemeral_reset:
-                        if not eph.is_safe_id(args.request_id):
-                            raise ValueError(
-                                "ephemeral request id must be a safe path token"
-                            )
-                        ref = current_item["source_refs"][0]
-                        target_agent = validate_agent_name(ref.get("agent"))
-                        eph_root = state.get("ephemeral_reviewers")
-                        active = (
-                            eph_root.get("active")
-                            if isinstance(eph_root, dict)
-                            else None
-                        )
-                        entry = (
-                            active.get(args.request_id)
-                            if isinstance(active, dict)
-                            else None
-                        )
-                        if (
-                            not isinstance(entry, dict)
-                            or entry.get("request_id") != args.request_id
-                            or entry.get("agent") != target_agent
-                        ):
-                            raise ValueError(
-                                "ephemeral HOLD does not match one exact active "
-                                "request and temporary identity"
-                            )
-                        held_terminal = eph.validate_held_terminal(
-                            entry.get("held_terminal")
-                        )
-                        if held_terminal is None:
-                            raise ValueError(
-                                "ephemeral HOLD has no valid persisted terminal "
-                                "disposition to archive"
-                            )
-                        launch_marker = store.read_launch_request(args.request_id)
-                        marker_errors = eph.validate_marker(launch_marker)
-                        if (
-                            marker_errors
-                            or not isinstance(launch_marker, dict)
-                            or launch_marker.get("request_id") != args.request_id
-                            or launch_marker.get("agent") != target_agent
-                            or launch_marker.get("state") not in eph.ACTIVE_STATES
-                        ):
-                            raise ValueError(
-                                "active launch marker does not match the exact "
-                                "ephemeral HOLD"
-                            )
-                    else:
-                        target_agent = args.agent
-
-                    runtime_view = runtime_obs.read_runtime(
-                        store.state_dir,
-                        target_agent,
-                        now_epoch=now,
-                    )
-                    if runtime_view.get("status") != runtime_obs.STATUS_VALID:
-                        raise ValueError(
-                            "strict wrapper runtime record is not valid: "
-                            f"{runtime_view.get('error') or runtime_view.get('status')}"
-                        )
-                    evidence = sup.process_tree_ownership_reset_evidence(
-                        state,
-                        target_agent,
-                        request_id=(args.request_id if ephemeral_reset else None),
-                        expected_root=store.root,
-                        verified_launch_nonce=args.verified_launch_nonce,
-                        runtime_record=runtime_view["record"],
-                        now_epoch=now,
-                    )
-                    live_identities = [
-                        row
-                        for row in evidence["identities"]
-                        if not _owner_identity_gone(row["pid"], row["start"])
-                    ]
-                    if live_identities:
-                        raise ValueError(
-                            "recorded process identities are still live or cannot be "
-                            "distinguished from pid reuse: "
-                            + ", ".join(
-                                f"{row['pid']}/{row['start']}"
-                                for row in live_identities[:8]
-                            )
-                        )
-
-                    marker_status, _marker, marker_detail = (
-                        store._read_supervisor_instance_strict_locked()
-                    )
-                    if marker_status != "absent":
-                        raise ValueError(
-                            "supervisor instance marker changed before commit: "
-                            f"{marker_status}: "
-                            f"{marker_detail or 'a supervisor may be live'}"
-                        )
-                    if store.supervisor_kill_switch() is not True:
-                        raise ValueError(
-                            "supervisor.kill was removed before reset commit"
-                        )
                     if configured_reset:
+                        target_agent = args.agent
+                        runtime_view = runtime_obs.read_runtime(
+                            store.state_dir,
+                            target_agent,
+                            now_epoch=now,
+                        )
+                        if runtime_view.get("status") != runtime_obs.STATUS_VALID:
+                            raise ValueError(
+                                "strict wrapper runtime record is not valid: "
+                                f"{runtime_view.get('error') or runtime_view.get('status')}"
+                            )
+                        evidence = sup.process_tree_ownership_reset_evidence(
+                            state,
+                            target_agent,
+                            expected_root=store.root,
+                            verified_launch_nonce=args.verified_launch_nonce,
+                            runtime_record=runtime_view["record"],
+                            now_epoch=now,
+                        )
+                        live_identities = [
+                            row
+                            for row in evidence["identities"]
+                            if not _owner_identity_gone(row["pid"], row["start"])
+                        ]
+                        if live_identities:
+                            raise ValueError(
+                                "recorded process identities are still live or "
+                                "cannot be distinguished from pid reuse: "
+                                + ", ".join(
+                                    f"{row['pid']}/{row['start']}"
+                                    for row in live_identities[:8]
+                                )
+                            )
+                        marker_status, _marker, marker_detail = (
+                            store._read_supervisor_instance_strict_locked()
+                        )
+                        if marker_status != "absent":
+                            raise ValueError(
+                                "supervisor instance marker changed before commit: "
+                                f"{marker_status}: "
+                                f"{marker_detail or 'a supervisor may be live'}"
+                            )
+                        if store.supervisor_kill_switch() is not True:
+                            raise ValueError(
+                                "supervisor.kill was removed before reset commit"
+                            )
                         sup.reset_process_tree_ownership_after_attended_teardown(
                             state,
                             target_agent,
@@ -12026,17 +11974,136 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                             expected_root=store.root,
                             runtime_record=runtime_view["record"],
                             recorded_identities_gone=True,
-                            reason=args.reason,
+                            reason=attended_reason,
                             now_epoch=now,
                         )
                         sup.save_supervisor_state(state_path, state)
                         output_record = state["process_tree_resets"][-1]
+                    else:
+                        if not eph.is_safe_id(args.request_id):
+                            raise ValueError(
+                                "ephemeral request id must be a safe path token"
+                            )
+                        pending = sup.attended_ephemeral_archive_pending(
+                            state,
+                            args.request_id,
+                        )
+                        if pending is not None:
+                            if (
+                                pending["hold_source_hash"]
+                                != args.hold_source_hash
+                                or pending["acknowledged_by"] != actor
+                                or pending["reason"] != attended_reason
+                                or pending["verified_launch_nonce"]
+                                != args.verified_launch_nonce
+                            ):
+                                raise ValueError(
+                                    "retry arguments do not match the durable "
+                                    "attended archive journal"
+                                )
+                        else:
+                            ref = current_item["source_refs"][0]
+                            target_agent = validate_agent_name(ref.get("agent"))
+                            eph_root = state.get("ephemeral_reviewers")
+                            active = (
+                                eph_root.get("active")
+                                if isinstance(eph_root, dict)
+                                else None
+                            )
+                            entry = (
+                                active.get(args.request_id)
+                                if isinstance(active, dict)
+                                else None
+                            )
+                            if (
+                                not isinstance(entry, dict)
+                                or entry.get("request_id") != args.request_id
+                                or entry.get("agent") != target_agent
+                            ):
+                                raise ValueError(
+                                    "ephemeral HOLD does not match one exact "
+                                    "active request and temporary identity"
+                                )
+                            held_terminal = eph.validate_held_terminal(
+                                entry.get("held_terminal")
+                            )
+                            if held_terminal is None:
+                                raise ValueError(
+                                    "ephemeral HOLD has no valid persisted "
+                                    "terminal disposition to archive"
+                                )
+                            launch_marker = store.read_launch_request(
+                                args.request_id
+                            )
+                            marker_errors = eph.validate_marker(launch_marker)
+                            if (
+                                marker_errors
+                                or not isinstance(launch_marker, dict)
+                                or launch_marker.get("request_id")
+                                != args.request_id
+                                or launch_marker.get("agent") != target_agent
+                                or launch_marker.get("state")
+                                not in eph.ACTIVE_STATES
+                            ):
+                                raise ValueError(
+                                    "active launch marker does not match the "
+                                    "exact ephemeral HOLD"
+                                )
+                            verification_mode = current_item.get(
+                                "attended_disposition_mode"
+                            )
+                            if verification_mode != "operator_attested":
+                                raise ValueError(
+                                    "this ephemeral HOLD has no attended archive "
+                                    "command; read `agenttalk attention` again"
+                                )
+                            if args.verified_launch_nonce:
+                                raise ValueError(
+                                    "terminal ephemeral archives use the "
+                                    "request-bound operator-attested command; "
+                                    "omit --verified-launch-nonce"
+                                )
+                            verified_nonce = None
+                            verified_identity_count = 0
+                            marker_status, _marker, marker_detail = (
+                                store._read_supervisor_instance_strict_locked()
+                            )
+                            if marker_status != "absent":
+                                raise ValueError(
+                                    "supervisor instance marker changed before "
+                                    "archive staging: "
+                                    f"{marker_status}: "
+                                    f"{marker_detail or 'a supervisor may be live'}"
+                                )
+                            if store.supervisor_kill_switch() is not True:
+                                raise ValueError(
+                                    "supervisor.kill was removed before archive "
+                                    "staging"
+                                )
+                            sup.stage_attended_ephemeral_archive(
+                                state,
+                                args.request_id,
+                                agent=target_agent,
+                                launch_marker=launch_marker,
+                                held_terminal=held_terminal,
+                                hold_source_hash=args.hold_source_hash,
+                                acknowledged_by=actor,
+                                verification_mode=verification_mode,
+                                verified_launch_nonce=verified_nonce,
+                                verified_identity_count=(
+                                    verified_identity_count
+                                ),
+                                reason=attended_reason,
+                                now_epoch=now,
+                            )
+                            # This durable journal must land before the launch
+                            # marker or temporary identity can be changed.
+                            sup.save_supervisor_state(state_path, state)
 
                 if ephemeral_reset:
-                    # Release config.lock before retiring the temporary agent;
-                    # retirement owns that lock. The supervisor lifecycle lock,
-                    # singleton absence, and kill switch still fence this whole
-                    # attended disposition.
+                    # The lifecycle lock fences the full transaction. The
+                    # durable journal makes marker/archive/config effects
+                    # idempotently recoverable after any later failure.
                     marker_status, _marker, marker_detail = (
                         store._read_supervisor_instance_strict_locked()
                     )
@@ -12050,30 +12117,12 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                         raise ValueError(
                             "supervisor.kill was removed before request archive"
                         )
-                    attended = {
-                        "schema_version": 1,
-                        "agent": target_agent,
-                        "request_id": args.request_id,
-                        "hold_source_hash": args.hold_source_hash,
-                        "acknowledged_by": actor,
-                        "verified_launch_nonce": args.verified_launch_nonce,
-                        "verified_identity_count": len(evidence["identities"]),
-                        "acknowledged_at": sup._event_now(now),
-                        "reason": attended_reason,
-                    }
-                    sup.archive_ephemeral_request(
+                    output_record = sup.finish_attended_ephemeral_archive(
                         store,
                         state,
                         args.request_id,
-                        terminal_state=held_terminal["terminal_state"],
-                        reason=held_terminal["reason"],
-                        now_epoch=now,
-                        completion=held_terminal["completion"],
-                        retire=True,
-                        extra={"attended_teardown": attended},
                     )
                     sup.save_supervisor_state(state_path, state)
-                    output_record = attended
         except (
             OSError,
             ValueError,
@@ -14064,8 +14113,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="reset_process_tree_ownership",
         action="store_true",
         help="Operator-attended disposition of a configured agent or terminal "
-             "ephemeral request's invalid/truncated owned-process-tree HOLD after "
-             "exact identity teardown verification. Never kills or launches.",
+             "ephemeral request's invalid/truncated owned-process-tree HOLD. "
+             "Configured resets require exact identity verification; terminal "
+             "ephemeral archives require explicit operator attestations. Never "
+             "kills or launches.",
     )
     gsup.add_argument("--clear-restart", dest="clear_restart", action="store_true",
                       help="Clear a restart-request marker by --for + --request-id.")
@@ -14163,8 +14214,8 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument(
         "--verified-launch-nonce",
         dest="verified_launch_nonce",
-        help="(--reset-process-tree-ownership) launch nonce read from the live "
-             "wrapper command line before attended teardown.",
+        help="(configured --reset-process-tree-ownership) launch nonce read from "
+             "the live wrapper command line before attended teardown.",
     )
     psup.add_argument(
         "--from",

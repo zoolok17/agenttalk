@@ -849,17 +849,17 @@ def process_tree_hold_items(state: dict) -> list[dict]:
             if request_id is not None
             else None
         )
+        ephemeral_archive_available = (
+            request_id is not None
+            and reset_agent is not None
+            and eph.is_safe_id(request_id)
+            and held_terminal is not None
+            and row.get("request_id") == request_id
+            and row.get("agent") == reset_agent
+        )
         reset_evidence_available = (
-            reset_agent is not None
-            and (
-                request_id is None
-                or (
-                    eph.is_safe_id(request_id)
-                    and held_terminal is not None
-                    and row.get("request_id") == request_id
-                    and row.get("agent") == reset_agent
-                )
-            )
+            request_id is None
+            and reset_agent is not None
             and isinstance(nonce, str)
             and _RESET_LAUNCH_NONCE_RE.fullmatch(nonce) is not None
             and row.get("launcher_nonce") == nonce
@@ -873,37 +873,46 @@ def process_tree_hold_items(state: dict) -> list[dict]:
             and bool(launcher_start)
             and reset_wrapper_recorded
         )
-        if reset_evidence_available:
-            selector = (
-                f"--for {reset_agent}"
-                if request_id is None
-                else f"--request-id {request_id}"
-            )
+        if ephemeral_archive_available:
             reset_command = (
                 "agenttalk supervise --reset-process-tree-ownership "
-                f"{selector} --hold-source-hash {it['source_hash']} "
+                f"--request-id {request_id} "
+                f"--hold-source-hash {it['source_hash']} --from LIAISON "
+                "--acknowledge-no-live-supervisor "
+                "--acknowledge-owned-processes-stopped "
+                '--reason "attended terminal request archive"'
+            )
+            it["operator_command"] = reset_command
+            it["attended_disposition_mode"] = "operator_attested"
+            it["recommendation"] = (
+                "Stop the supervisor, preserve supervisor.kill, and verify "
+                "under operator control that the request's processes are "
+                "stopped. This request-bound disposition deliberately relies "
+                "on the two explicit acknowledgements even when persisted "
+                "pid/start, runtime, generation, or nonce evidence is "
+                "incomplete. Replace LIAISON in "
+                f"`{reset_command}`. The command retires the temporary "
+                "identity and clears capacity; it never kills or launches."
+            )
+        elif reset_evidence_available:
+            reset_command = (
+                "agenttalk supervise --reset-process-tree-ownership "
+                f"--for {reset_agent} --hold-source-hash {it['source_hash']} "
                 "--verified-launch-nonce LIVE_NONCE --from LIAISON "
                 "--acknowledge-no-live-supervisor "
                 "--acknowledge-owned-processes-stopped "
                 '--reason "attended teardown verified"'
             )
             it["operator_command"] = reset_command
-            disposition = (
-                "Then refresh/validate the artifacts and request a restart to "
-                "create a new wrapper generation; the reset itself never "
-                "kills or launches."
-                if request_id is None
-                else (
-                    "The command archives that exact terminal request and "
-                    "retires its temporary identity; it never kills or launches."
-                )
-            )
+            it["attended_disposition_mode"] = "strict_identity"
             it["recommendation"] = (
                 "Stop the supervisor and verify every pid/start identity plus "
                 "the live wrapper launch nonce (the stored expected nonce is "
                 f"`{nonce}`). Replace LIVE_NONCE and LIAISON in "
                 f"`{reset_command}` while supervisor.kill remains present. "
-                f"{disposition}"
+                "Then refresh/validate the artifacts and request a restart to "
+                "create a new wrapper generation; the reset itself never "
+                "kills or launches."
             )
         else:
             it["recommendation"] = (
