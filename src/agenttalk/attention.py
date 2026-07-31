@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from agenttalk._jsonl import append_record, iter_lines
+from agenttalk import ephemeral as eph
 from agenttalk.store import validate_agent_name
 
 SCHEMA_VERSION = 1
@@ -780,6 +781,7 @@ def process_tree_hold_items(state: dict) -> list[dict]:
                     "brain_pid": row.get("brain_pid"),
                     "brain_start": row.get("brain_start"),
                     "managed_pids": row.get("managed_pids"),
+                    "held_terminal": row.get("held_terminal"),
                 }),
             },
             human_can_unblock_now=True,
@@ -842,9 +844,22 @@ def process_tree_hold_items(state: dict) -> list[dict]:
             reset_agent = validate_agent_name(agent)
         except (TypeError, ValueError):
             reset_agent = None
+        held_terminal = (
+            eph.validate_held_terminal(row.get("held_terminal"))
+            if request_id is not None
+            else None
+        )
         reset_evidence_available = (
-            request_id is None
-            and reset_agent is not None
+            reset_agent is not None
+            and (
+                request_id is None
+                or (
+                    eph.is_safe_id(request_id)
+                    and held_terminal is not None
+                    and row.get("request_id") == request_id
+                    and row.get("agent") == reset_agent
+                )
+            )
             and isinstance(nonce, str)
             and _RESET_LAUNCH_NONCE_RE.fullmatch(nonce) is not None
             and row.get("launcher_nonce") == nonce
@@ -859,31 +874,46 @@ def process_tree_hold_items(state: dict) -> list[dict]:
             and reset_wrapper_recorded
         )
         if reset_evidence_available:
+            selector = (
+                f"--for {reset_agent}"
+                if request_id is None
+                else f"--request-id {request_id}"
+            )
             reset_command = (
                 "agenttalk supervise --reset-process-tree-ownership "
-                f"--for {reset_agent} --hold-source-hash {it['source_hash']} "
+                f"{selector} --hold-source-hash {it['source_hash']} "
                 "--verified-launch-nonce LIVE_NONCE --from LIAISON "
                 "--acknowledge-no-live-supervisor "
                 "--acknowledge-owned-processes-stopped "
                 '--reason "attended teardown verified"'
             )
             it["operator_command"] = reset_command
+            disposition = (
+                "Then refresh/validate the artifacts and request a restart to "
+                "create a new wrapper generation; the reset itself never "
+                "kills or launches."
+                if request_id is None
+                else (
+                    "The command archives that exact terminal request and "
+                    "retires its temporary identity; it never kills or launches."
+                )
+            )
             it["recommendation"] = (
                 "Stop the supervisor and verify every pid/start identity plus "
                 "the live wrapper launch nonce (the stored expected nonce is "
                 f"`{nonce}`). Replace LIVE_NONCE and LIAISON in "
                 f"`{reset_command}` while supervisor.kill remains present. "
-                "Then refresh/validate the artifacts and request a restart to "
-                "create a new wrapper generation; the reset itself never "
-                "kills or launches."
+                f"{disposition}"
             )
-        elif request_id is None:
+        else:
             it["recommendation"] = (
                 "Stop the supervisor and preserve supervisor.kill. This HOLD "
                 "does not contain enough mutually agreeing pid/start, wrapper "
                 "generation, and launch-nonce evidence for the attended reset "
-                "command, so repair the damaged record manually under operator "
-                "control; do not kill by name or command-line pattern."
+                "or terminal request archive command, so repair the damaged "
+                "record manually under operator control; do not kill by name "
+                "or command-line pattern. Re-read the resulting item in "
+                "`agenttalk attention` before acting."
             )
         it["dedupe_key"] = dedupe_key(
             SOURCE_PROCESS_TREE_HOLD,

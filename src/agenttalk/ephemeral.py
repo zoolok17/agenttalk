@@ -42,6 +42,14 @@ COMPLETION_HOLD = "hold"
 COMPLETION_MALFORMED = "malformed"
 COMPLETION_NONE = "none"
 
+_COMPLETION_STATUSES = frozenset({
+    COMPLETION_APPROVED,
+    COMPLETION_REJECTED,
+    COMPLETION_HOLD,
+    COMPLETION_MALFORMED,
+    COMPLETION_NONE,
+})
+
 _SAFE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
 _SAFE_AGENT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -65,6 +73,71 @@ def is_safe_id(value: object) -> bool:
 
 def is_full_sha(value: object) -> bool:
     return isinstance(value, str) and bool(_FULL_SHA_RE.match(value))
+
+
+def make_held_terminal(
+    terminal_state: object,
+    reason: object,
+    completion: object,
+) -> dict:
+    """Return bounded terminal facts safe to persist in supervisor state."""
+    if terminal_state not in TERMINAL_STATES:
+        raise EphemeralError("held terminal state is invalid")
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or len(reason) > 500
+        or any(ord(char) < 32 for char in reason)
+    ):
+        raise EphemeralError(
+            "held terminal reason must be a non-empty single line of at most "
+            "500 characters"
+        )
+    if not isinstance(completion, dict):
+        raise EphemeralError("held terminal completion must be an object")
+    status = completion.get("status")
+    if status not in _COMPLETION_STATUSES:
+        raise EphemeralError("held terminal completion status is invalid")
+    bounded: dict = {"status": status}
+    for key in ("terminal", "hold", "counter", "evidence_only"):
+        if key in completion:
+            value = completion[key]
+            if not isinstance(value, bool):
+                raise EphemeralError(
+                    f"held terminal completion {key} must be boolean"
+                )
+            bounded[key] = value
+    if "message_id" in completion:
+        message_id = completion["message_id"]
+        if not is_safe_id(message_id):
+            raise EphemeralError(
+                "held terminal completion message_id must be a safe token"
+            )
+        bounded["message_id"] = message_id
+    return {
+        "terminal_state": terminal_state,
+        "reason": reason,
+        "completion": bounded,
+    }
+
+
+def validate_held_terminal(value: object) -> dict | None:
+    """Validate a persisted terminal HOLD record without accepting extras."""
+    if not isinstance(value, dict) or frozenset(value) != {
+        "terminal_state",
+        "reason",
+        "completion",
+    }:
+        return None
+    try:
+        canonical = make_held_terminal(
+            value.get("terminal_state"),
+            value.get("reason"),
+            value.get("completion"),
+        )
+    except EphemeralError:
+        return None
+    return canonical if canonical == value else None
 
 
 def _as_dict(value: object) -> dict:

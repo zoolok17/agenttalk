@@ -6786,6 +6786,16 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
                 "ephemeral reviewer process exited without typed terminal "
                 "review-result; no auto-restart"
             )
+        if terminal_action is not None:
+            # Persist the terminal facts before either the initial HOLD or the
+            # executor's post-kill launch barrier can make teardown sticky.
+            # The attended request-bound archive must never reconstruct them
+            # from a later, potentially different report.
+            next_entry["held_terminal"] = eph.make_held_terminal(
+                terminal_state,
+                terminal_reason,
+                completion,
+            )
         if terminal_action is not None and not teardown_ready:
             hold_reason = next_entry.get("process_tree_hold_reason")
             out[rid] = {
@@ -6894,6 +6904,7 @@ def process_tree_ownership_reset_evidence(
     state: dict,
     agent: str,
     *,
+    request_id: str | None = None,
     expected_root: str | Path,
     verified_launch_nonce: str,
     runtime_record: dict,
@@ -6908,10 +6919,32 @@ def process_tree_ownership_reset_evidence(
     reset authority merely because a human supplied a plausible pid or name.
     """
     agent = validate_agent_name(agent)
-    agents = state.get("agents") if isinstance(state, dict) else None
-    entry = agents.get(agent) if isinstance(agents, dict) else None
-    if not isinstance(entry, dict):
-        raise ValueError(f"no configured supervisor state exists for {agent!r}")
+    if request_id is None:
+        agents = state.get("agents") if isinstance(state, dict) else None
+        entry = agents.get(agent) if isinstance(agents, dict) else None
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"no configured supervisor state exists for {agent!r}"
+            )
+    else:
+        if not eph.is_safe_id(request_id):
+            raise ValueError("ephemeral request id must be a safe path token")
+        eph_root = (
+            state.get("ephemeral_reviewers")
+            if isinstance(state, dict)
+            else None
+        )
+        active = eph_root.get("active") if isinstance(eph_root, dict) else None
+        entry = active.get(request_id) if isinstance(active, dict) else None
+        if (
+            not isinstance(entry, dict)
+            or entry.get("request_id") != request_id
+            or entry.get("agent") != agent
+        ):
+            raise ValueError(
+                "no exact active ephemeral process-tree state exists for "
+                f"request {request_id!r} and agent {agent!r}"
+            )
 
     raw_tree = entry.get("owned_process_tree")
     if not isinstance(raw_tree, dict) or raw_tree.get("status") not in {
@@ -7560,7 +7593,8 @@ def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,
                               terminal_state: str, reason: str,
                               now_epoch: float | None = None,
                               completion: dict | None = None,
-                              retire: bool = True) -> dict:
+                              retire: bool = True,
+                              extra: dict | None = None) -> dict:
     """Archive a terminal launch request and tombstone its temporary identity."""
     marker = store.read_launch_request(request_id)
     root = eph.ensure_state(state)
@@ -7575,17 +7609,24 @@ def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,
                 store.retire_agent(agent, reason=f"ephemeral review {request_id}: {terminal_state}")
         except ValueError as e:
             retire_error = str(e)
-    extra = {"completion": completion or {}, "agent": agent}
+    archive_extra = {
+        "completion": completion or {},
+        "agent": agent,
+        **(extra if isinstance(extra, dict) else {}),
+    }
     if retire_error:
-        extra["retire_error"] = retire_error
+        archive_extra["retire_error"] = retire_error
     payload = eph.terminal_archive(
         marker,
         terminal_state=terminal_state,
         reason=reason,
         at_epoch=now_epoch,
-        extra=extra,
+        extra=archive_extra,
     )
-    store.archive_launch_request(request_id, payload)
+    if not store.archive_launch_request(request_id, payload):
+        raise eph.EphemeralError(
+            f"launch request {request_id!r} was not archived; active state retained"
+        )
     eph.forget_active(state, request_id)
     return state
 

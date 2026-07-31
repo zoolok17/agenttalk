@@ -15,6 +15,7 @@ from agenttalk import cli
 from agenttalk import lanes
 from agenttalk import store as store_mod
 from agenttalk import supervisor as sup
+from agenttalk import wrapper_runtime as wrt
 from agenttalk.store import Store
 from agenttalk.wrapper import loop
 
@@ -570,6 +571,36 @@ def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path
     assert agent in s.retired_agents()
 
 
+def test_archive_failure_retains_ephemeral_active_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    request_id = "lr-archive-failure"
+    state = {
+        "ephemeral_reviewers": {
+            "active": {
+                request_id: {
+                    "request_id": request_id,
+                    "agent": "adversary-lr-archive-failure",
+                },
+            },
+        },
+    }
+    monkeypatch.setattr(store, "archive_launch_request", lambda *_args: False)
+
+    with pytest.raises(eph.EphemeralError, match="active state retained"):
+        sup.archive_ephemeral_request(
+            store,
+            state,
+            request_id,
+            terminal_state=eph.STATE_FAILED,
+            reason="archive write failed",
+        )
+
+    assert request_id in state["ephemeral_reviewers"]["active"]
+
+
 def test_retired_name_is_not_reused(tmp_path: Path) -> None:
     s = _store(tmp_path)
     s.add_agent("adversary-lr-repeat", role="reviewer", groups=["ephemeral-reviewers"])
@@ -751,6 +782,9 @@ def test_timeout_plans_process_tree_kill_targets() -> None:
     )["ephemeral_reviewers"]["lr-timeout"]
     assert timeout["action"] == eph.ACTION_TIMEOUT
     assert [t["pid"] for t in timeout["kill_targets"]] == [10, 11, 12, 13, 14]
+    assert timeout["next_entry"]["held_terminal"]["terminal_state"] == (
+        eph.STATE_TIMED_OUT
+    )
     assert [
         entry["role"]
         for entry in timeout["next_entry"]["owned_process_tree"]["entries"]
@@ -833,6 +867,18 @@ def test_ephemeral_cap_exceeded_holds_archive_and_escalates_attention() -> None:
     assert held["kill_targets"] == []
     assert held["next_entry"]["owned_process_tree"]["status"] == "truncated"
     assert held["next_entry"]["owned_process_tree"]["observed_count"] == 65
+    assert held["next_entry"]["held_terminal"] == {
+        "terminal_state": eph.STATE_TIMED_OUT,
+        "reason": (
+            "ephemeral reviewer timed out without a typed terminal "
+            "review-result"
+        ),
+        "completion": {
+            "status": eph.COMPLETION_NONE,
+            "terminal": False,
+            "hold": True,
+        },
+    }
 
     attention_state = {
         "ephemeral_reviewers": {"active": {"lr-cap": held["next_entry"]}}
@@ -842,6 +888,156 @@ def test_ephemeral_cap_exceeded_holds_archive_and_escalates_attention() -> None:
         "process_tree_hold:ephemeral:lr-cap"
     ]
     assert "observed 65 identities over cap 64" in items[0]["why_it_matters"]
+    assert "--request-id lr-cap" in items[0]["operator_command"]
+    assert f"--hold-source-hash {items[0]['source_hash']}" in (
+        items[0]["operator_command"]
+    )
+    changed = json.loads(json.dumps(attention_state))
+    changed["ephemeral_reviewers"]["active"]["lr-cap"]["held_terminal"][
+        "reason"
+    ] = "a different bounded terminal reason"
+    assert att.process_tree_hold_items(changed)[0]["source_hash"] != (
+        items[0]["source_hash"]
+    )
+
+
+def _write_attended_ephemeral_hold_fixture(
+    store: Store,
+) -> tuple[str, str, str]:
+    request_id = "lr-attended"
+    agent = "adversary-lr-attended"
+    wrapper_start = "1970-01-01T00:10:00Z"
+    marker = _marker(
+        request_id,
+        state=eph.STATE_LAUNCHED,
+        agent=agent,
+    )
+    store.write_launch_request(marker)
+    store.add_agent(agent, role="reviewer", groups=["ephemeral-reviewers"])
+    held_terminal = {
+        "terminal_state": eph.STATE_TIMED_OUT,
+        "reason": (
+            "ephemeral reviewer timed out without a typed terminal "
+            "review-result"
+        ),
+        "completion": {
+            "status": eph.COMPLETION_NONE,
+            "terminal": False,
+            "hold": True,
+        },
+    }
+    entry = {
+        "request_id": request_id,
+        "agent": agent,
+        "requested_by": "lead",
+        "phase": eph.STATE_LAUNCHED,
+        "launcher_pid": 10,
+        "launcher_start": wrapper_start,
+        "launcher_nonce": SUPERVISOR_NONCE,
+        "launcher_nonce_injected": True,
+        "launcher_nonce_source": "agenttalk_global_arg",
+        "runtime_wrapper_generation": "wrapper-1",
+        "managed_pids": [],
+        "process_tree_hold_reason": "process_tree_truncated",
+        "held_terminal": held_terminal,
+        "owned_process_tree": {
+            "schema_version": 2,
+            "attribution_model": "owned_process_tree_v2",
+            "agent": agent,
+            "root_key": sup._root_key(str(store.root.resolve())),
+            "status": "truncated",
+            "reason_code": "process_tree_truncated",
+            "limit": 64,
+            "observed_count": 2,
+            "recorded_count": 1,
+            "omitted_count": 1,
+            "truncated": True,
+            "refreshed_at": "1970-01-01T00:16:40Z",
+            "wrapper_generation": "wrapper-1",
+            "launch_nonce": SUPERVISOR_NONCE,
+            "entries": [{
+                "pid": 10,
+                "start": wrapper_start,
+                "start_filetime": None,
+                "role": "wrapper",
+                "parent_pid": 1,
+                "discovered_at": "1970-01-01T00:16:40Z",
+            }],
+        },
+    }
+    state = {
+        "ephemeral_reviewers": {
+            "active": {request_id: entry},
+        },
+    }
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+    writer = wrt.WrapperRuntimeWriter(
+        store.state_dir,
+        agent,
+        "wrapper-1",
+        wrapper_pid=10,
+        wrapper_start=wrapper_start,
+        clock=lambda: NOW,
+    )
+    writer.idle()
+    item = att.process_tree_hold_items(state)[0]
+    return request_id, agent, item["source_hash"]
+
+
+def test_cli_attended_ephemeral_tree_hold_archives_exact_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    monkeypatch.setattr(cli, "_owner_identity_gone", lambda _pid, _start: True)
+
+    rc = cli.main([
+        "--root",
+        str(tmp_path),
+        "supervise",
+        "--reset-process-tree-ownership",
+        "--request-id",
+        request_id,
+        "--hold-source-hash",
+        source_hash,
+        "--verified-launch-nonce",
+        SUPERVISOR_NONCE,
+        "--acknowledge-no-live-supervisor",
+        "--acknowledge-owned-processes-stopped",
+        "--reason",
+        "all recorded request identities verified stopped",
+        "--from",
+        "lead",
+        "--now",
+        str(NOW),
+    ])
+
+    assert rc == 0
+    persisted = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    assert request_id not in persisted["ephemeral_reviewers"]["active"]
+    archived = json.loads(
+        (store.launch_requests_archive_dir / f"{request_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert archived["terminal_state"] == eph.STATE_TIMED_OUT
+    assert archived["completion"]["status"] == eph.COMPLETION_NONE
+    assert archived["attended_teardown"] == {
+        "schema_version": 1,
+        "agent": agent,
+        "request_id": request_id,
+        "hold_source_hash": source_hash,
+        "acknowledged_by": "lead",
+        "verified_launch_nonce": SUPERVISOR_NONCE,
+        "verified_identity_count": 1,
+        "acknowledged_at": "1970-01-01T00:16:40Z",
+        "reason": "all recorded request identities verified stopped",
+    }
+    assert agent not in store.load_config()["agents"]
+    assert agent in store.retired_agents()
+    assert "dev" in store.load_config()["agents"]
 
 
 def test_invalid_review_result_stays_hold_and_janitor_retires_orphan(tmp_path: Path) -> None:

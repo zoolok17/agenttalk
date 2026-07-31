@@ -11803,8 +11803,10 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         return None
 
     if args.reset_process_tree_ownership:
+        configured_reset = bool(args.agent)
+        ephemeral_reset = bool(args.request_id)
         if (
-            not args.agent
+            configured_reset == ephemeral_reset
             or not args.hold_source_hash
             or not args.verified_launch_nonce
             or not args.reason
@@ -11813,9 +11815,22 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         ):
             sys.stderr.write(
                 "agenttalk supervise --reset-process-tree-ownership requires "
-                "--for, --hold-source-hash, --verified-launch-nonce, --reason, "
+                "exactly one of --for or --request-id, plus "
+                "--hold-source-hash, --verified-launch-nonce, --reason, "
                 "--acknowledge-no-live-supervisor, and "
                 "--acknowledge-owned-processes-stopped\n"
+            )
+            return 2
+        attended_reason = args.reason.strip()
+        if (
+            not attended_reason
+            or len(attended_reason) > 500
+            or any(ord(char) < 32 for char in attended_reason)
+        ):
+            sys.stderr.write(
+                "agenttalk supervise --reset-process-tree-ownership: "
+                "--reason must be a non-empty single line of at most "
+                "500 characters\n"
             )
             return 2
         state_path = store.dir / "supervisor-state.json"
@@ -11829,6 +11844,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             )
             return 2
         now = args.now if args.now is not None else time.time()
+        output_record: dict | None = None
         try:
             with store._supervisor_lifecycle_lock():
                 marker_status, _marker, marker_detail = (
@@ -11866,18 +11882,34 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                     current_items = []
                     for item in A.process_tree_hold_items(state):
                         refs = item.get("source_refs")
-                        if (
+                        if not (
                             isinstance(refs, list)
                             and len(refs) == 1
                             and isinstance(refs[0], dict)
-                            and refs[0].get("kind") == "supervisor_state"
-                            and refs[0].get("agent") == args.agent
                         ):
+                            continue
+                        ref = refs[0]
+                        if configured_reset:
+                            matches = (
+                                ref.get("kind") == "supervisor_state"
+                                and ref.get("agent") == args.agent
+                            )
+                        else:
+                            matches = (
+                                ref.get("kind")
+                                == "supervisor_ephemeral_state"
+                                and ref.get("request_id") == args.request_id
+                            )
+                        if matches:
                             current_items.append(item)
                     if len(current_items) != 1:
+                        target = (
+                            f"configured agent {args.agent!r}"
+                            if configured_reset
+                            else f"ephemeral request {args.request_id!r}"
+                        )
                         raise ValueError(
-                            f"no unique configured process-tree HOLD exists for "
-                            f"{args.agent!r}"
+                            "no unique process-tree HOLD exists for " + target
                         )
                     current_item = current_items[0]
                     if current_item.get("source_hash") != args.hold_source_hash:
@@ -11885,9 +11917,61 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                             "HOLD source hash is stale; read `agenttalk attention` again"
                         )
 
+                    held_terminal = None
+                    if ephemeral_reset:
+                        if not eph.is_safe_id(args.request_id):
+                            raise ValueError(
+                                "ephemeral request id must be a safe path token"
+                            )
+                        ref = current_item["source_refs"][0]
+                        target_agent = validate_agent_name(ref.get("agent"))
+                        eph_root = state.get("ephemeral_reviewers")
+                        active = (
+                            eph_root.get("active")
+                            if isinstance(eph_root, dict)
+                            else None
+                        )
+                        entry = (
+                            active.get(args.request_id)
+                            if isinstance(active, dict)
+                            else None
+                        )
+                        if (
+                            not isinstance(entry, dict)
+                            or entry.get("request_id") != args.request_id
+                            or entry.get("agent") != target_agent
+                        ):
+                            raise ValueError(
+                                "ephemeral HOLD does not match one exact active "
+                                "request and temporary identity"
+                            )
+                        held_terminal = eph.validate_held_terminal(
+                            entry.get("held_terminal")
+                        )
+                        if held_terminal is None:
+                            raise ValueError(
+                                "ephemeral HOLD has no valid persisted terminal "
+                                "disposition to archive"
+                            )
+                        launch_marker = store.read_launch_request(args.request_id)
+                        marker_errors = eph.validate_marker(launch_marker)
+                        if (
+                            marker_errors
+                            or not isinstance(launch_marker, dict)
+                            or launch_marker.get("request_id") != args.request_id
+                            or launch_marker.get("agent") != target_agent
+                            or launch_marker.get("state") not in eph.ACTIVE_STATES
+                        ):
+                            raise ValueError(
+                                "active launch marker does not match the exact "
+                                "ephemeral HOLD"
+                            )
+                    else:
+                        target_agent = args.agent
+
                     runtime_view = runtime_obs.read_runtime(
                         store.state_dir,
-                        args.agent,
+                        target_agent,
                         now_epoch=now,
                     )
                     if runtime_view.get("status") != runtime_obs.STATUS_VALID:
@@ -11897,7 +11981,8 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                         )
                     evidence = sup.process_tree_ownership_reset_evidence(
                         state,
-                        args.agent,
+                        target_agent,
+                        request_id=(args.request_id if ephemeral_reset else None),
                         expected_root=store.root,
                         verified_launch_nonce=args.verified_launch_nonce,
                         runtime_record=runtime_view["record"],
@@ -11931,19 +12016,64 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                         raise ValueError(
                             "supervisor.kill was removed before reset commit"
                         )
-                    sup.reset_process_tree_ownership_after_attended_teardown(
+                    if configured_reset:
+                        sup.reset_process_tree_ownership_after_attended_teardown(
+                            state,
+                            target_agent,
+                            hold_source_hash=args.hold_source_hash,
+                            acknowledged_by=actor,
+                            verified_launch_nonce=args.verified_launch_nonce,
+                            expected_root=store.root,
+                            runtime_record=runtime_view["record"],
+                            recorded_identities_gone=True,
+                            reason=args.reason,
+                            now_epoch=now,
+                        )
+                        sup.save_supervisor_state(state_path, state)
+                        output_record = state["process_tree_resets"][-1]
+
+                if ephemeral_reset:
+                    # Release config.lock before retiring the temporary agent;
+                    # retirement owns that lock. The supervisor lifecycle lock,
+                    # singleton absence, and kill switch still fence this whole
+                    # attended disposition.
+                    marker_status, _marker, marker_detail = (
+                        store._read_supervisor_instance_strict_locked()
+                    )
+                    if marker_status != "absent":
+                        raise ValueError(
+                            "supervisor instance marker changed before archive: "
+                            f"{marker_status}: "
+                            f"{marker_detail or 'a supervisor may be live'}"
+                        )
+                    if store.supervisor_kill_switch() is not True:
+                        raise ValueError(
+                            "supervisor.kill was removed before request archive"
+                        )
+                    attended = {
+                        "schema_version": 1,
+                        "agent": target_agent,
+                        "request_id": args.request_id,
+                        "hold_source_hash": args.hold_source_hash,
+                        "acknowledged_by": actor,
+                        "verified_launch_nonce": args.verified_launch_nonce,
+                        "verified_identity_count": len(evidence["identities"]),
+                        "acknowledged_at": sup._event_now(now),
+                        "reason": attended_reason,
+                    }
+                    sup.archive_ephemeral_request(
+                        store,
                         state,
-                        args.agent,
-                        hold_source_hash=args.hold_source_hash,
-                        acknowledged_by=actor,
-                        verified_launch_nonce=args.verified_launch_nonce,
-                        expected_root=store.root,
-                        runtime_record=runtime_view["record"],
-                        recorded_identities_gone=True,
-                        reason=args.reason,
+                        args.request_id,
+                        terminal_state=held_terminal["terminal_state"],
+                        reason=held_terminal["reason"],
                         now_epoch=now,
+                        completion=held_terminal["completion"],
+                        retire=True,
+                        extra={"attended_teardown": attended},
                     )
                     sup.save_supervisor_state(state_path, state)
+                    output_record = attended
         except (
             OSError,
             ValueError,
@@ -11955,7 +12085,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 f"{exc}\n"
             )
             return 3
-        print(json.dumps(state["process_tree_resets"][-1], indent=2))
+        print(json.dumps(output_record, indent=2))
         return 0
 
     if args.prepare_launch_request:
@@ -12017,13 +12147,19 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                                  "--completion-json must be a JSON object\n")
                 return 2
         state = _read_state()
-        sup.archive_ephemeral_request(
-            store, state, args.request_id,
-            terminal_state=args.terminal_state,
-            reason=args.reason or "",
-            now_epoch=(args.now if args.now is not None else time.time()),
-            completion=completion,
-        )
+        try:
+            sup.archive_ephemeral_request(
+                store, state, args.request_id,
+                terminal_state=args.terminal_state,
+                reason=args.reason or "",
+                now_epoch=(args.now if args.now is not None else time.time()),
+                completion=completion,
+            )
+        except eph.EphemeralError as exc:
+            sys.stderr.write(
+                f"agenttalk supervise --archive-launch-request: {exc}\n"
+            )
+            return 3
         _write_state(state)
         return 0
 
@@ -13927,9 +14063,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--reset-process-tree-ownership",
         dest="reset_process_tree_ownership",
         action="store_true",
-        help="Operator-attended reset of a configured agent's invalid/truncated "
-             "owned-process-tree HOLD after exact identity teardown verification. "
-             "Never kills or launches a process.",
+        help="Operator-attended disposition of a configured agent or terminal "
+             "ephemeral request's invalid/truncated owned-process-tree HOLD after "
+             "exact identity teardown verification. Never kills or launches.",
     )
     gsup.add_argument("--clear-restart", dest="clear_restart", action="store_true",
                       help="Clear a restart-request marker by --for + --request-id.")
@@ -14104,9 +14240,15 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument(
         "--for",
         dest="agent",
-        help="Agent name for --clear-restart or --reset-process-tree-ownership.",
+        help="Agent name for --clear-restart or configured "
+             "--reset-process-tree-ownership.",
     )
-    psup.add_argument("--request-id", dest="request_id", help="(--clear-restart) rid to clear.")
+    psup.add_argument(
+        "--request-id",
+        dest="request_id",
+        help="Request id for --clear-restart or terminal ephemeral "
+             "--reset-process-tree-ownership.",
+    )
     psup.set_defaults(func=cmd_supervise)
 
     pdm = sub.add_parser(
