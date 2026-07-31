@@ -266,8 +266,19 @@ class BoundedStreamTee:
             tail = self._tail
             if tail is None:
                 raise OSError("wrapper log tail is unavailable")
-            tail.write(chunk)
+            # Account for the write BEFORE issuing it, not after: a
+            # terminating signal's handler runs between bytecode
+            # instructions, so it can only land in the gap between this
+            # call and the next one - never inside the write() call itself.
+            # Accounting first means a signal landing in that gap leaves
+            # self._tail_size OVERSTATED relative to the file (nothing was
+            # actually written yet), which only rotates a little early on
+            # the next write. Accounting after leaves it UNDERSTATED once
+            # the bytes are already on disk, so the next write believes it
+            # has more room than it does and can push the segment past
+            # segment_bytes by up to another chunk.
             self._tail_size += len(chunk)
+            tail.write(chunk)
             remaining = remaining[len(chunk):]
 
     def _write_original(self, text: str, *, bounded: bool) -> None:

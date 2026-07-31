@@ -165,6 +165,54 @@ def test_bounded_stream_tee_failure_discards_excess_without_breaking_wrapper(
     assert len(original.getvalue().encode("utf-8")) == 1024
 
 
+def test_bounded_stream_tee_tail_accounts_before_writing_not_after(
+    tmp_path: Path,
+) -> None:
+    """Finding C (PR 98 connector re-review, head 6495534): a terminating
+    signal's handler runs between bytecode instructions, so it can only land
+    in the gap between the tail write and the size accounting that follows
+    it - never inside the write call itself. Accounting AFTER the write
+    leaves self._tail_size understated once the real bytes are already on
+    disk if a signal lands in that gap, so the next write believes it has
+    more room than it does and can push a segment past segment_bytes by up
+    to another chunk. This interacts with the prior round's SIGTERM fix -
+    making a terminating signal actually unwind (and log) promptly, instead
+    of hanging, means a diagnostic write reaching this exact gap is now
+    something normal termination can hit, not an exotic timing accident.
+
+    Simulated directly rather than via a real OS signal: a tail whose
+    write() raises must still have updated the accounting BEFORE that
+    raise, proving accounting is ordered ahead of the write - the same
+    ordering a signal's handler firing right after write() returns would
+    otherwise be able to slip between."""
+    original = io.StringIO()
+    base = tmp_path / "stdout.log"
+    tee = wrapper_logs.BoundedStreamTee(
+        original,
+        base,
+        max_bytes=4096,
+        segment_count=4,
+    )
+    tee._open_tail()
+    real_tail = tee._tail
+
+    class RaisingTail:
+        def write(self, data: object) -> None:
+            raise OSError("simulated interruption during the tail write")
+
+    tee._tail = RaisingTail()
+    size_before = tee._tail_size
+    with pytest.raises(OSError):
+        tee._write_tail(b"x" * 100)
+    assert tee._tail_size == size_before + 100, (
+        "the tail's size accounting was not updated before the write that "
+        "raised - a signal landing in that gap would understate it instead"
+    )
+
+    tee._tail = real_tail
+    tee.close()
+
+
 def test_signal_diagnostic_is_deferred_until_stream_write_unwinds(
     tmp_path: Path,
 ) -> None:
