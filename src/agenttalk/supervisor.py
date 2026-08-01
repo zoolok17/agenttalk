@@ -7186,6 +7186,16 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
   } finally {
     $sha.Dispose()
   }
+  # Case-insensitive by PowerShell's default -match too (an uppercase-hex
+  # nonce would pass a pattern written to require lowercase) - left as-is,
+  # NOT because that is harmless in general, but because $nonce is not in
+  # the caller-or-config-supplied class TODAY: both callers pass
+  # [Guid]::NewGuid().ToString('N') (always lowercase) immediately before
+  # this call, with no config/argv path supplying it. That is a fact about
+  # today's callers, not a structural guarantee - if a future caller ever
+  # accepts this value from config or argv, this comparison needs the same
+  # -ceq/-cmatch treatment as everything else in this file, not inherited
+  # silent trust.
   if ($nonce -notmatch '^[0-9a-f]{32}$') {
     $nonce = [Guid]::NewGuid().ToString('N')
   }
