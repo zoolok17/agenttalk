@@ -521,7 +521,8 @@ def ensure_state(state: dict) -> dict:
 
 def record_prepared(state: dict, *, request_id: str, agent: str, requested_by: str,
                     profile: str, timeout_seconds: int, now_epoch: float,
-                    review_request_id: str, cli: str = "codex") -> dict:
+                    review_request_id: str, cli: str = "codex",
+                    launch: dict | None = None) -> dict:
     root = ensure_state(state)
     root["active"][request_id] = {
         "request_id": request_id,
@@ -529,6 +530,16 @@ def record_prepared(state: dict, *, request_id: str, agent: str, requested_by: s
         "requested_by": requested_by,
         "profile": profile,
         "cli": cli if isinstance(cli, str) and cli else "codex",
+        # Stored WHOLESALE, not as individually hand-picked fields (round
+        # 14, the persistence half of the rebuild class): module_args_from
+        # is the immediate case, but any future field of the profile's own
+        # launch config must survive into the persisted record the same
+        # way, or it dies here even after launch_spec() carries it through
+        # the launch itself. Every later lifecycle function (record_launched,
+        # etc.) reads this entry, mutates specific fields, and writes the
+        # SAME dict back rather than rebuilding it - so this is stored once,
+        # here, and every subsequent phase transition preserves it for free.
+        "launch": dict(launch) if isinstance(launch, dict) else {},
         "phase": STATE_REQUESTED,
         "prepared_epoch": now_epoch,
         "timeout_seconds": int(timeout_seconds),
