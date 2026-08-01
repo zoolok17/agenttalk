@@ -1260,6 +1260,59 @@ def test_m12_git_write_kills_and_reaps_on_base_exception(
     assert seen["killed"] is True
 
 
+def test_m12_git_write_falls_back_to_wait_when_retry_communicate_hangs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # PR 98 connector, round 9: a hook or descendant holding the captured
+    # stdout/stderr pipe handles open can keep the retry communicate()
+    # blocked past its own 5s timeout even though the killed process is
+    # already dead. wait() does not touch the pipes at all, so it still
+    # completes once the process is actually gone - fall back to it
+    # instead of silently giving up on the reap.
+    #
+    # This is why test_m12_git_write_kills_and_reaps_on_base_exception
+    # above is not enough on its own, as asked: its fake kill() marks the
+    # process reaped SYNCHRONOUSLY and its retry communicate() never
+    # times out, so that test would still pass unchanged with the
+    # swallowed-second-timeout bug present - it proves kill() was called,
+    # not that reap completes under the failure mode this finding
+    # describes. This test drives the retry communicate() into a second
+    # TimeoutExpired specifically, so it fails on the old code (nothing
+    # calls wait(), the process is left with poll() still None) and
+    # passes on the fix.
+    seen: dict = {}
+
+    class StuckRetryProc:
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            seen["killed"] = True
+
+        def communicate(self, timeout=None):  # noqa: ANN001
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise SystemExit(143)
+            raise subprocess.TimeoutExpired("git", timeout)
+
+        def wait(self, timeout=None):  # noqa: ANN001
+            seen["wait_timeout"] = timeout
+            self._returncode = -9
+            return self._returncode
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: StuckRetryProc())
+    with pytest.raises(SystemExit):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt4"), "a" * 40])
+    assert seen["killed"] is True
+    assert seen.get("wait_timeout") is not None
+
+
 def test_s2_failed_add_cleanup_removes_branch_after_lock_release(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)

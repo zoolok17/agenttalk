@@ -2072,7 +2072,19 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
             try:
                 proc.communicate(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
+                # A hook or descendant holding the captured stdout/stderr
+                # pipe handles open can keep communicate() blocked past
+                # this retry even though the killed process is already
+                # dead - wait() does not touch the pipes at all, so it
+                # still completes once the process is actually gone.
+                # This function's own contract (kill+REAP before
+                # returning, so a lane is never persisted after an
+                # unknown write state) applies on this path too, not
+                # just the routine-timeout branch above; silently
+                # swallowing a second TimeoutExpired here left the reap
+                # unconfirmed.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=25)
         raise
     return proc.returncode, out or "", err or ""
 
@@ -10650,32 +10662,48 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                     )
                     lifecycle_log.wrapper_exited(code, reason="system_exit")
                 raise
-            if not lifecycle_log.terminal_emitted:
-                lifecycle_log.wrapper_exception(exc)
-                # Print the traceback here, while sys.stderr is still the
-                # bounded tee installed above - the "finally" of that context
-                # manager restores the raw stream before this exception
-                # reaches whatever eventually reports it, which would
-                # otherwise let the one diagnostic anyone actually wants
-                # bypass the cap and the tail rotation #117 exists to
-                # provide.
-                traceback.print_exc(file=sys.stderr)
-            # New area (cold review): a bare re-raise here still reaches
-            # main()'s own KeyboardInterrupt/OSError one-liners, or Python's
-            # own default top-level traceback printer for anything else -
-            # ALL of which run after this "with" block's own finally has
-            # already restored the raw stream, writing straight to the
-            # unbounded underlying file. SystemExit (handled above) is the
-            # one exception type nothing above prints a traceback for at the
-            # true top level; everything else still needs converting to one,
-            # with the matching exit code, instead of letting the original
-            # exception type escape this block.
+            # Same shape, one layer up (PR 98 connector, round 9): the
+            # crash-reporting block below must run ONLY for genuinely
+            # unexpected exceptions. KeyboardInterrupt and (ValueError,
+            # FileNotFoundError, OSError) are NOT unexpected - main() (see
+            # its own except clauses) already has a concise, actionable
+            # one-line diagnostic for exactly these, and this block used to
+            # convert them to the SAME SystemExit codes further down, AFTER
+            # unconditionally recording wrapper_exception and printing a
+            # full Python traceback first. That turned a routine OSError
+            # into crash-report noise ahead of the one line anyone actually
+            # wants - the exact regression #117 exists to prevent, just for
+            # a wider set of types than SystemExit alone.
+            #
+            # Enumerated as a set, not patched type by type: anything NOT
+            # in this set falls through to the crash path below BY
+            # CONSTRUCTION, not by omission - a future exception type that
+            # gains a concise diagnostic elsewhere and is not added here
+            # must be a visible test failure, not a silent traceback. See
+            # test_cmd_wrap_routine_exception_types_skip_crash_reporting
+            # (this set) and
+            # test_cmd_wrap_unclassified_exception_still_gets_crash_reporting
+            # (the other half of the property).
             if isinstance(exc, KeyboardInterrupt):
                 sys.stderr.write("\nagenttalk: interrupted\n")
+                if not lifecycle_log.terminal_emitted:
+                    lifecycle_log.wrapper_exited(130, reason="keyboard_interrupt")
                 raise SystemExit(130) from exc
             if isinstance(exc, (ValueError, FileNotFoundError, OSError)):
                 sys.stderr.write(f"agenttalk: {exc}\n")
+                if not lifecycle_log.terminal_emitted:
+                    lifecycle_log.wrapper_exited(2, reason="mapped_cli_exception")
                 raise SystemExit(2) from exc
+            # Genuinely unexpected: record the crash fact and print the
+            # traceback here, while sys.stderr is still the bounded tee
+            # installed above - the "finally" of that context manager
+            # restores the raw stream before this exception reaches
+            # whatever eventually reports it, which would otherwise let
+            # the one diagnostic anyone actually wants bypass the cap and
+            # the tail rotation #117 exists to provide.
+            if not lifecycle_log.terminal_emitted:
+                lifecycle_log.wrapper_exception(exc)
+                traceback.print_exc(file=sys.stderr)
             raise SystemExit(1) from exc
         finally:
             del args._wrapper_lifecycle_log

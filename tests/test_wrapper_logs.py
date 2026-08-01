@@ -658,6 +658,102 @@ def test_cmd_wrap_routine_system_exit_emits_exited_fact_without_traceback(
     assert "Traceback (most recent call last)" not in tail
 
 
+@pytest.mark.parametrize(
+    "raise_exc,expected_code,expected_reason,expected_text",
+    [
+        (lambda: KeyboardInterrupt(), 130, "keyboard_interrupt", "interrupted"),
+        (lambda: ValueError("bad value"), 2, "mapped_cli_exception", "bad value"),
+        (lambda: FileNotFoundError("missing.toml"), 2, "mapped_cli_exception",
+         "missing.toml"),
+        (lambda: OSError("disk full"), 2, "mapped_cli_exception", "disk full"),
+    ],
+    ids=["KeyboardInterrupt", "ValueError", "FileNotFoundError", "OSError"],
+)
+def test_cmd_wrap_routine_exception_types_skip_crash_reporting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raise_exc,
+    expected_code: int,
+    expected_reason: str,
+    expected_text: str,
+) -> None:
+    # I2's shape, one layer up: main() already has a concise, actionable
+    # diagnostic for KeyboardInterrupt and (ValueError, FileNotFoundError,
+    # OSError) - cmd_wrap's except block converts them to the SAME
+    # SystemExit codes at the bottom, but the crash-reporting block above
+    # that conversion ran unconditionally for anything that wasn't
+    # SystemExit, so an OSError got wrapper_exception + a full Python
+    # traceback BEFORE being converted to the CLI's normal one-line error.
+    # The property: the crash path runs ONLY for exceptions not in this
+    # known, concise-diagnostic set - enumerated as a set (this
+    # parametrize), not patched type by type. A future exception type
+    # that gains a concise diagnostic elsewhere and is not added here
+    # must fail this test, not silently fall through to the crash path.
+    out_path = tmp_path / "stdout.log"
+    err_path = tmp_path / "stderr.log"
+    nonce = "f" * 32
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+
+    def raiser(_args: argparse.Namespace) -> int:
+        raise raise_exc()
+
+    monkeypatch.setattr(cli, "_cmd_wrap_with_logging", raiser)
+    args = argparse.Namespace(agent="worker", supervisor_launch_nonce=nonce)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cmd_wrap(args)
+    assert exc_info.value.code == expected_code
+
+    tail = "".join(
+        path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
+    )
+    rows = [json.loads(line) for line in tail.splitlines() if line.startswith("{")]
+    assert [row["event"] for row in rows] == ["wrapper_exited"]
+    assert rows[0]["exit_code"] == expected_code
+    assert rows[0]["reason"] == expected_reason
+    assert expected_text in tail
+    assert "Traceback (most recent call last)" not in tail
+
+
+def test_cmd_wrap_unclassified_exception_still_gets_crash_reporting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The other half of the property: an exception type NOT in the known,
+    # concise-diagnostic set must still fall through to the crash path -
+    # this is the visible-omission guard the enumeration exists for.
+    out_path = tmp_path / "stdout.log"
+    err_path = tmp_path / "stderr.log"
+    nonce = "9" * 32
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+
+    def raiser(_args: argparse.Namespace) -> int:
+        raise RuntimeError("truly unexpected")
+
+    monkeypatch.setattr(cli, "_cmd_wrap_with_logging", raiser)
+    args = argparse.Namespace(agent="worker", supervisor_launch_nonce=nonce)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cmd_wrap(args)
+    assert exc_info.value.code == 1
+
+    tail = "".join(
+        path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
+    )
+    rows = [json.loads(line) for line in tail.splitlines() if line.startswith("{")]
+    assert [row["event"] for row in rows] == ["wrapper_exception"]
+    assert rows[0]["exception_type"] == "RuntimeError"
+    assert "Traceback (most recent call last)" in tail
+
+
 def test_cmd_wrap_entry_bounds_python_level_wrapper_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
