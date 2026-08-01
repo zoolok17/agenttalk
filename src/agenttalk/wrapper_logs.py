@@ -265,7 +265,23 @@ class BoundedStreamTee:
         self._tail_count = self.segment_count - 1
         self._tail_index = 0
         self._tail_size = 0
-        self._tail_resume_append = False
+        # THE invariant that closes the whole class of "this ring lost the
+        # newest bytes" findings (round 18's trade-off, round 21/29's mtime
+        # ambiguity, round 29's missing-cursor fallback, and round 29's
+        # cursor-persistence-failure cascade - five different mechanisms,
+        # one recurring outcome): _open_tail may open a suffix with "wb"
+        # ONLY if THIS instance has itself already opened that exact index
+        # before, in memory, this run. A suffix this instance has never
+        # visited is NEVER truncated, no matter how _tail_index ended up
+        # pointing at it - a correct cursor, a stale cursor, no cursor at
+        # all, or a mid-write cascade through _advance_tail landing on an
+        # index nothing here has picked deliberately. Every one of those
+        # paths converges on the same safe default in _open_tail. Once a
+        # full ring lap has genuinely passed and this instance revisits an
+        # index it already knows about, "wb" is exactly the correct,
+        # expected ring behavior - discarding the oldest tracked content,
+        # not a guess about untracked content.
+        self._visited_tail_indices: set[int] = set()
         if resume:
             self._resume_tail_position()
         self._tail = None
@@ -274,7 +290,21 @@ class BoundedStreamTee:
         self._lock = threading.Lock()
 
     def _tail_cursor_path(self) -> Path:
-        return self.base_path.with_name(f"{self.base_path.name}.cursor")
+        # semgrep's agenttalk-no-raw-agent-name-in-filename fires on the
+        # SYNTACTIC shape f"...{$NAME}.cursor" regardless of what $NAME
+        # actually holds - it exists to catch an UNVALIDATED AGENT NAME
+        # reaching a path (the v0.2.1 path-traversal class; see
+        # SECURITY.md). self.base_path.name is never an agent name: it is
+        # this class's own fixed base_path (always literally "stdout.log"
+        # or "stderr.log", set once in __init__ from the supervisor's own
+        # ENV_STDOUT_PATH/ENV_STDERR_PATH, never operator- or
+        # agent-name-derived text) - the agent-name-to-path validation
+        # this rule protects already happened one layer up, in
+        # Get-SafeWrapperLogAgentDir's own hashing of the agent name into
+        # the DIRECTORY component, before this filename is ever built.
+        return self.base_path.with_name(
+            f"{self.base_path.name}.cursor"  # nosemgrep: agenttalk-no-raw-agent-name-in-filename
+        )
 
     def _write_tail_cursor(self) -> None:
         # Best-effort, same as the rest of this ring: a failure here must
@@ -319,27 +349,18 @@ class BoundedStreamTee:
         # rotation), and this reads that recorded index back - no mtime,
         # no tie-break, nothing wall-clock-dependent.
         #
-        # A missing or unreadable cursor (no prior instance ever wrote
-        # one, or it predates this fix - true of every generation on disk
-        # at the moment this fix ships) falls back to index 0 - but
-        # ALWAYS in append mode, never "wb". A round-29 rereview caught my
-        # first draft's fallback treating a missing cursor as "resume was
-        # never called at all", defaulting straight back to the ORIGINAL
-        # truncate-on-first-write behavior - which is strictly WORSE than
-        # the mtime scan it replaced on precisely the generations that
-        # predate this fix (every one on disk at upgrade time), and worse
-        # specifically in the crash path this whole module exists for: the
-        # mtime scan was USUALLY right, "no cursor -> wb" is truncated
-        # EVERY time. "Never touch content this process has no recorded
-        # fact about" is the right bar for this ring; it is not the same
-        # as "truncate whenever there is no fact", which is what my first
-        # draft actually did. Appending onto index 0 blind (no fact about
-        # whether it is really the segment a prior instance last used) can
-        # still produce a wrong ORDER - old content from an unrelated
-        # earlier rotation, followed by this instance's new content, in
-        # one file - but it can never DESTROY content, which is the
-        # property this whole fix exists to guarantee. No wall-clock
-        # dependency either way, unlike the mtime-scan alternative.
+        # This only has to pick a STARTING index - it does not have to
+        # get it right, and it does not set up "append the first open,
+        # then trust the rest" bookkeeping the way earlier drafts did.
+        # _open_tail's own per-index visited-set check (see __init__'s
+        # comment) is what actually guarantees nothing gets truncated on
+        # a first visit, for THIS index and for any index a later
+        # rotation cascades into - a missing/unreadable cursor (no prior
+        # instance ever wrote one, or it predates this fix), a STALE
+        # cursor (the prior instance's cursor REWRITE failed after it had
+        # already advanced - round 29 rereview), or a correct cursor all
+        # land on the exact same safe path below, uniformly, rather than
+        # each needing its own special case here.
         index = 0
         try:
             raw = self._tail_cursor_path().read_text(encoding="utf-8").strip()
@@ -348,14 +369,7 @@ class BoundedStreamTee:
                 index = parsed
         except (OSError, ValueError):
             pass
-        candidate = self.base_path.with_name(f"{self.base_path.name}.{index + 1}")
-        try:
-            size = candidate.stat().st_size
-        except OSError:
-            size = 0
         self._tail_index = index
-        self._tail_size = size
-        self._tail_resume_append = True
 
     @property
     def encoding(self) -> str:
@@ -396,21 +410,30 @@ class BoundedStreamTee:
         # could open a handle to this file in that window and keep it past
         # the chmod. The mode argument only takes effect when the file is
         # actually being CREATED (O_CREAT) - harmless, and irrelevant, for
-        # the "ab" resume case reopening a file that already exists.
+        # an "ab" open reopening a file that already exists.
         # pathlib.Path.open() does not forward an opener kwarg - use the
         # builtin open() (which does) against the string path instead.
         opener = _restrictive_file_opener if os.name != "nt" else None
-        # Only the very first open of a resumed instance appends (onto the
-        # size already recorded in __init__); every later rotation into a
-        # new segment - including a later revisit of this same index once
-        # the ring wraps back around - starts that segment fresh, exactly
-        # as an uninterrupted instance always has.
-        if self._tail_resume_append:
-            self._tail_resume_append = False
-            self._tail = open(str(path), "ab", opener=opener)
-        else:
+        # THE invariant (see __init__'s comment): "wb" is only ever used on
+        # an index THIS instance has already opened before, in memory -
+        # never on the strength of a cursor, a guess, or anywhere a
+        # cascading rotation happens to land. A first-ever visit to an
+        # index always appends onto whatever is actually on disk right
+        # now (seeded by a fresh stat, not by inherited bookkeeping from
+        # whichever segment this instance was previously using) - a
+        # nonexistent file opened "ab" is created fresh, identical to
+        # "wb" in that specific case, so this costs nothing for the
+        # ordinary, uninterrupted-instance path.
+        if self._tail_index in self._visited_tail_indices:
             self._tail = open(str(path), "wb", opener=opener)
             self._tail_size = 0
+        else:
+            try:
+                self._tail_size = path.stat().st_size
+            except OSError:
+                self._tail_size = 0
+            self._tail = open(str(path), "ab", opener=opener)
+        self._visited_tail_indices.add(self._tail_index)
         if os.name != "nt":
             # Defense in depth for a path this opener could not have
             # created fresh - e.g. a resumed file left behind by an older

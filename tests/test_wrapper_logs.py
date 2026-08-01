@@ -494,6 +494,50 @@ def test_bounded_stream_tee_resume_appends_not_truncates_when_no_cursor_exists(
     assert b"SECOND-INSTANCE-CRASH-SENTINEL" in combined
 
 
+def test_bounded_stream_tee_resume_survives_a_stale_cursor_after_rewrite_failure(
+    tmp_path: Path,
+) -> None:
+    """PR 98 round 29 connector finding, against 7a4ee43: if the
+    best-effort cursor rewrite in _write_tail_cursor fails right after
+    _advance_tail has already opened a new suffix, the STALE cursor
+    (still pointing at the segment just rotated OUT of, which is already
+    full) survives on disk. A later resume=True instance trusts it,
+    immediately advances past the reported-full segment on its first
+    write, and - before this fix - opened the NEXT suffix with "wb",
+    destroying whatever the crashed instance had already written there
+    before its own cursor-rewrite failure ever happened.
+
+    Simulates exactly that: .1 hand-written full (segment_bytes), .2
+    hand-written with real, never-recorded content (the segment the
+    crashed instance HAD rotated into but never got to confirm), and a
+    cursor file left stale at "0" (still naming .1). A resumed instance
+    must find its OWN first write immediately cascades past the
+    reported-full .1 into .2 - and append there, not truncate, because
+    THIS instance has never itself visited .2 before, regardless of what
+    the stale cursor said about .1."""
+    base = tmp_path / "stderr.log"
+    segment_bytes = 4096 // 4
+    (tmp_path / "stderr.log.1").write_bytes(b"A" * segment_bytes)
+    (tmp_path / "stderr.log.2").write_bytes(b"INSTANCE-A-REAL-UNRECORDED-CONTENT\n")
+    (tmp_path / "stderr.log.cursor").write_text("0", encoding="utf-8")  # stale
+
+    second = wrapper_logs.BoundedStreamTee(
+        io.StringIO(), base, max_bytes=4096, segment_count=4, resume=True,
+    )
+    second.write("SECOND-INSTANCE-CRASH-SENTINEL\n")
+    second.close()
+
+    seg2 = (tmp_path / "stderr.log.2").read_bytes()
+    assert seg2.startswith(b"INSTANCE-A-REAL-UNRECORDED-CONTENT\n"), (
+        "a stale cursor's cascading rotation must never truncate a segment "
+        "this instance has not itself visited before"
+    )
+    assert b"SECOND-INSTANCE-CRASH-SENTINEL" in seg2
+    # .1 (where the stale cursor pointed) is untouched-then-appended-to on
+    # this instance's own first visit, same guarantee as the no-cursor case.
+    assert (tmp_path / "stderr.log.1").read_bytes().startswith(b"A" * segment_bytes)
+
+
 def test_bounded_stream_tee_resume_still_rotates_and_truncates_the_next_segment(
     tmp_path: Path,
 ) -> None:
