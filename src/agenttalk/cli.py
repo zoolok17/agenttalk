@@ -2064,6 +2064,16 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
         try:
             out, err = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired as reap:
+            # A third exit from this function's timeout handling that used
+            # to raise immediately without ever calling wait() - a killed
+            # git could still go unreaped while this function returned
+            # (via raising), contradicting the docstring's own kill+REAP
+            # contract and leaving a lane mutation's lock state uncertain.
+            # Same fallback as the BaseException branch below: wait() does
+            # not touch the pipes, so it still completes once the process
+            # is actually gone.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=25)
             raise GitWriteError(
                 "mutating git timed out and could not be reaped; git/config lock may be stranded"
             ) from reap

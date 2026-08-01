@@ -1217,6 +1217,9 @@ def test_m12_git_write_env_timeout_and_allowlist(monkeypatch: pytest.MonkeyPatch
         def kill(self):
             seen["killed"] = True
 
+        def wait(self, timeout=None):  # noqa: ANN001
+            return -9
+
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: StuckProc())
     with pytest.raises(cli.GitWriteError, match="could not be reaped"):
         cli._git_write(
@@ -1366,12 +1369,56 @@ def test_m12_git_write_kill_raising_does_not_replace_the_timeout_error(
         def communicate(self, timeout=None):  # noqa: ANN001
             raise subprocess.TimeoutExpired("git", timeout)
 
+        def wait(self, timeout=None):  # noqa: ANN001
+            return -9
+
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: RaisingKillProc())
     with pytest.raises(cli.GitWriteError, match="could not be reaped"):
         cli._git_write(
             tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
                        str(tmp_path / "wt6"), "a" * 40], timeout=0.01)
     assert seen["kill_called"] is True
+
+
+def test_m12_git_write_routine_timeout_reaps_via_wait_on_second_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # Round 12 connector finding: a THIRD exit from _git_write's timeout
+    # handling, distinct from the BaseException branch fixed in round 9
+    # and the kill()-guard fixed in round 11 - on the ROUTINE timeout
+    # retry, a second TimeoutExpired raised immediately without ever
+    # calling wait(), so a killed git could still go unreaped while this
+    # function returned (by raising), contradicting its own docstring
+    # contract and leaving a lane mutation's lock state uncertain.
+    seen: dict = {}
+
+    class StuckRoutineRetryProc:
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            seen["killed"] = True
+
+        def communicate(self, timeout=None):
+            self.communicate_calls += 1
+            raise subprocess.TimeoutExpired("git", timeout)
+
+        def wait(self, timeout=None):  # noqa: ANN001
+            seen["wait_timeout"] = timeout
+            self._returncode = -9
+            return self._returncode
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: StuckRoutineRetryProc())
+    with pytest.raises(cli.GitWriteError, match="could not be reaped"):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt7"), "a" * 40], timeout=0.01)
+    assert seen["killed"] is True
+    assert seen.get("wait_timeout") is not None
 
 
 def test_s2_failed_add_cleanup_removes_branch_after_lock_release(
