@@ -1,13 +1,26 @@
 # Design 87-A module: owned-childless wrapper authority
 
-**Status:** Proposed, Revision 10; normative authority module of 87-A. This file
-and
+**Design status:** Proposed, Revision 11; candidate for
+**NORMATIVE-SPECIFICATION COMPLETE**. This file and
 [`DESIGN-87A-supervisor-classifier-authority.md`](DESIGN-87A-supervisor-classifier-authority.md)
 at the same commit form one specification. Neither is conforming alone.
 
+**Delivery status:** **IMPLEMENTATION BLOCKED.** Task #146 must replace the
+merged raw supervisor owned-tree kill entry with the closed dispatcher specified
+below and migrate every current caller. Task #115 and the closure successor also
+remain open dependencies. Revision 11 specifies those boundaries; it does not
+deliver them.
+
+**Conformance status:** **UNAVAILABLE.** Neither Q4 nor 87-A is complete,
+conforming, sealed, or enforced in merged code. If this revision passes design
+review, only the normative specification is complete. Runtime conformance still
+requires the named implementations and their executed controls.
+
+**Activation status:** **PROHIBITED** until delivery and conformance close.
+
 **Mode:** Reference.
 
-**Audience:** Contributors implementing tasks #78, #115, and #120, the
+**Audience:** Contributors implementing tasks #78, #115, #120, and #146, the
 closure successor defined below, and reviewers checking teardown authority.
 
 ## Boundary and placement decision
@@ -30,17 +43,21 @@ This is a normative seam, not hand-waving:
 87-A observes and classifies
   -> #120 publishes a bounded owned-tree snapshot or a closed refusal
   -> that snapshot, every parsed target, and every reloaded state remain inert evidence
-  -> the actual current-host effect adapter may mint a nonserializable exact-executor witness
+  -> #146 places the supervisor owned-tree native kill body behind one closed dispatcher
+  -> only that dispatcher's private capability factory may mint an exact-executor witness
   -> only an exact witness-plus-binding match may construct an operation-scoped permit
   -> only a permit may construct a reservation, effect-owned mutation, or typed external call
   -> adapters accept typed calls and return matching typed receipts, never raw IDs or state
-  -> existing Stop-Tree is the sole target-kill primitive for a permitted Windows call
+  -> the dispatcher alone projects a private immutable native plan into the sole native body
   -> #120's post-kill barrier may block, but never authorize, a launch
 ```
 
 This is a construction boundary, not a requirement to remember a check at every
 state entry. An eighteenth, nineteenth, or future childless-origin state may
 deserialize inert evidence, but it cannot manufacture the object needed to act.
+Preserving existing non-87-A behavior rather than preserving the raw kill entry
+point is the compatibility principle. A caller-settable discriminator or a
+typed wrapper around `kill_targets` is not authorization.
 
 The core's independently approved operand convention, 96-cell dominant
 projection, presence/targetability classifier, whole-wrapper absence reducer,
@@ -55,8 +72,8 @@ normative location. It is audit evidence, not a third 87-A specification.
 
 ## Safety decision
 
-**ENFORCED after task #115, the merged-#120 adapter, and the closure successor
-(#120 input delivered at `587e7c1`):** An owned wrapper whose CLI child is
+**SPECIFIED, NOT DELIVERED; requires tasks #115 and #146 plus the closure
+successor (#120 input delivered at `587e7c1`):** An owned wrapper whose CLI child is
 positively absent in two independent complete observations may be torn down
 only after the same-turn nonrenewable `ChildEstablishmentGuardV1` is
 `CLOSED`. Once closed, such a wrapper has no brain and no progressing CLI turn
@@ -74,8 +91,8 @@ complete `ABSENT` samples for the same guarded owner and guard object. Changing
 completeness, establishment state, owner, or confirmation count changes
 authority deterministically from the named case to none.
 
-**ENFORCED by the 87-A adapter over merged, reviewed task #120 (input delivered
-at `587e7c1`):** Ownership is never inferred from a process name,
+**SPECIFIED, NOT DELIVERED by the future 87-A adapter over merged, reviewed task
+#120 (input delivered at `587e7c1`):** Ownership is never inferred from a process name,
 executable basename, image substring, or command-line pattern. The wrapper
 must match the persisted PID, exact start guard, and launch nonce. Every tree
 target carries that same owner nonce through a complete #120 ownership proof.
@@ -107,7 +124,7 @@ as follows:
 | `status=absent` | No-kill absence/barrier evidence only; never an initial owned-tree teardown authority. |
 | `status=truncated|invalid`, a non-64 limit, inconsistent counts, omitted entries, or an unreadable binding | `INCOMPLETE`; no teardown authority. |
 | Live Windows `entries[].pid/start/start_filetime` | `OwnedTreeTargetV1.pid/start_guard` after exact live validation. The destructive guard is the positive decimal `start_filetime`; the rounded ISO `start` is capture/ordering corroboration and never substitutes for a missing FILETIME. The adapter derives and validates `parent_start_guard` and `depth` from the accepted live parent chain and projects the validated top-level owner nonce onto each target; it may not privately default any missing fact. |
-| Non-Windows platform, including a live Linux `entries[].start` token | #120 recognizes Linux `linux:<boot_id>:<start_ticks>` as observation/barrier input; it declares no macOS exact-token mapping. The current sole kill primitive has no non-Windows exact-token execution branch, so fresh authority construction returns pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`, short-circuits before the effect envelope or reservation exists, and constructs no executable target, permit, attempt, debt, or external call. Reloaded evidence may be parsed and ordinary observation bookkeeping may advance, but no matching permit or effect-owned mutation is constructible. Input acceptance is not effect capability. |
+| Non-Windows platform, including a live Linux `entries[].start` token | #120 recognizes Linux `linux:<boot_id>:<start_ticks>` as observation/barrier input; it declares no macOS exact-token mapping. The merged supervisor owned-tree native body has no non-Windows exact-token execution branch, so fresh authority construction returns pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`, short-circuits before the effect envelope or reservation exists, and constructs no executable target, permit, attempt, debt, or external call. Reloaded evidence may be parsed and ordinary observation bookkeeping may advance, but no matching permit or effect-owned mutation is constructible. Input acceptance is not effect capability. |
 | Non-live virtual ancestry bridge | Admissible only when copied exactly from a prior complete record with unchanged wrapper generation, launch nonce, and parent chain. It is validation provenance only: exclude it from `root_first_targets`, every target digest, and `Stop-Tree`. A live child whose immediate owned parent is such a bridge uses the module's existing positively proven orphan form: null owned-parent fields and depth one. |
 
 `role` and `discovered_at` are validated bounded metadata but are excluded from
@@ -129,6 +146,15 @@ target that signals within the budget is not sampled as live. Open failure,
 identity mismatch, termination failure, wait timeout, or depleted budget is not
 completion and is decided only by the fresh snapshot and barrier; a target still
 present remains survivor evidence.
+
+Those target-local semantics do not make merged `Stop-Tree($targets)` a
+conforming 87-A executor. At `587e7c1`, that function accepts a caller-supplied
+raw array and current planners call it directly. The unsealed entry can reach
+the native termination body without an 87-A permit. Consequently merged #120
+cannot mint `CurrentExactTargetExecutorWitnessV1`, even on Windows. Task #146
+must preserve the described non-87-A behavior while removing the raw entry,
+migrating every current caller through an independently authorized opaque call,
+and making the closed dispatcher the only route to the native body.
 
 The barrier rechecks recorded exact identities and fresh descendant edges.
 For an independently authorized Windows attempt, planning and `Stop-Tree`
@@ -176,22 +202,24 @@ failure follows the ordinary closure-veto/attempt rules; structural inability
 never does. Merged #120 narrows snapshot, target-identity, and post-effect
 ambiguity; it does not narrow this closure-capability refusal, and no formerly
 held closure-dependent teardown now proceeds. This structural refusal is scoped
-to the named closure-dependent path; it does not disable merged #120's
-snapshot, existing authorized exact-target execution, barrier, attended reset,
-or attended archive for their non-87-A callers.
+to the named closure-dependent path. Task #146 preserves merged #120's
+snapshot, exact-target behavior, barrier, attended reset, and attended archive
+for independently authorized non-87-A callers; it does not preserve the raw
+call signature or treat a planner array as authority.
 
 Capability claims are proved at the line where the effect happens, not where an
 input is accepted. Merged #120 accepts Linux `linux:<boot_id>:<start_ticks>` as
 an exact observation token (grammar at
 `src/agenttalk/supervisor.py:2187-2204`; exactness/record validation at
-`2087-2115`, `2438-2470` in `587e7c1`), but its sole executor enters the destructive branch only when
+`2087-2115`, `2438-2470` in `587e7c1`), but its current raw executor enters the destructive branch only when
 `start_filetime` is present (`8900-8928`) and explicitly skips an
 `owned_process_tree` target without it (`8930-8932`). Therefore that accepted
 token is not a POSIX kill adapter. Linux and macOS are structurally unavailable
 for this named teardown until a separately reviewed exact-token executor is
-delivered; Revision 10 does not dependency-track or assume one. The Windows
-FILETIME requirement is immutable and is never weakened to make another
-platform appear available.
+delivered; Revision 11 does not dependency-track or assume one. Windows is also
+unavailable to 87-A until #146 seals the dispatcher, even though merged #120's
+target-local FILETIME mechanics exist. The Windows FILETIME requirement is
+immutable and is never weakened to make another platform appear available.
 
 ```text
 MAX_OWNED_TREE_TARGETS_V1 = 64
@@ -332,14 +360,52 @@ ExactTargetExecutorBindingV1 {
 }
 
 CurrentExactTargetExecutorWitnessV1 =
-  fresh nonserializable, noncopyable current-process witness minted only by
-  the action-site adapter whose actual effect branch implements
-  "stop-tree/windows-filetime/v1"
+  fresh private, nonserializable, noncopyable, deeply immutable current-process
+  witness minted before permit/call construction only by #146's unexported
+  dispatcher-capability factory after proving this is a conforming Windows
+  dispatcher installation whose private native branch implements
+  "stop-tree/windows-filetime/v1"; it carries an unexported live
+  dispatcher-instance identity but grants no target authority by itself
 
-LiveEffectGuardBorrowV1 =
-  fresh nonserializable, noncopyable linear borrow of the exact currently held
-  per-agent effect-guard handle; while the borrow exists the handle cannot be
-  released, transferred, or replaced
+CurrentExactTargetExecutorWitnessConstructionV1 =
+  AVAILABLE(CurrentExactTargetExecutorWitnessV1)
+  | CAPABILITY_UNAVAILABLE(
+      EXACT_TARGET_EXECUTOR_UNAVAILABLE
+      | DISPATCHER_SEAL_UNDELIVERED)
+
+LiveEffectGuardLineageV1 =
+  one private, nonserializable, noncopyable in-process lineage minted exactly
+  once for one successful acquisition of the exact per-agent effect-guard
+  handle, carrying fresh lineage_id and acquisition_generation
+
+LiveEffectGuardLineageOwnerV1 =
+  the one unexported atomic owner cell created with that acquisition and
+  destroyed with guard release; it alone stores LiveEffectGuardLineageStateV1,
+  exposes no clone/mint API, and is never a field reachable from a sealed effect
+  value
+
+LiveEffectGuardLineageStateV1 =
+  AVAILABLE(LiveEffectGuardCustodyV1)
+  | OUTSTANDING {
+      lineage_id: lowercase hyphenated UUID
+      issuance_id: lowercase hyphenated UUID
+      holder: PERMIT | OWNER_COMMIT | CALL | RECEIPT
+    }
+  | POISONED {
+      lineage_id: lowercase hyphenated UUID
+      issuance_id: lowercase hyphenated UUID
+      cause: ADAPTER_EFFECT_UNCERTAIN | OWNER_COMMIT_UNCERTAIN
+               | RECEIPT_HANDOFF_UNCERTAIN | CUSTODY_PROTOCOL_BROKEN
+    }
+  | CLOSED
+
+LiveEffectGuardCustodyV1 =
+  the sole private, nonserializable, noncopyable, deeply immutable linear proof
+  for one LiveEffectGuardLineageV1; it contains no mutable owner-cell reference,
+  is minted initially for AVAILABLE, and on each private holder transition is
+  consumed, never copied, into exactly one successor proof for the same lineage
+  and issuance. The first transition is the atomic
+  AVAILABLE -> OUTSTANDING move in LiveEffectGuardLineageOwnerV1.
 
 ExactTargetExecutorOperationV1 =
   RESERVE | PRE_BARRIER_RELEASE | TAKEOVER
@@ -352,7 +418,8 @@ ExactTargetExecutorPermitUseV1 =
   STATE_MUTATION | EXTERNAL_CALL | RECEIPT_MUTATION
 
 ExactTargetExecutorPermitV1 =
-  fresh nonserializable, single-use permit constructed only from:
+  fresh private, nonserializable, noncopyable, deeply immutable, single-use
+  permit constructed only from:
     CurrentExactTargetExecutorWitnessV1
     + exact ExactTargetExecutorBindingV1
     + the operation's exact binding proof: normally the recomputed exact
@@ -364,8 +431,14 @@ ExactTargetExecutorPermitV1 =
     + one ExactTargetExecutorOperationV1
     + one ExactTargetExecutorPermitUseV1
     + that operation's exact live scope defined below
-    + for every guard-required operation, one LiveEffectGuardBorrowV1
-    + for RECEIPT_MUTATION, the exact allowed predecessor receipt
+    + for a guard-required STATE_MUTATION or EXTERNAL_CALL, the one
+      AVAILABLE LiveEffectGuardCustodyV1 moved atomically into this permit's
+      fresh issuance_id; no second issuance from the acquisition is possible
+      while its lineage is OUTSTANDING, POISONED, or CLOSED
+    + for RECEIPT_MUTATION, the exact allowed predecessor receipt, consumed as
+      the sole OUTSTANDING holder while preserving its lineage_id and
+      issuance_id; this continuation neither requires AVAILABLE custody nor
+      creates a fresh issuance
 
 ExactTargetExecutorPermitConstructionV1 =
   PERMITTED(ExactTargetExecutorPermitV1)
@@ -374,6 +447,7 @@ ExactTargetExecutorPermitConstructionV1 =
       STALE_CHECKED_REVISION
       | OPERAND_MISMATCH
       | INVALID_OPERATION_SCOPE
+      | LINEAGE_NOT_AVAILABLE_OR_POISONED
       | COPIED_FORGED_REPLAYED_OR_CONSUMED)
 
 ClosureCapabilityV1 =
@@ -385,6 +459,7 @@ ClosureCapabilityV1 =
   | CAPABILITY_UNAVAILABLE(
       ordered deduplicated nonempty tuple[
         EXACT_TARGET_EXECUTOR_UNAVAILABLE
+        | DISPATCHER_SEAL_UNDELIVERED
         | SUCCESSOR_MISSING
         | SUCCESSOR_UNREVIEWED
         | PROVIDER_INCOMPATIBLE
@@ -507,12 +582,14 @@ ChildlessEffectEnvelopeV1 {
 }
 
 ExecutableOwnedTargetSetV1 =
-  nonserializable exact root-first target tuple and recomputed target digest
+  private, nonserializable, noncopyable, deeply immutable, alias-free exact
+  root-first target tuple and recomputed target digest
   bound to one ExactTargetExecutorPermitV1(
     operation = STOP_TREE, use = EXTERNAL_CALL)
 
 PermitBoundChildlessMutationV1 =
-  nonserializable checked-state delta containing the exact expected revision,
+  private, nonserializable, noncopyable, deeply immutable, alias-free
+  checked-state delta containing the exact expected revision,
   one current ExactTargetExecutorPermitV1 whose use is STATE_MUTATION or
   RECEIPT_MUTATION, the exact current envelope or
   NO_CHILDLESS_ENVELOPE for an initial RESERVE, and the complete next
@@ -520,19 +597,55 @@ PermitBoundChildlessMutationV1 =
   permit's operation, plus the exact closed core ChildlessOuterStateDeltaV1
 
 ChildlessExternalEffectCallV1 =
-  nonserializable typed call in
+  private, nonserializable, noncopyable, deeply immutable, alias-free,
+  single-use typed call in
     CLOSURE_ACQUIRE | CLOSURE_RECONCILE | CLOSURE_RELEASE
     | RETIRED_ATTEMPT_RECONCILE | STOP_TREE | POST_ACTION_CAPTURE
     | SPAWN
   carrying one call_id, an exact permit whose use is EXTERNAL_CALL, its exact
   binding/continuation, only that operation's typed arguments, and ownership of
-  the permit's LiveEffectGuardBorrowV1
+  the permit's exact immutable LiveEffectGuardCustodyV1 proof and issuance_id;
+  its separate private lineage owner cell is atomically in holder CALL
 
 ChildlessExternalEffectReceiptV1 =
-  nonserializable typed result carrying the exact call_id, operation,
+  private, nonserializable, noncopyable, deeply immutable, alias-free,
+  single-use typed result carrying the exact call_id, operation,
   consumed call-permit identity/binding, call-time checked revision,
   operation-specific result, and
-  the same still-live guard borrow returned by the synchronous adapter
+  the same still-live immutable custody proof moved by the synchronous adapter;
+  its separate private lineage owner cell is atomically in holder RECEIPT
+
+ConfiguredAgentOwnedTreeCallV1 =
+  private, nonserializable, noncopyable, deeply immutable, alias-free,
+  single-use call constructible only from the checked configured-agent
+  relaunch/stuck-recovery planner provenance, the exact persisted barrier_state
+  authorizing that plan, and a privately sealed exact target tuple
+
+EphemeralTerminalOwnedTreeCallV1 =
+  private, nonserializable, noncopyable, deeply immutable, alias-free,
+  single-use call constructible only from exact request/action provenance for
+  COMPLETE | TIMEOUT | FAILED, the exact persisted next_entry, and a privately
+  sealed exact target tuple
+
+SupervisorOwnedTreeDispatchCallV1 =
+  private, nonserializable, noncopyable, deeply immutable, alias-free,
+  single-use closed sum of exactly:
+    CHILDLESS(
+      ChildlessExternalEffectCallV1(operation = STOP_TREE))
+    | CONFIGURED_AGENT_RELAUNCH(ConfiguredAgentOwnedTreeCallV1)
+    | EPHEMERAL_TERMINAL(EphemeralTerminalOwnedTreeCallV1)
+
+PrivateSupervisorOwnedTreeNativePlanV1 =
+  dispatcher-local deeply immutable leaves-first target tuple plus the exact
+  execution mode selected from one consumed SupervisorOwnedTreeDispatchCallV1;
+  this value is neither an API type nor constructible outside the private native
+  body. The body may materialize the tuple as one unaliased lexical raw array
+  only at the final native invocation and must discard it on return.
+
+SupervisorOwnedTreeDispatchReceiptV1 =
+  private, nonserializable, noncopyable, deeply immutable, alias-free result
+  bound to the exact consumed dispatch call, variant, target tuple, and native
+  outcomes; only CHILDLESS projects into ChildlessExternalEffectReceiptV1
 
 ChildlessSafetyReconciliationGateV1 =
   RETAIN_INVALID_FENCE
@@ -549,19 +662,61 @@ ChildlessSafetyReconciliationGateV1 =
         use = STATE_MUTATION))
 ```
 
+Every private transient value above carries an unexported construction seal
+over its complete transitive value. That seal is object provenance, not a
+persisted field, not a new digest domain, and not an authority substitute.
+Private constructors deep-copy and canonicalize caller material into primitives,
+enums, immutable tuples, and final sealed records before validation. No trusted
+effect object may retain or expose a reachable list, dictionary, set,
+byte-array, mutable record, caller-owned proxy, writable property, or mutable
+subclass. A frozen outer record with a mutable nested value is nonconforming.
+Consumers revalidate the private seal, exact lineage/call identity, complete
+canonical content, binding, and target digest before mutation or effect.
+`LiveEffectGuardLineageOwnerV1` is synchronization ownership outside every
+sealed value graph, not a nested mutable field. Sealed permits, calls, and
+receipts carry only the immutable opaque custody proof. Their private
+constructors atomically compare-and-move the separate owner cell before
+returning the next sealed value; failure returns no partially moved value.
+
+The #146 dispatcher accepts only `SupervisorOwnedTreeDispatchCallV1`, consumes
+it exactly once, validates its closed variant, and only then constructs
+`PrivateSupervisorOwnedTreeNativePlanV1` inside the sole supervisor owned-tree
+native body. Only there may the immutable plan tuple be materialized as an
+unaliased lexical raw array for the final native call. A caller-settable
+discriminant, a wrapper around `kill_targets`, a
+planner-produced array, or a field-equivalent copied record is inert evidence,
+not authorization. The childless variant requires the permit-bound typed call.
+The other two variants preserve independently authorized non-87-A behavior and
+cannot grant, imply, reuse, or satisfy childless authority. The phrase “sole
+native body” is scoped to the supervisor owned-tree executor in
+`supervisor.py`; the separate `turn_watchdog.py` kill facility has its own
+policy and is outside 87-A and #146.
+
 `ExactTargetExecutorBindingV1` is inert persisted evidence. It names the only
 executor contract that may act on the exact owner/target tuple, but it grants
 no authority and cannot mint a witness or permit. The existing seven digest
 domains remain unchanged: the binding references their recomputed identifiers
 rather than adding fields to any banked payload.
+`executor_contract="stop-tree/windows-filetime/v1"` identifies the exact
+FILETIME effect semantics; it is not a public function signature and does not
+authorize raw `Stop-Tree` invocation.
 
-`CurrentExactTargetExecutorWitnessV1` exists only in the current process at the
-line where the concrete effect adapter is available. Parser, snapshot,
-target-constructor, persisted platform text, or deserialized state cannot
-produce it. At merged #120, only the Windows exact-FILETIME branch at
-`src/agenttalk/supervisor.py:8900-8928` may back the V1 witness; the non-Windows
-skip at `8930-8932` produces no witness. A future executor requires a separately
-reviewed versioned contract.
+`CurrentExactTargetExecutorWitnessV1` exists only in the current process after
+#146's private capability factory has established the current conforming
+dispatcher installation and before any permit or call is constructed. This is
+not circular: the capability factory creates the witness; the permit constructor
+consumes its provenance plus the exact inert binding; the childless call carries
+that permit; and the dispatcher accepts the resulting closed variant only when
+the permit's unexported dispatcher-instance identity matches its own. Parser,
+snapshot, target constructor, persisted platform text, deserialized state, the
+merged raw `Stop-Tree` function, and either non-childless dispatcher variant
+cannot produce a witness. Merged #120's Windows exact-FILETIME branch at
+`src/agenttalk/supervisor.py:8900-8928` supplies the required target-local native
+semantics but cannot back the V1 witness while the raw entry remains. The
+non-Windows skip at `8930-8932` supplies neither semantics nor witness. Until
+#146 lands and its direction controls pass, witness construction returns
+`CAPABILITY_UNAVAILABLE(DISPATCHER_SEAL_UNDELIVERED)`. A future executor requires
+a separately reviewed versioned contract.
 
 The permit constructor compares every binding field. Except for the closed
 targetless cleanup scopes below, it also recomputes the exact owner and
@@ -570,30 +725,45 @@ operation-specific residual tuple is an exact ordered subset of that immutable
 authorization. A targetless scope instead proves its complete typed subject
 against the exact historical tombstone or current envelope binding. Every
 permit binds the current checked revision and is scoped to one operation and
-one use. A guard-required permit also linearly borrows the exact live guard
-handle: releasing, losing, transferring, or replacing that handle invalidates
-the permit before consumption. The checked owner revalidates the borrow while
-consuming a mutation permit and returns control of the still-held handle only
-after that checked commit. An external-call permit moves the borrow into the
-typed call; the synchronous adapter must revalidate it at entry and may return
-it only inside the matching typed receipt. Constructing the corresponding
-`RECEIPT_MUTATION` permit consumes that returned borrow from the exact receipt;
-it cannot acquire a second borrow or detach the result payload from the first.
-The checked receipt commit revalidates the borrow before applying the result and
-then returns control of the still-held handle. Thus a typed call cannot outlive
-or detach from its guard merely because its constructor once observed the guard.
-No unconsumed permit crosses a checked commit. Every
-external call uses three distinct permits under one held effect guard: a `STATE_MUTATION`
-permit arms the exact checked continuation; after that CAS, a newly constructed
-`EXTERNAL_CALL` permit at the successor revision constructs and invokes the
-call; after the synchronous result, a newly constructed `RECEIPT_MUTATION`
-permit at the then-current revision applies the matching receipt. An ordinary
+one use. One successful effect-guard acquisition creates exactly one
+`LiveEffectGuardLineageV1` in `AVAILABLE`. A guard-required permit constructor
+atomically consumes its sole custody token and moves that lineage to
+`OUTSTANDING(PERMIT, issuance_id)`. While the lineage is `OUTSTANDING`,
+`POISONED`, or `CLOSED`, a second issuance, permit, call, or receipt lineage cannot
+be minted from that acquisition. Every later stage moves the same
+`(lineage_id, issuance_id)` custody; no stage observes the handle and creates a
+replacement token.
+
+Custody resolution is total:
+
+| Exit | Exact lineage disposition |
+| --- | --- |
+| Mutation permit commits with a known result | Move custody through `OWNER_COMMIT`, consume the permit, and return exactly one successor custody token in `AVAILABLE`. |
+| Mutation commit outcome is uncertain | Atomically enter `POISONED(OWNER_COMMIT_UNCERTAIN)` exactly once. |
+| External call validates and returns normally | Move custody `PERMIT -> CALL -> RECEIPT`; only the matching sealed receipt owns it. |
+| Synchronous adapter rejects before the effect is positively proved to have begun | Consume the call and return exactly one successor custody token in `AVAILABLE`. |
+| Synchronous adapter throws or loses receipt handoff after the effect may have begun | Atomically enter `POISONED` exactly once; never return custody and never infer no effect. |
+| Receipt-mutation permit commits with a known result | Move custody `RECEIPT -> PERMIT -> OWNER_COMMIT`, consume the receipt and permit, and return exactly one successor token in `AVAILABLE`. |
+| Receipt commit is uncertain or its checked envelope changed incompatibly | Atomically enter `POISONED` and retain the persisted effect fence. |
+
+Every exit returns or poisons custody exactly once, never both and never
+neither. Repeating an exception cleanup or consuming a stale holder is rejected
+idempotently. A poisoned lineage cannot mint, return, or clear authority; the
+guard must unwind and release, a later acquisition creates a new lineage, and
+persisted `ARMED`/`CALL_RETURNED` recovery remains conservative and never
+reissues the uncertain effect.
+
+No unconsumed permit crosses a checked commit. Every external call therefore
+uses three sequential, distinct permits under one lineage: a `STATE_MUTATION`
+permit arms the exact checked continuation; only after that permit returns
+custody may an `EXTERNAL_CALL` permit at the successor revision construct and
+invoke the call; only by consuming the matching receipt-held custody may a
+distinct `RECEIPT_MUTATION` permit at the then-current revision apply it while
+preserving the call issuance. An ordinary
 observation CAS may intervene only when the effect envelope and continuation
 remain exact; the receipt-mutation constructor rechecks both and binds the new
-revision. The already-invoked call/receipt lineage may therefore span only such
-observation revisions; the consumed call permit itself is never reused, and any
-effect-envelope or continuation change rejects the receipt. The live-scope
-operand is a closed discriminated value:
+revision. The already-invoked call/receipt lineage may span only those
+observation revisions. The live-scope operand is a closed discriminated value:
 
 - `RESERVE` permits only `STATE_MUTATION` and has two closed current-state
   scopes. `INITIAL` requires top-level execution `IDLE` and creates the first
@@ -615,9 +785,9 @@ operand is a closed discriminated value:
 - `TAKEOVER`, every closure operation, `RETIRED_ATTEMPT_RECONCILE`,
   `STOP_TREE`, `POST_ACTION_CAPTURE`, `EFFECT_FINALIZE`, `SPAWN`,
   `SPAWN_RESULT_COMMIT`, and `SPAWN_IDENTITY_COMMIT` require the current caller
-  to hold the nonserializable effect guard. Their permits carry the same kind of
-  linear live-guard borrow; the spawn call moves that borrow into its typed call
-  and receipt exactly as every other external call does. First
+  to hold the nonserializable effect guard. Their permits move the same unique
+  lineage custody; the spawn call moves that custody into its typed call and
+  receipt exactly as every other external call does. First
   `CLOSURE_ACQUIRE` binds a proposed issuer continuation to the exact
   reservation, guard owner, and expected successor revision; its permit-bound
   mutation must install that exact continuation. Later operations require the
@@ -651,7 +821,8 @@ operand is a closed discriminated value:
   exact `SPAWN_RESERVATION/SPAWN/ARMED` continuation; only a fresh post-CAS
   `EXTERNAL_CALL` permit can construct `Start-Process`. A synchronous
   `SPAWN_RESULT_COMMIT` or `SPAWN_IDENTITY_COMMIT` requires the matching typed
-  spawn receipt and a fresh `RECEIPT_MUTATION` permit.
+  spawn receipt and a fresh receipt-derived `RECEIPT_MUTATION` permit that
+  preserves the call issuance.
   The only receipt-free result scope is `CRASHED_DURING_SPAWN`, which requires
   a fresh witness, the exact inert `SPAWN_IN_FLIGHT` envelope, the reacquired
   effect guard, and positive proof that the recorded issuing process/start
@@ -687,10 +858,14 @@ They cannot construct `ExecutableOwnedTargetSetV1`, rewrite authorization or
 debt, or act on a raw digest. Every other operation recomputes the complete
 owner/authorized-target tuple and residual subset when applicable.
 
-There is no generic null-scope fallback. Absence of a fresh current-host witness
-whose executor contract can serve the exact binding returns
-`CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`. A stale checked
-revision returns `REJECTED(STALE_CHECKED_REVISION)` and must reload/re-reduce.
+There is no generic null-scope fallback. Witness preflight runs before permit or
+provider construction. Absence of a fresh current-host witness returns the exact
+`CurrentExactTargetExecutorWitnessConstructionV1` reason:
+`CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` when no conforming
+exact executor exists for the host/binding, or
+`CAPABILITY_UNAVAILABLE(DISPATCHER_SEAL_UNDELIVERED)` when the required #146
+dispatcher seal is not delivered. A stale checked revision returns
+`REJECTED(STALE_CHECKED_REVISION)` and must reload/re-reduce.
 A copied, forged, replayed, consumed, wrong-use, mismatched, or unsupported live
 scope returns the corresponding `REJECTED` value; malformed checked evidence is
 handled by the earlier invalid-fence row. Every non-permitted result constructs
@@ -703,16 +878,21 @@ carries only the `RESERVE` permit; it is consumed by the selected initial or
 continuing reservation mutation and is never persisted or reused for
 acquisition.
 
-The `ClosureCapabilityV1` constructor takes ownership of and embeds a fresh
-unconsumed `RESERVE/STATE_MUTATION` permit before any closure-provider
-predicate; only its checked reservation mutation consumes it. If construction
-returns `CAPABILITY_UNAVAILABLE`, the capability constructor returns the exact
-one-element reason tuple `(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and does not
-inspect downstream successor reasons because that boundary is unreachable. A
-`REJECTED` result is not a capability result and follows its reload/reject rule.
-Only a permitted constructor collects successor reasons or produces
-`AVAILABLE`. Under merged #120, every non-Windows named-teardown path lacks a
-witness; Linux's admitted observation token does not change that fact.
+The `ClosureCapabilityV1` constructor first consumes witness preflight. A
+preflight failure returns the corresponding exact one-element reason tuple—
+`(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` or
+`(DISPATCHER_SEAL_UNDELIVERED)`—before permit or closure-provider predicates and
+does not inspect downstream successor reasons because that boundary is
+unreachable. Only an `AVAILABLE` witness may construct the fresh unconsumed
+`RESERVE/STATE_MUTATION` permit; the capability constructor then takes ownership
+of and embeds that permit before any closure-provider predicate, and only its
+checked reservation mutation consumes it. A permit-construction `REJECTED`
+result is not a capability result and follows its reload/reject rule. Only the
+witness-and-permit-admitted constructor collects successor reasons or produces
+`AVAILABLE`. Under merged #120, every non-Windows named-teardown path fails
+preflight with `EXACT_TARGET_EXECUTOR_UNAVAILABLE`, while a Windows path fails
+with `DISPATCHER_SEAL_UNDELIVERED` until #146 lands; Linux's admitted observation
+token does not change that fact.
 
 The receipt-predecessor relation is closed:
 
@@ -748,21 +928,29 @@ permit.
 The checked-state owner accepts no raw write to this envelope. It accepts only
 a `PermitBoundChildlessMutationV1` whose expected revision and permit still
 match, except for the two explicitly non-effect mutation classes below:
-a core `ClassifierObservationDeltaV1`, whose type cannot address the envelope,
+the core's owner-private ordinary-observation mutation, derived only by #115
+from one sealed receipt and unable to address the envelope,
 and creation of an unresolved state-loss quarantine. Consequently a future
 childless phase automatically inherits the same construction boundary. It may
 deserialize evidence inside the envelope, but without a matching fresh witness
-no executor-dependent external effect and no authority-enabling or effect-owned
-mutation is constructible. In particular, it cannot construct an executable
-target, reservation, permit-bound mutation, call, receipt, launch, or identity
-commit.
+no **87-A childless** executor-dependent external effect and no childless
+authority-enabling or effect-owned mutation is constructible. In particular, it
+cannot construct an executable target, reservation, permit-bound mutation,
+call, receipt, launch, or identity commit. Independently, no supervisor
+owned-tree native termination is reachable except by consuming one exact
+`SupervisorOwnedTreeDispatchCallV1` variant. A non-childless variant carries
+its own checked provenance and neither grants nor satisfies childless authority.
+Revision 11 specifies both rules, but merged code does not enforce the second:
+raw `Stop-Tree($targets)` and its two direct planner calls remain until #146.
 
 `OwnedTreeTargetV1`, `ChildlessTeardownAuthorityV1`,
 `ChildlessReservationEvidenceV1`, closure values, observations, and every
 persisted envelope member are inert evidence. `ExecutableOwnedTargetSetV1` is
-the only target type accepted by the `Stop-Tree` adapter.
+accepted only by the private constructor for the dispatcher's `CHILDLESS`
+variant; raw `Stop-Tree` accepts no conforming 87-A input.
 `ChildlessExternalEffectCallV1` is the only input accepted by every childless
-closure, teardown, post-action capture, and spawn adapter. Those adapters return a matching
+closure, teardown, post-action capture, and spawn adapter. The owned-tree
+dispatcher separately accepts only its closed three-variant sum. Those adapters return a matching
 `ChildlessExternalEffectReceiptV1`; raw IDs, raw target tuples, persisted
 state, and untyped provider results are rejected at the API boundary. A
 receipt changes checked state only through a matching
@@ -770,7 +958,10 @@ receipt changes checked state only through a matching
 Only the invoked adapter may construct its receipt, and only as the synchronous
 result of a valid typed call; a decoder or ordinary reducer cannot construct a
 receipt. Module-private constructors enforce these boundaries. Public parsing
-and serialization APIs expose inert evidence constructors only.
+and serialization APIs expose inert evidence constructors only. Every consumer
+also rejects a missing/private-seal mismatch, a mutable reachable member, a
+source-alias substitution, and an altered or field-equivalent copied graph
+before owner mutation or native effect.
 
 Every `COMPLETE`, `COMPLETE_GONE`, or `COMPLETE_RESIDUAL` ordinary tree/debt
 observation is well formed only when all of these hold:
@@ -814,7 +1005,7 @@ revision. This replaces the pre-review `win-tree/v1`
 mapping; the chained module vectors below are renewed accordingly. Any later
 change to those inputs requires a different version value and renewed
 vectors/review. Revision 9 first narrowed platform admission before target
-construction, and Revision 10 preserves that narrowing without changing the
+construction, and Revisions 10 and 11 preserve that narrowing without changing the
 admitted Windows mapping or its fixed vector. 87-A fixes
 `ownership_rule_version` to `owned-tree/v2` and the
 core coverage's `pid_start_guard_schema` to `2` for the exact-FILETIME mapping;
@@ -832,7 +1023,7 @@ rows, a duplicate guarded identity, or more than 64 targets is incomplete.
 The initial tuple sorts by depth, then PID, then ordinal start guard. Image and
 command-line text do not participate.
 
-**ENFORCED positive owner join:** `OwnedWrapperIdentityV1` is constructed only
+**SPECIFIED positive owner join; adapter not delivered:** `OwnedWrapperIdentityV1` is constructed only
 when all of these independently captured values are present and satisfy the
 displayed relation:
 
@@ -930,13 +1121,13 @@ the root exits, it returns `INCOMPLETE`.
 
 ### Meaning of COMPLETE and HELD
 
-**ENFORCED after merged, reviewed task #120 and the 87-A adapter:**
+**SPECIFIED; #120 input delivered and the 87-A adapter not delivered:**
 `COMPLETE` means the capture accounts for every
 process the guarded wrapper owns under one explicit coverage signature. It is
 not “all rows that happened to be readable.” An implementation that cannot
 prove its universe complete returns `INCOMPLETE`.
 
-**ENFORCED after the closure successor:** `HELD` is an action-scoped, non-destructive
+**SPECIFIED; closure successor not delivered:** `HELD` is an action-scoped, non-destructive
 closure, idempotently acquired/reconciled by its caller-supplied
 `acquisition_id`, with one linearization point before its capture. `INITIAL`
 has null debt fields and the complete wrapper-rooted tuple.
@@ -959,7 +1150,8 @@ keyed by `acquisition_id`; release additionally requires the exact
 live one-shot `RESERVE` permit. It is well formed only for an installed,
 independently reviewed implementation that can prove this contract inside the
 absolute dependency-plane constraint for every case it accepts **and** for a
-current action-site witness whose executor actually acts on the exact target
+current witness from #146's private dispatcher-capability factory whose native body
+actually acts on the exact target
 token. A valid observation token without such a witness returns
 `EXACT_TARGET_EXECUTOR_UNAVAILABLE`; parser or snapshot acceptance is
 insufficient. `ClosureCapabilityV1.CAPABILITY_UNAVAILABLE` is structural and
@@ -1041,7 +1233,7 @@ the operator preferred that availability loss to stale-authority risk.
 
 ### Operator-visible capability reductions
 
-Revision 10 has three permanent V1 capability limitations that operators must
+Revision 11 has three permanent V1 capability limitations that operators must
 see together. The first two are active recovery holds; the third refuses
 activation before imported state becomes an active checked store:
 
@@ -1308,7 +1500,7 @@ fields are non-null. A
 `COMPLETE_GONE` residual observation is inert input; only a fresh matching
 `EFFECT_FINALIZE` permit may construct the checked mutation that clears
 debt/cycle and writes the same-poll terminal. It constructs no authority or
-launch. The ordinary observation delta cannot perform that clear.
+launch. The #115 owner-private observation mutation cannot perform that clear.
 `INCOMPLETE` retains debt and constructs `BLOCKED(TEARDOWN_DEBT_INCOMPLETE)`.
 Closure is never a precondition of either authority constructor.
 
@@ -1433,9 +1625,10 @@ structurally invalid persisted state, malformed #120 snapshot, or malformed
 closure-successor value is
 `POLICY_HELD`; neither class grants authority.
 
-## Action-time closure and sole teardown path
+## Action-time closure and closed supervisor owned-tree dispatch
 
-**ENFORCED effect linearization after task #115 and the closure successor:**
+**SPECIFIED, NOT DELIVERED; requires tasks #115 and #146 plus the closure
+successor:**
 State CAS alone does not own an external call. Every childless active or
 retired closure-successor call, `Stop-Tree` call, action capture, and spawn
 therefore runs under one exclusive transient per-agent effect
@@ -1446,6 +1639,9 @@ not a daemon or persistence plane: it exists only while a live caller holds an
 in-process or kernel handle, is automatically released when that process
 exits, has no detached owner or durable payload, and is never evidence after
 release. No timeout, heartbeat, lease renewal, or second poller may steal it.
+One successful acquisition creates exactly one private lineage in `AVAILABLE`;
+the acquisition exposes no API capable of minting a second lineage or custody
+token.
 
 The checked owner identifies the exact supervisor process/start, applicable
 action-latch epoch, continuation role, typed subject, operation, stage, and
@@ -1454,20 +1650,31 @@ acquires the effect guard, recaptures every gate and basis, commits
 `effect_stage=ARMED` with a state-mutation permit, constructs a distinct fresh
 post-CAS call permit, rechecks that it still owns both the guard and exact
 checked owner, performs the one synchronous external operation, and constructs
-a third fresh receipt-mutation permit before committing `CALL_RETURNED` or the
+a third fresh receipt-derived mutation permit preserving the call issuance
+before committing `CALL_RETURNED` or the
 operation-specific terminal result. An adapter accepts a retired attempt only
 through its exact typed retired subject and rejects any caller whose persisted
 continuation owner no longer matches. Thus committing a phase never, by itself,
 licenses a later stale continuation.
 
-For every syntactically valid checked state, the structural universal is
-narrower and stronger than Revision 9's path-enumeration claim:
+For every syntactically valid checked state, Revision 11 specifies two separate
+structural rules. The childless rule is narrower and stronger than Revision 9's
+path-enumeration claim:
 
 ```text
 without a fresh CurrentExactTargetExecutorWitnessV1 that exactly matches the
-persisted ExactTargetExecutorBindingV1, no executor-dependent external effect
-and no authority-enabling or effect-owned mutation is constructible
+persisted ExactTargetExecutorBindingV1, no 87-A childless executor-dependent
+external effect and no childless authority-enabling or effect-owned mutation
+is constructible
+
+no supervisor owned-tree native termination is reachable except by consuming
+exactly one SupervisorOwnedTreeDispatchCallV1
 ```
+
+The second rule preserves authorized non-childless behavior through its own
+opaque variants without granting childless authority. It is a normative #146
+contract, not a current-code fact: merged `Stop-Tree($targets)` and its two raw
+planner calls remain reachable until #146 lands and is reviewed.
 
 The witness is an operand of construction, not a Boolean checked at remembered
 sites. Persisted Windows authority, a call-returned marker, a target tuple, a
@@ -1501,13 +1708,15 @@ a new quarantined genesis that exposes less authority and no childless effect
 object; it is not a constructor over a valid envelope. No other permit-free
 exception exists.
 
-Revision 10 explicitly withdraws Revision 9's broader promise that the entire
-checked state remains byte-identical on such a poll. A valid ordinary
-`ClassifierObservationDeltaV1` may increment `ordinary_poll_sequence`, reset
+Revision 10 explicitly withdrew Revision 9's broader promise that the entire
+checked state remains byte-identical on such a poll. A valid owner-private
+ordinary-observation mutation may increment
+`ordinary_poll_sequence`, reset
 `next_capture_ordinal`, clear the prior same-poll terminal, and update its
 observation-only projection. Its type cannot address the childless effect
 envelope. Quarantine creation is the only other permit-free childless-related
-mutation, and it strictly removes authority. No observation delta may clear or
+mutation, and it strictly removes authority. No #115 owner-private observation
+mutation may clear or
 rewrite a reservation, closure, debt, cycle, continuation, pending
 disposition, retired attempt, spawn state, or ambiguity state.
 
@@ -1582,8 +1791,9 @@ creates or increments its cycle in that mutation. At the successor revision,
 only a distinct fresh `CLOSURE_ACQUIRE/EXTERNAL_CALL` permit may construct the
 typed call. The closure adapter accepts no raw attempt ID and returns a receipt
 bound to that call permit, binding, continuation, and checked revision. The
-invocation retains the effect guard while a third fresh
-`CLOSURE_ACQUIRE/RECEIPT_MUTATION` permit applies the result. Acquisition and
+invocation retains the effect guard while a third, fresh receipt-derived
+`CLOSURE_ACQUIRE/RECEIPT_MUTATION` permit preserves the call issuance and
+applies the result. Acquisition and
 crash reconciliation remain idempotently keyed by the attempt ID. 87-A must then construct
 `ChildlessClosureEvidenceV1`; the closure object alone never supplies
 authority. A well-formed current equality mismatch is a closure veto and
@@ -1598,11 +1808,14 @@ closure ID while retaining its acquire/reconcile owner at `CALL_RETURNED`.
 Before termination, one fresh `STOP_TREE/STATE_MUTATION` permit constructs a mutation that atomically
 persists teardown debt, enters `TEARDOWN_IN_FLIGHT`, and records
 an exact `ACTIVE_ATTEMPT/STOP_TREE/ARMED/ISSUER` continuation. At the successor
-revision a second fresh `STOP_TREE/EXTERNAL_CALL` permit constructs
-`ExecutableOwnedTargetSetV1` and the typed `STOP_TREE` call.
-The adapter accepts neither the raw immutable tuple nor persisted state. On
-synchronous return, only the matching typed receipt plus a third fresh
-`STOP_TREE/RECEIPT_MUTATION` permit can construct the `CALL_RETURNED`
+revision, and only after arm custody returns, a second fresh
+`STOP_TREE/EXTERNAL_CALL` permit constructs `ExecutableOwnedTargetSetV1` and the
+sealed typed childless call. #146's private factory wraps that call as
+`SupervisorOwnedTreeDispatchCallV1.CHILDLESS`; the dispatcher accepts neither a
+raw tuple, planner array, caller tag, nor persisted state. On
+synchronous return, only the matching typed receipt plus a third, fresh
+receipt-derived `STOP_TREE/RECEIPT_MUTATION` permit preserving the call
+issuance can construct the `CALL_RETURNED`
 mutation; only that stage may arm a three-stage permitted post-action capture.
 If the owner dies or unwind is proved while still
 `ARMED`, recovery never reissues `Stop-Tree` or assumes it did not run: a
@@ -1728,8 +1941,8 @@ At the initial arm, `debt_id` is SHA-256 over
 
 ### Chained digest conformance vector
 
-**ENFORCED:** The following Revision 8 fixture is retained unchanged through
-Revision 10. It fixes all seven module digest domains and renews the
+**FROZEN CONFORMANCE EVIDENCE:** The following Revision 8 fixture is retained
+unchanged through Revision 11. It fixes all seven module digest domains and renews the
 authority-dependent chain for merged #120's
 `win-tree/v2` adapter and the explicit representation-token/exact-guard split.
 The two banked core condition fingerprints are outside this chain and remain
@@ -1824,7 +2037,7 @@ finalized reconciliation into immediate launch.
 
 ## Fail-closed state-loss quarantine
 
-**ENFORCED after task #115:** A missing, corrupt, torn, or rollback-unproven
+**SPECIFIED; implementation blocked on task #115:** A missing, corrupt, torn, or rollback-unproven
 checked state is not clean genesis. Recovery creates a new `state_epoch` only
 with `StateLossQuarantineV1.UNRESOLVED`; the physical owner projection
 deliberately excludes that epoch and is diagnostic only. Quarantine creation is
@@ -1846,7 +2059,7 @@ backup remains `ROLLBACK_UNPROVEN` and quarantined. Adding an independently
 retained last-commit revision/digest would change the persistence contract and
 requires a separately reviewed versioned design.
 
-Revision 10 defines no automatic V1 quarantine-clear transaction. The previous
+Revision 11 defines no automatic V1 quarantine-clear transaction. The previous
 `ProvablyDifferentPhysicalOwnerV1`/local `COMPLETE_GONE` carve-out is withdrawn:
 `OwnedPhysicalWrapperIdentityV1` has no host/process-universe operand, and a
 complete local absence on host B cannot prove that the copied prior wrapper or
@@ -2100,17 +2313,17 @@ enumerating every state that might enter it:
 | Construction boundary | Only conforming operation |
 | --- | --- |
 | Deserialize | Produce inert `ChildlessEffectEnvelopeV1` evidence. Deserialization never yields a witness, permit, executable target, mutation, call, or receipt. |
-| Ordinary observation | Commit only `ClassifierObservationDeltaV1`; its type cannot address the effect envelope. |
+| Ordinary observation | The installed observer adapter returns one sealed `OrdinaryClassifierObservationReceiptV1` to #115; inside the checked RMW the owner alone derives and commits the private observation mutation, which cannot address the effect envelope. |
 | Validate | Validate the complete envelope and exact binding before consulting host capability. A malformed envelope deterministically yields `POLICY_HELD`; malformed state precedes capability-unavailable reporting. |
-| Witness/preflight | The actual current-host action adapter may mint `CurrentExactTargetExecutorWitnessV1`; no other layer may do so. Static inability to serve the binding yields capability hold before guard acquisition. |
-| Guard and permit | Acquire the effect guard when required, then match witness, binding proof, checked revision, guard/continuation, and one operation/use. `REJECTED` yields zero effect plus reload/reject, not capability hold. |
+| Witness/preflight | Only #146's unexported dispatcher-capability factory may mint `CurrentExactTargetExecutorWitnessV1`, before any permit or call exists; merged raw `Stop-Tree`, non-childless variants, and every other layer may not. Static inability to serve the binding or an undelivered dispatcher seal yields capability hold before guard acquisition. |
+| Guard and permit | Acquire the effect guard when required, create its one unique lineage, and atomically move sole custody `AVAILABLE -> OUTSTANDING` while matching witness, binding proof, checked revision, guard/continuation, and one operation/use. A second issuance from the acquisition is unconstructible. `REJECTED` yields zero effect plus reload/reject, not capability hold. |
 | Childless-envelope mutation | Task #115 accepts only `PermitBoundChildlessMutationV1`; the owner algebra separately admits pure observation, private non-childless authority, and fail-closed quarantine-creation variants, none of which may address a current childless envelope. |
-| External effect | An adapter accepts only `ChildlessExternalEffectCallV1` and returns only its matching `ChildlessExternalEffectReceiptV1`. |
-| Receipt commit | A matching permit and receipt may construct the next checked mutation; replay, mismatch, or a changed revision cannot. |
+| External effect | A childless adapter accepts only a deeply sealed `ChildlessExternalEffectCallV1` and returns only its matching sealed receipt. Owned-tree termination additionally consumes the dispatcher's closed `CHILDLESS` variant; the private native body accepts no raw API input. |
+| Receipt commit | A matching sealed permit and receipt may construct the next checked mutation. Every normal or exceptional exit returns or poisons the exact lineage custody once; replay, mismatch, mutable alias, altered nested value, or a changed revision cannot. |
 
 Full-poll order is state-loss detection; dry-run discard or, for a non-dry-run
 outer-state failure, exclusive fail-closed quarantine creation; current-
-supervisor handling; ordinary observation commit; complete envelope validation;
+supervisor handling; #115 sealed-receipt ordinary observation commit; complete envelope validation;
 fresh witness/static preflight; required effect-guard acquisition; then permit
 and guarded mutation or call construction.
 This resolves the former malformed-versus-unavailable precedence conflict,
@@ -2189,7 +2402,8 @@ two schedule no generic backoff; a later retry begins only on a subsequent
 eligible ordinary poll.
 
 An ordinary residual observation is pure captured input, not a debt/cycle
-mutation by `ClassifierObservationDeltaV1`. Its `COMPLETE_GONE` clear is a
+mutation by the owner-private ordinary-observation projection. Its
+`COMPLETE_GONE` clear is a
 separate `PermitBoundChildlessMutationV1` and may commit only when
 `ExecutionEligibilityV1 == ELIGIBLE`, a fresh permit for
 `EFFECT_FINALIZE` exists, childless execution is `IDLE`, and there is no
@@ -2265,12 +2479,12 @@ Normal execution is:
 | --- | --- |
 | Reserve named proof | With no same-poll terminal/current obligation, consume a fresh witness plus inert authority and one `RESERVE` permit. `INITIAL` creates the first envelope/binding. `CONTINUE` transforms a qualifying childless-`IDLE` envelope: initial-mode retry may rebind while preserving cycle/terminal historical tombstones; debt completion retains the immutable binding and exact residual subset. Both install `PRE_BARRIER` in one checked mutation. |
 | Begin closure acquisition | Under the effect guard, a `STATE_MUTATION` permit live-recomputes the binding and persists acquiring plus an exact `ACTIVE_ATTEMPT/CLOSURE_ACQUIRE/ARMED` continuation. At the successor revision, a distinct fresh `EXTERNAL_CALL` permit constructs/invokes acquisition. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin does not change the cycle. |
-| Acquire valid closure | The typed receipt plus a distinct fresh `RECEIPT_MUTATION` permit and full joined equality persist `TREE_CLOSURE_HELD`, closure ID, and `CALL_RETURNED`. No raw provider result or consumed call permit may do so. |
-| Veto after `HELD` | A `STATE_MUTATION` permit arms exact release; after that CAS a fresh `EXTERNAL_CALL` permit constructs/invokes it, and only a fresh receipt-mutation permit may finalize `RELEASED`. Failure at any construction point retains the envelope. |
-| Arm teardown | A `STATE_MUTATION` permit atomically enters `TEARDOWN_IN_FLIGHT`, creates/updates debt, and writes `STOP_TREE/ARMED`; at the successor revision a fresh `EXTERNAL_CALL` permit constructs `ExecutableOwnedTargetSetV1` and the sole typed `STOP_TREE` call. Only a fresh matching receipt-mutation permit writes `CALL_RETURNED`. |
-| Observe action effect | A `POST_ACTION_CAPTURE/STATE_MUTATION` permit at `STOP_TREE/CALL_RETURNED` allocates the next nonzero ordinal and arms the typed capture; a fresh post-CAS call permit obtains its receipt, and a fresh receipt-mutation permit maps that observation into releasing state with `POST_ACTION_CAPTURE/CALL_RETURNED`, without clearing debt/current attempt or cycle `ISSUED`. A later `CLOSURE_RELEASE/STATE_MUTATION` permit alone may arm release. |
+| Acquire valid closure | The typed receipt plus a distinct fresh receipt-derived `RECEIPT_MUTATION` permit preserving the call issuance, and full joined equality, persist `TREE_CLOSURE_HELD`, closure ID, and `CALL_RETURNED`. No raw provider result or consumed call permit may do so. |
+| Veto after `HELD` | A `STATE_MUTATION` permit arms exact release; after that CAS a fresh `EXTERNAL_CALL` permit constructs/invokes it, and only a fresh receipt-derived permit preserving the call issuance may finalize `RELEASED`. Failure at any construction point retains the envelope. |
+| Arm teardown | A `STATE_MUTATION` permit atomically enters `TEARDOWN_IN_FLIGHT`, creates/updates debt, and writes `STOP_TREE/ARMED`; after its lineage custody returns, a fresh successor-revision `EXTERNAL_CALL` permit constructs the sealed target set and childless call, which #146's private CHILDLESS-variant constructor wraps for the closed dispatcher. Only a fresh matching receipt-derived permit over the receipt-held lineage and same call issuance writes `CALL_RETURNED`. |
+| Observe action effect | A `POST_ACTION_CAPTURE/STATE_MUTATION` permit at `STOP_TREE/CALL_RETURNED` allocates the next nonzero ordinal and arms the typed capture; a fresh post-CAS call permit obtains its receipt, and a fresh receipt-derived mutation permit preserving that call issuance maps the observation into releasing state with `POST_ACTION_CAPTURE/CALL_RETURNED`, without clearing debt/current attempt or cycle `ISSUED`. A later `CLOSURE_RELEASE/STATE_MUTATION` permit alone may arm release. |
 | Finalize release | A matching release receipt and finalize permit apply the disposition, bind the retired-attempt tombstone, and only then clear the continuation/release the guard. |
-| Spawn and identity commit | The same envelope/binding persists through `PRE_BARRIER`, `SPAWN_IN_FLIGHT`, and `AMBIGUOUS_LAUNCH`. A state-mutation permit first installs `SPAWN_RESERVATION/SPAWN/ARMED`; only a distinct fresh post-CAS call permit invokes spawn, and only its receipt plus a fresh receipt-mutation permit commits identity/ambiguity. The sole receipt-free conversion is the closed crash-only `SPAWN_RESULT_COMMIT` scope over the persisted issuer subject and positive issuer-death proof. |
+| Spawn and identity commit | The same envelope/binding persists through `PRE_BARRIER`, `SPAWN_IN_FLIGHT`, and `AMBIGUOUS_LAUNCH`. A state-mutation permit first installs `SPAWN_RESERVATION/SPAWN/ARMED`; only a distinct fresh post-CAS call permit invokes spawn, and only its receipt plus a fresh receipt-derived mutation permit preserving that call issuance commits identity/ambiguity. The sole receipt-free conversion is the closed crash-only `SPAWN_RESULT_COMMIT` scope over the persisted issuer subject and positive issuer-death proof. |
 | New guarded owner commits | Permitted only with quarantine `NONE`, debt `NONE`, and no childless effect envelope requiring cleanup. A quarantined state cannot commit a replacement owner automatically in V1. |
 
 Crash/reload is equally closed. Deserialization yields only the inert envelope;
@@ -2359,9 +2573,12 @@ transaction; no executor branch may save a cached whole state.
    closure, attempt-keyed acquire/reconcile/release, crash safety, and
    activated-platform compatibility. Until all pass, the static capability
    gate refuses before reservation with zero attempt and zero external call.
-   Prove `CurrentExactTargetExecutorWitnessV1` can be minted only by the actual
-   Windows FILETIME action adapter, never by input acceptance, parsing,
-   deserialization, platform text, or the checked store. Require
+   Prove `CurrentExactTargetExecutorWitnessV1` can be minted only by #146's
+   unexported dispatcher-capability factory, after that factory proves a
+   conforming Windows dispatcher installation and before any permit or call
+   exists. Input acceptance, parsing, deserialization, platform text, the
+   checked store, a submitted call, and either non-childless variant must not
+   expose or substitute for that factory. Require
    `ClosureCapabilityV1.AVAILABLE.reservation_permit.operation == RESERVE`,
    consume that permit exactly once when an initial or continuing reservation
    commits, and prove it cannot be persisted or reused for acquisition. Exercise
@@ -2380,9 +2597,12 @@ transaction; no executor branch may save a cached whole state.
     substitute for count two, and the action must veto before debt or
     `Stop-Tree`.
 5. Prove the admitted Windows initial root-first tuple and inherited-order
-   residual tuple reach only the existing leaves-first `Stop-Tree` adapter. No
-   process name/pattern, non-Windows token projection, or second kill path may
-   reach an authority target.
+   residual tuple can construct only the sealed
+   `SupervisorOwnedTreeDispatchCallV1.CHILDLESS` variant. Only the dispatcher's
+   private immutable native plan may project that variant into the unchanged
+   leaves-first native termination semantics; no raw target-array entry remains.
+   No process name/pattern, non-Windows token projection, or second supervisor
+   owned-tree kill path may reach an authority target.
 6. Failure-inject before and after the debt commit and after every target
    attempt. Partial kill retains debt and blocks every launch. A later ordinary
    `COMPLETE_RESIDUAL` observation—not a preexisting closure—constructs exact
@@ -2588,8 +2808,9 @@ transaction; no executor branch may save a cached whole state.
     generation/nonce/parent chain, exclude it from target tuples/digests and
     `Stop-Tree`, and normalize a live child behind it to the stated orphan
     form. Validate but exclude role/discovery metadata from authority. Prove an
-    openable exact-matching planned Windows target is verified and terminated
-    through one native handle, and every successful termination receives a wait
+    openable exact-matching planned Windows target reaches #120's unchanged
+    native semantics only through one sealed dispatcher variant, is verified
+    and terminated through one native handle, and every successful termination receives a wait
     attempt within the remaining shared tree-wide budget. Check-to-kill PID
     reuse must be impossible. Inject open failure, exact-identity mismatch,
     termination failure, wait timeout, and depleted budget; each must defer
@@ -2614,7 +2835,31 @@ transaction; no executor branch may save a cached whole state.
     IDs, bindings, persisted state,
     forged provider results, and copied/stale permits to the checked owner and
     every external adapter; each must be rejected before a state mutation or
-    call. For every `ExactTargetExecutorOperationV1` and permit use, prove the
+    call. Inspect the supervisor owned-tree surface and require exactly one
+    private native body, zero public raw-array termination entry, zero direct
+    `Stop-Tree $p.kill_targets` call, and zero route from planner targets to the
+    body except one consumed `SupervisorOwnedTreeDispatchCallV1`. Reject raw
+    arrays, caller-settable variant tags, wrappers around `kill_targets`, and
+    field-equivalent fake variants. Exercise the configured-agent and ephemeral
+    variants through their independent private constructors and prove parity for
+    their existing authorization, persistence/barrier ordering, exact target
+    behavior, dry-run, and action latch. Exercise the childless variant only
+    from the matching permit-bound typed call. Scope this static direction scan
+    to the supervisor owned-tree executor and explicitly exclude the separate
+    turn-watchdog facility. Prove the private native plan retains an immutable
+    tuple and that its final lexical raw-array materialization has no caller or
+    post-return alias.
+
+    Prove witness construction is acyclic and private: a conforming Windows
+    installation's unexported dispatcher-capability factory may mint a witness
+    before any permit or call exists; no public caller, raw native-body entry,
+    planner, persisted value, or non-childless variant may invoke that factory.
+    A childless call made from its witness-derived permit is accepted only by
+    the same live dispatcher instance. Reject a copied witness, a witness from a
+    different dispatcher instance, and any attempt to mint a witness by first
+    constructing or submitting a call.
+
+    For every `ExactTargetExecutorOperationV1` and permit use, prove the
     private permit constructor requires a fresh witness, exact binding, current
     revision, and the operation's closed live scope. Normally it also requires
     the recomputed authorized tuple/residual subset; the closed targetless old-
@@ -2630,14 +2875,35 @@ transaction; no executor branch may save a cached whole state.
     bearing operation, require three distinct permits at the arm revision,
     post-CAS call revision, and receipt-commit revision. Prove a consumed arm
     permit cannot construct a call and a call permit cannot apply a receipt;
-    enforce the closed receipt-predecessor table. For every guard-required
-    operation, construct a valid permit and then attempt to release, lose,
-    transfer, or replace the borrowed guard before consumption; the checked
-    owner must reject the mutation, and an external adapter must revalidate and
-    reject the call at entry. For a valid synchronous call, require its receipt
-    to return that same live borrow; constructing the receipt-mutation permit
-    consumes the returned borrow, and a lost/replaced borrow before commit must
-    reject the result with zero effect.
+    enforce the closed receipt-predecessor table.
+
+    From one successful guard acquisition, race two permit issuers and also
+    attempt sequential B1/P1 then B2/P2 before P1 resolves. Exactly one atomic
+    `AVAILABLE -> OUTSTANDING` move may succeed; P2 must reject with zero
+    mutation/call. After P1 returns custody exactly once, one successor issuance
+    may succeed and P1 replay must fail. Assert the same lineage_id and
+    issuance_id through permit, call, receipt, and receipt permit; an unrelated
+    token is rejected.
+
+    Inject synchronous exceptions during validation, before native invocation,
+    during invocation, after native return before receipt construction, during
+    receipt handoff, and during owner commit. Each path must produce exactly one
+    terminal custody disposition: return only with positive proof that no effect
+    began, otherwise `POISONED`; never both and never neither. Repeat cleanup and
+    require idempotent rejection. A poisoned lineage cannot issue again until
+    guard release/reacquisition and cannot reissue an uncertain external effect.
+
+    Reproduce the reviewer's mutation probe: construct a legitimate sealed call
+    whose nested target PID is 101, use the controlled tamper hook to rewrite it
+    to 202, and require consumer rejection before native effect. Ordinary public
+    mutation must fail; mutating the caller's original source alias after
+    construction must leave the call unchanged. Repeat the transitive tamper
+    control for the target set, permit proof/residual, next envelope/outer delta,
+    call arguments, receipt result, configured-agent provenance, and ephemeral
+    provenance. A frozen outer record, digest-only check, or public reseal API is
+    insufficient. Inspect each sealed graph and prove the atomic lineage owner
+    cell is not reachable; the immutable custody proof alone is present, while
+    each holder transition changes the separate cell exactly once.
 
     Round-trip every serializable state shape and prove witness, permit,
     executable target, mutation, call, receipt, and live effect guard are absent
@@ -2646,11 +2912,29 @@ transaction; no executor branch may save a cached whole state.
     proof, a deserialized closure/debt envelope, childless `SPAWN_IN_FLIGHT`,
     `AMBIGUOUS_LAUNCH`, and a retired-attempt tombstone as direction controls;
     the effect envelope must remain exact and no adapter may be called, while
-    two adjacent polls may advance only `ClassifierObservationDeltaV1` fields.
+    two adjacent polls may advance only the owner-private ordinary-observation
+    projection derived from distinct sealed receipts.
     Apply a private non-childless delta to each current childless envelope and
-    reject it before field application. Reject composite delta tags; commit an
-    ordinary observation first, reload, and mint any later permit only at the
-    successor revision. Prove initial non-dry-run state-loss quarantine
+    reject it before field application. Reject composite mutation tags. Submit
+    the former public observation-record shape with forged
+    `child_dead_confirmation.count=2`,
+    `owned_childless_confirmation.count=2`, and
+    `absence_confirmation=CONFIRMED`; #115 must reject it before any write.
+    Reject public/direct/fake receipt-factory access, an attempt to exchange raw
+    evidence for a receipt outside the installed observer adapter, and a receipt
+    minted by a substituted adapter. Prove only the #115-created lineage passed
+    to the installed adapter can mint one sealed receipt from one completed
+    acquisition. One
+    legitimate sealed ordinary receipt from empty/count-zero state may advance
+    at most to count one/`OBSERVED_ONCE`; confirmation requires a second distinct
+    acquisition and receipt committed against the successor revision. Reject
+    copied/replayed/serialized receipts, a second receipt from one lineage,
+    wrong agent/epoch/revision, forged sequence/ordinal, nonordinary receipts,
+    derived successor fields, and mutated nested evidence. Race two valid
+    same-revision receipt lineages: exactly one CAS commits and the loser is
+    poisoned and cannot be reused. Commit an ordinary observation first,
+    reload, and mint any later permit only at the successor revision. Prove
+    initial non-dry-run state-loss quarantine
     creation is the exclusive fail-closed permit-free mutation, dry-run loss
     persists nothing, and V1 has no automatic retirement constructor.
     Exercise every declared state-file/workspace transfer, restore, rollback,
@@ -2673,24 +2957,25 @@ transaction; no executor branch may save a cached whole state.
 
 | Property | Classification | Owner |
 | --- | --- | --- |
-| Two same-owner post-establishment complete child absences | #120 INPUT DELIVERED; ENFORCED after #115 and the 87-A adapter | 87-A reducer plus merged #120 snapshot |
-| PID/start/nonce ownership; never pattern ownership | #120 INPUT DELIVERED; ENFORCED by the 87-A adapter | Adapter over merged `owned_process_tree_v2`, including exact Windows FILETIME |
+| Two same-owner post-establishment complete child absences | #120 INPUT DELIVERED; NORMATIVE CONTRACT SPECIFIED; implementation requires #115 and the 87-A adapter | #115 owner-private reducer over sealed receipts plus merged #120 snapshot |
+| PID/start/nonce ownership; never pattern ownership | #120 INPUT DELIVERED; NORMATIVE CONTRACT SPECIFIED; adapter not implemented | Adapter over merged `owned_process_tree_v2`, including exact Windows FILETIME |
 | Complete 64-entry tree observation | DELIVERED by merged #120; 87-A adapter validation remains required | #120 snapshot plus 87-A adapter |
 | POSIX exact-target execution for named teardown | CURRENTLY UNAVAILABLE | #120 accepts Linux exact observation tokens but declares no macOS token and has no non-Windows executor branch. Fresh proofs cannot construct a reservation permit; deserialized reservations, phases, debt, spawn ambiguity, and retired tombstones are inert because they cannot construct a fresh matching permit, typed call, or effect-owned mutation. The effect envelope remains exact while ordinary observation may advance its separate projection. Every unresolved named case remains `POLICY_HELD` pending a human. |
-| Action-scoped creation closure | CURRENTLY UNAVAILABLE; ENFORCED after a conforming closure successor | Merged #120 does not freeze creation or expose attempt-keyed acquire/reconcile/release; otherwise `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human |
-| Atomic reservation/debt/cycle/terminal state | ENFORCED after #115 | Task #115 checked state owner |
-| External-call continuation/effect linearization | PARTIAL Windows target-local primitive DELIVERED by #120; full contract ENFORCED after #115 and the closure successor | #120 same-handle exact FILETIME check/terminate plus conditional bounded wait attempt, checked continuation state, and successor-owned attempt-bound synchronous adapters |
-| Fail-closed state-loss quarantine | ENFORCED after #115 | Task #115 checked state owner |
+| Action-scoped creation closure | CURRENTLY UNAVAILABLE; NORMATIVE CONTRACT SPECIFIED pending a conforming closure successor | Merged #120 does not freeze creation or expose attempt-keyed acquire/reconcile/release; otherwise `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human |
+| Atomic reservation/debt/cycle/terminal state | NORMATIVE CONTRACT SPECIFIED; implementation blocked on #115 | Task #115 checked state owner |
+| External-call continuation/effect linearization | PARTIAL Windows target-local primitive DELIVERED by #120; full normative contract specified; implementation blocked on #115, #146, and the closure successor | #120 same-handle exact FILETIME check/terminate plus conditional bounded wait attempt, #146 closed dispatch, checked continuation state, unique guard lineage, and successor-owned attempt-bound synchronous adapters |
+| Fail-closed state-loss quarantine | NORMATIVE CONTRACT SPECIFIED; implementation blocked on #115 | Task #115 checked state owner |
 | Automatic state-loss-quarantine retirement | UNAVAILABLE IN V1 ON EVERY PLATFORM | No trustworthy host/process-universe token exists in merged #120; quarantine stays `STATE_PROVENANCE_LOST`/`POLICY_HELD` pending attended handling. A future read-only existing-OS-token successor must satisfy M5 Option A. |
 | Same-platform state-file/workspace transfer, restore, rollback, and migration activation | UNAVAILABLE IN V1; DECLARED ACTIVATION REFUSES | A conforming activation path refuses before active-store admission with zero 87-A witness, mutation, effect, or launch and directs attended handling. An out-of-band replacement may be undetectable, is nonconforming, and has no 87-A guarantee. Future 87-C must bind the source universe within M5 Option A or keep imported state inert. |
 | No daemon, persistence plane, durable helper or OS object, or runtime dependency | DECIDED ABSOLUTE by operator on 2026-07-31 (M5 Option A) | Project/package boundary; no mechanism-specific exception |
-| Sole leaves-first guarded kill | ENFORCED for admitted Windows targets; POSIX unavailable | Same-handle exact FILETIME check/terminate and conditional bounded wait attempt in existing `Stop-Tree`; no non-Windows exact-token execution branch |
-| Three-attempt automatic cap and continuous typed attention | ENFORCED after #115 | 87-A state/output |
+| Supervisor owned-tree termination dispatch | NORMATIVE CONTRACT SPECIFIED; IMPLEMENTATION BLOCKED ON #146 | Merged #120 supplies the exact FILETIME native-body semantics, but merged code still exposes a raw-array entry. #146 installs the closed opaque-sum dispatcher, migrates both raw callers, and proves no direct target call survives. This is scoped to the supervisor owned-tree executor; POSIX remains unavailable. |
+| Three-attempt automatic cap and continuous typed attention | NORMATIVE CONTRACT SPECIFIED; implementation blocked on #115 | 87-A state/output |
 | Durable human delivery and receipt | STATED out of scope | Future 87-B; every `CAPABILITY_UNAVAILABLE` rendering names the held agent and required operator action |
 | Operator explanation of permanent capability limitations | REQUIRED before 87-A implementation close and activation | 87-B/follow-up operator manual and tutorial evidence must state all three limitations together: both indefinite `POLICY_HELD` paths and the declared transfer/restore/rollback/migration activation refusal, including the out-of-band-copy residual and attended action. |
 
-Task #78 consumes the named authority only after #115, the adapter over merged
-#120, and the closure successor. Task #116 remains blocked only on #115 and
+Task #78 consumes the named authority only after #115, #146, the adapter over
+merged #120, and the closure successor. Task #116 remains blocked only on #115 and
 independently stageable: an already-absent wrapper needs neither a target tree
 nor the closure successor. This preserves the
-task #94 ordering and #107's single contained kill site.
+task #94 ordering and #107's single contained supervisor owned-tree kill site
+after #146.
