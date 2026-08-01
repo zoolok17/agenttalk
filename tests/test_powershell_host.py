@@ -458,3 +458,164 @@ def test_run_probe_kills_and_reaps_child_on_base_exception(
     proc = created[0]
     assert proc.killed is True
     assert proc.communicate_calls == 2
+
+
+def test_run_probe_closes_containment_job_before_retrying_on_base_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10 connector finding: closing the containment job is what
+    actually frees a descendant holding the probe's stdout/stderr pipe
+    handles open (on Windows, via KILL_ON_JOB_CLOSE). The old code called
+    close_job() only in the outer finally, after the post-kill retry had
+    already been attempted - so the retry ran while the descendant was
+    still alive and holding the pipes. This fake models that dependency
+    directly: the retry can only drain once the job has been closed."""
+    job_state = {"closed": False}
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.killed = False
+            self.communicate_calls = 0
+            self.retry_saw_job_closed: bool | None = None
+            self._returncode: int | None = None
+            self.args = ["pwsh"]
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            self.killed = True
+            self._returncode = -9
+
+        def communicate(self, timeout=None):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise SystemExit(143)
+            self.retry_saw_job_closed = job_state["closed"]
+            if not job_state["closed"]:
+                raise subprocess.TimeoutExpired(cmd=self.args, timeout=timeout or 0)
+            return "", ""
+
+    created: list[_FakeProc] = []
+
+    def _fake_popen(*args, **kwargs):
+        proc = _FakeProc()
+        created.append(proc)
+        return proc
+
+    def _close() -> None:
+        job_state["closed"] = True
+
+    monkeypatch.setattr(psh.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(psh, "_attach_kill_on_close_job", lambda proc: (object(), _close))
+
+    with pytest.raises(SystemExit):
+        psh._run_probe("pwsh", timeout=5.0)
+
+    proc = created[0]
+    assert proc.killed is True
+    assert proc.communicate_calls == 2
+    assert proc.retry_saw_job_closed is True
+
+
+def test_run_probe_falls_back_to_wait_when_retry_times_out_again_on_base_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10 connector finding, sibling of _git_write's own
+    reap-after-stuck-retry: if the post-kill retry itself times out again
+    (e.g. on POSIX, where close_job is a no-op and a descendant can survive
+    regardless), the old code silently swallowed the second
+    TimeoutExpired without ever confirming the process was reaped."""
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.killed = False
+            self.communicate_calls = 0
+            self.wait_calls = 0
+            self._returncode: int | None = None
+            self.args = ["pwsh"]
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            self.killed = True
+
+        def communicate(self, timeout=None):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise SystemExit(143)
+            raise subprocess.TimeoutExpired(cmd=self.args, timeout=timeout or 0)
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            self._returncode = -9
+            return self._returncode
+
+    created: list[_FakeProc] = []
+
+    def _fake_popen(*args, **kwargs):
+        proc = _FakeProc()
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(psh.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(psh, "_attach_kill_on_close_job", lambda proc: (None, lambda: None))
+
+    with pytest.raises(SystemExit):
+        psh._run_probe("pwsh", timeout=5.0)
+
+    proc = created[0]
+    assert proc.killed is True
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 1
+
+
+def test_run_probe_bounds_the_routine_double_timeout_retry_and_reaps_via_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sibling of the same gap, found while surveying this fix's blast
+    radius: the routine double-timeout branch (both the requested timeout
+    and the 2s post-kill retry expire) fell back to an UNBOUNDED
+    communicate() - if a descendant retained the pipe handles, this could
+    block _run_probe forever even though the top-level probe was already
+    killed. Bound it and reap via wait(), same pattern as the
+    BaseException branch above."""
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.kill_calls = 0
+            self.communicate_calls = 0
+            self.wait_calls = 0
+            self._returncode: int | None = None
+            self.args = ["pwsh"]
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            self.kill_calls += 1
+
+        def communicate(self, timeout=None):
+            self.communicate_calls += 1
+            raise subprocess.TimeoutExpired(cmd=self.args, timeout=timeout or 0)
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            self._returncode = -9
+            return self._returncode
+
+    created: list[_FakeProc] = []
+
+    def _fake_popen(*args, **kwargs):
+        proc = _FakeProc()
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(psh.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(psh, "_attach_kill_on_close_job", lambda proc: (None, lambda: None))
+
+    with pytest.raises(psh.PowerShellHostError, match="probe timed out"):
+        psh._run_probe("pwsh", timeout=5.0)
+
+    proc = created[0]
+    assert proc.communicate_calls == 3
+    assert proc.wait_calls == 1

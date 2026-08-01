@@ -8,6 +8,7 @@ the cross-process lock order in :mod:`agenttalk.supervisor_lifecycle`.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -500,16 +501,35 @@ def _run_probe(path: str, *, timeout: float) -> subprocess.CompletedProcess[str]
                 stdout, stderr = proc.communicate(timeout=2.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                stdout, stderr = proc.communicate()
+                # A descendant holding the captured pipe handles open can
+                # keep this blocked even though proc itself is already
+                # dead - bound it and fall back to wait(), which does not
+                # touch the pipes at all, so the reap still completes.
+                try:
+                    stdout, stderr = proc.communicate(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=25.0)
             raise PowerShellHostError(f"probe timed out after {timeout:g}s") from None
         return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
     except BaseException:
         if proc.poll() is None:
             proc.kill()
+            # Close the containment job before retrying: on Windows this
+            # kills any descendant holding the captured stdout/stderr pipe
+            # handles open via KILL_ON_JOB_CLOSE, so communicate() below has
+            # a chance to actually drain. On POSIX close_job is a no-op -
+            # there is no equivalent containment - so wait() (which does
+            # not touch the pipes) is what guarantees the top-level process
+            # gets reaped there regardless of what a surviving descendant
+            # holds open.
+            close_job()
+            close_job = _noop
             try:
                 proc.communicate(timeout=5.0)
             except subprocess.TimeoutExpired:
-                pass
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=25.0)
         raise
     finally:
         close_job()
