@@ -1525,11 +1525,21 @@ def run_wrapper(
     except BaseException:
         _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
         if proc.poll() is None:
-            proc.terminate()
+            # terminate()/kill() can themselves raise (PermissionError on
+            # Windows, ProcessLookupError if the child already exited) -
+            # unguarded, that secondary error would REPLACE the owner
+            # exception being handled here (a signal-driven KeyboardInterrupt
+            # or SystemExit), skip the bounded wait/kill fallback below, and
+            # under cmd_wrap could relabel an intended signal exit as a
+            # routine mapped-error exit - corrupting the termination facts
+            # this cleanup exists to preserve.
+            with contextlib.suppress(OSError):
+                proc.terminate()
             try:
                 proc.wait(timeout=10.0)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                with contextlib.suppress(OSError):
+                    proc.kill()
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5.0)
         raise

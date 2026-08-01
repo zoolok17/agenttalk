@@ -619,3 +619,48 @@ def test_run_probe_bounds_the_routine_double_timeout_retry_and_reaps_via_wait(
     proc = created[0]
     assert proc.communicate_calls == 3
     assert proc.wait_calls == 1
+
+
+def test_run_probe_kill_raising_does_not_replace_the_owner_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 11 connector finding, sibling of the same pattern reported for
+    wrapper/run.py: kill() can itself raise (PermissionError on Windows,
+    ProcessLookupError if the child already exited). Unguarded, that
+    secondary error would replace the SystemExit/KeyboardInterrupt being
+    cleaned up after and skip the reap fallback entirely."""
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.kill_called = False
+            self.communicate_calls = 0
+            self._returncode: int | None = None
+            self.args = ["pwsh"]
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            self.kill_called = True
+            raise PermissionError("simulated: process handle already closing")
+
+        def communicate(self, timeout=None):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise SystemExit(143)
+            return "", ""
+
+    created: list[_FakeProc] = []
+
+    def _fake_popen(*args, **kwargs):
+        proc = _FakeProc()
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(psh.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(psh, "_attach_kill_on_close_job", lambda proc: (None, lambda: None))
+
+    with pytest.raises(SystemExit):
+        psh._run_probe("pwsh", timeout=5.0)
+
+    proc = created[0]
+    assert proc.kill_called is True

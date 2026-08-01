@@ -2056,7 +2056,11 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        proc.kill()
+        # kill() can itself raise (PermissionError on Windows,
+        # ProcessLookupError if the child already exited) - guarded so it
+        # can never pre-empt the GitWriteError raised below.
+        with contextlib.suppress(OSError):
+            proc.kill()
         try:
             out, err = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired as reap:
@@ -2068,7 +2072,11 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
         ) from e
     except BaseException:
         if proc.poll() is None:
-            proc.kill()
+            # kill() can itself raise - unguarded, that secondary error
+            # would replace the owner BaseException being handled here and
+            # skip the reap fallback below entirely.
+            with contextlib.suppress(OSError):
+                proc.kill()
             try:
                 proc.communicate(timeout=5)
             except subprocess.TimeoutExpired:

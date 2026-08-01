@@ -1313,6 +1313,67 @@ def test_m12_git_write_falls_back_to_wait_when_retry_communicate_hangs(
     assert seen.get("wait_timeout") is not None
 
 
+def test_m12_git_write_kill_raising_does_not_replace_the_owner_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # Round 11 connector finding, sibling of the same pattern reported for
+    # wrapper/run.py: kill() can itself raise (PermissionError on Windows,
+    # ProcessLookupError if the child already exited). Unguarded, that
+    # secondary error would replace the SystemExit being cleaned up after
+    # and skip the reap fallback entirely.
+    seen: dict = {}
+
+    class RaisingKillProc:
+        def __init__(self) -> None:
+            self.calls = 0
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            seen["kill_called"] = True
+            raise PermissionError("simulated: process handle already closing")
+
+        def communicate(self, timeout=None):  # noqa: ANN001
+            self.calls += 1
+            if self.calls == 1:
+                raise SystemExit(143)
+            return "", ""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: RaisingKillProc())
+    with pytest.raises(SystemExit):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt5"), "a" * 40])
+    assert seen["kill_called"] is True
+
+
+def test_m12_git_write_kill_raising_does_not_replace_the_timeout_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # Same finding, the routine (non-BaseException) timeout branch: kill()
+    # raising here would replace the intended GitWriteError with a bare
+    # PermissionError, breaking any caller that catches GitWriteError
+    # specifically.
+    seen: dict = {}
+
+    class RaisingKillProc:
+        def kill(self):
+            seen["kill_called"] = True
+            raise PermissionError("simulated: process handle already closing")
+
+        def communicate(self, timeout=None):  # noqa: ANN001
+            raise subprocess.TimeoutExpired("git", timeout)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: RaisingKillProc())
+    with pytest.raises(cli.GitWriteError, match="could not be reaped"):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt6"), "a" * 40], timeout=0.01)
+    assert seen["kill_called"] is True
+
+
 def test_s2_failed_add_cleanup_removes_branch_after_lock_release(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)

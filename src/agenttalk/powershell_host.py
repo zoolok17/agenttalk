@@ -487,7 +487,12 @@ def _run_probe(path: str, *, timeout: float) -> subprocess.CompletedProcess[str]
         try:
             _, close_job = _attach_kill_on_close_job(proc)
         except OSError as exc:
-            proc.kill()
+            # kill() can itself raise (PermissionError on Windows,
+            # ProcessLookupError if the child already exited) - unguarded,
+            # that secondary error would replace this OSError and skip the
+            # PowerShellHostError below entirely.
+            with contextlib.suppress(OSError):
+                proc.kill()
             proc.communicate()
             raise PowerShellHostError(
                 f"probe process containment failed: {exc}"
@@ -500,7 +505,10 @@ def _run_probe(path: str, *, timeout: float) -> subprocess.CompletedProcess[str]
             try:
                 stdout, stderr = proc.communicate(timeout=2.0)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                # kill() can itself raise - guarded so it can never pre-empt
+                # the "probe timed out" PowerShellHostError raised below.
+                with contextlib.suppress(OSError):
+                    proc.kill()
                 # A descendant holding the captured pipe handles open can
                 # keep this blocked even though proc itself is already
                 # dead - bound it and fall back to wait(), which does not
@@ -514,7 +522,11 @@ def _run_probe(path: str, *, timeout: float) -> subprocess.CompletedProcess[str]
         return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
     except BaseException:
         if proc.poll() is None:
-            proc.kill()
+            # kill() can itself raise - unguarded, that secondary error
+            # would replace the owner BaseException being handled here and
+            # skip the reap fallback below entirely.
+            with contextlib.suppress(OSError):
+                proc.kill()
             # Close the containment job before retrying: on Windows this
             # kills any descendant holding the captured stdout/stderr pipe
             # handles open via KILL_ON_JOB_CLOSE, so communicate() below has
