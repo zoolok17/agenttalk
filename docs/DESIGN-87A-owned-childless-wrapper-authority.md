@@ -102,7 +102,7 @@ as follows:
 | `status=absent` | No-kill absence/barrier evidence only; never an initial owned-tree teardown authority. |
 | `status=truncated|invalid`, a non-64 limit, inconsistent counts, omitted entries, or an unreadable binding | `INCOMPLETE`; no teardown authority. |
 | Live Windows `entries[].pid/start/start_filetime` | `OwnedTreeTargetV1.pid/start_guard` after exact live validation. The destructive guard is the positive decimal `start_filetime`; the rounded ISO `start` is capture/ordering corroboration and never substitutes for a missing FILETIME. The adapter derives and validates `parent_start_guard` and `depth` from the accepted live parent chain and projects the validated top-level owner nonce onto each target; it may not privately default any missing fact. |
-| Non-Windows platform, including a live Linux `entries[].start` token | #120 recognizes Linux `linux:<boot_id>:<start_ticks>` as observation/barrier input; it declares no macOS exact-token mapping. The current sole kill primitive has no non-Windows exact-token execution branch, so 87-A returns pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`, short-circuits the named destructive constructor before `OwnedWrapperTreeObservationV1.COMPLETE`, and constructs no owner/target tuple, authority, reservation, attempt, debt, or external call. Input acceptance is not effect capability. |
+| Non-Windows platform, including a live Linux `entries[].start` token | #120 recognizes Linux `linux:<boot_id>:<start_ticks>` as observation/barrier input; it declares no macOS exact-token mapping. The current sole kill primitive has no non-Windows exact-token execution branch, so fresh authority construction returns pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`, short-circuits the named destructive constructor before `OwnedWrapperTreeObservationV1.COMPLETE`, and constructs no owner/target tuple, authority, reservation, attempt, debt, or external call. Inherited checked state follows the later retained-fence rule. Input acceptance is not effect capability. |
 | Non-live virtual ancestry bridge | Admissible only when copied exactly from a prior complete record with unchanged wrapper generation, launch nonce, and parent chain. It is validation provenance only: exclude it from `root_first_targets`, every target digest, and `Stop-Tree`. A live child whose immediate owned parent is such a bridge uses the module's existing positively proven orphan form: null owned-parent fields and depth one. |
 
 `role` and `discovered_at` are validated bounded metadata but are excluded from
@@ -342,8 +342,16 @@ OwnedDebtResidualObservationV1 =
 ClosureProviderVersionV1 =
   nonempty NFC UTF-8 string of at most 128 bytes
 
+ExactTargetExecutorCapabilityV1 =
+  AVAILABLE {
+    platform: WINDOWS
+    executor_contract: "stop-tree/windows-filetime/v1"
+  }
+  | UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)
+
 ClosureCapabilityV1 =
   AVAILABLE {
+    exact_target_executor: ExactTargetExecutorCapabilityV1.AVAILABLE
     closure_provider_version: ClosureProviderVersionV1
   }
   | CAPABILITY_UNAVAILABLE(
@@ -427,15 +435,27 @@ ChildlessContinuationOwnerV1 =
     }
 ```
 
-The `ClosureCapabilityV1` constructor checks exact target execution before any
-closure-provider predicate. If that executor is unavailable, it returns
+`ExactTargetExecutorCapabilityV1` is a fresh, non-persisted fact about the
+current execution host and the action branch that actually terminates the
+typed target. Parser, snapshot, or target-constructor acceptance cannot produce
+`AVAILABLE`. At merged #120, only the Windows exact-FILETIME branch at
+`src/agenttalk/supervisor.py:8900-8928` satisfies the V1 contract; the
+non-Windows skip at `8930-8932` produces `UNAVAILABLE`. A future executor for a
+different platform requires a separately reviewed successor and a versioned
+contract change. For an inherited target tuple, `AVAILABLE` additionally
+requires every immutable target token to match that current-host executor
+contract; platform recognition alone is insufficient.
+
+The `ClosureCapabilityV1` constructor consumes that fresh exact-executor fact
+before any closure-provider predicate. If the executor is unavailable, it returns
 `CAPABILITY_UNAVAILABLE` with the exact one-element reason tuple
 `(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and does not inspect or combine downstream
 successor reasons because that boundary is unreachable. Only an admitted
 executor proceeds to collect all true successor reasons in the displayed order
-or produce `AVAILABLE`. Under merged #120, every non-Windows named-teardown path
-takes the short-circuiting unavailable arm; only Linux has an admitted exact
-observation token.
+or produce `AVAILABLE`, which carries the exact admitted executor value. Under
+merged #120, every fresh non-Windows named-teardown path takes the
+short-circuiting unavailable arm; only Linux has an admitted exact observation
+token.
 
 Every `COMPLETE`, `COMPLETE_GONE`, or `COMPLETE_RESIDUAL` ordinary tree/debt
 observation is well formed only when all of these hold:
@@ -625,8 +645,12 @@ can prove this contract inside the absolute dependency-plane constraint for
 every case it accepts **and** for a platform whose existing executor actually
 acts on the exact target token. A valid observation token without such an
 executor returns `EXACT_TARGET_EXECUTOR_UNAVAILABLE`; acceptance by a parser or
-snapshot producer is insufficient. `CAPABILITY_UNAVAILABLE` is structural and
-may appear only before reservation. The caller persists an available version in
+snapshot producer is insufficient. `ClosureCapabilityV1.CAPABILITY_UNAVAILABLE`
+is structural and may appear only before reservation. By contrast, a freshly
+reconstructed `ExactTargetExecutorCapabilityV1.UNAVAILABLE` is a current-host
+environment fact and may be observed after reservation or debt persistence; it
+selects the retained-fence rule and is not malformed closure-successor output.
+The caller persists an available provider version in
 `ChildlessContinuationOwnerV1` before acquisition;
 every `HELD`, `NEVER_ACQUIRED`, `RELEASED`, reconcile result, release request,
 and held refresh must match it byte-for-byte. A provider contract change
@@ -653,7 +677,12 @@ kill and launch. `NEVER_ACQUIRED` is terminal for that acquisition ID: the
 same checked transaction appends it to `retired_childless_attempt_ids`, and
 the closure successor must not later acquire it. An unexpected late `HELD` for a retired
 ID is never authority; it is accepted only to perform exact idempotent release
-under the effect guard, after which the tombstone remains.
+under the effect guard, after which the tombstone remains. The successor has no
+unsolicited result channel: a cleanup poll first checks current-host exact
+executor availability, acquires the effect guard, and reconciles by the
+persisted retired ID. A returned late `HELD` is released synchronously under
+that same guard. A crash leaves the retired ID for a later compatible-host
+reconcile; an unavailable host makes neither call and retains the ID.
 
 After crash/reload, only matching `NEVER_ACQUIRED` or `RELEASED` permits 87-A
 to finish a release-dependent transition. Matching `HELD` must be released
@@ -1052,6 +1081,22 @@ checked owner, performs the one synchronous external operation, and commits
 guard. An adapter refuses a retired attempt ID and any caller whose persisted
 continuation owner no longer matches. Thus committing a phase never, by
 itself, licenses a later stale continuation.
+
+Before every childless closure-successor call, `Stop-Tree` call, post-action or
+residual capture reservation, takeover CAS, observation-only debt clear,
+late-`HELD` release, and pending-disposition/debt finalization, the invocation reconstructs
+`ExactTargetExecutorCapabilityV1` on the current execution host. While
+`StateLossQuarantineV1` is `NONE`, an
+uninterrupted issuer also rechecks that operand immediately before its next
+external operation. `UNAVAILABLE` authorizes no cleanup exception: the
+invocation retains the complete checked fence byte-identically, makes no
+external call, reserves no capture ordinal, mutates no attempt/debt/cycle or
+terminal field, emits `CAPABILITY_UNAVAILABLE`, and remains `POLICY_HELD`.
+Persisted Windows authority or a previously returned external result cannot be
+used to manufacture current-host executor availability. An unresolved
+state-loss quarantine instead owns the earlier quarantine rows; its separately
+specified complete-extinction retirement may clear physically inactionable
+state, but is not named cleanup and performs no external operation.
 
 A non-`NONE` owner is well formed only when its token digest and PID/start
 exactly equal the arm-time `ExecutionGateCaptureV1` current supervisor; its
@@ -1538,6 +1583,9 @@ CHILDLESS_STATE_PROVENANCE_LOST iff
 
 CAPABILITY_UNAVAILABLE iff
   ClosureCapabilityV1 is CAPABILITY_UNAVAILABLE
+  or ExactTargetExecutorCapabilityV1 is UNAVAILABLE while a named reservation,
+     external-effect phase, outstanding teardown debt, or retired-attempt
+     cleanup is present
   or a post-reservation closure-successor value illegally claims structural
      unavailability
   or applicable reconciliation is UNKNOWN(CAPABILITY_UNAVAILABLE)
@@ -1582,16 +1630,43 @@ fields never cross the 87-B export boundary.
 
 ## Exact state transitions
 
-An already-owned childless fence uses a narrower gate than new recovery:
+The current-host executor operand is reconstructed for every state-entry
+archetype, rather than only the fresh constructor. An earlier dry-run,
+state-loss, or non-current-supervisor retain branch may stop evaluation first;
+those branches are also zero-call and zero-mutation, and no later operation may
+infer executor availability from them. Every non-quarantine row below is scoped
+to `StateLossQuarantineV1.NONE`; when quarantine is unresolved, its two rows
+exclusively own either fail-closed retention or the proved complete-extinction
+retirement:
+
+| State entry point | Persisted shape on entry | Required executor behavior |
+| --- | --- | --- |
+| Fresh automatic or manual selection | No named reservation or external-effect phase | Construct fresh `ExactTargetExecutorCapabilityV1` inside `ClosureCapabilityV1` before reservation. `UNAVAILABLE` creates no reservation, continuation, attempt, debt, capture, or external call. |
+| Uninterrupted live issuer | The same guard-owning invocation has just persisted `TREE_CLOSURE_ACQUIRING`, `TREE_CLOSURE_HELD`, `TEARDOWN_IN_FLIGHT`, or `TREE_CLOSURE_RELEASING` | Reconstruct the current-host operand before every next external call, capture reservation, or finalizing mutation. `UNAVAILABLE` retains the fence byte-identically. |
+| Live-continuation resume or same-process re-reduction | A checked continuation may resume, including after a CAS loser reloads | Enter `ChildlessSafetyReconciliationGateV1`; executor unavailability precedes continuation/takeover reasoning and permits no effect or mutation. |
+| Same-platform process restart or different-process takeover | A persisted external-effect phase has no live guard owner | Enter the same gate before effect-guard acquisition, takeover, reconcile, release, capture, or finalization. Availability alone does not prove predecessor death or grant takeover. |
+| Cross-platform state inheritance or resume | A phase created on an executor-capable host reaches another host through startup reload, workspace/state-file transfer, restore, checkpoint resume, rollback, or migration | Reconstruct from the current host, never from the persisted target or prior host. With quarantine `NONE`, Linux and macOS preserve every fence byte-identically and make no external call or debt mutation. If no earlier retain-only gate applies, they select `RETAIN_EXACT_TARGET_EXECUTOR_UNAVAILABLE`. Unresolved quarantine follows its two separate rows below. |
+| Debt-only inheritance | `IDLE` carries `TeardownDebtV1.OUTSTANDING` with no current attempt | Reconstruct the same current-host operand before ordinary residual observation or its clear. `UNAVAILABLE` preserves debt/cycle/execution/terminal byte-identically and allocates no capture. |
+| Retired-attempt cleanup | A persisted retired ID is reconciled, or an unexpected late `HELD` returns to the original synchronous caller | Reconstruct the operand before the reconcile call or exact release. `UNAVAILABLE` retains the retired ID and makes no call. No unsolicited result channel exists: a late `HELD` is processed only as the synchronous result of a compatible-host call under one effect guard, and the caller releases it before dropping that guard; a crash leaves the retired ID for a later compatible-host reconcile. |
+| Unresolved state loss or malformed-fence entry | Quarantine remains unresolved or the persisted phase/owner pairing is invalid | An applicable retain branch wins and is zero-call and zero-mutation: unresolved quarantine precedes executor evaluation, while executor unavailability precedes `RETAIN_INVALID_FENCE`. No state repair may synthesize executor availability. |
+| Proven quarantine retirement | Complete different-owner/extinction proof makes the old physical authority inactionable | The platform-neutral quarantine-retirement CAS may clear physically inactionable debt/cycle/execution state. It is a global state-loss transition, not named cleanup, makes no external call, and cannot launch in the same poll. |
+| Reloaded `PRE_BARRIER` | The named reservation has no attempt pair, continuation owner, closure, or external effect | The current-host operand is still checked first. `AVAILABLE` may select the state-only `MAY_RELEASE_PRE_BARRIER`; `UNAVAILABLE` retains the reservation byte-identically, creates no attempt, and never mutates debt. |
+
+An already-owned childless fence uses a narrower gate than new recovery. Its
+fresh executor operand is explicit:
 
 ```text
-ChildlessSafetyReconciliationGateV1 =
+ChildlessSafetyReconciliationGateV1(
+  current_exact_target_executor: ExactTargetExecutorCapabilityV1
+) =
   RETAIN_DRY_RUN
     if ExecutionGateCaptureV1.dry_run == true
   | RETAIN_STATE_PROVENANCE_LOST
     if StateLossQuarantineV1 is UNRESOLVED
   | RETAIN_NO_CURRENT_SUPERVISOR
     if ExecutionGateCaptureV1.supervisor_instance != CURRENT
+  | RETAIN_EXACT_TARGET_EXECUTOR_UNAVAILABLE
+    if current_exact_target_executor is UNAVAILABLE
   | MAY_RELEASE_PRE_BARRIER
     if the persisted phase is PRE_BARRIER, its attempt pair and continuation
        owner are null, and one checked state-only release is required
@@ -1615,6 +1690,13 @@ ChildlessSafetyReconciliationGateV1 =
 attempt/debt provenance.
 `RETAIN_NO_CURRENT_SUPERVISOR` performs no closure-successor call and no state mutation
 because the invocation does not own the executor claim.
+`RETAIN_EXACT_TARGET_EXECUTOR_UNAVAILABLE` is evaluated before
+`MAY_RELEASE_PRE_BARRIER`, effect-guard acquisition, predecessor-liveness
+reasoning, takeover, capture allocation, ordinary debt clear, late-`HELD`
+release, or any external-effect finalizer. It emits continuous
+`CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and
+`POLICY_HELD`; in particular, an inherited `CALL_RETURNED` result cannot clear
+or rewrite debt on an unavailable current host.
 `MAY_RELEASE_PRE_BARRIER` needs no effect guard because no external operation
 or attempt pair has been armed. It permits one state-only #115 CAS that releases
 the reservation, writes `BARRIER_VETOED` and the same-poll terminal, and
@@ -1694,9 +1776,12 @@ eligible ordinary poll.
 An ordinary residual observation is pure captured input, not a debt/cycle
 mutation by `ClassifierObservationDeltaV1`. Its `COMPLETE_GONE` clear is a
 separate recovery-authority delta and may commit only when
-`ExecutionEligibilityV1 == ELIGIBLE`, `recovery_execution == IDLE`, and there
-is no named reservation, closure ID, pending disposition, or debt current
-attempt. `DRY_RUN` may simulate it but discards every delta. Every other
+`ExecutionEligibilityV1 == ELIGIBLE`, fresh current-host
+`ExactTargetExecutorCapabilityV1` is `AVAILABLE`,
+`recovery_execution == IDLE`, and there is no named reservation, closure ID,
+pending disposition, or debt current attempt. Executor unavailability precedes
+the observation and retains debt/cycle/execution/capture ordinal/terminal
+byte-identically. `DRY_RUN` may simulate it but discards every delta. Every other
 noneligible global gate retains debt, cycle, execution, terminal, and
 continuous attention and falls through to the applicable no-op gate row
 below. Any persisted named phase takes the later phase-specific
@@ -1711,10 +1796,11 @@ exhaustive:
 | --- | --- | --- | --- |
 | Quarantine is `UNRESOLVED` and the exact checked `ProvablyDifferentPhysicalOwnerV1` clear predicate succeeds | Atomically retire quarantine, install the already-present replacement owner, clear unknowable old debt/cycle/execution fences only because the complete extinction proof makes them physically inactionable, and write the terminal. Perform no OS action and prohibit launch for this poll. | `NOT_ATTEMPTED` | Quarantine-retired audit fact; childless codes recompute on the next ordinary poll. |
 | `StateLossQuarantineV1` is `UNRESOLVED` | Retain quarantine and every recoverable fence; deny every kill, launch, closure acquisition, attempt/debt mutation, identity commit, and manual override. | `POLICY_HELD` | `CHILDLESS_STATE_PROVENANCE_LOST` continuously; any recoverable debt/cycle codes also remain visible. |
-| Structurally invalid persisted state, malformed #120 snapshot, or malformed closure-successor value, including a post-reservation claim of structural `CAPABILITY_UNAVAILABLE` | No destructive mutation; retain every owned fence. If an exact known closure exists and the safety-reconciliation gate is `MAY_RECONCILE`, only its non-destructive release/reconciliation may proceed. Do not finalize `CLOSURE_VETOED`, retry, or exhaust. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` for the structural claim, incomplete code otherwise; plus debt/cycle codes by predicate; pending a human. |
+| Structurally invalid persisted state, malformed #120 snapshot, or malformed closure-successor value, including a post-reservation claim of structural `CAPABILITY_UNAVAILABLE` | No destructive mutation; retain every owned fence. If an exact known closure exists, fresh current-host exact-executor availability is `AVAILABLE`, and the safety-reconciliation gate is `MAY_RECONCILE`, only its non-destructive release/reconciliation may proceed. Do not finalize `CLOSURE_VETOED`, retry, or exhaust. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` for the structural claim, incomplete code otherwise; plus debt/cycle codes by predicate; pending a human. |
 | Well-formed owner/child/tree/debt proof is incomplete before reservation | No reservation and no attempt consumed. | `POLICY_HELD` | Incomplete code; plus debt/cycle codes by predicate. |
 | `ClosureCapabilityV1` is `CAPABILITY_UNAVAILABLE` before reservation | Static capability refusal: create no reservation or continuation, consume no attempt, and make no external call. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` continuously pending a human; plus debt/cycle codes by predicate. |
-| `ExecutionEligibilityV1 == ELIGIBLE`, `recovery_execution == IDLE`, no named reservation/closure/pending disposition/current attempt exists, and ordinary observation-only debt reconciliation is `COMPLETE_GONE` | Clear debt and old-owner cycle, remain `IDLE`, write terminal; construct no authority and do not launch. | `NOT_ATTEMPTED` | No childless code after the atomic clear. |
+| `StateLossQuarantineV1` is `NONE` and fresh `ExactTargetExecutorCapabilityV1` is `UNAVAILABLE` while any named reservation/external-effect phase, outstanding teardown debt, or retired-attempt cleanup is present | Retain reservation/phase, closure, pending disposition, debt/current attempt, cycle, continuation owner, retired IDs, capture ordinal, and terminal byte-identically. Perform no takeover, observation, reconcile/release, finalization, `Stop-Tree`, or launch call. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` continuously pending a human; plus debt/cycle/incomplete codes by predicate. |
+| Exact target executor is `AVAILABLE`, `ExecutionEligibilityV1 == ELIGIBLE`, `recovery_execution == IDLE`, no named reservation/closure/pending disposition/current attempt exists, and ordinary observation-only debt reconciliation is `COMPLETE_GONE` | Clear debt and old-owner cycle, remain `IDLE`, write terminal; construct no authority and do not launch. | `NOT_ATTEMPTED` | No childless code after the atomic clear. |
 | No in-flight childless phase and a global/policy gate holds or no named candidate exists; cycle is `NONE` | No module mutation or terminal write. | `NOT_ATTEMPTED` | Debt/incomplete code only when its predicate independently applies. |
 | No in-flight childless phase and a global/policy gate holds or no named candidate exists; cycle is `ACTIVE` with a prior typed failure | Preserve the cycle; no attempt, backoff, or terminal mutation. | `NOT_ATTEMPTED` | Active code; debt/incomplete code by predicate. |
 | No in-flight childless phase and a global/policy gate holds or no otherwise-eligible automatic named proof exists; cycle is `EXHAUSTED` | Preserve the cycle; no attempt, backoff, or terminal mutation. | `NOT_ATTEMPTED` | Exhausted code; debt/incomplete code by predicate. |
@@ -1756,15 +1842,19 @@ Normal execution is:
 | Transition | Checked effect |
 | --- | --- |
 | Reserve named proof | Require core execution `IDLE`, no same-poll terminal, and no outstanding current attempt. Store origin, proof fields, target tuple, and execution-gate snapshot. Manual-wins stores its manual authority ID separately. |
-| Begin closure acquisition | Acquire the effect guard; live-recompute the reserved bindings; persist `TREE_CLOSURE_ACQUIRING` with a fresh attempt ID/revision and exact `CLOSURE_ACQUIRE/ARMED` continuation; recheck ownership; synchronously invoke the closure successor; and retain the guard through the returned-result CAS. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin does not change the cycle. |
-| Acquire valid closure | Require the full joined live-basis/capture/target equality, then persist `TREE_CLOSURE_HELD`, the exact closure ID, and the acquire/reconcile owner at `CALL_RETURNED` while retaining the effect guard. The same checked live chain must next replace it atomically with teardown arm or release arm. Do not increment the attempt again. |
-| Veto after `HELD` | Under the effect guard, persist `TREE_CLOSURE_RELEASING/CLOSURE_VETOED` and exact `CLOSURE_RELEASE/ARMED`; request release by exact pair; persist `CALL_RETURNED`; and finalize only after matching `RELEASED`. |
-| Arm teardown | Under the effect guard, atomically enter `TEARDOWN_IN_FLIGHT`, create/update origin-neutral debt, and persist exact `STOP_TREE/ARMED`. Recheck owner, call only `Stop-Tree`, and persist `CALL_RETURNED` before any observation. |
-| Observe action effect | Require `STOP_TREE/CALL_RETURNED`, allocate the next checked nonzero capture ordinal, map the closed observation, and atomically enter `TREE_CLOSURE_RELEASING` with the same continuation ID updated to `CLOSURE_RELEASE/ARMED`, without clearing debt/current attempt or cycle `ISSUED`. |
-| Finalize release | Retain the effect guard through matching release/result CAS, apply the pending-disposition rule, retire the attempt, and only then clear the continuation owner and release the guard. |
+| Begin closure acquisition | Require fresh `ExactTargetExecutorCapabilityV1.AVAILABLE`, acquire the effect guard; live-recompute the reserved bindings; persist `TREE_CLOSURE_ACQUIRING` with a fresh attempt ID/revision and exact `CLOSURE_ACQUIRE/ARMED` continuation; recheck ownership and current-host executor availability; synchronously invoke the closure successor; and retain the guard through the returned-result CAS. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin does not change the cycle. |
+| Acquire valid closure | Require fresh current-host executor availability plus the full joined live-basis/capture/target equality, then persist `TREE_CLOSURE_HELD`, the exact closure ID, and the acquire/reconcile owner at `CALL_RETURNED` while retaining the effect guard. The same checked live chain must next replace it atomically with teardown arm or release arm. Do not increment the attempt again. |
+| Veto after `HELD` | Recheck current-host executor availability. If available, under the effect guard persist `TREE_CLOSURE_RELEASING/CLOSURE_VETOED` and exact `CLOSURE_RELEASE/ARMED`; request release by exact pair; persist `CALL_RETURNED`; and finalize only after matching `RELEASED`. Unavailability retains the preexisting fence byte-identically. |
+| Arm teardown | Recheck current-host executor availability. If available, under the effect guard atomically enter `TEARDOWN_IN_FLIGHT`, create/update origin-neutral debt, and persist exact `STOP_TREE/ARMED`. Recheck owner and availability again, call only `Stop-Tree`, and persist `CALL_RETURNED` before any observation. Unavailability retains the preexisting fence byte-identically. |
+| Observe action effect | Require current-host executor availability and `STOP_TREE/CALL_RETURNED`, allocate the next checked nonzero capture ordinal, map the closed observation, and atomically enter `TREE_CLOSURE_RELEASING` with the same continuation ID updated to `CLOSURE_RELEASE/ARMED`, without clearing debt/current attempt or cycle `ISSUED`. Unavailability reserves no ordinal and retains the returned-effect fence. |
+| Finalize release | Require current-host executor availability, retain the effect guard through matching release/result CAS, apply the pending-disposition rule, retire the attempt, and only then clear the continuation owner and release the guard. Unavailability leaves every checked field byte-identical. |
 | New guarded owner commits | Permitted only with quarantine `NONE`, debt `NONE`, no childless closure phase/continuation owner/pending disposition, and either clean genesis or the complete provably-different-owner transition. Clear a debt-free old-owner cycle; leave no inherited authority. |
 
-Crash/reload is equally closed. Every retain gate uses the explicit
+Crash/reload is equally closed. Every entry first reconstructs the current-host
+exact-executor operand. `UNAVAILABLE` returns the explicit retained-fence row
+before effect-guard acquisition, takeover, reconcile/release, capture, or
+finalization; this includes every phase/stage inherited from another platform.
+Every other retain gate uses the explicit
 retained-fence row above. `MAY_TAKEOVER` first owns the effect guard, proves a
 persisted predecessor unable to resume, and commits the no-call takeover
 mapping; only after recomputation as `MAY_RECONCILE` may these operations run:
@@ -1833,6 +1923,9 @@ transaction; no executor branch may save a cached whole state.
    closure, attempt-keyed acquire/reconcile/release, crash safety, and
    activated-platform compatibility. Until all pass, the static capability
    gate refuses before reservation with zero attempt and zero external call.
+   Prove current-host `ExactTargetExecutorCapabilityV1` from the actual action
+   branch, never from input acceptance, and recheck it at every state entry and
+   operation listed in the archetype table.
 4. Revalidate after reservation. Owner, coverage, and target digest must match;
    initial mode additionally requires a fresh post-linearization nonordinary
    raw capture, same-capture complete child absence, exact current matcher
@@ -1881,13 +1974,18 @@ transaction; no executor branch may save a cached whole state.
     unavailability claim and reconciliation
     `UNKNOWN(CAPABILITY_UNAVAILABLE)`; both must retain their exact fences,
     avoid `CLOSURE_VETOED`/retry/exhaustion, and require task visibility.
+    Independently make the current-host exact executor unavailable with a
+    persisted reservation/phase, debt-only state, and retired-attempt cleanup;
+    each must emit exact capability attention and preserve all checked fields
+    byte-identically.
 8. After every finalized childless reservation/attempt outcome and
    observation-only debt reconciliation, attempt a second reservation in the
    same ordinary poll; the terminal must refuse it. Prove pure refusal,
    retained uncertainty, prior-poll exhaustion, and no-op `NOT_ATTEMPTED` do
    not write the terminal; successful cleanup `NOT_ATTEMPTED` does. Cross
    ordinary `COMPLETE_GONE` debt reconciliation with every
-   `ExecutionEligibilityV1`: only `ELIGIBLE` clears and writes the terminal,
+   `ExecutionEligibilityV1`: only `ELIGIBLE` together with fresh current-host
+   exact-executor `AVAILABLE` clears and writes the terminal,
    `DRY_RUN` discards, and every other gate retains debt/cycle/attention. The
    clear must also require `IDLE` with no reservation, closure, pending
    disposition, or current attempt. Inject the same observation into every
@@ -1913,9 +2011,11 @@ transaction; no executor branch may save a cached whole state.
     `RELEASED` binding its closure ID and finalizing the veto. Reload
     complete-gone cleanup emits `NOT_ATTEMPTED`, writes the terminal, and never
     launches. Cross every persisted named phase with every execution gate:
-    dry run and a non-current supervisor retain state byte-identically and make
-    no closure-successor call; a current supervisor under kill switch, disabled action
-    latch, missing report membership, or disabled auto-restart may only
+    dry run, a non-current supervisor, and current-host exact-executor
+    `UNAVAILABLE` retain state byte-identically and make no closure-successor
+    call; a current supervisor with exact-executor `AVAILABLE` under kill
+    switch, disabled action latch, missing report membership, or disabled
+    auto-restart may only
     reconcile/release/finalize the old fence and never acquire, kill, launch,
     consume a marker, increment an attempt, or change backoff/readiness.
 13. Generate every debt-current-attempt/cycle/execution cross-product. Accept
@@ -1954,10 +2054,13 @@ transaction; no executor branch may save a cached whole state.
     `CALL_RETURNED`, and after `CALL_RETURNED` before capture. Require no
     second `Stop-Tree`, no completion inference from `ARMED`, no release while
     a live foreign continuation can run, and no destructive call after
-    authority ownership is released. Reload `PRE_BARRIER` through its
-    state-only release without an attempt owner. For every takeover phase,
+    authority ownership is released. On an executor-compatible host, reload
+    `PRE_BARRIER` through its state-only release without an attempt owner; on
+    an unavailable host retain it byte-identically. For every takeover phase,
     assert the exact no-call mapping, recomputation to `MAY_RECONCILE`, and
-    rejection of `STOP_TREE/ARMED/RECONCILER`.
+    rejection of `STOP_TREE/ARMED/RECONCILER`. Repeat every paused state after
+    inheriting it on Linux and macOS; current-host executor unavailability must
+    win before takeover and make both pollers zero-call and zero-mutation.
 17. Lose checked state after automatic attempt one, two, and three, after debt
     arm, and after a partial leaves-first target attempt. A new epoch and the
     same physical PID/start/nonce/generation must remain
@@ -1975,8 +2078,11 @@ transaction; no executor branch may save a cached whole state.
     no-kill `RELAUNCH_ONLY`. With outstanding debt, both must hold or select
     exact `DEBT_COMPLETION`; with a present childless wrapper, both must require
     the named `INITIAL` authority before any kill.
-20. Construct each of the seven typed payload objects from the displayed
-    fixture values without parsing or copying the displayed JSON strings.
+20. Construct each of the seven typed payload objects through its typed
+    constructor using the scalar fixture values shown in the displayed JSON.
+    Parsing may extract those scalar values, but the expected typed object and
+    its field set must come from the independent typed constructor, not from
+    the parsed JSON object.
     Encode each object through the implementation's production
     `CanonicalJsonV1`; require exact displayed byte and byte-count equality,
     then compute `SHA-256(domain || NUL || produced_bytes)` and require the
@@ -2040,6 +2146,29 @@ transaction; no executor branch may save a cached whole state.
     that ordinary barrier evidence still blocks. A clear barrier without the
     typed closure/absence proof must also refuse debt clear. Attended reset/archive
     evidence must never substitute for automatic closure or completion.
+24. Execute the complete state-entry table with current-host executor
+    `AVAILABLE` on Windows and `UNAVAILABLE` on Linux and macOS. Cross fresh
+    selection; uninterrupted issuer at every `ARMED`/`CALL_RETURNED` phase;
+    live-continuation resume; same-process CAS re-reduction; same-platform
+    restart/takeover; cross-platform inheritance of `PRE_BARRIER`,
+    `TREE_CLOSURE_ACQUIRING`, `TREE_CLOSURE_HELD`,
+    `TREE_CLOSURE_RELEASING`, and `TEARDOWN_IN_FLIGHT`; `IDLE` with outstanding
+    debt and no current attempt; retired-ID reconcile/late `HELD`; unresolved
+    quarantine; malformed fence; and proved quarantine retirement. Every
+    unavailable named/debt/retired path with quarantine `NONE` must retain reservation, phase,
+    closure, pending disposition, debt/current attempt, cycle, continuation,
+    retired IDs, capture ordinal, and terminal byte-identically; make zero
+    takeover, capture, reconcile, release, `Stop-Tree`, launch, and finalizer
+    calls; and emit `CAPABILITY_UNAVAILABLE` plus `POLICY_HELD`. Prove
+    `RETAIN_EXACT_TARGET_EXECUTOR_UNAVAILABLE` with dry run false, quarantine
+    `NONE`, and a fresh current supervisor; separately cross each earlier
+    retain-only gate and require the same zero-call/zero-mutation safety. Prove
+    `MAY_RELEASE_PRE_BARRIER`, ordinary debt clear, late-`HELD` cleanup, and
+    every release finalizer run only when the fresh operand is `AVAILABLE`.
+    Separately prove complete-extinction quarantine retirement is the stated
+    platform-neutral no-OS-action transition and never named cleanup. A future
+    POSIX executor contract must not make a persisted Windows FILETIME tuple
+    compatible without a reviewed version/migration rule.
 
 ## Dependencies and release order
 
@@ -2048,7 +2177,7 @@ transaction; no executor branch may save a cached whole state.
 | Two same-owner post-establishment complete child absences | #120 INPUT DELIVERED; ENFORCED after #115 and the 87-A adapter | 87-A reducer plus merged #120 snapshot |
 | PID/start/nonce ownership; never pattern ownership | #120 INPUT DELIVERED; ENFORCED by the 87-A adapter | Adapter over merged `owned_process_tree_v2`, including exact Windows FILETIME |
 | Complete 64-entry tree observation | DELIVERED by merged #120; 87-A adapter validation remains required | #120 snapshot plus 87-A adapter |
-| POSIX exact-target execution for named teardown | CURRENTLY UNAVAILABLE | #120 accepts Linux exact observation tokens but declares no macOS token and has no non-Windows executor branch; return pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and `POLICY_HELD` pending a human |
+| POSIX exact-target execution for named teardown | CURRENTLY UNAVAILABLE | #120 accepts Linux exact observation tokens but declares no macOS token and has no non-Windows executor branch. With quarantine `NONE`, fresh paths return pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and inherited reservation/phase, debt-only, and retired-cleanup paths retain their checked state byte-identically before any call or mutation. The independent complete-extinction quarantine retirement is not named cleanup. Every unresolved named case remains `POLICY_HELD` pending a human. |
 | Action-scoped creation closure | CURRENTLY UNAVAILABLE; ENFORCED after a conforming closure successor | Merged #120 does not freeze creation or expose attempt-keyed acquire/reconcile/release; otherwise `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human |
 | Atomic reservation/debt/cycle/terminal state | ENFORCED after #115 | Task #115 checked state owner |
 | External-call continuation/effect linearization | PARTIAL Windows target-local primitive DELIVERED by #120; full contract ENFORCED after #115 and the closure successor | #120 same-handle exact FILETIME check/terminate plus conditional bounded wait attempt, checked continuation state, and successor-owned attempt-bound synchronous adapters |
