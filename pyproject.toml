@@ -53,7 +53,7 @@ ignore = [
 "src/agenttalk/supervisor.py" = ["E501"]
 
 [project.scripts]
-agenttalk = "agenttalk.cli:main"
+agenttalk = "agenttalk.cli:console_main"
 
 [tool.hatch.build.targets.sdist]
 include = [

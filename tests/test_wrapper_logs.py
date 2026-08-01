@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -1089,14 +1090,14 @@ def test_print_bounded_uncaught_exception_prints_normally_when_no_wrapper_log_is
     assert "Traceback (most recent call last)" in captured.getvalue()
 
 
-def test_top_level_boundary_keeps_second_traceback_within_cap_and_preserves_exception_type(
+def _install_boundary_test_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    nonce: str,
+) -> tuple[Path, Path]:
     out_path = tmp_path / "stdout.log"
     err_path = tmp_path / "stderr.log"
     err_path.write_text("E" * 1024, encoding="utf-8")
-    nonce = "a" * 32
     monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
     monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
     monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
@@ -1113,29 +1114,80 @@ def test_top_level_boundary_keeps_second_traceback_within_cap_and_preserves_exce
         raise RuntimeError("BOUNDARY-SENTINEL-BOOM " + "z" * 20_000)
 
     monkeypatch.setattr(cli, "_cmd_wrap_with_logging", blow_up)
+    return out_path, err_path
 
-    # Mirrors agenttalk/__main__.py's own dispatch: everything but SystemExit
-    # that escapes main() is genuinely uncaught, so this is the boundary
-    # print_bounded_uncaught_exception exists for. cli.main() itself is
-    # untouched by this fix - an embedder calling it directly still gets the
-    # original exception type back, which this also confirms.
+
+def test_console_main_bounds_the_top_level_traceback_and_returns_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 20: agenttalk/__main__.py, the installed console script, and
+    cli.py's own __main__ guard are three real top-level entry points that
+    all need this SAME property - drives console_main() itself (the one
+    shared function all three now call), not a hand-replicated copy of
+    what any one of them does."""
+    nonce = "a" * 32
+    _out_path, err_path = _install_boundary_test_env(tmp_path, monkeypatch, nonce)
+
+    result = cli.console_main(
+        ["--supervisor-launch-nonce", nonce, "wrap", "--for", "worker"]
+    )
+
+    assert result == 1
+    files = sorted(tmp_path.glob("stderr.log*"))
+    assert all(path.stat().st_size <= 1024 for path in files)
+    assert sum(path.stat().st_size for path in files) <= 4096
+
+
+def test_main_still_propagates_original_exception_type_for_embedders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The embedder-safety property console_main was built to preserve:
+    a program that imports cli and calls main([...]) directly never goes
+    through console_main at all, so it must still see the ORIGINAL
+    exception type, uncaught - exactly as if console_main did not exist."""
+    nonce = "b" * 32
+    _install_boundary_test_env(tmp_path, monkeypatch, nonce)
+
     try:
-        cli.main(
-            ["--supervisor-launch-nonce", nonce, "wrap", "--for", "worker"]
-        )
+        cli.main(["--supervisor-launch-nonce", nonce, "wrap", "--for", "worker"])
     except SystemExit as exc:
         raise AssertionError(
             "an unexpected exception must not be converted to SystemExit"
         ) from exc
     except RuntimeError as exc:
         assert "BOUNDARY-SENTINEL-BOOM" in str(exc)
-        wrapper_logs.print_bounded_uncaught_exception()
     else:
         raise AssertionError("cli.main should have raised")
 
-    files = sorted(tmp_path.glob("stderr.log*"))
-    assert all(path.stat().st_size <= 1024 for path in files)
-    assert sum(path.stat().st_size for path in files) <= 4096
+    # console_main installs no hook and replaces no stream itself - the
+    # only global side effect anywhere in this path is cmd_wrap's own tee
+    # install/restore, unchanged by this round and already unconditional.
+    assert sys.excepthook is sys.__excepthook__
+
+
+def test_console_main_passes_systemexit_through_unchanged() -> None:
+    """SystemExit (argparse's own error exit here) is never main()'s to
+    return-ify, and console_main must not touch it either - row 1 of the
+    contract table, now checked at the shared function too."""
+    with pytest.raises(SystemExit) as excinfo:
+        cli.console_main(["not-a-real-subcommand"])
+    assert excinfo.value.code == 2
+
+
+def test_console_main_returns_main_result_unchanged_for_routine_exit_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KeyboardInterrupt/ValueError/OSError already return ints from inside
+    main() itself (round 17) - console_main must pass those straight
+    through, not just the exception-propagation cases."""
+
+    def raise_keyboard_interrupt(_args: argparse.Namespace) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_cmd_wrap_with_logging", raise_keyboard_interrupt)
+    assert cli.console_main(["wrap", "--for", "worker"]) == 130
 
 
 @pytest.mark.parametrize(
