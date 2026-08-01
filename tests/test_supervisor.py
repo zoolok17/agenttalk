@@ -2299,6 +2299,55 @@ def test_supervise_bootstrap_check_validates_module_args_from(
     assert ("supervisor_agent_launch_module_args_from_valid", "Zeno") in by_id_agent
 
 
+def test_supervise_bootstrap_check_accepts_the_filled_manual_archetype_scaffold(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """Round 16 connector finding: making the module_args_from resolver
+    delegation run unconditionally (round 14) also ran it against
+    launches that are not Python at all. The MANUAL archetype's own
+    generated scaffold (CONFIG_TEMPLATE's AGENT_NAME entry: a direct
+    claude.exe/codex.exe launch, windows_args ["{SESSION_ARGS}"]) has no
+    '-m'/'agenttalk' anywhere in windows_args - the whole question of a
+    module boundary is meaningless for it - so a correctly filled-in
+    version of our OWN scaffold failed our OWN validator with
+    supervisor_agent_launch_module_args_from_wrong_token. Fixed by gating
+    the whole module_args_from block on windows_file's stem being a
+    recognized Python interpreter (the SAME set the runtime's own
+    _agenttalk_argv checks), not by re-narrowing to "only when
+    module_args_from is present" (that would reopen round 14's
+    absent-prefix gap for genuinely Python launches). Kept as its own
+    permanent test: our own generated scaffold failing our own validator
+    must stay impossible to reintroduce."""
+    s = _team(tmp_path, "Polaris,Deneb")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    for name in ("Polaris", "Deneb"):
+        s.write_heartbeat(name)
+    manual_template = json.loads(sup.CONFIG_TEMPLATE)["agents"]["AGENT_NAME"]
+    assert "wrapped" not in manual_template
+    manual = {
+        **manual_template,
+        "cwd": TEST_ROOT,
+        "env": {"AGENTTALK_SELF": "Deneb"},
+        "launch": {
+            **manual_template["launch"],
+            "windows_file": r"C:\Users\you\.local\bin\claude.exe",
+        },
+    }
+    assert "{SESSION_ARGS}" in manual["launch"]["windows_args"]
+    _write_supervisor_config(s, {"Deneb": manual})
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    payload = json.loads(capsys.readouterr().out)
+    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
+    assert not any(
+        cid.startswith("supervisor_agent_launch_module_args_from")
+        for cid, agent in by_id_agent if agent == "Deneb"
+    ), by_id_agent
+    assert rc == 0
+
+
 def test_supervise_bootstrap_check_accepts_constrained_ovh_qwen_profile(
     tmp_path: Path,
     capsys: pytest.CaptureFixture,

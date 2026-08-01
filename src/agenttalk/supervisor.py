@@ -5856,84 +5856,104 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                 _bootstrap_add(checks, "supervisor_agent_launch_args_set", "ok",
                                "launch.windows_args is filled", agent=name)
 
-            module_args_from = launch.get("module_args_from")
-            module_args_from_type_or_range_error = False
-            if module_args_from is not None:
-                if not isinstance(module_args_from, int) or isinstance(module_args_from, bool):
-                    _bootstrap_add(
-                        checks, "supervisor_agent_launch_module_args_from_invalid", "error",
-                        "launch.module_args_from must be an integer",
-                        agent=name,
-                        facts={"module_args_from": module_args_from},
-                        suggestion="set module_args_from to the index of '-m' in windows_args, "
-                                   "or remove it",
-                    )
-                    module_args_from_type_or_range_error = True
-                elif isinstance(windows_args, list) and not (
-                    0 <= module_args_from < len(windows_args)
-                ):
-                    _bootstrap_add(
-                        checks, "supervisor_agent_launch_module_args_from_out_of_range", "error",
-                        "launch.module_args_from is out of range for windows_args",
-                        agent=name,
-                        facts={"module_args_from": module_args_from,
-                               "windows_args_len": len(windows_args)},
-                        suggestion="point module_args_from at the index of '-m' in windows_args",
-                    )
-                    module_args_from_type_or_range_error = True
-            # In-range is necessary but not sufficient (PR 98 connector,
-            # round 9): the validator must accept exactly what the runtime
-            # resolver accepts, no more - an in-range module_args_from
-            # pointing at the wrong token, or a declared prefix containing
-            # a token outside the supported interpreter-flag allowlist,
-            # launches fine (the Python invocation still runs) while
-            # nonce injection, bounded logging, and launcher attribution
-            # are all silently disabled. Round 14: that includes
-            # module_args_from being ABSENT while windows_args carries an
-            # undeclared prefix (e.g. ["-u", "-m", "agenttalk", ...]) - the
-            # resolver defaults an absent field to offset 0 exactly like
-            # this call does, so skipping the check whenever the field is
-            # merely unset let that exact shape report clean. Run
-            # unconditionally (any type/range error above already fully
-            # explains the config; no need to also run this). Delegate to
-            # the SAME resolver the runtime uses instead of reimplementing
-            # this judgment a third time.
-            if not module_args_from_type_or_range_error and isinstance(windows_args, list):
-                if _resolve_module_flag_index(
-                    [str(token) for token in windows_args], module_args_from,
-                ) < 0:
-                    _bootstrap_add(
-                        checks, "supervisor_agent_launch_module_args_from_wrong_token",
-                        "error",
-                        (
-                            "launch.module_args_from is in range but does not point at "
-                            "'-m' 'agenttalk', or its declared prefix contains a token "
-                            "outside the supported interpreter-flag set"
-                            if module_args_from is not None else
-                            "launch.module_args_from is not set and windows_args does "
-                            "not start with '-m' 'agenttalk' - the runtime resolver "
-                            "defaults an absent declaration to offset 0 and will reject "
-                            "this exact invocation the same way"
-                        ),
-                        agent=name,
-                        facts={"module_args_from": module_args_from,
-                               "windows_args": windows_args},
-                        suggestion="point module_args_from at the index of '-m' in "
-                                   "windows_args, and declare only supported "
-                                   "interpreter flags before it (see "
-                                   "docs/supervisor-tutorial.md)",
-                    )
-                else:
-                    _bootstrap_add(
-                        checks, "supervisor_agent_launch_module_args_from_valid", "ok",
-                        (
-                            "launch.module_args_from is a valid index"
-                            if module_args_from is not None else
-                            "windows_args resolves as the plain, undeclared "
-                            "'-m' 'agenttalk' form"
-                        ),
-                        agent=name,
-                    )
+            # Round 16 connector finding: making the resolver delegation run
+            # unconditionally (round 14) also made it run for launches that
+            # are not Python at all - a manual archetype's claude.exe/
+            # codex.exe direct launch, or an agenttalk.exe entry-point
+            # launch - where windows_args never contains '-m'/'agenttalk'
+            # and the whole question of a module boundary is meaningless.
+            # windows_file's stem, not wrapped=true/false, is what actually
+            # decides whether the runtime resolver's own logic ever runs
+            # for this agent (_agenttalk_argv gates on exactly this set) -
+            # so this check must be gated on the SAME set, not removed
+            # back to "only when module_args_from is present" (that would
+            # reopen round 14's absent-prefix gap for genuinely Python
+            # launches). "pythonw" is deliberately NOT in this set: the
+            # runtime does not recognize it either (see _agenttalk_argv),
+            # so a pythonw-launched wrapped agent already gets no
+            # attribution regardless of module_args_from - a real, separate
+            # gap, not something this validator can paper over by silently
+            # accepting it here.
+            if _token_stem(windows_file) in {"python", "python3", "py"}:
+                module_args_from = launch.get("module_args_from")
+                module_args_from_type_or_range_error = False
+                if module_args_from is not None:
+                    if not isinstance(module_args_from, int) or isinstance(module_args_from, bool):
+                        _bootstrap_add(
+                            checks, "supervisor_agent_launch_module_args_from_invalid", "error",
+                            "launch.module_args_from must be an integer",
+                            agent=name,
+                            facts={"module_args_from": module_args_from},
+                            suggestion="set module_args_from to the index of '-m' in windows_args, "
+                                       "or remove it",
+                        )
+                        module_args_from_type_or_range_error = True
+                    elif isinstance(windows_args, list) and not (
+                        0 <= module_args_from < len(windows_args)
+                    ):
+                        _bootstrap_add(
+                            checks, "supervisor_agent_launch_module_args_from_out_of_range", "error",
+                            "launch.module_args_from is out of range for windows_args",
+                            agent=name,
+                            facts={"module_args_from": module_args_from,
+                                   "windows_args_len": len(windows_args)},
+                            suggestion="point module_args_from at the index of '-m' in windows_args",
+                        )
+                        module_args_from_type_or_range_error = True
+                # In-range is necessary but not sufficient (PR 98 connector,
+                # round 9): the validator must accept exactly what the
+                # runtime resolver accepts, no more - an in-range
+                # module_args_from pointing at the wrong token, or a
+                # declared prefix containing a token outside the supported
+                # interpreter-flag allowlist, launches fine (the Python
+                # invocation still runs) while nonce injection, bounded
+                # logging, and launcher attribution are all silently
+                # disabled. Round 14: that includes module_args_from being
+                # ABSENT while windows_args carries an undeclared prefix
+                # (e.g. ["-u", "-m", "agenttalk", ...]) - the resolver
+                # defaults an absent field to offset 0 exactly like this
+                # call does, so skipping the check whenever the field is
+                # merely unset let that exact shape report clean. Run
+                # unconditionally (any type/range error above already
+                # fully explains the config; no need to also run this).
+                # Delegate to the SAME resolver the runtime uses instead of
+                # reimplementing this judgment a third time.
+                if not module_args_from_type_or_range_error and isinstance(windows_args, list):
+                    if _resolve_module_flag_index(
+                        [str(token) for token in windows_args], module_args_from,
+                    ) < 0:
+                        _bootstrap_add(
+                            checks, "supervisor_agent_launch_module_args_from_wrong_token",
+                            "error",
+                            (
+                                "launch.module_args_from is in range but does not point at "
+                                "'-m' 'agenttalk', or its declared prefix contains a token "
+                                "outside the supported interpreter-flag set"
+                                if module_args_from is not None else
+                                "launch.module_args_from is not set and windows_args does "
+                                "not start with '-m' 'agenttalk' - the runtime resolver "
+                                "defaults an absent declaration to offset 0 and will reject "
+                                "this exact invocation the same way"
+                            ),
+                            agent=name,
+                            facts={"module_args_from": module_args_from,
+                                   "windows_args": windows_args},
+                            suggestion="point module_args_from at the index of '-m' in "
+                                       "windows_args, and declare only supported "
+                                       "interpreter flags before it (see "
+                                       "docs/supervisor-tutorial.md)",
+                        )
+                    else:
+                        _bootstrap_add(
+                            checks, "supervisor_agent_launch_module_args_from_valid", "ok",
+                            (
+                                "launch.module_args_from is a valid index"
+                                if module_args_from is not None else
+                                "windows_args resolves as the plain, undeclared "
+                                "'-m' 'agenttalk' form"
+                            ),
+                            agent=name,
+                        )
 
             if wrapped and isinstance(windows_args, list):
                 if "wrap" not in windows_args:
