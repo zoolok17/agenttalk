@@ -2165,6 +2165,37 @@ def test_supervise_bootstrap_check_validates_module_args_from(
     by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
     assert ("supervisor_agent_launch_module_args_from_valid", "Zeno") in by_id_agent
 
+    # PR 98 connector, round 9 - the seam again, in the validator: an
+    # IN-RANGE module_args_from that points at the WRONG token used to
+    # report valid, even though the runtime resolver rejects it - nonce
+    # injection, bounded logging, and launcher attribution all silently
+    # disabled on a config the validator called clean. windows_args
+    # ['-u', '-Xutf8', '-m', 'agenttalk', ...] with module_args_from=1
+    # points at '-Xutf8', not '-m' - in range, but the wrong token.
+    wrong_token = _wrapped_supervisor_agent("Zeno", "codex")
+    wrong_token["launch"]["windows_args"][0:0] = ["-u", "-Xutf8"]
+    wrong_token["launch"]["module_args_from"] = 1
+    _write_supervisor_config(s, {"Zeno": wrong_token})
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
+    assert ("supervisor_agent_launch_module_args_from_wrong_token", "Zeno") in by_id_agent
+
+    # Same shape, different cause: an in-range module_args_from whose
+    # declared prefix contains a token outside the allowlist (never a
+    # real interpreter flag) must also be refused, not just a wrong
+    # position.
+    disallowed_prefix = _wrapped_supervisor_agent("Zeno", "codex")
+    disallowed_prefix["launch"]["windows_args"].insert(0, "-Z")
+    disallowed_prefix["launch"]["module_args_from"] = 1
+    _write_supervisor_config(s, {"Zeno": disallowed_prefix})
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
+    assert ("supervisor_agent_launch_module_args_from_wrong_token", "Zeno") in by_id_agent
+
 
 def test_supervise_bootstrap_check_accepts_constrained_ovh_qwen_profile(
     tmp_path: Path,

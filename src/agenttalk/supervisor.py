@@ -2147,6 +2147,47 @@ def _module_args_from(cfg_agent: object) -> object:
     return launch.get("module_args_from") if isinstance(launch, dict) else None
 
 
+def _resolve_module_flag_index(
+    tokens_after_exe: list[str], module_args_from: object,
+) -> int:
+    """Python-side mirror of Resolve-AgenttalkModuleFlagIndex: given the
+    argv tokens AFTER the interpreter executable and a declared
+    module_args_from, return the index that holds '-m' (with 'agenttalk'
+    immediately after) if every prefix token before it is on the
+    allowlist, or -1 otherwise. A malformed module_args_from fails closed
+    (-1) rather than raising, matching the PowerShell side's own
+    fail-soft cast.
+
+    Shared by _agenttalk_argv (parses an OBSERVED command line at
+    attribution time) and bootstrap_check (validates a DECLARED config
+    at load time) so the two callers cannot independently drift from
+    what this returns - PR 98 connector, round 9: the validator only
+    checked module_args_from's type and range, so an in-range value
+    pointing at the WRONG token (e.g. windows_args ['-u', '-Xutf8', '-m',
+    'agenttalk'] with module_args_from=1) reported valid while this same
+    resolver logic, called at runtime, rejected it - nonce injection,
+    bounded logging, and launcher attribution all silently disabled on a
+    config the validator called clean."""
+    offset = 0
+    if module_args_from is not None:
+        try:
+            offset = int(module_args_from)
+        except (TypeError, ValueError):
+            return -1
+        if offset < 0:
+            return -1
+    if offset >= len(tokens_after_exe):
+        return -1
+    for prefix_token in tokens_after_exe[:offset]:
+        if not _allowed_interpreter_prefix_token(prefix_token):
+            return -1
+    if (offset + 1 < len(tokens_after_exe)
+            and tokens_after_exe[offset] == "-m"
+            and tokens_after_exe[offset + 1] == "agenttalk"):
+        return offset
+    return -1
+
+
 def _agenttalk_argv(command_line: object, module_args_from: object = None) -> list[str] | None:
     tokens = _split_command_line(command_line)
     if not tokens:
@@ -2155,28 +2196,10 @@ def _agenttalk_argv(command_line: object, module_args_from: object = None) -> li
     if first in _SHELL_HOSTS:
         return None
     if first in {"python", "python3", "py"}:
-        # module_args_from is operator-declared config, not argv - a
-        # malformed value must fail closed (return None) here rather than
-        # throw, matching Resolve-AgenttalkModuleFlagIndex's own fail-soft
-        # cast on the PowerShell side.
-        offset = 0
-        if module_args_from is not None:
-            try:
-                offset = int(module_args_from)
-            except (TypeError, ValueError):
-                return None
-            if offset < 0:
-                return None
-        index = 1 + offset
-        if index >= len(tokens):
+        rel_index = _resolve_module_flag_index(tokens[1:], module_args_from)
+        if rel_index < 0:
             return None
-        for prefix_token in tokens[1:index]:
-            if not _allowed_interpreter_prefix_token(prefix_token):
-                return None
-        if (index + 1 < len(tokens) and tokens[index] == "-m"
-                and tokens[index + 1] == "agenttalk"):
-            return tokens[index + 2:]
-        return None
+        return tokens[1 + rel_index + 2:]
     if first == "agenttalk":
         return tokens[1:]
     return None
@@ -4045,6 +4068,34 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                         facts={"module_args_from": module_args_from,
                                "windows_args_len": len(windows_args)},
                         suggestion="point module_args_from at the index of '-m' in windows_args",
+                    )
+                # In-range is necessary but not sufficient (PR 98
+                # connector, round 9): the validator must accept exactly
+                # what the runtime resolver accepts, no more - an
+                # in-range module_args_from pointing at the wrong token,
+                # or a declared prefix containing a token outside the
+                # supported interpreter-flag allowlist, launches fine
+                # (the Python invocation still runs) while nonce
+                # injection, bounded logging, and launcher attribution
+                # are all silently disabled. Delegate to the SAME
+                # resolver the runtime uses instead of reimplementing
+                # this judgment a third time.
+                elif isinstance(windows_args, list) and _resolve_module_flag_index(
+                    [str(token) for token in windows_args], module_args_from,
+                ) < 0:
+                    _bootstrap_add(
+                        checks, "supervisor_agent_launch_module_args_from_wrong_token",
+                        "error",
+                        "launch.module_args_from is in range but does not point at "
+                        "'-m' 'agenttalk', or its declared prefix contains a token "
+                        "outside the supported interpreter-flag set",
+                        agent=name,
+                        facts={"module_args_from": module_args_from,
+                               "windows_args": windows_args},
+                        suggestion="point module_args_from at the index of '-m' in "
+                                   "windows_args, and declare only supported "
+                                   "interpreter flags before it (see "
+                                   "docs/supervisor-tutorial.md)",
                     )
                 else:
                     _bootstrap_add(
