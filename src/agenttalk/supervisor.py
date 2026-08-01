@@ -7290,6 +7290,13 @@ function New-WrapperLogPendingMarker([string]$attempt) {
     (New-Object Text.UTF8Encoding($false))
   )
 }
+function Write-WrapperLogSequenceFile([string]$path, [long]$value) {
+  [IO.File]::WriteAllText(
+    $path,
+    [string]$value,
+    (New-Object Text.UTF8Encoding($false))
+  )
+}
 function New-WrapperLogTargets([string]$name, [string]$nonce) {
   # Agent names are already roster-validated. Re-check here because these paths
   # are later used by bounded cleanup; never let a config string select a parent.
@@ -7348,13 +7355,18 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
         continue
       }
       New-WrapperLogPendingMarker $attempt
+      $sequenceWriteFailed = $false
       try {
-        [IO.File]::WriteAllText(
-          (Join-Path $attempt '.sequence'),
-          [string]$seq,
-          (New-Object Text.UTF8Encoding($false))
-        )
+        Write-WrapperLogSequenceFile (Join-Path $attempt '.sequence') $seq
       } catch {
+        # #139-family: Complete-WrapperLogTargets' retention sort ranks a
+        # missing-.sequence generation BELOW every sequence-bearing one,
+        # regardless of actual launch order (sortKey '0-name' vs
+        # '1-sequence') - a transient failure HERE must propagate into
+        # sequence_uncertain, the same signal a failed root SCAN already
+        # produces below, or a later prune cycle can evict THIS (possibly
+        # newer) generation while keeping a genuinely older one.
+        $sequenceWriteFailed = $true
         Write-Warning (
           "supervisor: cannot record wrapper log launch sequence under '{0}' ({1})" -f
           $agentDir, $_.Exception.Message)
@@ -7389,7 +7401,7 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
     stderr = Join-Path $generationDir 'stderr.log'
     generation_dir = $generationDir
     agent_name = $name
-    sequence_uncertain = $seqResult.uncertain
+    sequence_uncertain = ($seqResult.uncertain -or $sequenceWriteFailed)
   }
 }
 function Complete-WrapperLogTargets($targets) {

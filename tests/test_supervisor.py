@@ -5453,6 +5453,90 @@ def test_ps_wrapper_log_prune_bound_recovers_from_persistent_uncertainty(
     )
 
 
+def test_ps_wrapper_log_sequence_write_failure_marks_uncertain_and_defers_prune(
+    tmp_path: Path,
+) -> None:
+    """Round 12 connector finding, #139-family: a transient failure writing
+    a generation's .sequence file left sequence_uncertain reflecting only
+    the earlier root-SCAN result, not the write itself - the generation
+    still launched and committed with no .sequence file at all.
+    Complete-WrapperLogTargets' retention sort ranks a missing-.sequence
+    generation BELOW every sequence-bearing one regardless of actual
+    launch order ('0-name' sorts before '1-sequence'), so a transient write
+    failure on the NEWEST generation could make retention prune it while
+    keeping a genuinely OLDER one.
+
+    Write-WrapperLogSequenceFile is overridden (a plain PowerShell function
+    redefinition, not an OS-level fault injection - the write call is
+    factored into its own named helper for exactly this reason) to fail on
+    the second launch only. With quota=1, retention would prune down to 1
+    survivor if it trusted the write - it must instead defer pruning this
+    cycle because sequence_uncertain is now true, so both generations
+    survive."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    primary = tmp_path / "primary"
+    fallback = tmp_path / "fallback"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    result_path = tmp_path / "sequence-write-failure.json"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(primary))}",
+        f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+        "$WrapperLogGenerations = 1",
+        helpers,
+        "$t1 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "Complete-WrapperLogTargets $t1",
+        "function Write-WrapperLogSequenceFile([string]$path, [long]$value) {",
+        "  throw 'simulated transient .sequence write failure'",
+        "}",
+        "$t2 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "Complete-WrapperLogTargets $t2",
+        f"$agentDir = Join-Path {_pslit(str(primary))} {_pslit(agent_leaf)}",
+        "$survivors = @(Get-ChildItem -LiteralPath $agentDir -Directory | "
+        "  ForEach-Object { $_.Name })",
+        "$t2SeqFile = Join-Path ([string]$t2.generation_dir) '.sequence'",
+        "@{ uncertain1 = [bool]$t1.sequence_uncertain; "
+        "uncertain2 = [bool]$t2.sequence_uncertain; "
+        "t2HasSequenceFile = (Test-Path -LiteralPath $t2SeqFile); "
+        "survivorCount = $survivors.Count; "
+        "g1Name = (Split-Path ([string]$t1.generation_dir) -Leaf); "
+        "g2Name = (Split-Path ([string]$t2.generation_dir) -Leaf); "
+        "survivors = $survivors } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "sequence-write-failure.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["uncertain1"] is False
+    assert payload["t2HasSequenceFile"] is False
+    assert payload["uncertain2"] is True, (
+        "a transient .sequence WRITE failure must propagate into "
+        "sequence_uncertain, not just a failed root scan"
+    )
+    assert payload["survivorCount"] == 2, (
+        "retention pruned down to quota=1 despite the write failure - "
+        "it could have evicted the newer generation and kept the older one"
+    )
+    assert payload["g1Name"] in payload["survivors"]
+    assert payload["g2Name"] in payload["survivors"]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
 def test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker(
     tmp_path: Path,
