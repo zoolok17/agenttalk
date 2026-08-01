@@ -7264,14 +7264,46 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
       foreach ($existing in @(
         Get-ChildItem -LiteralPath $scanAgentDir -Directory -ErrorAction Stop
       )) {
+        $committed = Test-Path -LiteralPath (Join-Path $existing.FullName '.committed')
         $seqFile = Join-Path $existing.FullName '.sequence'
-        if (-not (Test-Path -LiteralPath $seqFile)) { continue }
+        if (-not (Test-Path -LiteralPath $seqFile)) {
+          # #139-family, round 13: a COMMITTED generation with no
+          # .sequence file is exactly the write-failure gap round 12
+          # fixed - but that fix's sequence_uncertain lives only on the
+          # ONE launch that hit it, never persisted. Without this check
+          # the NEXT launch's scan silently skips this generation, reuses
+          # the sequence number it never recorded, and retention's sort
+          # key ranks it below every sequence-bearing entry even though
+          # it may be the newest generation on disk. A non-committed
+          # (pending/orphaned) generation is not in retention's ranked
+          # set at all (Complete-WrapperLogTargets excludes it), so it
+          # does not need to propagate uncertainty here.
+          #
+          # But "no .sequence file" is ALSO the permanent, by-design shape
+          # of a pre-upgrade legacy generation that never wrote one at
+          # all (see the name-fallback sortKey comment in
+          # Complete-WrapperLogTargets) - those must keep tolerating
+          # pruning forever, exactly as before, or a fleet with any
+          # legacy history would never prune again. The two are
+          # indistinguishable by absence alone, so a genuine write
+          # failure also drops an explicit .sequence-failed marker (see
+          # New-WrapperLogTargets) - only THAT combination propagates
+          # uncertainty; a bare missing .sequence with no failure marker
+          # is the legacy case and stays exactly as tolerant as before.
+          if ($committed -and (Test-Path -LiteralPath (Join-Path $existing.FullName '.sequence-failed'))) {
+            $uncertain = $true
+          }
+          continue
+        }
         try {
           $existingSeq = [int64]([IO.File]::ReadAllText($seqFile).Trim())
           if ($existingSeq -gt $seq) { $seq = $existingSeq }
         } catch {
           # Corrupt/unreadable record does not veto this generation's own
-          # sequence; it just cannot contribute to the max.
+          # sequence contribution to the max, but for a COMMITTED
+          # generation it is the same uncertainty class as a missing
+          # record - propagate it the same way.
+          if ($committed) { $uncertain = $true }
         }
       }
     } catch {
@@ -7370,6 +7402,22 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
         Write-Warning (
           "supervisor: cannot record wrapper log launch sequence under '{0}' ({1})" -f
           $agentDir, $_.Exception.Message)
+        # Round 13: an explicit marker, not just the absence of .sequence -
+        # a bare missing .sequence file is ALSO the permanent, by-design
+        # shape of a pre-upgrade legacy generation that never wrote one at
+        # all, and that case must keep tolerating pruning forever (see the
+        # matching comment in Get-NextWrapperLogSequence). Best-effort:
+        # this marker existing is a nice-to-have signal, not itself a
+        # durability guarantee this generation depends on.
+        try {
+          [IO.File]::WriteAllText(
+            (Join-Path $attempt '.sequence-failed'), '',
+            (New-Object Text.UTF8Encoding($false))
+          )
+        } catch {
+          # Best-effort only - if even this fails, the generation falls
+          # back to the legacy-tolerant "missing .sequence" treatment.
+        }
       }
       $generationDir = $attempt
       break
