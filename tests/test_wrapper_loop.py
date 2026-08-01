@@ -1466,6 +1466,40 @@ def test_procstream_constructor_write_error_closes_pipes_and_child(monkeypatch) 
     assert proc.wait_calls == [10.0]
 
 
+def test_procstream_constructor_error_reaps_child_before_exit_observer_join(
+    monkeypatch,
+) -> None:
+    created = _patch_procstream_popen_write_error(monkeypatch)
+    observer_joins: list[int | None] = []
+
+    class _Observer:
+        def __init__(self, proc: _TrackedPopen) -> None:
+            self._proc = proc
+
+        def join(self, timeout=None) -> None:
+            assert timeout == 10.0
+            observer_joins.append(self._proc.poll())
+
+    monkeypatch.setattr(
+        run,
+        "_start_windows_launcher_exit_observer",
+        lambda proc, _start, **_kwargs: _Observer(proc),
+    )
+
+    with pytest.raises(OSError):
+        run._ProcStream(
+            ["codex"],
+            "prompt",
+            on_spawn=lambda _pid, _start: {"turn_generation": 1},
+            on_launcher_exit=lambda *_args, **_kwargs: None,
+        )
+
+    proc = created[0]
+    assert proc.terminated is True
+    assert proc.wait_calls == [10.0]
+    assert observer_joins == [-15]
+
+
 def test_procstream_success_closes_stdout_once(monkeypatch) -> None:
     lines = _codex_turn_lines()
     created: list[_TrackedPopen] = []

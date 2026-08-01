@@ -57,7 +57,7 @@ def _bound_idle_runtime(store: Store, *, now_epoch: float = NOW) -> tuple[dict, 
     wrapper_pid = 555
     wrapper_start = _iso(now_epoch - 100)
     nonce = "A" * 32
-    wrt.WrapperRuntimeWriter(
+    runtime = wrt.WrapperRuntimeWriter(
         store.state_dir,
         "beta",
         "health-test-wrapper",
@@ -71,6 +71,7 @@ def _bound_idle_runtime(store: Store, *, now_epoch: float = NOW) -> tuple[dict, 
         launcher_nonce=nonce,
         launcher_nonce_injected=True,
         launcher_nonce_source="agenttalk_global_arg",
+        runtime_wrapper_generation=runtime["wrapper_generation"],
     )
     snapshot = [{
         "pid": wrapper_pid,
@@ -82,6 +83,9 @@ def _bound_idle_runtime(store: Store, *, now_epoch: float = NOW) -> tuple[dict, 
             f"--root {store.root} wrap --for beta --cli claude --loop"
         ),
         "start_time": wrapper_start,
+        "start_filetime": str(
+            int((now_epoch - 100 + 11_644_473_600) * 10_000_000)
+        ),
     }]
     return state, snapshot
 

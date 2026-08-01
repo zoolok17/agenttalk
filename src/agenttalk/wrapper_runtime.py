@@ -25,7 +25,8 @@ from typing import Callable
 
 from agenttalk.store import validate_agent_name
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 MAX_RECORD_BYTES = 16 * 1024
 # The generated supervisor captures integer ``--now`` before starting Python,
 # while the wrapper can publish concurrently.  Bound that observation race
@@ -73,10 +74,19 @@ RECORD_KEYS = frozenset({
     "message_id",
     "cli_launcher_pid",
     "cli_launcher_start",
+    "cli_launcher_lifetime",
     "progress_sequence",
     "last_progress_at",
     "last_outcome",
     "updated_at",
+})
+
+LEGACY_RECORD_KEYS = RECORD_KEYS - {"cli_launcher_lifetime"}
+LAUNCHER_LIFETIME_SOURCE = "windows_get_process_times_v1"
+_LAUNCHER_LIFETIME_KEYS = frozenset({
+    "source",
+    "creation_filetime",
+    "exit_filetime",
 })
 
 _SAFE_GENERATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -143,6 +153,41 @@ def _positive_pid(value: object, *, field: str, optional: bool = False) -> int |
     return value
 
 
+def _filetime(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[1-9][0-9]{0,19}", value) is None
+    ):
+        raise RuntimeRecordError(f"{field} must be positive decimal FILETIME ticks")
+    return value
+
+
+def _launcher_lifetime(value: object) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or frozenset(value) != _LAUNCHER_LIFETIME_KEYS:
+        raise RuntimeRecordError("cli_launcher_lifetime is malformed")
+    if value.get("source") != LAUNCHER_LIFETIME_SOURCE:
+        raise RuntimeRecordError("cli_launcher_lifetime source is invalid")
+    creation = _filetime(
+        value.get("creation_filetime"),
+        field="cli_launcher_lifetime.creation_filetime",
+    )
+    exit_time = _filetime(
+        value.get("exit_filetime"),
+        field="cli_launcher_lifetime.exit_filetime",
+    )
+    if int(exit_time) <= int(creation):
+        raise RuntimeRecordError(
+            "cli_launcher_lifetime exit must be after creation"
+        )
+    return {
+        "source": LAUNCHER_LIFETIME_SOURCE,
+        "creation_filetime": creation,
+        "exit_filetime": exit_time,
+    }
+
+
 def runtime_path(state_dir: str | os.PathLike[str], agent: str) -> Path:
     try:
         return (
@@ -162,8 +207,23 @@ def validate_record(
     """Return a normalized copy or raise :class:`RuntimeRecordError`."""
     if not isinstance(raw, dict):
         raise RuntimeRecordError("record must be an object")
-    unknown = set(raw) - RECORD_KEYS
-    missing = RECORD_KEYS - set(raw)
+    schema_version = raw.get("schema_version")
+    if (
+        isinstance(schema_version, int)
+        and not isinstance(schema_version, bool)
+        and schema_version == SCHEMA_VERSION
+    ):
+        expected_keys = RECORD_KEYS
+    elif (
+        isinstance(schema_version, int)
+        and not isinstance(schema_version, bool)
+        and schema_version == LEGACY_SCHEMA_VERSION
+    ):
+        expected_keys = LEGACY_RECORD_KEYS
+    else:
+        raise RuntimeRecordError("unsupported schema_version")
+    unknown = set(raw) - expected_keys
+    missing = expected_keys - set(raw)
     if unknown:
         raise RuntimeRecordError(
             "record has unknown keys: " + ", ".join(sorted(unknown))
@@ -172,8 +232,6 @@ def validate_record(
         raise RuntimeRecordError(
             "record is missing keys: " + ", ".join(sorted(missing))
         )
-    if raw.get("schema_version") != SCHEMA_VERSION:
-        raise RuntimeRecordError("unsupported schema_version")
 
     try:
         agent = validate_agent_name(raw.get("agent"))
@@ -193,6 +251,10 @@ def validate_record(
         raise RuntimeRecordError("phase is invalid")
 
     normalized = {
+        # Canonicalize accepted legacy input to the current public shape.  The
+        # supervisor defensively validates the already-normalized read view a
+        # second time, so returning a v1 marker alongside the v2-only nullable
+        # field would make validation non-idempotent.
         "schema_version": SCHEMA_VERSION,
         "agent": agent,
         "wrapper_pid": _positive_pid(raw.get("wrapper_pid"), field="wrapper_pid"),
@@ -213,6 +275,11 @@ def validate_record(
         ),
         "cli_launcher_start": _safe_optional_text(
             raw.get("cli_launcher_start"), field="cli_launcher_start"
+        ),
+        "cli_launcher_lifetime": (
+            None
+            if schema_version == LEGACY_SCHEMA_VERSION
+            else _launcher_lifetime(raw.get("cli_launcher_lifetime"))
         ),
         "progress_sequence": _nonnegative_int(
             raw.get("progress_sequence"), field="progress_sequence"
@@ -254,6 +321,7 @@ def validate_record(
                 "message_id",
                 "cli_launcher_pid",
                 "cli_launcher_start",
+                "cli_launcher_lifetime",
             )
         ):
             raise RuntimeRecordError("idle phase carries active-turn fields")
@@ -264,6 +332,7 @@ def validate_record(
         if (
             normalized["cli_launcher_pid"] is not None
             or normalized["cli_launcher_start"] is not None
+            or normalized["cli_launcher_lifetime"] is not None
             or normalized["last_outcome"] is not None
             or normalized["last_progress_at"] is not None
         ):
@@ -473,6 +542,7 @@ class WrapperRuntimeWriter:
         self._message_id: str | None = None
         self._launcher_pid: int | None = None
         self._launcher_start: str | None = None
+        self._launcher_lifetime: dict | None = None
         self._last_progress_at: str | None = None
         self._last_progress_write_epoch: float | None = None
         self._last_outcome: str | None = None
@@ -491,6 +561,11 @@ class WrapperRuntimeWriter:
             "message_id": self._message_id,
             "cli_launcher_pid": self._launcher_pid,
             "cli_launcher_start": self._launcher_start,
+            "cli_launcher_lifetime": (
+                None
+                if self._launcher_lifetime is None
+                else dict(self._launcher_lifetime)
+            ),
             "progress_sequence": self._progress_sequence,
             "last_progress_at": self._last_progress_at,
             "last_outcome": self._last_outcome,
@@ -511,6 +586,7 @@ class WrapperRuntimeWriter:
             self._message_id = None
             self._launcher_pid = None
             self._launcher_start = None
+            self._launcher_lifetime = None
             return self._write(now)
 
     def starting(
@@ -527,6 +603,7 @@ class WrapperRuntimeWriter:
             self._message_id = _safe_optional_text(message_id, field="message_id")
             self._launcher_pid = None
             self._launcher_start = None
+            self._launcher_lifetime = None
             self._last_progress_at = None
             self._last_progress_write_epoch = None
             self._last_outcome = None
@@ -551,8 +628,49 @@ class WrapperRuntimeWriter:
                 _safe_optional_text(start, field="cli_launcher_start")
             self._launcher_pid = launcher_pid
             self._launcher_start = start
+            self._launcher_lifetime = None
             self._phase = PHASE_ACTIVE
             return self._write(float(self._clock()))
+
+    def launcher_exited(
+        self,
+        launcher_pid: int,
+        launcher_start: str | None,
+        creation_filetime: str,
+        exit_filetime: str,
+        *,
+        turn_generation: int,
+    ) -> dict | None:
+        """Publish one exact, generation-fenced launcher-exit certificate.
+
+        A daemon process-handle observer may finish after the turn advances.
+        Such a late result must never overwrite the next turn or a terminal
+        disposition, so every ownership coordinate is rechecked under the
+        writer lock before the durable write.
+        """
+        with self._lock:
+            if (
+                self._phase != PHASE_ACTIVE
+                or self._turn_generation != turn_generation
+                or self._launcher_pid != launcher_pid
+                or self._launcher_start != launcher_start
+            ):
+                return None
+            _positive_pid(launcher_pid, field="cli_launcher_pid")
+            lifetime = _launcher_lifetime({
+                "source": LAUNCHER_LIFETIME_SOURCE,
+                "creation_filetime": creation_filetime,
+                "exit_filetime": exit_filetime,
+            })
+            if self._launcher_lifetime is not None:
+                if self._launcher_lifetime != lifetime:
+                    raise RuntimeRecordError(
+                        "cli_launcher_lifetime cannot change within one turn"
+                    )
+                return self._record(float(self._clock()))
+            self._launcher_lifetime = lifetime
+            now = float(self._clock())
+            return self._write(now)
 
     def progress(self) -> dict:
         with self._lock:

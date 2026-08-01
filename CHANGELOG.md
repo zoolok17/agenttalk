@@ -48,6 +48,47 @@ design. The item that did ship is the one measured to cost the most in the field
 
 ### Fixed
 
+- **Wrapped supervisor recovery now requires a bounded, identity-verified owned
+  process tree.** Each poll records at most 64 parent-linked identities with
+  explicit wrapper, launcher, brain, and tool-descendant roles. Ownership is
+  anchored by matching supervisor state, wrapper-runtime generation, live
+  pid/start identity, and a launch nonce re-read from the live wrapper command
+  line; process names never authorize teardown. Windows launcher handoff uses a
+  nullable, generation-fenced `GetProcessTimes` lifetime certificate; when that
+  certificate is present, an exited launcher's first child must carry an exact
+  FILETIME strictly inside the launcher's creation/exit interval. Authoritative
+  `complete`/`absent` Windows tree entries require an exact `start_filetime`;
+  `invalid`/`truncated` HOLD entries may retain null as readable failure
+  evidence, but null grants no identity authority. Linux boot-ID/start-ticks
+  tokens are exact without FILETIME. A missing current FILETIME is ambiguous
+  when the prior identity recorded one. A prior complete tree can bridge an
+  exited intermediate process only for the same generation and nonce, with the
+  exact previously recorded child identity and parent edge; a new or reparented
+  child fails closed. A complete tree feeds the existing leaves-first `Stop-Tree`.
+  An invalid or truncated tree takes precedence over restart markers and
+  child-liveness verdicts, grants no automatic kill authority, and creates a
+  durable, nondismissible supervisor HOLD in `agenttalk attention` and the
+  dashboard. Invalid/truncated evidence stays sticky until an operator stops the
+  supervisor and owned processes, proves the recorded identities gone or
+  recycled, and runs the hash/nonce-bound attended ownership reset. That reset
+  atomically retires only the exact old runtime record by digest plus
+  PID/start/generation/nonce, so its unchanged sidecar cannot recreate the HOLD
+  while a genuinely new record still follows normal adoption; the next launch
+  must earn a new wrapper generation and tree. An all-gone snapshot
+  preserves an `absent` identity certificate with no kill authority; unreadable
+  start identity, missing exact FILETIME where prior proof requires one, or a
+  child spawned after planning blocks the post-kill launch barrier. Legacy
+  wrapped `managed_pids`, launcher, and brain identities remain bounded
+  migration evidence until that attended boundary, rather than being silently
+  discarded. One-shot ephemeral reviewers use the same checked tree and persist
+  it before teardown; their legacy command-line/name kill path has been removed.
+  The closed taxonomy also reserves `detached_gate_runner` for a future,
+  bounded gate job registered by its exact PID/start plus the owning wrapper's
+  generation and launch nonce. Current discovery never infers that role from a
+  name or command line, and the label alone grants no authority. Detached
+  execution, watchdog exclusion, and mandatory SHA-bound terminal evidence,
+  including timeout and kill results, remain the separate #121 implementation.
+
 - **Coverage evidence now preserves the zero-runtime-dependency boundary without taking
   custody of report files.** Attestation accepts only a recognized coverage.py/pytest-cov
   terminal summary from stdout; it no longer parses root JSON or XML reports. A scan

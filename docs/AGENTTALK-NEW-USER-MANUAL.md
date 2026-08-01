@@ -519,6 +519,46 @@ After an upgrade, stop the supervisor, wait for its process to exit, and run
 byte-for-byte and does not touch runtime state. A partial four-file replacement
 is detectable and safely rerunnable; the set is not group-atomic.
 
+The owned-tree upgrade is an attended boundary for wrappers that predate the
+strict record. Do not rely on a normal poll to migrate old `managed_pids`: the
+old traversal could have missed a reparented shell/tool branch. Unprovable
+legacy evidence appears as a nondismissible `process_tree_hold` in
+`agenttalk attention` and the dashboard.
+
+To clear that HOLD safely:
+
+1. Leave `.agenttalk/supervisor.kill` present, stop the supervisor, and confirm
+   its strict instance marker is absent.
+2. Copy the current Attention item's `source_hash` and launch nonce. Inventory
+   the complete old tree. Before stopping the wrapper, re-read
+   `--supervisor-launch-nonce` from its live command line and verify it matches
+   the recorded nonce; after teardown, verify every recorded PID/start is gone
+   or definitely recycled. If the wrapper is no longer live enough to re-read
+   its nonce, use manual repair instead of this reset.
+3. As the operator-facing liaison (or sole lead), run:
+
+```powershell
+agenttalk supervise --reset-process-tree-ownership --from <liaison> `
+  --for <agent> --hold-source-hash <64hex> `
+  --verified-launch-nonce <verified-launch-nonce> `
+  --acknowledge-no-live-supervisor `
+  --acknowledge-owned-processes-stopped `
+  --reason "attended owned-tree migration"
+```
+
+The command refuses stale hashes, missing or mismatched nonces, an invalid or
+mismatched strict runtime wrapper identity/generation, live or unverifiable
+recorded identities, or an unauthorized actor. It never kills or launches; it
+only revokes stale evidence and records the attended boundary. That atomic
+boundary retires the exact old runtime digest and PID/start/generation/nonce;
+the unchanged sidecar cannot recreate the HOLD, while a changed or
+new-generation runtime still fails closed through normal adoption. If the HOLD
+has no nonce/reset evidence, manual repair is required. Refresh and validate
+the generated scripts only after removing `supervisor.kill` while the
+supervisor host remains stopped (`--refresh-scripts` refuses under the kill
+switch). Queue a restart, then resume the supervisor so the new wrapper
+generation earns a fresh tree.
+
 Recommended wrapped launch shape:
 
 ```powershell
@@ -534,8 +574,11 @@ wrapper idle wait or child progress
 
 heartbeat stale and agent is instrumented
         -> supervisor plans stuck recovery or manual restart
-        -> old process tree is killed best-effort
-        -> launch barrier refuses duplicates if a same-agent wrapper survived
+        -> strict bounded owned tree is revalidated
+        -> complete tree is killed leaves-first with PID/start guards
+        -> all-gone proof persists an absent certificate with no kill authority
+        -> invalid/truncated tree becomes a nondismissible Attention HOLD
+        -> launch barrier refuses exact, ambiguous, or newly spawned descendants
         -> wrapper reloads session state and re-enters the loop
 
 valid message repeatedly poisons the wrapper
@@ -876,8 +919,11 @@ heartbeat freshness. Wrapped listeners also publish a strict turn-lifecycle
 record: only validated `idle` is `HEALTHY_IDLE`, while active work requires a
 live discovered CLI brain and real adapter progress. Missing, malformed, or
 ambiguous runtime evidence is `CLI_CHILD_UNKNOWN` and never automatic kill
-authority. After upgrading generated supervisor artifacts, restart existing
-wrappers so they publish the record:
+authority when no owned-tree HOLD applies. An invalid or truncated owned tree
+is checked first, reports `PROCESS_TREE_INVALID` or
+`PROCESS_TREE_TRUNCATED`, and leaves a restart marker unconsumed. After
+upgrading generated supervisor artifacts, use the attended sequence above so
+wrappers publish the record:
 
 ```powershell
 agenttalk supervise --refresh-scripts
