@@ -754,6 +754,65 @@ def test_stream_environment_context_restores_process_streams(
     assert os.environ[wrapper_logs.ENV_STDOUT_PATH] == str(out_path)
 
 
+def test_stream_environment_confirms_the_generation_from_inside_the_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 23: replaces the round-19/20/21 predictive probe entirely - the
+    supervisor no longer forecasts whether a launch will reach cmd_wrap, it
+    waits for THIS wrapper process to say so by evidence. Simulates the
+    supervisor's own .pending marker (New-WrapperLogPendingMarker) to prove
+    the wrapper transitions it to .committed itself, at the point
+    authentication has already succeeded and both tees are live - not
+    merely that the marker exists at some point after the fact."""
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / ".pending").write_bytes(b"")
+    out_path = generation / "stdout.log"
+    err_path = generation / "stderr.log"
+    nonce = "a" * 32
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+
+    with wrapper_logs.installed_standard_streams_from_environment(
+        expected_nonce=nonce,
+    ):
+        # Confirmed WHILE still inside the context - proving this happens
+        # at stream-install time, not merely "eventually, somehow".
+        assert (generation / ".committed").exists()
+        assert not (generation / ".pending").exists()
+
+    assert (generation / ".committed").exists()
+
+
+def test_stream_environment_without_a_matching_nonce_never_touches_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch that never authenticates never installs streams at all -
+    it must not confirm a generation it was never actually authorized to
+    write into either."""
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / ".pending").write_bytes(b"")
+    out_path = generation / "stdout.log"
+    err_path = generation / "stderr.log"
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, "a" * 32)
+
+    with wrapper_logs.installed_standard_streams_from_environment(
+        expected_nonce="b" * 32,
+    ):
+        pass
+
+    assert not (generation / ".committed").exists()
+    assert (generation / ".pending").exists()
+
+
 def test_cmd_wrap_records_setup_exception_before_loop_exists(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

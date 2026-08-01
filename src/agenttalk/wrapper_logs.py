@@ -563,6 +563,15 @@ def installed_standard_streams_from_environment(
     sys.stdout = stdout
     sys.stderr = stderr
     _LAST_STDERR_LOG_CONFIG = (stderr_path, max_bytes, segment_count)
+    # Round 23: this is the ONE moment that proves - by evidence, not by a
+    # pre-launch guess - that this launch actually reaches cmd_wrap and
+    # installs its streams: authentication has already succeeded and both
+    # tees are live. Confirm the generation directly from here, the same
+    # way the supervisor used to (write .committed, drop .pending), so the
+    # supervisor's commit decision is now the wrapper's own report instead
+    # of a prediction about argv grammar, quoting, cwd, interpreter, or
+    # timing it can never fully replicate.
+    _confirm_wrapper_log_generation(Path(stderr_path).parent)
     try:
         yield
     finally:
@@ -570,6 +579,21 @@ def installed_standard_streams_from_environment(
         sys.stderr = original_stderr
         stdout.close()
         stderr.close()
+
+
+def _confirm_wrapper_log_generation(generation_dir: Path) -> None:
+    """Mark a wrapper log generation committed from INSIDE the wrapper
+    process itself, mirroring supervisor.py's own .pending/.committed
+    marker pair (New-WrapperLogPendingMarker / the marker half of what was
+    Complete-WrapperLogTargets) - best-effort: a failure here must not
+    crash a wrapper that otherwise started fine, it just leaves the
+    generation looking unresolved, which the supervisor's retention rule
+    already treats as "preserve, never evict" rather than "safe to prune"."""
+    try:
+        (generation_dir / ".committed").write_bytes(b"")
+        (generation_dir / ".pending").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def print_bounded_uncaught_exception() -> None:

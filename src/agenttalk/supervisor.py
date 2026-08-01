@@ -9599,100 +9599,6 @@ function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFro
   }
   return $false
 }
-function Test-AgenttalkWrapArgvReachesCmdWrap($probePython, $root, $srcOnPyPath, $file, $argv, $moduleArgsFrom = $null, $cwd = $null, $timeoutMs = 5000) {
-  # Round 19: knowing the tail's first token is literally 'wrap'
-  # (Test-AgenttalkWrapInvocation) proves the subcommand name, not that
-  # agenttalk's OWN argparse ever actually reaches cmd_wrap with it -
-  # `wrap --help`/`wrap -h`/any parse-invalid wrap tail (an unrecognized
-  # flag, a value-taking flag with none) all call sys.exit from inside
-  # argparse BEFORE cmd_wrap installs the bounded streams, exactly like
-  # `wrap` does not, and this call site had no way to tell those apart.
-  #
-  # Same disease as the interpreter layer (which tokens mean CPython never
-  # reaches -m agenttalk), one parser over - but a different remedy: that
-  # layer had no way to ask CPython directly, so the interpreter-prefix
-  # allowlist above is a deliberate, maintained model of its grammar.
-  # agenttalk's own parser is this project's code and can be asked
-  # directly instead of modeled a third time (module_args_from's own
-  # comment: two hand-modeled attempts at CPython's grammar already
-  # leaked this week) - so this delegates to a real `agenttalk
-  # _internal-check-wrap-dispatch` probe rather than re-deriving
-  # argparse's nargs=REMAINDER/help/error-exit behavior here.
-  $args = @($argv)
-  $index = Resolve-AgenttalkOwnArgvIndex $file $args $moduleArgsFrom
-  if ($index -lt 0) { return $false }
-  $tail = if ($index -lt $args.Count) { @($args[$index..($args.Count - 1)]) } else { @() }
-  if (-not $probePython) { return $false }
-  # Round 21 (connector finding): this probe is OBSERVATIONAL - it decides
-  # only whether to log, never whether to launch - and ran synchronously
-  # with no bound inside Launch/Launch-Spec, both called from the
-  # supervisor's SINGLE polling loop. A hanging interpreter startup (a
-  # stalled sitecustomize, a wedged filesystem) would stall the entire
-  # fleet's supervisor over a decision that was only ever meant to avoid
-  # committing an empty log generation - strictly worse than the defect it
-  # fixed. Run it as its own process with a hard wall-clock bound instead
-  # of the call operator's unbounded, synchronous wait; a probe that
-  # cannot answer in time is killed and treated as NOT reaching cmd_wrap -
-  # the same fail-toward-not-logging direction as every other resolution
-  # failure in this function (an unresolvable prefix, an unrunnable
-  # interpreter), never fail-toward-waiting.
-  $savedPP = $env:PYTHONPATH
-  if ($srcOnPyPath) { $env:PYTHONPATH = (Join-Path $root 'src') + ';' + $env:PYTHONPATH }
-  $proc = $null
-  # Start-Process refuses two -Redirect* parameters pointed at the SAME
-  # path (even a device name like NUL) - two distinct throwaway files, one
-  # each, discarded in the finally below regardless of outcome.
-  $outFile = [System.IO.Path]::GetTempFileName()
-  $errFile = [System.IO.Path]::GetTempFileName()
-  try {
-    # Round 22 (connector finding): a probe that predicts a launch is only
-    # worth what its fidelity is worth. -ArgumentList given an ARRAY joins
-    # the elements with a bare space and re-parses that as one command
-    # line - the original argument boundaries are lost the moment any
-    # wrapper argument (most commonly the project root) contains a space.
-    # The real launch already solved this (Quote-Arg + a single joined
-    # string, passed verbatim to Start-Process) - reuse it rather than
-    # re-deriving argument passing a second time, or this probe answers a
-    # question about a DIFFERENT command line than the one that actually
-    # runs. Environment and stdin were checked too: build_parser()'s own
-    # construction reads no environment variable (only PYTHONPATH, for
-    # import resolution, already handled above) and this probe subcommand
-    # never reads stdin, so neither needs replicating - but the working
-    # directory does, since `-m` prepends the CURRENT directory to
-    # sys.path, and a probe run from a different cwd than the real launch
-    # could resolve a different `agenttalk` if one happened to shadow it.
-    $probeArgv = @('-m', 'agenttalk', '_internal-check-wrap-dispatch', '--') + $tail
-    $argline = (@($probeArgv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
-    $workingDirectory = if ($cwd) { $cwd } elseif ($root) { $root } else { $null }
-    $startArgs = @{
-      FilePath = $probePython
-      ArgumentList = $argline
-      PassThru = $true
-      WindowStyle = 'Hidden'
-      RedirectStandardOutput = $outFile
-      RedirectStandardError = $errFile
-    }
-    # Only set -WorkingDirectory when one is actually known - passing $null
-    # explicitly is itself a Start-Process error, not "use the default".
-    if ($workingDirectory) { $startArgs['WorkingDirectory'] = $workingDirectory }
-    $proc = Start-Process @startArgs
-    if (-not $proc.WaitForExit($timeoutMs)) {
-      return $false
-    }
-    return $proc.ExitCode -eq 0
-  } catch {
-    # A probe that cannot even run (bad interpreter path, etc.) proves
-    # nothing about whether cmd_wrap is reachable - fail closed rather than
-    # grant the logging capability on an unconfirmed guess.
-    return $false
-  } finally {
-    if ($proc -and -not $proc.HasExited) {
-      try { Stop-Process -InputObject $proc -Force -ErrorAction SilentlyContinue } catch {}
-    }
-    Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
-    if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
-  }
-}
 function Preflight($name, $plan, $file, $codexHome) {
   # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
   # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
@@ -10097,9 +10003,10 @@ namespace Agenttalk {
 }
 function Start-WrapperProcess([hashtable]$startArgs) {
   # Returns [pscustomobject]@{ Process = <process>; Redirected = <bool> } -
-  # NEVER the bare process object. I1: logging capability (the env vars,
-  # the nonce, AND the caller's eventual Complete-WrapperLogTargets call)
-  # is granted if and only if the child's output is ACTUALLY redirected.
+  # NEVER the bare process object. I1: logging capability (the env vars
+  # and the nonce - a wrapper that never actually got redirected has no
+  # channel to confirm anything through) is granted if and only if the
+  # child's output is ACTUALLY redirected.
   # This is the ONE place that knows the true outcome; every caller must
   # use .Redirected rather than inferring it from a PID alone.
   $redirected = (
@@ -10373,13 +10280,13 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
           # key ranks it below every sequence-bearing entry even though
           # it may be the newest generation on disk. A non-committed
           # (pending/orphaned) generation is not in retention's ranked
-          # set at all (Complete-WrapperLogTargets excludes it), so it
+          # set at all (Invoke-WrapperLogRetentionPrune excludes it), so it
           # does not need to propagate uncertainty here.
           #
           # But "no .sequence file" is ALSO the permanent, by-design shape
           # of a pre-upgrade legacy generation that never wrote one at
           # all (see the name-fallback sortKey comment in
-          # Complete-WrapperLogTargets) - those must keep tolerating
+          # Invoke-WrapperLogRetentionPrune) - those must keep tolerating
           # pruning forever, exactly as before, or a fleet with any
           # legacy history would never prune again. The two are
           # indistinguishable by absence alone, so a genuine write
@@ -10496,7 +10403,7 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
         try {
           Write-WrapperLogSequenceFile (Join-Path $attempt '.sequence') $seq
         } catch {
-          # #139-family: Complete-WrapperLogTargets' retention sort ranks a
+          # #139-family: Invoke-WrapperLogRetentionPrune's retention sort ranks a
           # missing-.sequence generation BELOW every sequence-bearing one,
           # regardless of actual launch order (sortKey '0-name' vs
           # '1-sequence') - a transient failure HERE must propagate into
@@ -10533,7 +10440,7 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
         # marker, and retention preserves EVERY markerless directory forever
         # because it cannot tell an orphan from a genuinely interrupted launch.
         # Best-effort delete it now, while this attempt is still reachable -
-        # Complete-WrapperLogTargets is never even told about a candidate this
+        # Invoke-WrapperLogRetentionPrune is never even told about a candidate this
         # loop abandoned, so nothing downstream can ever clean it up otherwise.
         if ($attempt -and (Test-Path -LiteralPath $attempt)) {
           Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
@@ -10552,6 +10459,8 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
     return $null
   }
 
+  Invoke-WrapperLogRetentionPrune $name $roots ($seqResult.uncertain -or $sequenceWriteFailed)
+
   return [pscustomobject]@{
     stdout = Join-Path $generationDir 'stdout.log'
     stderr = Join-Path $generationDir 'stderr.log'
@@ -10560,34 +10469,38 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
     sequence_uncertain = ($seqResult.uncertain -or $sequenceWriteFailed)
   }
 }
-function Complete-WrapperLogTargets($targets) {
-  if ($null -eq $targets) { return }
-  $generationDir = [IO.Path]::GetFullPath([string]$targets.generation_dir)
-  try {
-    [IO.File]::WriteAllText(
-      (Join-Path $generationDir '.committed'),
-      '',
-      (New-Object Text.UTF8Encoding($false))
-    )
-    Remove-Item -LiteralPath (Join-Path $generationDir '.pending') -Force `
-      -ErrorAction SilentlyContinue
-  } catch {
-    # Without a committed marker a later failed launch must not evict prior
-    # evidence. Keep both the new process and all prior generations.
-    Write-Warning (
-      "supervisor: cannot commit wrapper log generation '{0}' ({1}); skipping prune" -f
-      $generationDir, $_.Exception.Message)
-    return
-  }
-  $name = [string]$targets.agent_name
-  $roots = @($WrapperLogRoot, $WrapperLogFallbackRoot) |
-    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
-    Select-Object -Unique
-
-  # Retention is one per-agent budget across the persistent and fallback roots.
-  # Cleanup is deliberately restricted to exact owned names and never traverses
-  # a reparse point. Deletion failure can exceed the quota until the filesystem
-  # problem is resolved, but it never blocks the recovery launch.
+function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]$sequenceUncertain) {
+  # Round 23: this used to run synchronously right after Complete-
+  # WrapperLogTargets marked ONE specific generation committed - now that
+  # the WRAPPER PROCESS marks its own generation committed (see
+  # installed_standard_streams_from_environment), the supervisor has no
+  # single post-launch moment to hang pruning off of. Called instead from
+  # New-WrapperLogTargets, right after a new generation has been
+  # successfully created (preserving the original ordering rationale:
+  # never prune old evidence before proving a new destination actually
+  # accepted a write, so a persistent-root failure that falls back to a
+  # secondary root never loses evidence for nothing).
+  #
+  # Keeps the newest $WrapperLogGenerations ALREADY-COMMITTED generations -
+  # NOT ($WrapperLogGenerations - 1) reserving a slot for the one just
+  # created. That reservation was tried first and was wrong: the new
+  # generation's fate is not yet known here (still .pending; it may never
+  # be confirmed at all - a launch that never reaches cmd_wrap, or one the
+  # caller discards outright), so budgeting for it as if it were certain
+  # evicted real, already-proven evidence for a guess that did not pay
+  # off. Only evicting once the ALREADY-CONFIRMED count genuinely exceeds
+  # quota means a run of launches that all happen to confirm can leave one
+  # MORE than quota on disk for one extra cycle (the next launch's own
+  # prune brings it back down) - a bounded, self-correcting overshoot of
+  # at most one, which is the honest cost of not being able to synchronously
+  # observe the wrapper's own confirmation from here. That is a strictly
+  # better trade than evicting proven evidence on an unconfirmed guess.
+  #
+  # Retention is one per-agent budget across the persistent and fallback
+  # roots. Cleanup is deliberately restricted to exact owned names and
+  # never traverses a reparse point. Deletion failure can exceed the
+  # quota until the filesystem problem is resolved, but it never blocks
+  # the recovery launch.
   $owned = @()
   foreach ($candidate in $roots) {
     $agentDir = Get-SafeWrapperLogAgentDir $candidate $name $false
@@ -10607,11 +10520,15 @@ function Complete-WrapperLogTargets($targets) {
         }
         $committed = Test-Path -LiteralPath (Join-Path $old.FullName '.committed')
         if (-not $committed) {
-          # A crash or filesystem failure can leave either a pending generation
-          # or markerless debris. Neither proves that CreateProcess returned.
+          # A crash, a launch that never reached cmd_wrap (wrap --help, a
+          # parse-invalid tail), or a filesystem failure can all leave a
+          # pending or markerless directory behind. None of those prove
+          # the wrapper ever authenticated and installed its streams.
           # Preserve it, but never let it consume a retained slot or evict
-          # proven evidence. Only the synchronous caught-failure path may
-          # delete a pending generation.
+          # proven evidence - #139 tracks bounding this class separately
+          # (a dead-and-never-committed generation should eventually be
+          # pruned too, once its owning process is confirmed gone, not
+          # kept forever; this scheme raises how often that gap is hit).
           Write-Warning (
             "supervisor: preserving unresolved wrapper log generation '{0}'" -f
             $old.FullName)
@@ -10644,7 +10561,7 @@ function Complete-WrapperLogTargets($targets) {
     }
   }
 
-  if ([bool]$targets.sequence_uncertain) {
+  if ($sequenceUncertain) {
     # I3: refusing to prune under an unreliable ordering must be BOUNDED - a
     # persistently (not just transiently) unscannable root must not let
     # generations for this agent accumulate forever. Skip pruning while the
@@ -10658,37 +10575,28 @@ function Complete-WrapperLogTargets($targets) {
       Write-Warning (
         ("supervisor: wrapper log launch sequence is unreliable for '{0}' " +
          "(a configured root could not be scanned); skipping prune this cycle") -f
-        $generationDir)
+        $name)
       return
     }
     Write-Warning (
       ("supervisor: wrapper log launch sequence remains unreliable for '{0}' " +
        "but the generation count ({1}) exceeds the safety bound ({2}); " +
        "pruning anyway rather than accumulating indefinitely") -f
-      $generationDir, $owned.Count, $uncertainBound)
+      $name, $owned.Count, $uncertainBound)
   }
 
-  $keep = @($generationDir)
-  $keepPrior = [Math]::Max(0, [int]$WrapperLogGenerations - 1)
-  if ($keepPrior -gt 0) {
-    $keep += @(
-      $owned |
-        Where-Object {
-          # Deliberately case-insensitive: this is a FILESYSTEM PATH
-          # identity check (NTFS is case-insensitive), not an argv/config
-          # token the CLI parses - the same directory reached via a
-          # differently-cased path must still be excluded.
-          [IO.Path]::GetFullPath($_.item.FullName) -ne $generationDir
-        } |
-        Sort-Object { $_.sort_key } -Descending |
-        Select-Object -First $keepPrior |
-        ForEach-Object { [IO.Path]::GetFullPath($_.item.FullName) }
-    )
-  }
+  $keepCount = [Math]::Max(0, [int]$WrapperLogGenerations)
+  $keep = @(
+    $owned |
+      Sort-Object { $_.sort_key } -Descending |
+      Select-Object -First $keepCount |
+      ForEach-Object { [IO.Path]::GetFullPath($_.item.FullName) }
+  )
   foreach ($record in $owned) {
     $full = [IO.Path]::GetFullPath($record.item.FullName)
-    # Deliberately case-insensitive - same filesystem-path-identity
-    # reasoning as $keep's own construction above.
+    # Deliberately case-insensitive - this is a FILESYSTEM PATH identity
+    # check (NTFS is case-insensitive), not an argv/config token the CLI
+    # parses.
     if ($keep -contains $full) { continue }
     try {
       Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
@@ -10699,7 +10607,6 @@ function Complete-WrapperLogTargets($targets) {
         $full, $_.Exception.Message)
     }
   }
-
 }
 function Discard-PendingWrapperLogTargets($targets) {
   if ($null -eq $targets) { return }
@@ -10763,7 +10670,6 @@ function Launch($name, $plan, $codexHome) {
     $tokens = $tokens | ForEach-Object { if ($_ -ceq '{SESSION_ID}') { $sid } else { $_ } }
   }
   $argv = @()
-  $cwd = if ($a.cwd) { $a.cwd } else { $Root }
   $cwdToken = if ($a.cwd) { [string]$a.cwd } else { '' }
   foreach ($x in @($a.launch.windows_args)) {
     if ($x -ceq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
@@ -10773,11 +10679,21 @@ function Launch($name, $plan, $codexHome) {
   $launchNonce = [guid]::NewGuid().ToString('N')
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
   $argv = @($nonceResult.argv)
+  # Round 23: no longer a prediction. The supervisor used to ask a probe
+  # whether this argv would reach cmd_wrap before ever starting the real
+  # process - five rounds of fidelity/blast-radius defects (quoting, cwd,
+  # interpreter, timeout, temp resources) later, that probe is deleted.
+  # Test-AgenttalkWrapInvocation stays: it reads the STATIC configured
+  # argv (is the subcommand literally 'wrap'), not runtime behavior, so it
+  # has no fidelity gap - it is an optimization to skip logging setup for
+  # an obviously-non-wrap launch, not a forecast. Whether THIS launch
+  # actually reaches cmd_wrap is now something the wrapper process itself
+  # reports, by evidence, from inside installed_standard_streams_from_
+  # environment - see New-WrapperLogTargets/Invoke-WrapperLogRetentionPrune.
   $shouldLog = (
     [bool]$a.wrapped -and
     $plan.launch_mode -eq 'wrap' -and
-    (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom) -and
-    (Test-AgenttalkWrapArgvReachesCmdWrap $AgenttalkPython $Root $SrcOnPyPath $file $argv $moduleArgsFrom $cwd)
+    (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom)
   )
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
@@ -10816,8 +10732,7 @@ function Launch($name, $plan, $codexHome) {
     }
   }
   try {
-    # $cwd is already set above (shared with the wrap-dispatch probe, so it
-    # sees the SAME working directory the real launch will use).
+    $cwd = if ($a.cwd) { $a.cwd } else { $Root }
     # Quote each token per Windows rules and pass ONE command-line string: a bare
     # array element containing a space would otherwise be split into two args at
     # the Start-Process handoff (so a path/arg WITH SPACES survives as one arg).
@@ -10849,15 +10764,21 @@ function Launch($name, $plan, $codexHome) {
   }
   $proc = $launch.Process
   if ($proc -and $proc.Id) {
-    # I1: a completed generation is committed evidence, weighed in future
-    # retention decisions - it must never be committed for a launch that
-    # never actually redirected into it. A PID alone does not prove that;
-    # $launch.Redirected is Start-WrapperProcess's own report of what
-    # actually happened.
+    # Round 23: committing is no longer this call's decision. If
+    # Start-Process itself never redirected, there is no channel a
+    # confirmation could ever arrive through, so discarding immediately is
+    # a fact, not a prediction - that case stays. Otherwise, this
+    # generation is left exactly as New-WrapperLogTargets created it
+    # (.pending): the wrapper process itself writes .committed from
+    # inside installed_standard_streams_from_environment once it has
+    # authenticated and installed its own streams - real evidence that it
+    # reached cmd_wrap, not a pre-launch guess that it would. A launch
+    # that starts, authenticates, and then dies before ever reaching that
+    # point - or one that never reaches cmd_wrap at all (wrap --help, a
+    # parse-invalid tail) - leaves a pending generation that is preserved
+    # and unpruned until #139 lands.
     if ($null -ne $logTargets -and -not $launch.Redirected) {
       Discard-PendingWrapperLogTargets $logTargets
-    } else {
-      Complete-WrapperLogTargets $logTargets
     }
     $out = @{ pid = $proc.Id; session_id = $sid; start = (Proc-Start $proc.Id);
               launcher_nonce_injected = [bool]$nonceResult.injected;
@@ -10881,7 +10802,6 @@ function Launch-Spec($name, $spec, $codexHome) {
   }
   $windowStyle = if ($spec.window_style) { [string]$spec.window_style } else { 'Hidden' }
   if ($spec.window_style_warning) { Write-Warning ("supervisor: ephemeral {0}: {1}" -f $name, $spec.window_style_warning) }
-  $specCwd = if ($spec.cwd) { $spec.cwd } else { $Root }
   $specCwdToken = if ($spec.cwd) { [string]$spec.cwd } else { '' }
   $argv = @($spec.launch.windows_args)
   $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
@@ -10890,10 +10810,10 @@ function Launch-Spec($name, $spec, $codexHome) {
   $launchNonce = [guid]::NewGuid().ToString('N')
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
   $argv = @($nonceResult.argv)
-  $shouldLog = (
-    (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom) -and
-    (Test-AgenttalkWrapArgvReachesCmdWrap $AgenttalkPython $Root $SrcOnPyPath $file $argv $moduleArgsFrom $specCwd)
-  )
+  # Round 23: no probe left to predict reachability - see Launch's own
+  # comment for the full reasoning. $shouldLog is now purely the cheap,
+  # non-predictive static check.
+  $shouldLog = (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom)
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
   } else { $null }
@@ -10926,8 +10846,7 @@ function Launch-Spec($name, $spec, $codexHome) {
     }
   }
   try {
-    # $specCwd is already set above (shared with the wrap-dispatch probe,
-    # so it sees the SAME working directory the real launch will use).
+    $specCwd = if ($spec.cwd) { $spec.cwd } else { $Root }
     $startArgs = @{
       FilePath = $file
       WorkingDirectory = $specCwd
@@ -10956,10 +10875,10 @@ function Launch-Spec($name, $spec, $codexHome) {
   }
   $proc = $launch.Process
   if ($proc -and $proc.Id) {
+    # Round 23: see Launch's own comment - committing is the wrapper's own
+    # job now, from evidence, not this call's decision.
     if ($null -ne $logTargets -and -not $launch.Redirected) {
       Discard-PendingWrapperLogTargets $logTargets
-    } else {
-      Complete-WrapperLogTargets $logTargets
     }
     $out = @{ pid = $proc.Id; start = (Proc-Start $proc.Id);
               launcher_nonce_injected = [bool]$nonceResult.injected;
