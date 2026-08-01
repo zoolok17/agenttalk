@@ -9599,7 +9599,7 @@ function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFro
   }
   return $false
 }
-function Test-AgenttalkWrapArgvReachesCmdWrap($probePython, $root, $srcOnPyPath, $file, $argv, $moduleArgsFrom = $null, $timeoutMs = 5000) {
+function Test-AgenttalkWrapArgvReachesCmdWrap($probePython, $root, $srcOnPyPath, $file, $argv, $moduleArgsFrom = $null, $cwd = $null, $timeoutMs = 5000) {
   # Round 19: knowing the tail's first token is literally 'wrap'
   # (Test-AgenttalkWrapInvocation) proves the subcommand name, not that
   # agenttalk's OWN argparse ever actually reaches cmd_wrap with it -
@@ -9645,10 +9645,37 @@ function Test-AgenttalkWrapArgvReachesCmdWrap($probePython, $root, $srcOnPyPath,
   $outFile = [System.IO.Path]::GetTempFileName()
   $errFile = [System.IO.Path]::GetTempFileName()
   try {
-    $probeArgs = @('-m', 'agenttalk', '_internal-check-wrap-dispatch', '--') + $tail
-    $proc = Start-Process -FilePath $probePython -ArgumentList $probeArgs `
-      -PassThru -WindowStyle Hidden `
-      -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    # Round 22 (connector finding): a probe that predicts a launch is only
+    # worth what its fidelity is worth. -ArgumentList given an ARRAY joins
+    # the elements with a bare space and re-parses that as one command
+    # line - the original argument boundaries are lost the moment any
+    # wrapper argument (most commonly the project root) contains a space.
+    # The real launch already solved this (Quote-Arg + a single joined
+    # string, passed verbatim to Start-Process) - reuse it rather than
+    # re-deriving argument passing a second time, or this probe answers a
+    # question about a DIFFERENT command line than the one that actually
+    # runs. Environment and stdin were checked too: build_parser()'s own
+    # construction reads no environment variable (only PYTHONPATH, for
+    # import resolution, already handled above) and this probe subcommand
+    # never reads stdin, so neither needs replicating - but the working
+    # directory does, since `-m` prepends the CURRENT directory to
+    # sys.path, and a probe run from a different cwd than the real launch
+    # could resolve a different `agenttalk` if one happened to shadow it.
+    $probeArgv = @('-m', 'agenttalk', '_internal-check-wrap-dispatch', '--') + $tail
+    $argline = (@($probeArgv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
+    $workingDirectory = if ($cwd) { $cwd } elseif ($root) { $root } else { $null }
+    $startArgs = @{
+      FilePath = $probePython
+      ArgumentList = $argline
+      PassThru = $true
+      WindowStyle = 'Hidden'
+      RedirectStandardOutput = $outFile
+      RedirectStandardError = $errFile
+    }
+    # Only set -WorkingDirectory when one is actually known - passing $null
+    # explicitly is itself a Start-Process error, not "use the default".
+    if ($workingDirectory) { $startArgs['WorkingDirectory'] = $workingDirectory }
+    $proc = Start-Process @startArgs
     if (-not $proc.WaitForExit($timeoutMs)) {
       return $false
     }
@@ -10179,6 +10206,46 @@ function Start-WrapperProcess([hashtable]$startArgs) {
     Redirected = $redirected
   }
 }
+if (-not ('AgenttalkSupervisorNativePosix' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+public static class AgenttalkSupervisorNativePosix {
+    [DllImport("libc", SetLastError = true)]
+    public static extern int umask(int mask);
+}
+'@
+}
+function Set-AgenttalkRestrictiveUmask {
+  # Round 22 (connector finding, security): chmod-AFTER cannot close the
+  # window between creating a wrapper log path (directory or file) and
+  # tightening it - another local user on a shared POSIX account can open
+  # a handle inside that window and keep it past the later chmod. The only
+  # way to create a path that is NEVER briefly world/group-readable is to
+  # have the KERNEL apply a restrictive mode at creation time, before any
+  # separate chmod call is even reachable - tightening this process's OWN
+  # umask before the create calls does exactly that (umask only NARROWS a
+  # requested mode, so 0700/0600 requests are unaffected by whatever the
+  # ambient umask already was). Returns the previous umask to restore
+  # (an int, possibly 0 - a real, valid prior value, not a sentinel) or
+  # $null on Windows / if the native call itself is unavailable, so the
+  # caller knows there is nothing to restore.
+  if (Test-RunningOnWindows) { return $null }
+  try {
+    # umask REMOVES bits from any requested mode - 0077 strips every
+    # group/other bit, leaving a 0666 file request at 0600 and a 0777
+    # directory request at 0700, regardless of whatever the ambient
+    # umask already was.
+    return [AgenttalkSupervisorNativePosix]::umask(0x3F)  # 0077 octal
+  } catch {
+    return $null
+  }
+}
+function Restore-AgenttalkUmask($previous) {
+  if ($null -eq $previous) { return }
+  if (Test-RunningOnWindows) { return }
+  try { [void][AgenttalkSupervisorNativePosix]::umask($previous) } catch {}
+}
 function Get-SafeWrapperLogAgentDir(
   [string]$candidate,
   [string]$name,
@@ -10403,70 +10470,81 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
   # before the fallback gets its chance.
   $generationDir = $null
   foreach ($candidate in $roots) {
-    $agentDir = Get-SafeWrapperLogAgentDir $candidate $name $true
-    if ($null -eq $agentDir) { continue }
+    # Round 22 (connector finding, security): every path created below -
+    # $agentDir inside Get-SafeWrapperLogAgentDir, $attempt, and the two
+    # log files inside Protect-WrapperLogPaths - must never exist even
+    # briefly with default, umask-derived permissions; a restrictive
+    # process umask makes the KERNEL apply the tight mode at creation,
+    # closing the window a later chmod cannot.
+    $savedUmask = Set-AgenttalkRestrictiveUmask
     try {
-      $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
-      $attempt = Join-Path $agentDir ("{0}-{1}" -f $stamp, $nonce)
-      $null = New-Item -ItemType Directory -Path $attempt -ErrorAction Stop
-      $stdoutPath = Join-Path $attempt 'stdout.log'
-      $stderrPath = Join-Path $attempt 'stderr.log'
-      $rootFull = [IO.Path]::GetFullPath($candidate)
-      if (-not (Protect-WrapperLogPaths $rootFull $agentDir $attempt $stdoutPath $stderrPath)) {
-        Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
-        continue
-      }
-      New-WrapperLogPendingMarker $attempt
-      $sequenceWriteFailed = $false
+      $agentDir = Get-SafeWrapperLogAgentDir $candidate $name $true
+      if ($null -eq $agentDir) { continue }
       try {
-        Write-WrapperLogSequenceFile (Join-Path $attempt '.sequence') $seq
-      } catch {
-        # #139-family: Complete-WrapperLogTargets' retention sort ranks a
-        # missing-.sequence generation BELOW every sequence-bearing one,
-        # regardless of actual launch order (sortKey '0-name' vs
-        # '1-sequence') - a transient failure HERE must propagate into
-        # sequence_uncertain, the same signal a failed root SCAN already
-        # produces below, or a later prune cycle can evict THIS (possibly
-        # newer) generation while keeping a genuinely older one.
-        $sequenceWriteFailed = $true
-        Write-Warning (
-          "supervisor: cannot record wrapper log launch sequence under '{0}' ({1})" -f
-          $agentDir, $_.Exception.Message)
-        # Round 13: an explicit marker, not just the absence of .sequence -
-        # a bare missing .sequence file is ALSO the permanent, by-design
-        # shape of a pre-upgrade legacy generation that never wrote one at
-        # all, and that case must keep tolerating pruning forever (see the
-        # matching comment in Get-NextWrapperLogSequence). Best-effort:
-        # this marker existing is a nice-to-have signal, not itself a
-        # durability guarantee this generation depends on.
-        try {
-          [IO.File]::WriteAllText(
-            (Join-Path $attempt '.sequence-failed'), '',
-            (New-Object Text.UTF8Encoding($false))
-          )
-        } catch {
-          # Best-effort only - if even this fails, the generation falls
-          # back to the legacy-tolerant "missing .sequence" treatment.
+        $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
+        $attempt = Join-Path $agentDir ("{0}-{1}" -f $stamp, $nonce)
+        $null = New-Item -ItemType Directory -Path $attempt -ErrorAction Stop
+        $stdoutPath = Join-Path $attempt 'stdout.log'
+        $stderrPath = Join-Path $attempt 'stderr.log'
+        $rootFull = [IO.Path]::GetFullPath($candidate)
+        if (-not (Protect-WrapperLogPaths $rootFull $agentDir $attempt $stdoutPath $stderrPath)) {
+          Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
+          continue
         }
+        New-WrapperLogPendingMarker $attempt
+        $sequenceWriteFailed = $false
+        try {
+          Write-WrapperLogSequenceFile (Join-Path $attempt '.sequence') $seq
+        } catch {
+          # #139-family: Complete-WrapperLogTargets' retention sort ranks a
+          # missing-.sequence generation BELOW every sequence-bearing one,
+          # regardless of actual launch order (sortKey '0-name' vs
+          # '1-sequence') - a transient failure HERE must propagate into
+          # sequence_uncertain, the same signal a failed root SCAN already
+          # produces below, or a later prune cycle can evict THIS (possibly
+          # newer) generation while keeping a genuinely older one.
+          $sequenceWriteFailed = $true
+          Write-Warning (
+            "supervisor: cannot record wrapper log launch sequence under '{0}' ({1})" -f
+            $agentDir, $_.Exception.Message)
+          # Round 13: an explicit marker, not just the absence of .sequence -
+          # a bare missing .sequence file is ALSO the permanent, by-design
+          # shape of a pre-upgrade legacy generation that never wrote one at
+          # all, and that case must keep tolerating pruning forever (see the
+          # matching comment in Get-NextWrapperLogSequence). Best-effort:
+          # this marker existing is a nice-to-have signal, not itself a
+          # durability guarantee this generation depends on.
+          try {
+            [IO.File]::WriteAllText(
+              (Join-Path $attempt '.sequence-failed'), '',
+              (New-Object Text.UTF8Encoding($false))
+            )
+          } catch {
+            # Best-effort only - if even this fails, the generation falls
+            # back to the legacy-tolerant "missing .sequence" treatment.
+          }
+        }
+        $generationDir = $attempt
+        break
+      } catch {
+        # A failure here can land AFTER the generation directory was already
+        # created (e.g. the .pending write itself fails) - without cleanup that
+        # directory is left behind with neither a .pending nor a .committed
+        # marker, and retention preserves EVERY markerless directory forever
+        # because it cannot tell an orphan from a genuinely interrupted launch.
+        # Best-effort delete it now, while this attempt is still reachable -
+        # Complete-WrapperLogTargets is never even told about a candidate this
+        # loop abandoned, so nothing downstream can ever clean it up otherwise.
+        if ($attempt -and (Test-Path -LiteralPath $attempt)) {
+          Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Warning (
+          ("supervisor: cannot create wrapper log generation under '{0}' ({1}); " +
+           "trying fallback") -f
+          $agentDir, $_.Exception.Message)
       }
-      $generationDir = $attempt
-      break
-    } catch {
-      # A failure here can land AFTER the generation directory was already
-      # created (e.g. the .pending write itself fails) - without cleanup that
-      # directory is left behind with neither a .pending nor a .committed
-      # marker, and retention preserves EVERY markerless directory forever
-      # because it cannot tell an orphan from a genuinely interrupted launch.
-      # Best-effort delete it now, while this attempt is still reachable -
-      # Complete-WrapperLogTargets is never even told about a candidate this
-      # loop abandoned, so nothing downstream can ever clean it up otherwise.
-      if ($attempt -and (Test-Path -LiteralPath $attempt)) {
-        Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
-      }
-      Write-Warning (
-        ("supervisor: cannot create wrapper log generation under '{0}' ({1}); " +
-         "trying fallback") -f
-        $agentDir, $_.Exception.Message)
+    } finally {
+      Restore-AgenttalkUmask $savedUmask
     }
   }
   if ($null -eq $generationDir) {
@@ -10685,6 +10763,7 @@ function Launch($name, $plan, $codexHome) {
     $tokens = $tokens | ForEach-Object { if ($_ -ceq '{SESSION_ID}') { $sid } else { $_ } }
   }
   $argv = @()
+  $cwd = if ($a.cwd) { $a.cwd } else { $Root }
   $cwdToken = if ($a.cwd) { [string]$a.cwd } else { '' }
   foreach ($x in @($a.launch.windows_args)) {
     if ($x -ceq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
@@ -10698,7 +10777,7 @@ function Launch($name, $plan, $codexHome) {
     [bool]$a.wrapped -and
     $plan.launch_mode -eq 'wrap' -and
     (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom) -and
-    (Test-AgenttalkWrapArgvReachesCmdWrap $AgenttalkPython $Root $SrcOnPyPath $file $argv $moduleArgsFrom)
+    (Test-AgenttalkWrapArgvReachesCmdWrap $AgenttalkPython $Root $SrcOnPyPath $file $argv $moduleArgsFrom $cwd)
   )
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
@@ -10737,7 +10816,8 @@ function Launch($name, $plan, $codexHome) {
     }
   }
   try {
-    $cwd = if ($a.cwd) { $a.cwd } else { $Root }
+    # $cwd is already set above (shared with the wrap-dispatch probe, so it
+    # sees the SAME working directory the real launch will use).
     # Quote each token per Windows rules and pass ONE command-line string: a bare
     # array element containing a space would otherwise be split into two args at
     # the Start-Process handoff (so a path/arg WITH SPACES survives as one arg).
@@ -10801,6 +10881,7 @@ function Launch-Spec($name, $spec, $codexHome) {
   }
   $windowStyle = if ($spec.window_style) { [string]$spec.window_style } else { 'Hidden' }
   if ($spec.window_style_warning) { Write-Warning ("supervisor: ephemeral {0}: {1}" -f $name, $spec.window_style_warning) }
+  $specCwd = if ($spec.cwd) { $spec.cwd } else { $Root }
   $specCwdToken = if ($spec.cwd) { [string]$spec.cwd } else { '' }
   $argv = @($spec.launch.windows_args)
   $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
@@ -10811,7 +10892,7 @@ function Launch-Spec($name, $spec, $codexHome) {
   $argv = @($nonceResult.argv)
   $shouldLog = (
     (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom) -and
-    (Test-AgenttalkWrapArgvReachesCmdWrap $AgenttalkPython $Root $SrcOnPyPath $file $argv $moduleArgsFrom)
+    (Test-AgenttalkWrapArgvReachesCmdWrap $AgenttalkPython $Root $SrcOnPyPath $file $argv $moduleArgsFrom $specCwd)
   )
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
@@ -10845,10 +10926,11 @@ function Launch-Spec($name, $spec, $codexHome) {
     }
   }
   try {
-    $cwd = if ($spec.cwd) { $spec.cwd } else { $Root }
+    # $specCwd is already set above (shared with the wrap-dispatch probe,
+    # so it sees the SAME working directory the real launch will use).
     $startArgs = @{
       FilePath = $file
-      WorkingDirectory = $cwd
+      WorkingDirectory = $specCwd
       WindowStyle = $windowStyle
       PassThru = $true
     }

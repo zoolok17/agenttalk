@@ -210,6 +210,14 @@ def _harden_posix_log_paths(*paths: Path) -> None:
             os.chmod(directory, stat.S_IRWXU)
 
 
+def _restrictive_file_opener(path: str, flags: int) -> int:
+    """An io.open() opener that bakes 0600 into the underlying os.open()
+    call - the mode argument only applies when the file is actually being
+    created, so this closes the create-then-chmod window without changing
+    behavior for a file that already exists."""
+    return os.open(path, flags, 0o600)
+
+
 class BoundedStreamTee:
     """Text stream that bounds the inherited redirect and keeps a newest-output ring.
 
@@ -320,8 +328,22 @@ class BoundedStreamTee:
         )
 
     def _open_tail(self) -> None:
-        self.base_path.parent.mkdir(parents=True, exist_ok=True)
+        # mode=0o700 is applied atomically by mkdir itself (harmless no-op
+        # shape on Windows) - unlike a chmod issued after the fact, there is
+        # no window where a freshly-created directory sits at the default,
+        # umask-derived mode.
+        self.base_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self._tail_path()
+        # A custom opener bakes the restrictive mode into the SAME os.open()
+        # call that creates the file, closing the window a separate chmod
+        # afterward cannot: another local user on a shared POSIX account
+        # could open a handle to this file in that window and keep it past
+        # the chmod. The mode argument only takes effect when the file is
+        # actually being CREATED (O_CREAT) - harmless, and irrelevant, for
+        # the "ab" resume case reopening a file that already exists.
+        # pathlib.Path.open() does not forward an opener kwarg - use the
+        # builtin open() (which does) against the string path instead.
+        opener = _restrictive_file_opener if os.name != "nt" else None
         # Only the very first open of a resumed instance appends (onto the
         # size already recorded in __init__); every later rotation into a
         # new segment - including a later revisit of this same index once
@@ -329,11 +351,14 @@ class BoundedStreamTee:
         # as an uninterrupted instance always has.
         if self._tail_resume_append:
             self._tail_resume_append = False
-            self._tail = path.open("ab")
+            self._tail = open(str(path), "ab", opener=opener)
         else:
-            self._tail = path.open("wb")
+            self._tail = open(str(path), "wb", opener=opener)
             self._tail_size = 0
         if os.name != "nt":
+            # Defense in depth for a path this opener could not have
+            # created fresh - e.g. a resumed file left behind by an older
+            # agenttalk version that predates this fix.
             with contextlib.suppress(OSError):
                 os.chmod(path, 0o600)
 

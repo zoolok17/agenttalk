@@ -135,6 +135,30 @@ def test_default_wrapper_log_root_falls_back_to_tempdir_when_home_is_unresolvabl
     assert checkout.resolve() not in resolved.resolve().parents
 
 
+def test_restrictive_file_opener_bakes_0o600_into_os_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 22: verifies the ARGUMENT _open_tail's opener passes to
+    os.open, independent of platform - the actual POSIX permission
+    enforcement (mode bits meaning something real on disk) is checked
+    separately, skipped on Windows, in
+    test_bounded_stream_tee_creates_tail_path_restrictively_not_via_later_chmod."""
+    recorded = {}
+    real_open = os.open
+
+    def spy(path: str, flags: int, mode: int = 0o777) -> int:
+        recorded["mode"] = mode
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", spy)
+    path = tmp_path / "probe-file"
+    fd = wrapper_logs._restrictive_file_opener(str(path), os.O_WRONLY | os.O_CREAT)
+    os.close(fd)
+
+    assert recorded["mode"] == 0o600
+
+
 def test_bounded_stream_tee_keeps_each_file_and_generation_within_cap(
     tmp_path: Path,
 ) -> None:
@@ -1385,6 +1409,46 @@ def test_stream_environment_hardens_sensitive_log_permissions(
     assert stat.S_IMODE(err_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(generation.stat().st_mode) == 0o700
     assert stat.S_IMODE(generation.parent.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_bounded_stream_tee_creates_tail_path_restrictively_not_via_later_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 22 (connector finding, security): chmod-AFTER cannot close the
+    window between creating a path and tightening it - another local user
+    on a shared POSIX account could open a handle inside that window and
+    keep it past the chmod. Checking the FINAL mode after everything runs
+    would pass even with the old create-then-chmod code (the chmod still
+    ran and still corrected it eventually) - that is exactly the test
+    shape the connector warned against. This neuters os.chmod entirely
+    (monkeypatched to raise, caught by the existing contextlib.suppress)
+    AND sets a fully permissive ambient umask, so the ONLY way the mode
+    ends up correct is if the creation call itself (the opener passed to
+    Path.open, and mkdir's own mode= argument) already requested it -
+    proving the fix is atomic-at-creation, not merely fast-to-correct."""
+    old_umask = os.umask(0o000)
+    monkeypatch.setattr(
+        os, "chmod",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("chmod disabled for this test")),
+    )
+    try:
+        base = tmp_path / "project" / "worker" / "generation" / "stderr.log"
+        original = io.StringIO()
+        tee = wrapper_logs.BoundedStreamTee(
+            original, base, max_bytes=4096, segment_count=4,
+        )
+        tee.write("SENTINEL\n")
+        tee.close()
+    finally:
+        os.umask(old_umask)
+
+    tail_files = sorted(base.parent.glob("stderr.log.*"))
+    assert tail_files
+    for path in tail_files:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600, path
+    assert stat.S_IMODE(base.parent.stat().st_mode) == 0o700
 
 
 def test_ambient_log_paths_without_matching_launch_nonce_are_ignored(

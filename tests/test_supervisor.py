@@ -6608,6 +6608,18 @@ def _exec_helpers(tmp_path: Path) -> str:
     return "function Assert-ActionsEnabled([string]$what) { return $true }\n" + block
 
 
+def _quote_arg_helper(tmp_path: Path) -> str:
+    """Extract the verbatim Quote-Arg function from an ALREADY-generated
+    supervisor.ps1 (call _exec_helpers(tmp_path) first, which is what
+    actually generates it) - Quote-Arg lives in its own region, outside
+    exec-helpers', so a harness that calls a function depending on it
+    (Test-AgenttalkWrapArgvReachesCmdWrap, round 22) needs this too."""
+    text = (Store(tmp_path).dir / "supervisor.ps1").read_text(encoding="utf-8-sig")
+    block = text[text.index("# region quote-arg"):text.index("# endregion quote-arg")]
+    assert "function Quote-Arg" in block
+    return block
+
+
 def _pslit(v: str) -> str:
     return "'" + str(v).replace("'", "''") + "'"
 
@@ -6803,7 +6815,7 @@ def test_supervisor_wrap_argv_reaches_cmd_wrap_asks_the_real_parser(
     shell = _pick_powershell()
     if not shell:
         return
-    helpers = _exec_helpers(tmp_path)
+    helpers = _exec_helpers(tmp_path) + "\n" + _quote_arg_helper(tmp_path)
     out = tmp_path / "wrap_dispatch.json"
     src_dir = str(Path(__file__).resolve().parents[1] / "src")
     harness = "\n".join([
@@ -6832,10 +6844,20 @@ def test_supervisor_wrap_argv_reaches_cmd_wrap_asks_the_real_parser(
         "$badProbe = Test-AgenttalkWrapArgvReachesCmdWrap "
         "'definitely-not-a-real-interpreter.exe' $null $false "
         "'python.exe' @('-m','agenttalk','--root','R','wrap') $null",
+        # Round 22 connector finding: an ARGUMENT ARRAY passed to
+        # Start-Process -ArgumentList is joined with a bare space and
+        # re-parsed as one command line - a --root value containing a
+        # space (an entirely realistic project path) would have split into
+        # two tokens at the OLD code, desyncing the probe's answer from
+        # what the real launch (which already used Quote-Arg) would do.
+        "$spaceInRoot = Test-AgenttalkWrapArgvReachesCmdWrap $py $null $false "
+        "'python.exe' @('-m','agenttalk','--root','C:\\has a space\\root',"
+        "'wrap','--for','worker') $null",
         "@{ normal = $normal; help = $help; dash_h = $dashH; "
         "bad_flag = $badFlag; not_wrap = $notWrap; "
         "help_in_remainder = $helpInRemainder; unreachable = $unreachable; "
-        "bad_probe = $badProbe } | ConvertTo-Json -Depth 3 | "
+        "bad_probe = $badProbe; space_in_root = $spaceInRoot } | "
+        "ConvertTo-Json -Depth 3 | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
     script = tmp_path / "wrap-dispatch.ps1"
@@ -6854,6 +6876,7 @@ def test_supervisor_wrap_argv_reaches_cmd_wrap_asks_the_real_parser(
     assert data["help_in_remainder"] is True, data
     assert data["unreachable"] is False, data
     assert data["bad_probe"] is False, data
+    assert data["space_in_root"] is True, data
 
 
 def test_supervisor_wrap_dispatch_probe_times_out_and_fails_toward_not_logging(
@@ -6870,7 +6893,7 @@ def test_supervisor_wrap_dispatch_probe_times_out_and_fails_toward_not_logging(
     shell = _pick_powershell()
     if not shell:
         return
-    helpers = _exec_helpers(tmp_path)
+    helpers = _exec_helpers(tmp_path) + "\n" + _quote_arg_helper(tmp_path)
     out = tmp_path / "wrap_dispatch_timeout.json"
     fake_root = tmp_path / "fake-checkout"
     fake_pkg = fake_root / "src" / "agenttalk"
@@ -6887,7 +6910,7 @@ def test_supervisor_wrap_dispatch_probe_times_out_and_fails_toward_not_logging(
         "$sw = [System.Diagnostics.Stopwatch]::StartNew()",
         "$result = Test-AgenttalkWrapArgvReachesCmdWrap $py $fakeRoot $true "
         "'python.exe' @('-m','agenttalk','--root','R','wrap','--for','worker') "
-        "$null 500",
+        "-moduleArgsFrom $null -timeoutMs 500",
         "$sw.Stop()",
         "@{ result = $result; elapsed_ms = $sw.ElapsedMilliseconds } | "
         f"ConvertTo-Json -Depth 3 | Set-Content {_pslit(str(out))} -Encoding utf8",
