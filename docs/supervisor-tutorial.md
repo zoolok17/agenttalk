@@ -35,7 +35,10 @@ Three ideas carry the whole feature:
    Only a validated `idle` phase can be `HEALTHY_IDLE`. During an active
    turn the supervisor independently discovers the real CLI brain and
    requires real adapter progress. Missing, malformed, or ambiguous
-   evidence is non-green and never automatic kill authority.
+   evidence is non-green and never automatic kill authority. Before that
+   child-health decision, an invalid/truncated owned tree creates a
+   `PROCESS_TREE_INVALID`/`PROCESS_TREE_TRUNCATED` HOLD and preserves any
+   restart request.
 
 2. **The supervisor is an external monitor, not a daemon inside the
    bus.** `agenttalk supervise` only computes a read-only **report**
@@ -502,7 +505,9 @@ Supervision is **additive and reversible**. The bus — your messages,
 roster, cursors, threads, and session history — is never touched by
 turning supervision on or off. There is no data migration, no `reset`,
 no re-`init`. You are only adding (or removing) an external monitor and a
-few optional config files.
+few optional config files. Upgrading an already wrapped fleet from legacy
+process ownership is the attended exception described below; it still does not
+rewrite bus data.
 
 ### Adding supervision to a project you already run by hand
 
@@ -542,6 +547,47 @@ agent and the rest of your team see the same bus — a supervised
 > `/agenttalk.listen` for `codex-dev` open *and* have the supervisor launch
 > `codex-dev` — that's two consumers on one mailbox (unsupported; see the
 > README "one window per agent" note). Pick one driver per agent.
+
+### Upgrading a legacy wrapped fleet
+
+A legacy `managed_pids` record cannot prove the whole owned tree because the
+old traversal stopped at shell hosts. The supervisor retains that evidence as
+a nondismissible `process_tree_hold`; it does not use it to kill.
+
+1. Leave `.agenttalk/supervisor.kill` present, stop the supervisor, and confirm
+   the strict instance marker is absent.
+2. Read `agenttalk attention` and record the HOLD's `source_hash` and launch
+   nonce. Inventory the full process tree. Before stopping the wrapper, re-read
+   `--supervisor-launch-nonce` from its live command line and verify it matches
+   the recorded nonce; after teardown, verify every recorded PID/start identity
+   is absent or definitely recycled. If the wrapper is no longer live enough
+   to re-read its nonce, use manual repair instead of this reset.
+3. Run the reset as the operator-facing liaison (or sole lead):
+
+```powershell
+agenttalk supervise --reset-process-tree-ownership --from <liaison> `
+  --for <agent> --hold-source-hash <64hex> `
+  --verified-launch-nonce <verified-launch-nonce> `
+  --acknowledge-no-live-supervisor `
+  --acknowledge-owned-processes-stopped `
+  --reason "attended owned-tree migration"
+```
+
+The reset is hash-, nonce-, role-, marker-, kill-switch-, strict-runtime-, and
+PID/start-checked. It never kills or launches; it revokes stale ownership
+evidence and appends a bounded audit entry. A stale hash, missing/mismatched
+nonce, invalid or mismatched runtime wrapper identity/generation, live or
+unverifiable identity, or unauthorized actor refuses the operation. If the
+HOLD has no nonce/reset evidence, manual state repair is required. The reset
+also atomically retires the exact old runtime digest and its
+PID/start/generation/nonce boundary. Only that unchanged sidecar is ignored;
+changed or new-generation runtime evidence still follows fail-closed adoption.
+
+4. Keep the supervisor host stopped, remove `supervisor.kill`, and run
+   `agenttalk supervise --refresh-scripts` (`--refresh-scripts` refuses while
+   the kill switch is present). Queue
+   `agenttalk request-restart --for <agent>`, then resume the supervisor. The
+   next launch must earn a new wrapper generation and complete tree.
 
 ### Mixed mode
 
@@ -617,10 +663,23 @@ without ever rebuilding state.
   wrapper dead-letters the message, use
   `agenttalk dead-letter list`, `show`, `requeue`, or `resolve` to inspect and
   make an operator decision without rewinding cursors.
-- **Upgrade is fail-safe.** An older wrapper without
-  `wrapper-runtime.json` reports `CLI_CHILD_UNKNOWN`, even with a fresh
-  heartbeat. Run `agenttalk supervise --refresh-scripts`, then
-  `agenttalk request-restart --for AGENT_NAME`.
+- **Upgrade is fail-safe.** Owned-tree validation precedes restart-marker and
+  child-liveness policy. An invalid or truncated tree reports
+  `PROCESS_TREE_INVALID` or `PROCESS_TREE_TRUNCATED`, grants no kill authority,
+  and leaves the restart marker unconsumed. If no tree HOLD applies, an older
+  wrapper without `wrapper-runtime.json` reports `CLI_CHILD_UNKNOWN`, even with
+  a fresh heartbeat. Use the attended migration sequence above; a plain
+  refresh/restart cannot clear legacy ownership evidence.
+- **Windows launcher-lifetime proof is nullable.** `cli_launcher_lifetime` is
+  either null or a complete positive-decimal `GetProcessTimes` creation/exit
+  interval. Authoritative `complete`/`absent` Windows tree entries require a
+  positive decimal `start_filetime`. `invalid`/`truncated` HOLD entries may
+  retain null so failure evidence stays readable, but null grants no identity
+  authority. Linux boot-ID/start-ticks tokens are exact without FILETIME. If a
+  prior identity recorded a FILETIME, a current row missing it is ambiguous. A
+  prior complete tree bridges an exited intermediate only for the same wrapper
+  generation and launch nonce, with the exact previously recorded child and
+  parent edge. New or reparented children fail closed.
 - **Generation-bound waiter teardown.** A wrapper loop writes a unique token in
   its waiting marker and clears only that token in `finally`. An old wrapper
   therefore cannot erase a replacement marker. This protects observability; it
@@ -662,6 +721,7 @@ without ever rebuilding state.
 | `agenttalk supervise --select-pwsh [--pwsh ABSOLUTE_PATH]` | Probe and record the PowerShell Core 7+ host. An explicit candidate never falls through. |
 | `agenttalk supervise --refresh-scripts [--pwsh ABSOLUTE_PATH]` | Regenerate/validate all four artifacts under the lifecycle lock; preserve config/runtime state. |
 | `agenttalk supervise --repair-instance-marker --quarantine --acknowledge-no-live-supervisor` | Explicitly quarantine an invalid singleton marker after the operator confirms no supervisor is live. |
+| `agenttalk supervise --reset-process-tree-ownership --from L --for A --hold-source-hash HASH --verified-launch-nonce NONCE --acknowledge-no-live-supervisor --acknowledge-owned-processes-stopped --reason TEXT` | Record an attended owned-tree boundary. Requires liaison/sole-lead authority, the kill switch, no live instance marker, the current Attention hash and nonce, and every recorded PID/start proven gone or recycled. Never kills or launches. |
 | `agenttalk supervise --report` | Read-only per-agent liveness JSON (fresh/stale + threshold). |
 | `agenttalk supervise --plan` | The action plan (decision table) the monitor executes. |
 | `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` hooks into the **project** `.claude/settings.json`. Codex modes write only the heartbeat hook to `.codex/hooks.json`. Never global, never clobbers unrelated settings. |

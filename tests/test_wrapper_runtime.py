@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import errno
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -66,6 +68,156 @@ def test_runtime_writer_publishes_closed_lifecycle_and_monotonic_progress(
     assert final_idle["last_outcome"] == wr.OUTCOME_SUCCESS
     assert final_idle["turn_id"] is None
     assert wr.read_runtime(tmp_path, "worker", now_epoch=NOW)["status"] == wr.STATUS_VALID
+
+
+def test_runtime_v2_publishes_exact_launcher_lifetime_and_reads_v1(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path)
+    writer.starting(message_id="msg-1", turn_id="turn-1")
+    active = writer.active(456, "start-456")
+    certified = writer.launcher_exited(
+        456,
+        "start-456",
+        "100",
+        "200",
+        turn_generation=active["turn_generation"],
+    )
+
+    assert certified is not None
+    assert certified["schema_version"] == 2
+    assert certified["cli_launcher_lifetime"] == {
+        "source": wr.LAUNCHER_LIFETIME_SOURCE,
+        "creation_filetime": "100",
+        "exit_filetime": "200",
+    }
+    assert wr.read_runtime(
+        tmp_path,
+        "worker",
+        now_epoch=NOW,
+    )["record"]["cli_launcher_lifetime"] == certified[
+        "cli_launcher_lifetime"
+    ]
+
+    legacy = dict(certified)
+    legacy["schema_version"] = 1
+    legacy.pop("cli_launcher_lifetime")
+    normalized = wr.validate_record(legacy, expected_agent="worker", now_epoch=NOW)
+    assert normalized["schema_version"] == 2
+    assert normalized["cli_launcher_lifetime"] is None
+    public = dict(normalized)
+    public.pop("_updated_epoch")
+    public.pop("_last_progress_epoch")
+    assert wr.validate_record(
+        public,
+        expected_agent="worker",
+        now_epoch=NOW,
+    ) == normalized
+
+    wr.runtime_path(tmp_path, "worker").write_text(
+        json.dumps(legacy),
+        encoding="utf-8",
+    )
+    read_legacy = wr.read_runtime(tmp_path, "worker", now_epoch=NOW)
+    assert read_legacy["status"] == wr.STATUS_VALID
+    assert read_legacy["record"]["schema_version"] == 2
+    assert read_legacy["record"]["cli_launcher_lifetime"] is None
+
+
+def test_runtime_rejects_boolean_schema_version(tmp_path: Path) -> None:
+    record = _writer(tmp_path).idle()
+    record["schema_version"] = True
+
+    with pytest.raises(wr.RuntimeRecordError, match="schema_version"):
+        wr.validate_record(record, expected_agent="worker", now_epoch=NOW)
+
+
+def test_launcher_exit_observer_cannot_write_into_later_turn(
+    tmp_path: Path,
+) -> None:
+    writer = _writer(tmp_path)
+    writer.starting(message_id="msg-1", turn_id="turn-1")
+    first = writer.active(456, "start-456")
+    writer.terminal(wr.OUTCOME_FAILED)
+    writer.starting(message_id="msg-2", turn_id="turn-2")
+    second = writer.active(789, "start-789")
+
+    late = writer.launcher_exited(
+        456,
+        "start-456",
+        "100",
+        "200",
+        turn_generation=first["turn_generation"],
+    )
+    durable = wr.read_runtime(tmp_path, "worker", now_epoch=NOW)["record"]
+
+    assert late is None
+    assert second["turn_generation"] == first["turn_generation"] + 1
+    assert durable["cli_launcher_pid"] == 789
+    assert durable["cli_launcher_lifetime"] is None
+
+
+@pytest.mark.parametrize(
+    "lifetime",
+    [
+        {
+            "source": wr.LAUNCHER_LIFETIME_SOURCE,
+            "creation_filetime": "200",
+            "exit_filetime": "200",
+        },
+        {
+            "source": wr.LAUNCHER_LIFETIME_SOURCE,
+            "creation_filetime": "201",
+            "exit_filetime": "200",
+        },
+        {
+            "source": "untrusted",
+            "creation_filetime": "100",
+            "exit_filetime": "200",
+        },
+        {
+            "source": wr.LAUNCHER_LIFETIME_SOURCE,
+            "creation_filetime": "not-ticks",
+            "exit_filetime": "200",
+        },
+    ],
+)
+def test_runtime_rejects_malformed_launcher_lifetime(
+    tmp_path: Path,
+    lifetime: dict,
+) -> None:
+    writer = _writer(tmp_path)
+    writer.starting(message_id="msg-1", turn_id="turn-1")
+    record = writer.active(456, "start-456")
+    record["cli_launcher_lifetime"] = lifetime
+
+    with pytest.raises(wr.RuntimeRecordError):
+        wr.validate_record(record, expected_agent="worker", now_epoch=NOW)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process handles only")
+def test_windows_launcher_exit_observer_uses_retained_process_handle() -> None:
+    proc = subprocess.Popen(  # noqa: S603  # nosec B603
+        [sys.executable, "-c", "raise SystemExit(0)"],
+    )
+    published: list[tuple] = []
+    thread = run._start_windows_launcher_exit_observer(  # noqa: SLF001
+        proc,
+        wr.process_start_token(proc.pid),
+        turn_generation=7,
+        publish=lambda *args, **kwargs: published.append((args, kwargs)),
+    )
+
+    assert thread is not None
+    thread.join(timeout=10)
+    proc.wait(timeout=10)
+    assert not thread.is_alive()
+    assert len(published) == 1
+    args, kwargs = published[0]
+    assert args[0] == proc.pid
+    assert int(args[2]) > 0
+    assert int(args[3]) > int(args[2])
+    assert kwargs == {"turn_generation": 7}
 
 
 def test_runtime_writer_coalesces_progress_and_forces_terminal_high_water(

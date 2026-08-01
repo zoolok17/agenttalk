@@ -1555,6 +1555,94 @@ def run_wrapper(
     return rc
 
 
+def _start_windows_launcher_exit_observer(
+    proc: subprocess.Popen,
+    launcher_start: str | None,
+    *,
+    turn_generation: int,
+    publish: Callable[..., object],
+) -> threading.Thread | None:
+    """Publish exact Windows creation/exit FILETIMEs from the retained handle.
+
+    ``ParentProcessId`` survives creator exit on Windows and may later name a
+    recycled PID. The exact lifetime of this handle is therefore the only safe
+    first-poll bridge for a native launcher that hands off and exits. Failure to
+    obtain it is deliberately quiet: the supervisor then has no certificate
+    and refuses teardown.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        handle_value = int(proc._handle)  # type: ignore[attr-defined]  # noqa: SLF001
+        if handle_value <= 0:
+            return None
+        pid = int(proc.pid)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    def observe() -> None:
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.WaitForSingleObject.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            handle = wintypes.HANDLE(handle_value)
+            if kernel32.WaitForSingleObject(handle, 0xFFFFFFFF) != 0:
+                return
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return
+            creation_ticks = (
+                (int(creation.dwHighDateTime) << 32)
+                | int(creation.dwLowDateTime)
+            )
+            exit_ticks = (
+                (int(exit_time.dwHighDateTime) << 32)
+                | int(exit_time.dwLowDateTime)
+            )
+            if creation_ticks <= 0 or exit_ticks <= creation_ticks:
+                return
+            publish(
+                pid,
+                launcher_start,
+                str(creation_ticks),
+                str(exit_ticks),
+                turn_generation=turn_generation,
+            )
+        except Exception:  # noqa: BLE001 - missing proof must fail closed, not crash turn
+            return
+
+    thread = threading.Thread(
+        target=observe,
+        name=f"agenttalk-launcher-exit-{pid}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 class _ProcStream:
     """Default make_drive spawner: spawn the CLI for one turn (prompt on STDIN, to
     dodge quoting), yield its stdout lines, and expose the child EXIT CODE as
@@ -1570,8 +1658,9 @@ class _ProcStream:
                  work_heartbeat=None, work_heartbeat_stamp=None,
                  work_heartbeat_status=None,
                  child_env: dict[str, str] | None = None,
-                 on_spawn: Callable[[int, str | None], None] | None = None,
+                 on_spawn: Callable[[int, str | None], object] | None = None,
                  on_exit: Callable[[int, str | None, int], None] | None = None,
+                 on_launcher_exit: Callable[..., object] | None = None,
                  lease_lost_exceptions: tuple = ()) -> None:
         # argv is the operator-provided launch command; never shell=True.
         # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
@@ -1598,6 +1687,7 @@ class _ProcStream:
         self._watchdog_stream_interrupted = False
         self._watchdog_stream_done = False
         self._watchdog_root_waiter: threading.Thread | None = None
+        self._launcher_exit_observer = None
         self.work_heartbeat_result: dict | None = None
         self._work_hb = None
         self._on_exit = on_exit
@@ -1610,7 +1700,26 @@ class _ProcStream:
                 from agenttalk.wrapper_runtime import process_start_token
 
                 self.pid_start = process_start_token(self.pid)
-                on_spawn(self.pid, self.pid_start)
+                active_record = on_spawn(self.pid, self.pid_start)
+                turn_generation = (
+                    active_record.get("turn_generation")
+                    if isinstance(active_record, dict)
+                    else None
+                )
+                if (
+                    on_launcher_exit is not None
+                    and isinstance(turn_generation, int)
+                    and not isinstance(turn_generation, bool)
+                    and turn_generation > 0
+                ):
+                    self._launcher_exit_observer = (
+                        _start_windows_launcher_exit_observer(
+                            self._proc,
+                            self.pid_start,
+                            turn_generation=turn_generation,
+                            publish=on_launcher_exit,
+                        )
+                    )
             if self._proc.stdin is not None:
                 if stdin_text is not None:
                     self._proc.stdin.write(stdin_text)
@@ -1739,12 +1848,19 @@ class _ProcStream:
             # change the child result or strand its cleanup. A None returncode
             # means the exit was never actually confirmed - reporting it as one
             # would assert a fact we do not have, so skip the callback instead
-            # of inventing a synthetic exit code.
+            # of inventing a synthetic exit code. This fact fires unconditionally
+            # here - independent of #120's launcher-exit observer below, so an
+            # absent or Windows-only-missing observer can never suppress it.
             if self._on_exit is not None and self.returncode is not None:
                 try:
                     self._on_exit(self.pid, self.pid_start, self.returncode)
                 except Exception as exc:
                     _ = exc
+            if self._launcher_exit_observer is not None:
+                # #112 owns the wait/watchdog ordering above. #120's retained
+                # handle observer is joined only after that flow has confirmed
+                # root exit, so neither feature weakens the other's boundary.
+                self._launcher_exit_observer.join(timeout=5.0)
 
     def _interrupt_watchdog_stream(self) -> None:
         with self._watchdog_stream_condition:
@@ -1843,11 +1959,22 @@ class _ProcStream:
     def _cleanup_after_constructor_error(self) -> None:
         # Best-effort only: preserve the original constructor failure so make_drive
         # keeps its existing spawn/exec classification.
-        for worker in (self._work_hb, self._watchdog):
+        stoppable_workers = (self._work_hb, self._watchdog)
+        # Stop every stoppable worker before joining any one of them. The
+        # Windows launcher-exit observer is intentionally not stoppable: its
+        # retained process handle unblocks only after the child exits.
+        for worker in stoppable_workers:
             if worker is None:
                 continue
             try:
-                worker.stop()
+                if hasattr(worker, "stop"):
+                    worker.stop()
+            except Exception as exc:
+                _ = exc
+        for worker in stoppable_workers:
+            if worker is None:
+                continue
+            try:
                 worker.join(timeout=10.0)
             except Exception as exc:
                 _ = exc
@@ -1856,27 +1983,36 @@ class _ProcStream:
                 _close_pipe_suppressing_benign_pipe_teardown(pipe)
             except OSError as exc:
                 _ = exc
+        child_reaped = False
         try:
             if self._proc.poll() is None:
                 self._proc.terminate()
             self.returncode = self._proc.wait(timeout=10.0)
+            child_reaped = True
         except subprocess.TimeoutExpired:
             try:
                 self._proc.kill()
                 self.returncode = self._proc.wait(timeout=5.0)
+                child_reaped = True
             except Exception as exc:
                 _ = exc
-        except OSError as exc:
+        except Exception as exc:
             _ = exc
         # New area (cold review): this cleanup path terminates and reaps the
         # child but - unlike __iter__'s own finally block - never told
         # on_exit about it, so a child that WAS confirmed dead here left no
         # child_exited record at all. Skip, not fabricate, if the double-
-        # exception fallback above still left returncode unconfirmed - the
-        # same invariant _ProcStream.__iter__ already holds elsewhere.
-        if self._on_exit is not None and self.returncode is not None:
+        # exception fallback above never confirmed the reap - the same
+        # invariant _ProcStream.__iter__ already holds elsewhere. Fires
+        # independent of #120's launcher-exit observer below either way.
+        if child_reaped and self._on_exit is not None:
             try:
                 self._on_exit(self.pid, self.pid_start, self.returncode)
+            except Exception as exc:
+                _ = exc
+        if child_reaped and self._launcher_exit_observer is not None:
+            try:
+                self._launcher_exit_observer.join(timeout=10.0)
             except Exception as exc:
                 _ = exc
 
@@ -2263,6 +2399,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                                on_exit=(
                                    lifecycle_log.child_exited
                                    if lifecycle_log is not None
+                                   else None
+                               ),
+                               on_launcher_exit=(
+                                   runtime_writer.launcher_exited
+                                   if runtime_writer is not None
                                    else None
                                ),
                                lease_lost_exceptions=lease_lost_exceptions)
@@ -2773,6 +2914,11 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                                on_exit=(
                                    lifecycle_log.child_exited
                                    if lifecycle_log is not None
+                                   else None
+                               ),
+                               on_launcher_exit=(
+                                   runtime_writer.launcher_exited
+                                   if runtime_writer is not None
                                    else None
                                ),
                                lease_lost_exceptions=lease_lost_exceptions)

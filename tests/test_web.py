@@ -3066,7 +3066,7 @@ const root = {
 const payloads = {
   lastState: { roots: [root], _fetchedAt: now },
   attentionData: {
-    count: 2,
+    count: 3,
     items: [
       {
         source: 'escalation',
@@ -3090,6 +3090,17 @@ const payloads = {
         agent: 'stuck-agent',
         ts: iso,
         age_seconds: 900,
+      },
+      {
+        source: 'supervisor',
+        source_label: 'SUPERVISOR HOLD',
+        severity: 'high',
+        title: 'supervisor process-tree HOLD: codex-test',
+        detail: 'Automatic teardown is HOLD because the tree is truncated.',
+        recommendation: 'Inspect and reduce the owned tree before recovery.',
+        agent: 'codex-test',
+        ts: iso,
+        age_seconds: 5,
       },
     ],
   },
@@ -3262,6 +3273,7 @@ const cases = [
       'Operator decision needed',
       'Can I publish v0.72.1 now?',
       'stuck-agent',
+      'Inspect and reduce the owned tree before recovery.',
     ],
   },
   { view: 'lead-chat', expected: ['Lead chat', 'Direct channel', 'route received'] },
@@ -5044,6 +5056,102 @@ def _attention(base: str) -> dict:
         assert resp.status == 200
         assert resp.headers["Content-Type"].startswith("application/json")
         return json.loads(resp.read())
+
+
+def test_api_attention_surfaces_process_tree_hold_without_liaison(
+    tmp_path: Path,
+) -> None:
+    from agenttalk import attention as attention_mod
+    from agenttalk import supervisor as supervisor_mod
+
+    s = _make_store(tmp_path)
+    assert s.operator_facing() is None
+    assert s.sole_lead() is None
+    entries = [
+        {
+            "pid": 100 + index,
+            "start": f"linux:{'a' * 32}:{index + 1}",
+            "start_filetime": None,
+            "role": "wrapper" if index == 0 else "tool_descendant",
+            "parent_pid": 0 if index == 0 else 99 + index,
+            "discovered_at": "2026-06-01T00:00:00Z",
+        }
+        for index in range(64)
+    ]
+    supervisor_mod.save_supervisor_state(
+        s.dir / "supervisor-state.json",
+        {
+            "agents": {
+                "alpha": {
+                    "launcher_pid": 100,
+                    "launcher_start": f"linux:{'a' * 32}:1",
+                    "launcher_nonce": "12345678-1234-4234-8234-123456789abc",
+                    "runtime_wrapper_generation": "wrapper-1",
+                    "owned_process_tree": {
+                        "schema_version": 2,
+                        "attribution_model": "owned_process_tree_v2",
+                        "agent": "alpha",
+                        "root_key": str(s.root),
+                        "status": "truncated",
+                        "reason_code": "process_tree_truncated",
+                        "limit": 64,
+                        "observed_count": 65,
+                        "recorded_count": 64,
+                        "omitted_count": 1,
+                        "truncated": True,
+                        "refreshed_at": "2026-06-01T00:00:00Z",
+                        "wrapper_generation": "wrapper-1",
+                        "launch_nonce": "12345678-1234-4234-8234-123456789abc",
+                        "entries": entries,
+                    }
+                }
+            }
+        },
+    )
+
+    collected = web._collect_web_attention_items(
+        s,
+        ["alpha", "beta"],
+        None,
+    )
+    internal = next(
+        item
+        for item in collected
+        if item["source"] == attention_mod.SOURCE_PROCESS_TREE_HOLD
+    )
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    wire = next(
+        item for item in payload["items"]
+        if item["id"] == "process_tree_hold:alpha"
+    )
+    assert wire == {
+        "id": internal["item_id"],
+        "source": "supervisor",
+        "source_label": "SUPERVISOR HOLD",
+        "severity": "high",
+        "title": internal["title"],
+        "agent": "alpha",
+        "detail": internal["why_it_matters"],
+        "recommendation": web._envelope_str(internal["recommendation"]),
+        "operator_command": internal["operator_command"],
+        "age_seconds": 0.0,
+        "human_can_unblock_now": True,
+    }
+    assert wire["operator_command"].endswith(
+        '--reason "attended teardown verified"'
+    )
+    assert "LIVE_NONCE" in wire["operator_command"]
+    console_source = (
+        Path(web.__file__).with_name("web_static") / "console.js"
+    ).read_text(encoding="utf-8")
+    assert "item.operator_command" in console_source
 
 
 def test_api_attention_hides_resolved_dead_letter_and_keeps_unresolved(

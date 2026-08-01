@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os as _os
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from agenttalk import store as store_mod
 from agenttalk.store import (
     COMPOSING_INTENT_STALE_SECONDS,
     CONTROL_KINDS,
@@ -1510,3 +1513,212 @@ def test_read_heartbeat_waiting_tolerate_torn_read(tmp_path: Path) -> None:
     # empty (caught mid-truncate) also reads as None, not a crash
     (s.state_dir / "codex-test.heartbeat").write_text("", encoding="utf-8")
     assert s.read_heartbeat("codex-test") is None
+
+
+# --------------------------------------- exact Windows owner identity teardown
+
+class _FakeWinCall:
+    def __init__(self, implementation):
+        self.implementation = implementation
+        self.restype = None
+        self.argtypes = None
+
+    def __call__(self, *args):
+        return self.implementation(*args)
+
+
+class _FakeOwnerIdentityKernel32:
+    def __init__(
+        self,
+        *,
+        handle: int = 404,
+        exit_code: int = 259,
+        creation_filetime: int = 134_116_392_315_000_000,
+        exit_query_ok: bool = True,
+        times_query_ok: bool = True,
+    ) -> None:
+        self.opened: list[tuple[int, bool, int]] = []
+        self.closed: list[int] = []
+        self.times_queries = 0
+
+        def open_process(access: int, inherit: bool, pid: int) -> int:
+            self.opened.append((access, inherit, pid))
+            return handle
+
+        def get_exit_code(_handle: int, code) -> bool:
+            code._obj.value = exit_code
+            return exit_query_ok
+
+        def get_process_times(
+            _handle: int,
+            creation,
+            _exit_time,
+            _kernel_time,
+            _user_time,
+        ) -> bool:
+            self.times_queries += 1
+            creation._obj.dwHighDateTime = creation_filetime >> 32
+            creation._obj.dwLowDateTime = creation_filetime & 0xFFFFFFFF
+            return times_query_ok
+
+        def close_handle(open_handle: int) -> bool:
+            self.closed.append(open_handle)
+            return True
+
+        self.OpenProcess = _FakeWinCall(open_process)
+        self.GetExitCodeProcess = _FakeWinCall(get_exit_code)
+        self.GetProcessTimes = _FakeWinCall(get_process_times)
+        self.CloseHandle = _FakeWinCall(close_handle)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "creation_filetime", "expected_gone"),
+    [
+        (259, 134_116_392_315_000_000, False),
+        (259, 134_116_392_315_000_001, True),
+        (0, 134_116_392_315_000_000, True),
+    ],
+)
+def test_windows_exact_owner_identity_uses_one_handle(
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int,
+    creation_filetime: int,
+    expected_gone: bool,
+) -> None:
+    kernel32 = _FakeOwnerIdentityKernel32(
+        exit_code=exit_code,
+        creation_filetime=creation_filetime,
+    )
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32,
+                        raising=False)
+    monkeypatch.setattr(store_mod, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        store_mod,
+        "_process_liveness",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("rounded fallback used")),
+    )
+
+    assert store_mod._owner_identity_gone(
+        321,
+        "2026-07-04T07:20:31.500000Z",
+        "134116392315000000",
+    ) is expected_gone
+    assert kernel32.opened == [(0x1000, False, 321)]
+    assert kernel32.closed == [404]
+    assert kernel32.times_queries == (1 if exit_code == 259 else 0)
+
+
+@pytest.mark.parametrize(
+    ("handle", "last_error", "exit_query_ok", "times_query_ok", "expected_gone"),
+    [
+        (0, 87, True, True, True),
+        (0, 5, True, True, False),
+        (404, 0, False, True, False),
+        (404, 0, True, False, False),
+    ],
+)
+def test_windows_exact_owner_identity_probe_ambiguity_is_conservative(
+    monkeypatch: pytest.MonkeyPatch,
+    handle: int,
+    last_error: int,
+    exit_query_ok: bool,
+    times_query_ok: bool,
+    expected_gone: bool,
+) -> None:
+    kernel32 = _FakeOwnerIdentityKernel32(
+        handle=handle,
+        exit_query_ok=exit_query_ok,
+        times_query_ok=times_query_ok,
+    )
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32,
+                        raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error, raising=False)
+    monkeypatch.setattr(store_mod, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        store_mod,
+        "_process_liveness",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("rounded fallback used")),
+    )
+
+    assert store_mod._owner_identity_gone(
+        321,
+        "2026-07-04T07:20:31.500000Z",
+        "134116392315000000",
+    ) is expected_gone
+    assert kernel32.closed == ([404] if handle else [])
+
+
+def test_windows_exact_owner_identity_rejects_malformed_expected_filetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("malformed identity opened a process")
+        ),
+        raising=False,
+    )
+
+    assert store_mod._windows_owner_identity_gone_exact(321, "not-a-filetime") is False
+
+
+def test_owner_identity_exact_probe_never_falls_back_to_rounded_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(store_mod, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        store_mod,
+        "_windows_owner_identity_gone_exact",
+        lambda _pid, _start_filetime: False,
+    )
+    monkeypatch.setattr(
+        store_mod,
+        "_process_liveness",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("rounded fallback used")),
+    )
+
+    assert store_mod._owner_identity_gone(
+        321,
+        "2026-07-04T07:20:31.500000Z",
+        "134116392315000000",
+    ) is False
+
+
+def test_owner_identity_linux_token_ignores_incidental_filetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(store_mod, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(store_mod, "_process_liveness", lambda _pid: store_mod.PROC_ALIVE)
+    monkeypatch.setattr(
+        store_mod,
+        "_process_start_token",
+        lambda _pid: "linux:12345678-1234-1234-1234-123456789abc:2",
+    )
+    monkeypatch.setattr(
+        store_mod,
+        "_windows_owner_identity_gone_exact",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("Windows probe used")),
+    )
+
+    assert store_mod._owner_identity_gone(
+        321,
+        "linux:12345678-1234-1234-1234-123456789abc:1",
+        "134116392315000000",
+    ) is True
+
+
+def test_owner_identity_two_argument_call_stays_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(store_mod, "_process_liveness", lambda _pid: store_mod.PROC_ALIVE)
+    monkeypatch.setattr(
+        store_mod,
+        "_process_start_token",
+        lambda _pid: "linux:12345678-1234-1234-1234-123456789abc:2",
+    )
+
+    assert store_mod._owner_identity_gone(
+        321,
+        "linux:12345678-1234-1234-1234-123456789abc:1",
+    ) is True

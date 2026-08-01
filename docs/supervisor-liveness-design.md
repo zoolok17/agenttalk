@@ -1,5 +1,8 @@
 # Design: supervisor liveness-model redesign (0.28.1 blocker)
 
+Audience: supervisor operators and contributors maintaining process ownership
+and recovery.
+
 Status: draft (design-review round 5 — codex round-4 classifier fix folded in)
 Date: 2026-06-18
 Author: claude-agenttalk-developer-2
@@ -55,8 +58,11 @@ Per agent the supervisor tracks:
   Used ONLY during the launch grace window; its death is expected, not failure.
 - `brain_pid` — the discovered long-lived Codex TUI process. **This is THE
   managed PID; it is MANDATORY for a `healthy` classification.**
-- `managed_pids` — last-seen descendant set (command-runner(s) + the
-  `wait`/python). Used for the recursive kill and zombie detection.
+- `managed_pids` — legacy/manual-agent descendant provenance. Wrapped agents do
+  not use this unbounded channel for teardown authority.
+- `owned_process_tree` — the wrapped-agent, strict bounded projection described
+  below. It carries parent edges, roles, discovery times, truncation evidence,
+  wrapper generation, and the launch nonce.
 - `resume_available` — whether this agent has reached readiness in its isolated
   `CODEX_HOME` at least once (so `resume --last` is safe). Replaces the Codex
   rollout-UUID `session_id`, which the round-3 ruling DROPPED (isolated home
@@ -90,8 +96,34 @@ backoff_next_epoch, healthy_since, consumed_rids, last_warn_epoch}` to:
       "launcher_start":    "2026-06-18T08:50:11.0Z",   // start-time, anti-reuse
       "brain_pid":         20480,                       // null until discovered
       "brain_start":       "2026-06-18T08:50:43.0Z",
-      "managed_pids":      [ {"pid": 25080, "start": "...", "last_seen": 1718700750.0, "kind": "wait"},
-                             {"pid": 25012, "start": "...", "last_seen": 1718700750.0, "kind": "runner"} ],
+      "managed_pids":      [],
+      "owned_process_tree": {
+        "schema_version": 2,
+        "attribution_model": "owned_process_tree_v2",
+        "agent": "codex-test",
+        "root_key": "d:\\projects\\example",
+        "status": "complete",
+        "reason_code": null,
+        "limit": 64,
+        "observed_count": 4,
+        "recorded_count": 4,
+        "omitted_count": 0,
+        "truncated": false,
+        "refreshed_at": "2026-06-18T08:51:00.000000Z",
+        "wrapper_generation": "wrapper-1",
+        "launch_nonce": "0123456789abcdef0123456789abcdef",
+        "entries": [
+          {"pid": 19904, "start": "...", "start_filetime": "...",
+           "role": "wrapper", "parent_pid": 1000, "discovered_at": "..."},
+          {"pid": 20100, "start": "...", "start_filetime": "...",
+           "role": "cli_launcher", "parent_pid": 19904, "discovered_at": "..."},
+          {"pid": 20480, "start": "...", "start_filetime": "...",
+           "role": "cli_brain", "parent_pid": 20100, "discovered_at": "..."},
+          {"pid": 25080, "start": "...", "start_filetime": "...",
+           "role": "tool_descendant", "parent_pid": 20480,
+           "discovered_at": "..."}
+        ]
+      },
       "launching":         false,                       // in grace?
       "launch_grace_until": 0.0,                        // epoch; >now => in grace
       "last_launch_epoch": 1718700611.0,
@@ -116,15 +148,76 @@ backoff_next_epoch, healthy_since, consumed_rids, last_warn_epoch}` to:
 ```
 
 `launched` (today's boolean) is subsumed by `brain_pid != null || launching`.
-Back-compat: a state file from the old schema is read with all new fields
-defaulting (`brain_pid=null`, `launching=false`, `managed_pids=[]`,
-`readiness_seen=false`); the first poll re-discovers, so no migration step is
-required.
+An old wrapped state is not silently rewritten. Its `managed_pids`,
+`brain_pid`, and launcher identities are retained as bounded, non-authoritative
+migration evidence, and automatic teardown is HOLD until an attended new
+wrapper generation earns the strict tree. This is necessary because the old
+traversal stopped at shell hosts and therefore cannot prove that a reparented
+tool descendant is absent.
 
-`managed_pids` freshness (codex Q6): re-derived from the snapshot EVERY poll and
-persisted whenever the set changes, each row carrying `start` (anti-reuse) and
-`last_seen` (epoch). A stale `managed_pids` entry is only ever used as a
-cleanup/kill fallback, always start-time-guarded, never as a liveness signal.
+For manual agents, `managed_pids` remains the legacy provenance channel. For
+wrapped agents, each poll re-derives `owned_process_tree` from triple agreement:
+supervisor state, the strict wrapper-runtime record, and the live wrapper must
+match on PID/start identity, wrapper generation, and launch nonce. The nonce is
+re-read from the live wrapper command line; process names and command-line
+patterns never establish descendant ownership.
+
+The closed role taxonomy also reserves `detached_gate_runner` for a future
+#121-style gate job that is deliberately bounded, owned, and allowed to outlive
+the wrapped turn that launched it. The role must come from an explicit
+registration bound to the job's exact PID/start plus the owning wrapper's
+generation and launch nonce; neither a process name nor a command-line pattern
+may assign it, and the label alone grants no teardown authority. Until that
+registration path exists, ordinary discovery records every such process as
+`tool_descendant`.
+
+This reservation does not implement the detached runner or change the turn
+watchdog. That later implementation must make the registered job attributable
+and reapable through this tree, exclude it from the watchdog's hung-tool test,
+and write durable SHA-bound terminal evidence for every outcome, including a
+job timeout or kill. A timeout must never reproduce the no-artifact failure
+mode tracked by #88.
+
+The wrapped tree crosses shell hosts and records at most 64 parent-first
+identities. A complete record alone supplies start-guarded `kill_targets` to the
+existing `Stop-Tree`. Invalid evidence or any omitted identity produces a HOLD
+and no automatic teardown. It also produces a durable, nondismissible
+`process_tree_hold` item visible in `agenttalk attention` and the dashboard.
+The item tells the operator to inspect or reduce the tree and to verify every
+PID/start identity plus the live launch nonce before an attended teardown. A
+truncated or invalid record is sticky: a later smaller poll does not clear it.
+The operator records the boundary with the explicit hash/nonce-bound ownership
+reset only after the attended identity check, then starts a new wrapper
+generation. The item remains visible in `agenttalk attention` and the
+dashboard, so exceeding the cap cannot fade into silent, permanent automation
+immunity. One-shot ephemeral reviewers use the same refresh and HOLD rules;
+their freshly complete tree is saved before the existing `Stop-Tree` is allowed
+to run.
+
+When a fresh snapshot proves every identity in a previously complete tree
+absent or definitively recycled, the record becomes `status=absent`. It retains
+the bounded historical identities, generation, nonce, and refreshed proof time
+as a no-kill absence certificate. A present PID with unreadable start evidence,
+or a missing live FILETIME when one was recorded, is ambiguous and becomes
+invalid HOLD instead. The post-kill launch barrier checks both exact historical
+identities and newly observed descendant edges rooted at any recorded PID.
+
+On Windows, `cli_launcher_lifetime` is nullable. When present it is an
+all-or-nothing retained-handle certificate: source plus positive decimal
+creation and exit FILETIMEs, with creation strictly before exit. Authoritative
+`complete`/`absent` Windows tree entries require a positive decimal
+`start_filetime`. `invalid`/`truncated` HOLD entries may retain null so their
+failure evidence stays readable, but null grants no identity authority. Linux
+boot-ID/start-ticks tokens are exact without FILETIME. If prior proof recorded
+a FILETIME, a current row missing it is ambiguous. A previous complete tree may
+bridge an exited intermediate process only for the same wrapper generation and
+launch nonce, with the exact previously recorded child identity and parent
+edge. A new or reparented child invalidates the tree.
+
+For `status=complete|absent|truncated`, `wrapper_generation` and `launch_nonce`
+are required, non-null identity values. An `invalid` HOLD may store either as
+`null` when that missing proof is itself the reason teardown was refused; null
+never supplies ownership or kill authority.
 
 New per-CLI config (in `supervisor.json`, defaults baked at `--init`):
 `requires_brain_pid` (Codex `true`; Claude `true` until Phase 2 — see §CLI),
@@ -144,11 +237,16 @@ each poll and hands it to Python as part of the state (alongside the existing
 ```jsonc
 { "pid": 25080, "parent_pid": 20480, "name": "python.exe",
   "command_line": "...agenttalk wait --for codex-test...",
-  "start_time": "2026-06-18T08:50:44.0Z" }
+  "start_time": "2026-06-18T08:50:44.0Z",
+  "start_filetime": "133947102440000000" }
 ```
 
 `.ps1` helper `Get-ProcSnapshot` uses `Get-CimInstance Win32_Process`
-(`ProcessId`, `ParentProcessId`, `Name`, `CommandLine`, `CreationDate`).
+(`ProcessId`, `ParentProcessId`, `Name`, `CommandLine`, `CreationDate`) plus one
+batched `Get-Process` read. It accepts only a live handle whose exact creation
+FILETIME is within CIM's sub-microsecond formatting loss, then records the
+handle's exact FILETIME in `start_filetime`. It never performs one
+`Get-Process -Id` lookup per snapshot row.
 Note from the live test: Codex's *sandboxed* `Get-CimInstance` was DENIED, but
 the EXTERNAL supervisor runs unsandboxed and has permission — we design for the
 real supervisor context.
@@ -209,6 +307,12 @@ window.
 
 The table is evaluated TOP-DOWN; the first matching row wins (so the
 readiness-failed row is reached before `ACTIVE_OR_BUSY`).
+
+For wrapped agents, the owned-tree gate precedes this table and the manual
+restart-marker branch. `status=invalid|truncated` returns `WARN_ONLY` with
+`PROCESS_TREE_INVALID` or `PROCESS_TREE_TRUNCATED`, no targets, and no marker
+consumption. `CLI_CHILD_UNKNOWN` applies only after this process-authority gate
+passes.
 
 | State            | Condition (first match wins, top-down)                           | Action |
 |------------------|------------------------------------------------------------------|--------|
@@ -275,11 +379,20 @@ State machine (transitions):
 ### Classify (the table above) — pure Python in `plan_actions`.
 
 ### Kill path (executor, on STUCK / ZOMBIE_WAIT / failed-grace)
-Recursive process-tree kill rooted at `brain_pid` + recorded `managed_pids` +
-any matching orphan `agenttalk wait --for <agent>` (matched by command line).
-**Leaves first, brain last.** Verify none remain (re-snapshot) before
-relaunch. Each kill checks start-time to avoid killing a reused PID. NOT a Job
-Object in v1.
+For wrapped agents, a complete `owned_process_tree` supplies the only automatic
+teardown targets. The executor passes those parent-first targets to the existing
+`Stop-Tree`, which kills **leaves first** and skips an identity when its live
+start time differs. Command-line or process-name matches cannot add a wrapped
+kill target. A truncated or invalid record instead creates `WARN_ONLY`/HOLD
+state plus the operator-visible attention item described above. Manual-agent
+legacy recovery retains its existing provenance behavior. This is not a Job
+Object.
+
+Ephemeral wrapped reviewers are not an exception: command-line/name matches and
+legacy launch-delta `managed_pids` cannot authorize their teardown. Completion,
+timeout, or wrapper exit remains HOLD until that same poll freshly revalidates a
+complete tree. The generated executor persists the resulting ephemeral state
+before calling the existing `Stop-Tree`, then archives and retires the reviewer.
 
 ### Resume (per-agent isolated CODEX_HOME + `resume --last` — codex round-3 ruling)
 
@@ -428,8 +541,42 @@ un-monitorable launcher, exactly the handoff storm we are fixing).
   `launch.windows_args` (the merged layer) stay. New config knobs:
   `launch_grace_seconds` (default 120), `brain_pattern`, `requires_brain_pid`,
   `codex_home_isolation` (per-CLI defaults baked at `--init`).
-- `supervisor-state.json` old-schema files load with new fields defaulted;
-  first poll re-discovers. No migration.
+- `supervisor-state.json` old-schema wrapped ownership is an attended migration,
+  not a rediscovery shortcut. Keep `supervisor.kill` present, stop the
+  supervisor, confirm the strict instance marker is absent, and verify/stop the
+  old wrapper tree by PID/start. Before stopping the wrapper, re-read its launch
+  nonce from the live command line and verify it matches the recorded nonce.
+  If the live wrapper is unavailable for that re-read, use manual repair, not
+  this reset. Use the current Attention item and that verified nonce:
+
+  ```powershell
+  agenttalk supervise --reset-process-tree-ownership --from <liaison> `
+    --for <agent> --hold-source-hash <64hex> `
+    --verified-launch-nonce <verified-launch-nonce> `
+    --acknowledge-no-live-supervisor `
+    --acknowledge-owned-processes-stopped `
+    --reason "attended owned-tree migration"
+  ```
+
+  The operation rechecks liaison/sole-lead authority, canonical state, the kill
+  switch, absent marker, current hash, matching nonce, strict runtime agreement
+  on wrapper PID/start/generation, and that every recorded PID/start is gone or
+  confidently recycled. It never kills or launches; it records a bounded reset
+  audit and, in that same state write, an exact runtime-record revocation bound
+  to its digest, PID/start, generation, and verified nonce. The unchanged
+  sidecar is ignored only at that attended boundary so it cannot recreate the
+  retired HOLD; a changed or new-generation record still takes the ordinary
+  fail-closed adoption path. Once a replacement launcher identity is recorded,
+  the retired sidecar no longer bypasses its live/unknown identity check; the
+  replacement remains HOLD until it publishes new runtime or is proved absent.
+  Missing nonce/reset evidence refuses and requires manual repair.
+  Keep the supervisor host stopped, remove `supervisor.kill`, then
+  refresh/validate generated scripts (`--refresh-scripts` refuses under the
+  kill switch), queue a restart, and resume supervision so the new generation
+  earns a complete tree. Unprovable legacy evidence remains a nondismissible
+  `process_tree_hold` in `agenttalk attention` and the dashboard until the reset
+  commits; automatic teardown authority returns only after the new generation
+  earns a complete tree.
 - If the snapshot is totally unavailable for a `requires_brain_pid` CLI, the
   supervisor FAILS CLOSED (`SNAPSHOT_UNAVAILABLE`): warn + operator notify, no
   kill, no relaunch (codex BLOCKER). The legacy single-PID `pid_alive` path is
@@ -523,8 +670,10 @@ sections above:
   `--snapshot-file`; never persisted into `next_state`. (§Process-snapshot,
   §plan_actions, §.ps1.)
 - **Q5:** resume ambiguity rule (see MAJOR; superseded by round-2 default below).
-- **Q6:** `managed_pids` re-derived every poll, persisted on change, with
-  `start` + `last_seen`; stale entries only a start-time-guarded kill fallback.
+- **Q6:** manual agents retain `managed_pids`; wrapped agents re-derive the
+  bounded `owned_process_tree` every poll. Only a complete nonce/generation/
+  PID-start-bound record authorizes the existing start-guarded `Stop-Tree`;
+  `absent` is a durable no-kill certificate and invalid/truncated records HOLD.
   (§State schema.)
 
 ## Design decisions (codex design-review round 2 — RESOLVED)

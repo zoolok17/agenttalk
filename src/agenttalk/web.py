@@ -2323,6 +2323,7 @@ def build_onboarding(desc: RootDescriptor, *,
 # Internal attention source -> the design's coarse wire source + label + severity.
 _ATTENTION_SOURCE_MAP: dict[str, tuple[str, str, str]] = {
     _attention.SOURCE_NEEDS_OPERATOR: ("escalation", "ESCALATION", "high"),
+    _attention.SOURCE_PROCESS_TREE_HOLD: ("supervisor", "SUPERVISOR HOLD", "high"),
     _attention.SOURCE_CONFIG_BLOCKED: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_GATE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_CLOSE_HOLD: ("gate", "GATE HOLD", "high"),
@@ -2362,6 +2363,15 @@ def _collect_web_attention_items(store: Store, roster: list[str],
         items += A.config_blocked_items(holds)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("config_blocked", str(e)))
+    try:
+        from agenttalk import supervisor as _supervisor
+
+        state = _supervisor.load_supervisor_state(
+            store.dir / "supervisor-state.json"
+        )
+        items += A.process_tree_hold_items(state)
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("process_tree_hold", str(e)))
     try:
         items += A.dead_letter_items(store.list_dead_letters())
     except Exception as e:  # noqa: BLE001
@@ -2542,6 +2552,18 @@ def build_attention(desc: RootDescriptor,
                 "age_seconds": float(it.get("age_seconds") or 0),
                 "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
             }
+            if (
+                src == _attention.SOURCE_PROCESS_TREE_HOLD
+                and it.get("recommendation")
+            ):
+                # Unlike answerable escalations, this HOLD has no mutation
+                # action. The remediation must therefore travel on the ordinary
+                # card even when dashboard actions are disabled.
+                entry["recommendation"] = _envelope_str(it.get("recommendation"))
+                if it.get("operator_command"):
+                    entry["operator_command"] = _operator_command_str(
+                        it.get("operator_command")
+                    )
             if actions_enabled:
                 action = _answer_action_for_item(it, for_agent)
                 if action is not None:
@@ -2600,6 +2622,7 @@ def build_attention(desc: RootDescriptor,
 # multi-paragraph prose can ride a field. Envelope summaries are short by design.
 _ENVELOPE_MAX = 300
 _ATTENTION_PROMPT_MAX = 1200
+_OPERATOR_COMMAND_MAX = 1000
 
 
 def _envelope_str(value: Any) -> str:
@@ -2611,6 +2634,19 @@ def _envelope_str(value: Any) -> str:
     if len(s) > _ENVELOPE_MAX:
         s = s[: _ENVELOPE_MAX - 1].rstrip() + "…"
     return s
+
+
+def _operator_command_str(value: Any) -> str:
+    """Return one complete, bounded operator command without body-like text."""
+    if not isinstance(value, str):
+        return ""
+    command = "".join(
+        char if ord(char) >= 32 else " "
+        for char in value.replace("\r", " ").replace("\n", " ")
+    ).strip()
+    if len(command) > _OPERATOR_COMMAND_MAX:
+        return ""
+    return command
 
 
 def _attention_prompt_excerpt(value: Any) -> str:

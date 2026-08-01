@@ -410,6 +410,259 @@ def _now() -> str:
     return "2026-06-01T00:00:00Z"
 
 
+def _process_tree_state(
+    *,
+    status: str,
+    reason_code: str | None,
+    observed_count: int = 65,
+) -> dict:
+    recorded_count = min(observed_count, 64)
+    omitted_count = observed_count - recorded_count
+    entries = [
+        {
+            "pid": 100 + index,
+            "start": f"linux:{'a' * 32}:{index + 1}",
+            "start_filetime": None,
+            "role": "wrapper" if index == 0 else "tool_descendant",
+            "parent_pid": 0 if index == 0 else 99 + index,
+            "discovered_at": "2026-06-01T00:00:00Z",
+        }
+        for index in range(recorded_count)
+    ]
+    return {
+        "agents": {
+            "worker": {
+                "launcher_pid": 100,
+                "launcher_start": f"linux:{'a' * 32}:1",
+                "launcher_nonce": "12345678-1234-4234-8234-123456789abc",
+                "runtime_wrapper_generation": "wrapper-1",
+                "owned_process_tree": {
+                    "schema_version": 2,
+                    "attribution_model": "owned_process_tree_v2",
+                    "agent": "worker",
+                    "root_key": "root-1",
+                    "status": status,
+                    "reason_code": reason_code,
+                    "limit": 64,
+                    "observed_count": observed_count,
+                    "recorded_count": recorded_count,
+                    "omitted_count": omitted_count,
+                    "truncated": omitted_count > 0,
+                    "refreshed_at": "2026-06-01T00:00:00Z",
+                    "wrapper_generation": "wrapper-1",
+                    "launch_nonce": "12345678-1234-4234-8234-123456789abc",
+                    "entries": entries,
+                }
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "reason_code", "observed_count", "expected_detail"),
+    [
+        ("truncated", "process_tree_truncated", 65, "observed 65 identities over cap 64"),
+        ("invalid", "duplicate_pid", 3, "invalid (duplicate_pid)"),
+    ],
+)
+def test_process_tree_hold_projects_blocking_operator_action(
+    status: str,
+    reason_code: str,
+    observed_count: int,
+    expected_detail: str,
+) -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status=status,
+            reason_code=reason_code,
+            observed_count=observed_count,
+        )
+    )[0]
+
+    assert item["item_id"] == "process_tree_hold:worker"
+    assert item["source"] == att.SOURCE_PROCESS_TREE_HOLD
+    assert item["state"] == "active"
+    assert item["advisory"] is False
+    assert item["human_can_unblock_now"] is True
+    assert item["priority"] == item["risk_severity"] == item["confidence"] == "high"
+    assert expected_detail in item["why_it_matters"]
+    assert "pid/start identity" in item["recommendation"]
+    assert "live wrapper launch nonce" in item["recommendation"]
+    assert item["operator_command"].startswith(
+        "agenttalk supervise --reset-process-tree-ownership"
+    )
+    assert f"--hold-source-hash {item['source_hash']}" in item["operator_command"]
+    assert "--verified-launch-nonce LIVE_NONCE" in (
+        item["operator_command"]
+    )
+    assert "--from LIAISON" in item["operator_command"]
+    assert "--acknowledge-owned-processes-stopped" in item["operator_command"]
+    assert "stored expected nonce is" in item["recommendation"]
+    assert item["source_refs"] == [{
+        "kind": "supervisor_state",
+        "agent": "worker",
+        "reason_code": reason_code,
+    }]
+
+    forged_dismiss = _disp(
+        item["item_id"],
+        item["source"],
+        att.ACTION_DISMISS,
+        item["source_hash"],
+    )
+    queue = att.build_queue([item], [forged_dismiss], now_iso=_now())
+    surfaced = queue["items"][0]
+    assert surfaced["state"] == "active"
+    assert "ignored_illegitimate_disposition" in surfaced["warnings"]
+
+
+def test_process_tree_hold_hash_binds_exact_tree_and_legacy_evidence() -> None:
+    state = _process_tree_state(
+        status="truncated",
+        reason_code="process_tree_truncated",
+    )
+    original = att.process_tree_hold_items(state)[0]["source_hash"]
+
+    state["agents"]["worker"]["owned_process_tree"]["entries"][1]["start"] = (
+        f"linux:{'b' * 32}:2"
+    )
+    changed_tree = att.process_tree_hold_items(state)[0]["source_hash"]
+    assert changed_tree != original
+
+    state["agents"]["worker"]["legacy_process_evidence"] = {
+        "schema_version": 1,
+        "status": "migration_hold",
+        "limit": 64,
+        "observed_count": 1,
+        "recorded_count": 1,
+        "omitted_count": 0,
+        "truncated": False,
+        "malformed_count": 0,
+        "source_hash": "a" * 64,
+        "entries": [{
+            "pid": 100,
+            "start": f"linux:{'a' * 32}:1",
+            "source": "wrapper",
+        }],
+    }
+    assert att.process_tree_hold_items(state)[0]["source_hash"] != changed_tree
+
+
+def test_process_tree_hold_omits_reset_command_without_exact_nonce_authority() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_nonce",
+        observed_count=1,
+    )
+    state["agents"]["worker"]["owned_process_tree"]["launch_nonce"] = None
+    item = att.process_tree_hold_items(state)[0]
+
+    assert "operator_command" not in item
+    assert "does not contain enough mutually agreeing" in item["recommendation"]
+
+
+def test_process_tree_hold_omits_reset_command_for_invalid_agent_key() -> None:
+    state = _process_tree_state(
+        status="truncated",
+        reason_code="process_tree_truncated",
+    )
+    row = state["agents"].pop("worker")
+    invalid_agent = "worker; Write-Output PWNED"
+    state["agents"][invalid_agent] = row
+
+    item = att.process_tree_hold_items(state)[0]
+
+    assert item["item_id"] == f"process_tree_hold:{invalid_agent}"
+    assert item["state"] == "active"
+    assert item["advisory"] is False
+    assert "operator_command" not in item
+    assert "does not contain enough mutually agreeing" in item["recommendation"]
+
+
+def test_process_tree_hold_projection_ignores_a_complete_record() -> None:
+    held = _process_tree_state(
+        status="truncated",
+        reason_code="process_tree_truncated",
+    )
+    assert att.process_tree_hold_items(held)
+
+    complete = _process_tree_state(
+        status="complete",
+        reason_code=None,
+        observed_count=4,
+    )
+    assert att.process_tree_hold_items(complete) == []
+
+
+def test_ephemeral_process_tree_hold_without_tree_is_operator_visible() -> None:
+    state = {
+        "ephemeral_reviewers": {
+            "active": {
+                "lr-missing-agent": {
+                    "process_tree_hold_reason": "ephemeral_agent_identity_missing",
+                },
+            },
+        },
+    }
+
+    item = att.process_tree_hold_items(state)[0]
+
+    assert item["item_id"] == "process_tree_hold:ephemeral:lr-missing-agent"
+    assert item["affected"] == ["lr-missing-agent"]
+    assert "ephemeral_agent_identity_missing" in item["why_it_matters"]
+    assert item["source_refs"] == [{
+        "kind": "supervisor_ephemeral_state",
+        "agent": "lr-missing-agent",
+        "request_id": "lr-missing-agent",
+        "reason_code": "ephemeral_agent_identity_missing",
+    }]
+
+    no_hold_reason = {
+        "ephemeral_reviewers": {
+            "active": {"lr-launch-window": {"owned_process_tree": None}},
+        },
+    }
+    assert att.process_tree_hold_items(no_hold_reason) == []
+
+    malformed_reason = {
+        "ephemeral_reviewers": {
+            "active": {
+                "lr-corrupt": {
+                    "owned_process_tree": {"status": "complete"},
+                    "process_tree_hold_reason": {"bad": "shape"},
+                },
+            },
+        },
+    }
+    malformed_item = att.process_tree_hold_items(malformed_reason)[0]
+    assert "process_tree_hold_reason_invalid" in malformed_item["why_it_matters"]
+
+
+def test_ephemeral_process_tree_cap_hold_is_operator_visible() -> None:
+    state = _process_tree_state(
+        status="truncated",
+        reason_code="process_tree_truncated",
+        observed_count=65,
+    )
+    row = state["agents"].pop("worker")
+    row["agent"] = "adversary-lr-cap"
+    row["owned_process_tree"]["agent"] = "adversary-lr-cap"
+    state["ephemeral_reviewers"] = {"active": {"lr-cap": row}}
+
+    item = att.process_tree_hold_items(state)[0]
+
+    assert item["item_id"] == "process_tree_hold:ephemeral:lr-cap"
+    assert item["affected"] == ["adversary-lr-cap"]
+    assert "observed 65 identities over cap 64" in item["why_it_matters"]
+    assert "`agenttalk attention`" in item["recommendation"]
+    assert item["source_refs"] == [{
+        "kind": "supervisor_ephemeral_state",
+        "agent": "adversary-lr-cap",
+        "request_id": "lr-cap",
+        "reason_code": "process_tree_truncated",
+    }]
+
+
 def test_needs_operator_item_carries_typed_fields_and_surfaces_malformed() -> None:
     good = att.needs_operator_items([{"request_id": "esc-1", "subject": "ship?",
         "sender": "beta", "age_seconds": 10,

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.80.0] - 2026-07-31
+
+Theme: **a watchdog kill must fail the turn.** Scoped down from four items to one during the release
+round: the three supervisor items originally declared for 0.80.0 (kill-switch startup persistence,
+the supervisor-state lock, wrapper stdout/stderr capture) each produced a *growing* count of confirmed
+independent-review findings rather than a shrinking one, so they ship in 0.81.0 after they converge
+instead of half-converged here. The same split discipline already applied to the recovery-authority
+design. The item that did ship is the one measured to cost the most in the field.
+
+### Fixed
+
+- **A watchdog-killed turn now unwinds into a terminal outcome instead of wedging the wrapper it
+  was protecting.** When the per-turn watchdog killed a hung tool tree, the wrapper froze at
+  `phase=active` with no terminal record: the turn was never failed, never reported and never
+  released, so the agent stayed silently unavailable until an operator noticed and reset it by
+  hand. The shutdown path already wrote the correct terminal record; the watchdog path simply
+  skipped it. Measured ten times in production before the fix, each identifiable by
+  `last_progress_at - cli_launcher_start` landing within a few seconds of the 1800s turn cap.
+  Two defects found by independent review during the fix are included: a *reported* kill is no
+  longer treated as an exit confirmation (the wake now waits for confirmed root exit), and the
+  watchdog stays armed through that confirmation, so a root that closes stdout while remaining
+  alive and hung can still be reached.
+
 ### Changed
 
 - **The lead skill now requires reading the code host's AUTOMATED review findings as a gate
@@ -18,7 +41,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commits, so the anchor alone does not distinguish a new finding from a carried-over one.
   Each finding now requires a per-finding disposition citing code.
 
+- **CI supersedes stale runs instead of queueing an additional full matrix per push**
+  (contributor-facing; no runtime effect). Both workflows now declare a concurrency group keyed
+  on workflow and ref. `master` is deliberately exempt from cancellation so that a release-gating
+  or version-ratchet run is never killed by a following push.
+
 ### Fixed
+
+- **Wrapped supervisor recovery now requires a bounded, identity-verified owned
+  process tree.** Each poll records at most 64 parent-linked identities with
+  explicit wrapper, launcher, brain, and tool-descendant roles. Ownership is
+  anchored by matching supervisor state, wrapper-runtime generation, live
+  pid/start identity, and a launch nonce re-read from the live wrapper command
+  line; process names never authorize teardown. Windows launcher handoff uses a
+  nullable, generation-fenced `GetProcessTimes` lifetime certificate; when that
+  certificate is present, an exited launcher's first child must carry an exact
+  FILETIME strictly inside the launcher's creation/exit interval. Authoritative
+  `complete`/`absent` Windows tree entries require an exact `start_filetime`;
+  `invalid`/`truncated` HOLD entries may retain null as readable failure
+  evidence, but null grants no identity authority. Linux boot-ID/start-ticks
+  tokens are exact without FILETIME. A missing current FILETIME is ambiguous
+  when the prior identity recorded one. A prior complete tree can bridge an
+  exited intermediate process only for the same generation and nonce, with the
+  exact previously recorded child identity and parent edge; a new or reparented
+  child fails closed. A complete tree feeds the existing leaves-first `Stop-Tree`.
+  An invalid or truncated tree takes precedence over restart markers and
+  child-liveness verdicts, grants no automatic kill authority, and creates a
+  durable, nondismissible supervisor HOLD in `agenttalk attention` and the
+  dashboard. Invalid/truncated evidence stays sticky until an operator stops the
+  supervisor and owned processes, proves the recorded identities gone or
+  recycled, and runs the hash/nonce-bound attended ownership reset. That reset
+  atomically retires only the exact old runtime record by digest plus
+  PID/start/generation/nonce, so its unchanged sidecar cannot recreate the HOLD
+  while a genuinely new record still follows normal adoption; the next launch
+  must earn a new wrapper generation and tree. An all-gone snapshot
+  preserves an `absent` identity certificate with no kill authority; unreadable
+  start identity, missing exact FILETIME where prior proof requires one, or a
+  child spawned after planning blocks the post-kill launch barrier. Legacy
+  wrapped `managed_pids`, launcher, and brain identities remain bounded
+  migration evidence until that attended boundary, rather than being silently
+  discarded. One-shot ephemeral reviewers use the same checked tree and persist
+  it before teardown; their legacy command-line/name kill path has been removed.
+  The closed taxonomy also reserves `detached_gate_runner` for a future,
+  bounded gate job registered by its exact PID/start plus the owning wrapper's
+  generation and launch nonce. Current discovery never infers that role from a
+  name or command line, and the label alone grants no authority. Detached
+  execution, watchdog exclusion, and mandatory SHA-bound terminal evidence,
+  including timeout and kill results, remain the separate #121 implementation.
 
 - **Coverage evidence now preserves the zero-runtime-dependency boundary without taking
   custody of report files.** Attestation accepts only a recognized coverage.py/pytest-cov

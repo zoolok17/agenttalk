@@ -143,6 +143,68 @@ _COORDINATION_BARRIER_FIELDS = frozenset({
     "last_observed_epoch",
     "consecutive_blocked_polls",
 })
+_OWNED_PROCESS_TREE_SCHEMA = 2
+_OWNED_PROCESS_TREE_MODEL = "owned_process_tree_v2"
+_OWNED_PROCESS_TREE_LIMIT = 64
+_LEGACY_PROCESS_EVIDENCE_SCHEMA = 1
+_REVOKED_WRAPPER_RUNTIME_SCHEMA = 1
+_OWNED_PROCESS_TREE_ROLES = frozenset({
+    "wrapper",
+    "cli_launcher",
+    "cli_brain",
+    "tool_descendant",
+    # #121 reservation only: never infer this label or use it alone for watchdog
+    # exclusion. Registration must bind the job's exact PID/start plus the owning
+    # wrapper's generation/nonce; every terminal outcome, including timeout/kill,
+    # must write durable SHA-bound evidence.
+    "detached_gate_runner",
+})
+_OWNED_PROCESS_TREE_STATUSES = frozenset({
+    "complete",
+    "absent",
+    "truncated",
+    "invalid",
+})
+_SAFE_WRAPPER_GENERATION_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z"
+)
+_OWNED_PROCESS_TREE_FIELDS = frozenset({
+    "schema_version",
+    "attribution_model",
+    "agent",
+    "root_key",
+    "status",
+    "reason_code",
+    "limit",
+    "observed_count",
+    "recorded_count",
+    "omitted_count",
+    "truncated",
+    "refreshed_at",
+    "wrapper_generation",
+    "launch_nonce",
+    "entries",
+})
+_OWNED_PROCESS_TREE_ENTRY_FIELDS = frozenset({
+    "pid",
+    "start",
+    "start_filetime",
+    "role",
+    "parent_pid",
+    "discovered_at",
+})
+_REVOKED_WRAPPER_RUNTIME_FIELDS = frozenset({
+    "schema_version",
+    "agent",
+    "root_key",
+    "wrapper_pid",
+    "wrapper_start",
+    "wrapper_generation",
+    "launch_nonce",
+    "runtime_record_digest",
+    "hold_source_hash",
+    "revoked_at",
+})
 _EXPLICIT_UNAVAILABLE_HEALTH = frozenset({
     health_model.STATE_RATE_LIMITED_OR_OUTAGE,
     health_model.STATE_ERRORED_POISON,
@@ -1941,7 +2003,8 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
 # managed descendant set for a tree-kill. All pure - no OS calls - so the whole
 # liveness/classification path is unit-tested from hand-built snapshots.
 #
-# A snapshot is a LIST of rows {pid, parent_pid, name, command_line, start_time}.
+# A snapshot is a LIST of rows
+# {pid, parent_pid, name, command_line, start_time, start_filetime}.
 # ``snapshot is None`` means UNAVAILABLE (capture failed) - distinct from an
 # empty list (captured, nothing matched). command_line may be missing/empty
 # (access-limited): we then degrade to name+ancestry only and NEVER match/kill a
@@ -1950,14 +2013,118 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
 def _snap_index(snapshot: list[dict] | None) -> dict[int, dict]:
     idx: dict[int, dict] = {}
     for row in snapshot or []:
+        if not isinstance(row, dict):
+            continue
         pid = row.get("pid")
         if isinstance(pid, int):
             idx[pid] = row
     return idx
 
 
+def _snapshot_pid_integrity_error(snapshot: list[dict]) -> str | None:
+    """Validate the PID/parent graph before any last-row-wins indexing.
+
+    Snapshot rows are evidence used to prove both ownership and absence.  A
+    duplicate PID makes the result depend on row order, while an invalid PID or
+    parent can hide an edge.  Either condition must therefore fail closed.
+    """
+    duplicate_pid = False
+    seen: set[int] = set()
+    for row in snapshot:
+        if not isinstance(row, dict):
+            return "invalid_process_row"
+        pid = row.get("pid")
+        parent_pid = row.get("parent_pid")
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(parent_pid, int)
+            or isinstance(parent_pid, bool)
+            or parent_pid < 0
+        ):
+            return "invalid_process_row"
+        if pid in seen:
+            duplicate_pid = True
+        seen.add(pid)
+    return "duplicate_pid" if duplicate_pid else None
+
+
 def _start_of(row: dict | None):
     return (row or {}).get("start_time")
+
+
+def _filetime_of(row: dict | None) -> str | None:
+    value = (row or {}).get("start_filetime")
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,19}", value):
+        return value
+    return None
+
+
+def _filetime_start_token(value: object) -> str | None:
+    """Render exact Windows creation ticks as a comparable ISO start token."""
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[1-9][0-9]{0,19}", value) is None
+    ):
+        return None
+    try:
+        seconds = (int(value) / 10_000_000.0) - 11_644_473_600
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _filetime_identity_matches(row: dict | None, expected: object) -> bool:
+    """Check companion FILETIME only when the row uses Windows ISO identity."""
+    start_key = _start_order_key(_start_of(row))
+    if start_key is not None and start_key[0] != "iso":
+        # Linux boot-id/start-ticks is already exact. A stale incidental
+        # FILETIME-shaped field must not override the platform identity.
+        return True
+    if expected is None:
+        return True
+    return isinstance(expected, str) and _filetime_of(row) == expected
+
+
+def _has_exact_start_identity(row: dict | None) -> bool:
+    """Whether a snapshot row carries its platform's exact start identity."""
+    key = _start_order_key(_start_of(row))
+    if key is None:
+        return False
+    # Win32_Process exposes a rounded ISO timestamp, so Windows additionally
+    # needs the kernel FILETIME. Linux's boot-id/start-ticks token is already
+    # exact and intentionally has no FILETIME companion.
+    return key[0] != "iso" or _filetime_of(row) is not None
+
+
+def _exact_start_order_key_values(
+    start: object,
+    start_filetime: object,
+) -> tuple[str, int | float] | None:
+    """Return a platform-exact process-start key when one was captured."""
+    key = _start_order_key(start)
+    if key is None:
+        return None
+    if key[0] != "iso":
+        # Linux's boot-id/start-ticks token is already exact. Ignore any stale
+        # FILETIME-shaped field rather than changing the token's platform.
+        return key
+    if (
+        isinstance(start_filetime, str)
+        and re.fullmatch(r"[1-9][0-9]{0,19}", start_filetime)
+    ):
+        return ("win32-filetime", int(start_filetime))
+    return None
+
+
+def _exact_start_order_key(
+    row: dict | None,
+) -> tuple[str, int | float] | None:
+    """Comparable exact process-start key, never a rounded Windows timestamp."""
+    return _exact_start_order_key_values(_start_of(row), _filetime_of(row))
 
 
 def _iso_epoch(value) -> float | None:
@@ -2024,11 +2191,11 @@ def _start_tokens_match(observed, expected) -> bool:
 
 def _start_order_key(value: object) -> tuple[str, int | float] | None:
     """Comparable process-start key for known snapshot/token schemes."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 256:
+        return None
     epoch = _iso_epoch(value)
     if epoch is not None:
         return ("iso", epoch)
-    if not isinstance(value, str):
-        return None
     match = re.fullmatch(
         r"linux:([0-9a-fA-F-]{32,64}):([0-9]+)",
         value.strip(),
@@ -2036,7 +2203,1107 @@ def _start_order_key(value: object) -> tuple[str, int | float] | None:
     if match is None:
         return None
     boot_id, ticks = match.groups()
-    return (f"linux:{boot_id.casefold()}", int(ticks))
+    try:
+        return (f"linux:{boot_id.casefold()}", int(ticks))
+    except ValueError:
+        return None
+
+
+def _strict_start_order_reason(
+    parent_start: object,
+    parent_filetime: object,
+    child_start: object,
+    child_filetime: object,
+) -> str | None:
+    """Return why a child does not start strictly after its parent."""
+    parent_key = _exact_start_order_key_values(parent_start, parent_filetime)
+    child_key = _exact_start_order_key_values(child_start, child_filetime)
+    if parent_key is None or child_key is None:
+        # Rounded chronology remains useful for structural diagnostics when an
+        # exact Windows identity could not be captured. Live-tree construction
+        # marks that row invalid, while validation permits it only in durable
+        # invalid/truncated HOLD evidence; this fallback grants no authority.
+        parent_key = _start_order_key(parent_start)
+        child_key = _start_order_key(child_start)
+    if parent_key is None or child_key is None:
+        return "unparseable_start_edge"
+    if parent_key[0] != child_key[0]:
+        return "incomparable_start_edge"
+    if child_key[1] == parent_key[1]:
+        return "equal_start_edge"
+    if child_key[1] < parent_key[1]:
+        return "inverted_start_edge"
+    return None
+
+
+def _strict_owned_child_edge(parent: dict, child: dict) -> str | None:
+    """Return a reason code unless ``child`` is a strict live child of ``parent``."""
+    if child.get("parent_pid") != parent.get("pid"):
+        return "parent_mismatch"
+    return _strict_start_order_reason(
+        _start_of(parent),
+        _filetime_of(parent),
+        _start_of(child),
+        _filetime_of(child),
+    )
+
+
+def _valid_wrapper_generation(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and _SAFE_WRAPPER_GENERATION_RE.fullmatch(value) is not None
+    )
+
+
+def _utc_epoch(value: object) -> float | None:
+    """Return an epoch only for an explicit UTC timestamp."""
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed.utcoffset().total_seconds() != 0
+    ):
+        return None
+    epoch = parsed.timestamp()
+    return epoch if math.isfinite(epoch) else None
+
+
+def _wrapper_runtime_record_digest(record: dict) -> str:
+    """Bind an attended reset to one exact validated runtime observation."""
+    public_record = {
+        key: value
+        for key, value in record.items()
+        if not key.startswith("_")
+    }
+    payload = json.dumps(
+        public_record,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _valid_revoked_wrapper_runtime(
+    value: object,
+    *,
+    agent: str,
+    root_key: str | None,
+) -> dict | None:
+    """Return one strict attended-reset runtime revocation boundary."""
+    if (
+        not isinstance(value, dict)
+        or frozenset(value) != _REVOKED_WRAPPER_RUNTIME_FIELDS
+        or not isinstance(value.get("schema_version"), int)
+        or isinstance(value.get("schema_version"), bool)
+        or value.get("schema_version") != _REVOKED_WRAPPER_RUNTIME_SCHEMA
+        or value.get("agent") != agent
+        or not isinstance(root_key, str)
+        or not root_key
+        or value.get("root_key") != root_key
+        or not isinstance(value.get("wrapper_pid"), int)
+        or isinstance(value.get("wrapper_pid"), bool)
+        or value["wrapper_pid"] <= 0
+        or _start_order_key(value.get("wrapper_start")) is None
+        or not _valid_wrapper_generation(value.get("wrapper_generation"))
+        or not _valid_launch_nonce(value.get("launch_nonce"))
+        or not isinstance(value.get("runtime_record_digest"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            value["runtime_record_digest"],
+        ) is None
+        or not isinstance(value.get("hold_source_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["hold_source_hash"]) is None
+        or _utc_epoch(value.get("revoked_at")) is None
+    ):
+        return None
+    return copy.deepcopy(value)
+
+
+def _runtime_record_is_revoked(record: dict, boundary: dict) -> bool:
+    """Match only the exact runtime record retired by an attended reset."""
+    return (
+        record.get("wrapper_pid") == boundary.get("wrapper_pid")
+        and _start_tokens_match(
+            record.get("wrapper_start"),
+            boundary.get("wrapper_start"),
+        )
+        and record.get("wrapper_generation")
+        == boundary.get("wrapper_generation")
+        and _wrapper_runtime_record_digest(record)
+        == boundary.get("runtime_record_digest")
+    )
+
+
+def _valid_owned_process_tree(
+    value: object,
+    *,
+    agent: str,
+    root_key: str | None,
+    wrapper_generation: object | None = None,
+    launch_nonce: object | None = None,
+) -> dict | None:
+    """Return a copied strict tree record, or ``None`` for any schema drift.
+
+    The record is kill-adjacent durable input. Unknown fields, partial rows,
+    duplicate identities, and a changed wrapper generation/nonce all invalidate
+    carry-forward rather than silently widening authority.
+    """
+    if not isinstance(value, dict) or frozenset(value) != _OWNED_PROCESS_TREE_FIELDS:
+        return None
+    status = value.get("status")
+    record_generation = value.get("wrapper_generation")
+    record_nonce = value.get("launch_nonce")
+    if (
+        value.get("schema_version") != _OWNED_PROCESS_TREE_SCHEMA
+        or value.get("attribution_model") != _OWNED_PROCESS_TREE_MODEL
+        or value.get("agent") != agent
+        or value.get("root_key") != root_key
+        or status not in _OWNED_PROCESS_TREE_STATUSES
+        or value.get("limit") != _OWNED_PROCESS_TREE_LIMIT
+        or (
+            status != "invalid"
+            and not _valid_launch_nonce(record_nonce)
+        )
+        or (
+            status == "invalid"
+            and record_nonce is not None
+            and not _valid_launch_nonce(record_nonce)
+        )
+    ):
+        return None
+    if (
+        wrapper_generation is not None
+        and record_generation is not None
+        and record_generation != wrapper_generation
+    ):
+        return None
+    if (
+        launch_nonce is not None
+        and record_nonce is not None
+        and record_nonce != launch_nonce
+    ):
+        return None
+    if not (
+        status == "invalid"
+        and record_generation is None
+    ) and not _valid_wrapper_generation(record_generation):
+        return None
+    if (
+        not isinstance(value.get("refreshed_at"), str)
+        or len(value["refreshed_at"]) > 64
+        or _utc_epoch(value["refreshed_at"]) is None
+    ):
+        return None
+    counts: list[int] = []
+    for field in ("observed_count", "recorded_count", "omitted_count"):
+        count = value.get(field)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            return None
+        counts.append(count)
+    observed_count, recorded_count, omitted_count = counts
+    entries = value.get("entries")
+    if (
+        not isinstance(entries, list)
+        or (not entries and value.get("status") != "invalid")
+        or len(entries) != recorded_count
+        or recorded_count > _OWNED_PROCESS_TREE_LIMIT
+        or observed_count != recorded_count + omitted_count
+        or value.get("truncated") is not (omitted_count > 0)
+    ):
+        return None
+    reason_code = value.get("reason_code")
+    if value.get("status") == "complete":
+        if reason_code is not None or omitted_count:
+            return None
+    elif value.get("status") == "absent":
+        if reason_code != "process_tree_absent" or omitted_count:
+            return None
+    elif (
+        not isinstance(reason_code, str)
+        or not reason_code
+        or len(reason_code) > 256
+        or (value.get("status") == "truncated" and not omitted_count)
+    ):
+        return None
+    seen: set[tuple[int, str]] = set()
+    seen_pids: set[int] = set()
+    entries_by_pid: dict[int, dict] = {}
+    for index, entry in enumerate(entries):
+        if (
+            not isinstance(entry, dict)
+            or frozenset(entry) != _OWNED_PROCESS_TREE_ENTRY_FIELDS
+        ):
+            return None
+        pid = entry.get("pid")
+        start = entry.get("start")
+        start_key = _start_order_key(start)
+        start_filetime = entry.get("start_filetime")
+        parent_pid = entry.get("parent_pid")
+        # Complete/absent trees grant future launch and teardown authority, so
+        # Windows entries need exact FILETIME identity. Nullable entries remain
+        # readable in invalid/truncated records as durable HOLD diagnostics.
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(parent_pid, int)
+            or isinstance(parent_pid, bool)
+            or parent_pid < 0
+            or not isinstance(start, str)
+            or not start
+            or len(start) > 256
+            or start_key is None
+            or (
+                start_filetime is not None
+                and (
+                    not isinstance(start_filetime, str)
+                    or re.fullmatch(r"[1-9][0-9]{0,19}", start_filetime) is None
+                )
+            )
+            or (
+                status in {"complete", "absent"}
+                and start_key is not None
+                and start_key[0] == "iso"
+                and start_filetime is None
+            )
+            or entry.get("role") not in _OWNED_PROCESS_TREE_ROLES
+            or not isinstance(entry.get("discovered_at"), str)
+            or len(entry["discovered_at"]) > 64
+            or _utc_epoch(entry["discovered_at"]) is None
+            or (pid, start) in seen
+            or pid in seen_pids
+        ):
+            return None
+        role = entry.get("role")
+        if index == 0:
+            if role != "wrapper":
+                return None
+        else:
+            if role == "wrapper":
+                return None
+            parent = entries_by_pid.get(parent_pid)
+            if parent is None:
+                return None
+            edge_reason = _strict_start_order_reason(
+                parent["start"],
+                parent.get("start_filetime"),
+                start,
+                start_filetime,
+            )
+            if edge_reason is not None:
+                return None
+        seen.add((pid, start))
+        seen_pids.add(pid)
+        entries_by_pid[pid] = entry
+    return copy.deepcopy(value)
+
+
+def _invalid_owned_process_tree_record(
+    *,
+    agent: str,
+    root_key: str,
+    wrapper_generation: str | None,
+    launch_nonce: str | None,
+    now_epoch: float,
+    reason_code: str,
+) -> dict:
+    """Return strict durable HOLD evidence for an unusable prior tree record."""
+    if not _valid_wrapper_generation(wrapper_generation):
+        wrapper_generation = None
+    if not _valid_launch_nonce(launch_nonce):
+        launch_nonce = None
+    return {
+        "schema_version": _OWNED_PROCESS_TREE_SCHEMA,
+        "attribution_model": _OWNED_PROCESS_TREE_MODEL,
+        "agent": agent,
+        "root_key": root_key,
+        "status": "invalid",
+        "reason_code": reason_code,
+        "limit": _OWNED_PROCESS_TREE_LIMIT,
+        "observed_count": 0,
+        "recorded_count": 0,
+        "omitted_count": 0,
+        "truncated": False,
+        "refreshed_at": _event_now(now_epoch),
+        "wrapper_generation": wrapper_generation,
+        "launch_nonce": launch_nonce,
+        "entries": [],
+    }
+
+
+def _valid_legacy_process_migration_evidence(value: object) -> dict | None:
+    fields = frozenset({
+        "schema_version",
+        "status",
+        "limit",
+        "observed_count",
+        "recorded_count",
+        "omitted_count",
+        "truncated",
+        "malformed_count",
+        "source_hash",
+        "entries",
+    })
+    if not isinstance(value, dict) or frozenset(value) != fields:
+        return None
+    counts = [
+        value.get(field)
+        for field in (
+            "observed_count",
+            "recorded_count",
+            "omitted_count",
+            "malformed_count",
+        )
+    ]
+    if (
+        value.get("schema_version") != _LEGACY_PROCESS_EVIDENCE_SCHEMA
+        or value.get("status") != "migration_hold"
+        or value.get("limit") != _OWNED_PROCESS_TREE_LIMIT
+        or any(
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+            for count in counts
+        )
+        or counts[0] != counts[1] + counts[2]
+        or value.get("truncated") is not (counts[2] > 0)
+        or counts[3] > counts[2]
+        or not isinstance(value.get("source_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["source_hash"]) is None
+    ):
+        return None
+    entries = value.get("entries")
+    if (
+        not isinstance(entries, list)
+        or len(entries) != counts[1]
+        or len(entries) > _OWNED_PROCESS_TREE_LIMIT
+    ):
+        return None
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or frozenset(entry) != {"pid", "start", "source"}
+            or not isinstance(entry.get("pid"), int)
+            or isinstance(entry.get("pid"), bool)
+            or entry["pid"] <= 0
+            or not isinstance(entry.get("start"), str)
+            or not entry["start"]
+            or len(entry["start"]) > 256
+            or any(ord(char) < 32 for char in entry["start"])
+            or entry.get("source") not in {
+                "wrapper",
+                "legacy_brain",
+                "managed_pids",
+            }
+        ):
+            return None
+    return copy.deepcopy(value)
+
+
+def _legacy_process_migration_evidence(st: dict) -> dict | None:
+    """Bound pre-v2 ownership rows for attended migration diagnostics only."""
+    existing = _valid_legacy_process_migration_evidence(
+        st.get("legacy_process_evidence")
+    )
+    if existing is not None:
+        return existing
+    if st.get("owned_process_tree_pending") is True:
+        return None
+    raw_managed = st.get("managed_pids")
+    migration_shaped = bool(
+        st.get("launched")
+        or isinstance(st.get("runtime_wrapper_generation"), str)
+        or st.get("launcher_pid") is not None
+        or st.get("brain_pid") is not None
+        or raw_managed not in (None, [])
+    )
+    if not migration_shaped:
+        return None
+
+    raw_candidates: list[tuple[str, object]] = [
+        ("wrapper", {
+            "pid": st.get("launcher_pid"),
+            "start": st.get("launcher_start"),
+        }),
+        ("legacy_brain", {
+            "pid": st.get("brain_pid"),
+            "start": st.get("brain_start"),
+        }),
+    ]
+    if isinstance(raw_managed, list):
+        raw_candidates.extend(("managed_pids", item) for item in raw_managed)
+    elif raw_managed is not None:
+        raw_candidates.append(("managed_pids_malformed", raw_managed))
+
+    entries: list[dict] = []
+    malformed_count = 0
+    observed_count = 0
+    for source, item in raw_candidates:
+        if source in {"wrapper", "legacy_brain"} and (
+            not isinstance(item, dict)
+            or item.get("pid") is None
+            and item.get("start") is None
+        ):
+            continue
+        observed_count += 1
+        pid = item.get("pid") if isinstance(item, dict) else None
+        start = item.get("start") if isinstance(item, dict) else None
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(start, str)
+            or not start
+            or len(start) > 256
+            or any(ord(char) < 32 for char in start)
+        ):
+            malformed_count += 1
+            continue
+        if len(entries) < _OWNED_PROCESS_TREE_LIMIT:
+            entries.append({
+                "pid": pid,
+                "start": start,
+                "source": source,
+            })
+
+    source_payload = {
+        "launcher_pid": st.get("launcher_pid"),
+        "launcher_start": st.get("launcher_start"),
+        "brain_pid": st.get("brain_pid"),
+        "brain_start": st.get("brain_start"),
+        "managed_pids": raw_managed,
+        "launched": st.get("launched"),
+        "runtime_wrapper_generation": st.get("runtime_wrapper_generation"),
+    }
+    try:
+        source_bytes = json.dumps(
+            source_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+            default=repr,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        source_bytes = repr(source_payload).encode("utf-8", errors="replace")
+    omitted_count = observed_count - len(entries)
+    return {
+        "schema_version": _LEGACY_PROCESS_EVIDENCE_SCHEMA,
+        "status": "migration_hold",
+        "limit": _OWNED_PROCESS_TREE_LIMIT,
+        "observed_count": observed_count,
+        "recorded_count": len(entries),
+        "omitted_count": omitted_count,
+        "truncated": omitted_count > 0,
+        "malformed_count": malformed_count,
+        "source_hash": hashlib.sha256(source_bytes).hexdigest(),
+        "entries": entries,
+    }
+
+
+def _recorded_process_identity_state(
+    row: dict | None,
+    *,
+    expected_start: object,
+    expected_filetime: object = None,
+) -> str:
+    """Classify current evidence as same, different, absent, or ambiguous."""
+    if not isinstance(row, dict):
+        return "absent"
+    observed_start = _start_of(row)
+    observed_filetime = _filetime_of(row)
+    expected_key = _start_order_key(expected_start)
+    if expected_key is not None and expected_key[0] != "iso":
+        observed_key = _start_order_key(observed_start)
+        if observed_key is None:
+            return "ambiguous"
+        return "same" if observed_key == expected_key else "different"
+    if expected_filetime is not None:
+        if observed_filetime is None:
+            return "ambiguous"
+        if observed_filetime == expected_filetime:
+            return "same"
+        return "different"
+    if _start_tokens_match(observed_start, expected_start):
+        return "same"
+    if _start_order_key(observed_start) is not None:
+        return "different"
+    return "ambiguous"
+
+
+def _unverified_owned_process_tree(
+    prior: dict | None,
+    snapshot: list[dict] | None,
+    *,
+    now_epoch: float,
+    reason_code: str,
+) -> dict | None:
+    """Fail closed when current proof cannot safely reuse a prior tree.
+
+    A complete prior remains the durable absence certificate when a current
+    snapshot proves every recorded pid/start identity absent. Any prior identity
+    still present, or an unavailable snapshot, converts it to sticky invalid
+    HOLD evidence. Existing truncated/invalid records are already sticky.
+    """
+    if prior is None:
+        return None
+    if prior.get("status") not in {"complete", "absent"}:
+        held = copy.deepcopy(prior)
+        if (
+            held.get("status") == "invalid"
+            and held.get("reason_code")
+            == "process_tree_invalid_generation_adoption_pending"
+        ):
+            held["reason_code"] = reason_code
+            held["refreshed_at"] = _event_now(now_epoch)
+        return held
+    snapshot_error = (
+        _snapshot_pid_integrity_error(snapshot)
+        if snapshot is not None
+        else None
+    )
+    if snapshot is not None and snapshot_error is None:
+        idx = _snap_index(snapshot)
+        identity_states = [
+            _recorded_process_identity_state(
+                idx.get(entry.get("pid")),
+                expected_start=entry.get("start"),
+                expected_filetime=entry.get("start_filetime"),
+            )
+            for entry in prior.get("entries", [])
+            if isinstance(entry, dict)
+        ]
+        if all(state in {"absent", "different"} for state in identity_states):
+            absent = copy.deepcopy(prior)
+            absent["status"] = "absent"
+            absent["reason_code"] = "process_tree_absent"
+            absent["refreshed_at"] = _event_now(now_epoch)
+            return absent
+    held = copy.deepcopy(prior)
+    held["status"] = "invalid"
+    held["reason_code"] = (
+        f"process_tree_invalid_snapshot_{snapshot_error}"
+        if snapshot_error is not None
+        else reason_code
+    )
+    held["refreshed_at"] = _event_now(now_epoch)
+    return held
+
+
+def _owned_process_tree(
+    snapshot: list[dict],
+    *,
+    st: dict,
+    record: dict,
+    wrapper_row: dict,
+    brain_row: dict | None,
+    agent: str,
+    root_key: str,
+    now_epoch: float,
+) -> tuple[dict, list[dict], str | None]:
+    """Derive one bounded, nonce-anchored wrapper-owned tree from a poll.
+
+    The wrapper identity is already triple-bound by the caller. Descendants are
+    admitted only by strict parent/start edges; image names may assign a role to
+    an admitted row but never establish ownership. After an owned parent exits,
+    it may remain as a non-killable structural bridge, but a current child below
+    that virtual identity must exactly match a previously complete
+    same-generation/nonce tree.
+    """
+    wrapper_generation = record["wrapper_generation"]
+    launch_nonce = st["launcher_nonce"]
+    refreshed_at = _event_now(now_epoch)
+    raw_prior = st.get("owned_process_tree")
+    prior = _valid_owned_process_tree(
+        raw_prior,
+        agent=agent,
+        root_key=root_key,
+        wrapper_generation=wrapper_generation,
+        launch_nonce=launch_nonce,
+    )
+    prior_entries = (prior or {}).get("entries", [])
+    prior_by_pid = {entry["pid"]: entry for entry in prior_entries}
+    if (prior or {}).get("status") == "truncated":
+        return copy.deepcopy(prior), [], "prior_tree_hold"
+    if (
+        (prior or {}).get("status") == "invalid"
+        and prior.get("reason_code")
+        != "process_tree_invalid_generation_adoption_pending"
+    ):
+        return copy.deepcopy(prior), [], "prior_tree_hold"
+    if (prior or {}).get("status") == "absent":
+        held = _unverified_owned_process_tree(
+            prior,
+            snapshot,
+            now_epoch=now_epoch,
+            reason_code="process_tree_invalid_absent_identity_reappeared",
+        )
+        if isinstance(held, dict) and held.get("status") == "invalid":
+            return held, [], "prior_absence_identity_reappeared"
+    # Only a previously complete tree can bridge an exited parent. Truncated
+    # and invalid records remain durable HOLD evidence, not ownership authority.
+    prior_authority = prior if (prior or {}).get("status") == "complete" else None
+    prior_record_invalid = raw_prior is not None and (
+        prior is None
+        or (
+            prior.get("status") == "invalid"
+            and prior.get("reason_code")
+            == "process_tree_invalid_prior_record_invalid"
+        )
+    )
+
+    snapshot_error = _snapshot_pid_integrity_error(snapshot)
+    idx = _snap_index(snapshot)
+    children = _children_map(idx)
+
+    # pid -> {row, role, depth, live}; exited, previously earned identities may
+    # remain as virtual ancestry bridges, but are never emitted as kill targets.
+    owned: dict[int, dict] = {}
+    invalid_reason = (
+        "prior_record_invalid"
+        if prior_record_invalid
+        else snapshot_error
+    )
+    role_rank = {
+        "tool_descendant": 0,
+        "detached_gate_runner": 1,
+        "cli_brain": 2,
+        "cli_launcher": 3,
+        "wrapper": 4,
+    }
+
+    def add_node(row: dict, *, role: str, depth: int, live: bool) -> bool:
+        nonlocal invalid_reason
+        pid = row.get("pid")
+        start = _start_of(row)
+        start_key = _start_order_key(start)
+        start_filetime = _filetime_of(row)
+        parent_pid = row.get("parent_pid")
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(parent_pid, int)
+            or isinstance(parent_pid, bool)
+            or parent_pid < 0
+            or not isinstance(start, str)
+            or not start
+            or start_key is None
+        ):
+            invalid_reason = invalid_reason or "invalid_process_row"
+            return False
+        if not _has_exact_start_identity(row):
+            # Windows' CIM timestamp is rounded. It can identify graph edges,
+            # but it cannot authorize a destructive action after planning.
+            # Any retained Windows row therefore needs the exact kernel
+            # FILETIME; childless absent launchers are omitted before reaching
+            # add_node rather than persisted as future ownership authority.
+            invalid_reason = (
+                invalid_reason or "exact_start_filetime_unavailable"
+            )
+        existing = owned.get(pid)
+        if existing is not None:
+            if (
+                not _start_tokens_match(_start_of(existing["row"]), start)
+                or _filetime_of(existing["row"]) != start_filetime
+                or existing["row"].get("parent_pid") != parent_pid
+            ):
+                invalid_reason = invalid_reason or "pid_identity_collision"
+                return False
+            existing["depth"] = min(int(existing["depth"]), depth)
+            if role_rank[role] > role_rank[existing["role"]]:
+                existing["role"] = role
+            if live and not existing["live"]:
+                existing["row"] = row
+                existing["live"] = True
+            return True
+        owned[pid] = {
+            "row": row,
+            "role": role,
+            "depth": depth,
+            "live": live,
+        }
+        return True
+
+    add_node(wrapper_row, role="wrapper", depth=0, live=True)
+    wrapper_pid = wrapper_row.get("pid")
+    recycled_parent_pids: set[int] = set()
+
+    # Rehydrate exact live identities from the previous complete tree. A live
+    # descendant whose intermediate parent exited remains owned only because
+    # the exact same-generation/nonce identity and its full prior ancestry were
+    # already earned. Missing ancestors are retained as non-killable bridges.
+    if prior_authority is not None and prior_entries:
+        prior_root = prior_entries[0]
+        if (
+            prior_root.get("pid") != wrapper_pid
+            or not _start_tokens_match(
+                prior_root.get("start"),
+                _start_of(wrapper_row),
+            )
+        ):
+            invalid_reason = invalid_reason or "prior_wrapper_mismatch"
+            prior_authority = None
+        else:
+            live_prior: set[int] = set()
+            for entry in prior_entries:
+                row = idx.get(entry["pid"])
+                identity_state = _recorded_process_identity_state(
+                    row,
+                    expected_start=entry["start"],
+                    expected_filetime=entry.get("start_filetime"),
+                )
+                if (
+                    entry["pid"] != wrapper_pid
+                    and identity_state == "different"
+                    and _has_exact_start_identity(row)
+                ):
+                    recycled_parent_pids.add(entry["pid"])
+                    continue
+                if not isinstance(row, dict) or not _start_tokens_match(
+                    _start_of(row),
+                    entry["start"],
+                ):
+                    continue
+                if row.get("parent_pid") != entry["parent_pid"]:
+                    invalid_reason = invalid_reason or "prior_parent_drift"
+                    continue
+                if not _filetime_identity_matches(
+                    row,
+                    entry.get("start_filetime"),
+                ):
+                    invalid_reason = invalid_reason or "prior_filetime_drift"
+                    continue
+                live_prior.add(entry["pid"])
+            needed = set(live_prior)
+            for entry in reversed(prior_entries):
+                if entry["pid"] in needed and entry["parent_pid"] in prior_by_pid:
+                    needed.add(entry["parent_pid"])
+            prior_depth: dict[int, int] = {}
+            for entry in prior_entries:
+                pid = entry["pid"]
+                parent_pid = entry["parent_pid"]
+                depth = 0 if pid == wrapper_pid else prior_depth[parent_pid] + 1
+                prior_depth[pid] = depth
+                if pid == wrapper_pid or pid not in needed:
+                    continue
+                is_live = pid in live_prior
+                row = idx[pid] if is_live else {
+                    "pid": pid,
+                    "parent_pid": parent_pid,
+                    "name": None,
+                    "command_line": None,
+                    "start_time": entry["start"],
+                    "start_filetime": entry.get("start_filetime"),
+                }
+                add_node(
+                    row,
+                    role=entry["role"],
+                    depth=depth,
+                    live=is_live,
+                )
+    launcher_pid = record.get("cli_launcher_pid")
+    launcher_start = record.get("cli_launcher_start")
+    launcher_lifetime = record.get("cli_launcher_lifetime")
+    launcher_creation_filetime = (
+        launcher_lifetime.get("creation_filetime")
+        if isinstance(launcher_lifetime, dict)
+        and launcher_lifetime.get("source")
+        == runtime_obs.LAUNCHER_LIFETIME_SOURCE
+        else None
+    )
+    launcher_exit_filetime = (
+        launcher_lifetime.get("exit_filetime")
+        if isinstance(launcher_lifetime, dict)
+        else None
+    )
+    if isinstance(launcher_pid, int) and isinstance(launcher_start, str):
+        current_launcher = idx.get(launcher_pid)
+        current_launcher_identity = _recorded_process_identity_state(
+            current_launcher,
+            expected_start=launcher_start,
+            expected_filetime=launcher_creation_filetime,
+        )
+        if current_launcher_identity == "different":
+            recycled_parent_pids.add(launcher_pid)
+        launcher_live = bool(
+            isinstance(current_launcher, dict)
+            and current_launcher.get("parent_pid") == wrapper_pid
+            and _start_tokens_match(
+                _start_of(current_launcher),
+                launcher_start,
+            )
+            and (
+                launcher_creation_filetime is None
+                or _filetime_of(current_launcher)
+                == launcher_creation_filetime
+            )
+        )
+        if launcher_live:
+            launcher_row = current_launcher
+        else:
+            if (
+                isinstance(current_launcher, dict)
+                and (
+                    current_launcher_identity == "same"
+                    or (
+                        current_launcher_identity == "ambiguous"
+                        and _start_tokens_match(
+                            _start_of(current_launcher),
+                            launcher_start,
+                        )
+                    )
+                )
+                and current_launcher.get("parent_pid") != wrapper_pid
+            ):
+                invalid_reason = invalid_reason or "launcher_parent_mismatch"
+            launcher_row = {
+                "pid": launcher_pid,
+                "parent_pid": wrapper_pid,
+                "name": None,
+                "command_line": None,
+                "start_time": launcher_start,
+                "start_filetime": launcher_creation_filetime,
+            }
+            prior_launcher = owned.get(launcher_pid)
+            if (
+                isinstance(prior_launcher, dict)
+                and prior_launcher.get("role") == "cli_launcher"
+                and _has_exact_start_identity(prior_launcher.get("row"))
+            ):
+                launcher_row = prior_launcher["row"]
+            elif not _has_exact_start_identity(launcher_row):
+                if current_launcher_identity == "different":
+                    # A recycled PID and its current children are unrelated to
+                    # the recorded launcher. They grant neither kill nor HOLD
+                    # authority.
+                    launcher_row = None
+                elif current_launcher is not None:
+                    invalid_reason = (
+                        invalid_reason or "exact_start_filetime_unavailable"
+                    )
+                    launcher_row = None
+                elif children.get(launcher_pid):
+                    # Windows retains PPID edges after a parent exits. Without
+                    # an exact lifetime/prior certificate those children are
+                    # ambiguous.
+                    invalid_reason = (
+                        invalid_reason or "unproven_virtual_parent_descendant"
+                    )
+                    launcher_row = None
+                else:
+                    # A childless, absent launcher cannot be killed and its
+                    # rounded identity must not be persisted as future
+                    # ownership authority.
+                    launcher_row = None
+        if launcher_pid == wrapper_pid:
+            invalid_reason = invalid_reason or "launcher_equals_wrapper"
+        elif launcher_row is not None:
+            edge_reason = _strict_owned_child_edge(wrapper_row, launcher_row)
+            if edge_reason is not None:
+                invalid_reason = invalid_reason or edge_reason
+            add_node(
+                launcher_row,
+                role="cli_launcher",
+                depth=1,
+                live=launcher_live,
+            )
+
+    queue = sorted(owned, key=lambda pid: (owned[pid]["depth"], pid))
+    queued = set(queue)
+    cursor = 0
+    while cursor < len(queue):
+        parent_pid = queue[cursor]
+        cursor += 1
+        parent = owned[parent_pid]
+        parent_row = parent["row"]
+        for child_pid in sorted(children.get(parent_pid, [])):
+            child = idx.get(child_pid)
+            if not isinstance(child, dict):
+                invalid_reason = invalid_reason or "missing_child_row"
+                continue
+            if not parent["live"]:
+                prior_parent = prior_by_pid.get(parent_pid)
+                prior_child = prior_by_pid.get(child_pid)
+                certified_launcher_child = bool(
+                    parent_pid == launcher_pid
+                    and isinstance(launcher_creation_filetime, str)
+                    and isinstance(launcher_exit_filetime, str)
+                    and _filetime_of(child) is not None
+                    and int(launcher_creation_filetime)
+                    < int(_filetime_of(child) or "0")
+                    < int(launcher_exit_filetime)
+                )
+                prior_owned_child = bool(
+                    prior_authority is not None
+                    and prior_parent is not None
+                    and prior_child is not None
+                    and _start_tokens_match(
+                        _start_of(parent_row),
+                        prior_parent["start"],
+                    )
+                    and prior_child["parent_pid"] == parent_pid
+                    and child.get("parent_pid") == parent_pid
+                    and _start_tokens_match(
+                        _start_of(child),
+                        prior_child["start"],
+                    )
+                    and _filetime_identity_matches(
+                        child,
+                        prior_child.get("start_filetime"),
+                    )
+                )
+                if (
+                    parent_pid in recycled_parent_pids
+                    and not certified_launcher_child
+                    and not prior_owned_child
+                ):
+                    # Children of the replacement process are foreign. Retain
+                    # only descendants already proven by exact prior identity
+                    # or by the exited launcher's exact lifetime bounds.
+                    continue
+                if not certified_launcher_child and not prior_owned_child:
+                    invalid_reason = (
+                        invalid_reason
+                        or "unproven_virtual_parent_descendant"
+                    )
+                    continue
+            edge_reason = _strict_owned_child_edge(parent_row, child)
+            if edge_reason is not None:
+                invalid_reason = invalid_reason or edge_reason
+                continue
+            role = (
+                "cli_brain"
+                if isinstance(brain_row, dict) and child_pid == brain_row.get("pid")
+                else "tool_descendant"
+            )
+            if add_node(
+                child,
+                role=role,
+                depth=int(parent["depth"]) + 1,
+                live=True,
+            ) and child_pid not in queued:
+                queue.append(child_pid)
+                queued.add(child_pid)
+
+    if isinstance(brain_row, dict):
+        brain_pid = brain_row.get("pid")
+        if brain_pid not in owned:
+            invalid_reason = invalid_reason or "brain_outside_owned_tree"
+        elif owned[brain_pid]["role"] == "tool_descendant":
+            owned[brain_pid]["role"] = "cli_brain"
+
+    observed_count = len(owned)
+    mandatory: set[int] = set()
+    if isinstance(wrapper_pid, int):
+        mandatory.add(wrapper_pid)
+    if isinstance(launcher_pid, int) and launcher_pid in owned:
+        mandatory.add(launcher_pid)
+    if isinstance(brain_row, dict) and brain_row.get("pid") in owned:
+        mandatory.add(brain_row["pid"])
+
+    selected: set[int] = set()
+    for pid in sorted(mandatory):
+        current = pid
+        while current in owned and current not in selected:
+            selected.add(current)
+            parent_pid = owned[current]["row"].get("parent_pid")
+            current = parent_pid if isinstance(parent_pid, int) else -1
+    parent_first = sorted(
+        owned,
+        key=lambda pid: (int(owned[pid]["depth"]), pid),
+    )
+    if len(selected) > _OWNED_PROCESS_TREE_LIMIT:
+        # A mandatory identity plus its ancestor closure must never be sliced.
+        invalid_reason = invalid_reason or "mandatory_tree_exceeds_limit"
+        selected = set(parent_first[:_OWNED_PROCESS_TREE_LIMIT])
+    else:
+        for pid in parent_first:
+            if len(selected) >= _OWNED_PROCESS_TREE_LIMIT:
+                break
+            if pid in selected:
+                continue
+            parent_pid = owned[pid]["row"].get("parent_pid")
+            if pid == wrapper_pid or parent_pid in selected:
+                selected.add(pid)
+
+    ordered_pids = [pid for pid in parent_first if pid in selected]
+    entries: list[dict] = []
+    for pid in ordered_pids:
+        node = owned[pid]
+        row = node["row"]
+        start = _start_of(row)
+        prior_entry = prior_by_pid.get(pid)
+        discovered_at = (
+            prior_entry["discovered_at"]
+            if prior_entry is not None
+            and _recorded_process_identity_state(
+                row,
+                expected_start=prior_entry["start"],
+                expected_filetime=prior_entry.get("start_filetime"),
+            )
+            == "same"
+            else refreshed_at
+        )
+        entries.append({
+            "pid": pid,
+            "start": start,
+            "start_filetime": _filetime_of(row),
+            "role": node["role"],
+            "parent_pid": row["parent_pid"],
+            "discovered_at": discovered_at,
+        })
+
+    omitted_count = max(0, observed_count - len(entries))
+    if invalid_reason is not None:
+        status = "invalid"
+        reason_code = f"process_tree_invalid_{invalid_reason}"
+    elif omitted_count:
+        status = "truncated"
+        reason_code = "process_tree_truncated"
+    else:
+        status = "complete"
+        reason_code = None
+    tree = {
+        "schema_version": _OWNED_PROCESS_TREE_SCHEMA,
+        "attribution_model": _OWNED_PROCESS_TREE_MODEL,
+        "agent": agent,
+        "root_key": root_key,
+        "status": status,
+        "reason_code": reason_code,
+        "limit": _OWNED_PROCESS_TREE_LIMIT,
+        "observed_count": observed_count,
+        "recorded_count": len(entries),
+        "omitted_count": omitted_count,
+        "truncated": bool(omitted_count),
+        "refreshed_at": refreshed_at,
+        "wrapper_generation": wrapper_generation,
+        "launch_nonce": launch_nonce,
+        "entries": entries,
+    }
+    kill_targets = []
+    if status == "complete":
+        for pid in ordered_pids:
+            node = owned[pid]
+            if not node["live"]:
+                continue
+            target = {
+                "pid": pid,
+                "start": _start_of(node["row"]),
+                "reason": "owned_process_tree",
+                "source": "owned_process_tree",
+            }
+            start_filetime = _filetime_of(node["row"])
+            if start_filetime is not None:
+                target["start_filetime"] = start_filetime
+            kill_targets.append(target)
+    return tree, kill_targets, invalid_reason
 
 
 def _diag() -> dict[str, int]:
@@ -2465,6 +3732,9 @@ def _record_target(targets: dict[int, dict], row: dict, reason: str,
         "source": reason,
         "seed_descendants": bool(seed_descendants),
     }
+    start_filetime = _filetime_of(row)
+    if start_filetime is not None:
+        target["start_filetime"] = start_filetime
     if isinstance(launcher_source, dict):
         target.update({
             "source_launcher_pid": launcher_source.get("pid"),
@@ -2957,6 +4227,9 @@ def _prior_wrapper_may_be_alive(st: dict) -> bool:
     managed = st.get("managed_pids")
     if isinstance(managed, list) and any(isinstance(item, dict) for item in managed):
         return True
+    tree = st.get("owned_process_tree")
+    if isinstance(tree, dict) and bool(tree.get("entries")):
+        return True
     return bool(st.get("launching"))
 
 
@@ -2967,6 +4240,7 @@ def evaluate_launch_barrier(
     agent: str,
     *,
     root_key: str | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """Post-kill one-live-wrapper barrier for the generated executor.
 
@@ -2975,9 +4249,19 @@ def evaluate_launch_barrier(
     same-agent wrapper or wait process survived before Start-Process runs.
     """
     root_key = root_key or _root_key(config.get("root") or config.get("root_key") or "")
-    st = _agent_state_entry(state, agent)
+    if request_id is None:
+        st = _agent_state_entry(state, agent)
+    else:
+        eph_root = (
+            state.get("ephemeral_reviewers")
+            if isinstance(state, dict)
+            else None
+        )
+        active = eph_root.get("active") if isinstance(eph_root, dict) else None
+        candidate = active.get(request_id) if isinstance(active, dict) else None
+        st = candidate if isinstance(candidate, dict) else {}
     if snapshot is None:
-        blocked = _prior_wrapper_may_be_alive(st)
+        blocked = request_id is not None or _prior_wrapper_may_be_alive(st)
         return {
             "allow_launch": not blocked,
             "blocked": blocked,
@@ -2987,14 +4271,193 @@ def evaluate_launch_barrier(
             "survivors": [],
         }
 
+    snapshot_error = _snapshot_pid_integrity_error(snapshot)
+    if snapshot_error is not None:
+        return {
+            "allow_launch": False,
+            "blocked": True,
+            "reason": f"snapshot_{snapshot_error}",
+            "snapshot_available": True,
+            "survivor_count": 0,
+            "survivors": [],
+        }
+
     survivors: list[dict] = []
+    survivor_keys: set[tuple[object, object]] = set()
+    survivor_count = 0
+
+    def add_survivor(item: dict) -> None:
+        nonlocal survivor_count
+        key = (item.get("kind"), item.get("pid"))
+        if key in survivor_keys:
+            return
+        survivor_keys.add(key)
+        survivor_count += 1
+        if len(survivors) < 8:
+            survivors.append(item)
+    raw_tree = st.get("owned_process_tree")
+    tree = None
+    if raw_tree is not None:
+        tree = _valid_owned_process_tree(
+            raw_tree,
+            agent=agent,
+            root_key=root_key,
+            wrapper_generation=(
+                st.get("runtime_wrapper_generation")
+                if isinstance(st.get("runtime_wrapper_generation"), str)
+                else None
+            ),
+            launch_nonce=(
+                st.get("launcher_nonce")
+                if _valid_launch_nonce(st.get("launcher_nonce"))
+                else None
+            ),
+        )
+        if tree is None or tree.get("status") not in {"complete", "absent"}:
+            return {
+                "allow_launch": False,
+                "blocked": True,
+                "reason": "owned_process_tree_unavailable",
+                "snapshot_available": True,
+                "survivor_count": 0,
+                "survivors": [],
+            }
+    elif request_id is not None:
+        return {
+            "allow_launch": False,
+            "blocked": True,
+            "reason": "owned_process_tree_unavailable",
+            "snapshot_available": True,
+            "survivor_count": 0,
+            "survivors": [],
+        }
+    idx = _snap_index(snapshot)
+    tree_judged_state_launcher = False
+    if isinstance(tree, dict):
+        tree_entries = tree.get("entries", [])
+        closure_seed_pids: set[int] = set()
+        recycled_parent_rows: dict[int, dict] = {}
+        for entry_index, entry in enumerate(tree_entries):
+            row = idx.get(entry.get("pid"))
+            identity_state = _recorded_process_identity_state(
+                row,
+                expected_start=entry.get("start"),
+                expected_filetime=entry.get("start_filetime"),
+            )
+            pid = entry.get("pid")
+            if (
+                entry_index == 0
+                and entry.get("role") == "wrapper"
+                and pid == st.get("launcher_pid")
+                and _start_tokens_match(
+                    entry.get("start"),
+                    st.get("launcher_start"),
+                )
+            ):
+                tree_judged_state_launcher = True
+            if (
+                identity_state != "different"
+                and isinstance(pid, int)
+                and not isinstance(pid, bool)
+            ):
+                # An absent recorded parent remains a conservative closure
+                # root: on Windows it may have exited after spawning a child.
+                # A definitively different exact identity is a recycled PID,
+                # however, and grants no ownership of its current children.
+                closure_seed_pids.add(pid)
+            elif (
+                identity_state == "different"
+                and isinstance(pid, int)
+                and not isinstance(pid, bool)
+                and isinstance(row, dict)
+            ):
+                recycled_parent_rows[pid] = row
+            if identity_state in {"absent", "different"}:
+                continue
+            add_survivor({
+                "kind": (
+                    "owned_process"
+                    if identity_state == "same"
+                    else "owned_process_identity_ambiguous"
+                ),
+                "pid": entry["pid"],
+                "name": _event_token(
+                    row.get("name") if isinstance(row, dict) else None,
+                    "unknown",
+                ),
+            })
+        # Planning and Stop-Tree are separated by process scheduling. A
+        # recorded parent can spawn after the plan, then exit during teardown,
+        # leaving a child that was never a kill target. Treat every current
+        # descendant edge rooted at a recorded PID as survivor evidence. This
+        # graph relation only blocks launch; it never authorizes killing.
+        recorded_pids = closure_seed_pids
+        closure_seen = set(recorded_pids)
+        frontier = list(recorded_pids)
+        children = _children_map(idx)
+        # A recorded parent may spawn an unplanned child, exit, and have its
+        # PID recycled before this barrier snapshot. The replacement PID is
+        # not an ownership root, but a child whose exact start strictly
+        # predates it belongs to the old side of the edge. Exact equal/newer
+        # children belong to the replacement; missing/incomparable exact
+        # evidence remains conservative because this barrier never kills.
+        for parent_pid, replacement in recycled_parent_rows.items():
+            replacement_key = _exact_start_order_key(replacement)
+            for pid in children.get(parent_pid, []):
+                row = idx[pid]
+                child_key = _exact_start_order_key(row)
+                if (
+                    replacement_key is not None
+                    and child_key is not None
+                    and child_key[0] == replacement_key[0]
+                    and child_key[1] >= replacement_key[1]
+                ):
+                    continue
+                if pid in closure_seen:
+                    continue
+                closure_seen.add(pid)
+                frontier.append(pid)
+                add_survivor({
+                    "kind": "owned_descendant_edge",
+                    "pid": pid,
+                    "name": _event_token(row.get("name"), "unknown"),
+                })
+        while frontier:
+            parent_pid = frontier.pop()
+            for pid in children.get(parent_pid, []):
+                if pid in closure_seen:
+                    continue
+                closure_seen.add(pid)
+                frontier.append(pid)
+                row = idx[pid]
+                add_survivor({
+                    "kind": "owned_descendant_edge",
+                    "pid": pid,
+                    "name": _event_token(row.get("name"), "unknown"),
+                })
     for row in snapshot:
         if not isinstance(row, dict):
             continue
         kind = None
+        if (
+            row.get("pid") == st.get("launcher_pid")
+            and not tree_judged_state_launcher
+            and (
+                _recorded_process_identity_state(
+                    row,
+                    expected_start=st.get("launcher_start"),
+                )
+                in {"same", "ambiguous"}
+            )
+        ):
+            # Blocking a second launch needs no command-line authority. The
+            # exact state pid/start identity is sufficient to prove that the
+            # prior launcher still exists, even when its command line is
+            # unreadable. This never authorizes killing that process.
+            kind = "state_launcher"
         # row is an arbitrary post-kill survivor, not a confirmed launcher -
         # parsed by its own argv shape, not this agent's declared prefix.
-        if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+        elif parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
             kind = "own_wrapper"
         elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
             kind = "own_wait"
@@ -3005,23 +4468,51 @@ def evaluate_launch_barrier(
             "pid": row.get("pid") if isinstance(row.get("pid"), int) else None,
             "name": _event_token(row.get("name"), "unknown"),
         }
-        survivors.append(item)
+        add_survivor(item)
 
-    blocked = bool(survivors)
+    blocked = survivor_count > 0
     reason = "clear"
     if blocked:
         reason = (
-            "same_agent_wrapper_survived"
-            if any(s.get("kind") == "own_wrapper" for s in survivors)
-            else "same_agent_wait_survived"
+            "owned_process_survived"
+            if any(s.get("kind") == "owned_process" for s in survivors)
+            else (
+                "owned_process_identity_ambiguous"
+                if any(
+                    s.get("kind") == "owned_process_identity_ambiguous"
+                    for s in survivors
+                )
+                else (
+                    "owned_descendant_edge_survived"
+                    if any(
+                        s.get("kind") == "owned_descendant_edge"
+                        for s in survivors
+                    )
+                    else (
+                        "state_launcher_survived"
+                        if any(
+                            s.get("kind") == "state_launcher"
+                            for s in survivors
+                        )
+                        else (
+                            "same_agent_wrapper_survived"
+                            if any(
+                                s.get("kind") == "own_wrapper"
+                                for s in survivors
+                            )
+                            else "same_agent_wait_survived"
+                        )
+                    )
+                )
+            )
         )
     return {
         "allow_launch": not blocked,
         "blocked": blocked,
         "reason": reason,
         "snapshot_available": True,
-        "survivor_count": len(survivors),
-        "survivors": survivors[:8],
+        "survivor_count": survivor_count,
+        "survivors": survivors,
     }
 
 
@@ -3337,6 +4828,17 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
     These fields seed next-state and scoped kill targets. Manual agents retain
     heartbeat authority; wrapped agents combine a strict runtime observation
     with independently discovered wrapper/CLI process identity."""
+    lcfg = _liveness_cfg(cfg_agent)
+    if bool(lcfg.get("wrapped", False)):
+        return _wrapped_liveness(
+            snapshot,
+            st,
+            cfg_agent,
+            agent,
+            now_epoch,
+            runtime_view,
+            root_key=root_key,
+        )
     attr = _attribution(
         snapshot,
         st,
@@ -3346,17 +4848,6 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
         request_id=request_id,
         now_epoch=now_epoch,
     )
-    lcfg = _liveness_cfg(cfg_agent)
-    if bool(lcfg.get("wrapped", False)):
-        return _wrapped_liveness(
-            snapshot,
-            st,
-            cfg_agent,
-            agent,
-            now_epoch,
-            attr,
-            runtime_view,
-        )
     if snapshot is None:
         return {"snapshot_available": False, "brain_pid": attr.get("brain_pid"),
                 "brain_start": attr.get("brain_start"), "brain_alive": False,
@@ -3407,19 +4898,108 @@ def _wrapped_liveness(
     cfg_agent: dict,
     agent: str,
     now_epoch: float,
-    attr: dict,
     runtime_view: dict | None,
+    *,
+    root_key: str | None,
 ) -> dict:
-    """Bind one strict wrapper-runtime observation to a trustworthy snapshot."""
+    """Bind one strict runtime observation to one nonce-owned process tree."""
+    diagnostics = _diag()
+    prior_tree = None
+    raw_prior = None
+    legacy_evidence = _legacy_process_migration_evidence(st)
+    prior_generation = st.get("runtime_wrapper_generation")
+    has_revoked_runtime = "revoked_wrapper_runtime" in st
+    raw_revoked_runtime = st.get("revoked_wrapper_runtime")
+    revoked_runtime = (
+        _valid_revoked_wrapper_runtime(
+            raw_revoked_runtime,
+            agent=agent,
+            root_key=root_key,
+        )
+        if has_revoked_runtime
+        else None
+    )
+    if isinstance(root_key, str):
+        raw_prior = st.get("owned_process_tree")
+        prior_tree = _valid_owned_process_tree(
+            raw_prior,
+            agent=agent,
+            root_key=root_key,
+            wrapper_generation=(
+                prior_generation if isinstance(prior_generation, str) else None
+            ),
+            launch_nonce=(
+                st.get("launcher_nonce")
+                if _valid_launch_nonce(st.get("launcher_nonce"))
+                else None
+            ),
+        )
+        # Any malformed persisted tree is ambiguous: an envelope mismatch can
+        # be corruption of the current authority, not proof that the record is
+        # stale. Only record_launch or the explicit generation-adoption branch
+        # below may clear it.
+        prior_record_invalid = (
+            raw_prior is not None
+            and prior_tree is None
+        )
+        if prior_record_invalid:
+            prior_tree = _invalid_owned_process_tree_record(
+                agent=agent,
+                root_key=root_key,
+                wrapper_generation=(
+                    prior_generation
+                    if isinstance(prior_generation, str)
+                    else None
+                ),
+                launch_nonce=(
+                    st.get("launcher_nonce")
+                    if _valid_launch_nonce(st.get("launcher_nonce"))
+                    else None
+                ),
+                now_epoch=now_epoch,
+                reason_code="process_tree_invalid_prior_record_invalid",
+            )
+        if (
+            raw_prior is None
+            and legacy_evidence is not None
+        ):
+            # The pre-v2 channel can contain exact owned identities, but lacks
+            # the bounded parent graph and generation binding needed for safe
+            # automatic teardown. Never silently discard that upgrade evidence:
+            # an attended new launch generation is the migration boundary.
+            prior_tree = _invalid_owned_process_tree_record(
+                agent=agent,
+                root_key=root_key,
+                wrapper_generation=(
+                    prior_generation
+                    if _valid_wrapper_generation(prior_generation)
+                    else None
+                ),
+                launch_nonce=(
+                    st.get("launcher_nonce")
+                    if _valid_launch_nonce(st.get("launcher_nonce"))
+                    else None
+                ),
+                now_epoch=now_epoch,
+                reason_code="process_tree_invalid_legacy_managed_pids",
+            )
     base = {
         "snapshot_available": snapshot is not None,
         "brain_pid": None,
         "brain_start": None,
         "brain_alive": False,
-        "wait_alive": bool(attr.get("wait_alive")),
-        "managed_pids": attr.get("managed_pids") or [],
-        "kill_targets": list(attr.get("targets") or []),
-        "diagnostics": attr.get("diagnostics") or _diag(),
+        "wait_alive": False,
+        # Legacy rows are never teardown authority. The separately bounded
+        # migration object remains operator evidence until a new generation
+        # earns a strict tree.
+        "managed_pids": [],
+        "legacy_process_evidence": copy.deepcopy(legacy_evidence),
+        "owned_process_tree_pending": st.get("owned_process_tree_pending") is True,
+        "owned_process_tree": prior_tree,
+        "owned_process_tree_error": None,
+        "owned_process_tree_refreshed": False,
+        "kill_targets": [],
+        "diagnostics": diagnostics,
         "discovered_brain": False,
         "runtime_status": runtime_obs.STATUS_ABSENT,
         "runtime_error": "missing",
@@ -3430,6 +5010,136 @@ def _wrapped_liveness(
         "child_state": "unknown",
         "child_reason": "runtime_missing",
     }
+    verified_wrapper_generation: str | None = None
+
+    if has_revoked_runtime and revoked_runtime is None:
+        # This marker is the atomic attended-reset boundary that makes an old
+        # runtime file non-authoritative. Schema drift must therefore HOLD
+        # rather than silently deleting the boundary and reviving stale state.
+        base["owned_process_tree"] = _invalid_owned_process_tree_record(
+            agent=agent,
+            root_key=root_key if isinstance(root_key, str) else "",
+            wrapper_generation=None,
+            launch_nonce=None,
+            now_epoch=now_epoch,
+            reason_code="process_tree_invalid_runtime_revocation_record",
+        )
+        base["owned_process_tree_error"] = (
+            "process_tree_invalid_runtime_revocation_record"
+        )
+        base["child_reason"] = (
+            "process_tree_invalid_runtime_revocation_record"
+        )
+        return base
+
+    def _unverified_owned_process_may_exist() -> bool:
+        """Conservatively detect ownership-shaped live evidence without a tree."""
+        identities: list[tuple[int, object]] = []
+        for pid_key, start_key in (
+            ("launcher_pid", "launcher_start"),
+            ("pid", "launcher_start"),
+        ):
+            pid = st.get(pid_key)
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                identities.append((pid, st.get(start_key)))
+        current_record = base.get("runtime_record")
+        if isinstance(current_record, dict):
+            for pid_key, start_key in (
+                ("wrapper_pid", "wrapper_start"),
+                ("cli_launcher_pid", "cli_launcher_start"),
+            ):
+                pid = current_record.get(pid_key)
+                if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                    identities.append((pid, current_record.get(start_key)))
+        if snapshot is None:
+            return bool(identities)
+        roots = {pid for pid, _start in identities}
+        for pid, start in identities:
+            row = _snap_index(snapshot).get(pid)
+            if isinstance(row, dict) and _start_tokens_match(_start_of(row), start):
+                return True
+        # A launcher may already have exited and left a reparenting race. A
+        # direct or transitive edge below any recorded wrapper/launcher PID is
+        # sufficient ambiguity to HOLD, but never to kill.
+        frontier = set(roots)
+        remaining = [row for row in snapshot if isinstance(row, dict)]
+        while frontier:
+            next_frontier: set[int] = set()
+            for row in remaining:
+                pid = row.get("pid")
+                if (
+                    row.get("parent_pid") in frontier
+                    and isinstance(pid, int)
+                    and not isinstance(pid, bool)
+                    and pid > 0
+                ):
+                    return True
+            frontier = next_frontier
+        return False
+
+    def _current_proof_failed(
+        child_reason: str,
+        *,
+        hold_reason: str,
+    ) -> dict:
+        prior_for_check = base.get("owned_process_tree")
+        tree = _unverified_owned_process_tree(
+            prior_for_check,
+            snapshot,
+            now_epoch=now_epoch,
+            reason_code=hold_reason,
+        )
+        if (
+            isinstance(prior_for_check, dict)
+            and prior_for_check.get("status") in {"complete", "absent"}
+            and isinstance(tree, dict)
+            and tree.get("status") == "absent"
+            and snapshot is not None
+        ):
+            base["owned_process_tree_refreshed"] = True
+        adopted_tree_missing = bool(
+            prior_for_check is None
+            and isinstance(prior_generation, str)
+            and prior_generation == verified_wrapper_generation
+        )
+        if (
+            tree is None
+            and (
+                adopted_tree_missing
+                or _unverified_owned_process_may_exist()
+            )
+            and isinstance(root_key, str)
+        ):
+            tree = _invalid_owned_process_tree_record(
+                agent=agent,
+                root_key=root_key,
+                wrapper_generation=(
+                    verified_wrapper_generation
+                    or (
+                        prior_generation
+                        if isinstance(prior_generation, str)
+                        else None
+                    )
+                ),
+                launch_nonce=(
+                    st.get("launcher_nonce")
+                    if _valid_launch_nonce(st.get("launcher_nonce"))
+                    else None
+                ),
+                now_epoch=now_epoch,
+                reason_code=hold_reason,
+            )
+        base["owned_process_tree"] = tree
+        if isinstance(tree, dict) and tree.get("status") in {
+            "truncated",
+            "invalid",
+        }:
+            base["owned_process_tree_error"] = tree.get("reason_code")
+            base["child_reason"] = tree.get("reason_code") or child_reason
+        else:
+            base["child_reason"] = child_reason
+        return base
+
     view = runtime_view if isinstance(runtime_view, dict) else {}
     status = (
         view.get("status")
@@ -3445,15 +5155,19 @@ def _wrapped_liveness(
     base["runtime_status"] = status
     base["runtime_error"] = view.get("error")
     if status != runtime_obs.STATUS_VALID:
-        base["child_reason"] = f"runtime_{status}"
-        return base
+        return _current_proof_failed(
+            f"runtime_{status}",
+            hold_reason=f"process_tree_invalid_runtime_{status}",
+        )
 
     record = view.get("record")
     if not isinstance(record, dict):
         base["runtime_status"] = runtime_obs.STATUS_INVALID
         base["runtime_error"] = "record_missing"
-        base["child_reason"] = "runtime_invalid"
-        return base
+        return _current_proof_failed(
+            "runtime_invalid",
+            hold_reason="process_tree_invalid_runtime_record_missing",
+        )
     try:
         normalized = runtime_obs.validate_record(
             record,
@@ -3463,20 +5177,70 @@ def _wrapped_liveness(
     except runtime_obs.RuntimeRecordError:
         base["runtime_status"] = runtime_obs.STATUS_INVALID
         base["runtime_error"] = "record_invalid"
-        base["child_reason"] = "runtime_invalid"
-        return base
+        return _current_proof_failed(
+            "runtime_invalid",
+            hold_reason="process_tree_invalid_runtime_record_invalid",
+        )
     updated_epoch = normalized.pop("_updated_epoch")
     progress_epoch = normalized.pop("_last_progress_epoch")
     record = normalized
+    if (
+        revoked_runtime is not None
+        and _runtime_record_is_revoked(record, revoked_runtime)
+    ):
+        # The reset and this marker were committed in the same supervisor-state
+        # write after a human proved every recorded identity gone. The runtime
+        # file is intentionally left in place so reset is cross-file atomic;
+        # only its exact digest/identity/generation is treated as retired. A
+        # genuinely new or changed record follows the normal adoption path.
+        base["runtime_status"] = runtime_obs.STATUS_ABSENT
+        base["runtime_error"] = "attended_reset_revoked"
+        return _current_proof_failed(
+            "runtime_generation_revoked_by_attended_reset",
+            hold_reason=(
+                "process_tree_invalid_runtime_revoked_replacement_unverified"
+            ),
+        )
+    verified_wrapper_generation = record.get("wrapper_generation")
     base["runtime_record"] = record
     base["runtime_updated_age_seconds"] = max(0.0, now_epoch - updated_epoch)
     base["runtime_progress_age_seconds"] = (
         None if progress_epoch is None else max(0.0, now_epoch - progress_epoch)
     )
 
-    if snapshot is None:
-        base["child_reason"] = "snapshot_unavailable"
+    if not isinstance(root_key, str) or not root_key:
+        return _current_proof_failed(
+            "root_identity_unavailable",
+            hold_reason="process_tree_invalid_root_identity_unavailable",
+        )
+    wrapper_generation = record.get("wrapper_generation")
+    if wrapper_generation != st.get("runtime_wrapper_generation"):
+        # A new wrapper generation supersedes any prior tree, but adoption is a
+        # fail-closed poll rather than a relaunch-authority gap. The next poll
+        # may replace this one specific transition marker only after it binds
+        # the live wrapper and derives a complete current tree.
+        base["owned_process_tree"] = _invalid_owned_process_tree_record(
+            agent=agent,
+            root_key=root_key,
+            wrapper_generation=wrapper_generation,
+            launch_nonce=(
+                st.get("launcher_nonce")
+                if _valid_launch_nonce(st.get("launcher_nonce"))
+                else None
+            ),
+            now_epoch=now_epoch,
+            reason_code="process_tree_invalid_generation_adoption_pending",
+        )
+        base["owned_process_tree_error"] = (
+            "process_tree_invalid_generation_adoption_pending"
+        )
+        base["child_reason"] = "wrapper_generation_mismatch"
         return base
+    if snapshot is None:
+        return _current_proof_failed(
+            "snapshot_unavailable",
+            hold_reason="process_tree_invalid_snapshot_unavailable",
+        )
     idx = _snap_index(snapshot)
     wrapper_pid = record.get("wrapper_pid")
     wrapper_start = record.get("wrapper_start")
@@ -3484,28 +5248,102 @@ def _wrapped_liveness(
         wrapper_pid != st.get("launcher_pid")
         or not _start_tokens_match(wrapper_start, st.get("launcher_start"))
     ):
-        base["child_reason"] = "wrapper_state_mismatch"
-        return base
+        return _current_proof_failed(
+            "wrapper_state_mismatch",
+            hold_reason="process_tree_invalid_wrapper_state_mismatch",
+        )
     wrapper_row = idx.get(wrapper_pid)
     if wrapper_row is None:
         base["wrapper_state"] = "dead"
-        base["child_reason"] = "wrapper_absent"
-        return base
+        return _current_proof_failed(
+            "wrapper_absent",
+            hold_reason=(
+                "process_tree_invalid_wrapper_absent_live_descendant"
+            ),
+        )
     if not _pid_alive_guarded(idx, wrapper_pid, wrapper_start):
-        base["child_reason"] = "wrapper_identity_ambiguous"
-        return base
-    wrapper_attributed = any(
-        target.get("pid") == wrapper_pid
-        and target.get("reason") == "confirmed_launcher"
-        for target in attr.get("targets") or []
-        if isinstance(target, dict)
+        return _current_proof_failed(
+            "wrapper_identity_ambiguous",
+            hold_reason="process_tree_invalid_wrapper_identity_ambiguous",
+        )
+    wrapper_attributed, _launcher_source = _is_confirmed_launcher(
+        idx,
+        wrapper_row,
+        st,
+        root_key,
+        agent,
+        diagnostics,
+        _module_args_from(cfg_agent),
     )
     if not wrapper_attributed:
-        base["child_reason"] = "wrapper_attribution_ambiguous"
-        return base
+        return _current_proof_failed(
+            "wrapper_attribution_ambiguous",
+            hold_reason="process_tree_invalid_wrapper_attribution_ambiguous",
+        )
     base["wrapper_state"] = "alive"
 
     phase = record.get("phase")
+    candidate = None
+    launcher_pid = record.get("cli_launcher_pid")
+    launcher_start = record.get("cli_launcher_start")
+    launcher_lifetime = record.get("cli_launcher_lifetime")
+    ownership_record = record
+    if (
+        launcher_start is None
+        and isinstance(launcher_lifetime, dict)
+        and launcher_lifetime.get("source")
+        == runtime_obs.LAUNCHER_LIFETIME_SOURCE
+    ):
+        launcher_start = _filetime_start_token(
+            launcher_lifetime.get("creation_filetime")
+        )
+        if launcher_start is not None:
+            # The retained handle is stronger than the racy secondary PID
+            # lookup. Normalize only this planner copy; the runtime evidence
+            # remains an exact creation/exit certificate.
+            ownership_record = {**record, "cli_launcher_start": launcher_start}
+    if phase == runtime_obs.PHASE_ACTIVE and (
+        not isinstance(launcher_pid, int)
+        or not isinstance(launcher_start, str)
+    ):
+        return _current_proof_failed(
+            "launcher_identity_unavailable",
+            hold_reason="process_tree_invalid_launcher_identity_unavailable",
+        )
+    lcfg = _liveness_cfg(cfg_agent)
+    brain_pattern = cfg_agent.get("brain_pattern") or lcfg.get("brain_pattern", "")
+    if phase == runtime_obs.PHASE_ACTIVE:
+        candidate = _discover_brain(
+            idx,
+            agent,
+            launcher_pid,
+            brain_pattern,
+            allow_launcher_self=bool(lcfg.get("allow_launcher_self", False)),
+            launcher_start=launcher_start,
+            require_launcher_bound=True,
+            turn_generation=record.get("turn_generation"),
+        )
+    tree, kill_targets, tree_error = _owned_process_tree(
+        snapshot,
+        st=st,
+        record=ownership_record,
+        wrapper_row=wrapper_row,
+        brain_row=candidate,
+        agent=agent,
+        root_key=root_key,
+        now_epoch=now_epoch,
+    )
+    base["owned_process_tree"] = tree
+    base["owned_process_tree_error"] = tree_error
+    base["owned_process_tree_refreshed"] = True
+    if tree.get("status") == "complete":
+        base["legacy_process_evidence"] = None
+        base["owned_process_tree_pending"] = False
+    base["kill_targets"] = kill_targets
+    if tree.get("status") == "invalid":
+        base["child_reason"] = tree.get("reason_code") or "process_tree_invalid"
+        return base
+
     if phase == runtime_obs.PHASE_IDLE:
         base["child_state"] = "not_required"
         base["child_reason"] = "idle"
@@ -3522,30 +5360,6 @@ def _wrapped_liveness(
         base["child_reason"] = "phase_unknown"
         return base
 
-    launcher_pid = record.get("cli_launcher_pid")
-    launcher_start = record.get("cli_launcher_start")
-    if not isinstance(launcher_pid, int) or not isinstance(launcher_start, str):
-        base["child_reason"] = "launcher_identity_unavailable"
-        return base
-    launcher_row = idx.get(launcher_pid)
-    if launcher_row is not None and not _pid_alive_guarded(
-        idx, launcher_pid, launcher_start
-    ):
-        base["child_reason"] = "launcher_identity_mismatch"
-        return base
-
-    lcfg = _liveness_cfg(cfg_agent)
-    brain_pattern = cfg_agent.get("brain_pattern") or lcfg.get("brain_pattern", "")
-    candidate = _discover_brain(
-        idx,
-        agent,
-        launcher_pid,
-        brain_pattern,
-        allow_launcher_self=bool(lcfg.get("allow_launcher_self", False)),
-        launcher_start=launcher_start,
-        require_launcher_bound=True,
-        turn_generation=record.get("turn_generation"),
-    )
     if candidate is not None:
         candidate_pid = candidate.get("pid")
         candidate_start = _start_of(candidate)
@@ -3555,22 +5369,6 @@ def _wrapped_liveness(
         base["discovered_brain"] = True
         base["child_state"] = "alive"
         base["child_reason"] = "brain_discovered"
-        if (
-            isinstance(candidate_pid, int)
-            and isinstance(candidate_start, str)
-            and candidate_start
-            and not any(
-                target.get("pid") == candidate_pid
-                for target in base["kill_targets"]
-                if isinstance(target, dict)
-            )
-        ):
-            base["kill_targets"].append({
-                "pid": candidate_pid,
-                "start": candidate_start,
-                "reason": "runtime_brain",
-                "source": "wrapper_runtime",
-            })
         return base
 
     pattern = str(brain_pattern or "").casefold()
@@ -3745,6 +5543,19 @@ def build_report(store: Store, *, now_epoch: float,
             "deadline_epoch": entry.get("deadline_epoch"),
             "launcher_pid": entry.get("launcher_pid"),
             "launcher_start": entry.get("launcher_start"),
+            "wrapper_runtime": (
+                runtime_obs.read_runtime(
+                    store.state_dir,
+                    agent,
+                    now_epoch=now_epoch,
+                )
+                if isinstance(agent, str)
+                else {
+                    "status": runtime_obs.STATUS_ABSENT,
+                    "record": None,
+                    "error": "agent_missing",
+                }
+            ),
             "completion": completion,
         }
     known_temp = {
@@ -4361,6 +6172,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     brain_pid = liveness.get("brain_pid")
     brain_start = liveness.get("brain_start")
     managed = liveness.get("managed_pids") or []
+    owned_tree = (
+        liveness.get("owned_process_tree")
+        if isinstance(liveness.get("owned_process_tree"), dict)
+        else None
+    )
     attributed_targets = liveness.get("kill_targets") or []
     diagnostics = liveness.get("diagnostics") or _diag()
 
@@ -4459,9 +6275,9 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         next_runtime_phase = st.get("runtime_phase")
         next_runtime_sequence = prior_sequence
 
-    # carry-forward: ALL supervisor-owned fields pass THROUGH (BLOCKER-3 lesson -
-    # a healthy `none` tick must never drop discovery/liveness state). The
-    # volatile snapshot is NEVER stored here (codex discipline note 1).
+    # Carry forward supervisor-owned fields. The raw process snapshot is never
+    # persisted; wrapped agents store only the bounded strict projection earned
+    # above.
     nxt = {
         "consecutive_fails": fails, "backoff_next_epoch": backoff_next,
         "healthy_since": healthy_since, "consumed_rids": consumed,
@@ -4486,6 +6302,22 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         "runtime_dead_polls": 0,
         "runtime_stall_polls": 0,
     }
+    if "revoked_wrapper_runtime" in st:
+        # Keep the fixed-size revocation boundary across reset, relaunch
+        # reservation, and the window before the new wrapper publishes its
+        # first strict runtime record.
+        nxt["revoked_wrapper_runtime"] = copy.deepcopy(
+            st.get("revoked_wrapper_runtime")
+        )
+    if owned_tree is not None:
+        nxt["owned_process_tree"] = copy.deepcopy(owned_tree)
+    legacy_process_evidence = liveness.get("legacy_process_evidence")
+    if isinstance(legacy_process_evidence, dict):
+        nxt["legacy_process_evidence"] = copy.deepcopy(
+            legacy_process_evidence
+        )
+    if liveness.get("owned_process_tree_pending") is True:
+        nxt["owned_process_tree_pending"] = True
 
     def _relaunch_state() -> None:
         nf = fails + 1
@@ -4521,12 +6353,16 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             if not include_launcher and target.get("reason") == "confirmed_launcher":
                 continue
             if isinstance(target.get("pid"), int) and isinstance(target.get("start"), str) and target.get("start"):
-                out.append({
+                item = {
                     "pid": target["pid"],
                     "start": target["start"],
                     "reason": target.get("reason") or target.get("source") or "live_chain",
                     "source": target.get("source") or target.get("reason") or "live_chain",
-                })
+                }
+                start_filetime = target.get("start_filetime")
+                if isinstance(start_filetime, str) and start_filetime:
+                    item["start_filetime"] = start_filetime
+                out.append(item)
         return out
 
     def _result(action, *, state, kill_first=False, kill_orphans=False,
@@ -4572,6 +6408,41 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         elif fails and (now_epoch - float(healthy_since)) >= reset_after:
             nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
         return _result(NONE, state=state, reason=reason)
+
+    # A partial wrapped tree is evidence, never teardown authority. This check
+    # precedes even an authorized restart marker: Stop-Tree cannot safely reap
+    # an omitted branch, and consuming the marker would hide the operator's
+    # still-unfulfilled request. The durable state projection feeds the global
+    # Attention queue until an attended ownership reset/new generation replaces
+    # it. Only the explicit generation-adoption marker may complete next poll.
+    tree_status = owned_tree.get("status") if owned_tree is not None else None
+    if wrapped and tree_status in {"truncated", "invalid"}:
+        observed = owned_tree.get("observed_count")
+        limit = owned_tree.get("limit")
+        notify = now_epoch - last_warn >= suspect_interval
+        if notify:
+            nxt["last_warn_epoch"] = now_epoch
+        if tree_status == "truncated":
+            tree_state = "PROCESS_TREE_TRUNCATED"
+            tree_reason = (
+                f"owned process tree observed {observed} identities over cap "
+                f"{limit}; HOLDING automatic teardown because a partial kill "
+                "could strand descendants; operator attention required"
+            )
+        else:
+            tree_state = "PROCESS_TREE_INVALID"
+            tree_reason = (
+                "owned process tree failed strict parent/start validation "
+                f"({owned_tree.get('reason_code')}); HOLDING automatic teardown "
+                "because a partial kill could strand descendants; operator "
+                "attention required"
+            )
+        return _result(
+            WARN_ONLY,
+            state=tree_state,
+            notify=notify,
+            reason=tree_reason,
+        )
 
     # 0) Manual restart-request marker (highest priority).
     if isinstance(marker, dict) and isinstance(marker.get("request_id"), str):
@@ -5108,35 +6979,85 @@ def _store_cfg_from_report(report: dict) -> dict:
     return cfg
 
 
-def _ephemeral_kill_targets(snapshot: list[dict] | None, entry: dict,
-                            now_epoch: float, *,
-                            root_key: str | None = None) -> list[dict]:
-    agent = str(entry.get("agent") or "")
-    attr = _attribution(
+def _ephemeral_owned_process_view(
+    snapshot: list[dict] | None,
+    entry: dict,
+    report_entry: dict,
+    now_epoch: float,
+    *,
+    root_key: str | None,
+) -> tuple[dict, dict, bool]:
+    """Refresh one ephemeral wrapper through the strict wrapped authority path."""
+    next_entry = copy.deepcopy(entry)
+    try:
+        agent = validate_agent_name(entry.get("agent"))
+    except (TypeError, ValueError):
+        next_entry["process_tree_hold_reason"] = "ephemeral_agent_identity_missing"
+        return next_entry, {
+            "kill_targets": [],
+            "owned_process_tree": None,
+            "owned_process_tree_refreshed": False,
+            "child_reason": "ephemeral_agent_identity_missing",
+        }, False
+    cfg_agent = {
+        "cli": (
+            entry.get("cli")
+            if isinstance(entry.get("cli"), str) and entry.get("cli")
+            else "codex"
+        ),
+        "wrapped": True,
+    }
+    liveness = _wrapped_liveness(
         snapshot,
         entry,
-        {"cli": entry.get("cli") or "codex", "wrapped": True},
+        cfg_agent,
         agent,
-        root_key=root_key or entry.get("root_key"),
-        request_id=str(entry.get("request_id") or ""),
-        now_epoch=now_epoch,
+        now_epoch,
+        (
+            report_entry.get("wrapper_runtime")
+            if isinstance(report_entry, dict)
+            else None
+        ),
+        root_key=root_key,
     )
-    out: list[dict] = []
-    for target in attr.get("targets") or []:
-        if isinstance(target.get("pid"), int) and isinstance(target.get("start"), str) and target.get("start"):
-            out.append({
-                "pid": target["pid"],
-                "start": target["start"],
-                "reason": target.get("reason") or target.get("source") or "provenanced_prior",
-                "source": target.get("source") or target.get("reason") or "provenanced_prior",
-            })
-    if attr.get("managed_pids") is not None:
-        entry["managed_pids"] = attr.get("managed_pids")
-    if attr.get("diagnostics"):
-        entry["provenance_diagnostics"] = {
-            k: v for k, v in attr["diagnostics"].items() if v
-        }
-    return out
+    next_entry["managed_pids"] = []
+    runtime_record = liveness.get("runtime_record")
+    if (
+        liveness.get("runtime_status") == runtime_obs.STATUS_VALID
+        and isinstance(runtime_record, dict)
+        and isinstance(runtime_record.get("wrapper_generation"), str)
+    ):
+        next_entry["runtime_wrapper_generation"] = runtime_record[
+            "wrapper_generation"
+        ]
+    tree = liveness.get("owned_process_tree")
+    if isinstance(tree, dict):
+        next_entry["owned_process_tree"] = copy.deepcopy(tree)
+    legacy_process_evidence = liveness.get("legacy_process_evidence")
+    if isinstance(legacy_process_evidence, dict):
+        next_entry["legacy_process_evidence"] = copy.deepcopy(
+            legacy_process_evidence
+        )
+    else:
+        next_entry.pop("legacy_process_evidence", None)
+    if liveness.get("owned_process_tree_pending") is True:
+        next_entry["owned_process_tree_pending"] = True
+    else:
+        next_entry.pop("owned_process_tree_pending", None)
+    complete = bool(
+        isinstance(tree, dict)
+        and tree.get("status") in {"complete", "absent"}
+        and liveness.get("owned_process_tree_refreshed") is True
+    )
+    if complete:
+        next_entry.pop("process_tree_hold_reason", None)
+    else:
+        next_entry["process_tree_hold_reason"] = (
+            tree.get("reason_code")
+            if isinstance(tree, dict)
+            else liveness.get("child_reason")
+        ) or "process_tree_authority_unavailable"
+    return next_entry, liveness, complete
 
 
 def _ephemeral_process_alive(snapshot: list[dict] | None, entry: dict) -> bool | None:
@@ -5213,57 +7134,124 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
         if not isinstance(entry, dict):
             continue
         rpt_entry = rpt_active.get(rid) if isinstance(rpt_active.get(rid), dict) else {}
-        completion = rpt_entry.get("completion") if isinstance(rpt_entry.get("completion"), dict) else {}
+        raw_completion = rpt_entry.get("completion")
+        completion = (
+            copy.deepcopy(raw_completion)
+            if isinstance(raw_completion, dict) and raw_completion
+            else {
+                "status": eph.COMPLETION_NONE,
+                "terminal": False,
+                "hold": True,
+                "reason": "no typed review-result",
+            }
+        )
+        next_entry, liveness, teardown_ready = _ephemeral_owned_process_view(
+            snapshot,
+            entry,
+            rpt_entry,
+            now_epoch,
+            root_key=root_key,
+        )
+        kill_targets = (
+            copy.deepcopy(liveness.get("kill_targets") or [])
+            if teardown_ready
+            else []
+        )
+        terminal_action = None
+        terminal_state = None
+        terminal_reason = None
         if completion.get("terminal") is True:
-            kt = _ephemeral_kill_targets(snapshot, entry, now_epoch, root_key=root_key)
-            out[rid] = {
-                "request_id": rid,
-                "agent": entry.get("agent"),
-                "action": eph.ACTION_COMPLETE,
-                "state": eph.STATE_COMPLETED,
-                "terminal_state": eph.STATE_COMPLETED,
-                "reason": f"typed review-result status={completion.get('status')}",
-                "completion": completion,
-                "kill_first": bool(kt),
-                "kill_targets": kt,
-                "retire": True,
-                "archive": True,
-                "next_state": _ephemeral_next_without(state, rid),
-            }
-            continue
+            terminal_action = eph.ACTION_COMPLETE
+            terminal_state = eph.STATE_COMPLETED
+            terminal_reason = (
+                f"typed review-result status={completion.get('status')}"
+            )
         deadline = entry.get("deadline_epoch")
-        if isinstance(deadline, (int, float)) and now_epoch >= float(deadline):
-            kt = _ephemeral_kill_targets(snapshot, entry, now_epoch, root_key=root_key)
-            out[rid] = {
-                "request_id": rid,
-                "agent": entry.get("agent"),
-                "action": eph.ACTION_TIMEOUT,
-                "state": eph.STATE_TIMED_OUT,
-                "terminal_state": eph.STATE_TIMED_OUT,
-                "reason": "ephemeral reviewer timed out without a typed terminal review-result",
-                "completion": completion,
-                "kill_first": bool(kt),
-                "kill_targets": kt,
-                "retire": True,
-                "archive": True,
-                "next_state": _ephemeral_next_without(state, rid),
-            }
-            continue
+        if (
+            terminal_action is None
+            and isinstance(deadline, (int, float))
+            and now_epoch >= float(deadline)
+        ):
+            terminal_action = eph.ACTION_TIMEOUT
+            terminal_state = eph.STATE_TIMED_OUT
+            terminal_reason = (
+                "ephemeral reviewer timed out without a typed terminal "
+                "review-result"
+            )
         alive = _ephemeral_process_alive(snapshot, entry)
-        if entry.get("phase") == eph.STATE_LAUNCHED and alive is False:
+        if (
+            terminal_action is None
+            and entry.get("phase") == eph.STATE_LAUNCHED
+            and alive is False
+        ):
+            terminal_action = eph.ACTION_FAILED
+            terminal_state = eph.STATE_FAILED
+            terminal_reason = (
+                "ephemeral reviewer process exited without typed terminal "
+                "review-result; no auto-restart"
+            )
+        persisted_terminal = eph.validate_held_terminal(
+            entry.get("held_terminal")
+        )
+        if persisted_terminal is not None:
+            # The first terminal observation is the attended disposition. A
+            # later report cannot rewrite a timeout/failure after it has been
+            # persisted and surfaced to the operator.
+            terminal_state = persisted_terminal["terminal_state"]
+            terminal_reason = persisted_terminal["reason"]
+            completion = copy.deepcopy(persisted_terminal["completion"])
+            terminal_action = {
+                eph.STATE_COMPLETED: eph.ACTION_COMPLETE,
+                eph.STATE_TIMED_OUT: eph.ACTION_TIMEOUT,
+                eph.STATE_FAILED: eph.ACTION_FAILED,
+                eph.STATE_DENIED: eph.ACTION_DENY,
+            }[terminal_state]
+        if terminal_action is not None:
+            # Persist the terminal facts before either the initial HOLD or the
+            # executor's post-kill launch barrier can make teardown sticky.
+            # The attended request-bound archive must never reconstruct them
+            # from a later, potentially different report.
+            next_entry["held_terminal"] = eph.make_held_terminal(
+                terminal_state,
+                terminal_reason,
+                completion,
+            )
+        if terminal_action is not None and not teardown_ready:
+            hold_reason = next_entry.get("process_tree_hold_reason")
             out[rid] = {
                 "request_id": rid,
                 "agent": entry.get("agent"),
-                "action": eph.ACTION_FAILED,
-                "state": eph.STATE_FAILED,
-                "terminal_state": eph.STATE_FAILED,
-                "reason": "ephemeral reviewer process exited without typed terminal review-result; no auto-restart",
+                "action": eph.ACTION_NONE,
+                "state": "process_tree_hold",
+                "reason": (
+                    f"{terminal_reason}; HOLDING archive and teardown until "
+                    "the owned process tree is freshly and completely "
+                    f"revalidated ({hold_reason})"
+                ),
                 "completion": completion,
                 "kill_first": False,
                 "kill_targets": [],
+                "retire": False,
+                "archive": False,
+                "auto_restart": False,
+                "next_entry": next_entry,
+            }
+            continue
+        if terminal_action is not None:
+            out[rid] = {
+                "request_id": rid,
+                "agent": entry.get("agent"),
+                "action": terminal_action,
+                "state": terminal_state,
+                "terminal_state": terminal_state,
+                "reason": terminal_reason,
+                "completion": completion,
+                "kill_first": bool(kill_targets),
+                "kill_targets": kill_targets,
                 "retire": True,
                 "archive": True,
                 "next_state": _ephemeral_next_without(state, rid),
+                "next_entry": next_entry,
             }
             continue
         out[rid] = {
@@ -5274,6 +7262,7 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
             "reason": completion.get("reason") or "awaiting typed review-result",
             "completion": completion,
             "auto_restart": False,
+            "next_entry": next_entry,
         }
     for agent in rpt_root.get("orphan_agents") or []:
         if isinstance(agent, str):
@@ -5299,9 +7288,8 @@ def plan_actions(report: dict, state: dict, config: dict,
 
     ``snapshot`` is the executor's process snapshot (list of rows) interpreted
     per agent by :func:`_liveness`. Manual agents use it for best-effort restart
-    targets. Wrapped agents also use it to bind the runtime record and discover
-    the active CLI brain. The snapshot is an INPUT only and is never folded into
-    ``next_state``."""
+    targets. Wrapped agents use it to re-prove ownership and project a bounded,
+    strict process tree into ``next_state`` for the next poll."""
     cfg_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     rpt_agents = report.get("agents") or {}
     state_agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
@@ -5330,6 +7318,412 @@ def plan_actions(report: dict, state: dict, config: dict,
             report, state, config, now_epoch=now_epoch, snapshot=snapshot,
             root_key=root_key),
     }
+
+
+def process_tree_ownership_reset_evidence(
+    state: dict,
+    agent: str,
+    *,
+    request_id: str | None = None,
+    expected_root: str | Path,
+    verified_launch_nonce: str,
+    runtime_record: dict,
+    now_epoch: float | None = None,
+) -> dict:
+    """Return the exact identities an attended ownership reset must verify.
+
+    This is deliberately stricter than the ordinary HOLD projection.  Reset is
+    available only when the persisted tree, supervisor state, and the wrapper's
+    strict runtime record agree on one wrapper identity, generation, and launch
+    nonce.  A damaged record remains visible for manual repair; it never becomes
+    reset authority merely because a human supplied a plausible pid or name.
+    """
+    agent = validate_agent_name(agent)
+    if request_id is None:
+        agents = state.get("agents") if isinstance(state, dict) else None
+        entry = agents.get(agent) if isinstance(agents, dict) else None
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"no configured supervisor state exists for {agent!r}"
+            )
+    else:
+        if not eph.is_safe_id(request_id):
+            raise ValueError("ephemeral request id must be a safe path token")
+        eph_root = (
+            state.get("ephemeral_reviewers")
+            if isinstance(state, dict)
+            else None
+        )
+        active = eph_root.get("active") if isinstance(eph_root, dict) else None
+        entry = active.get(request_id) if isinstance(active, dict) else None
+        if (
+            not isinstance(entry, dict)
+            or entry.get("request_id") != request_id
+            or entry.get("agent") != agent
+        ):
+            raise ValueError(
+                "no exact active ephemeral process-tree state exists for "
+                f"request {request_id!r} and agent {agent!r}"
+            )
+
+    raw_tree = entry.get("owned_process_tree")
+    if not isinstance(raw_tree, dict) or raw_tree.get("status") not in {
+        "invalid",
+        "truncated",
+    }:
+        raise ValueError(f"{agent!r} has no strict process-tree HOLD to reset")
+    launch_nonce = raw_tree.get("launch_nonce")
+    wrapper_generation = raw_tree.get("wrapper_generation")
+    expected_root_key = _root_key(str(Path(expected_root).resolve()))
+    if (
+        expected_root_key is None
+        or not _valid_launch_nonce(verified_launch_nonce)
+        or launch_nonce != verified_launch_nonce
+        or entry.get("launcher_nonce") != verified_launch_nonce
+        or not _valid_wrapper_generation(wrapper_generation)
+        or entry.get("runtime_wrapper_generation") != wrapper_generation
+    ):
+        raise ValueError(
+            "process-tree HOLD does not agree on a valid root, generation, "
+            "and verified launch nonce"
+        )
+    tree = _valid_owned_process_tree(
+        raw_tree,
+        agent=agent,
+        root_key=expected_root_key,
+        wrapper_generation=wrapper_generation,
+        launch_nonce=verified_launch_nonce,
+    )
+    if tree is None or tree.get("status") not in {"invalid", "truncated"}:
+        raise ValueError("process-tree HOLD record is malformed or belongs to another root")
+
+    try:
+        runtime = runtime_obs.validate_record(
+            runtime_record,
+            expected_agent=agent,
+            now_epoch=now_epoch,
+        )
+    except runtime_obs.RuntimeRecordError as exc:
+        raise ValueError(f"strict wrapper runtime record is invalid: {exc}") from exc
+    wrapper_pid = runtime.get("wrapper_pid")
+    wrapper_start = runtime.get("wrapper_start")
+    if (
+        runtime.get("wrapper_generation") != wrapper_generation
+        or not isinstance(wrapper_pid, int)
+        or isinstance(wrapper_pid, bool)
+        or wrapper_pid <= 0
+        or not isinstance(wrapper_start, str)
+        or not wrapper_start
+        or entry.get("launcher_pid") != wrapper_pid
+        or not _start_tokens_match(entry.get("launcher_start"), wrapper_start)
+    ):
+        raise ValueError(
+            "supervisor state and strict wrapper runtime record do not agree "
+            "on wrapper pid/start/generation"
+        )
+
+    identities: list[dict] = []
+    for row in tree.get("entries", []):
+        identities.append({
+            "pid": row["pid"],
+            "start": row["start"],
+            "start_filetime": row.get("start_filetime"),
+            "source": "owned_process_tree",
+            "role": row["role"],
+        })
+    legacy = _valid_legacy_process_migration_evidence(
+        entry.get("legacy_process_evidence")
+    )
+    if entry.get("legacy_process_evidence") is not None and legacy is None:
+        raise ValueError("legacy process migration evidence is malformed")
+    if legacy is not None:
+        for row in legacy["entries"]:
+            identities.append({
+                "pid": row["pid"],
+                "start": row["start"],
+                "source": "legacy_process_evidence",
+                "role": row["source"],
+            })
+
+    runtime_launcher_pid = runtime.get("cli_launcher_pid")
+    runtime_launcher_start = runtime.get("cli_launcher_start")
+    if (runtime_launcher_pid is None) != (runtime_launcher_start is None):
+        raise ValueError("strict runtime launcher pid/start evidence is incomplete")
+    if runtime_launcher_pid is not None:
+        identities.append({
+            "pid": runtime_launcher_pid,
+            "start": runtime_launcher_start,
+            "source": "wrapper_runtime",
+            "role": "cli_launcher",
+        })
+
+    brain_pid = entry.get("brain_pid")
+    brain_start = entry.get("brain_start")
+    if (brain_pid is None) != (brain_start is None):
+        raise ValueError("supervisor brain pid/start evidence is incomplete")
+    if brain_pid is not None:
+        if (
+            not isinstance(brain_pid, int)
+            or isinstance(brain_pid, bool)
+            or brain_pid <= 0
+            or not isinstance(brain_start, str)
+            or not brain_start
+            or len(brain_start) > 256
+            or any(ord(char) < 32 for char in brain_start)
+        ):
+            raise ValueError("supervisor brain pid/start evidence is malformed")
+        identities.append({
+            "pid": brain_pid,
+            "start": brain_start,
+            "source": "supervisor_state",
+            "role": "cli_brain",
+        })
+
+    managed = entry.get("managed_pids", [])
+    if not isinstance(managed, list) or len(managed) > _OWNED_PROCESS_TREE_LIMIT:
+        raise ValueError("supervisor managed pid evidence is malformed or unbounded")
+    for row in managed:
+        pid = row.get("pid") if isinstance(row, dict) else None
+        start = row.get("start") if isinstance(row, dict) else None
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(start, str)
+            or not start
+            or len(start) > 256
+            or any(ord(char) < 32 for char in start)
+        ):
+            raise ValueError("supervisor managed pid evidence contains a malformed row")
+        identities.append({
+            "pid": pid,
+            "start": start,
+            "source": "supervisor_state",
+            "role": "managed_pid",
+        })
+
+    wrapper_rows = [
+        row
+        for row in identities
+        if row["pid"] == wrapper_pid
+        and _start_tokens_match(row["start"], wrapper_start)
+        and row["role"] == "wrapper"
+    ]
+    if not wrapper_rows:
+        raise ValueError(
+            "process-tree evidence does not contain the strict runtime wrapper identity"
+        )
+
+    if any(_start_order_key(row.get("start")) is None for row in identities):
+        raise ValueError(
+            "process-tree reset evidence contains an unparseable pid/start identity"
+        )
+
+    deduped: list[dict] = []
+    seen: set[tuple[int, str]] = set()
+    for row in identities:
+        key = (row["pid"], row["start"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return {
+        "agent": agent,
+        "root_key": expected_root_key,
+        "wrapper_generation": wrapper_generation,
+        "launch_nonce": verified_launch_nonce,
+        "wrapper_pid": wrapper_pid,
+        "wrapper_start": wrapper_start,
+        "runtime_record_digest": _wrapper_runtime_record_digest(runtime),
+        "identities": deduped,
+    }
+
+
+def _validated_process_tree_reset_audit(state: dict) -> list[dict]:
+    audit = state.get("process_tree_resets")
+    if audit is None:
+        return []
+    if (
+        not isinstance(audit, list)
+        or len(audit) > 64
+        or any(
+            not isinstance(record, dict)
+            or frozenset(record) != {
+                "schema_version",
+                "agent",
+                "hold_source_hash",
+                "acknowledged_by",
+                "verified_launch_nonce",
+                "verified_identity_count",
+                "acknowledged_at",
+                "reason",
+                "previous",
+            }
+            or record.get("schema_version") != 1
+            or not isinstance(record.get("agent"), str)
+            or not isinstance(record.get("acknowledged_by"), str)
+            or not isinstance(record.get("hold_source_hash"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", record["hold_source_hash"]) is None
+            or not _valid_launch_nonce(record.get("verified_launch_nonce"))
+            or not isinstance(record.get("verified_identity_count"), int)
+            or isinstance(record.get("verified_identity_count"), bool)
+            or record["verified_identity_count"] < 1
+            or _utc_epoch(record.get("acknowledged_at")) is None
+            or not isinstance(record.get("reason"), str)
+            or not record["reason"]
+            or not isinstance(record.get("previous"), dict)
+            for record in audit
+        )
+    ):
+        raise ValueError("process-tree reset audit history is malformed")
+    return list(audit)
+
+
+def reset_process_tree_ownership_after_attended_teardown(
+    state: dict,
+    agent: str,
+    *,
+    hold_source_hash: str,
+    acknowledged_by: str,
+    verified_launch_nonce: str,
+    expected_root: str | Path,
+    runtime_record: dict,
+    recorded_identities_gone: bool,
+    reason: str,
+    now_epoch: float | None = None,
+) -> dict:
+    """Record an attended teardown boundary and revoke stale ownership state.
+
+    This operation never kills or launches a process. The CLI authorizes it only
+    while the supervisor kill switch is present, the singleton marker is absent,
+    and ``hold_source_hash`` still names the visible process-tree Attention item.
+    The next launch must create a new wrapper generation and earn a fresh tree.
+    """
+    agent = validate_agent_name(agent)
+    acknowledged_by = validate_agent_name(acknowledged_by)
+    if (
+        not isinstance(hold_source_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", hold_source_hash) is None
+    ):
+        raise ValueError("hold source hash must be 64 lowercase hexadecimal characters")
+    cleaned_reason = reason.strip() if isinstance(reason, str) else ""
+    if (
+        not cleaned_reason
+        or len(cleaned_reason) > 500
+        or any(ord(char) < 32 for char in cleaned_reason)
+    ):
+        raise ValueError("reason must be a non-empty single line of at most 500 characters")
+    if recorded_identities_gone is not True:
+        raise ValueError("every recorded pid/start identity must be gone or recycled")
+    evidence = process_tree_ownership_reset_evidence(
+        state,
+        agent,
+        expected_root=expected_root,
+        verified_launch_nonce=verified_launch_nonce,
+        runtime_record=runtime_record,
+        now_epoch=now_epoch,
+    )
+    audit = _validated_process_tree_reset_audit(state)
+    agents = state["agents"]
+    entry = agents[agent]
+    raw_tree = entry.get("owned_process_tree")
+    tree_status = raw_tree.get("status") if isinstance(raw_tree, dict) else None
+    legacy = _valid_legacy_process_migration_evidence(
+        entry.get("legacy_process_evidence")
+    )
+    if tree_status not in {"invalid", "truncated"} and legacy is None:
+        raise ValueError(f"{agent!r} has no process-tree HOLD to reset")
+
+    previous = {
+        "tree_status": tree_status,
+        "tree_reason_code": (
+            raw_tree.get("reason_code")
+            if isinstance(raw_tree, dict)
+            else None
+        ),
+        "wrapper_generation": (
+            raw_tree.get("wrapper_generation")
+            if isinstance(raw_tree, dict)
+            else entry.get("runtime_wrapper_generation")
+        ),
+        "launch_nonce": (
+            raw_tree.get("launch_nonce")
+            if isinstance(raw_tree, dict)
+            else entry.get("launcher_nonce")
+        ),
+        "legacy_source_hash": (
+            legacy.get("source_hash")
+            if isinstance(legacy, dict)
+            else None
+        ),
+    }
+
+    reset_epoch = (
+        float(now_epoch)
+        if now_epoch is not None
+        else datetime.now(timezone.utc).timestamp()
+    )
+    revoked_at = _event_now(reset_epoch)
+
+    for key in (
+        "launcher_pid",
+        "launcher_start",
+        "launcher_nonce",
+        "launcher_nonce_injected",
+        "launcher_nonce_source",
+        "launcher_nonce_missing_reason",
+        "brain_pid",
+        "brain_start",
+        "owned_process_tree",
+        "legacy_process_evidence",
+        "process_tree_hold_reason",
+        "runtime_wrapper_generation",
+        "runtime_turn_generation",
+        "runtime_phase",
+        "runtime_progress_sequence",
+        "runtime_progress_seen_epoch",
+        "runtime_sequence_regressed",
+        "runtime_dead_polls",
+        "runtime_stall_polls",
+        "pid",
+        "pid_alive",
+    ):
+        entry.pop(key, None)
+    entry.update({
+        "managed_pids": [],
+        "owned_process_tree_pending": True,
+        "launching": False,
+        "launch_grace_until": 0.0,
+        "readiness_seen": False,
+        "launched": False,
+        "healthy_since": None,
+        "revoked_wrapper_runtime": {
+            "schema_version": _REVOKED_WRAPPER_RUNTIME_SCHEMA,
+            "agent": agent,
+            "root_key": evidence["root_key"],
+            "wrapper_pid": evidence["wrapper_pid"],
+            "wrapper_start": evidence["wrapper_start"],
+            "wrapper_generation": evidence["wrapper_generation"],
+            "launch_nonce": evidence["launch_nonce"],
+            "runtime_record_digest": evidence["runtime_record_digest"],
+            "hold_source_hash": hold_source_hash,
+            "revoked_at": revoked_at,
+        },
+    })
+
+    audit.append({
+        "schema_version": 1,
+        "agent": agent,
+        "hold_source_hash": hold_source_hash,
+        "acknowledged_by": acknowledged_by,
+        "verified_launch_nonce": evidence["launch_nonce"],
+        "verified_identity_count": len(evidence["identities"]),
+        "acknowledged_at": revoked_at,
+        "reason": cleaned_reason,
+        "previous": previous,
+    })
+    state["process_tree_resets"] = audit[-64:]
+    return state
 
 
 def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
@@ -5381,20 +7775,30 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
     lcfg = {"cli": cli}
     if isinstance(cfg_agent, dict):
         lcfg.update(cfg_agent)
-    launch_children, diagnostics = capture_launch_child_provenance(
-        pre_snapshot,
-        post_snapshot,
-        launcher_pid=pid,
-        launcher_start=pid_start,
-        launcher_nonce=entry.get("launcher_nonce"),
-        launcher_nonce_injected=entry.get("launcher_nonce_injected") is True,
-        cfg_agent=lcfg,
-        agent=agent,
-        root_key=root_key,
-        request_id=None,
-        now_epoch=now,
-    )
+    if bool(lcfg.get("wrapped", False)):
+        # Wrapped ownership is derived only from the bounded strict poll tree.
+        # Do not even build the legacy unbounded launch-delta channel.
+        launch_children, diagnostics = [], _diag()
+    else:
+        launch_children, diagnostics = capture_launch_child_provenance(
+            pre_snapshot,
+            post_snapshot,
+            launcher_pid=pid,
+            launcher_start=pid_start,
+            launcher_nonce=entry.get("launcher_nonce"),
+            launcher_nonce_injected=entry.get("launcher_nonce_injected") is True,
+            cfg_agent=lcfg,
+            agent=agent,
+            root_key=root_key,
+            request_id=None,
+            now_epoch=now,
+        )
     entry["managed_pids"] = launch_children
+    # A successful launch starts a new ownership generation. The next strict
+    # runtime + snapshot poll must earn a fresh tree before any teardown.
+    entry.pop("owned_process_tree", None)
+    entry.pop("legacy_process_evidence", None)
+    entry["owned_process_tree_pending"] = True
     entry["provenance_diagnostics"] = {k: v for k, v in diagnostics.items() if v}
     entry["last_launch_epoch"] = now
     if grace_seconds is not None:
@@ -5528,6 +7932,11 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
         timeout_seconds=timeout,
         now_epoch=now_epoch,
         review_request_id=msg.id,
+        cli=(
+            profile.get("cli")
+            if isinstance(profile.get("cli"), str)
+            else "codex"
+        ),
     )
     spec = eph.launch_spec(marker, profile, agent)
     if workspace_path:
@@ -5561,6 +7970,7 @@ def record_ephemeral_launch(state: dict, request_id: str, *, pid: int | None,
                             launcher_nonce_source: str | None = None,
                             launcher_nonce_missing_reason: str | None = None) -> dict:
     """Apply an ephemeral wrapper launch success to supervisor state."""
+    del pre_snapshot, post_snapshot, cfg_agent, root_key
     now = now_epoch if now_epoch is not None else datetime.now(timezone.utc).timestamp()
     result = eph.record_launched(
         state,
@@ -5586,34 +7996,324 @@ def record_ephemeral_launch(state: dict, request_id: str, *, pid: int | None,
                 entry["launcher_nonce_missing_reason"] = launcher_nonce_missing_reason
             else:
                 entry.pop("launcher_nonce_missing_reason", None)
-        agent = entry.get("agent")
-        lcfg = {"cli": "codex", "wrapped": True}
-        if isinstance(cfg_agent, dict):
-            lcfg.update(cfg_agent)
-        if isinstance(agent, str):
-            launch_children, diagnostics = capture_launch_child_provenance(
-                pre_snapshot,
-                post_snapshot,
-                launcher_pid=pid,
-                launcher_start=pid_start,
-                launcher_nonce=entry.get("launcher_nonce"),
-                launcher_nonce_injected=entry.get("launcher_nonce_injected") is True,
-                cfg_agent=lcfg,
-                agent=agent,
-                root_key=root_key,
-                request_id=request_id,
-                now_epoch=now,
-            )
-            entry["managed_pids"] = launch_children
-            entry["provenance_diagnostics"] = {k: v for k, v in diagnostics.items() if v}
+        # Ephemeral wrappers use the same bounded, runtime-bound process tree as
+        # configured wrappers. Launch deltas and command-line/name matches are
+        # never teardown authority.
+        entry["managed_pids"] = []
+        entry.pop("owned_process_tree", None)
+        entry.pop("legacy_process_evidence", None)
+        entry["owned_process_tree_pending"] = True
+        entry.pop("runtime_wrapper_generation", None)
+        entry.pop("process_tree_hold_reason", None)
+        entry["provenance_diagnostics"] = {}
+        entry["last_launch_epoch"] = now
     return result
+
+
+_ATTENDED_EPHEMERAL_ARCHIVE_MODES = frozenset({
+    "strict_identity",
+    "operator_attested",
+})
+_ATTENDED_EPHEMERAL_ARCHIVE_PENDING_FIELDS = frozenset({
+    "schema_version",
+    "request_id",
+    "agent",
+    "hold_source_hash",
+    "acknowledged_by",
+    "verification_mode",
+    "verified_launch_nonce",
+    "verified_identity_count",
+    "acknowledged_at",
+    "acknowledged_at_epoch",
+    "reason",
+    "terminal",
+    "archive_payload",
+})
+
+
+def _validate_attended_ephemeral_archive_pending(
+    value: object,
+) -> dict:
+    """Validate one durable attended-archive journal without trusting extras."""
+    if (
+        not isinstance(value, dict)
+        or frozenset(value) != _ATTENDED_EPHEMERAL_ARCHIVE_PENDING_FIELDS
+        or value.get("schema_version") != 1
+    ):
+        raise ValueError("attended ephemeral archive journal is malformed")
+    request_id = value.get("request_id")
+    if not eph.is_safe_id(request_id):
+        raise ValueError("attended ephemeral archive request id is invalid")
+    agent = validate_agent_name(value.get("agent"))
+    actor = validate_agent_name(value.get("acknowledged_by"))
+    hold_source_hash = value.get("hold_source_hash")
+    if (
+        not isinstance(hold_source_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", hold_source_hash) is None
+    ):
+        raise ValueError("attended ephemeral archive source hash is invalid")
+    mode = value.get("verification_mode")
+    nonce = value.get("verified_launch_nonce")
+    identity_count = value.get("verified_identity_count")
+    if (
+        mode not in _ATTENDED_EPHEMERAL_ARCHIVE_MODES
+        or not isinstance(identity_count, int)
+        or isinstance(identity_count, bool)
+        or identity_count < 0
+        or (
+            mode == "strict_identity"
+            and (not _valid_launch_nonce(nonce) or identity_count < 1)
+        )
+        or (
+            mode == "operator_attested"
+            and (nonce is not None or identity_count != 0)
+        )
+    ):
+        raise ValueError(
+            "attended ephemeral archive verification evidence is invalid"
+        )
+    acknowledged_at = value.get("acknowledged_at")
+    acknowledged_at_epoch = value.get("acknowledged_at_epoch")
+    if (
+        _utc_epoch(acknowledged_at) is None
+        or isinstance(acknowledged_at_epoch, bool)
+        or not isinstance(acknowledged_at_epoch, (int, float))
+        or not math.isfinite(float(acknowledged_at_epoch))
+        or float(acknowledged_at_epoch) < 0
+    ):
+        raise ValueError("attended ephemeral archive timestamp is invalid")
+    reason = value.get("reason")
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or len(reason) > 500
+        or any(ord(char) < 32 for char in reason)
+    ):
+        raise ValueError("attended ephemeral archive reason is invalid")
+    terminal = eph.validate_held_terminal(value.get("terminal"))
+    if terminal is None:
+        raise ValueError("attended ephemeral archive terminal facts are invalid")
+
+    attended = {
+        "schema_version": 1,
+        "agent": agent,
+        "request_id": request_id,
+        "hold_source_hash": hold_source_hash,
+        "acknowledged_by": actor,
+        "verification_mode": mode,
+        "verified_launch_nonce": nonce,
+        "verified_identity_count": identity_count,
+        "acknowledged_at": acknowledged_at,
+        "reason": reason,
+    }
+    payload = value.get("archive_payload")
+    expected_payload_fields = {
+        "schema_version",
+        "request_id",
+        "terminal_state",
+        "reason",
+        "archived_at",
+        "archived_at_epoch",
+        "original",
+        "completion",
+        "agent",
+        "attended_teardown",
+    }
+    marker = payload.get("original") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or frozenset(payload) != expected_payload_fields
+        or payload.get("schema_version") != eph.SCHEMA_VERSION
+        or payload.get("request_id") != request_id
+        or payload.get("terminal_state") != terminal["terminal_state"]
+        or payload.get("reason") != terminal["reason"]
+        or _utc_epoch(payload.get("archived_at")) is None
+        or payload.get("archived_at_epoch") != acknowledged_at_epoch
+        or payload.get("completion") != terminal["completion"]
+        or payload.get("agent") != agent
+        or payload.get("attended_teardown") != attended
+        or not isinstance(marker, dict)
+        or marker.get("request_id") != request_id
+        or marker.get("agent") != agent
+        or marker.get("state") not in eph.ACTIVE_STATES
+        or eph.validate_marker(marker)
+    ):
+        raise ValueError("attended ephemeral archive payload is malformed")
+    return copy.deepcopy(value)
+
+
+def attended_ephemeral_archive_pending(
+    state: dict,
+    request_id: str,
+) -> dict | None:
+    """Return one validated pending attended archive, if present."""
+    if not eph.is_safe_id(request_id):
+        raise ValueError("ephemeral request id must be a safe path token")
+    root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    pending = (
+        root.get("attended_archive_pending")
+        if isinstance(root, dict)
+        else None
+    )
+    if pending is None:
+        return None
+    if not isinstance(pending, dict) or len(pending) > 64:
+        raise ValueError("attended ephemeral archive journals are malformed")
+    raw = pending.get(request_id)
+    if raw is None:
+        return None
+    record = _validate_attended_ephemeral_archive_pending(raw)
+    if record["request_id"] != request_id:
+        raise ValueError("attended ephemeral archive journal key is stale")
+    return record
+
+
+def stage_attended_ephemeral_archive(
+    state: dict,
+    request_id: str,
+    *,
+    agent: str,
+    launch_marker: dict,
+    held_terminal: dict,
+    hold_source_hash: str,
+    acknowledged_by: str,
+    verification_mode: str,
+    verified_launch_nonce: str | None,
+    verified_identity_count: int,
+    reason: str,
+    now_epoch: float,
+) -> dict:
+    """Persist all authority and payload needed for an idempotent retry."""
+    terminal = eph.validate_held_terminal(held_terminal)
+    if terminal is None:
+        raise ValueError("ephemeral HOLD has no valid terminal disposition")
+    acknowledged_at = _event_now(now_epoch)
+    attended = {
+        "schema_version": 1,
+        "agent": agent,
+        "request_id": request_id,
+        "hold_source_hash": hold_source_hash,
+        "acknowledged_by": acknowledged_by,
+        "verification_mode": verification_mode,
+        "verified_launch_nonce": verified_launch_nonce,
+        "verified_identity_count": verified_identity_count,
+        "acknowledged_at": acknowledged_at,
+        "reason": reason,
+    }
+    payload = eph.terminal_archive(
+        launch_marker,
+        terminal_state=terminal["terminal_state"],
+        reason=terminal["reason"],
+        at_epoch=now_epoch,
+        extra={
+            "completion": terminal["completion"],
+            "agent": agent,
+            "attended_teardown": attended,
+        },
+    )
+    record = _validate_attended_ephemeral_archive_pending({
+        "schema_version": 1,
+        "request_id": request_id,
+        "agent": agent,
+        "hold_source_hash": hold_source_hash,
+        "acknowledged_by": acknowledged_by,
+        "verification_mode": verification_mode,
+        "verified_launch_nonce": verified_launch_nonce,
+        "verified_identity_count": verified_identity_count,
+        "acknowledged_at": acknowledged_at,
+        "acknowledged_at_epoch": now_epoch,
+        "reason": reason,
+        "terminal": terminal,
+        "archive_payload": payload,
+    })
+    root = eph.ensure_state(state)
+    pending = root.setdefault("attended_archive_pending", {})
+    if not isinstance(pending, dict) or len(pending) > 64:
+        raise ValueError("attended ephemeral archive journals are malformed")
+    existing = pending.get(request_id)
+    if existing is not None:
+        if _validate_attended_ephemeral_archive_pending(existing) != record:
+            raise ValueError(
+                "a different attended archive is already pending for this request"
+            )
+        return record
+    if len(pending) >= 64:
+        raise ValueError("attended ephemeral archive journal cap is 64")
+    pending[request_id] = copy.deepcopy(record)
+    return record
+
+
+def finish_attended_ephemeral_archive(
+    store: Store,
+    state: dict,
+    request_id: str,
+) -> dict:
+    """Apply external effects for a staged archive, then finalize memory state."""
+    record = attended_ephemeral_archive_pending(state, request_id)
+    if record is None:
+        raise ValueError(
+            f"no attended ephemeral archive is pending for {request_id!r}"
+        )
+    root = eph.ensure_state(state)
+    active = root["active"]
+    entry = active.get(request_id)
+    if (
+        not isinstance(entry, dict)
+        or entry.get("request_id") != request_id
+        or entry.get("agent") != record["agent"]
+        or eph.validate_held_terminal(entry.get("held_terminal"))
+        != record["terminal"]
+    ):
+        raise ValueError(
+            "active ephemeral HOLD changed after its attended archive was staged"
+        )
+    if not store.complete_launch_request_archive(
+        request_id,
+        record["archive_payload"],
+    ):
+        raise eph.EphemeralError(
+            f"launch request {request_id!r} was not archived; journal retained"
+        )
+    agent = record["agent"]
+    config = store.load_config()
+    active_agents = config.get("agents") or []
+    retired_agents = store.retired_agents()
+    if agent in active_agents:
+        store.retire_agent(
+            agent,
+            reason=(
+                f"ephemeral review {request_id}: "
+                f"{record['terminal']['terminal_state']}"
+            ),
+        )
+    elif agent not in retired_agents:
+        raise ValueError(
+            f"temporary identity {agent!r} is neither active nor retired"
+        )
+
+    history = root.get("attended_archive_history")
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        **record["archive_payload"]["attended_teardown"],
+        "terminal_state": record["terminal"]["terminal_state"],
+    })
+    root["attended_archive_history"] = history[-64:]
+    active.pop(request_id, None)
+    pending = root.get("attended_archive_pending")
+    if isinstance(pending, dict):
+        pending.pop(request_id, None)
+        if not pending:
+            root.pop("attended_archive_pending", None)
+    return copy.deepcopy(record["archive_payload"]["attended_teardown"])
 
 
 def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,
                               terminal_state: str, reason: str,
                               now_epoch: float | None = None,
                               completion: dict | None = None,
-                              retire: bool = True) -> dict:
+                              retire: bool = True,
+                              extra: dict | None = None) -> dict:
     """Archive a terminal launch request and tombstone its temporary identity."""
     marker = store.read_launch_request(request_id)
     root = eph.ensure_state(state)
@@ -5628,17 +8328,24 @@ def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,
                 store.retire_agent(agent, reason=f"ephemeral review {request_id}: {terminal_state}")
         except ValueError as e:
             retire_error = str(e)
-    extra = {"completion": completion or {}, "agent": agent}
+    archive_extra = {
+        "completion": completion or {},
+        "agent": agent,
+        **(extra if isinstance(extra, dict) else {}),
+    }
     if retire_error:
-        extra["retire_error"] = retire_error
+        archive_extra["retire_error"] = retire_error
     payload = eph.terminal_archive(
         marker,
         terminal_state=terminal_state,
         reason=reason,
         at_epoch=now_epoch,
-        extra=extra,
+        extra=archive_extra,
     )
-    store.archive_launch_request(request_id, payload)
+    if not store.archive_launch_request(request_id, payload):
+        raise eph.EphemeralError(
+            f"launch request {request_id!r} was not archived; active state retained"
+        )
     eph.forget_active(state, request_id)
     return state
 
@@ -6130,6 +8837,18 @@ function Write-StateFileAtomic([string]$path, $state) {
 function Set-AgentState($state, $name, $value) {
   $state.agents | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
 }
+function Set-EphemeralState($state, $requestId, $value) {
+  if (-not $state.ephemeral_reviewers) {
+    $state | Add-Member -NotePropertyName ephemeral_reviewers `
+      -NotePropertyValue ([pscustomobject]@{}) -Force
+  }
+  if (-not $state.ephemeral_reviewers.active) {
+    $state.ephemeral_reviewers | Add-Member -NotePropertyName active `
+      -NotePropertyValue ([pscustomobject]@{}) -Force
+  }
+  $state.ephemeral_reviewers.active | Add-Member `
+    -NotePropertyName $requestId -NotePropertyValue $value -Force
+}
 function Load-State {
   $primaryExists = Test-Path -LiteralPath $StatePath
   $backupExists = Test-Path -LiteralPath $StateBackupPath
@@ -6196,6 +8915,73 @@ function Quote-Arg([string]$a) {
 }
 # endregion quote-arg
 # region exec-helpers  (extracted verbatim by the test harness with kill-switch stubs)
+if (-not ('AgenttalkSupervisorNativeV2' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class AgenttalkSupervisorNativeV2 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(
+        UInt32 desiredAccess, bool inheritHandle, UInt32 processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetProcessTimes(
+        IntPtr processHandle, out long creationTime, out long exitTime,
+        out long kernelTime, out long userTime);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool TerminateProcess(
+        IntPtr processHandle, UInt32 exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern UInt32 WaitForSingleObject(
+        IntPtr handle, UInt32 milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseHandle(IntPtr handle);
+}
+'@
+}
+function Open-AgenttalkProcessHandle($procId) {
+  if (-not $procId) { return $null }
+  # SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION. The
+  # one returned handle is the identity certificate, destructive capability,
+  # and termination-completion signal.
+  $handle = [AgenttalkSupervisorNativeV2]::OpenProcess(
+    [uint32]0x101001, $false, [uint32]$procId)
+  if ($handle -eq [IntPtr]::Zero) { return $null }
+  return $handle
+}
+function Get-AgenttalkProcessHandleStartFiletime($handle) {
+  if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $null }
+  [long]$creation = 0
+  [long]$exit = 0
+  [long]$kernel = 0
+  [long]$user = 0
+  if (-not [AgenttalkSupervisorNativeV2]::GetProcessTimes(
+      $handle, [ref]$creation, [ref]$exit, [ref]$kernel, [ref]$user)) {
+    return $null
+  }
+  return $creation.ToString([Globalization.CultureInfo]::InvariantCulture)
+}
+function Stop-AgenttalkProcessHandle($handle) {
+  if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $false }
+  return [AgenttalkSupervisorNativeV2]::TerminateProcess($handle, [uint32]1)
+}
+function Wait-AgenttalkProcessHandleExit($handle, $timeoutMilliseconds) {
+  if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $false }
+  return [AgenttalkSupervisorNativeV2]::WaitForSingleObject(
+    $handle, [uint32]$timeoutMilliseconds) -eq [uint32]0
+}
+function Close-AgenttalkProcessHandle($handle) {
+  if ($null -ne $handle -and $handle -ne [IntPtr]::Zero) {
+    [void][AgenttalkSupervisorNativeV2]::CloseHandle($handle)
+  }
+}
 function Proc-Start($procId) {
   # The live start-time of a pid in the SAME ISO format Get-ProcSnapshot emits,
   # so recorded start-times compare exactly (anti-pid-reuse). $null if gone.
@@ -6216,11 +9002,42 @@ function Get-ProcSnapshot($path) {
   # marker (NOT a list) so Python reads it as UNAVAILABLE and fails closed.
   try {
     $procs = Get-CimInstance Win32_Process -ErrorAction Stop
+    # Read live handles once.  CIM CreationDate is rounded to microseconds, so
+    # use it only to bind each parent/command row to the same live PID within
+    # that bounded rounding window; persist the exact handle FILETIME.
+    $liveByPid = @{}
+    foreach ($liveProc in @(Get-Process -ErrorAction SilentlyContinue)) {
+      try { $liveByPid[[int]$liveProc.Id] = $liveProc } catch {}
+    }
     $rows = foreach ($p in $procs) {
+      # Win32_Process includes the System Idle Process at PID 0. It is not a
+      # killable process identity and parent_pid=0 is already the graph's root
+      # sentinel, so exclude it before the strict Python integrity gate.
+      $pidValue = [int]$p.ProcessId
+      if ($pidValue -le 0) { continue }
       $start = $null
-      try { if ($p.CreationDate) { $start = ([datetimeoffset]$p.CreationDate).ToString('o') } } catch {}
-      [pscustomobject]@{ pid = [int]$p.ProcessId; parent_pid = [int]$p.ParentProcessId;
-                         name = $p.Name; command_line = $p.CommandLine; start_time = $start }
+      $startFiletime = $null
+      try {
+        if ($p.CreationDate) {
+          $cimStart = [datetimeoffset]$p.CreationDate
+          $start = $cimStart.ToString('o')
+          $live = $liveByPid[$pidValue]
+          if ($live) {
+            $liveTicks = ([datetimeoffset]$live.StartTime).UtcDateTime.ToFileTimeUtc()
+            $cimTicks = $cimStart.UtcDateTime.ToFileTimeUtc()
+          }
+          # CIM loses at most nine 100ns FILETIME ticks when it formats the
+          # creation timestamp. A wider mismatch means the PID was recycled
+          # between snapshots and grants no ownership certificate.
+          if ($live -and ([math]::Abs($liveTicks - $cimTicks) -lt 10)) {
+            $startFiletime = $liveTicks.ToString(
+              [Globalization.CultureInfo]::InvariantCulture)
+          }
+        }
+      } catch {}
+      [pscustomobject]@{ pid = $pidValue; parent_pid = [int]$p.ParentProcessId;
+                         name = $p.Name; command_line = $p.CommandLine;
+                         start_time = $start; start_filetime = $startFiletime }
     }
     # -InputObject (NOT a pipe) serializes the array AS a JSON array for any
     # count; a pipe would unroll it into a {"value":..,"Count":..} wrapper. Empty
@@ -6244,9 +9061,46 @@ function Stop-Tree($targets) {
   # so we kill in REVERSE (managed descendants/leaves before the brain). A target
   # whose live start-time no longer matches is a RECYCLED pid -> never killed.
   $arr = @($targets); [array]::Reverse($arr)
+  # Share five seconds across the whole tree: enough for ordinary pending-I/O
+  # cancellation, bounded to one third of the default 15-second poll, and not
+  # multiplied by the 64-target tree limit.
+  $terminationWaitBudgetMilliseconds = 5000
+  $terminationWaitStopwatch = [Diagnostics.Stopwatch]::StartNew()
   foreach ($t in $arr) {
     if (-not $t.pid) { continue }
     if (-not $t.start) { continue }
+    $exact = [string]$t.start_filetime
+    if ($exact) {
+      # The CIM timestamp is rounded. Verify the kernel FILETIME and terminate
+      # through ONE native handle, so PID reuse cannot occur between the check
+      # and the destructive action.
+      $processHandle = $null
+      try {
+        $processHandle = Open-AgenttalkProcessHandle ([int]$t.pid)
+        if ($null -eq $processHandle) { continue }
+        $liveFiletime = Get-AgenttalkProcessHandleStartFiletime $processHandle
+        if ($null -eq $liveFiletime -or $liveFiletime -ne $exact) { continue }
+        if (Stop-AgenttalkProcessHandle $processHandle) {
+          $remainingWaitMilliseconds = [math]::Max(
+            0,
+            $terminationWaitBudgetMilliseconds -
+              [int]$terminationWaitStopwatch.ElapsedMilliseconds)
+          [void](Wait-AgenttalkProcessHandleExit `
+            $processHandle $remainingWaitMilliseconds)
+        }
+      } catch {
+      } finally {
+        if ($null -ne $processHandle) {
+          Close-AgenttalkProcessHandle $processHandle
+        }
+      }
+      continue
+    }
+    # New owned-tree targets must always carry exact Windows identity. Refuse
+    # any malformed/drifted target even if the Python planner was bypassed.
+    if ([string]$t.source -eq 'owned_process_tree') { continue }
+    # Legacy persisted targets have no exact FILETIME. Retain their existing
+    # rounded-start guard rather than silently making them unkillable.
     $live = Proc-Start $t.pid
     if ($null -eq $live) { continue }                 # already gone
     if ($live -ne $t.start) { continue }              # pid reused - DO NOT kill
@@ -7934,6 +10788,18 @@ $pollNum = 0
     $lastLogged[$name] = $p.state
     switch ($p.action) {
       { $_ -in 'relaunch','stuck_recover' } {
+        # Persist the freshly revalidated tree before using it. The barrier
+        # state deliberately excludes the relaunch transition/marker consume;
+        # a crash can lose an action, never its current ownership evidence.
+        if (-not $p.barrier_state) {
+          Write-Warning ("supervisor: {0}: relaunch has no ownership barrier state; refusing action" -f $name)
+          continue
+        }
+        Set-AgentState $state $name $p.barrier_state
+        if (-not (Save-StateForPoll $state)) {
+          Wait-ForNextPoll $cfg
+          continue supervisorPoll
+        }
         # Kill FIRST when the plan says so: a leaves-first, start-time-guarded
         # process-TREE kill of the recorded targets (brain + managed descendants
         # + any orphan wait). The launcher pid is long dead - we never rely on it.
@@ -7951,8 +10817,19 @@ $pollNum = 0
         if (($null -eq $barrier) -or $barrier.blocked) {
           $why = if ($barrier -and $barrier.reason) { $barrier.reason } else { 'launch_barrier_unavailable' }
           $n = if ($barrier -and $barrier.survivor_count) { [int]$barrier.survivor_count } else { 0 }
-          Write-Warning ("supervisor: {0}: launch barrier held ({1}; survivors={2}) - skipping relaunch this tick" -f $name, $why, $n)
+          if ($p.barrier_state -and $p.barrier_state.owned_process_tree) {
+            $p.barrier_state.owned_process_tree.status = 'invalid'
+            $p.barrier_state.owned_process_tree.reason_code = ("process_tree_invalid_post_kill_{0}" -f $why)
+            $p.barrier_state.owned_process_tree.truncated = $false
+            $p.barrier_state.owned_process_tree.omitted_count = 0
+            $p.barrier_state.owned_process_tree.observed_count = [int]$p.barrier_state.owned_process_tree.recorded_count
+          }
           if ($p.barrier_state) { Set-AgentState $state $name $p.barrier_state } else { Set-AgentState $state $name $p.next_state }
+          if (-not (Save-StateForPoll $state)) {
+            Wait-ForNextPoll $cfg
+            continue supervisorPoll
+          }
+          Write-Warning ("supervisor: {0}: launch barrier held ({1}; survivors={2}) - skipping relaunch this tick" -f $name, $why, $n)
           continue
         }
         # SEED the agent for UNATTENDED launch (blocker #2). Codex: a per-agent
@@ -8116,10 +10993,47 @@ $pollNum = 0
   foreach ($rid in $plan.ephemeral_reviewers.PSObject.Properties.Name) {
     $p = $plan.ephemeral_reviewers.$rid
     if ($DryRun) { Write-Host ("ephemeral {0}: {1} - {2}" -f $rid, $p.action, $p.reason); continue }
+    if ($p.next_entry) {
+      # Persist freshly observed ownership before any Stop-Tree call. A crash
+      # can therefore lose an action, never the authority evidence for it.
+      Set-EphemeralState $state $rid $p.next_entry
+      if (-not (Save-StateForPoll $state)) {
+        Wait-ForNextPoll $cfg
+        continue supervisorPoll
+      }
+    }
     if (($p.action -ne 'none') -and (-not (Assert-ActionsEnabled ("ephemeral {0} {1}" -f $rid, $p.action)))) { continue }
     switch ($p.action) {
       { $_ -in 'ephemeral_complete','ephemeral_timeout','ephemeral_failed' } {
         if ($p.kill_first -and $p.kill_targets) { Stop-Tree $p.kill_targets }
+        $teardownBarrierPath = Join-Path $PSScriptRoot ("supervisor-ephemeral-barrier-{0}.json" -f $rid)
+        Get-ProcSnapshot $teardownBarrierPath | Out-Null
+        $teardownBarrierText = & $AgenttalkCmd --root $Root supervise `
+          --launch-barrier --for $p.agent --request-id $rid `
+          --state-file $StatePath --snapshot-file $teardownBarrierPath --now $now
+        $teardownBarrier = $null
+        try { $teardownBarrier = $teardownBarrierText | ConvertFrom-Json } catch {}
+        if (($null -eq $teardownBarrier) -or $teardownBarrier.blocked) {
+          $why = if ($teardownBarrier -and $teardownBarrier.reason) {
+            $teardownBarrier.reason
+          } else { 'ephemeral_teardown_barrier_unavailable' }
+          if ($p.next_entry.owned_process_tree) {
+            $p.next_entry.owned_process_tree.status = 'invalid'
+            $p.next_entry.owned_process_tree.reason_code = ("process_tree_invalid_post_kill_{0}" -f $why)
+            $p.next_entry.owned_process_tree.truncated = $false
+            $p.next_entry.owned_process_tree.omitted_count = 0
+            $p.next_entry.owned_process_tree.observed_count = [int]$p.next_entry.owned_process_tree.recorded_count
+          }
+          $p.next_entry | Add-Member -NotePropertyName process_tree_hold_reason `
+            -NotePropertyValue ("process_tree_invalid_post_kill_{0}" -f $why) -Force
+          Set-EphemeralState $state $rid $p.next_entry
+          if (-not (Save-StateForPoll $state)) {
+            Wait-ForNextPoll $cfg
+            continue supervisorPoll
+          }
+          Write-Warning ("supervisor: ephemeral {0}: teardown barrier held ({1}); keeping active for operator attention" -f $rid, $why)
+          continue
+        }
         $completionJson = '{}'
         if ($p.completion) { $completionJson = ($p.completion | ConvertTo-Json -Compress -Depth 8) }
         if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }

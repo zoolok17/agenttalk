@@ -27,11 +27,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from agenttalk._jsonl import append_record, iter_lines
+from agenttalk import ephemeral as eph
+from agenttalk.store import validate_agent_name
 
 SCHEMA_VERSION = 1
 
@@ -49,10 +52,12 @@ _CAP_OPTION = 300
 _MAX_OPTIONS = 10
 _CAP_AFFECTED = 200
 _MAX_AFFECTED = 20
+_RESET_LAUNCH_NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 
 # --- sources ---
 SOURCE_NEEDS_OPERATOR = "needs_operator"
 SOURCE_CONFIG_BLOCKED = "config_blocked"
+SOURCE_PROCESS_TREE_HOLD = "process_tree_hold"
 SOURCE_DEAD_LETTER = "dead_letter"
 SOURCE_GATE_HOLD = "gate_hold"
 SOURCE_CLOSE_HOLD = "close_hold"
@@ -64,6 +69,7 @@ SOURCE_ERROR = "source_error"
 # rank weight per source (higher = more urgent to a human)
 _SOURCE_WEIGHT = {
     SOURCE_NEEDS_OPERATOR: 100,
+    SOURCE_PROCESS_TREE_HOLD: 95,
     SOURCE_CONFIG_BLOCKED: 90,
     SOURCE_COORDINATION_STALL: 85,
     SOURCE_DEAD_LETTER: 80,
@@ -77,7 +83,11 @@ _SOURCE_WEIGHT = {
 # Blocking sources: a human must repair/answer/waive/defer - NEVER dismiss (dismiss would
 # silently hide a real need). config/gate/close/lead_unarmed are dismissable ONLY when the
 # collector classifies that specific item advisory (see item["advisory"]).
-_ALWAYS_BLOCKING = frozenset({SOURCE_NEEDS_OPERATOR, SOURCE_DEAD_LETTER})
+_ALWAYS_BLOCKING = frozenset({
+    SOURCE_NEEDS_OPERATOR,
+    SOURCE_PROCESS_TREE_HOLD,
+    SOURCE_DEAD_LETTER,
+})
 _ADVISORY_CAPABLE = frozenset({
     SOURCE_CONFIG_BLOCKED,
     SOURCE_GATE_HOLD,
@@ -675,6 +685,283 @@ def config_blocked_items(holds: list[dict]) -> list[dict]:
                       source_refs=[{"kind": "config_blocked", "agent": ag}])
         it["dedupe_key"] = dedupe_key(SOURCE_CONFIG_BLOCKED, identity=ag)
         out.append(it)
+    return out
+
+
+def process_tree_hold_items(state: dict) -> list[dict]:
+    """Project strict supervisor process-tree HOLDs into global human attention.
+
+    A truncated/invalid tree deliberately authorizes no automated teardown.
+    This durable projection prevents that fail-closed decision from becoming
+    silent immunity for a runaway process tree. Sticky HOLD records clear only
+    through an operator-attended ownership reset/new wrapper generation.
+    """
+    agents = state.get("agents") if isinstance(state, dict) else None
+    out: list[dict] = []
+
+    def append_hold(
+        *,
+        identity: str,
+        agent: str,
+        row: dict,
+        request_id: str | None = None,
+    ) -> None:
+        tree = row.get("owned_process_tree")
+        tree_record = tree if isinstance(tree, dict) else {}
+        status = tree_record.get("status")
+        hold_reason = row.get("process_tree_hold_reason")
+        if (
+            status not in {"truncated", "invalid"}
+            and request_id is not None
+            and "process_tree_hold_reason" in row
+        ):
+            # Ephemeral identity/runtime validation can fail before a strict
+            # tree can be constructed. The durable HOLD reason must still
+            # become operator-visible rather than granting silent immunity.
+            status = "invalid"
+            if (
+                not isinstance(hold_reason, str)
+                or not hold_reason
+                or len(hold_reason) > 256
+                or any(ord(char) < 32 for char in hold_reason)
+            ):
+                hold_reason = "process_tree_hold_reason_invalid"
+        if status not in {"truncated", "invalid"}:
+            return
+        observed = tree_record.get("observed_count")
+        limit = tree_record.get("limit")
+        reason_code = tree_record.get("reason_code") or hold_reason
+        if status == "truncated":
+            summary = (
+                f"{agent} owned process tree observed {observed} identities "
+                f"over cap {limit}; automatic teardown is HOLD because a "
+                "partial kill could strand descendants."
+            )
+        else:
+            summary = (
+                f"{agent} owned process tree is invalid ({reason_code}); "
+                "automatic teardown is HOLD because a partial kill could "
+                "strand descendants."
+            )
+        recommendation = (
+            "Inspect and reduce the owned tree, or perform an operator-attended "
+            "teardown only after verifying every pid/start identity and the "
+            "live wrapper launch nonce. Record the resolution by starting a new "
+            "wrapper generation; an ordinary smaller poll does not clear this "
+            "sticky HOLD. This item is visible in `agenttalk attention` and the "
+            "supervisor dashboard."
+        )
+        it = _mk_item(
+            SOURCE_PROCESS_TREE_HOLD,
+            item_id(SOURCE_PROCESS_TREE_HOLD, identity),
+            title=f"supervisor process-tree HOLD: {agent}",
+            ident_content={
+                "agent": agent,
+                "request_id": request_id,
+                "status": status,
+                "reason_code": reason_code,
+                "observed_count": observed,
+                "limit": limit,
+                "wrapper_generation": tree_record.get("wrapper_generation"),
+                "launch_nonce": tree_record.get("launch_nonce"),
+                "evidence_hash": source_hash({
+                    "owned_process_tree": tree_record,
+                    "legacy_process_evidence": row.get(
+                        "legacy_process_evidence"
+                    ),
+                    "launcher_pid": row.get("launcher_pid"),
+                    "launcher_start": row.get("launcher_start"),
+                    "launcher_nonce": row.get("launcher_nonce"),
+                    "runtime_wrapper_generation": row.get(
+                        "runtime_wrapper_generation"
+                    ),
+                    "revoked_wrapper_runtime": row.get(
+                        "revoked_wrapper_runtime"
+                    ),
+                    "brain_pid": row.get("brain_pid"),
+                    "brain_start": row.get("brain_start"),
+                    "managed_pids": row.get("managed_pids"),
+                    "held_terminal": row.get("held_terminal"),
+                }),
+            },
+            human_can_unblock_now=True,
+            fields={
+                "why_it_matters": summary,
+                "recommendation": recommendation,
+                "risk_if_ignored": (
+                    "The agent remains intentionally unkillable by automation "
+                    "until complete ownership evidence is restored."
+                ),
+                "priority": "high",
+                "risk_severity": "high",
+                "confidence": "high",
+                "affected": [agent],
+            },
+            source_refs=[{
+                "kind": "supervisor_state",
+                "agent": agent,
+                "reason_code": reason_code,
+            }] if request_id is None else [{
+                "kind": "supervisor_ephemeral_state",
+                "agent": agent,
+                "request_id": request_id,
+                "reason_code": reason_code,
+            }],
+        )
+        nonce = tree_record.get("launch_nonce")
+        generation = tree_record.get("wrapper_generation")
+        launcher_pid = row.get("launcher_pid")
+        launcher_start = row.get("launcher_start")
+        tree_entries = tree_record.get("entries")
+        legacy = row.get("legacy_process_evidence")
+        legacy_entries = (
+            legacy.get("entries")
+            if isinstance(legacy, dict)
+            else None
+        )
+        reset_wrapper_recorded = any(
+            isinstance(entry, dict)
+            and entry.get("pid") == launcher_pid
+            and entry.get("start") == launcher_start
+            and entry.get("role") == "wrapper"
+            for entry in (
+                tree_entries
+                if isinstance(tree_entries, list)
+                else []
+            )
+        ) or any(
+            isinstance(entry, dict)
+            and entry.get("pid") == launcher_pid
+            and entry.get("start") == launcher_start
+            and entry.get("source") == "wrapper"
+            for entry in (
+                legacy_entries
+                if isinstance(legacy_entries, list)
+                else []
+            )
+        )
+        try:
+            reset_agent = validate_agent_name(agent)
+        except (TypeError, ValueError):
+            reset_agent = None
+        held_terminal = (
+            eph.validate_held_terminal(row.get("held_terminal"))
+            if request_id is not None
+            else None
+        )
+        ephemeral_archive_available = (
+            request_id is not None
+            and reset_agent is not None
+            and eph.is_safe_id(request_id)
+            and held_terminal is not None
+            and row.get("request_id") == request_id
+            and row.get("agent") == reset_agent
+        )
+        reset_evidence_available = (
+            request_id is None
+            and reset_agent is not None
+            and isinstance(nonce, str)
+            and _RESET_LAUNCH_NONCE_RE.fullmatch(nonce) is not None
+            and row.get("launcher_nonce") == nonce
+            and isinstance(generation, str)
+            and bool(generation)
+            and row.get("runtime_wrapper_generation") == generation
+            and isinstance(launcher_pid, int)
+            and not isinstance(launcher_pid, bool)
+            and launcher_pid > 0
+            and isinstance(launcher_start, str)
+            and bool(launcher_start)
+            and reset_wrapper_recorded
+        )
+        if ephemeral_archive_available:
+            reset_command = (
+                "agenttalk supervise --reset-process-tree-ownership "
+                f"--request-id {request_id} "
+                f"--hold-source-hash {it['source_hash']} --from LIAISON "
+                "--acknowledge-no-live-supervisor "
+                "--acknowledge-owned-processes-stopped "
+                '--reason "attended terminal request archive"'
+            )
+            it["operator_command"] = reset_command
+            it["attended_disposition_mode"] = "operator_attested"
+            it["recommendation"] = (
+                "Stop the supervisor, preserve supervisor.kill, and verify "
+                "under operator control that the request's processes are "
+                "stopped. This request-bound disposition deliberately relies "
+                "on the two explicit acknowledgements even when persisted "
+                "pid/start, runtime, generation, or nonce evidence is "
+                "incomplete. Replace LIAISON in "
+                f"`{reset_command}`. The command retires the temporary "
+                "identity and clears capacity; it never kills or launches."
+            )
+        elif reset_evidence_available:
+            reset_command = (
+                "agenttalk supervise --reset-process-tree-ownership "
+                f"--for {reset_agent} --hold-source-hash {it['source_hash']} "
+                "--verified-launch-nonce LIVE_NONCE --from LIAISON "
+                "--acknowledge-no-live-supervisor "
+                "--acknowledge-owned-processes-stopped "
+                '--reason "attended teardown verified"'
+            )
+            it["operator_command"] = reset_command
+            it["attended_disposition_mode"] = "strict_identity"
+            it["recommendation"] = (
+                "Stop the supervisor and verify every pid/start identity plus "
+                "the live wrapper launch nonce (the stored expected nonce is "
+                f"`{nonce}`). Replace LIVE_NONCE and LIAISON in "
+                f"`{reset_command}` while supervisor.kill remains present. "
+                "Then refresh/validate the artifacts and request a restart to "
+                "create a new wrapper generation; the reset itself never "
+                "kills or launches."
+            )
+        else:
+            it["recommendation"] = (
+                "Stop the supervisor and preserve supervisor.kill. This HOLD "
+                "does not contain enough mutually agreeing pid/start, wrapper "
+                "generation, and launch-nonce evidence for the attended reset "
+                "or terminal request archive command, so repair the damaged "
+                "record manually under operator control; do not kill by name "
+                "or command-line pattern. Re-read the resulting item in "
+                "`agenttalk attention` before acting."
+            )
+        it["dedupe_key"] = dedupe_key(
+            SOURCE_PROCESS_TREE_HOLD,
+            identity=identity,
+        )
+        out.append(it)
+
+    if isinstance(agents, dict):
+        for agent, row in sorted(agents.items()):
+            if isinstance(agent, str) and isinstance(row, dict):
+                append_hold(identity=agent, agent=agent, row=row)
+    eph_root = (
+        state.get("ephemeral_reviewers")
+        if isinstance(state, dict)
+        else None
+    )
+    active = eph_root.get("active") if isinstance(eph_root, dict) else None
+    if isinstance(active, dict):
+        for request_id, row in sorted(active.items()):
+            if not isinstance(request_id, str) or not isinstance(row, dict):
+                continue
+            fallback_agent = request_id
+            try:
+                fallback_agent = validate_agent_name(fallback_agent)
+            except (TypeError, ValueError):
+                fallback_agent = (
+                    "ephemeral-"
+                    + hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:12]
+                )
+            try:
+                agent = validate_agent_name(row.get("agent"))
+            except (TypeError, ValueError):
+                agent = fallback_agent
+            append_hold(
+                identity=f"ephemeral:{request_id}",
+                agent=agent,
+                row=row,
+                request_id=request_id,
+            )
     return out
 
 

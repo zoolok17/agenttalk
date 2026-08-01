@@ -541,15 +541,67 @@ listeners also publish a strict `wrapper-runtime.json` lifecycle record. Only a
 validated idle phase can be `HEALTHY_IDLE`; active work requires an
 independently discovered real CLI brain plus accepted adapter progress.
 Missing, malformed, or ambiguous evidence is `CLI_CHILD_UNKNOWN`, never green
-or automatic kill authority.
+or automatic kill authority when no owned-tree HOLD applies. Owned-tree
+validation runs first: an invalid or truncated tree reports
+`PROCESS_TREE_INVALID` or `PROCESS_TREE_TRUNCATED`, authorizes no kill, and
+leaves any restart marker unconsumed.
 
-After upgrading, refresh generated artifacts and restart existing wrappers so
-they publish the record:
+On Windows, `cli_launcher_lifetime` is deliberately nullable. A non-null value
+is an all-or-nothing `GetProcessTimes` certificate with positive decimal
+creation/exit FILETIMEs and creation before exit. Authoritative
+`complete`/`absent` Windows tree entries require a positive decimal
+`start_filetime`. `invalid`/`truncated` HOLD entries may retain null so their
+failure evidence stays readable, but null grants no identity authority. Linux
+boot-ID/start-ticks tokens are exact without FILETIME. If a prior identity
+recorded an exact FILETIME, a current row with that field missing is ambiguous.
+A prior complete tree bridges an exited intermediate process only for the same
+wrapper generation and launch nonce, with the exact previously recorded child
+identity and parent edge. A new or reparented child invalidates the tree.
+
+### Recover an owned-process-tree HOLD
+
+Use this attended sequence when an upgrade or a tree over the 64-entry cap
+creates a nondismissible `process_tree_hold`. The reset command revokes stale
+evidence only; it never stops or launches a process.
+
+1. Create or leave `.agenttalk/supervisor.kill` in place. Stop the supervisor
+   and confirm its strict instance marker is absent.
+2. Read the current item with `agenttalk attention`. Record its
+   `source_hash` and launch nonce.
+3. Inventory and stop the complete wrapper tree. Verify every recorded
+   PID/start identity is absent or definitely recycled. Before stopping the
+   wrapper, re-read `--supervisor-launch-nonce` from its live command line and
+   verify it matches the recorded nonce. If the wrapper is no longer live
+   enough to re-read it, do not use the reset command; use manual repair.
+4. As the configured operator-facing liaison (or sole lead), run:
 
 ```powershell
-agenttalk supervise --refresh-scripts
-agenttalk request-restart --for AGENT_NAME
+agenttalk supervise --reset-process-tree-ownership --from <liaison> `
+  --for <agent> --hold-source-hash <64hex> `
+  --verified-launch-nonce <verified-launch-nonce> `
+  --acknowledge-no-live-supervisor `
+  --acknowledge-owned-processes-stopped `
+  --reason "attended owned-tree migration"
 ```
+
+The command uses only the canonical supervisor state and rechecks the kill
+switch, absent instance marker, current nondismissible Attention hash, recorded
+nonce, a valid strict runtime record that agrees on wrapper
+PID/start/generation, and every recorded PID/start under the lifecycle and
+config locks. A stale hash, missing or mismatched nonce, invalid/mismatched
+runtime record, live or unverifiable identity, or unauthorized actor refuses
+the reset. If the HOLD lacks nonce/reset evidence, manual state repair remains
+required. The reset atomically records the exact retired runtime digest and
+PID/start/generation/nonce boundary. Only that unchanged sidecar is ignored
+while the restart is queued; a changed or new-generation runtime still follows
+normal fail-closed adoption.
+
+5. Keep the supervisor host stopped, remove `supervisor.kill`, and run
+   `agenttalk supervise --refresh-scripts` to regenerate and validate the
+   generated artifacts. (`--refresh-scripts` refuses while the kill switch is
+   present.) Queue `agenttalk request-restart --for <agent>`, then resume the
+   supervisor. The next launch must earn a fresh wrapper generation and
+   complete tree before automatic teardown is available.
 
 Freshness is bounded against clock error: a heartbeat farther in the future
 than the configured allowance cannot make an agent healthy. The monitor's
