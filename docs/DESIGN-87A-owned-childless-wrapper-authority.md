@@ -1,6 +1,6 @@
 # Design 87-A module: owned-childless wrapper authority
 
-**Status:** Proposed, Revision 9; normative authority module of 87-A. This file
+**Status:** Proposed, Revision 10; normative authority module of 87-A. This file
 and
 [`DESIGN-87A-supervisor-classifier-authority.md`](DESIGN-87A-supervisor-classifier-authority.md)
 at the same commit form one specification. Neither is conforming alone.
@@ -29,13 +29,18 @@ This is a normative seam, not hand-waving:
 ```text
 87-A observes and classifies
   -> #120 publishes a bounded owned-tree snapshot or a closed refusal
-  -> 87-A proves an exact target executor or returns CAPABILITY_UNAVAILABLE
-  -> the closure successor declares AVAILABLE or CAPABILITY_UNAVAILABLE
-  -> only AVAILABLE may acquire HELD closure or a transient closed refusal
-  -> 87-A constructs or refuses authority
-  -> existing Stop-Tree is the sole target-kill primitive
+  -> that snapshot, every parsed target, and every reloaded state remain inert evidence
+  -> the actual current-host effect adapter may mint a nonserializable exact-executor witness
+  -> only an exact witness-plus-binding match may construct an operation-scoped permit
+  -> only a permit may construct a reservation, effect-owned mutation, or typed external call
+  -> adapters accept typed calls and return matching typed receipts, never raw IDs or state
+  -> existing Stop-Tree is the sole target-kill primitive for a permitted Windows call
   -> #120's post-kill barrier may block, but never authorize, a launch
 ```
+
+This is a construction boundary, not a requirement to remember a check at every
+state entry. An eighteenth, nineteenth, or future childless-origin state may
+deserialize inert evidence, but it cannot manufacture the object needed to act.
 
 The core's independently approved operand convention, 96-cell dominant
 projection, presence/targetability classifier, whole-wrapper absence reducer,
@@ -102,7 +107,7 @@ as follows:
 | `status=absent` | No-kill absence/barrier evidence only; never an initial owned-tree teardown authority. |
 | `status=truncated|invalid`, a non-64 limit, inconsistent counts, omitted entries, or an unreadable binding | `INCOMPLETE`; no teardown authority. |
 | Live Windows `entries[].pid/start/start_filetime` | `OwnedTreeTargetV1.pid/start_guard` after exact live validation. The destructive guard is the positive decimal `start_filetime`; the rounded ISO `start` is capture/ordering corroboration and never substitutes for a missing FILETIME. The adapter derives and validates `parent_start_guard` and `depth` from the accepted live parent chain and projects the validated top-level owner nonce onto each target; it may not privately default any missing fact. |
-| Non-Windows platform, including a live Linux `entries[].start` token | #120 recognizes Linux `linux:<boot_id>:<start_ticks>` as observation/barrier input; it declares no macOS exact-token mapping. The current sole kill primitive has no non-Windows exact-token execution branch, so fresh authority construction returns pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`, short-circuits the named destructive constructor before `OwnedWrapperTreeObservationV1.COMPLETE`, and constructs no owner/target tuple, authority, reservation, attempt, debt, or external call. Inherited checked state follows the later retained-fence rule. Input acceptance is not effect capability. |
+| Non-Windows platform, including a live Linux `entries[].start` token | #120 recognizes Linux `linux:<boot_id>:<start_ticks>` as observation/barrier input; it declares no macOS exact-token mapping. The current sole kill primitive has no non-Windows exact-token execution branch, so fresh authority construction returns pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`, short-circuits before the effect envelope or reservation exists, and constructs no executable target, permit, attempt, debt, or external call. Reloaded evidence may be parsed and ordinary observation bookkeeping may advance, but no matching permit or effect-owned mutation is constructible. Input acceptance is not effect capability. |
 | Non-live virtual ancestry bridge | Admissible only when copied exactly from a prior complete record with unchanged wrapper generation, launch nonce, and parent chain. It is validation provenance only: exclude it from `root_first_targets`, every target digest, and `Stop-Tree`. A live child whose immediate owned parent is such a bridge uses the module's existing positively proven orphan form: null owned-parent fields and depth one. |
 
 `role` and `discovered_at` are validated bounded metadata but are excluded from
@@ -184,7 +189,7 @@ an exact observation token (grammar at
 `owned_process_tree` target without it (`8930-8932`). Therefore that accepted
 token is not a POSIX kill adapter. Linux and macOS are structurally unavailable
 for this named teardown until a separately reviewed exact-token executor is
-delivered; Revision 9 does not dependency-track or assume one. The Windows
+delivered; Revision 10 does not dependency-track or assume one. The Windows
 FILETIME requirement is immutable and is never weakened to make another
 platform appear available.
 
@@ -219,6 +224,9 @@ OwnedWrapperIdentityV1 {
 OwnedPhysicalWrapperIdentityV1 =
   exact projection of OwnedWrapperIdentityV1 excluding state_epoch
 
+QuarantineRetirementCapabilityV1 =
+  CAPABILITY_UNAVAILABLE(PROCESS_UNIVERSE_IDENTITY_UNAVAILABLE)
+
 StateLossQuarantineV1 =
   NONE
   | UNRESOLVED {
@@ -227,6 +235,8 @@ StateLossQuarantineV1 =
       prior_physical_owner: OwnedPhysicalWrapperIdentityV1 | UNKNOWN
       attempt_provenance: UNKNOWN
       debt_provenance: UNKNOWN
+      retirement_capability:
+        QuarantineRetirementCapabilityV1.CAPABILITY_UNAVAILABLE
     }
 
 OwnedTreeTargetV1 {
@@ -242,34 +252,6 @@ OwnedTreeCoverageV1 {
   observer_version: nonempty NFC UTF-8 string of at most 128 bytes
   process_source_digest: Hex64
   ownership_rule_version: "owned-tree/v2"
-}
-
-LostOwnerExtinctionObservationV1 =
-  INCOMPLETE(
-    ordered deduplicated nonempty tuple[
-      CAPABILITY_UNAVAILABLE
-      | SNAPSHOT_UNAVAILABLE
-      | SNAPSHOT_TRUNCATED
-      | COVERAGE_UNREADABLE
-      | PRIOR_PHYSICAL_OWNER_UNKNOWN
-      | PRIOR_OWNER_IDENTITY_UNREADABLE
-      | PRIOR_OWNER_OR_RESIDUAL_MEMBERSHIP_UNPROVEN
-    ] in displayed order
-  )
-  | COMPLETE_GONE {
-      capture_id: CaptureIdV1
-      coverage: OwnedTreeCoverageV1
-      prior_physical_owner: OwnedPhysicalWrapperIdentityV1
-      replacement_physical_owner: OwnedPhysicalWrapperIdentityV1
-      replacement_root_guarded_identity_present: true
-      prior_root_guarded_identity_absent: true
-      every_prior_owner_residual_absent: true
-    }
-
-ProvablyDifferentPhysicalOwnerV1 {
-  prior_physical_owner: OwnedPhysicalWrapperIdentityV1
-  replacement_owner: OwnedWrapperIdentityV1
-  extinction: LostOwnerExtinctionObservationV1.COMPLETE_GONE
 }
 
 OwnedWrapperTreeObservationV1 =
@@ -342,16 +324,62 @@ OwnedDebtResidualObservationV1 =
 ClosureProviderVersionV1 =
   nonempty NFC UTF-8 string of at most 128 bytes
 
-ExactTargetExecutorCapabilityV1 =
-  AVAILABLE {
-    platform: WINDOWS
-    executor_contract: "stop-tree/windows-filetime/v1"
-  }
-  | UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)
+ExactTargetExecutorBindingV1 {
+  platform: WINDOWS
+  executor_contract: "stop-tree/windows-filetime/v1"
+  owner_identity_id: Hex64
+  authorized_target_digest: Hex64
+}
+
+CurrentExactTargetExecutorWitnessV1 =
+  fresh nonserializable, noncopyable current-process witness minted only by
+  the action-site adapter whose actual effect branch implements
+  "stop-tree/windows-filetime/v1"
+
+LiveEffectGuardBorrowV1 =
+  fresh nonserializable, noncopyable linear borrow of the exact currently held
+  per-agent effect-guard handle; while the borrow exists the handle cannot be
+  released, transferred, or replaced
+
+ExactTargetExecutorOperationV1 =
+  RESERVE | PRE_BARRIER_RELEASE | TAKEOVER
+  | CLOSURE_ACQUIRE | CLOSURE_RECONCILE | CLOSURE_RELEASE
+  | RETIRED_ATTEMPT_RECONCILE | STOP_TREE | POST_ACTION_CAPTURE
+  | EFFECT_FINALIZE | SPAWN | SPAWN_RESULT_COMMIT
+  | SPAWN_IDENTITY_COMMIT | OWNER_TRANSITION
+
+ExactTargetExecutorPermitUseV1 =
+  STATE_MUTATION | EXTERNAL_CALL | RECEIPT_MUTATION
+
+ExactTargetExecutorPermitV1 =
+  fresh nonserializable, single-use permit constructed only from:
+    CurrentExactTargetExecutorWitnessV1
+    + exact ExactTargetExecutorBindingV1
+    + the operation's exact binding proof: normally the recomputed exact
+      owner/authorized-target tuple and, when applicable, an exact authorized
+      residual subset; only the closed targetless old-side rebind and cleanup
+      scopes below may use an exact tombstone/envelope binding plus their typed
+      subject and prospective proof
+    + current checked-state revision
+    + one ExactTargetExecutorOperationV1
+    + one ExactTargetExecutorPermitUseV1
+    + that operation's exact live scope defined below
+    + for every guard-required operation, one LiveEffectGuardBorrowV1
+    + for RECEIPT_MUTATION, the exact allowed predecessor receipt
+
+ExactTargetExecutorPermitConstructionV1 =
+  PERMITTED(ExactTargetExecutorPermitV1)
+  | CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)
+  | REJECTED(
+      STALE_CHECKED_REVISION
+      | OPERAND_MISMATCH
+      | INVALID_OPERATION_SCOPE
+      | COPIED_FORGED_REPLAYED_OR_CONSUMED)
 
 ClosureCapabilityV1 =
   AVAILABLE {
-    exact_target_executor: ExactTargetExecutorCapabilityV1.AVAILABLE
+    reservation_permit:
+      ExactTargetExecutorPermitV1(operation = RESERVE, use = STATE_MUTATION)
     closure_provider_version: ClosureProviderVersionV1
   }
   | CAPABILITY_UNAVAILABLE(
@@ -413,6 +441,35 @@ OwnedTreeClosureReconciliationV1 =
       ] in displayed order
     )
 
+ChildlessContinuationSubjectV1 =
+  ACTIVE_ATTEMPT {
+    reservation_id: lowercase hyphenated UUID
+    attempt_id: lowercase hyphenated UUID
+    attempt_revision: uint64
+    closure_provider_version: ClosureProviderVersionV1
+  }
+  | RETIRED_ATTEMPT {
+      attempt_id: lowercase hyphenated UUID
+      attempt_revision: uint64
+      closure_provider_version: ClosureProviderVersionV1
+    }
+  | SPAWN_RESERVATION {
+      reservation_id: lowercase hyphenated UUID
+    }
+
+ChildlessContinuationOperationV1 =
+  CLOSURE_ACQUIRE | CLOSURE_RECONCILE | CLOSURE_RELEASE
+  | RETIRED_ATTEMPT_RECONCILE | STOP_TREE | POST_ACTION_CAPTURE
+  | SPAWN
+
+TakeoverOriginV1 =
+  NONE
+  | FROM {
+      predecessor_continuation_id: lowercase hyphenated UUID
+      predecessor_operation: ChildlessContinuationOperationV1
+      predecessor_effect_stage: ARMED | CALL_RETURNED
+    }
+
 ChildlessContinuationOwnerV1 =
   NONE
   | OWNED {
@@ -422,40 +479,298 @@ ChildlessContinuationOwnerV1 =
       action_latch_epoch: uint64 | null
       continuation_id: lowercase hyphenated UUID
       role: ISSUER | RECONCILER
-      closure_provider_version: ClosureProviderVersionV1
-      attempt_id: lowercase hyphenated UUID
-      attempt_revision: uint64
-      operation:
-        CLOSURE_ACQUIRE
-        | CLOSURE_RECONCILE
-        | CLOSURE_RELEASE
-        | STOP_TREE
-      effect_stage: ARMED | CALL_RETURNED
+      subject: ChildlessContinuationSubjectV1
+      operation: ChildlessContinuationOperationV1
+      effect_stage: ARMED | CALL_RETURNED | TAKEOVER_CHECKPOINT
+      takeover_origin: TakeoverOriginV1
       armed_state_revision: uint64
     }
+
+BoundRetiredChildlessAttemptV1 {
+  attempt_id: lowercase hyphenated UUID
+  attempt_revision: uint64
+  executor_binding: ExactTargetExecutorBindingV1
+  closure_provider_version: ClosureProviderVersionV1
+  cleanup_state:
+    TERMINAL(NEVER_ACQUIRED | RELEASED)
+    | RELEASE_PENDING(closure_id: lowercase hyphenated UUID)
+}
+
+ChildlessEffectEnvelopeV1 {
+  executor_binding: ExactTargetExecutorBindingV1
+  execution: core ChildlessRecoveryExecutionV1
+  teardown_debt: TeardownDebtV1
+  automatic_cycle: AutomaticChildlessCycleV1
+  continuation_owner: ChildlessContinuationOwnerV1
+  retired_attempts:
+    bounded ordered tuple[BoundRetiredChildlessAttemptV1] of length 0..128
+}
+
+ExecutableOwnedTargetSetV1 =
+  nonserializable exact root-first target tuple and recomputed target digest
+  bound to one ExactTargetExecutorPermitV1(
+    operation = STOP_TREE, use = EXTERNAL_CALL)
+
+PermitBoundChildlessMutationV1 =
+  nonserializable checked-state delta containing the exact expected revision,
+  one current ExactTargetExecutorPermitV1 whose use is STATE_MUTATION or
+  RECEIPT_MUTATION, the exact current envelope or
+  NO_CHILDLESS_ENVELOPE for an initial RESERVE, and the complete next
+  ChildlessEffectEnvelopeV1 or terminal envelope removal allowed by that
+  permit's operation, plus the exact closed core ChildlessOuterStateDeltaV1
+
+ChildlessExternalEffectCallV1 =
+  nonserializable typed call in
+    CLOSURE_ACQUIRE | CLOSURE_RECONCILE | CLOSURE_RELEASE
+    | RETIRED_ATTEMPT_RECONCILE | STOP_TREE | POST_ACTION_CAPTURE
+    | SPAWN
+  carrying one call_id, an exact permit whose use is EXTERNAL_CALL, its exact
+  binding/continuation, only that operation's typed arguments, and ownership of
+  the permit's LiveEffectGuardBorrowV1
+
+ChildlessExternalEffectReceiptV1 =
+  nonserializable typed result carrying the exact call_id, operation,
+  consumed call-permit identity/binding, call-time checked revision,
+  operation-specific result, and
+  the same still-live guard borrow returned by the synchronous adapter
+
+ChildlessSafetyReconciliationGateV1 =
+  RETAIN_INVALID_FENCE
+  | RETAIN_LIVE_CONTINUATION
+  | RETAIN_EFFECT_GUARD_UNAVAILABLE
+  | MAY_RELEASE_PRE_BARRIER(
+      ExactTargetExecutorPermitV1(
+        operation = PRE_BARRIER_RELEASE, use = STATE_MUTATION))
+  | MAY_TAKEOVER(
+      ExactTargetExecutorPermitV1(operation = TAKEOVER, use = STATE_MUTATION))
+  | MAY_RECONCILE(
+      ExactTargetExecutorPermitV1(
+        operation = CLOSURE_RECONCILE | RETIRED_ATTEMPT_RECONCILE,
+        use = STATE_MUTATION))
 ```
 
-`ExactTargetExecutorCapabilityV1` is a fresh, non-persisted fact about the
-current execution host and the action branch that actually terminates the
-typed target. Parser, snapshot, or target-constructor acceptance cannot produce
-`AVAILABLE`. At merged #120, only the Windows exact-FILETIME branch at
-`src/agenttalk/supervisor.py:8900-8928` satisfies the V1 contract; the
-non-Windows skip at `8930-8932` produces `UNAVAILABLE`. A future executor for a
-different platform requires a separately reviewed successor and a versioned
-contract change. For an inherited target tuple, `AVAILABLE` additionally
-requires every immutable target token to match that current-host executor
-contract; platform recognition alone is insufficient.
+`ExactTargetExecutorBindingV1` is inert persisted evidence. It names the only
+executor contract that may act on the exact owner/target tuple, but it grants
+no authority and cannot mint a witness or permit. The existing seven digest
+domains remain unchanged: the binding references their recomputed identifiers
+rather than adding fields to any banked payload.
 
-The `ClosureCapabilityV1` constructor consumes that fresh exact-executor fact
-before any closure-provider predicate. If the executor is unavailable, it returns
-`CAPABILITY_UNAVAILABLE` with the exact one-element reason tuple
-`(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and does not inspect or combine downstream
-successor reasons because that boundary is unreachable. Only an admitted
-executor proceeds to collect all true successor reasons in the displayed order
-or produce `AVAILABLE`, which carries the exact admitted executor value. Under
-merged #120, every fresh non-Windows named-teardown path takes the
-short-circuiting unavailable arm; only Linux has an admitted exact observation
-token.
+`CurrentExactTargetExecutorWitnessV1` exists only in the current process at the
+line where the concrete effect adapter is available. Parser, snapshot,
+target-constructor, persisted platform text, or deserialized state cannot
+produce it. At merged #120, only the Windows exact-FILETIME branch at
+`src/agenttalk/supervisor.py:8900-8928` may back the V1 witness; the non-Windows
+skip at `8930-8932` produces no witness. A future executor requires a separately
+reviewed versioned contract.
+
+The permit constructor compares every binding field. Except for the closed
+targetless cleanup scopes below, it also recomputes the exact owner and
+authorized-target digest from the displayed tuple and proves any
+operation-specific residual tuple is an exact ordered subset of that immutable
+authorization. A targetless scope instead proves its complete typed subject
+against the exact historical tombstone or current envelope binding. Every
+permit binds the current checked revision and is scoped to one operation and
+one use. A guard-required permit also linearly borrows the exact live guard
+handle: releasing, losing, transferring, or replacing that handle invalidates
+the permit before consumption. The checked owner revalidates the borrow while
+consuming a mutation permit and returns control of the still-held handle only
+after that checked commit. An external-call permit moves the borrow into the
+typed call; the synchronous adapter must revalidate it at entry and may return
+it only inside the matching typed receipt. Constructing the corresponding
+`RECEIPT_MUTATION` permit consumes that returned borrow from the exact receipt;
+it cannot acquire a second borrow or detach the result payload from the first.
+The checked receipt commit revalidates the borrow before applying the result and
+then returns control of the still-held handle. Thus a typed call cannot outlive
+or detach from its guard merely because its constructor once observed the guard.
+No unconsumed permit crosses a checked commit. Every
+external call uses three distinct permits under one held effect guard: a `STATE_MUTATION`
+permit arms the exact checked continuation; after that CAS, a newly constructed
+`EXTERNAL_CALL` permit at the successor revision constructs and invokes the
+call; after the synchronous result, a newly constructed `RECEIPT_MUTATION`
+permit at the then-current revision applies the matching receipt. An ordinary
+observation CAS may intervene only when the effect envelope and continuation
+remain exact; the receipt-mutation constructor rechecks both and binds the new
+revision. The already-invoked call/receipt lineage may therefore span only such
+observation revisions; the consumed call permit itself is never reused, and any
+effect-envelope or continuation change rejects the receipt. The live-scope
+operand is a closed discriminated value:
+
+- `RESERVE` permits only `STATE_MUTATION` and has two closed current-state
+  scopes. `INITIAL` requires top-level execution `IDLE` and creates the first
+  envelope/binding. `CONTINUE` requires an existing envelope whose execution is
+  `IDLE`, with no current attempt, closure, pending disposition, continuation,
+  or `RELEASE_PENDING` tombstone. For initial-mode retry with debt `NONE`, it
+  may atomically replace the envelope's current binding with the prospective
+  fresh tree binding only when the prospective owner identity exactly equals
+  the old binding owner. It preserves the same-owner cycle and terminal
+  tombstones under their own historical bindings. A physically different owner
+  must first use `OWNER_TRANSITION` and then `RESERVE/INITIAL`; `CONTINUE` cannot
+  bypass that boundary. For `DEBT_COMPLETION`, the prospective
+  binding must equal the immutable envelope/debt binding and its targets must be
+  the exact authorized residual subset. Both scopes install `PRE_BARRIER`; no
+  other operation may create or renew a reservation.
+- `PRE_BARRIER_RELEASE` requires a valid `PRE_BARRIER` envelope with null
+  attempt, closure, continuation, spawn guard, and deadline. It is a state-only
+  `STATE_MUTATION`; it does not imply an external effect.
+- `TAKEOVER`, every closure operation, `RETIRED_ATTEMPT_RECONCILE`,
+  `STOP_TREE`, `POST_ACTION_CAPTURE`, `EFFECT_FINALIZE`, `SPAWN`,
+  `SPAWN_RESULT_COMMIT`, and `SPAWN_IDENTITY_COMMIT` require the current caller
+  to hold the nonserializable effect guard. Their permits carry the same kind of
+  linear live-guard borrow; the spawn call moves that borrow into its typed call
+  and receipt exactly as every other external call does. First
+  `CLOSURE_ACQUIRE` binds a proposed issuer continuation to the exact
+  reservation, guard owner, and expected successor revision; its permit-bound
+  mutation must install that exact continuation. Later operations require the
+  exact current checked continuation, tombstone, or receipt stated below, or a
+  proposed replacement continuation derived from it by the closed transition.
+  `TAKEOVER` additionally requires positive predecessor-unwind or
+  PID/start-death proof and authorizes only its no-call `STATE_MUTATION`. That
+  mutation preserves the predecessor operation as evidence but changes its
+  stage to inert `TAKEOVER_CHECKPOINT`; it never writes `ARMED` for any later
+  operation.
+- A call-bearing `STATE_MUTATION` installs exactly one `OWNED/ARMED`
+  continuation. Its subject is `ACTIVE_ATTEMPT` for closure, `Stop-Tree`, and
+  post-action capture; `RETIRED_ATTEMPT` for retired reconcile/release; or
+  `SPAWN_RESERVATION` for spawn. The post-CAS `EXTERNAL_CALL` permit requires
+  that exact subject, operation, `ARMED` stage, `armed_state_revision`, and live
+  guard. No raw ID, tombstone, reservation, or receipt can construct it. An
+  `OWNED/ARMED` continuation for operation `O` is constructible only by an
+  `O/STATE_MUTATION` permit. Applying operation `P`'s receipt may write only
+  `P/CALL_RETURNED` or the closed receipt-successor state allowed by the table
+  below; it may not arm a different operation. Chaining to a later call
+  therefore requires a new checked commit with that later operation's own
+  `STATE_MUTATION` permit.
+- `EFFECT_FINALIZE` has one additional debt-only scope: the exact current
+  envelope is childless `IDLE`, has no closure, pending disposition,
+  continuation, or debt current attempt, and the current ordinary residual is
+  matching `COMPLETE_GONE`. The caller still holds the transient effect guard;
+  the permit authorizes only the atomic debt/cycle clear plus same-poll terminal
+  and constructs no external call or launch.
+- `SPAWN` requires an exact transient live-action scope plus the pre-spawn
+  barrier result. Its `STATE_MUTATION` enters `SPAWN_IN_FLIGHT` and installs an
+  exact `SPAWN_RESERVATION/SPAWN/ARMED` continuation; only a fresh post-CAS
+  `EXTERNAL_CALL` permit can construct `Start-Process`. A synchronous
+  `SPAWN_RESULT_COMMIT` or `SPAWN_IDENTITY_COMMIT` requires the matching typed
+  spawn receipt and a fresh `RECEIPT_MUTATION` permit.
+  The only receipt-free result scope is `CRASHED_DURING_SPAWN`, which requires
+  a fresh witness, the exact inert `SPAWN_IN_FLIGHT` envelope, the reacquired
+  effect guard, and positive proof that the recorded issuing process/start
+  cannot resume. Its persisted continuation must be either the exact dead-
+  issuer `SPAWN_RESERVATION/SPAWN/ARMED` predecessor or the exact table-
+  authorized `SPAWN_RESERVATION/SPAWN/TAKEOVER_CHECKPOINT/RECONCILER` derived
+  from that predecessor. It is a `STATE_MUTATION`, not a receipt mutation.
+  `SPAWN_IDENTITY_COMMIT` also
+  requires the exact guarded identity checkpoint returned for that spawn.
+  Two other no-receipt state-only scopes are closed: a later strict checkpoint
+  may construct `SPAWN_IDENTITY_COMMIT/STATE_MUTATION` only when it exactly
+  matches the guard retained in `AMBIGUOUS_LAUNCH`; and two compatible ordinary
+  absence captures strictly after the ambiguity boundary may construct
+  `SPAWN_RESULT_COMMIT/STATE_MUTATION` only to resolve that exact envelope to
+  `IDLE` without launch. None may be built from a persisted
+  `SPAWN_IN_FLIGHT`/`AMBIGUOUS_LAUNCH` value alone.
+- `OWNER_TRANSITION` is state-only. It requires an exact fresh guarded identity
+  checkpoint for a physically different owner, quarantine `NONE`, debt `NONE`,
+  childless execution `IDLE`, no continuation or retired cleanup obligation,
+  and a witness matching the old envelope binding. It may clear only that old
+  owner's cycle/envelope while committing the new guarded owner; it cannot kill
+  or launch.
+
+The only targetless old-side permit scopes are: `RESERVE/CONTINUE` changed-tree
+rebind over the exact old envelope binding plus same owner, no debt/current
+obligation/continuation/`RELEASE_PENDING`, and the complete fresh prospective
+owner/target tuple; takeover/reconcile/release/finalization of a typed retired-
+attempt subject whose tombstone carries the exact historical binding; and
+`OWNER_TRANSITION` over the exact old envelope binding. These
+scopes still require a matching current-host witness, checked revision, effect
+guard when applicable, and their complete typed subject/receipt/checkpoint.
+They cannot construct `ExecutableOwnedTargetSetV1`, rewrite authorization or
+debt, or act on a raw digest. Every other operation recomputes the complete
+owner/authorized-target tuple and residual subset when applicable.
+
+There is no generic null-scope fallback. Absence of a fresh current-host witness
+whose executor contract can serve the exact binding returns
+`CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`. A stale checked
+revision returns `REJECTED(STALE_CHECKED_REVISION)` and must reload/re-reduce.
+A copied, forged, replayed, consumed, wrong-use, mismatched, or unsupported live
+scope returns the corresponding `REJECTED` value; malformed checked evidence is
+handled by the earlier invalid-fence row. Every non-permitted result constructs
+no permit, mutation, or call. Only static witness/executor inability is rendered
+as operator-facing capability unavailability. A permit is neither serializable
+nor reusable after its operation/use,
+checked revision, target/residual tuple, effect-guard ownership, continuation,
+receipt, or identity checkpoint changes. `ClosureCapabilityV1.AVAILABLE`
+carries only the `RESERVE` permit; it is consumed by the selected initial or
+continuing reservation mutation and is never persisted or reused for
+acquisition.
+
+The `ClosureCapabilityV1` constructor takes ownership of and embeds a fresh
+unconsumed `RESERVE/STATE_MUTATION` permit before any closure-provider
+predicate; only its checked reservation mutation consumes it. If construction
+returns `CAPABILITY_UNAVAILABLE`, the capability constructor returns the exact
+one-element reason tuple `(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and does not
+inspect downstream successor reasons because that boundary is unreachable. A
+`REJECTED` result is not a capability result and follows its reload/reject rule.
+Only a permitted constructor collects successor reasons or produces
+`AVAILABLE`. Under merged #120, every non-Windows named-teardown path lacks a
+witness; Linux's admitted observation token does not change that fact.
+
+The receipt-predecessor relation is closed:
+
+| Receipt operation | Permitted receipt mutation |
+| --- | --- |
+| `CLOSURE_ACQUIRE` | `CLOSURE_ACQUIRE` to bind/persist the exact result, or `EFFECT_FINALIZE` only for the event table's matching terminal `NEVER_ACQUIRED`/`RELEASED` case. |
+| `CLOSURE_RECONCILE` | `CLOSURE_RECONCILE` to persist the exact same-operation `CALL_RETURNED` checkpoint, or `EFFECT_FINALIZE` only for an event-table terminal result. That terminal scope includes exact matching `RELEASED` after persisted `STOP_TREE/CALL_RETURNED`: it finalizes conservatively as `EFFECT_UNPROVEN`, retains debt, and performs no residual-capture call. A later operation's own state-mutation permit performs any next arm. |
+| `CLOSURE_RELEASE` | `CLOSURE_RELEASE` to persist the same-operation `CALL_RETURNED` checkpoint for matching `HELD`/`UNKNOWN`, or `EFFECT_FINALIZE` for exact `RELEASED` on the active disposition or retired cleanup subject. A later retry begins with its own `CLOSURE_RECONCILE/STATE_MUTATION` arm. |
+| `RETIRED_ATTEMPT_RECONCILE` | `RETIRED_ATTEMPT_RECONCILE` to restore terminal state or persist `RELEASE_PENDING` plus the reconcile `CALL_RETURNED` checkpoint. Exact release is armed only by a later `CLOSURE_RELEASE/STATE_MUTATION` permit. |
+| `STOP_TREE` | `STOP_TREE` to record `CALL_RETURNED`; it cannot finalize the effect. |
+| `POST_ACTION_CAPTURE` | `POST_ACTION_CAPTURE` to map the typed observation and persist its `CALL_RETURNED` release-required checkpoint. Exact closure release is armed only by a later `CLOSURE_RELEASE/STATE_MUTATION` permit. |
+| `SPAWN` | Exactly one of `SPAWN_RESULT_COMMIT` or `SPAWN_IDENTITY_COMMIT`, according to the typed result and guarded checkpoint. |
+
+Every other operation pair, a receipt whose call permit/binding/call ID does
+not match, or a receipt applied after the envelope/continuation changed is
+rejected before mutation.
+
+`ChildlessEffectEnvelopeV1` is the only persisted home for childless-owned
+effect state. The core represents execution as `IDLE`, a non-childless value,
+or `CHILDLESS(ChildlessEffectEnvelopeV1)`; it never persists a childless
+reservation or phase standalone. `ChildlessRecoveryExecutionV1` includes its
+own `IDLE`, every named reservation phase through `SPAWN_IN_FLIGHT`, and
+`AMBIGUOUS_LAUNCH`. The envelope remains present with childless execution
+`IDLE` while debt, an automatic cycle, a continuation, or a retired attempt
+remains. Every target tuple, attempt, closure, debt, continuation, pending
+disposition, and active cycle attempt inside it must equal its current binding.
+A terminal retired attempt retains the historical binding under which it was
+issued and may differ after a safe initial-mode retry rebind; its cleanup uses
+only that tombstone binding. A `RELEASE_PENDING` tombstone forbids
+reservation/rebind. Any other mismatch is a malformed envelope and grants no
+permit.
+
+The checked-state owner accepts no raw write to this envelope. It accepts only
+a `PermitBoundChildlessMutationV1` whose expected revision and permit still
+match, except for the two explicitly non-effect mutation classes below:
+a core `ClassifierObservationDeltaV1`, whose type cannot address the envelope,
+and creation of an unresolved state-loss quarantine. Consequently a future
+childless phase automatically inherits the same construction boundary. It may
+deserialize evidence inside the envelope, but without a matching fresh witness
+no executor-dependent external effect and no authority-enabling or effect-owned
+mutation is constructible. In particular, it cannot construct an executable
+target, reservation, permit-bound mutation, call, receipt, launch, or identity
+commit.
+
+`OwnedTreeTargetV1`, `ChildlessTeardownAuthorityV1`,
+`ChildlessReservationEvidenceV1`, closure values, observations, and every
+persisted envelope member are inert evidence. `ExecutableOwnedTargetSetV1` is
+the only target type accepted by the `Stop-Tree` adapter.
+`ChildlessExternalEffectCallV1` is the only input accepted by every childless
+closure, teardown, post-action capture, and spawn adapter. Those adapters return a matching
+`ChildlessExternalEffectReceiptV1`; raw IDs, raw target tuples, persisted
+state, and untyped provider results are rejected at the API boundary. A
+receipt changes checked state only through a matching
+`PermitBoundChildlessMutationV1` in the same guarded operation.
+Only the invoked adapter may construct its receipt, and only as the synchronous
+result of a valid typed call; a decoder or ordinary reducer cannot construct a
+receipt. Module-private constructors enforce these boundaries. Public parsing
+and serialization APIs expose inert evidence constructors only.
 
 Every `COMPLETE`, `COMPLETE_GONE`, or `COMPLETE_RESIDUAL` ordinary tree/debt
 observation is well formed only when all of these hold:
@@ -498,9 +813,10 @@ recycle-aware enumeration/ownership algorithm, and pinned implementation
 revision. This replaces the pre-review `win-tree/v1`
 mapping; the chained module vectors below are renewed accordingly. Any later
 change to those inputs requires a different version value and renewed
-vectors/review. Revision 9 narrows platform admission before target
-construction; it does not change the admitted Windows mapping or its fixed
-vector. 87-A fixes `ownership_rule_version` to `owned-tree/v2` and the
+vectors/review. Revision 9 first narrowed platform admission before target
+construction, and Revision 10 preserves that narrowing without changing the
+admitted Windows mapping or its fixed vector. 87-A fixes
+`ownership_rule_version` to `owned-tree/v2` and the
 core coverage's `pid_start_guard_schema` to `2` for the exact-FILETIME mapping;
 none of those values may be omitted or privately defaulted.
 
@@ -639,19 +955,19 @@ release:
 The closure-successor seam exposes one process-version-stable
 `ClosureCapabilityV1` before reservation, then acquire, reconcile, and release
 keyed by `acquisition_id`; release additionally requires the exact
-`closure_id`. `AVAILABLE` exposes one exact `ClosureProviderVersionV1` and is
-well formed only for an installed, independently reviewed implementation that
-can prove this contract inside the absolute dependency-plane constraint for
-every case it accepts **and** for a platform whose existing executor actually
-acts on the exact target token. A valid observation token without such an
-executor returns `EXACT_TARGET_EXECUTOR_UNAVAILABLE`; acceptance by a parser or
-snapshot producer is insufficient. `ClosureCapabilityV1.CAPABILITY_UNAVAILABLE`
-is structural and may appear only before reservation. By contrast, a freshly
-reconstructed `ExactTargetExecutorCapabilityV1.UNAVAILABLE` is a current-host
-environment fact and may be observed after reservation or debt persistence; it
-selects the retained-fence rule and is not malformed closure-successor output.
-The caller persists an available provider version in
-`ChildlessContinuationOwnerV1` before acquisition;
+`closure_id`. `AVAILABLE` exposes one exact `ClosureProviderVersionV1` and a
+live one-shot `RESERVE` permit. It is well formed only for an installed,
+independently reviewed implementation that can prove this contract inside the
+absolute dependency-plane constraint for every case it accepts **and** for a
+current action-site witness whose executor actually acts on the exact target
+token. A valid observation token without such a witness returns
+`EXACT_TARGET_EXECUTOR_UNAVAILABLE`; parser or snapshot acceptance is
+insufficient. `ClosureCapabilityV1.CAPABILITY_UNAVAILABLE` is structural and
+may appear only before reservation. After reservation, failure to construct a
+fresh permit is a current-host fact: the envelope remains inert and exact, but
+ordinary observation bookkeeping may still advance.
+The caller persists an available provider version in the continuation's typed
+`ACTIVE_ATTEMPT` subject before acquisition;
 every `HELD`, `NEVER_ACQUIRED`, `RELEASED`, reconcile result, release request,
 and held refresh must match it byte-for-byte. A provider contract change
 requires a new version. Missing or mismatched versions normalize to `UNKNOWN`,
@@ -674,15 +990,20 @@ in that null-ID acquiring state. Once a closure ID has been bound, every
 persisted pair. Missing, null, changed, or conflicting IDs normalize to
 `UNKNOWN`, retain the reservation and any debt/current attempt, and forbid
 kill and launch. `NEVER_ACQUIRED` is terminal for that acquisition ID: the
-same checked transaction appends it to `retired_childless_attempt_ids`, and
-the closure successor must not later acquire it. An unexpected late `HELD` for a retired
-ID is never authority; it is accepted only to perform exact idempotent release
-under the effect guard, after which the tombstone remains. The successor has no
-unsolicited result channel: a cleanup poll first checks current-host exact
-executor availability, acquires the effect guard, and reconciles by the
-persisted retired ID. A returned late `HELD` is released synchronously under
-that same guard. A crash leaves the retired ID for a later compatible-host
-reconcile; an unavailable host makes neither call and retains the ID.
+same checked transaction appends its bound attempt ID/revision, binding,
+provider version, and `TERMINAL(NEVER_ACQUIRED)` tombstone to
+`retired_attempts`, and the closure successor must not later acquire it. An
+unexpected late `HELD` for a retired ID is never authority. A cleanup poll must
+first arm a typed `RETIRED_ATTEMPT` continuation, then use a distinct fresh
+post-CAS permit to construct the reconcile call. A matching receipt may only
+restore terminal state or persist `RELEASE_PENDING(closure_id)` with the
+reconcile continuation at `CALL_RETURNED`. A later
+`CLOSURE_RELEASE/STATE_MUTATION` permit must replace that checkpoint with
+`CLOSURE_RELEASE/ARMED`; release then uses its own fresh post-CAS call permit
+and matching receipt mutation. The successor has no unsolicited result
+channel. A crash leaves the
+typed continuation/tombstone for guarded takeover; a host without a matching
+witness can deserialize both but can build neither mutation nor call.
 
 After crash/reload, only matching `NEVER_ACQUIRED` or `RELEASED` permits 87-A
 to finish a release-dependent transition. Matching `HELD` must be released
@@ -717,6 +1038,32 @@ implementation that discovers an unprovable case opens or updates a task; it
 must not introduce a mechanism as an implementation detail.
 This deliberately accepts that some recoveries may never become automatic;
 the operator preferred that availability loss to stale-authority risk.
+
+### Operator-visible capability reductions
+
+Revision 10 has two permanent held paths that operators must see together:
+
+- On Linux and macOS, every closure-dependent named teardown returns
+  `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and recovery
+  remains `POLICY_HELD` pending a human. This persists until a separately
+  reviewed exact-token kill adapter exists; #120's accepted Linux observation
+  token is not that adapter.
+- On every platform, automatic retirement of
+  `StateLossQuarantineV1.UNRESOLVED` is unavailable in V1. Recovery remains
+  `POLICY_HELD` with `CHILDLESS_STATE_PROVENANCE_LOST` pending attended
+  handling because merged #120 supplies no trustworthy host/process-universe
+  token. A local replacement and local absence cannot prove that the prior
+  wrapper and erased-debt members are extinct in their source universe.
+
+None of the following is sufficient, alone or in combination, to establish
+that missing process-universe identity: **PID and start, hostname,
+`state_epoch`, `process_source_digest`, MachineGuid alone, local absence**.
+A future successor may enable automatic retirement only through a reviewed
+read-only producer over an **existing OS token** that binds the prior owner and
+extinction coverage to the same source host/process universe. It may introduce
+no new file, registry value, helper, daemon, OS object, persistence plane, or
+runtime dependency. Until that successor is delivered, the unavailable result
+is the design, not a temporary implementation fallback.
 
 ## Two independent complete child-absence captures
 
@@ -798,7 +1145,8 @@ From count two, another distinct compatible capture adjacent to the stored
 last capture keeps count two and slides the window: prior `last_capture_id`
 becomes `first_capture_id`, the current capture becomes `last_capture_id`, and
 the current ordinary sequence becomes `last_ordinary_poll_sequence`. Replay
-leaves the state byte-identical. A gap or any changed equality input restarts
+leaves the `OwnedChildlessConfirmationV1` value byte-identical. A gap or any
+changed equality input restarts
 at the current qualifying sample; nonqualifying evidence resets to empty. Tree
 membership may change between samples; the action-time closure freezes and
 revalidates the final target set. The overlay is committed atomically beside,
@@ -936,8 +1284,10 @@ It also copies the committed successor revision containing that residual and
 its exact same-revision condition fingerprint. Its four
 childless/runtime/config/establishment basis fields are null and both debt
 fields are non-null. A
-`COMPLETE_GONE` residual observation clears debt/cycle in an observation-only
-checked transition, writes the same-poll terminal, and constructs no authority.
+`COMPLETE_GONE` residual observation is inert input; only a fresh matching
+`EFFECT_FINALIZE` permit may construct the checked mutation that clears
+debt/cycle and writes the same-poll terminal. It constructs no authority or
+launch. The ordinary observation delta cannot perform that clear.
 `INCOMPLETE` retains debt and constructs `BLOCKED(TEARDOWN_DEBT_INCOMPLETE)`.
 Closure is never a precondition of either authority constructor.
 
@@ -978,9 +1328,14 @@ canonical `{"basis_id": ..., "mode": "INITIAL" | "DEBT_COMPLETION",
 "schema": "provably-childless-owned-wrapper-authority/v1",
 "target_digest": ...}`.
 
-The core copies every displayed proof field into its checked reservation.
-Neither an authority hash, the generic targetability digest, nor a
-command-line match is decoded or substituted for the target tuple.
+Every displayed proof object is inert. The fresh reservation constructor must
+consume it together with a current witness, recompute its tuple/digest, create
+the exact `ExactTargetExecutorBindingV1`, and emit one
+`PermitBoundChildlessMutationV1` whose next state is
+`CHILDLESS(ChildlessEffectEnvelopeV1)`. No caller may copy the fields directly
+into checked state. Neither an authority hash, the generic targetability
+digest, nor a command-line match is decoded or substituted for the target
+tuple.
 
 `ChildlessClosureEvidenceV1` is the 87-A join over the closure-successor result
 and current checked state; the successor does not decide authority. It is valid only when the
@@ -1060,9 +1415,9 @@ closure-successor value is
 ## Action-time closure and sole teardown path
 
 **ENFORCED effect linearization after task #115 and the closure successor:**
-State CAS alone does not own an external call. Every childless
-closure-successor call, `Stop-Tree` call, and
-action capture therefore runs under one exclusive transient per-agent effect
+State CAS alone does not own an external call. Every childless active or
+retired closure-successor call, `Stop-Tree` call, action capture, and spawn
+therefore runs under one exclusive transient per-agent effect
 guard and one checked `ChildlessContinuationOwnerV1`. Lock order is fixed:
 configuration snapshot, action latch, effect guard, then the short #115
 checked-state transaction. The effect guard is caller-owned synchronization,
@@ -1072,41 +1427,81 @@ exits, has no detached owner or durable payload, and is never evidence after
 release. No timeout, heartbeat, lease renewal, or second poller may steal it.
 
 The checked owner identifies the exact supervisor process/start, applicable
-action-latch epoch, continuation role, attempt, operation, stage, and state
-revision. The invocation
+action-latch epoch, continuation role, typed subject, operation, stage, and
+state revision. The invocation
 acquires the effect guard, recaptures every gate and basis, commits
-`effect_stage=ARMED`, rechecks that it still owns both the guard and exact
-checked owner, performs the one synchronous external operation, and commits
-`CALL_RETURNED` or the operation-specific terminal result before releasing the
-guard. An adapter refuses a retired attempt ID and any caller whose persisted
-continuation owner no longer matches. Thus committing a phase never, by
-itself, licenses a later stale continuation.
+`effect_stage=ARMED` with a state-mutation permit, constructs a distinct fresh
+post-CAS call permit, rechecks that it still owns both the guard and exact
+checked owner, performs the one synchronous external operation, and constructs
+a third fresh receipt-mutation permit before committing `CALL_RETURNED` or the
+operation-specific terminal result. An adapter accepts a retired attempt only
+through its exact typed retired subject and rejects any caller whose persisted
+continuation owner no longer matches. Thus committing a phase never, by itself,
+licenses a later stale continuation.
 
-Before every childless closure-successor call, `Stop-Tree` call, post-action or
-residual capture reservation, takeover CAS, observation-only debt clear,
-late-`HELD` release, and pending-disposition/debt finalization, the invocation reconstructs
-`ExactTargetExecutorCapabilityV1` on the current execution host. While
-`StateLossQuarantineV1` is `NONE`, an
-uninterrupted issuer also rechecks that operand immediately before its next
-external operation. `UNAVAILABLE` authorizes no cleanup exception: the
-invocation retains the complete checked fence byte-identically, makes no
-external call, reserves no capture ordinal, mutates no attempt/debt/cycle or
-terminal field, emits `CAPABILITY_UNAVAILABLE`, and remains `POLICY_HELD`.
-Persisted Windows authority or a previously returned external result cannot be
-used to manufacture current-host executor availability. An unresolved
-state-loss quarantine instead owns the earlier quarantine rows; its separately
-specified complete-extinction retirement may clear physically inactionable
-state, but is not named cleanup and performs no external operation.
+For every syntactically valid checked state, the structural universal is
+narrower and stronger than Revision 9's path-enumeration claim:
+
+```text
+without a fresh CurrentExactTargetExecutorWitnessV1 that exactly matches the
+persisted ExactTargetExecutorBindingV1, no executor-dependent external effect
+and no authority-enabling or effect-owned mutation is constructible
+```
+
+The witness is an operand of construction, not a Boolean checked at remembered
+sites. Persisted Windows authority, a call-returned marker, a target tuple, a
+closure result, or a deserialized envelope cannot substitute for it. Failure
+because the current host cannot supply a matching witness leaves the complete
+`ChildlessEffectEnvelopeV1` byte-identical, makes no external call, and emits
+`CAPABILITY_UNAVAILABLE` plus `POLICY_HELD`; a `REJECTED` construction instead
+performs zero effect and follows its reload/reject rule.
+
+For the sole first `RESERVE/INITIAL` constructor, where no persisted binding yet
+exists, “matching the persisted binding” means matching the prospective exact
+binding carried by the one-shot permit and atomically persisting that same value
+as part of the envelope-creation mutation. `RESERVE/CONTINUE` matches the exact
+current envelope binding and, for a permitted initial-mode rebind, also carries
+the prospective fresh binding committed by that same mutation. No other
+operation receives a prospective-binding exception.
+
+Here **authority-enabling mutation** means a checked change that creates,
+consumes, releases, or rebinds a childless reservation; changes childless
+execution, attempt, closure, debt, cycle, continuation, retired-attempt,
+nonordinary-capture, spawn, or guarded-identity ownership; or clears one of
+those fences. It does not mean a pure ordinary-observation field whose value is
+inert evidence and whose constructor returns no reservation, permit, executable
+target, call, or receipt. Such evidence may make a later pure predicate true,
+but it cannot act until a separate permitted mutation succeeds.
+
+The sole outer-state exception is
+`StateLossQuarantineCreationDeltaV1`, used only when no trustworthy current
+state/revision exists to mutate. It replaces unreadable or unproven bytes with
+a new quarantined genesis that exposes less authority and no childless effect
+object; it is not a constructor over a valid envelope. No other permit-free
+exception exists.
+
+Revision 10 explicitly withdraws Revision 9's broader promise that the entire
+checked state remains byte-identical on such a poll. A valid ordinary
+`ClassifierObservationDeltaV1` may increment `ordinary_poll_sequence`, reset
+`next_capture_ordinal`, clear the prior same-poll terminal, and update its
+observation-only projection. Its type cannot address the childless effect
+envelope. Quarantine creation is the only other permit-free childless-related
+mutation, and it strictly removes authority. No observation delta may clear or
+rewrite a reservation, closure, debt, cycle, continuation, pending
+disposition, retired attempt, spawn state, or ambiguity state.
 
 A non-`NONE` owner is well formed only when its token digest and PID/start
 exactly equal the arm-time `ExecutionGateCaptureV1` current supervisor; its
-attempt ID/revision equal the core reservation; and `armed_state_revision` is
-the successor revision that wrote that owner. `CLOSURE_ACQUIRE` and callable
-`STOP_TREE/ARMED` require `role=ISSUER` and non-null
+typed subject exactly equals the active reservation/attempt, one retained
+tombstone, or the spawn reservation required by its operation; and
+`armed_state_revision` is the successor revision that wrote that owner.
+`CLOSURE_ACQUIRE`, callable `STOP_TREE/ARMED`, and `SPAWN/ARMED` require
+`role=ISSUER` and non-null
 `action_latch_epoch` exactly equal to a fresh enabled action latch.
 Non-destructive `CLOSURE_RECONCILE` and
-`CLOSURE_RELEASE` retain the current epoch when the latch is enabled and use
-null when cleanup is permitted under a disabled latch.
+`CLOSURE_RELEASE`, `RETIRED_ATTEMPT_RECONCILE`, and
+`POST_ACTION_CAPTURE` retain the current epoch when the latch is enabled and
+use null when cleanup is permitted under a disabled latch.
 Here `supervisor_start_guard` and the execution-gate supervisor start are both
 generic `ProcStartGuardV1` representation tokens. Their exact arm-time equality
 binds the live continuation; neither is compared with an owned-tree
@@ -1118,55 +1513,80 @@ latch later disables. The pre-call recheck requires the operation-specific
 values still equal a fresh gate capture. Any mismatch is a veto before a new
 external call, not permission to continue under the older owner.
 
-`role=RECONCILER` can be written only by the takeover CAS below. It may invoke
-only idempotent closure-successor reconcile/release operations. In particular,
-an inherited `STOP_TREE/ARMED/ISSUER` tombstone is transformed atomically to
-`TREE_CLOSURE_RELEASING/EFFECT_UNPROVEN` plus
-`CLOSURE_RELEASE/ARMED/RECONCILER`; a
-`STOP_TREE/ARMED/RECONCILER` state is invalid and can never call `Stop-Tree`.
-`STOP_TREE/CALL_RETURNED/RECONCILER` may take the read-only post-action
-capture, then release. These role constraints are checked again by each
-adapter.
+`role=ISSUER` requires `takeover_origin=NONE`. `role=RECONCILER` is first
+introduced only by a takeover CAS and requires `takeover_origin=FROM` carrying
+the exact immediate predecessor continuation ID, operation, and stage. The
+takeover itself keeps the predecessor operation, writes inert
+`TAKEOVER_CHECKPOINT`, and never writes any operation at `ARMED`; at that
+checkpoint `operation == takeover_origin.predecessor_operation`. No adapter
+accepts the checkpoint. Only after reload may a distinct operation-specific
+`STATE_MUTATION` permit replace it with the closed table's next arm. That arm
+and its `CALL_RETURNED` checkpoint retain the same `takeover_origin` so their
+phase/operation provenance remains structurally checkable. A later distinct
+post-CAS call permit is still mandatory. Another takeover replaces the origin
+with its exact immediate predecessor; it cannot erase or invent a stage.
 
 A different poller cannot reconcile while the persisted continuation may
 resume: it returns `RETAIN_LIVE_CONTINUATION`. Takeover is permitted only
 after acquiring the released effect guard and positively proving either
 same-process structured unwind/cancellation or that the guarded predecessor
 PID/start no longer exists. Mere age, missing heartbeat, a timeout, or
-different supervisor token is not proof. The takeover writes a new checked
-continuation owner with `role=RECONCILER` before any reconciliation operation.
+different supervisor token is not proof. The takeover writes the exact
+`role=RECONCILER/TAKEOVER_CHECKPOINT/takeover_origin=FROM` owner before any
+reconciliation operation.
+Its closed no-call mapping is behavioral definition, not the universal proof:
+
+| Predecessor obligation | Takeover checkpoint state | Only next arm/result mutation |
+| --- | --- | --- |
+| acquiring closure | retain acquiring and the predecessor operation | `CLOSURE_RECONCILE` |
+| held closure | retain held and the predecessor operation; teardown stays forbidden | `CLOSURE_RECONCILE` |
+| releasing closure, including post-action capture | retain disposition, debt, and predecessor operation | `CLOSURE_RECONCILE` |
+| `STOP_TREE/ARMED` | map to releasing/`EFFECT_UNPROVEN`, retain debt, preserve predecessor `STOP_TREE` | `CLOSURE_RELEASE` |
+| `STOP_TREE/CALL_RETURNED` | retain returned-effect fact and debt, preserve predecessor `STOP_TREE` | `CLOSURE_RECONCILE`; then `POST_ACTION_CAPTURE` only after matching `HELD`, or receipt-bound `EFFECT_FINALIZE/EFFECT_UNPROVEN` after matching `RELEASED` |
+| retired-attempt cleanup | retain childless `IDLE`, tombstone, and predecessor operation | `RETIRED_ATTEMPT_RECONCILE` |
+| `SPAWN/ARMED` | retain `SPAWN_IN_FLIGHT` and predecessor `SPAWN` | crash-only `SPAWN_RESULT_COMMIT` with positive issuer-death proof |
+
+Any predecessor not admitted by this closed table is invalid and remains inert.
 A matching
 `NEVER_ACQUIRED` is a stable terminal result for that acquisition attempt and
 retires the attempt in the same transaction; a later unexpected `HELD` is
 release-only and can never restore authority. Any result that cannot be
 classified exactly is `UNKNOWN` and retains the fence.
 
-After the checked reservation, an invocation under that guard persists a fresh
-attempt ID,
-`ChildlessContinuationOwnerV1(CLOSURE_ACQUIRE, ARMED, ISSUER)`, and
-`TREE_CLOSURE_ACQUIRING` in one task #115 transaction. Automatic origin also
-creates or increments its cycle in that transaction. Only that checked owner
-may synchronously invoke the closure successor with the attempt ID. It retains the effect
-guard through the returned-result CAS. Acquisition and crash reconciliation
-are idempotently keyed by the attempt ID. 87-A must then construct
+After the checked reservation, an invocation under that guard uses a fresh
+`CLOSURE_ACQUIRE/STATE_MUTATION` permit to persist a fresh attempt ID, an exact
+`ACTIVE_ATTEMPT/CLOSURE_ACQUIRE/ARMED/ISSUER` continuation, and
+`TREE_CLOSURE_ACQUIRING` inside the same envelope. Automatic origin also
+creates or increments its cycle in that mutation. At the successor revision,
+only a distinct fresh `CLOSURE_ACQUIRE/EXTERNAL_CALL` permit may construct the
+typed call. The closure adapter accepts no raw attempt ID and returns a receipt
+bound to that call permit, binding, continuation, and checked revision. The
+invocation retains the effect guard while a third fresh
+`CLOSURE_ACQUIRE/RECEIPT_MUTATION` permit applies the result. Acquisition and
+crash reconciliation remain idempotently keyed by the attempt ID. 87-A must then construct
 `ChildlessClosureEvidenceV1`; the closure object alone never supplies
 authority. A well-formed current equality mismatch is a closure veto and
-follows exact release. Malformed closure-successor output or structurally invalid checked
-state is `POLICY_HELD`; if an exact closure pair is known, only its
-non-destructive release/reconciliation may proceed. Neither case kills or
-launches.
+follows exact release. A well-formed envelope plus malformed closure-successor
+output is `POLICY_HELD`; if its exact closure pair is known, only permit-bound
+non-destructive reconciliation/release may proceed. Structurally invalid
+checked state instead selects `RETAIN_INVALID_FENCE` before witness/permit
+construction and makes no mutation or call. Neither case kills or launches.
 
-Only after that equality check may the guard-owning invocation persist the
+Only after that equality check may a receipt-derived mutation persist the
 closure ID while retaining its acquire/reconcile owner at `CALL_RETURNED`.
-Before termination, it atomically
-persists the teardown debt, enters `TEARDOWN_IN_FLIGHT`, and records
-`ChildlessContinuationOwnerV1(STOP_TREE, ARMED, ISSUER)`. It rechecks exact ownership
-and then passes the complete immutable target tuple to the repository's
-existing `Stop-Tree`. On synchronous return it commits the same owner with
-`CALL_RETURNED`; only that stage may reserve a post-action capture. If the
-owner dies or unwind is proved while still `ARMED`, recovery never reissues
-`Stop-Tree` or assumes it did not run: it records `EFFECT_UNPROVEN`, retains
-debt, releases any exact closure, and forbids launch. No copied
+Before termination, one fresh `STOP_TREE/STATE_MUTATION` permit constructs a mutation that atomically
+persists teardown debt, enters `TEARDOWN_IN_FLIGHT`, and records
+an exact `ACTIVE_ATTEMPT/STOP_TREE/ARMED/ISSUER` continuation. At the successor
+revision a second fresh `STOP_TREE/EXTERNAL_CALL` permit constructs
+`ExecutableOwnedTargetSetV1` and the typed `STOP_TREE` call.
+The adapter accepts neither the raw immutable tuple nor persisted state. On
+synchronous return, only the matching typed receipt plus a third fresh
+`STOP_TREE/RECEIPT_MUTATION` permit can construct the `CALL_RETURNED`
+mutation; only that stage may arm a three-stage permitted post-action capture.
+If the owner dies or unwind is proved while still
+`ARMED`, recovery never reissues `Stop-Tree` or assumes it did not run: a
+permitted reconcile/release mutation records `EFFECT_UNPROVEN`, retains debt,
+releases any exact closure, and forbids launch. No copied
 `Stop-Process`, `TerminateJobObject`, name/pattern kill, or second target-kill
 path is conforming.
 
@@ -1236,11 +1656,12 @@ The failure mapping is total: a residual containing the authorized tuple's
 depth-zero wrapper target is `SAME_OWNER_SURVIVED`; a nonempty residual without
 that root is `MEMBER_SURVIVED`; `INCOMPLETE` is `EFFECT_UNPROVEN`.
 `COMPLETE_GONE` may clear debt and proceed to the core's fresh final barrier
-only in the same checked action invocation after verified closure release.
+only through a permit-bound mutation after a matching typed release receipt.
+The same envelope and binding then carry through `PRE_BARRIER`,
+`SPAWN_IN_FLIGHT`, and any `AMBIGUOUS_LAUNCH`; launch and identity commit are
+typed permitted operations, not consequences of deserializing those phases.
 Every failure retains debt and forbids launch until release handling finishes.
-Crash or reload never recreates the same-call launch continuation; it
-reconciles closure and debt and requires a later ordinary poll to reserve fresh
-authority.
+Crash or reload never recreates the same-call continuation or receipt.
 
 ## Durable teardown debt
 
@@ -1271,6 +1692,13 @@ The pair is non-null if and only if core execution is
 attempt pair. `CLOSURE_VETOED` release has both debt attempt fields null.
 Mismatch is invalid state and `POLICY_HELD`.
 
+`TeardownDebtV1` is inert persisted evidence and is well formed only inside a
+`ChildlessEffectEnvelopeV1` whose binding matches its owner and recomputed
+authorized target digest. Neither an ordinary observation nor a raw debt value
+can clear or rewrite it. Every debt mutation is carried by a
+`PermitBoundChildlessMutationV1`; the payload and its banked `debt_id` formula
+remain unchanged.
+
 At the initial arm, `debt_id` is SHA-256 over
 `agenttalk.supervisor.childless-teardown-debt.v1\0` plus canonical
 `{"initial_attempt_id": ..., "initial_authority_id": ...,
@@ -1279,8 +1707,8 @@ At the initial arm, `debt_id` is SHA-256 over
 
 ### Chained digest conformance vector
 
-**ENFORCED:** The following Revision 8 fixture is retained unchanged in
-Revision 9. It fixes all seven module digest domains and renews the
+**ENFORCED:** The following Revision 8 fixture is retained unchanged through
+Revision 10. It fixes all seven module digest domains and renews the
 authority-dependent chain for merged #120's
 `win-tree/v2` adapter and the explicit representation-token/exact-guard split.
 The two banked core condition fingerprints are outside this chain and remain
@@ -1350,7 +1778,8 @@ then verifies change propagation only.
 Outstanding debt has precedence over every new owner, whole-wrapper absence,
 manual marker, and relaunch-only proof. A complete observation may:
 
-- clear debt without an OS action only for `COMPLETE_GONE`;
+- clear debt without an OS action only for `COMPLETE_GONE` and only through a
+  fresh matching `EFFECT_FINALIZE` permit-bound mutation;
 - construct `DEBT_COMPLETION` authority only for an exact live residual subset
   from `COMPLETE_RESIDUAL`, then require a new post-reservation `HELD` closure;
   or
@@ -1360,12 +1789,13 @@ manual marker, and relaunch-only proof. A complete observation may:
 orphaned conhost/shell/tool reachable after the wrapper root exits. Debt alone
 never authorizes a new identity.
 
-Every finalized childless reservation/attempt outcome or observation-only debt
-reconciliation writes
+Every finalized childless reservation/attempt outcome or permit-bound debt
+reconciliation from ordinary residual evidence writes
 `recovery_poll_terminal_sequence=ordinary_poll_sequence`. Pure refusal,
 retained closure uncertainty, prior-poll exhaustion, and a no-op
 `NOT_ATTEMPTED` row that leaves debt/cycle/execution unchanged do not. The
-`NOT_ATTEMPTED` emitted after successful observation-only or reload cleanup is
+`NOT_ATTEMPTED` emitted after successful permit-bound ordinary-evidence or
+reload cleanup is
 a finalized reconciliation and does write the terminal. The reservation
 predicate rejects equality. The next ordinary-poll increment clears the
 terminal. Thus one poll cannot consume two automatic attempts or turn
@@ -1376,11 +1806,16 @@ finalized reconciliation into immediate launch.
 **ENFORCED after task #115:** A missing, corrupt, torn, or rollback-unproven
 checked state is not clean genesis. Recovery creates a new `state_epoch` only
 with `StateLossQuarantineV1.UNRESOLVED`; the physical owner projection
-deliberately excludes that epoch. The quarantine denies the named teardown,
+deliberately excludes that epoch and is diagnostic only. Quarantine creation is
+an explicit task #115 transaction and the sole permit-free mutation that may
+replace unknown childless effect state: it creates the new epoch and
+`UNRESOLVED` together, grants no authority, and makes no external call. The
+quarantine denies the named teardown,
 every other kill, every launch/relaunch, closure acquisition, attempt
 increment/reset, debt clear, marker consumption, managed-owner commit, and
-grace-based recovery. It emits continuous `STATE_PROVENANCE_LOST` attention.
-Manual acknowledgement or force cannot override it.
+grace-based recovery. It emits continuous
+`CHILDLESS_STATE_PROVENANCE_LOST` attention. Manual acknowledgement or force
+cannot override it.
 
 This revision intentionally defines no exact-restoration constructor. The
 shipped store may accept a structurally valid backup that is one committed
@@ -1390,41 +1825,36 @@ backup remains `ROLLBACK_UNPROVEN` and quarantined. Adding an independently
 retained last-commit revision/digest would change the persistence contract and
 requires a separately reviewed versioned design.
 
-The only quarantine-clear transaction is therefore a complete
-`ProvablyDifferentPhysicalOwnerV1` proving both a distinct physical replacement
-and extinction of the prior wrapper plus every process that could belong to an
-erased debt tuple.
+Revision 10 defines no automatic V1 quarantine-clear transaction. The previous
+`ProvablyDifferentPhysicalOwnerV1`/local `COMPLETE_GONE` carve-out is withdrawn:
+`OwnedPhysicalWrapperIdentityV1` has no host/process-universe operand, and a
+complete local absence on host B cannot prove that the copied prior wrapper or
+erased-debt members are extinct on host A. The type is host-local evidence, not
+a globally unique owner identity. `retirement_capability` therefore remains
+`CAPABILITY_UNAVAILABLE(PROCESS_UNIVERSE_IDENTITY_UNAVAILABLE)` on every
+platform, even when a distinct local replacement exists.
 
-A different `state_epoch`, wrapper generation, PID, start guard, nonce, or
-merely valid backup by itself is insufficient. The replacement's exact
-physical projection must differ from the prior projection in at least one
-field; `replacement_owner` projected without its new epoch must equal
-`extinction.replacement_physical_owner`; and
-`prior_physical_owner == extinction.prior_physical_owner ==` the quarantine's
-known prior owner. The current ordinary capture must have ordinal zero,
-current epoch/agent/sequence, complete ownership coverage, the replacement
-root positively present, and the prior root plus every possible nonce-owned
-rootless residual positively absent. If the prior physical owner is `UNKNOWN`,
-or the 87-A adapter over #120 cannot completely prove the old owner and all
-possible rootless residuals
-gone, the second transition is impossible and quarantine remains
-indefinitely. This is intentional: lost provenance after a partial
-`Stop-Tree` cannot be laundered into launch authority.
+A future version may add retirement only if it persists a trustworthy source
+host/process-universe binding before loss and obtains extinction coverage for
+that exact same universe from a reviewed read-only producer over an existing OS
+token. Unknown, unreadable, transferred, or mismatched universe identity must
+remain non-retirable. PID and start, hostname, `state_epoch`,
+`process_source_digest`, MachineGuid alone, local absence, or any combination
+of those facts is insufficient. The producer must satisfy the absolute M5
+boundary: no new file, registry value, helper, daemon, OS object, persistence
+plane, or runtime dependency.
 
-The clearing CAS requires `dry_run=false`, a freshly captured current
-supervisor, an unchanged quarantine ID and state revision, and the same live
-complete capture revalidated immediately before commit. It atomically installs
-the already-present replacement owner, sets quarantine/debt/cycle/execution/
-continuation/pending disposition to their clean values, writes the same-poll
-terminal and a quarantine-retired audit fact, and performs no OS action. No
-kill or launch is permitted in that poll; the next ordinary poll must rebuild
-all evidence from the replacement owner.
+Until such a successor is delivered, `UNRESOLVED` remains sticky pending
+attended handling. Ordinary local observations may continue for diagnostics,
+but they cannot construct a retirement mutation, clear unknown debt/cycle or
+effect state, commit a replacement owner, kill, or launch.
 
 State loss after issued attempt one, two, or three therefore cannot recreate a
 fresh three-attempt budget. State loss after debt arm or any partial target
-attempt cannot erase debt precedence. Task #115 must distinguish clean initial
-creation from loss of an expected state object; implementations that cannot
-make that distinction fail closed in quarantine.
+attempt cannot erase debt precedence or become locally clearable. Task #115
+must distinguish clean initial creation from loss of an expected state object;
+implementations that cannot make that distinction fail closed in the permanent
+V1 quarantine.
 
 ## Bounded automatic cycle
 
@@ -1471,8 +1901,11 @@ automatic reservation.
 
 `EXHAUSTED` emits `AUTOMATIC_CHILDLESS_RETRY_EXHAUSTED` and mandatory action
 attention on every poll until a successful childless cleanup, a
-`ProvablyDifferentPhysicalOwnerV1` transition outside quarantine, or a
-successful authorized manual cleanup clears the cycle. A mere new
+freshly committed different guarded owner while quarantine and debt are both
+`NONE`, or a successful authorized manual cleanup clears the cycle. The
+different-owner clear is an `OWNER_TRANSITION` permit-bound mutation over the
+old envelope plus the exact new guarded checkpoint; it is not an observation
+delta or a generic identity write. A mere new
 `state_epoch` or apparently new guarded owner after state loss cannot clear
 it. It suppresses only a further automatic named childless teardown for that
 owner;
@@ -1583,9 +2016,11 @@ CHILDLESS_STATE_PROVENANCE_LOST iff
 
 CAPABILITY_UNAVAILABLE iff
   ClosureCapabilityV1 is CAPABILITY_UNAVAILABLE
-  or ExactTargetExecutorCapabilityV1 is UNAVAILABLE while a named reservation,
-     external-effect phase, outstanding teardown debt, or retired-attempt
-     cleanup is present
+  or fresh reservation permit construction returns CAPABILITY_UNAVAILABLE
+  or ChildlessEffectEnvelopeV1 exists and next-permit construction returns
+     CAPABILITY_UNAVAILABLE for its binding/current-host witness
+  or StateLossQuarantineV1 is UNRESOLVED and its retirement_capability is
+     CAPABILITY_UNAVAILABLE
   or a post-reservation closure-successor value illegally claims structural
      unavailability
   or applicable reconciliation is UNKNOWN(CAPABILITY_UNAVAILABLE)
@@ -1615,8 +2050,11 @@ cycle is emitted on every poll, including polls where other policy gates hold.
 87-B must join an action resolution to the exact matching fingerprint and take
 the held agent name from `RecoveryConditionV1.canonical_condition.agent_key`.
 Every routine or incident rendering of `CAPABILITY_UNAVAILABLE` must name that
-agent and state explicitly that operator action is required. A bare enum or a
-message that omits either fact is nonconforming.
+agent, state explicitly that operator action is required, and distinguish the
+two permanent V1 reductions when applicable: POSIX named teardown lacks an
+exact-token executor, while automatic quarantine retirement lacks a trustworthy
+process-universe identity. A bare enum, an unnamed agent, or a message that
+collapses either permanent held path into a transient retry is nonconforming.
 
 In the original surviving live invocation, a successful gone proof after
 verified release has no terminal module result: the core's final barrier/spawn
@@ -1630,120 +2068,59 @@ fields never cross the 87-B export boundary.
 
 ## Exact state transitions
 
-The current-host executor operand is reconstructed for every state-entry
-archetype, rather than only the fresh constructor. An earlier dry-run,
-state-loss, or non-current-supervisor retain branch may stop evaluation first;
-those branches are also zero-call and zero-mutation, and no later operation may
-infer executor availability from them. Every non-quarantine row below is scoped
-to `StateLossQuarantineV1.NONE`; when quarantine is unresolved, its two rows
-exclusively own either fail-closed retention or the proved complete-extinction
-retirement:
+The safety property is established by a closed construction pipeline, not by
+enumerating every state that might enter it:
 
-| State entry point | Persisted shape on entry | Required executor behavior |
-| --- | --- | --- |
-| Fresh automatic or manual selection | No named reservation or external-effect phase | Construct fresh `ExactTargetExecutorCapabilityV1` inside `ClosureCapabilityV1` before reservation. `UNAVAILABLE` creates no reservation, continuation, attempt, debt, capture, or external call. |
-| Uninterrupted live issuer | The same guard-owning invocation has just persisted `TREE_CLOSURE_ACQUIRING`, `TREE_CLOSURE_HELD`, `TEARDOWN_IN_FLIGHT`, or `TREE_CLOSURE_RELEASING` | Reconstruct the current-host operand before every next external call, capture reservation, or finalizing mutation. `UNAVAILABLE` retains the fence byte-identically. |
-| Live-continuation resume or same-process re-reduction | A checked continuation may resume, including after a CAS loser reloads | Enter `ChildlessSafetyReconciliationGateV1`; executor unavailability precedes continuation/takeover reasoning and permits no effect or mutation. |
-| Same-platform process restart or different-process takeover | A persisted external-effect phase has no live guard owner | Enter the same gate before effect-guard acquisition, takeover, reconcile, release, capture, or finalization. Availability alone does not prove predecessor death or grant takeover. |
-| Cross-platform state inheritance or resume | A phase created on an executor-capable host reaches another host through startup reload, workspace/state-file transfer, restore, checkpoint resume, rollback, or migration | Reconstruct from the current host, never from the persisted target or prior host. With quarantine `NONE`, Linux and macOS preserve every fence byte-identically and make no external call or debt mutation. If no earlier retain-only gate applies, they select `RETAIN_EXACT_TARGET_EXECUTOR_UNAVAILABLE`. Unresolved quarantine follows its two separate rows below. |
-| Debt-only inheritance | `IDLE` carries `TeardownDebtV1.OUTSTANDING` with no current attempt | Reconstruct the same current-host operand before ordinary residual observation or its clear. `UNAVAILABLE` preserves debt/cycle/execution/terminal byte-identically and allocates no capture. |
-| Retired-attempt cleanup | A persisted retired ID is reconciled, or an unexpected late `HELD` returns to the original synchronous caller | Reconstruct the operand before the reconcile call or exact release. `UNAVAILABLE` retains the retired ID and makes no call. No unsolicited result channel exists: a late `HELD` is processed only as the synchronous result of a compatible-host call under one effect guard, and the caller releases it before dropping that guard; a crash leaves the retired ID for a later compatible-host reconcile. |
-| Unresolved state loss or malformed-fence entry | Quarantine remains unresolved or the persisted phase/owner pairing is invalid | An applicable retain branch wins and is zero-call and zero-mutation: unresolved quarantine precedes executor evaluation, while executor unavailability precedes `RETAIN_INVALID_FENCE`. No state repair may synthesize executor availability. |
-| Proven quarantine retirement | Complete different-owner/extinction proof makes the old physical authority inactionable | The platform-neutral quarantine-retirement CAS may clear physically inactionable debt/cycle/execution state. It is a global state-loss transition, not named cleanup, makes no external call, and cannot launch in the same poll. |
-| Reloaded `PRE_BARRIER` | The named reservation has no attempt pair, continuation owner, closure, or external effect | The current-host operand is still checked first. `AVAILABLE` may select the state-only `MAY_RELEASE_PRE_BARRIER`; `UNAVAILABLE` retains the reservation byte-identically, creates no attempt, and never mutates debt. |
+| Construction boundary | Only conforming operation |
+| --- | --- |
+| Deserialize | Produce inert `ChildlessEffectEnvelopeV1` evidence. Deserialization never yields a witness, permit, executable target, mutation, call, or receipt. |
+| Ordinary observation | Commit only `ClassifierObservationDeltaV1`; its type cannot address the effect envelope. |
+| Validate | Validate the complete envelope and exact binding before consulting host capability. A malformed envelope deterministically yields `POLICY_HELD`; malformed state precedes capability-unavailable reporting. |
+| Witness/preflight | The actual current-host action adapter may mint `CurrentExactTargetExecutorWitnessV1`; no other layer may do so. Static inability to serve the binding yields capability hold before guard acquisition. |
+| Guard and permit | Acquire the effect guard when required, then match witness, binding proof, checked revision, guard/continuation, and one operation/use. `REJECTED` yields zero effect plus reload/reject, not capability hold. |
+| Childless-envelope mutation | Task #115 accepts only `PermitBoundChildlessMutationV1`; the owner algebra separately admits pure observation, private non-childless authority, and fail-closed quarantine-creation variants, none of which may address a current childless envelope. |
+| External effect | An adapter accepts only `ChildlessExternalEffectCallV1` and returns only its matching `ChildlessExternalEffectReceiptV1`. |
+| Receipt commit | A matching permit and receipt may construct the next checked mutation; replay, mismatch, or a changed revision cannot. |
 
-An already-owned childless fence uses a narrower gate than new recovery. Its
-fresh executor operand is explicit:
+Full-poll order is state-loss detection; dry-run discard or, for a non-dry-run
+outer-state failure, exclusive fail-closed quarantine creation; current-
+supervisor handling; ordinary observation commit; complete envelope validation;
+fresh witness/static preflight; required effect-guard acquisition; then permit
+and guarded mutation or call construction.
+This resolves the former malformed-versus-unavailable precedence conflict,
+preserves dry-run zero persistence, and makes the observation projection
+explicit.
 
-```text
-ChildlessSafetyReconciliationGateV1(
-  current_exact_target_executor: ExactTargetExecutorCapabilityV1
-) =
-  RETAIN_DRY_RUN
-    if ExecutionGateCaptureV1.dry_run == true
-  | RETAIN_STATE_PROVENANCE_LOST
-    if StateLossQuarantineV1 is UNRESOLVED
-  | RETAIN_NO_CURRENT_SUPERVISOR
-    if ExecutionGateCaptureV1.supervisor_instance != CURRENT
-  | RETAIN_EXACT_TARGET_EXECUTOR_UNAVAILABLE
-    if current_exact_target_executor is UNAVAILABLE
-  | MAY_RELEASE_PRE_BARRIER
-    if the persisted phase is PRE_BARRIER, its attempt pair and continuation
-       owner are null, and one checked state-only release is required
-  | RETAIN_LIVE_CONTINUATION
-    if a different checked ChildlessContinuationOwnerV1 can still resume
-  | RETAIN_EFFECT_GUARD_UNAVAILABLE
-    if the invocation cannot acquire the exclusive effect guard, or a
-       different persisted predecessor exists and cannot be proved unable
-       to resume
-  | MAY_TAKEOVER
-    if this invocation owns the effect guard, the exact persisted predecessor
-       is positively unable to resume, and the checked revision still matches
-  | MAY_RECONCILE
-    if this invocation owns the effect guard and exact checked continuation
-  | RETAIN_INVALID_FENCE
-    otherwise
-```
+`ChildlessSafetyReconciliationGateV1` is total without manufacturing
+capability. A malformed envelope produces the pure inert
+`RETAIN_INVALID_FENCE` first. A valid envelope plus a live foreign
+continuation or unavailable effect guard produces the corresponding pure inert
+`RETAIN_*` value without a permit, mutation, or call. Only a `MAY_*` variant
+requires and carries the displayed fresh operation/use-specific permit; no
+`MAY_*` result exists when that permit is absent. `MAY_TAKEOVER` authorizes only a permit-bound no-call
+mutation; after its CAS, the winner must obtain a new operation-scoped permit
+before reconcile or release. Those adapters accept typed calls, not persisted
+attempt or closure IDs. Kill switch, action latch, report membership, and
+auto-restart may still block new recovery while permitted non-destructive fence
+cleanup proceeds. Unknown evidence retains the envelope.
 
-`RETAIN_DRY_RUN` performs no closure-successor call and no persistence.
-`RETAIN_STATE_PROVENANCE_LOST` performs no cleanup that depends on erased
-attempt/debt provenance.
-`RETAIN_NO_CURRENT_SUPERVISOR` performs no closure-successor call and no state mutation
-because the invocation does not own the executor claim.
-`RETAIN_EXACT_TARGET_EXECUTOR_UNAVAILABLE` is evaluated before
-`MAY_RELEASE_PRE_BARRIER`, effect-guard acquisition, predecessor-liveness
-reasoning, takeover, capture allocation, ordinary debt clear, late-`HELD`
-release, or any external-effect finalizer. It emits continuous
-`CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and
-`POLICY_HELD`; in particular, an inherited `CALL_RETURNED` result cannot clear
-or rewrite debt on an unavailable current host.
-`MAY_RELEASE_PRE_BARRIER` needs no effect guard because no external operation
-or attempt pair has been armed. It permits one state-only #115 CAS that releases
-the reservation, writes `BARRIER_VETOED` and the same-poll terminal, and
-performs no closure-successor call, teardown, launch, marker consumption, attempt/cycle
-mutation, or debt clear.
-`RETAIN_LIVE_CONTINUATION` and `RETAIN_EFFECT_GUARD_UNAVAILABLE` close both
-commit/effect gaps without inferring that an external call did or did not
-occur. `RETAIN_INVALID_FENCE` makes the constructor total for an unmatched or
-malformed phase/owner pairing; the earlier invalid-state event remains
-`POLICY_HELD`. Every retain variant preserves the exact reservation, closure,
-pending disposition, debt/current attempt, cycle, continuation owner, and
-terminal.
-`MAY_TAKEOVER` authorizes no external call. It permits exactly one #115 CAS
-that compares the full old continuation owner and state revision, replaces
-its supervisor/continuation fields with this guard holder, sets
-`role=RECONCILER`, preserves the exact attempt/closure/debt/cycle, and applies
-exactly one phase mapping:
+This rule covers `PRE_BARRIER`, closure phases, teardown, debt-only `IDLE`,
+retired attempts, `SPAWN_IN_FLIGHT`, `AMBIGUOUS_LAUNCH`, live resume, reload,
+takeover, and future childless-origin variants within one supported V1 store
+activation without making that list the proof. Every one lives inside the
+envelope. A state not recognized by a permit/call constructor is inert by
+construction.
 
-- acquiring, at either stage, stays acquiring and becomes
-  `CLOSURE_RECONCILE/ARMED`;
-- held becomes `TREE_CLOSURE_RELEASING/CLOSURE_VETOED` with
-  `CLOSURE_RELEASE/ARMED`;
-- releasing preserves its pending disposition and becomes
-  `CLOSURE_RECONCILE/ARMED`;
-- teardown at `STOP_TREE/ARMED` becomes
-  `TREE_CLOSURE_RELEASING/EFFECT_UNPROVEN` with
-  `CLOSURE_RELEASE/ARMED`; and
-- teardown at `STOP_TREE/CALL_RETURNED` remains teardown with the returned
-  effect fact and exact `STOP_TREE/CALL_RETURNED`.
-
-Each successor writes the new `armed_state_revision`; a disabled action latch
-uses null only on the new non-destructive reconcile/release operation. A CAS
-loser reloads the gate. The winner must recompute as `MAY_RECONCILE`; it cannot
-continue directly from `MAY_TAKEOVER`.
-`MAY_RECONCILE` authorizes only checked non-destructive cleanup of an
-already-persisted named external-effect phase under the effect guard: call
-closure-successor reconcile/release by persisted attempt/closure IDs, capture post-action
-or residual evidence after an already-issued teardown, and finalize the
-persisted disposition. Before each closure-successor operation it commits its exact new
-`ChildlessContinuationOwnerV1`; it retains the guard through the returned
-result CAS. The `STOP_TREE/CALL_RETURNED` read-only capture instead retains
-that exact owner until its atomic transition to releasing. It may do so while
-kill switch, action latch, report membership, or auto-restart blocks new
-recovery, because it cannot acquire a new closure, reserve/increment an
-attempt, invoke `Stop-Tree`, launch, consume a marker, or change generic
-backoff/readiness. This is fence cleanup, not teardown authority. Unknown
-cleanup evidence retains every fence.
+This is not a same-platform host-transfer proof. V1 defines no supported
+state-file/workspace transfer, restore, rollback, or migration activation; 87-C
+owns those contracts. Because the persisted executor binding intentionally has
+no trustworthy host/process-universe operand, mere equality of platform,
+executor-contract text, PID/start, or binding digests cannot make copied state a
+conforming migration. An implementation must not activate such a workflow under
+87-A alone. A future 87-C design must either bind the source universe with a
+reviewed existing-OS-token mechanism inside M5 Option A or keep the transferred
+state inert. This unsupported migration boundary is not a third automatic
+recovery path.
 
 Task #115 adds the core's
 `TREE_CLOSURE_RELEASING` phase and persisted
@@ -1765,9 +2142,10 @@ Only exact `RELEASED` may finalize the pending disposition:
   the reservation, and for automatic origin records the same cycle outcome and
   exhausts exactly on attempt three. Manual origin leaves the cycle
   byte-identical.
-- `COMPLETE_GONE` clears debt and the old-owner cycle. Only the original live
-  invocation may normalize the reservation to `PRE_BARRIER` and continue to
-  the fresh final barrier; reload finalization enters `IDLE` with no launch.
+- `COMPLETE_GONE` clears debt and the old-owner cycle only through the matching
+  `EFFECT_FINALIZE` permit-bound mutation. Only the original live invocation
+  may normalize the reservation to `PRE_BARRIER` and continue to the fresh
+  final barrier; reload finalization enters `IDLE` with no launch.
 
 Each finalized branch writes the same-poll terminal. Failure attempts one and
 two schedule no generic backoff; a later retry begins only on a subsequent
@@ -1775,44 +2153,48 @@ eligible ordinary poll.
 
 An ordinary residual observation is pure captured input, not a debt/cycle
 mutation by `ClassifierObservationDeltaV1`. Its `COMPLETE_GONE` clear is a
-separate recovery-authority delta and may commit only when
-`ExecutionEligibilityV1 == ELIGIBLE`, fresh current-host
-`ExactTargetExecutorCapabilityV1` is `AVAILABLE`,
-`recovery_execution == IDLE`, and there is no named reservation, closure ID,
-pending disposition, or debt current attempt. Executor unavailability precedes
-the observation and retains debt/cycle/execution/capture ordinal/terminal
-byte-identically. `DRY_RUN` may simulate it but discards every delta. Every other
-noneligible global gate retains debt, cycle, execution, terminal, and
-continuous attention and falls through to the applicable no-op gate row
-below. Any persisted named phase takes the later phase-specific
-release/reconciliation rows and cannot be erased by an ordinary observation.
+separate `PermitBoundChildlessMutationV1` and may commit only when
+`ExecutionEligibilityV1 == ELIGIBLE`, a fresh permit for
+`EFFECT_FINALIZE` exists, childless execution is `IDLE`, and there is no
+closure, pending disposition, or debt current attempt. The observation commits
+before permit construction and may update only ordinary observation fields.
+If no permit exists, the envelope including debt/cycle/execution remains exact
+while ordinary sequence/ordinal/terminal bookkeeping may change. `DRY_RUN` may
+simulate but persists neither delta. A persisted childless phase remains inside
+the envelope and cannot be erased by an ordinary observation.
 
 The event constructor evaluates the following rows top to bottom and returns
 the first applicable row; each later row therefore includes the negation of
-all earlier predicates. The resulting event/result mapping is disjoint and
-exhaustive:
+all earlier predicates. After the explicit permit-failure rows, every row that
+changes the effect envelope or invokes an adapter implicitly requires the
+operation-specific permit, and every returned-result row requires the matching
+typed receipt. The resulting event/result mapping is disjoint and exhaustive:
 
 | Event at this poll | State/debt/cycle effect | Module result | Required visibility |
 | --- | --- | --- | --- |
-| Quarantine is `UNRESOLVED` and the exact checked `ProvablyDifferentPhysicalOwnerV1` clear predicate succeeds | Atomically retire quarantine, install the already-present replacement owner, clear unknowable old debt/cycle/execution fences only because the complete extinction proof makes them physically inactionable, and write the terminal. Perform no OS action and prohibit launch for this poll. | `NOT_ATTEMPTED` | Quarantine-retired audit fact; childless codes recompute on the next ordinary poll. |
-| `StateLossQuarantineV1` is `UNRESOLVED` | Retain quarantine and every recoverable fence; deny every kill, launch, closure acquisition, attempt/debt mutation, identity commit, and manual override. | `POLICY_HELD` | `CHILDLESS_STATE_PROVENANCE_LOST` continuously; any recoverable debt/cycle codes also remain visible. |
-| Structurally invalid persisted state, malformed #120 snapshot, or malformed closure-successor value, including a post-reservation claim of structural `CAPABILITY_UNAVAILABLE` | No destructive mutation; retain every owned fence. If an exact known closure exists, fresh current-host exact-executor availability is `AVAILABLE`, and the safety-reconciliation gate is `MAY_RECONCILE`, only its non-destructive release/reconciliation may proceed. Do not finalize `CLOSURE_VETOED`, retry, or exhaust. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` for the structural claim, incomplete code otherwise; plus debt/cycle codes by predicate; pending a human. |
+| `DRY_RUN` with any outer-state or envelope condition | Compute only the simulated fail-closed result; persist no observation, quarantine, envelope, terminal, or other delta and make no external call. | `POLICY_HELD` when state is lost/invalid/unavailable; otherwise the pure simulated result. | Simulated codes only; no persisted visibility claim. |
+| Non-dry-run expected checked state is missing, corrupt, torn, or rollback-unproven and quarantine has not yet been created | In one fail-closed task #115 transaction create a new epoch plus `StateLossQuarantineV1.UNRESOLVED`; construct no permit, effect mutation, external call, replacement owner, or launch. | `POLICY_HELD` | `CHILDLESS_STATE_PROVENANCE_LOST` continuously. |
+| `StateLossQuarantineV1` is `UNRESOLVED` | Retain quarantine indefinitely in V1; ordinary diagnostic observation may advance, but automatic retirement, every kill/launch, closure acquisition, attempt/debt mutation, identity commit, and manual override are unavailable. | `POLICY_HELD` | `CHILDLESS_STATE_PROVENANCE_LOST` and `CAPABILITY_UNAVAILABLE` continuously; any recoverable debt/cycle codes remain visible. |
+| `ChildlessEffectEnvelopeV1` is structurally invalid, or #120/closure output is malformed, including a post-reservation structural-unavailability claim | Malformed wins before witness/permit construction. Retain the exact effect envelope; ordinary observation-only fields may already have advanced. Construct no call or effect-owned mutation and do not retry/exhaust. | `POLICY_HELD` | Incomplete code, plus capability/debt/cycle codes by predicate; pending a human. |
 | Well-formed owner/child/tree/debt proof is incomplete before reservation | No reservation and no attempt consumed. | `POLICY_HELD` | Incomplete code; plus debt/cycle codes by predicate. |
 | `ClosureCapabilityV1` is `CAPABILITY_UNAVAILABLE` before reservation | Static capability refusal: create no reservation or continuation, consume no attempt, and make no external call. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` continuously pending a human; plus debt/cycle codes by predicate. |
-| `StateLossQuarantineV1` is `NONE` and fresh `ExactTargetExecutorCapabilityV1` is `UNAVAILABLE` while any named reservation/external-effect phase, outstanding teardown debt, or retired-attempt cleanup is present | Retain reservation/phase, closure, pending disposition, debt/current attempt, cycle, continuation owner, retired IDs, capture ordinal, and terminal byte-identically. Perform no takeover, observation, reconcile/release, finalization, `Stop-Tree`, or launch call. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` continuously pending a human; plus debt/cycle/incomplete codes by predicate. |
-| Exact target executor is `AVAILABLE`, `ExecutionEligibilityV1 == ELIGIBLE`, `recovery_execution == IDLE`, no named reservation/closure/pending disposition/current attempt exists, and ordinary observation-only debt reconciliation is `COMPLETE_GONE` | Clear debt and old-owner cycle, remain `IDLE`, write terminal; construct no authority and do not launch. | `NOT_ATTEMPTED` | No childless code after the atomic clear. |
+| A valid `ChildlessEffectEnvelopeV1` exists and next-permit construction returns `CAPABILITY_UNAVAILABLE` | Retain the complete effect envelope byte-identically. Ordinary observation-only fields may advance. Construct no takeover, reconcile/release, capture reservation, finalization, `Stop-Tree`, spawn, or identity commit. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` continuously pending a human; plus debt/cycle/incomplete codes by predicate. |
+| A fresh named proof's reservation-permit construction returns `CAPABILITY_UNAVAILABLE` | Create no effect envelope, reservation, continuation, attempt, cycle, debt, executable target, or external call. | `POLICY_HELD` | `CAPABILITY_UNAVAILABLE` continuously pending a human. |
+| Permit construction returns `REJECTED` | Construct no mutation or call. A stale revision reloads/re-reduces; invalid or replayed private operands are rejected and cannot become a capability hold. | `NOT_ATTEMPTED` unless same-invocation re-reduction reaches another row. | Existing codes only; no `CAPABILITY_UNAVAILABLE` solely from rejection. |
+| A permitted envelope has childless execution `IDLE`, no closure/pending disposition/current attempt, and ordinary residual evidence is `COMPLETE_GONE` | A permit-bound mutation clears debt and old-owner cycle, remains childless `IDLE`, and writes the terminal; construct no launch. | `NOT_ATTEMPTED` | No childless code after the atomic clear. |
 | No in-flight childless phase and a global/policy gate holds or no named candidate exists; cycle is `NONE` | No module mutation or terminal write. | `NOT_ATTEMPTED` | Debt/incomplete code only when its predicate independently applies. |
 | No in-flight childless phase and a global/policy gate holds or no named candidate exists; cycle is `ACTIVE` with a prior typed failure | Preserve the cycle; no attempt, backoff, or terminal mutation. | `NOT_ATTEMPTED` | Active code; debt/incomplete code by predicate. |
 | No in-flight childless phase and a global/policy gate holds or no otherwise-eligible automatic named proof exists; cycle is `EXHAUSTED` | Preserve the cycle; no attempt, backoff, or terminal mutation. | `NOT_ATTEMPTED` | Exhausted code; debt/incomplete code by predicate. |
 | Automatic named proof is otherwise eligible, no eligible manual origin wins, and its cycle was already `EXHAUSTED` before this poll | No reservation, attempt, backoff, or terminal mutation. | `AUTOMATIC_RETRY_EXHAUSTED` | Exhausted code; debt code if applicable. |
-| An existing external-effect childless phase has gate `MAY_TAKEOVER` | Apply exactly the no-call phase mapping above in one CAS, then reload state and recompute the gate/table while retaining the effect guard. A CAS loser reloads without mutation. | No terminal module result yet. | Existing debt/cycle/incomplete codes by predicate. |
-| An existing external-effect childless phase has any `RETAIN_*` safety-reconciliation gate | Retain reservation/phase, closure, pending disposition, debt/current attempt, cycle, continuation owner, and terminal byte-identically; perform no closure-successor call. | `POLICY_HELD` | Incomplete code; plus debt/cycle codes by predicate. |
-| A named `PRE_BARRIER` reservation is vetoed or reloaded before closure acquisition begins and its gate is `MAY_RELEASE_PRE_BARRIER` | Release that reservation by the state-only CAS, consume no automatic attempt, preserve debt/cycle and marker semantics, and write the terminal. | `BARRIER_VETOED` | Debt/cycle/incomplete code by predicate. |
+| A valid envelope plus permit has gate `MAY_TAKEOVER` | Apply the exact no-call takeover as a permit-bound mutation, then reload and mint a new operation-scoped permit. A CAS loser reloads without mutation. | No terminal module result yet. | Existing debt/cycle/incomplete codes by predicate. |
+| A valid permitted envelope has any other retain-only safety gate | Retain the effect envelope exactly and perform no external call; ordinary observation-only fields may already have advanced. | `POLICY_HELD` | Incomplete code; plus debt/cycle codes by predicate. |
+| A childless `PRE_BARRIER` reservation is vetoed or reloaded before closure acquisition | A permit-bound mutation releases that reservation, consumes no automatic attempt, preserves debt/cycle and marker semantics, and writes the terminal. | `BARRIER_VETOED` | Debt/cycle/incomplete code by predicate. |
 | Live acquisition returns a well-formed `HELD` and the full joined evidence is valid | Persist `TREE_CLOSURE_HELD`; no outcome or terminal is finalized. | No terminal module result yet. | Codes from preexisting debt/cycle only. |
 | Any well-formed matching `HELD` returned by acquisition/reconciliation is not action-ready, or recaptured evidence/gates make a persisted `TREE_CLOSURE_HELD` non-action-ready | Bind/retain its closure ID, persist `TREE_CLOSURE_RELEASING/CLOSURE_VETOED`, and request release; no outcome is finalized yet. The earlier live-valid row alone may continue toward teardown. | No terminal module result yet. | Incomplete code while release remains held; debt code if applicable. |
-| `TEARDOWN_IN_FLIGHT` has `STOP_TREE/CALL_RETURNED` and the same checked continuation chain owns the effect guard | Reserve the next nonzero capture ordinal, take the fresh post-action observation, persist its mapped releasing disposition, and update the same continuation ID to exact closure release; no outcome is finalized yet. | No terminal module result yet. | Debt code; incomplete also when the observation is incomplete. |
+| `TEARDOWN_IN_FLIGHT` has `STOP_TREE/CALL_RETURNED` and the same checked continuation chain owns the effect guard | Reserve the next nonzero capture ordinal and arm the typed post-action observation. Its receipt mutation persists the mapped releasing disposition with `POST_ACTION_CAPTURE/CALL_RETURNED`; a later `CLOSURE_RELEASE/STATE_MUTATION` permit must replace that checkpoint with exact release. No outcome is finalized yet. | No terminal module result yet. | Debt code; incomplete also when the observation is incomplete. |
 | `TREE_CLOSURE_RELEASING` reconciliation remains matching `HELD`, or any applicable acquisition/reconciliation is `UNKNOWN` | Retain phase, reservation, pending disposition, debt/current attempt, and automatic `ISSUED`; no terminal write. | `POLICY_HELD` | Incomplete code; debt code if applicable. |
 | Acquisition returns no closure and matching reconciliation proves terminal `NEVER_ACQUIRED`; acquiring reconciliation proves matching `RELEASED` and binds its returned closure ID; held-phase reconciliation proves matching `RELEASED` after atomically recording pending `CLOSURE_VETOED`; or any persisted `TREE_CLOSURE_RELEASING/CLOSURE_VETOED` reaches exact `RELEASED` | Finalize `CLOSURE_VETOED`; retire the attempt in the same transaction; debt unchanged. A later unexpected `HELD` for that retired attempt is release-only. Manual origin always leaves the cycle byte-identical; automatic issued-attempt count 1–2 becomes `ACTIVE/CLOSURE_VETOED`; count 3 becomes `EXHAUSTED/CLOSURE_VETOED`. | Manual origin: `BARRIER_VETOED`; automatic count 1–2: `BARRIER_VETOED`; automatic count 3: `AUTOMATIC_RETRY_EXHAUSTED`. | Cycle code by resulting predicate; debt code if applicable. |
+| Reload/takeover retained `STOP_TREE/CALL_RETURNED`, and its exact `CLOSURE_RECONCILE` receipt proves matching `RELEASED` before any post-action capture | Consume that receipt only through `EFFECT_FINALIZE`; conservatively finalize `EFFECT_UNPROVEN`, retire the attempt, retain debt, clear its current-attempt pair, enter childless `IDLE`, and perform no residual-capture call or launch. Manual origin leaves the cycle byte-identical; automatic issued-attempt count 1–2 becomes `ACTIVE/EFFECT_UNPROVEN`, count 3 becomes `EXHAUSTED/EFFECT_UNPROVEN`. A later ordinary poll may clear debt only through the existing debt-only `EFFECT_FINALIZE` scope and matching `COMPLETE_GONE`. | Manual origin: `TEARDOWN_FAILED`; automatic count 1–2: `TEARDOWN_FAILED`; automatic count 3: `AUTOMATIC_RETRY_EXHAUSTED`. | Incomplete, debt, and cycle code by predicate. |
 | Post-action `COMPLETE_RESIDUAL` contains the wrapper root and exact release is proved | Finalize `SAME_OWNER_SURVIVED`. Manual origin leaves any cycle byte-identical; automatic issued-attempt count 1–2 becomes `ACTIVE`, count 3 `EXHAUSTED`. | Manual origin: `TEARDOWN_FAILED`; automatic count 1–2: `TEARDOWN_FAILED`; automatic count 3: `AUTOMATIC_RETRY_EXHAUSTED`. | Debt plus cycle code by predicate. |
 | Post-action `COMPLETE_RESIDUAL` omits the wrapper root and exact release is proved | Apply the preceding row with `MEMBER_SURVIVED`. | Same origin/attempt-sensitive result as the preceding row. | Debt plus cycle code by predicate. |
 | Post-action `INCOMPLETE` and exact release is proved | Apply the preceding row with `EFFECT_UNPROVEN`. | Same origin/attempt-sensitive result as the preceding row. | Incomplete, debt, and cycle code by predicate. |
@@ -1828,8 +2210,11 @@ attempt ordinal: its veto is always `BARRIER_VETOED`, its teardown failure is
 always `TEARDOWN_FAILED`, and its cycle is byte-identical. Reload finalization
 uses the persisted origin and the same mapping.
 `CLOSURE_VETOED` never means structural `CAPABILITY_UNAVAILABLE`: the latter is
-either the zero-attempt pre-reservation row or a malformed/unknown retained
-fence pending a human, and it never reaches automatic retry/exhaustion.
+either the zero-attempt pre-reservation row, a valid persisted envelope that the
+current host statically cannot serve, or a malformed/unknown retained fence
+whose applicable attention includes capability loss. It never reaches
+automatic retry/exhaustion. A stale, copied, replayed, consumed, or mismatched
+permit is instead `REJECTED` and cannot be relabelled as capability loss.
 Rows marked “no terminal module result yet” are internal same-invocation
 transitions and do not emit an action-resolution record at that point. The
 invocation either reaches a later final row or returns with retained checked
@@ -1841,23 +2226,29 @@ Normal execution is:
 
 | Transition | Checked effect |
 | --- | --- |
-| Reserve named proof | Require core execution `IDLE`, no same-poll terminal, and no outstanding current attempt. Store origin, proof fields, target tuple, and execution-gate snapshot. Manual-wins stores its manual authority ID separately. |
-| Begin closure acquisition | Require fresh `ExactTargetExecutorCapabilityV1.AVAILABLE`, acquire the effect guard; live-recompute the reserved bindings; persist `TREE_CLOSURE_ACQUIRING` with a fresh attempt ID/revision and exact `CLOSURE_ACQUIRE/ARMED` continuation; recheck ownership and current-host executor availability; synchronously invoke the closure successor; and retain the guard through the returned-result CAS. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin does not change the cycle. |
-| Acquire valid closure | Require fresh current-host executor availability plus the full joined live-basis/capture/target equality, then persist `TREE_CLOSURE_HELD`, the exact closure ID, and the acquire/reconcile owner at `CALL_RETURNED` while retaining the effect guard. The same checked live chain must next replace it atomically with teardown arm or release arm. Do not increment the attempt again. |
-| Veto after `HELD` | Recheck current-host executor availability. If available, under the effect guard persist `TREE_CLOSURE_RELEASING/CLOSURE_VETOED` and exact `CLOSURE_RELEASE/ARMED`; request release by exact pair; persist `CALL_RETURNED`; and finalize only after matching `RELEASED`. Unavailability retains the preexisting fence byte-identically. |
-| Arm teardown | Recheck current-host executor availability. If available, under the effect guard atomically enter `TEARDOWN_IN_FLIGHT`, create/update origin-neutral debt, and persist exact `STOP_TREE/ARMED`. Recheck owner and availability again, call only `Stop-Tree`, and persist `CALL_RETURNED` before any observation. Unavailability retains the preexisting fence byte-identically. |
-| Observe action effect | Require current-host executor availability and `STOP_TREE/CALL_RETURNED`, allocate the next checked nonzero capture ordinal, map the closed observation, and atomically enter `TREE_CLOSURE_RELEASING` with the same continuation ID updated to `CLOSURE_RELEASE/ARMED`, without clearing debt/current attempt or cycle `ISSUED`. Unavailability reserves no ordinal and retains the returned-effect fence. |
-| Finalize release | Require current-host executor availability, retain the effect guard through matching release/result CAS, apply the pending-disposition rule, retire the attempt, and only then clear the continuation owner and release the guard. Unavailability leaves every checked field byte-identical. |
-| New guarded owner commits | Permitted only with quarantine `NONE`, debt `NONE`, no childless closure phase/continuation owner/pending disposition, and either clean genesis or the complete provably-different-owner transition. Clear a debt-free old-owner cycle; leave no inherited authority. |
+| Reserve named proof | With no same-poll terminal/current obligation, consume a fresh witness plus inert authority and one `RESERVE` permit. `INITIAL` creates the first envelope/binding. `CONTINUE` transforms a qualifying childless-`IDLE` envelope: initial-mode retry may rebind while preserving cycle/terminal historical tombstones; debt completion retains the immutable binding and exact residual subset. Both install `PRE_BARRIER` in one checked mutation. |
+| Begin closure acquisition | Under the effect guard, a `STATE_MUTATION` permit live-recomputes the binding and persists acquiring plus an exact `ACTIVE_ATTEMPT/CLOSURE_ACQUIRE/ARMED` continuation. At the successor revision, a distinct fresh `EXTERNAL_CALL` permit constructs/invokes acquisition. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin does not change the cycle. |
+| Acquire valid closure | The typed receipt plus a distinct fresh `RECEIPT_MUTATION` permit and full joined equality persist `TREE_CLOSURE_HELD`, closure ID, and `CALL_RETURNED`. No raw provider result or consumed call permit may do so. |
+| Veto after `HELD` | A `STATE_MUTATION` permit arms exact release; after that CAS a fresh `EXTERNAL_CALL` permit constructs/invokes it, and only a fresh receipt-mutation permit may finalize `RELEASED`. Failure at any construction point retains the envelope. |
+| Arm teardown | A `STATE_MUTATION` permit atomically enters `TEARDOWN_IN_FLIGHT`, creates/updates debt, and writes `STOP_TREE/ARMED`; at the successor revision a fresh `EXTERNAL_CALL` permit constructs `ExecutableOwnedTargetSetV1` and the sole typed `STOP_TREE` call. Only a fresh matching receipt-mutation permit writes `CALL_RETURNED`. |
+| Observe action effect | A `POST_ACTION_CAPTURE/STATE_MUTATION` permit at `STOP_TREE/CALL_RETURNED` allocates the next nonzero ordinal and arms the typed capture; a fresh post-CAS call permit obtains its receipt, and a fresh receipt-mutation permit maps that observation into releasing state with `POST_ACTION_CAPTURE/CALL_RETURNED`, without clearing debt/current attempt or cycle `ISSUED`. A later `CLOSURE_RELEASE/STATE_MUTATION` permit alone may arm release. |
+| Finalize release | A matching release receipt and finalize permit apply the disposition, bind the retired-attempt tombstone, and only then clear the continuation/release the guard. |
+| Spawn and identity commit | The same envelope/binding persists through `PRE_BARRIER`, `SPAWN_IN_FLIGHT`, and `AMBIGUOUS_LAUNCH`. A state-mutation permit first installs `SPAWN_RESERVATION/SPAWN/ARMED`; only a distinct fresh post-CAS call permit invokes spawn, and only its receipt plus a fresh receipt-mutation permit commits identity/ambiguity. The sole receipt-free conversion is the closed crash-only `SPAWN_RESULT_COMMIT` scope over the persisted issuer subject and positive issuer-death proof. |
+| New guarded owner commits | Permitted only with quarantine `NONE`, debt `NONE`, and no childless effect envelope requiring cleanup. A quarantined state cannot commit a replacement owner automatically in V1. |
 
-Crash/reload is equally closed. Every entry first reconstructs the current-host
-exact-executor operand. `UNAVAILABLE` returns the explicit retained-fence row
-before effect-guard acquisition, takeover, reconcile/release, capture, or
-finalization; this includes every phase/stage inherited from another platform.
-Every other retain gate uses the explicit
-retained-fence row above. `MAY_TAKEOVER` first owns the effect guard, proves a
-persisted predecessor unable to resume, and commits the no-call takeover
-mapping; only after recomputation as `MAY_RECONCILE` may these operations run:
+Crash/reload is equally closed. Deserialization yields only the inert envelope;
+the full-poll precedence above handles state loss, observation, quarantine, and
+malformed state without constructing an effect object. A valid envelope can
+advance only after the current caller obtains a fresh witness, passes static
+executor preflight, acquires the effect guard when the operation requires it,
+and constructs the exact operation permit. `CAPABILITY_UNAVAILABLE` at preflight
+selects the retained-envelope row; `REJECTED` after guard acquisition performs
+zero effect, releases the guard, and follows its reload/reject rule. This order
+also applies to a phase inherited from another platform.
+`MAY_TAKEOVER` itself carries a `TAKEOVER` permit, first owns the effect guard,
+proves a persisted predecessor unable to resume, and commits only the no-call
+takeover mapping. The winner must reload and construct a new operation permit;
+only then may these phase-specific operations run:
 
 - `TREE_CLOSURE_ACQUIRING`: write `CLOSURE_RECONCILE/ARMED`, reconcile by
   attempt ID, and retain the guard through the result CAS. Matching
@@ -1867,30 +2258,38 @@ mapping; only after recomputation as `MAY_RECONCILE` may these operations run:
   the same veto. Matching `HELD` is persisted as releasing/vetoed and released
   without termination. `UNKNOWN` retains state and the retired set is
   unchanged.
-- `TREE_CLOSURE_HELD`: do not terminate. Under the guard, persist
-  releasing/`CLOSURE_VETOED` with `CLOSURE_RELEASE/ARMED`; matching `RELEASED`
-  may then finalize directly, while matching `HELD` requires exact idempotent
-  release and a later matching `RELEASED`. `UNKNOWN` retains the held state.
-- `TREE_CLOSURE_RELEASING`: use checked `CLOSURE_RECONCILE` or
-  `CLOSURE_RELEASE` ownership for each exact synchronous call and finalize the
-  already persisted disposition only on matching `RELEASED`.
+- `TREE_CLOSURE_HELD`: do not terminate. Replace the takeover checkpoint only
+  with `CLOSURE_RECONCILE/ARMED`. A matching `RELEASED` may finalize the veto;
+  matching `HELD` requires a later, distinct `CLOSURE_RELEASE/STATE_MUTATION`
+  arm and exact idempotent release; `UNKNOWN` retains the held state.
+- `TREE_CLOSURE_RELEASING`: replace the takeover checkpoint only with
+  `CLOSURE_RECONCILE/ARMED`. Finalize the already persisted disposition on
+  matching `RELEASED`; matching `HELD` may proceed only through a later,
+  distinct `CLOSURE_RELEASE/STATE_MUTATION` arm, and `UNKNOWN` retains state.
 - `TEARDOWN_IN_FLIGHT` with `STOP_TREE/ARMED`: never reissue `Stop-Tree`, never
   infer that it did or did not run, and never infer action completion. After
   predecessor-death proof, persist `EFFECT_UNPROVEN`, retain debt, and release
-  any exact closure under a takeover continuation. No branch launches.
-- `TEARDOWN_IN_FLIGHT` with `STOP_TREE/CALL_RETURNED`: a takeover may write
-  a new `STOP_TREE/CALL_RETURNED/RECONCILER` owner while preserving the returned
-  effect fact. After the gate recomputes `MAY_RECONCILE`, it may obtain a fresh
+  any exact closure only after the takeover checkpoint is replaced by a distinct
+  `CLOSURE_RELEASE/STATE_MUTATION` arm. No branch launches.
+- `TEARDOWN_IN_FLIGHT` with `STOP_TREE/CALL_RETURNED`: takeover writes the inert
+  `STOP_TREE/TAKEOVER_CHECKPOINT/RECONCILER` owner while preserving the returned
+  effect fact. After a distinct `CLOSURE_RECONCILE/STATE_MUTATION` arm and
+  matching reconciliation, it may obtain a fresh
   post-action observation under matching `HELD`, then atomically persist the
-  mapped releasing disposition with `CLOSURE_RELEASE/ARMED`. If
-  reconciliation instead proves matching `RELEASED`, obtain a fresh
-  `OwnedDebtResidualObservationV1` without assuming frozen membership:
-  `COMPLETE_GONE` clears debt/cycle into `IDLE`; `COMPLETE_RESIDUAL` or
-  `INCOMPLETE` finalizes the mapped failure into `IDLE`. No reload branch
-  launches. `UNKNOWN` retains reservation, debt/current attempt, and cycle
-  `ISSUED`; `NEVER_ACQUIRED` is invalid after debt and retains the fence.
+  mapped releasing disposition with `POST_ACTION_CAPTURE/CALL_RETURNED`. A
+  later `CLOSURE_RELEASE/STATE_MUTATION` permit alone may replace it with
+  `CLOSURE_RELEASE/ARMED`. If reconciliation instead proves matching
+  `RELEASED`, consume that exact reconcile receipt through a fresh
+  `EFFECT_FINALIZE` permit and conservatively finalize `EFFECT_UNPROVEN`: enter
+  childless `IDLE`, retire the attempt, retain debt, clear its current-attempt
+  pair, record the origin-sensitive failure/exhaustion result, and make no
+  residual-capture call or launch. The next ordinary poll may clear that debt
+  only through the existing debt-only `EFFECT_FINALIZE` scope and a matching
+  `OwnedDebtResidualObservationV1.COMPLETE_GONE`. `UNKNOWN`
+  retains reservation, debt/current attempt, and cycle `ISSUED`;
+  `NEVER_ACQUIRED` is invalid after debt and retains the fence.
 
-Every reload post-action or residual capture atomically reserves the current
+Every reload post-action capture atomically reserves the current
 core `next_capture_ordinal` under the same checked continuation, then
 increments it. Its `CaptureIdV1` has the current state epoch, agent, ordinary
 poll sequence, and that exact nonzero ordinal; it is greater than any prior
@@ -1923,9 +2322,15 @@ transaction; no executor branch may save a cached whole state.
    closure, attempt-keyed acquire/reconcile/release, crash safety, and
    activated-platform compatibility. Until all pass, the static capability
    gate refuses before reservation with zero attempt and zero external call.
-   Prove current-host `ExactTargetExecutorCapabilityV1` from the actual action
-   branch, never from input acceptance, and recheck it at every state entry and
-   operation listed in the archetype table.
+   Prove `CurrentExactTargetExecutorWitnessV1` can be minted only by the actual
+   Windows FILETIME action adapter, never by input acceptance, parsing,
+   deserialization, platform text, or the checked store. Require
+   `ClosureCapabilityV1.AVAILABLE.reservation_permit.operation == RESERVE`,
+   consume that permit exactly once when an initial or continuing reservation
+   commits, and prove it cannot be persisted or reused for acquisition. Exercise
+   initial creation, same-binding retry, changed-tree initial-mode rebind, and
+   immutable-binding debt completion. Rebind must preserve terminal tombstones
+   under their historical bindings and refuse any `RELEASE_PENDING` tombstone.
 4. Revalidate after reservation. Owner, coverage, and target digest must match;
    initial mode additionally requires a fresh post-linearization nonordinary
    raw capture, same-capture complete child absence, exact current matcher
@@ -1974,18 +2379,23 @@ transaction; no executor branch may save a cached whole state.
     unavailability claim and reconciliation
     `UNKNOWN(CAPABILITY_UNAVAILABLE)`; both must retain their exact fences,
     avoid `CLOSURE_VETOED`/retry/exhaustion, and require task visibility.
-    Independently make the current-host exact executor unavailable with a
-    persisted reservation/phase, debt-only state, and retired-attempt cleanup;
-    each must emit exact capability attention and preserve all checked fields
-    byte-identically.
+    Independently remove the current-host witness with a persisted reservation/
+    phase, debt-only state, and retired-attempt cleanup. Static inability must
+    emit exact capability attention, preserve the complete childless effect
+    envelope exactly, and construct no permit-bound mutation or call. Then
+    supply a fresh but mismatching witness for each shape: construction must be
+    `REJECTED`, preserve the envelope, make no mutation/call, reload or reject,
+    and must not manufacture operator-facing capability attention. Two adjacent
+    polls may still advance only the closed ordinary-observation projection.
 8. After every finalized childless reservation/attempt outcome and
-   observation-only debt reconciliation, attempt a second reservation in the
+   permit-bound debt reconciliation from ordinary residual evidence, attempt a
+   second reservation in the
    same ordinary poll; the terminal must refuse it. Prove pure refusal,
    retained uncertainty, prior-poll exhaustion, and no-op `NOT_ATTEMPTED` do
    not write the terminal; successful cleanup `NOT_ATTEMPTED` does. Cross
    ordinary `COMPLETE_GONE` debt reconciliation with every
-   `ExecutionEligibilityV1`: only `ELIGIBLE` together with fresh current-host
-   exact-executor `AVAILABLE` clears and writes the terminal,
+   `ExecutionEligibilityV1`: only `ELIGIBLE` together with a fresh matching
+   `EFFECT_FINALIZE` permit clears and writes the terminal,
    `DRY_RUN` discards, and every other gate retains debt/cycle/attention. The
    clear must also require `IDLE` with no reservation, closure, pending
    disposition, or current attempt. Inject the same observation into every
@@ -2011,11 +2421,12 @@ transaction; no executor branch may save a cached whole state.
     `RELEASED` binding its closure ID and finalizing the veto. Reload
     complete-gone cleanup emits `NOT_ATTEMPTED`, writes the terminal, and never
     launches. Cross every persisted named phase with every execution gate:
-    dry run, a non-current supervisor, and current-host exact-executor
-    `UNAVAILABLE` retain state byte-identically and make no closure-successor
-    call; a current supervisor with exact-executor `AVAILABLE` under kill
-    switch, disabled action latch, missing report membership, or disabled
-    auto-restart may only
+    dry run and a non-current supervisor make no closure-successor call or
+    effect-owned mutation. A missing/mismatching fresh witness preserves the
+    complete childless effect envelope exactly while ordinary observation may
+    advance its separate projection. A current supervisor with a valid
+    operation permit under kill switch, disabled action latch, missing report
+    membership, or disabled auto-restart may only
     reconcile/release/finalize the old fence and never acquire, kill, launch,
     consume a marker, increment an attempt, or change backoff/readiness.
 13. Generate every debt-current-attempt/cycle/execution cross-product. Accept
@@ -2054,21 +2465,30 @@ transaction; no executor branch may save a cached whole state.
     `CALL_RETURNED`, and after `CALL_RETURNED` before capture. Require no
     second `Stop-Tree`, no completion inference from `ARMED`, no release while
     a live foreign continuation can run, and no destructive call after
-    authority ownership is released. On an executor-compatible host, reload
-    `PRE_BARRIER` through its state-only release without an attempt owner; on
-    an unavailable host retain it byte-identically. For every takeover phase,
-    assert the exact no-call mapping, recomputation to `MAY_RECONCILE`, and
-    rejection of `STOP_TREE/ARMED/RECONCILER`. Repeat every paused state after
+    authority ownership is released. From retained `STOP_TREE/CALL_RETURNED`,
+    make reconcile return matching `RELEASED`; require receipt-bound
+    `EFFECT_FINALIZE` to record `EFFECT_UNPROVEN`, retain debt, enter `IDLE`, and
+    make no residual-capture call or launch. With a fresh matching
+    `PRE_BARRIER_RELEASE` permit, reload `PRE_BARRIER` through its state-only
+    release without an attempt owner; without that permit retain the envelope
+    exactly. For every takeover phase,
+    assert the exact no-call mapping and then only the closed table's exact next
+    operation (`CLOSURE_RECONCILE`, `CLOSURE_RELEASE`, retired reconcile, or the
+    crash-only spawn result as applicable); reject
+    `STOP_TREE/ARMED/RECONCILER`. Repeat every paused state after
     inheriting it on Linux and macOS; current-host executor unavailability must
     win before takeover and make both pollers zero-call and zero-mutation.
 17. Lose checked state after automatic attempt one, two, and three, after debt
     arm, and after a partial leaves-first target attempt. A new epoch and the
     same physical PID/start/nonce/generation must remain
     `STATE_PROVENANCE_LOST`, with no fresh budget, debt clear, kill, or launch.
-    Clear only by a distinct physical owner plus complete
-    old-owner/all-residual extinction. A structurally valid one-generation-old
-    backup, unknown prior owner, or unprovable rootless residual must leave
-    quarantine indefinitely.
+    Prove V1 exposes no automatic retirement constructor at all: a distinct
+    local owner, a structurally valid one-generation-old backup, or local
+    absence of the old owner and every visible residual must each leave
+    quarantine indefinitely. Attempt to supply PID and start, hostname,
+    `state_epoch`, `process_source_digest`, MachineGuid alone, local absence,
+    and combinations of those values; none may construct a retirement delta.
+    Only attended handling outside automatic recovery may resolve the state.
 18. Enter `SPAWN_IN_FLIGHT` only with `spawned_guard=null`. Inject a valid
     returned guard and require an atomic identity commit directly to `IDLE`;
     inject ambiguous output and require `AMBIGUOUS_LAUNCH`. Reload must never
@@ -2094,8 +2514,11 @@ transaction; no executor branch may save a cached whole state.
 21. Race two reload reconcilers reserving nonordinary capture ordinals.
     Require distinct CAS-allocated values greater than zero at the current
     ordinary sequence, exact attempt binding, and no reuse/wrap. Pair an
-    ordinal-zero ordinary residual with a nonzero reload residual and prove
-    each is accepted only in its stated context.
+    ordinal-zero ordinary residual with a nonzero reload post-action capture and
+    prove each is accepted only in its stated context. For matching `RELEASED`
+    after retained `STOP_TREE/CALL_RETURNED`, require no capture allocation or
+    external capture call: finalize `EFFECT_UNPROVEN` and leave residual
+    discovery to the next ordinary poll.
 22. Inspect the 87-A adapter and closure successor's implementation, package,
     state, and activated-platform diffs. Any new daemon/service, persistence
     plane, durable helper, durable file/database/registry/journal, durable named
@@ -2146,29 +2569,55 @@ transaction; no executor branch may save a cached whole state.
     that ordinary barrier evidence still blocks. A clear barrier without the
     typed closure/absence proof must also refuse debt clear. Attended reset/archive
     evidence must never substitute for automatic closure or completion.
-24. Execute the complete state-entry table with current-host executor
-    `AVAILABLE` on Windows and `UNAVAILABLE` on Linux and macOS. Cross fresh
-    selection; uninterrupted issuer at every `ARMED`/`CALL_RETURNED` phase;
-    live-continuation resume; same-process CAS re-reduction; same-platform
-    restart/takeover; cross-platform inheritance of `PRE_BARRIER`,
-    `TREE_CLOSURE_ACQUIRING`, `TREE_CLOSURE_HELD`,
-    `TREE_CLOSURE_RELEASING`, and `TEARDOWN_IN_FLIGHT`; `IDLE` with outstanding
-    debt and no current attempt; retired-ID reconcile/late `HELD`; unresolved
-    quarantine; malformed fence; and proved quarantine retirement. Every
-    unavailable named/debt/retired path with quarantine `NONE` must retain reservation, phase,
-    closure, pending disposition, debt/current attempt, cycle, continuation,
-    retired IDs, capture ordinal, and terminal byte-identically; make zero
-    takeover, capture, reconcile, release, `Stop-Tree`, launch, and finalizer
-    calls; and emit `CAPABILITY_UNAVAILABLE` plus `POLICY_HELD`. Prove
-    `RETAIN_EXACT_TARGET_EXECUTOR_UNAVAILABLE` with dry run false, quarantine
-    `NONE`, and a fresh current supervisor; separately cross each earlier
-    retain-only gate and require the same zero-call/zero-mutation safety. Prove
-    `MAY_RELEASE_PRE_BARRIER`, ordinary debt clear, late-`HELD` cleanup, and
-    every release finalizer run only when the fresh operand is `AVAILABLE`.
-    Separately prove complete-extinction quarantine retirement is the stated
-    platform-neutral no-OS-action transition and never named cleanup. A future
-    POSIX executor contract must not make a persisted Windows FILETIME tuple
-    compatible without a reviewed version/migration rule.
+24. Prove the construction seal, not a state-entry inventory. Through every
+    public decoder and reducer, deserialize a valid current childless envelope;
+    it may yield inert evidence only. Feed an unknown schema-valid extension
+    through the compatibility boundary and require either closed rejection or
+    inert opaque evidence, never an action object. Attempt to pass raw targets,
+    IDs, bindings, persisted state,
+    forged provider results, and copied/stale permits to the checked owner and
+    every external adapter; each must be rejected before a state mutation or
+    call. For every `ExactTargetExecutorOperationV1` and permit use, prove the
+    private permit constructor requires a fresh witness, exact binding, current
+    revision, and the operation's closed live scope. Normally it also requires
+    the recomputed authorized tuple/residual subset; the closed targetless old-
+    side rebind, retired-cleanup, and owner-transition scopes instead require
+    the exact tombstone/envelope binding plus the complete fresh prospective
+    proof or typed subject/checkpoint specified above.
+    Independently mismatch each applicable operand, reuse the one-shot permit, and
+    change the revision before consuming the permit. No case may yield an
+    executable target, permit-bound mutation, or typed call. Separately invoke
+    a valid typed call, commit an observation-only revision while it runs, and
+    require a fresh receipt permit to accept the result only when envelope and
+    continuation remain exact; any effect-state change rejects it. For every call-
+    bearing operation, require three distinct permits at the arm revision,
+    post-CAS call revision, and receipt-commit revision. Prove a consumed arm
+    permit cannot construct a call and a call permit cannot apply a receipt;
+    enforce the closed receipt-predecessor table. For every guard-required
+    operation, construct a valid permit and then attempt to release, lose,
+    transfer, or replace the borrowed guard before consumption; the checked
+    owner must reject the mutation, and an external adapter must revalidate and
+    reject the call at entry. For a valid synchronous call, require its receipt
+    to return that same live borrow; constructing the receipt-mutation permit
+    consumes the returned borrow, and a lost/replaced borrow before commit must
+    reject the result with zero effect.
+
+    Round-trip every serializable state shape and prove witness, permit,
+    executable target, mutation, call, receipt, and live effect guard are absent
+    after decoding. Prove only the actual adapter can return a receipt and only
+    for its matching typed call. On Linux and macOS, exercise at least a fresh
+    proof, a deserialized closure/debt envelope, childless `SPAWN_IN_FLIGHT`,
+    `AMBIGUOUS_LAUNCH`, and a retired-attempt tombstone as direction controls;
+    the effect envelope must remain exact and no adapter may be called, while
+    two adjacent polls may advance only `ClassifierObservationDeltaV1` fields.
+    Apply a private non-childless delta to each current childless envelope and
+    reject it before field application. Reject composite delta tags; commit an
+    ordinary observation first, reload, and mint any later permit only at the
+    successor revision. Prove initial non-dry-run state-loss quarantine
+    creation is the exclusive fail-closed permit-free mutation, dry-run loss
+    persists nothing, and V1 has no automatic retirement constructor.
+    A future POSIX executor contract must not make a persisted Windows FILETIME
+    binding compatible without a reviewed version/migration rule.
 
 ## Dependencies and release order
 
@@ -2177,11 +2626,12 @@ transaction; no executor branch may save a cached whole state.
 | Two same-owner post-establishment complete child absences | #120 INPUT DELIVERED; ENFORCED after #115 and the 87-A adapter | 87-A reducer plus merged #120 snapshot |
 | PID/start/nonce ownership; never pattern ownership | #120 INPUT DELIVERED; ENFORCED by the 87-A adapter | Adapter over merged `owned_process_tree_v2`, including exact Windows FILETIME |
 | Complete 64-entry tree observation | DELIVERED by merged #120; 87-A adapter validation remains required | #120 snapshot plus 87-A adapter |
-| POSIX exact-target execution for named teardown | CURRENTLY UNAVAILABLE | #120 accepts Linux exact observation tokens but declares no macOS token and has no non-Windows executor branch. With quarantine `NONE`, fresh paths return pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and inherited reservation/phase, debt-only, and retired-cleanup paths retain their checked state byte-identically before any call or mutation. The independent complete-extinction quarantine retirement is not named cleanup. Every unresolved named case remains `POLICY_HELD` pending a human. |
+| POSIX exact-target execution for named teardown | CURRENTLY UNAVAILABLE | #120 accepts Linux exact observation tokens but declares no macOS token and has no non-Windows executor branch. Fresh proofs cannot construct a reservation permit; deserialized reservations, phases, debt, spawn ambiguity, and retired tombstones are inert because they cannot construct a fresh matching permit, typed call, or effect-owned mutation. The effect envelope remains exact while ordinary observation may advance its separate projection. Every unresolved named case remains `POLICY_HELD` pending a human. |
 | Action-scoped creation closure | CURRENTLY UNAVAILABLE; ENFORCED after a conforming closure successor | Merged #120 does not freeze creation or expose attempt-keyed acquire/reconcile/release; otherwise `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human |
 | Atomic reservation/debt/cycle/terminal state | ENFORCED after #115 | Task #115 checked state owner |
 | External-call continuation/effect linearization | PARTIAL Windows target-local primitive DELIVERED by #120; full contract ENFORCED after #115 and the closure successor | #120 same-handle exact FILETIME check/terminate plus conditional bounded wait attempt, checked continuation state, and successor-owned attempt-bound synchronous adapters |
 | Fail-closed state-loss quarantine | ENFORCED after #115 | Task #115 checked state owner |
+| Automatic state-loss-quarantine retirement | UNAVAILABLE IN V1 ON EVERY PLATFORM | No trustworthy host/process-universe token exists in merged #120; quarantine stays `STATE_PROVENANCE_LOST`/`POLICY_HELD` pending attended handling. A future read-only existing-OS-token successor must satisfy M5 Option A. |
 | No daemon, persistence plane, durable helper or OS object, or runtime dependency | DECIDED ABSOLUTE by operator on 2026-07-31 (M5 Option A) | Project/package boundary; no mechanism-specific exception |
 | Sole leaves-first guarded kill | ENFORCED for admitted Windows targets; POSIX unavailable | Same-handle exact FILETIME check/terminate and conditional bounded wait attempt in existing `Stop-Tree`; no non-Windows exact-token execution branch |
 | Three-attempt automatic cap and continuous typed attention | ENFORCED after #115 | 87-A state/output |
