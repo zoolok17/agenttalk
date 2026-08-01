@@ -1,13 +1,13 @@
 # Design 87-A: Supervisor classifier and recovery-authority totality
 
-**Design status:** Proposed, Revision 11; candidate for
+**Design status:** Proposed, Revision 12; candidate for
 **NORMATIVE-SPECIFICATION COMPLETE** with the operator-directed owned-childless
 wrapper authority. This core and its
 [normative owned-childless module](DESIGN-87A-owned-childless-wrapper-authority.md)
 at the same commit constitute 87-A; neither is conforming alone.
 
 **Delivery status:** **IMPLEMENTATION BLOCKED** on task #115, task #146, and the
-closure successor. Revision 11 specifies those mechanisms; it does not deliver
+closure successor. Revision 12 specifies those mechanisms; it does not deliver
 them.
 
 **Conformance status:** **UNAVAILABLE.** Neither Q4 nor 87-A is complete,
@@ -45,7 +45,7 @@ Every asserted property in this document has one of these labels:
   implementable contract and its mandatory evidence. It does not assert that
   executable enforcement exists.
 - **IMPLEMENTATION BLOCKED** means at least one named prerequisite required for
-  conformance is absent from merged code. Revision 11 is independently blocked
+  conformance is absent from merged code. Revision 12 is independently blocked
   on #115, #146, and the closure successor.
 
 An implementation may claim conformance to 87-A only when every ENFORCED rule
@@ -97,9 +97,11 @@ not erase mandatory escalation.
 - Task #146 owns the supervisor owned-tree effect-entry migration. Merged code
   still exposes raw `Stop-Tree($targets)` at
   `src/agenttalk/supervisor.py:8889-8939`; the configured-agent and ephemeral
-  planners call it with `.kill_targets` at `9392` and `9591`. Revision 11
+  planners call it with `.kill_targets` at `9392` and `9591`. Revision 12
   specifies one closed dispatcher over opaque childless, configured-agent, and
-  ephemeral-terminal variants. It does not claim that runtime seal exists until
+  ephemeral-terminal variants, with one private atomic use owner and winning
+  admission, plan ownership, native entry, and receipt-consumption transitions
+  per call. It does not claim that runtime seal exists until
   #146 migrates every caller, removes the raw entry, and passes the direction
   controls. “Sole native body” is scoped to the supervisor owned-tree executor;
   `src/agenttalk/wrapper/turn_watchdog.py` has a separate kill facility outside
@@ -118,7 +120,7 @@ not erase mandatory escalation.
   and that successor.
   Task #116 remains independent because an absent wrapper needs no teardown
   target.
-- Revision 11 preserves existing non-87-A owned-tree behavior, not the raw
+- Revision 12 preserves existing non-87-A owned-tree behavior, not the raw
   `Stop-Tree` entry point. Only #146's closed dispatcher may reach the private
   supervisor owned-tree native body after migration.
 - The task #81 recovery umbrella preceding Design 87 is consistent with the
@@ -150,7 +152,7 @@ closure, debt, and cap contract; splitting task #120's snapshot/barrier and
 the closure-successor mechanism separately keeps platform implementation
 detail out without separating 87-A's authority.
 These independently reverified figures remain frozen historical panel
-evidence; later revisions, including Revisions 10 and 11, do not recompute or replace
+evidence; later revisions do not recompute or replace
 them.
 
 **STATED non-goals:** 87-A does not specify notification routes, human receipt,
@@ -188,8 +190,10 @@ fresh non-serializable executor witness that matches the persisted inert
   binding, no 87-A childless executor-dependent external effect and no
   childless authority-enabling or effect-owned mutation is constructible.
   Separately, no supervisor owned-tree native termination is reachable except
-  through one consumed closed dispatcher variant; that second rule is specified
-  but remains undelivered until #146. Deserializing a reservation, phase,
+  through one `SupervisorOwnedTreeNativeInvocationV1` created by the winning
+  admission, plan-ownership, and native-entry transitions for a closed
+  dispatcher variant; that second rule is specified but remains undelivered
+  until #146. Deserializing a reservation, phase,
 debt, retired ID, or future childless state yields evidence only; it cannot
 manufacture the permit, executable call, receipt, or checked delta needed to
 act.
@@ -198,8 +202,9 @@ In that universal, authority-enabling mutation is the module's closed term for
 a change to childless reservation/execution/attempt/closure/debt/cycle/
 continuation/retired-attempt/nonordinary-capture/spawn/guarded-identity
 ownership or for clearing such a fence. Pure ordinary-observation evidence is
-not an authority object: it may change only when #115 consumes one sealed
-ordinary-observation receipt and derives the private mutation inside its checked
+not an authority object: it may change only when #115 consumes one opaque
+commit-custody handle over a sealed ordinary-observation receipt and derives
+the private mutation inside its checked
 RMW transaction. It cannot reserve, consume, or execute the predicate it later
 helps satisfy.
 
@@ -820,13 +825,45 @@ in-flight, and ambiguity fence. Manual readiness bookkeeping is orthogonal to
 that ownership fence and cannot authorize or block a later recovery.
 
 Task #115 owns the sole observation begin/checked-reduce/commit API. It accepts
-one sealed ordinary-observation receipt, not a caller-constructed successor or
-arbitrary field map:
+one `OrdinaryObservationCommitCustodyV1` over a sealed ordinary-observation
+receipt, not a standalone receipt, caller-constructed successor, or arbitrary
+field map:
 
 ```text
 OrdinaryObservationLineageV1 =
   one private, nonserializable, noncopyable, single-use lineage issued by the
-  #115 owner and bound to exact agent_key + state_epoch + expected_revision
+  #115 owner at begin, carrying:
+    lineage_id
+    expected_agent_key
+    expected_state_epoch
+    expected_revision
+    prospective_capture_id: exactly CaptureIdV1 {
+      state_epoch = expected_state_epoch
+      agent_key = expected_agent_key
+      ordinary_poll_sequence =
+        checked predecessor.ordinary_poll_sequence + 1
+      capture_ordinal = 0
+    }
+  invariant: prospective_capture_id is fixed before observer acquisition and
+             immutable within this lineage; this lineage cannot replace,
+             rebind, or restamp it
+
+OrdinaryObservationLineageOwnerV1 =
+  one private, nonserializable, noncopyable atomic owner cell minted exactly
+  once with OrdinaryObservationLineageV1 and never reachable from the lineage
+  or receipt graph; only the acquisition and commit-custody handles below carry
+  its unexported reference;
+  its closed states are UNUSED | ACQUIRING | RECEIPT | COMMITTING | CLOSED
+  | POISONED
+
+OrdinaryObservationAcquisitionV1 =
+  private, nonserializable, noncopyable opaque handle pairing the immutable
+  lineage proof with an unexported reference to its exact owner cell; aliases
+  may exist, but only one UNUSED -> ACQUIRING compare-and-swap may win
+
+OrdinaryObservationBeginResultV1 =
+  READY(OrdinaryObservationAcquisitionV1)
+  | CAPTURE_SEQUENCE_EXHAUSTED
 
 OrdinaryClassifierObservationReceiptV1 =
   private, nonserializable, noncopyable, deeply immutable, alias-free,
@@ -836,18 +873,32 @@ OrdinaryClassifierObservationReceiptV1 =
     expected_agent_key
     expected_state_epoch
     expected_revision
-    exact sealed raw ordinary capture and independent classifier operands
-  invariant: contains no caller-settable ordinary_poll_sequence,
-             capture_ordinal, continuity/guard successor, confirmation count,
-             confirmation basis, last/first capture successor, CONFIRMED state,
-             or other persisted successor field
+    prospective_capture_id: exactly lineage.prospective_capture_id
+    exact sealed raw ordinary capture and independent classifier operands,
+      with raw capture.capture_id exactly equal to prospective_capture_id
+  invariant: ordinary_poll_sequence and capture_ordinal occur only inside the
+             owner-bound prospective_capture_id and matching raw capture ID;
+             neither is caller-settable or restampable
+  invariant: contains no caller-settable continuity/guard successor,
+             confirmation count, confirmation basis, last/first capture
+             successor, CONFIRMED state, or other persisted successor field
+
+OrdinaryObservationCommitCustodyV1 =
+  private, nonserializable, noncopyable opaque handle emitted exactly once
+  alongside one OrdinaryClassifierObservationReceiptV1; it carries that sealed
+  receipt plus an unexported reference to the exact lineage owner. It is outside
+  every sealed graph. Aliases may exist, but all name the same RECEIPT state and
+  only one RECEIPT -> COMMITTING compare-and-swap may win
 
 PrivateClassifierObservationMutationV1 =
   private, nonserializable, noncopyable, deeply immutable, single-commit result
   derived and applied only inside #115's checked RMW transaction {
   expected_state_epoch: lowercase hyphenated UUID
   expected_revision: uint64
-  ordinary_poll_sequence: exactly current + 1
+  capture_id: exactly receipt.prospective_capture_id
+  ordinary_poll_sequence:
+    exactly capture_id.ordinary_poll_sequence and exactly
+    checked predecessor.ordinary_poll_sequence + 1 using checked uint64 addition
   next_capture_ordinal: exactly 1
   recovery_poll_terminal_sequence: null
   runtime_continuity: RuntimeContinuityStateV1
@@ -946,21 +997,47 @@ PrivateClassifierStateMutationV1 =
     | STATE_LOSS_QUARANTINE(StateLossQuarantineCreationDeltaV1)
 ```
 
-The #115 owner creates `OrdinaryObservationLineageV1` at begin and passes it
-only to the installed ordinary-observer adapter. That adapter's unexported
-receipt factory deep-copies one completed raw capture into
-`OrdinaryClassifierObservationReceiptV1`; receiving raw operands, knowing a
-lineage ID, or implementing the public owner API does not expose that factory.
-This is one #115 begin/observe/checked-reduce/commit boundary, not a second
-observation owner.
+At begin, the #115 owner reads the checked predecessor. When its
+`ordinary_poll_sequence` is less than the maximum `uint64`, begin fixes the
+prospective ordinal-zero `CaptureIdV1` and atomically creates the lineage owner
+before the installed observer performs any acquisition. At the maximum value,
+checked addition is impossible: begin returns `CAPTURE_SEQUENCE_EXHAUSTED`,
+constructs no lineage, acquisition handle, capture, receipt, or mutation,
+performs no 87-A action, and requires attended state-epoch rollover handling.
+It never wraps to zero. Begin does not commit or reserve persisted state. The
+owner invokes the installed ordinary-observer adapter only with the resulting
+`OrdinaryObservationAcquisitionV1`. That adapter must win the exact atomic
+`UNUSED -> ACQUIRING` transition before its first observation step; a concurrent
+alias or sequential replay loses without observation or receipt construction.
+The winner writes the exact prospective ID into one new immutable
+`ProcessObservationV1`; its unexported receipt factory deep-copies and seals
+that completed acquisition, fully constructs a dormant
+`OrdinaryObservationCommitCustodyV1`, then atomically moves the owner
+`ACQUIRING -> RECEIPT` and yields that exact custody handle. No fallible
+allocation occurs between transition and yield. Any uncertain acquisition,
+receipt/custody construction, or handoff poisons the owner instead of retrying.
+No factory surface accepts an acquisition completed for a different lineage or
+replaces its capture ID. Receiving raw operands, knowing a lineage ID, or
+implementing the public owner API does not expose that factory. This is one #115
+begin/observe/checked-reduce/commit boundary, not a second observation owner.
 
 The ordinary-observation equations remain pure and independently testable, but
-their constructor and execution are private to #115's checked transaction. The
-owner validates the intact receipt seal and lineage against the current state,
-derives `ordinary_poll_sequence = current + 1`, ordinal-zero `CaptureIdV1`,
-continuity, establishment guard, and every confirmation successor from the
-checked predecessor plus the receipt's raw operands, constructs
-`PrivateClassifierObservationMutationV1`, and applies it before leaving that
+their constructor and execution are private to #115's checked transaction. At
+commit, #115 accepts only `OrdinaryObservationCommitCustodyV1`, validates its
+sealed receipt and exact owner binding, and uses that handle's unexported owner
+reference; the sealed receipt alone is inert, and no receipt-to-owner registry
+or caller mutex is permitted. It must win `RECEIPT -> COMMITTING` before
+derivation or field application. A same-reference custody-handle alias or
+sequential replay loses without mutation. The winner validates the intact
+receipt seal, lineage, expected predecessor, prospective capture ID, and raw
+capture ID against the still-current predecessor. It derives one candidate
+observation successor whose sequence is exactly that begin-bound ID and the
+predecessor sequence plus one, copies the ID unchanged into
+`PrivateClassifierObservationMutationV1`, and derives continuity,
+establishment guard, and every
+confirmation successor from the checked predecessor plus the receipt's raw
+operands. Commit never mints, replaces, reseals, or restamps a completed
+acquisition's `CaptureIdV1`. The owner applies the mutation before leaving that
 same transaction. A caller cannot submit that mutation or choose any derived
 field. The committed module overlay is reduced from the same receipt and never
 feeds or rewrites either banked child counter. It may advance exactly the
@@ -969,12 +1046,19 @@ displayed fields while a childless executor is unavailable, but cannot alter
 launch/backoff/readiness, marker/configuration state, allocate a nonordinary
 effect capture, or write an effect terminal.
 
-One receipt commits or is poisoned exactly once. Copy, replay, serialization,
+One receipt commits or is poisoned exactly once. A successful checked commit
+moves its owner `COMMITTING -> CLOSED`; after the one commit-admission winner,
+a stale predecessor, checked-state compare-and-swap loss, or uncertain commit
+moves it to `POISONED`, never back to `RECEIPT`. A losing receipt-consumption
+alias does not change the winner's owner state. Copy, replay, serialization,
 wrong agent/epoch/revision, a nonordinary receipt, mutable or altered nested
 evidence, or any receipt carrying a derived successor field is rejected before
-field application. Two valid lineages based on one predecessor revision are
-safe: the checked CAS admits at most one; the stale loser is poisoned and must
-recapture. One legitimate receipt can advance an empty/count-zero confirmation
+field application. Two valid lineages based on one predecessor revision may
+carry the same prospective capture ID, but the checked CAS admits at most one.
+The stale loser's lineage, receipt, and completed acquisition are poisoned.
+After reload, that acquisition cannot be wrapped, resealed, or restamped with
+the successor prospective ID; only a new begin and a new real acquisition may
+produce the next receipt. One legitimate receipt can advance an empty/count-zero confirmation
 only to count one/`OBSERVED_ONCE`; a second confirmation requires a distinct
 later acquisition and receipt committed against the successor revision.
 
@@ -996,8 +1080,9 @@ constructor; it cannot compose with an observation, authority, or effect delta.
 
 The checked owner applies exactly one private tagged mutation per transaction.
 Its public observation API is
-`commit_ordinary_observation(OrdinaryClassifierObservationReceiptV1)`, not
-`commit_delta(OBSERVATION(...))`. A non-dry-run poll first consumes that receipt,
+`commit_ordinary_observation(OrdinaryObservationCommitCustodyV1)`, not
+`commit_delta(OBSERVATION(...))`. A non-dry-run poll first consumes that custody
+handle and its sealed receipt,
 derives and commits the private observation mutation, reloads the successor
 revision, and only then may privately construct a non-childless or permit-bound
 childless delta. It may never infer a permit from the observation or upgrade the
@@ -1631,6 +1716,14 @@ CaptureIdV1 {
 }
 ```
 
+For an ordinary observation, #115 computes the prospective `CaptureIdV1` at
+begin from the checked predecessor and binds it into the private lineage before
+acquisition. The installed observer writes that exact ID into
+`ProcessObservationV1`. Persisted `ordinary_poll_sequence` advances only if the
+matching receipt wins commit; commit validates and preserves the ID rather than
+restamping the completed capture. A stale acquisition cannot be rebound to a
+later poll identity.
+
 The canonical state owner increments `ordinary_poll_sequence` once for each
 committed ordinary observation of that agent. The planner's ordinary capture
 has `capture_ordinal=0`. Reusing a cached capture preserves its ID and cannot
@@ -1677,7 +1770,7 @@ change is unequal even when both captures happen to be empty.
 ### Typed one-use confirmation
 
 **SPECIFIED by this persisted closed state and #115's owner-private reducer over
-one sealed ordinary-observation receipt:**
+one commit-custody-bound sealed ordinary-observation receipt:**
 
 ```text
 AbsenceConfirmationStateV1 =
@@ -1789,8 +1882,9 @@ guarded_launcher_identity_digest, recognition_config_digest, coverage)`.
 “Consecutive” means adjacent committed `ordinary_poll_sequence` values for the
 same `agent_key` and `state_epoch`. Heartbeat, runtime-reason, and restart-marker
 changes do not reset physical evidence. A qualifying capture has
-`capture_ordinal=0`, complete coverage, presence `ABSENT`, and the reducer's
-agent key and state epoch. Dry run and recovery-policy `HOLD` do not request a
+the exact #115 begin-bound ordinal-zero `CaptureIdV1` validated unchanged at
+commit, complete coverage, presence `ABSENT`, and the reducer's agent key and
+state epoch. Dry run and recovery-policy `HOLD` do not request a
 launch reservation and therefore do not consume.
 
 The launch reservation consumes confirmation atomically before the final
@@ -1917,10 +2011,11 @@ is unreadable; `AGENT_NOT_REPORTED` for report absence;
 launch, seed managed identity, or update launch/backoff/readiness state.
 
 `DRY_RUN` may compute and display a pure simulated decision but discards every
-owner-private observation mutation and consumes or poisons its sealed receipt;
+owner-private observation mutation and consumes or poisons its observation
+commit custody;
 it performs no state/event/marker/config persistence. For every other value,
 the checked owner may first consume one
-`OrdinaryClassifierObservationReceiptV1` and derive/commit the observation-only
+`OrdinaryObservationCommitCustodyV1` and derive/commit the observation-only
 projection, including the nonrenewable freshness anchor, continuity, and
 confirmation resets, inside the same #115 RMW transaction. That observation
 commit cannot reserve or consume an absence/manual proof or alter
@@ -1954,7 +2049,17 @@ custody. The owner cell is not reachable from an effect value. The permit, bindi
 targets, mutation, call, receipt, and all nested members are transitively
 immutable, alias-free, and privately sealed; they carry only an immutable opaque
 custody proof. A synchronous adapter atomically moves the separate owner cell
-through CALL and RECEIPT while carrying that proof. Every normal/exception exit returns or
+through `CALL -> DISPATCHING -> PLAN_OWNED -> INVOKING -> RECEIPT` while
+carrying that proof; only the `DISPATCHING -> PLAN_OWNED` winner may construct a
+plan, and only the `PLAN_OWNED -> INVOKING` winner may enter the native body.
+For owned-tree `STOP_TREE`, this is the module's private submission/admission/
+invocation boundary.
+The configured-agent and ephemeral dispatch variants each use an equivalent
+private per-call atomic owner. Concurrent aliases and sequential replay at every
+call/admission/invocation/receipt-custody handoff lose with zero effect. A
+sealed dispatcher receipt alone is inert; its private custody handle is the
+only association to the exact owner and the only input accepted for receipt
+consumption. Every normal/exception exit returns or
 poisons custody exactly once; an effect-uncertain throw poisons it and never
 licenses reissue. A receipt-mutation permit consumes the exact receipt-held
 proof and atomically moves the same OUTSTANDING call issuance from RECEIPT to
@@ -2005,7 +2110,27 @@ release its reservation, write its same-poll terminal, and consume no automatic
 attempt. Static executor unavailability retains the complete envelope; a stale
 revision reloads/re-reduces, and any other rejected private operand performs no
 mutation. Both branches leave any still-matching manual marker pending and any
-one-use absence proof consumed. After a childless closure is held but before
+one-use absence proof consumed.
+
+`EPHEMERAL_TERMINAL` has no 87-A reservation and therefore does not borrow the
+reservation `snapshot_id` rule. It uses the module's narrow
+`EphemeralTerminalFinalActionGateV1`: after winning its private atomic dispatch
+admission but before native-plan construction, the dispatcher requires the
+same enabled action-latch epoch under the latch read guard and separately
+requires the kill switch to remain clear. It retains the latch guard through
+issuance and preserves the private native body's final kill-switch check. A
+post-construction latch or kill-switch change consumes the call as a typed
+pre-effect rejection, preserves persisted `next_entry`, and produces no plan,
+raw array, or effect. The disabled-latch exception above is non-destructive
+fence cleanup and never authorizes this destructive ephemeral variant.
+If the kill switch changes after the outer check or plan construction but before
+the native body's final check, that body returns the invocation-bound typed
+`ACTIONS_DISABLED_NO_EFFECT` result before lexical raw-array materialization.
+The dispatcher consumes the call as
+`REJECTED_NO_EFFECT(FINAL_ACTION_GATE_CHANGED)`, retains `next_entry`, and
+produces no receipt, raw array, or effect.
+
+After a childless closure is held but before
 `Stop-Tree`, the executor
 instead commits `TREE_CLOSURE_RELEASING/CLOSURE_VETOED`, requests release using
 the exact persisted attempt/closure pair, and may release the reservation only
@@ -2500,7 +2625,8 @@ atomically moves its sole custody before constructing its revision-bound permit.
 Only then is any release,
 takeover, nonordinary capture, reconciliation, finalization, `Stop-Tree`, or
 launch object constructible. A native owned-tree termination additionally
-requires one consumed closed dispatcher variant. This is a construction rule,
+requires the one winning private admission, plan-ownership, and native-entry
+transition for one closed dispatcher variant. This is a construction rule,
 not an inventory of entry paths, but that dispatcher rule remains undelivered
 until #146.
 
@@ -3347,6 +3473,19 @@ without all of this executed evidence:
     instance/report/config/kill-switch captures and action-latch epoch change.
     Every mismatch vetoes the next OS action and preserves the exact
     origin-specific state delta.
+    Independently construct a legitimate `EPHEMERAL_TERMINAL` call, then race
+    an action-latch epoch change after construction but before dispatch; repeat
+    with a kill-switch activation while the latch remains unchanged. Each race
+    must permit exactly one winning dispatch admission and then terminate as a
+    typed pre-effect rejection, preserve the exact persisted `next_entry`, and
+    create no native plan, raw array, or effect; no second admission may exist.
+    With both gates unchanged, retain the
+    latch read guard through issuance and preserve the private native body's
+    separate final kill-switch check. Add a third race after the outer checks
+    and native-plan construction but before that inner check: the typed result
+    must be `ACTIONS_DISABLED_NO_EFFECT`, the call must become
+    `REJECTED_NO_EFFECT(FINAL_ACTION_GATE_CHANGED)`, `next_entry` must remain
+    exact, and no lexical raw array or native effect may exist.
 29. Execute every mandatory case in the normative owned-childless module,
      including initial versus rootless debt-residual observation, joined
      action-time evidence, tree-closure races, action-time target-rebinding
@@ -3451,8 +3590,23 @@ without all of this executed evidence:
     `CAPABILITY_UNAVAILABLE`, and require `action_attention_required=true`.
     Join the exact fingerprint to `canonical_condition.agent_key`; every 87-B
     rendering must name that agent and say operator action is required.
+    Exercise exact preflight direction, not only generic zero-effect behavior.
+    On a staged Windows path with valid exact-FILETIME semantics and no #146
+    dispatcher seal, require witness construction and fresh capability to return
+    exactly `DISPATCHER_SEAL_UNDELIVERED` before permit or closure-provider
+    evaluation. Repeat from a retained Windows effect envelope: preserve the
+    envelope exactly except the separately permitted #115 observation
+    projection, export generic `CAPABILITY_UNAVAILABLE` attention, and construct
+    no permit, mutation, call, or effect. On Linux and macOS, where the exact
+    executor and seal are both absent, require
+    `EXACT_TARGET_EXECUTOR_UNAVAILABLE` to take precedence. With a staged
+    conforming Windows seal present but the closure successor absent, require an
+    available witness followed by exactly `SUCCESSOR_MISSING`, never
+    `DISPATCHER_SEAL_UNDELIVERED`. These are proposed conformance outcomes, not
+    runtime behavior at merged `587e7c1`.
 38. Integrate the module's construction-seal suite. Prove the checked owner has
-    exactly four internal mutation variants, exposes the sealed-receipt ordinary
+    exactly four internal mutation variants, exposes the custody-bound
+    sealed-receipt ordinary
     observation API rather than a caller-supplied observation mutation, and has
     no raw whole-state or childless-envelope write. Exercise every public decoder/reducer and every childless external
     adapter with raw IDs, target tuples, bindings, persisted envelopes, forged
@@ -3465,7 +3619,9 @@ without all of this executed evidence:
     Inspect the supervisor owned-tree effect surface and require exactly one
     private native body, zero public raw-array termination entry, zero direct
     `Stop-Tree $p.kill_targets` call, and zero route from planner targets to the
-    body except one consumed `SupervisorOwnedTreeDispatchCallV1`. Reject raw
+    body except one `SupervisorOwnedTreeNativeInvocationV1` produced by the
+    winning atomic admission and plan-ownership transitions over the exact
+    call's private submission/use-owner pair. Reject raw
     arrays, caller-settable tags, wrappers around `kill_targets`, and
     field-equivalent fake variants. Prove configured-agent and ephemeral-terminal
     authorization/persistence/barrier parity through their independent private
@@ -3475,6 +3631,57 @@ without all of this executed evidence:
     tuple and materializes its lexical raw array only for the final private-body
     invocation, with no caller or post-return alias.
 
+    For each of CHILDLESS, CONFIGURED_AGENT_RELAUNCH, and EPHEMERAL_TERMINAL,
+    retain two references to the same legitimate private submission and race
+    dispatch. Exactly one atomic `CALL -> DISPATCHING` compare-and-swap may win;
+    only that winner may receive one admission. Retain two references to that
+    admission and race `DISPATCHING -> PLAN_OWNED`; exactly one winner may
+    construct one native plan and one invocation handle. Retain two references
+    to that invocation and race native entry; exactly one
+    `PLAN_OWNED -> INVOKING` winner may reach the final check, lexical raw array,
+    or native effect. Pause after each transition and prove the concurrent alias
+    loses with zero effect. Sequentially replay the submission, admission, and
+    invocation after normal receipt, positive pre-effect rejection, and uncertain
+    exception; every replay must create no new capability or plan and produce
+    zero effect.
+    Noncopyable must not be treated as protection against aliasing the same
+    object. Prove each call constructor privately emits exactly one atomic owner
+    plus one opaque submission, and that admission/invocation handles retain the
+    same owner outside the deeply sealed value graphs; a
+    caller mutex, external call-ID registry, or unstated dispatcher lock is not
+    a conforming substitute.
+
+    Retain two references to every legitimate
+    `SupervisorOwnedTreeDispatchReceiptCustodyV1` and race consumption. Prove
+    the sealed receipt alone cannot locate or mutate an owner. For
+    CHILDLESS exactly one `RECEIPT -> PERMIT` receipt-mutation admission may win.
+    For CONFIGURED_AGENT_RELAUNCH and EPHEMERAL_TERMINAL exactly one
+    `RECEIPT -> CONSUMING_RECEIPT` compare-and-swap may win before existing
+    planner behavior. Normal success must end `CLOSED`; a possibly-started or
+    uncertain planner behavior/commit must end
+    `POISONED(PLANNER_COMMIT_UNCERTAIN)`. Inject synchronous failure
+    after receipt admission but before mutation/planner behavior and require
+    childless `CUSTODY_PROTOCOL_BROKEN` or non-childless
+    `DISPATCH_PROTOCOL_BROKEN`, never a return to `RECEIPT`; distinguish these
+    from childless `OWNER_COMMIT_UNCERTAIN` and non-childless
+    `PLANNER_COMMIT_UNCERTAIN` after work may have begun. Concurrent losers and
+    sequential custody-handle replay must produce zero mutation, launch, or effect.
+
+    For EPHEMERAL_TERMINAL, separately change the action-latch epoch and activate
+    the kill switch after legitimate call construction but before dispatch.
+    Each case must permit exactly one winning admission, consume the call as
+    `REJECTED_NO_EFFECT`, preserve exact `next_entry`, and create no native plan,
+    raw array, or effect; a second admission or replay remains rejected.
+    With both unchanged, require the same enabled latch epoch under its read
+    guard immediately before plan construction, a separately fresh clear
+    kill-switch check, retention of the latch guard through issuance, and the
+    native body's final kill-switch check. Pause after the outer checks and plan
+    construction but before that inner check, activate the kill switch, and
+    require the invocation-bound typed `ACTIONS_DISABLED_NO_EFFECT` result, one
+    `REJECTED_NO_EFFECT(FINAL_ACTION_GATE_CHANGED)` transition, retained
+    `next_entry`, no lexical raw-array materialization or native effect, and
+    zero-effect replay.
+
     Prove the private witness path is acyclic: the conforming Windows
     dispatcher's unexported capability factory mints the current witness before
     any permit or call exists, and the later childless call is accepted only by
@@ -3483,7 +3690,7 @@ without all of this executed evidence:
     and witness creation by either non-childless variant.
 
     Reject any composite/multi-tag mutation. In a non-dry-run poll, consume one
-    `OrdinaryClassifierObservationReceiptV1`, derive/commit only the private
+    `OrdinaryObservationCommitCustodyV1`, derive/commit only the private
     `OBSERVATION` mutation, reload its successor revision, and then construct at most one
     later authority/effect delta against that revision. Prove every childless
     outer-field update is present in the exact private
@@ -3517,10 +3724,13 @@ without all of this executed evidence:
     From one guard acquisition, race two issuers and attempt B1/P1 then B2/P2
     before P1 resolves. Exactly one `AVAILABLE -> OUTSTANDING` issuance wins;
     P2 rejects with zero mutation/call. Assert one lineage_id/issuance_id moves
-    through permit, call, receipt, and receipt permit. After custody returns,
+    through permit, call, winning dispatch admission, plan ownership, native
+    invocation, receipt, and receipt permit. After custody returns,
     exactly one successor issuance may proceed and P1 replay fails. Inject
-    synchronous exceptions before effect, during effect, after native return,
-    during receipt handoff, and during owner commit. Each returns custody only
+    admission-result handoff failure; plan/invocation-handle construction or
+    handoff failure; synchronous exceptions during validation, native entry, or
+    effect; and failures after native return, during receipt handoff, receipt
+    consumption, and owner/planner commit. Each returns custody only
     with positive no-effect proof or otherwise poisons it exactly once—never
     both or neither. A poisoned lineage cannot issue again before guard
     release/reacquisition and never reissues an uncertain effect.
@@ -3533,8 +3743,11 @@ without all of this executed evidence:
     mutation next state, call arguments, receipt result, and both non-childless
     provenance variants. A frozen outer record or digest-only check is
     insufficient. Inspect every sealed graph and prove the atomic lineage owner
-    cell is unreachable; only the immutable custody proof is present, and each
-    holder transition changes the separate cell exactly once.
+    and non-childless dispatch-use owner cells are unreachable; only immutable
+    custody/use proofs are present. Prove the private submission, admission, and
+    invocation and receipt-custody handles are the only associations between
+    their exact immutable values and owner, and each holder transition changes the separate cell
+    exactly once.
 
     Submit the former public observation-record shape with forged child-dead
     count two, owned-childless count two, and confirmed absence; the #115 public
@@ -3542,13 +3755,40 @@ without all of this executed evidence:
     to the receipt factory, an attempt to exchange raw evidence for a receipt
     outside the installed observer adapter, and a receipt minted by a substituted
     adapter. Prove only the #115-created lineage passed to the installed adapter
-    can mint one sealed receipt from one completed acquisition. One legitimate receipt from
+    can mint one sealed receipt from one completed acquisition. Retain two
+    references to the same private acquisition handle and race the installed
+    adapter: exactly one `UNUSED -> ACQUIRING` compare-and-swap may win before
+    observation; the loser and sequential replay perform zero acquisition and
+    mint no receipt. Inject receipt/custody construction and atomic-yield
+    handoff failure and require one `POISONED` owner with no returned custody
+    handle. Retain two references to the resulting
+    `OrdinaryObservationCommitCustodyV1` and race #115 commit; prove the sealed
+    receipt alone cannot locate its owner. Exactly one
+    `RECEIPT -> COMMITTING` transition may win before
+    reducer derivation or field application; the loser and sequential replay
+    perform zero mutation. Require that
+    lineage to contain the exact prospective ordinal-zero `CaptureIdV1` before
+    acquisition begins. Prove `ProcessObservationV1.capture_id`,
+    `receipt.prospective_capture_id`,
+    `PrivateClassifierObservationMutationV1.capture_id`, and every non-null
+    successor capture-ID field that records the current sample equal that
+    begin-bound ID byte-for-byte. Empty/reset successors retain null IDs; no
+    successor may synthesize a different ID or restamp at commit. From a checked
+    predecessor sequence `n`, require the begin-bound ID, raw/tree displayed
+    sequence, and candidate mutation sequence to equal checked `n + 1`; only
+    after the winning commit may current equal `n + 1`. At maximum `uint64`,
+    require exactly `CAPTURE_SEQUENCE_EXHAUSTED`, no acquisition handle,
+    observation, receipt, mutation, or 87-A action, and no wrap to zero. One legitimate receipt from
     count zero may reach at most count one/`OBSERVED_ONCE`; a second distinct
     post-successor acquisition is required to confirm. Reject copy, replay,
     serialization, two receipts from one lineage, wrong agent/epoch/revision,
     forged sequence/ordinal, nonordinary receipt, derived successor fields, and
     mutated nested evidence. Race two valid same-revision receipt lineages:
     exactly one CAS commits and the loser is poisoned and cannot be reused.
+    Attempt to pass the stale loser's completed acquisition into a successor
+    lineage, reseal it, or restamp it with the successor capture ID; each must
+    reject without state change or confirmation advance. Only a new begin plus
+    a distinct acquisition after successor reload may mint the next receipt.
     Separately prove state-loss quarantine creation is the sole permit-free
     fail-closed mutation in a non-dry-run invocation. Repeat every outer-state
     loss under dry run and require only a simulated hold with zero persistence.
@@ -3601,7 +3841,7 @@ without all of this executed evidence:
 | Same-platform state-file/workspace transfer, restore, rollback, and migration activation | UNAVAILABLE IN V1; DECLARED ACTIVATION REFUSES | A conforming activation path refuses before imported bytes become the active checked store and constructs no 87-A witness, mutation, effect, or launch. An out-of-band replacement may be undetectable, is nonconforming, and has no 87-A guarantee. Future 87-C must bind the source universe within M5 Option A or keep imported state inert. |
 | Raw discovery stops flapping | STATED not promised | Process-discovery behavior is unchanged. |
 | Owned-childless teardown requires a nonce-owned complete tree, an exact target executor, and action-time closure | WINDOWS #120 INPUT/TARGET-LOCAL EFFECT DELIVERED; NORMATIVE CONTRACT SPECIFIED; TEARDOWN IMPLEMENTATION BLOCKED on #115, #146, and the closure successor; POSIX unavailable independently | Merged #120 supplies exact Windows target/effect evidence but exposes a raw entry, supplies no POSIX exact-token executor, and supplies no action-scoped creation closure. A fresh proof cannot create an envelope without a `RESERVE` permit; deserialized evidence cannot construct a witness, lineage, sealed call, receipt, or effect mutation. Unresolved named paths remain `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human. |
-| Supervisor owned-tree termination dispatch | NORMATIVE CONTRACT SPECIFIED; IMPLEMENTATION BLOCKED ON #146 | One closed sum admits permit-bound childless, independently authorized configured-agent, and independently authorized ephemeral-terminal calls. Merged raw `Stop-Tree($targets)` and both raw callers make the seal absent until #146 migrates them and proves the private native body has no other entry. Scope excludes the turn watchdog. |
+| Supervisor owned-tree termination dispatch | NORMATIVE CONTRACT SPECIFIED; IMPLEMENTATION BLOCKED ON #146 | One closed sum admits permit-bound childless, independently authorized configured-agent, and independently authorized ephemeral-terminal calls. Every variant has one private atomic use owner: submission aliases race for one admission, admission aliases race for one plan, invocation aliases race for one native entry, and receipt aliases race before any receipt-driven behavior. Replay or same-reference races at every stage produce zero additional mutation, launch, or effect. The ephemeral variant also repeats its narrow action-latch and kill-switch gates at dispatch. Merged raw `Stop-Tree($targets)` and both raw callers make the seal absent until #146 migrates them and proves the private native body has no other entry. Scope excludes the turn watchdog. |
 | Child-establishment grace cannot be sampled away | NORMATIVE CONTRACT SPECIFIED; implementation blocked on #115, #146, the merged-#120 adapter, and the closure successor for effect conformance | Nonrenewable same-turn closed guard in observation, confirmation, reservation, and action equality. |
 | External childless calls cannot outlive their authority owner | PARTIAL WINDOWS #120 TARGET-LOCAL PRIMITIVE DELIVERED; full normative contract specified; implementation blocked on #115, #146, and the closure successor | For an openable exact-FILETIME Windows target, merged #120 binds identity-check and termination to one handle and attempts the bounded same-handle wait. Unique lineage custody, deep seals, closed dispatch, checked continuation owner/stage, stable tombstones, and attempt-bound synchronous adapters remain absent. |
 | POSIX named owned-childless teardown and inherited cleanup | CURRENTLY UNAVAILABLE | #120 accepts Linux exact observation tokens but declares no macOS mapping, and the merged supervisor owned-tree body skips the Linux-token target because it has no FILETIME. No POSIX childless dispatcher witness exists, so neither fresh authority nor a deserialized `PRE_BARRIER`, external-effect phase, debt-only state, spawn ambiguity, or retired tombstone can construct the permit and typed object required to act. The Windows FILETIME guard is unchanged. |
