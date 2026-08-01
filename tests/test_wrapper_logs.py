@@ -90,6 +90,50 @@ def test_default_wrapper_log_root_uses_independent_fallback_when_home_is_checkou
     assert checkout.resolve() not in resolved.resolve().parents
 
 
+def test_default_wrapper_log_root_tolerates_unresolvable_home_when_configured_path_is_valid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    local = tmp_path / "local-state"
+
+    def _raise_no_home() -> Path:
+        raise RuntimeError("could not determine home directory")
+
+    monkeypatch.setattr(wrapper_logs.Path, "home", staticmethod(_raise_no_home))
+
+    resolved = wrapper_logs.default_wrapper_log_root(
+        checkout,
+        platform="posix",
+        environ={"XDG_STATE_HOME": str(local)},
+    )
+
+    assert resolved.parent == local / "agenttalk" / "wrapper-logs"
+    assert checkout.resolve() not in resolved.resolve().parents
+
+
+def test_default_wrapper_log_root_falls_back_to_tempdir_when_home_is_unresolvable_and_no_state_path_is_configured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    def _raise_no_home() -> Path:
+        raise RuntimeError("could not determine home directory")
+
+    monkeypatch.setattr(wrapper_logs.Path, "home", staticmethod(_raise_no_home))
+
+    resolved = wrapper_logs.default_wrapper_log_root(
+        checkout,
+        platform="posix",
+        environ={},
+    )
+
+    assert checkout.resolve() not in resolved.resolve().parents
+
+
 def test_bounded_stream_tee_keeps_each_file_and_generation_within_cap(
     tmp_path: Path,
 ) -> None:
@@ -983,6 +1027,115 @@ def test_cmd_wrap_uncaught_exception_traceback_is_bounded_and_in_tail(
     )
     assert "TRACEBACK-SENTINEL-BOOM" in tail
     assert "Traceback (most recent call last)" in tail
+
+
+def test_print_bounded_uncaught_exception_writes_into_tail_ring_when_config_is_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_path = tmp_path / "stdout.log"
+    err_path = tmp_path / "stderr.log"
+    err_path.write_text("E" * 1024, encoding="utf-8")
+    nonce = "f" * 32
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
+    monkeypatch.setenv(wrapper_logs.ENV_MAX_BYTES, "4096")
+    monkeypatch.setenv(wrapper_logs.ENV_SEGMENT_COUNT, "4")
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+    monkeypatch.setattr(wrapper_logs, "_LAST_STDERR_LOG_CONFIG", None)
+
+    # Simulate cmd_wrap's own tee lifecycle: installed, then torn down
+    # normally by the unconditional finally in installed_standard_streams_
+    # from_environment - exactly the state the tee is in by the time
+    # agenttalk/__main__.py's top-level fallback would ever run.
+    with wrapper_logs.installed_standard_streams_from_environment(
+        expected_nonce=nonce,
+    ):
+        pass
+
+    try:
+        raise RuntimeError("TOP-LEVEL-SENTINEL-BOOM")
+    except RuntimeError:
+        wrapper_logs.print_bounded_uncaught_exception()
+
+    files = sorted(tmp_path.glob("stderr.log*"))
+    assert all(path.stat().st_size <= 1024 for path in files)
+    assert sum(path.stat().st_size for path in files) <= 4096
+    tail = "".join(
+        path.read_text(encoding="utf-8", errors="replace") for path in files
+    )
+    assert "TOP-LEVEL-SENTINEL-BOOM" in tail
+    assert "Traceback (most recent call last)" in tail
+    # The raw file the supervisor redirects to must not receive this second
+    # copy directly - only the bounded tail ring does.
+    assert "TOP-LEVEL-SENTINEL-BOOM" not in err_path.read_text(encoding="utf-8")
+
+
+def test_print_bounded_uncaught_exception_prints_normally_when_no_wrapper_log_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wrapper_logs, "_LAST_STDERR_LOG_CONFIG", None)
+    captured = io.StringIO()
+    monkeypatch.setattr("sys.stderr", captured)
+
+    try:
+        raise RuntimeError("MANUAL-RUN-SENTINEL")
+    except RuntimeError:
+        wrapper_logs.print_bounded_uncaught_exception()
+
+    assert "MANUAL-RUN-SENTINEL" in captured.getvalue()
+    assert "Traceback (most recent call last)" in captured.getvalue()
+
+
+def test_top_level_boundary_keeps_second_traceback_within_cap_and_preserves_exception_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_path = tmp_path / "stdout.log"
+    err_path = tmp_path / "stderr.log"
+    err_path.write_text("E" * 1024, encoding="utf-8")
+    nonce = "a" * 32
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
+    monkeypatch.setenv(wrapper_logs.ENV_MAX_BYTES, "4096")
+    monkeypatch.setenv(wrapper_logs.ENV_SEGMENT_COUNT, "4")
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+    monkeypatch.setattr(wrapper_logs, "_LAST_STDERR_LOG_CONFIG", None)
+
+    def blow_up(_args: argparse.Namespace) -> int:
+        import sys
+
+        sys.stderr.write("x" * 20_000)
+        raise RuntimeError("BOUNDARY-SENTINEL-BOOM " + "z" * 20_000)
+
+    monkeypatch.setattr(cli, "_cmd_wrap_with_logging", blow_up)
+
+    # Mirrors agenttalk/__main__.py's own dispatch: everything but SystemExit
+    # that escapes main() is genuinely uncaught, so this is the boundary
+    # print_bounded_uncaught_exception exists for. cli.main() itself is
+    # untouched by this fix - an embedder calling it directly still gets the
+    # original exception type back, which this also confirms.
+    try:
+        cli.main(
+            ["--supervisor-launch-nonce", nonce, "wrap", "--for", "worker"]
+        )
+    except SystemExit as exc:
+        raise AssertionError(
+            "an unexpected exception must not be converted to SystemExit"
+        ) from exc
+    except RuntimeError as exc:
+        assert "BOUNDARY-SENTINEL-BOOM" in str(exc)
+        wrapper_logs.print_bounded_uncaught_exception()
+    else:
+        raise AssertionError("cli.main should have raised")
+
+    files = sorted(tmp_path.glob("stderr.log*"))
+    assert all(path.stat().st_size <= 1024 for path in files)
+    assert sum(path.stat().st_size for path in files) <= 4096
 
 
 def test_cmd_wrap_records_terminating_signal_without_exception_duplicate(

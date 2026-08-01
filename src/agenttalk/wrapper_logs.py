@@ -18,6 +18,7 @@ tracked but not yet closed.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import signal
@@ -25,6 +26,7 @@ import stat
 import sys
 import tempfile
 import threading
+import traceback
 from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +82,36 @@ def _authenticated_environment(
     )
 
 
+def _home_state_root(home_env: str | None, *parts: str) -> Path | None:
+    """Resolve a home-relative state directory, tolerating an unresolvable
+    home (no HOME/USERPROFILE and no passwd entry) by treating it as an
+    unavailable candidate rather than raising."""
+    try:
+        home = Path(home_env) if home_env else Path.home()
+    except RuntimeError:
+        return None
+    return home.expanduser().resolve().joinpath(*parts)
+
+
+def _candidate_state_roots(
+    configured: Path | None,
+    home_env: str | None,
+    home_parts: tuple[str, ...],
+    project: Path,
+) -> Iterator[Path]:
+    # Each candidate is resolved only once the previous one has been tried
+    # and rejected, so an unresolvable home fallback is never even attempted
+    # - let alone allowed to raise - while a valid configured path (the
+    # preferred input) is still available and unconsulted.
+    if configured is not None and configured.is_absolute():
+        yield configured
+    home_root = _home_state_root(home_env, *home_parts)
+    if home_root is not None:
+        yield home_root
+    yield Path(tempfile.gettempdir()).resolve()
+    yield project.parent / ".agenttalk-wrapper-logs"
+
+
 def default_wrapper_log_root(
     project_root: str | os.PathLike[str],
     *,
@@ -91,36 +123,21 @@ def default_wrapper_log_root(
     target = os.name if platform is None else platform
     if target == "nt":
         raw = env.get("LOCALAPPDATA")
-        fallback = (
-            Path(env.get("USERPROFILE") or Path.home()).expanduser().resolve()
-            / "AppData"
-            / "Local"
-        )
+        home_env, home_parts = env.get("USERPROFILE"), ("AppData", "Local")
     else:
         raw = env.get("XDG_STATE_HOME")
-        fallback = (
-            Path(env.get("HOME") or Path.home()).expanduser().resolve()
-            / ".local"
-            / "state"
-        )
-    configured = Path(raw).expanduser() if raw else None
+        home_env, home_parts = env.get("HOME"), (".local", "state")
     # A relative state-directory value is interpreted against the process cwd.
     # The supervisor must not let ambient cwd move diagnostic logs back into the
     # checkout, so only absolute platform state roots are eligible.
-    base = (
-        configured
-        if configured is not None and configured.is_absolute()
-        else fallback
-    )
+    configured = Path(raw).expanduser() if raw else None
     project = Path(project_root).resolve()
     project_id = project_id_for_root(project)
-    candidates = (
-        base,
-        fallback,
-        Path(tempfile.gettempdir()).resolve(),
-        project.parent / ".agenttalk-wrapper-logs",
-    )
-    for candidate in dict.fromkeys(candidates):
+    seen: set[Path] = set()
+    for candidate in _candidate_state_roots(configured, home_env, home_parts, project):
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         result = candidate / "agenttalk" / "wrapper-logs" / project_id
         if not result.resolve().is_relative_to(project):
             return result
@@ -421,6 +438,18 @@ class BoundedStreamTee:
             self._closed = True
 
 
+# Set by installed_standard_streams_from_environment right before it installs
+# the bounded tees, and deliberately never cleared: it is read exactly once,
+# by print_bounded_uncaught_exception at the true top-level script boundary
+# (agenttalk/__main__.py), which runs strictly after this module's own
+# context manager has already restored sys.stdout/sys.stderr and is no
+# longer reachable from that call site. Holding onto a resolved path and two
+# bounded integers - not a stream or hook - so a stale value left over after
+# a normal exit is inert rather than something that could leak behavior into
+# unrelated later code.
+_LAST_STDERR_LOG_CONFIG: tuple[str, int, int] | None = None
+
+
 @contextlib.contextmanager
 def installed_standard_streams_from_environment(
     environ: Mapping[str, str] | None = None,
@@ -428,6 +457,7 @@ def installed_standard_streams_from_environment(
     expected_nonce: str | None = None,
 ) -> Iterator[None]:
     """Install bounded stdout/stderr mirrors only for supervisor-marked wrappers."""
+    global _LAST_STDERR_LOG_CONFIG
     env = os.environ if environ is None else environ
     if not _authenticated_environment(env, expected_nonce):
         yield
@@ -466,6 +496,7 @@ def installed_standard_streams_from_environment(
     )
     sys.stdout = stdout
     sys.stderr = stderr
+    _LAST_STDERR_LOG_CONFIG = (stderr_path, max_bytes, segment_count)
     try:
         yield
     finally:
@@ -473,6 +504,48 @@ def installed_standard_streams_from_environment(
         sys.stderr = original_stderr
         stdout.close()
         stderr.close()
+
+
+def print_bounded_uncaught_exception() -> None:
+    """Print the currently-propagating exception the way Python's own
+    top-level printer would - call only from the real script entry point
+    (agenttalk/__main__.py), from an except block, once main() has let an
+    exception escape uncaught.
+
+    By the time control reaches here, installed_standard_streams_from_
+    environment's own finally has already restored sys.stdout/sys.stderr -
+    cmd_wrap's bare re-raise of an unexpected exception had to leave that
+    restore unconditional so an embedder catching the same exception gets
+    back clean, unmodified stream state. For a supervisor-launched wrapper,
+    the restored stderr IS the raw file the supervisor redirected to, with
+    no cap of its own - letting Python's default printer write a second,
+    unbounded copy of a traceback there (the first copy already landed,
+    correctly bounded, inside cmd_wrap before this ever runs) can push that
+    file past the advertised cap. Route this copy through the same bounded
+    tail-ring mechanism instead; a manual run with no wrapper log installed
+    prints normally, unchanged.
+    """
+    config = _LAST_STDERR_LOG_CONFIG
+    if config is None:
+        traceback.print_exc(file=sys.stderr)
+        return
+    stderr_path, max_bytes, segment_count = config
+    try:
+        tee = BoundedStreamTee(
+            io.StringIO(),
+            stderr_path,
+            max_bytes=max_bytes,
+            segment_count=segment_count,
+        )
+        try:
+            traceback.print_exc(file=tee)
+        finally:
+            tee.close()
+    except Exception:
+        # Best-effort: a failure bounding this redundant second copy must
+        # not swallow the crash itself.
+        with contextlib.suppress(Exception):
+            traceback.print_exc(file=sys.stderr)
 
 
 def _utc_iso(epoch: float) -> str:
