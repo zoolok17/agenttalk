@@ -3395,13 +3395,15 @@ def _token_stem(token: str) -> str:
 # redefines); the PowerShell side is the single source of truth for its own
 # language. Each entry's justification lives on the PowerShell function -
 # duplicating the reasoning here would just be a third place to drift.
-_ALLOWED_INTERPRETER_PREFIX_FLAGS = frozenset({"-u", "-I", "-S", "-B", "-E", "-P"})
+_ALLOWED_INTERPRETER_PREFIX_FLAGS = frozenset(
+    {"-u", "-I", "-S", "-B", "-E", "-P", "-b", "-bb"}
+)
 
 
 def _allowed_interpreter_prefix_token(token: str) -> bool:
     if token in _ALLOWED_INTERPRETER_PREFIX_FLAGS:
         return True
-    return len(token) > 2 and token.startswith("-X")
+    return len(token) > 2 and (token.startswith("-X") or token.startswith("-W"))
 
 
 def _module_args_from(cfg_agent: object) -> object:
@@ -9179,6 +9181,19 @@ function Test-AgenttalkAllowedInterpreterPrefixToken([string]$token) {
   #       script-path token without knowing -X consumes a value, which is
   #       exactly the "which flags consume a value" problem this
   #       mechanism declines to solve (round 4).
+  #   -b  warn (doubled as -bb, error) on str(bytes)/str(bytearray) and
+  #       bytes-vs-str comparisons - diagnostic only, same shape and same
+  #       no-execution-mode-effect as -B; never consumes a value, so it
+  #       needs no attached/separate distinction.
+  #   -W  warning-filter control, ATTACHED form only (e.g. -Wignore) -
+  #       same "CPython's scanner always continues past it" property as
+  #       -X, and the same bare-form refusal for the same reason (a value
+  #       token dangling after a bare -W is indistinguishable from a
+  #       script-path token). NOTE: -Werror is a genuine footgun - any
+  #       warning the launched code triggers becomes a crash instead of a
+  #       log line - a launch-configuration risk for the operator to own,
+  #       the same category as -S's and -E's own NOTE above, not a
+  #       security bypass of this check.
   #
   # Deliberately excluded despite looking superficially safe:
   #   -O/-OO strips `assert` statements, and this codebase has already
@@ -9197,10 +9212,14 @@ function Test-AgenttalkAllowedInterpreterPrefixToken([string]$token) {
   # mode) - and let the deliberately-excluded lowercase form through the
   # allowlist by accident.
   if ($token -ceq '-u' -or $token -ceq '-I' -or $token -ceq '-S' -or
-      $token -ceq '-B' -or $token -ceq '-E' -or $token -ceq '-P') {
+      $token -ceq '-B' -or $token -ceq '-E' -or $token -ceq '-P' -or
+      $token -ceq '-b' -or $token -ceq '-bb') {
     return $true
   }
-  if ($token.Length -gt 2 -and $token.StartsWith('-X', [StringComparison]::Ordinal)) {
+  if ($token.Length -gt 2 -and (
+      $token.StartsWith('-X', [StringComparison]::Ordinal) -or
+      $token.StartsWith('-W', [StringComparison]::Ordinal)
+  )) {
     return $true
   }
   return $false

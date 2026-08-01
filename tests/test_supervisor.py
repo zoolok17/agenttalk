@@ -6576,6 +6576,13 @@ _PREFIX_TOKEN_AGREEMENT_TABLE: list[tuple[str, bool]] = [
     # allowed: this project's actual needs (I2, 5th-leak-round allowlist)
     ("-u", True), ("-I", True), ("-S", True), ("-B", True), ("-E", True), ("-P", True),
     ("-Xutf8", True), ("-Xdev", True), ("-X3", True),
+    # round 15 connector finding: -W (attached form only, same shape as
+    # -X) and -b (bare, same shape as -B) were never evaluated either way.
+    ("-b", True), ("-bb", True),
+    ("-Wignore", True), ("-Werror", True), ("-Wdefault", True),
+    # -W's own separate-token form (no attached value) is not supported,
+    # same reasoning as -X's own case a few lines below.
+    ("-W", False),
     # execution-mode tokens (I2, rounds 1-4)
     ("-", False), ("-m", False), ("-mfoo", False), ("-magenttalk", False),
     ("-c", False), ("-cprint(1)", False), ("--", False),
@@ -6588,8 +6595,11 @@ _PREFIX_TOKEN_AGREEMENT_TABLE: list[tuple[str, bool]] = [
     ("-X", False),
     # deliberately excluded despite looking superficially safe
     ("-O", False), ("-OO", False), ("-i", False),
-    # invented / never-real spellings
-    ("-Z", False), ("-3", False), ("-Q", False), ("-Wignore", False),
+    # invented / never-real spellings, including the wrong-case forms of
+    # this round's two additions - -w is not a CPython flag at all, and
+    # a case-insensitive compare would equate it with -W by accident,
+    # the same class of mistake -i-vs-I already guards against above.
+    ("-Z", False), ("-3", False), ("-Q", False), ("-w", False), ("-wignore", False),
 ]
 
 
