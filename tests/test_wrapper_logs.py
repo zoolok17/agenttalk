@@ -277,6 +277,47 @@ def test_bounded_stream_tee_tail_accounts_before_writing_not_after(
     tee.close()
 
 
+def test_bounded_stream_tee_tail_rotates_before_splitting_a_utf8_code_point(
+    tmp_path: Path,
+) -> None:
+    """Round 11 connector finding, the serious one: _write_tail sliced the
+    encoded byte buffer at `available` with no regard for UTF-8 code point
+    boundaries. When a multi-byte character's leading byte is the LAST byte
+    that fits in the current segment, the old code split its encoded bytes
+    across two files - the first segment ends with a dangling lead byte,
+    the next begins with an orphaned continuation byte, and a strict UTF-8
+    reader then fails to open EITHER file - not merely mis-render one
+    character, the whole diagnostic becomes unopenable.
+
+    Constructed at the byte level, not hoped into: 127 ASCII bytes exactly
+    fill the segment to available=1, so e-acute (2-byte UTF-8) lands with
+    its lead byte as the very last byte that would fit. Asserted on the
+    raw bytes read back from disk, each segment decoded standalone - a
+    string round-trip through Python would paper over exactly this."""
+    original = io.StringIO()
+    base = tmp_path / "stdout.log"
+    tee = wrapper_logs.BoundedStreamTee(
+        original,
+        base,
+        max_bytes=4096,
+        segment_count=32,  # segment_bytes = 4096 // 32 = 128
+    )
+    assert tee.segment_bytes == 128
+
+    payload = ("A" * 127) + "é" + "BB"  # 127 + 2 + 2 = 131 encoded bytes
+    tee.write(payload)
+    tee.close()
+
+    seg1 = (tmp_path / "stdout.log.1").read_bytes()
+    seg2 = (tmp_path / "stdout.log.2").read_bytes()
+
+    seg1.decode("utf-8")
+    seg2.decode("utf-8")
+
+    assert seg1 == b"A" * 127
+    assert seg2 == "éBB".encode("utf-8")
+
+
 def test_signal_diagnostic_is_deferred_until_stream_write_unwinds(
     tmp_path: Path,
 ) -> None:

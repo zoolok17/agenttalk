@@ -153,6 +153,31 @@ def _utf8_prefix(text: str, budget: int) -> str:
     return raw[:budget].decode("utf-8", "ignore")
 
 
+def _utf8_chunk_boundary(raw, limit: int) -> int:
+    """Largest n <= min(limit, len(raw)) such that raw[:n] does not end
+    mid-code-point. Assumes raw is itself well-formed UTF-8 as a whole (as
+    produced by str.encode("utf-8", ...)), not that every prefix of it is -
+    only the last, possibly-truncated code point within the limit matters."""
+    n = min(limit, len(raw))
+    if n <= 0:
+        return 0
+    start = n - 1
+    while start > 0 and (raw[start] & 0xC0) == 0x80:
+        start -= 1
+    lead = raw[start]
+    if lead < 0x80:
+        seq_len = 1
+    elif lead & 0xE0 == 0xC0:
+        seq_len = 2
+    elif lead & 0xF0 == 0xE0:
+        seq_len = 3
+    elif lead & 0xF8 == 0xF0:
+        seq_len = 4
+    else:
+        seq_len = 1
+    return n if start + seq_len <= n else start
+
+
 def _harden_posix_log_paths(*paths: Path) -> None:
     if os.name == "nt":
         return
@@ -270,7 +295,26 @@ class BoundedStreamTee:
             if self._tail_size >= self.segment_bytes:
                 self._advance_tail()
             available = self.segment_bytes - self._tail_size
-            chunk = remaining[:available]
+            boundary = _utf8_chunk_boundary(remaining, available)
+            if boundary == 0:
+                # The next code point does not fit in what is left of this
+                # segment at all - not only right after a rotation, but any
+                # time a nearly-full segment's remaining room is narrower
+                # than the code point landing there. Rotating to a fresh
+                # segment (segment_bytes is bounded well above 4 bytes, the
+                # max UTF-8 sequence length) gives it room to fit whole,
+                # rather than splitting its encoded bytes across files, and
+                # rather than looping forever re-deriving the same
+                # zero-byte boundary against an unchanged buffer.
+                self._advance_tail()
+                available = self.segment_bytes
+                boundary = _utf8_chunk_boundary(remaining, available)
+                if boundary == 0:
+                    # Unreachable given the enforced segment_bytes bound -
+                    # a last resort so a future bound change fails soft
+                    # (one split code point) rather than hanging.
+                    boundary = 1
+            chunk = remaining[:boundary]
             tail = self._tail
             if tail is None:
                 raise OSError("wrapper log tail is unavailable")
