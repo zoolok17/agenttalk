@@ -6649,6 +6649,21 @@ _PREFIX_TOKEN_AGREEMENT_TABLE: list[tuple[str, bool]] = [
     # a case-insensitive compare would equate it with -W by accident,
     # the same class of mistake -i-vs-I already guards against above.
     ("-Z", False), ("-3", False), ("-Q", False), ("-w", False), ("-wignore", False),
+    # round 21 connector finding: -X presite=MODULE (debug builds) imports
+    # an arbitrary module before site initialization - before -m agenttalk
+    # is ever reached - the same before-main property as -c/-m/a bare
+    # script path, just spelled as a -X sub-option. The ONE -X attached
+    # form this allowlist must refuse despite the blanket -X* accept above.
+    ("-Xpresite=mod", False), ("-Xpresite=some.module", False),
+    # bare, no "=value" attached at all - the denial is a PREFIX match on
+    # "presite", not on "presite=", specifically so this doesn't slip
+    # through: "presite".startswith("presite=") is False, so a value-less
+    # spelling would otherwise fall through to the blanket -X* accept.
+    ("-Xpresite", False),
+    # a DIFFERENT, invented -X sub-option that merely SHARES presite's
+    # first few characters must still be allowed - the denial is scoped to
+    # "presite" itself, not to a broad "-Xpre*" family.
+    ("-Xpreflight", True),
 ]
 
 
@@ -6839,6 +6854,57 @@ def test_supervisor_wrap_argv_reaches_cmd_wrap_asks_the_real_parser(
     assert data["help_in_remainder"] is True, data
     assert data["unreachable"] is False, data
     assert data["bad_probe"] is False, data
+
+
+def test_supervisor_wrap_dispatch_probe_times_out_and_fails_toward_not_logging(
+    tmp_path: Path,
+) -> None:
+    """Round 21 connector finding, supervisor.py:9607's class: the probe ran
+    synchronously with no bound inside Launch/Launch-Spec, both called from
+    the supervisor's single polling loop - a hanging interpreter startup
+    would stall the entire fleet's supervisor over a decision that only
+    ever gated LOGGING, never LAUNCHING. Points $probePython's `-m
+    agenttalk` at a FAKE, deliberately-hanging package (not the real one)
+    via PYTHONPATH, so this proves the timeout actually fires and kills the
+    child, not merely that a fast probe returns fast."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "wrap_dispatch_timeout.json"
+    fake_root = tmp_path / "fake-checkout"
+    fake_pkg = fake_root / "src" / "agenttalk"
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (fake_pkg / "__main__.py").write_text(
+        "import time\ntime.sleep(30)\n", encoding="utf-8",
+    )
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        f"$py = {_pslit(sys.executable)}",
+        f"$fakeRoot = {_pslit(str(fake_root))}",
+        "$sw = [System.Diagnostics.Stopwatch]::StartNew()",
+        "$result = Test-AgenttalkWrapArgvReachesCmdWrap $py $fakeRoot $true "
+        "'python.exe' @('-m','agenttalk','--root','R','wrap','--for','worker') "
+        "$null 500",
+        "$sw.Stop()",
+        "@{ result = $result; elapsed_ms = $sw.ElapsedMilliseconds } | "
+        f"ConvertTo-Json -Depth 3 | Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    script = tmp_path / "wrap-dispatch-timeout.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert data["result"] is False, data
+    # Bounded by the probe's own 500ms timeout, not by the fake module's
+    # 30s sleep - generous slack for process start/teardown on a loaded
+    # CI runner, but nowhere near the sleep duration.
+    assert data["elapsed_ms"] < 15_000, data
 
 
 def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> None:

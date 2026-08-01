@@ -322,6 +322,84 @@ def test_bounded_stream_tee_tail_accounts_before_writing_not_after(
     tee.close()
 
 
+def test_bounded_stream_tee_resume_appends_to_newest_segment_instead_of_truncating(
+    tmp_path: Path,
+) -> None:
+    """Round 21 (connector finding; withdraws the trade-off accepted in
+    round 20): print_bounded_uncaught_exception's fresh, second tee used to
+    always reset to segment .1 and open it with "wb" - truncating whatever
+    was there regardless of whether it was the OLDEST content (as normal
+    rotation would discard anyway) or the NEWEST (a live wrapper's own
+    lifecycle output, written moments before the crash). resume=True must
+    probe the filesystem for the most-recently-written segment and APPEND
+    to it instead."""
+    base = tmp_path / "stderr.log"
+    original = io.StringIO()
+    first = wrapper_logs.BoundedStreamTee(
+        original, base, max_bytes=4096, segment_count=4,
+    )
+    first.write("FIRST-INSTANCE-NEWEST-LIFECYCLE-OUTPUT\n")
+    first.close()
+
+    tail_files = sorted(tmp_path.glob("stderr.log.*"))
+    assert tail_files
+    newest = max(tail_files, key=lambda p: p.stat().st_mtime)
+    newest_content_before = newest.read_bytes()
+    assert b"FIRST-INSTANCE-NEWEST-LIFECYCLE-OUTPUT" in newest_content_before
+
+    second = wrapper_logs.BoundedStreamTee(
+        io.StringIO(), base, max_bytes=4096, segment_count=4, resume=True,
+    )
+    second.write("SECOND-INSTANCE-CRASH-SENTINEL\n")
+    second.close()
+
+    combined = newest.read_bytes()
+    assert combined.startswith(newest_content_before), (
+        "resume must APPEND to the newest segment, not truncate it"
+    )
+    assert b"SECOND-INSTANCE-CRASH-SENTINEL" in combined
+
+
+def test_bounded_stream_tee_resume_still_rotates_and_truncates_the_next_segment(
+    tmp_path: Path,
+) -> None:
+    """A resumed instance must still behave like a normal one once the
+    resumed segment fills up - truncating the NEXT segment in ring order is
+    the correct, expected ring-buffer behavior, only the FIRST open (the
+    resumed one) is special."""
+    base = tmp_path / "stderr.log"
+    first = wrapper_logs.BoundedStreamTee(
+        io.StringIO(), base, max_bytes=4096, segment_count=4,
+    )
+    # Long enough to cycle through all 3 tail segments more than once, so
+    # every one of them ends up holding some of this text - avoids having
+    # to manufacture a stale file with a manually-set mtime.
+    first.write("old-content-that-must-be-evicted-by-rotation " * 200)
+    first.close()
+
+    tail_files = sorted(tmp_path.glob("stderr.log.*"))
+    assert len(tail_files) == 3
+    before = {p.name: p.read_bytes() for p in tail_files}
+    assert all(b"old-content" in content for content in before.values())
+
+    second = wrapper_logs.BoundedStreamTee(
+        io.StringIO(), base, max_bytes=4096, segment_count=4, resume=True,
+    )
+    # Enough to force a full extra rotation cycle past the resumed segment.
+    second.write("x" * 3500)
+    second.close()
+
+    after = {p.name: p.read_bytes() for p in tail_files}
+    evicted = [
+        name for name, content in after.items() if b"old-content" not in content
+    ]
+    assert evicted, "at least one segment must have been freshly rotated into"
+    # Every freshly-rotated segment must be a clean truncate - no stale
+    # old-content leaking in alongside the new "x"s.
+    for name in evicted:
+        assert after[name].strip(b"x") == b""
+
+
 def test_bounded_stream_tee_tail_rotates_before_splitting_a_utf8_code_point(
     tmp_path: Path,
 ) -> None:
@@ -725,7 +803,6 @@ def test_cmd_wrap_routine_system_exit_emits_exited_fact_without_traceback(
     monkeypatch.setattr("sys.stderr", io.StringIO())
 
     def not_initialized(_args: argparse.Namespace) -> int:
-        import sys
 
         sys.stderr.write(
             "agenttalk: not initialized at X\n"
@@ -966,7 +1043,6 @@ def test_cmd_wrap_entry_bounds_python_level_wrapper_output(
     monkeypatch.setattr("sys.stderr", io.StringIO())
 
     def emit_output(_args: argparse.Namespace) -> int:
-        import sys
 
         sys.stdout.write("x" * 20_000)
         sys.stdout.write("FINAL-SENTINEL\n")
@@ -1003,7 +1079,6 @@ def test_cmd_wrap_uncaught_exception_traceback_is_bounded_and_in_tail(
     monkeypatch.setattr("sys.stderr", io.StringIO())
 
     def blow_up(_args: argparse.Namespace) -> int:
-        import sys
 
         # The initial segment is already full; more chatter before the crash
         # forces several rotations, so the eventual traceback lands in a
@@ -1047,14 +1122,16 @@ def test_print_bounded_uncaught_exception_writes_into_tail_ring_when_config_is_s
     monkeypatch.setattr("sys.stderr", io.StringIO())
     monkeypatch.setattr(wrapper_logs, "_LAST_STDERR_LOG_CONFIG", None)
 
-    # Simulate cmd_wrap's own tee lifecycle: installed, then torn down
-    # normally by the unconditional finally in installed_standard_streams_
-    # from_environment - exactly the state the tee is in by the time
-    # agenttalk/__main__.py's top-level fallback would ever run.
+    # Simulate cmd_wrap's own tee lifecycle: installed, writes some real
+    # lifecycle output (round 21: this is the content a naive fresh tee
+    # would have truncated), then torn down normally by the unconditional
+    # finally in installed_standard_streams_from_environment - exactly the
+    # state the tee is in by the time agenttalk/__main__.py's top-level
+    # fallback would ever run.
     with wrapper_logs.installed_standard_streams_from_environment(
         expected_nonce=nonce,
     ):
-        pass
+        sys.stderr.write("LIVE-WRAPPER-LIFECYCLE-OUTPUT-BEFORE-THE-CRASH\n")
 
     try:
         raise RuntimeError("TOP-LEVEL-SENTINEL-BOOM")
@@ -1069,6 +1146,10 @@ def test_print_bounded_uncaught_exception_writes_into_tail_ring_when_config_is_s
     )
     assert "TOP-LEVEL-SENTINEL-BOOM" in tail
     assert "Traceback (most recent call last)" in tail
+    # Round 21: the crash traceback's own bounded write must not have
+    # truncated the lifecycle output the FIRST tee had already written -
+    # only a genuinely full ring may evict it via normal rotation.
+    assert "LIVE-WRAPPER-LIFECYCLE-OUTPUT-BEFORE-THE-CRASH" in tail
     # The raw file the supervisor redirects to must not receive this second
     # copy directly - only the bounded tail ring does.
     assert "TOP-LEVEL-SENTINEL-BOOM" not in err_path.read_text(encoding="utf-8")
@@ -1108,7 +1189,6 @@ def _install_boundary_test_env(
     monkeypatch.setattr(wrapper_logs, "_LAST_STDERR_LOG_CONFIG", None)
 
     def blow_up(_args: argparse.Namespace) -> int:
-        import sys
 
         sys.stderr.write("x" * 20_000)
         raise RuntimeError("BOUNDARY-SENTINEL-BOOM " + "z" * 20_000)
@@ -1160,11 +1240,17 @@ def test_main_still_propagates_original_exception_type_for_embedders(
         assert "BOUNDARY-SENTINEL-BOOM" in str(exc)
     else:
         raise AssertionError("cli.main should have raised")
-
-    # console_main installs no hook and replaces no stream itself - the
-    # only global side effect anywhere in this path is cmd_wrap's own tee
-    # install/restore, unchanged by this round and already unconditional.
-    assert sys.excepthook is sys.__excepthook__
+    # Deliberately no sys.excepthook assertion here: console_main never
+    # installs one on any path (the design that would have needed one was
+    # rejected in round 18), so there is nothing of THIS code's making to
+    # check for - and the ambient hook is not this test's to assert on.
+    # merely `import pytest` on Python <3.11 replaces sys.excepthook with
+    # the `exceptiongroup` backport's handler (confirmed by reproducing:
+    # `python -c "import sys; import pytest; print(sys.excepthook)"` shows
+    # exceptiongroup_excepthook, before any of this test's code ever runs),
+    # which is exactly what made an earlier, now-removed version of this
+    # assertion fail on the 3.10 CI legs - a fact about the test
+    # environment, not about main()/console_main.
 
 
 def test_console_main_passes_systemexit_through_unchanged() -> None:

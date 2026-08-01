@@ -3403,7 +3403,13 @@ _ALLOWED_INTERPRETER_PREFIX_FLAGS = frozenset(
 def _allowed_interpreter_prefix_token(token: str) -> bool:
     if token in _ALLOWED_INTERPRETER_PREFIX_FLAGS:
         return True
-    return len(token) > 2 and (token.startswith("-X") or token.startswith("-W"))
+    if len(token) > 2 and (token.startswith("-X") or token.startswith("-W")):
+        # -X presite=MODULE - see the PowerShell function's own comment for
+        # the survey against every other -X sub-option this project knows.
+        if token.startswith("-X") and token[2:].startswith("presite"):
+            return False
+        return True
+    return False
 
 
 def _module_args_from(cfg_agent: object) -> object:
@@ -9240,6 +9246,22 @@ function Test-AgenttalkAllowedInterpreterPrefixToken([string]$token) {
       $token.StartsWith('-X', [StringComparison]::Ordinal) -or
       $token.StartsWith('-W', [StringComparison]::Ordinal)
   )) {
+    # -X presite=MODULE (debug builds only) imports an arbitrary module
+    # BEFORE site initialization - before anything else CPython does,
+    # including reaching -m agenttalk. Same before-main,
+    # execution-mode-changing property as -c/-m/a bare script path, just
+    # spelled as a -X sub-option instead of its own flag - the ONE
+    # attached -X form this allowlist must still refuse. Surveyed the rest
+    # of CPython's documented -X options for the same property: importtime,
+    # dev, utf8, pycache_prefix, int_max_str_digits, frozen_modules,
+    # faulthandler, showrefcount, tracemalloc, no_debug_ranges,
+    # warn_default_encoding - every one of them only configures behavior or
+    # enables a BUILT-IN diagnostic; none imports operator-supplied code
+    # ahead of anything else. presite is the only one with this shape.
+    if ($token.StartsWith('-X', [StringComparison]::Ordinal) -and
+        $token.Substring(2) -clike 'presite*') {
+      return $false
+    }
     return $true
   }
   return $false
@@ -9577,7 +9599,7 @@ function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFro
   }
   return $false
 }
-function Test-AgenttalkWrapArgvReachesCmdWrap($probePython, $root, $srcOnPyPath, $file, $argv, $moduleArgsFrom = $null) {
+function Test-AgenttalkWrapArgvReachesCmdWrap($probePython, $root, $srcOnPyPath, $file, $argv, $moduleArgsFrom = $null, $timeoutMs = 5000) {
   # Round 19: knowing the tail's first token is literally 'wrap'
   # (Test-AgenttalkWrapInvocation) proves the subcommand name, not that
   # agenttalk's OWN argparse ever actually reaches cmd_wrap with it -
@@ -9601,17 +9623,46 @@ function Test-AgenttalkWrapArgvReachesCmdWrap($probePython, $root, $srcOnPyPath,
   if ($index -lt 0) { return $false }
   $tail = if ($index -lt $args.Count) { @($args[$index..($args.Count - 1)]) } else { @() }
   if (-not $probePython) { return $false }
+  # Round 21 (connector finding): this probe is OBSERVATIONAL - it decides
+  # only whether to log, never whether to launch - and ran synchronously
+  # with no bound inside Launch/Launch-Spec, both called from the
+  # supervisor's SINGLE polling loop. A hanging interpreter startup (a
+  # stalled sitecustomize, a wedged filesystem) would stall the entire
+  # fleet's supervisor over a decision that was only ever meant to avoid
+  # committing an empty log generation - strictly worse than the defect it
+  # fixed. Run it as its own process with a hard wall-clock bound instead
+  # of the call operator's unbounded, synchronous wait; a probe that
+  # cannot answer in time is killed and treated as NOT reaching cmd_wrap -
+  # the same fail-toward-not-logging direction as every other resolution
+  # failure in this function (an unresolvable prefix, an unrunnable
+  # interpreter), never fail-toward-waiting.
   $savedPP = $env:PYTHONPATH
   if ($srcOnPyPath) { $env:PYTHONPATH = (Join-Path $root 'src') + ';' + $env:PYTHONPATH }
+  $proc = $null
+  # Start-Process refuses two -Redirect* parameters pointed at the SAME
+  # path (even a device name like NUL) - two distinct throwaway files, one
+  # each, discarded in the finally below regardless of outcome.
+  $outFile = [System.IO.Path]::GetTempFileName()
+  $errFile = [System.IO.Path]::GetTempFileName()
   try {
-    & $probePython -m agenttalk '_internal-check-wrap-dispatch' '--' @tail *>$null
-    return $LASTEXITCODE -eq 0
+    $probeArgs = @('-m', 'agenttalk', '_internal-check-wrap-dispatch', '--') + $tail
+    $proc = Start-Process -FilePath $probePython -ArgumentList $probeArgs `
+      -PassThru -WindowStyle Hidden `
+      -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+    if (-not $proc.WaitForExit($timeoutMs)) {
+      return $false
+    }
+    return $proc.ExitCode -eq 0
   } catch {
     # A probe that cannot even run (bad interpreter path, etc.) proves
     # nothing about whether cmd_wrap is reachable - fail closed rather than
     # grant the logging capability on an unconfirmed guess.
     return $false
   } finally {
+    if ($proc -and -not $proc.HasExited) {
+      try { Stop-Process -InputObject $proc -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
     if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
   }
 }

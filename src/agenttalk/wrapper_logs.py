@@ -233,6 +233,7 @@ class BoundedStreamTee:
         *,
         max_bytes: int = WRAPPER_LOG_MAX_BYTES,
         segment_count: int = WRAPPER_LOG_SEGMENT_COUNT,
+        resume: bool = False,
     ) -> None:
         if max_bytes < _MIN_MAX_BYTES or max_bytes > _MAX_MAX_BYTES:
             raise ValueError("max_bytes is outside the supported bound")
@@ -256,10 +257,41 @@ class BoundedStreamTee:
         self._tail_count = self.segment_count - 1
         self._tail_index = 0
         self._tail_size = 0
+        self._tail_resume_append = False
+        if resume:
+            self._resume_tail_position()
         self._tail = None
         self._tail_failed = False
         self._closed = False
         self._lock = threading.Lock()
+
+    def _resume_tail_position(self) -> None:
+        # A fresh instance re-constructed against a base_path a PRIOR
+        # instance already wrote into (print_bounded_uncaught_exception's
+        # second, top-level tee is the one real caller of this) has no
+        # memory of where that prior instance left off. Defaulting to
+        # _tail_index=0 and opening .1 with "wb" would TRUNCATE whichever
+        # segment happens to sit there - which, after a normal rotation
+        # cycle, is as likely to be the NEWEST content as the oldest.
+        # Probe the filesystem instead (the only source of truth a fresh
+        # instance has): resume writing into whichever suffix has the
+        # newest mtime, appending rather than truncating it - only a LATER
+        # rotation (triggered by this segment filling up) truncates the
+        # NEXT one, exactly the same as an uninterrupted single instance
+        # would have done.
+        best_index, best_mtime, best_size = None, -1.0, 0
+        for i in range(self._tail_count):
+            candidate = self.base_path.with_name(f"{self.base_path.name}.{i + 1}")
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            if stat.st_mtime >= best_mtime:
+                best_index, best_mtime, best_size = i, stat.st_mtime, stat.st_size
+        if best_index is not None:
+            self._tail_index = best_index
+            self._tail_size = best_size
+            self._tail_resume_append = True
 
     @property
     def encoding(self) -> str:
@@ -290,8 +322,17 @@ class BoundedStreamTee:
     def _open_tail(self) -> None:
         self.base_path.parent.mkdir(parents=True, exist_ok=True)
         path = self._tail_path()
-        self._tail = path.open("wb")
-        self._tail_size = 0
+        # Only the very first open of a resumed instance appends (onto the
+        # size already recorded in __init__); every later rotation into a
+        # new segment - including a later revisit of this same index once
+        # the ring wraps back around - starts that segment fresh, exactly
+        # as an uninterrupted instance always has.
+        if self._tail_resume_append:
+            self._tail_resume_append = False
+            self._tail = path.open("ab")
+        else:
+            self._tail = path.open("wb")
+            self._tail_size = 0
         if os.name != "nt":
             with contextlib.suppress(OSError):
                 os.chmod(path, 0o600)
@@ -536,6 +577,7 @@ def print_bounded_uncaught_exception() -> None:
             stderr_path,
             max_bytes=max_bytes,
             segment_count=segment_count,
+            resume=True,
         )
         try:
             traceback.print_exc(file=tee)
