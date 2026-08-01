@@ -9611,6 +9611,35 @@ def _attended_process_tree_reset_args(source_hash: str) -> list[str]:
     ]
 
 
+def test_process_tree_reset_evidence_preserves_exact_filetime(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+
+    evidence = sup.process_tree_ownership_reset_evidence(
+        state,
+        "worker",
+        expected_root=store.root,
+        verified_launch_nonce=SUPERVISOR_NONCE,
+        runtime_record=_wrapper_runtime_view()["record"],
+        now_epoch=NOW,
+    )
+
+    tree_entries = state["agents"]["worker"]["owned_process_tree"]["entries"]
+    projected = [
+        row for row in evidence["identities"]
+        if row["source"] == "owned_process_tree"
+    ]
+    assert [
+        (row["pid"], row["start"], row.get("start_filetime"))
+        for row in projected
+    ] == [
+        (row["pid"], row["start"], row.get("start_filetime"))
+        for row in tree_entries
+    ]
+
+
 def test_attended_process_tree_reset_is_audited_and_rearms_new_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9618,11 +9647,26 @@ def test_attended_process_tree_reset_is_audited_and_rearms_new_generation(
     store = _team(tmp_path)
     store.set_role("lead", "lead")
     store.set_operator_facing("lead")
-    _state, source_hash = _write_attended_process_tree_reset_fixture(store)
+    state, source_hash = _write_attended_process_tree_reset_fixture(store)
     (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
-    monkeypatch.setattr(cli, "_owner_identity_gone", lambda _pid, _start: True)
+    probed_identities: list[tuple[int, str, str | None]] = []
+
+    def identity_gone(
+        pid: int,
+        start: str,
+        start_filetime: str | None = None,
+    ) -> bool:
+        probed_identities.append((pid, start, start_filetime))
+        return True
+
+    monkeypatch.setattr(cli, "_owner_identity_gone", identity_gone)
 
     assert _run(_attended_process_tree_reset_args(source_hash), tmp_path) == 0
+
+    assert probed_identities == [
+        (row["pid"], row["start"], row.get("start_filetime"))
+        for row in state["agents"]["worker"]["owned_process_tree"]["entries"]
+    ]
 
     persisted = sup.load_supervisor_state(
         store.dir / "supervisor-state.json"
@@ -9682,7 +9726,11 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
     _state, source_hash = _write_attended_process_tree_reset_fixture(store)
     kill_switch = store.dir / "supervisor.kill"
     kill_switch.write_text("stop", encoding="utf-8")
-    monkeypatch.setattr(cli, "_owner_identity_gone", lambda _pid, _start: True)
+    monkeypatch.setattr(
+        cli,
+        "_owner_identity_gone",
+        lambda _pid, _start, _start_filetime=None: True,
+    )
 
     assert _run(_attended_process_tree_reset_args(source_hash), tmp_path) == 0
     reset_state = sup.load_supervisor_state(
@@ -9887,7 +9935,11 @@ def test_attended_process_tree_reset_fails_closed(
     _state, source_hash = _write_attended_process_tree_reset_fixture(store)
     args = _attended_process_tree_reset_args(source_hash)
     (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
-    monkeypatch.setattr(cli, "_owner_identity_gone", lambda _pid, _start: True)
+    monkeypatch.setattr(
+        cli,
+        "_owner_identity_gone",
+        lambda _pid, _start, _start_filetime=None: True,
+    )
 
     if failure == "kill_switch_absent":
         (store.dir / "supervisor.kill").unlink()
@@ -9912,7 +9964,7 @@ def test_attended_process_tree_reset_fails_closed(
         monkeypatch.setattr(
             cli,
             "_owner_identity_gone",
-            lambda _pid, _start: False,
+            lambda _pid, _start, _start_filetime=None: False,
         )
     elif failure == "current_runtime_launcher_live":
         writer = wrt.WrapperRuntimeWriter(
@@ -9928,7 +9980,7 @@ def test_attended_process_tree_reset_fails_closed(
         monkeypatch.setattr(
             cli,
             "_owner_identity_gone",
-            lambda pid, _start: pid != 901,
+            lambda pid, _start, _start_filetime=None: pid != 901,
         )
     elif failure == "runtime_missing":
         wrt.runtime_path(store.state_dir, "worker").unlink()
@@ -9954,7 +10006,11 @@ def test_attended_process_tree_reset_fails_closed(
             damaged,
         )
     elif failure == "kill_switch_removed_during_probe":
-        def remove_kill_switch(_pid: int, _start: str) -> bool:
+        def remove_kill_switch(
+            _pid: int,
+            _start: str,
+            _start_filetime: str | None = None,
+        ) -> bool:
             (store.dir / "supervisor.kill").unlink(missing_ok=True)
             return True
 

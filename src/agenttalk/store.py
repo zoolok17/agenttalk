@@ -7249,8 +7249,101 @@ def _start_tokens_same(left: object, right: object) -> bool:
     )
 
 
-def _owner_identity_gone(pid: object, recorded_pid_start: object) -> bool:
+def _windows_owner_identity_gone_exact(
+    pid: object,
+    recorded_start_filetime: object,
+) -> bool:
+    """Compare one live Windows process handle with an exact creation FILETIME."""
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(recorded_start_filetime, str)
+        or re.fullmatch(r"[1-9][0-9]{0,19}", recorded_start_filetime) is None
+    ):
+        return False
+    try:
+        import ctypes  # stdlib; lazy so POSIX never pays for it
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_INVALID_PARAMETER = 87
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            pid,
+        )
+        if not handle:
+            return ctypes.get_last_error() == ERROR_INVALID_PARAMETER
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            if code.value != STILL_ACTIVE:
+                return True
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return False
+            creation_ticks = (
+                int(creation.dwHighDateTime) << 32
+            ) | int(creation.dwLowDateTime)
+            if creation_ticks <= 0:
+                return False
+            return str(creation_ticks) != recorded_start_filetime
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - exact probe ambiguity is never gone
+        return False
+
+
+def _owner_identity_gone(
+    pid: object,
+    recorded_pid_start: object,
+    recorded_start_filetime: object = None,
+) -> bool:
     """True only when the recorded owner is confidently not the same process."""
+    if (
+        os.name == "nt"
+        and recorded_start_filetime is not None
+        and not (
+            isinstance(recorded_pid_start, str)
+            and recorded_pid_start.startswith("linux:")
+        )
+    ):
+        # A supplied exact identity is authoritative. Probe ambiguity must not
+        # regain teardown authority through the weaker rounded token path.
+        return _windows_owner_identity_gone_exact(pid, recorded_start_filetime)
     liveness = _process_liveness(pid)
     if liveness == PROC_DEAD:
         return True

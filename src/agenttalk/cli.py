@@ -11941,7 +11941,11 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                         live_identities = [
                             row
                             for row in evidence["identities"]
-                            if not _owner_identity_gone(row["pid"], row["start"])
+                            if not _owner_identity_gone(
+                                row["pid"],
+                                row["start"],
+                                row.get("start_filetime"),
+                            )
                         ]
                         if live_identities:
                             raise ValueError(

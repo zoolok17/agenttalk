@@ -7272,6 +7272,7 @@ def process_tree_ownership_reset_evidence(
         identities.append({
             "pid": row["pid"],
             "start": row["start"],
+            "start_filetime": row.get("start_filetime"),
             "source": "owned_process_tree",
             "role": row["role"],
         })
