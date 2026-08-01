@@ -122,7 +122,10 @@ them.
 **STATED non-goals:** 87-A does not specify notification routes, human receipt,
 incident retention, state-extension compatibility, executor capability
 activation, migration, rollback, wrapper-writer generations, or a rollout
-runbook. Those concerns must not be reintroduced here.
+runbook. Those concerns must not be reintroduced here, except that 87-A defines
+the fail-closed V1 boundary: a conforming activation path refuses any declared
+transfer, restore, rollback, or migration before imported state becomes the
+active checked store. 87-C owns any future supported workflow.
 
 **DECIDED dependency-plane constraint (operator, 2026-07-31; M5 Option A):**
 Implementation adds no daemon, new persistence plane, durable helper or
@@ -169,6 +172,21 @@ quarantine remains `POLICY_HELD` pending attended handling. A future successor
 may use only a read-only producer over an existing OS token; it may not add a
 file, registry value, helper, daemon, OS object, persistence plane, or runtime
 dependency.
+
+Same-platform state-file/workspace transfer, restore, rollback, and migration
+activation are likewise unavailable in V1. When a conforming activation path
+is told, or otherwise knows, that checked state came from one of those
+operations, it must refuse before admitting or decoding those bytes as the
+active checked store. The refusal constructs no
+`CurrentExactTargetExecutorWitnessV1`, permit, authority/effect mutation,
+external call, or launch and directs attended handling and 87-C. It is an
+activation refusal, not an active-agent `CAPABILITY_UNAVAILABLE`/`POLICY_HELD`
+result. An out-of-band copy or overwrite presented as an ordinary same-store
+restart may be indistinguishable from local checked state and may proceed; that
+bypass is nonconforming and has no 87-A safety or recovery guarantee. If the
+existing outer-state checks detect rollback-unproven state, only fail-closed
+`StateLossQuarantineV1.UNRESOLVED` is admitted. Future 87-C must bind the source
+universe within M5 Option A or keep imported state inert.
 Finding an unprovable case during implementation creates a task; it never
 authorizes an implementation-detail mechanism.
 This is an intentional availability cost: some recoveries may never become
@@ -2378,15 +2396,27 @@ takeover, nonordinary capture, reconciliation, finalization, `Stop-Tree`, or
 launch object constructible. This is a construction rule, not an inventory of
 entry paths.
 
-This construction seal is not a same-platform host-transfer guarantee. V1 has
-no conforming state-file/workspace transfer, restore, rollback, or migration
-activation; those are 87-C scope. The inert binding contains no trustworthy
-host/process-universe operand, so platform/contract equality, PID/start, or its
-digests cannot prove a copied state belongs to the destination universe. 87-A
-must not activate such a workflow. A future 87-C design must add reviewed
-source-universe semantics within M5 Option A or keep the copied state inert.
-The non-Windows inherited-state rule below remains independently structural
-because no matching V1 action-site executor witness exists there.
+This construction seal is not a same-platform host-transfer guarantee. Same-
+platform state-file/workspace transfer, restore, rollback, and migration
+activation are unavailable in V1; those are 87-C scope. The inert binding
+contains no trustworthy host/process-universe operand, so platform/contract
+equality, PID/start, or its digests cannot prove a copied state belongs to the
+destination universe. A conforming activation path that is told, or otherwise
+knows, that state came from one of those operations must refuse before
+admitting or decoding the bytes as the active checked store. It constructs no
+witness, permit, authority/effect mutation, call, or launch. This is an
+activation refusal before a conforming active agent exists, not
+`CAPABILITY_UNAVAILABLE`/`POLICY_HELD` within one.
+
+An out-of-band copy or overwrite can bypass that boundary and may be
+indistinguishable from an ordinary same-store reload. It may therefore be
+treated as local checked state, but that deployment is nonconforming and 87-A
+makes no safety or recovery guarantee for it. If outer-state validation detects
+rollback-unproven state, the sole admitted non-dry-run transition is fail-closed
+quarantine; V1 does not promise universal detection. A future 87-C design must
+add reviewed source-universe semantics within M5 Option A or keep copied state
+inert. The non-Windows inherited-state rule below remains independently
+structural because no matching V1 action-site executor witness exists there.
 
 Without a `PERMITTED` construction, the envelope is retained exactly and no
 adapter is callable. Static witness/executor inability emits
@@ -2953,7 +2983,9 @@ rounded-start path and any weakening of the Windows FILETIME requirement remain
 forbidden.
 
 **OPERATOR-VISIBLE CAPABILITY CONSEQUENCES:** This revision deliberately leaves
-two paths indefinitely held pending a human:
+three permanent V1 capability limitations. The first two remain indefinitely
+held pending a human; the third refuses activation before imported state becomes
+active:
 
 1. On Linux and macOS with state-loss quarantine `NONE`, every fresh
    closure-dependent named teardown returns
@@ -2968,6 +3000,17 @@ two paths indefinitely held pending a human:
    token, so local evidence cannot prove that the lost owner and every residual
    are extinct in the source universe. The quarantine remains
    `STATE_PROVENANCE_LOST` and `POLICY_HELD` pending attended handling.
+3. Same-platform state-file/workspace transfer, restore (including backup
+   restore), rollback, and migration activation are unavailable in V1. A
+   conforming activation path that knows
+   checked state came from one of those operations refuses before active-store
+   admission, constructs no witness, permit, authority/effect mutation, call,
+   or launch, identifies the rejected operation/store, and directs attended
+   handling and 87-C. This is not an active-agent `POLICY_HELD` result. An out-
+   of-band copy may be indistinguishable from same-store reload and may proceed
+   outside that boundary; it is nonconforming and has no 87-A guarantee. If
+   existing validation detects it as rollback-unproven, only fail-closed state-
+   loss quarantine is admitted.
 
 The following are explicitly insufficient as a process-universe proof: PID and
 start, hostname, `state_epoch`, `process_source_digest`, MachineGuid alone,
@@ -2975,8 +3018,10 @@ local absence. A future successor may consume a read-only producer over an
 existing OS token only; it may add no file, registry value, helper, daemon, OS
 object, persistence plane, or runtime dependency. Accepting an identity token
 as parser or snapshot input does not make it executable or authoritative.
-87-B projections and the required operator manual and tutorial must state both
-permanent held paths and the attended action required.
+87-B projections, 87-C activation surfaces, and the required operator manual
+and tutorial must state all three permanent limitations and the attended action
+required. Held-agent projections apply to items 1 and 2; item 3 identifies the
+rejected operation/store rather than fabricating an active agent.
 
 For `CONDITIONAL_POST_TEARDOWN`, the fresh post-teardown capture is also the
 final barrier. A survivor, unavailable/incomplete capture, or ambiguous
@@ -3005,9 +3050,14 @@ including first-managed grace and chronic snapshot-failure projection.
 Otherwise 87-C must retain shipped behavior; a silent cold-start strand is not
 an acceptable partial activation.
 87-A implementation close and 87-C activation additionally require reviewed
-87-B/follow-up operator-manual and tutorial evidence explaining that
-child-death recovery can remain indefinitely `POLICY_HELD` when capability is
-unavailable, naming the held agent, and directing the operator to act.
+87-B/follow-up operator-manual and tutorial evidence explaining all three
+limitations above: child-death recovery can remain indefinitely `POLICY_HELD`
+when capability is unavailable; provenance loss remains held because automatic
+quarantine retirement is unavailable;
+and declared transfer/restore/rollback/migration activation refuses before
+active-store admission while an out-of-band bypass is nonconforming and
+unvouched. The evidence names the held agent for the first two, identifies the
+rejected operation/store for the third, and directs the operator to act.
 
 ## Heartbeat boundary and task #116
 
@@ -3342,9 +3392,19 @@ without all of this executed evidence:
     fail-closed mutation in a non-dry-run invocation. Repeat every outer-state
     loss under dry run and require only a simulated hold with zero persistence.
     Prove that no automatic V1 retirement constructor can be reached with local
-    or transferred evidence. A future POSIX contract may not
-    make an inherited Windows FILETIME binding actionable without reviewed
-    version/migration semantics.
+    or transferred evidence. Exercise every declared same-platform state-
+    file/workspace transfer, restore, rollback, and migration activation entry;
+    each must refuse before active-store admission with no witness, permit,
+    authority/effect mutation, external call, or launch. Require the refusal to
+    identify the rejected operation/store and direct attended handling without
+    fabricating an active-agent hold. As a negative boundary, show that a
+    structurally valid out-of-band replacement presented as an in-place restart
+    need not be distinguishable from local state: it is nonconforming, may
+    proceed outside 87-A's guarantees, and cannot be claimed as a fail-closed V1
+    migration path. When outer-state checks detect rollback-unproven state,
+    require only `StateLossQuarantineCreationDeltaV1`. A future POSIX contract
+    may not make an inherited Windows FILETIME binding actionable without
+    reviewed version/migration semantics.
 
 ## Mechanism inventory
 
@@ -3376,8 +3436,8 @@ without all of this executed evidence:
 | No daemon, persistence plane, durable helper or OS object, or runtime dependency | DECIDED ABSOLUTE by operator on 2026-07-31 (M5 Option A) | Pure code, existing checked state, and transient caller-owned synchronization only; there is no mechanism-specific exception, and missing conforming action-scoped closure remains `CAPABILITY_UNAVAILABLE` when that boundary cannot prove its contract. |
 | Earlier fresh-but-confirmed-absent recovery | STATED out of scope | Task #116, blocked on #115 but not #87, scheduled before 87-A implementation. |
 | Durable incident visibility/delivery | STATED out of scope | Future 87-B, dependent on tasks #114/#115; every unavailable-capability projection names the held agent and required operator action. |
-| Operator documentation of indefinite capability holds | REQUIRED before implementation close/activation | 87-B/follow-up manual and tutorial evidence explains permanent `POLICY_HELD` availability cost and the human action required. |
-| Migration and rollback | STATED out of scope | Future 87-C after 87-A/87-B. |
+| Operator documentation of permanent capability limitations | REQUIRED before implementation close/activation | 87-B/follow-up manual and tutorial evidence states all three limitations together: the two permanent `POLICY_HELD` availability costs and the declared transfer/restore/rollback/migration activation refusal, including the out-of-band-copy residual and attended action. |
+| Same-platform state-file/workspace transfer, restore, rollback, and migration activation | UNAVAILABLE IN V1; DECLARED ACTIVATION REFUSES | A conforming activation path refuses before imported bytes become the active checked store and constructs no 87-A witness, mutation, effect, or launch. An out-of-band replacement may be undetectable, is nonconforming, and has no 87-A guarantee. Future 87-C must bind the source universe within M5 Option A or keep imported state inert. |
 | Raw discovery stops flapping | STATED not promised | Process-discovery behavior is unchanged. |
 | Owned-childless teardown requires a nonce-owned complete tree, an exact target executor, and action-time closure | WINDOWS #120 INPUT/EFFECT DELIVERED; TEARDOWN CURRENTLY UNAVAILABLE until #115 and a conforming closure successor; POSIX executor unavailable independently | Merged #120 supplies exact Windows target/effect evidence but no POSIX exact-token executor or action-scoped creation closure. A fresh proof cannot create an envelope without a `RESERVE` permit; deserialized childless evidence cannot construct a fresh operation permit, typed call, receipt, or effect-owned mutation. The envelope remains exact while ordinary observation may advance its separate projection. Unresolved named paths remain `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human. |
 | Child-establishment grace cannot be sampled away | ENFORCED after #115, the merged-#120 adapter, and the closure successor | Nonrenewable same-turn closed guard in observation, confirmation, reservation, and action equality. |
@@ -3390,4 +3450,5 @@ without all of this executed evidence:
 This core and its same-commit normative module together are sufficient to
 implement and review 87-A's pure classifier and authority substrate. Neither
 file alone is conforming. They are not permission to activate the behavior and
-make no delivery or migration promise.
+make no delivery promise or supported migration promise beyond the explicit V1
+activation refusal above.
