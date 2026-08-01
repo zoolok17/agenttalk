@@ -1,6 +1,6 @@
 # Design 87-A module: owned-childless wrapper authority
 
-**Status:** Proposed, Revision 7; normative authority module of 87-A. This file
+**Status:** Proposed, Revision 8; normative authority module of 87-A. This file
 and
 [`DESIGN-87A-supervisor-classifier-authority.md`](DESIGN-87A-supervisor-classifier-authority.md)
 at the same commit form one specification. Neither is conforming alone.
@@ -49,7 +49,8 @@ normative location. It is audit evidence, not a third 87-A specification.
 
 ## Safety decision
 
-**ENFORCED after tasks #115 and #120 and the closure successor:** An owned wrapper whose CLI child is
+**ENFORCED after task #115, the merged-#120 adapter, and the closure successor
+(#120 input delivered at `587e7c1`):** An owned wrapper whose CLI child is
 positively absent in two independent complete observations may be torn down
 only after the same-turn nonrenewable `ChildEstablishmentGuardV1` is
 `CLOSED`. Once closed, such a wrapper has no brain and no progressing CLI turn
@@ -67,7 +68,8 @@ complete `ABSENT` samples for the same guarded owner and guard object. Changing
 completeness, establishment state, owner, or confirmation count changes
 authority deterministically from the named case to none.
 
-**ENFORCED after merged, reviewed task #120:** Ownership is never inferred from a process name,
+**ENFORCED by the 87-A adapter over merged, reviewed task #120 (input delivered
+at `587e7c1`):** Ownership is never inferred from a process name,
 executable basename, image substring, or command-line pattern. The wrapper
 must match the persisted PID, exact start guard, and launch nonce. Every tree
 target carries that same owner nonce through a complete #120 ownership proof.
@@ -81,23 +83,24 @@ directly terminate arbitrary processes.
 
 ## Published #120 snapshot and closure-successor contracts
 
-**STATED #120 integration status (2026-07-31):** task #120 head
-`28f663fce694fd72f311bda7590ced53abfab528` is **UNMERGED**, exists only on
-`origin/codex/task120-owned-process-tree-final`, and has no completed review in
-open PR 102. Its contract may move under review; this specification maps that
-exact head and does not call it shipped or delivered.
+**DELIVERED #120 integration status (2026-08-01):** task #120 shipped on master
+as squash commit `587e7c1`. This specification maps the merged content, not the
+pre-review candidate SHA.
 
-At that head, #120 persists `owned_process_tree_v2` in existing supervisor
-state. It records at most 64 parent-first entries with PID, start,
+Merged #120 persists strict-schema `owned_process_tree_v2` in existing
+supervisor state. It records at most 64 parent-first entries with PID, start,
 `start_filetime`, role, parent PID, discovery time, wrapper generation, and one
-top-level launch nonce. The 87-A adapter maps it as follows:
+top-level launch nonce. Complete/absent Windows records require a positive
+decimal exact creation FILETIME for every ISO-start entry; nullable FILETIME is
+retained only in truncated/invalid HOLD diagnostics. The 87-A adapter maps it
+as follows:
 
 | #120 value | 87-A mapping |
 | --- | --- |
 | `status=complete`, `limit=64`, internally consistent counts, no omission/truncation, and valid generation/nonce | Candidate input to `OwnedWrapperTreeObservationV1.COMPLETE`; the adapter still performs the positive owner join and validates every live target against the same fresh complete raw process capture. |
 | `status=absent` | No-kill absence/barrier evidence only; never an initial owned-tree teardown authority. |
 | `status=truncated|invalid`, a non-64 limit, inconsistent counts, omitted entries, or an unreadable binding | `INCOMPLETE`; no teardown authority. |
-| Live `entries[].pid/start` | `OwnedTreeTargetV1.pid/start_guard` after exact live validation. `start_filetime`, when present, must corroborate the fresh row. The adapter derives and validates `parent_start_guard` and `depth` from the accepted live parent chain and projects the validated top-level owner nonce onto each target; it may not privately default any missing fact. |
+| Live `entries[].pid/start/start_filetime` | `OwnedTreeTargetV1.pid/start_guard` after exact live validation. On Windows the destructive guard is the positive decimal `start_filetime`; the rounded ISO `start` is capture/ordering corroboration and never substitutes for a missing FILETIME. On a platform whose exact start identity is carried directly in `start`, that exact token is the guard. The adapter derives and validates `parent_start_guard` and `depth` from the accepted live parent chain and projects the validated top-level owner nonce onto each target; it may not privately default any missing fact. |
 | Non-live virtual ancestry bridge | Admissible only when copied exactly from a prior complete record with unchanged wrapper generation, launch nonce, and parent chain. It is validation provenance only: exclude it from `root_first_targets`, every target digest, and `Stop-Tree`. A live child whose immediate owned parent is such a bridge uses the module's existing positively proven orphan form: null owned-parent fields and depth one. |
 
 `role` and `discovered_at` are validated bounded metadata but are excluded from
@@ -105,21 +108,56 @@ owner identity, target tuples, and target digests. The unique live wrapper
 entry becomes depth zero with null internal parent fields; its external
 supervisor/console parent is never an owned edge. The reserved
 `detached_gate_runner` role never grants ownership by itself.
+The owner retains the accepted wrapper row's reported `start` separately as
+`wrapper_start_token` and its destructive exact identity as
+`wrapper_start_guard`; neither field may substitute for the other.
 
-#120 also implements a post-kill launch barrier. It rechecks recorded
-PID/start identities and fresh descendant edges rooted at any recorded PID.
-Planning and `Stop-Tree` are separated by process scheduling, so #120
-explicitly permits a recorded parent to create a late descendant after the
-plan; that descendant may survive the planned `Stop-Tree` because it was never
-a kill target, and the barrier catches it only to block launch. The barrier
-never adds a kill target, proves teardown effect, or supplies closure evidence.
+#120 also strengthens target-local effect execution and implements a post-kill
+launch barrier. For an openable planned Windows owned-tree target whose exact
+creation FILETIME matches, `Stop-Tree` verifies identity and terminates through
+one native handle. Every successful termination receives a wait attempt within
+the remaining shared tree-wide budget before the fresh snapshot. Thus PID reuse
+cannot occur between identity check and kill on a terminated target, and a
+target that signals within the budget is not sampled as live. Open failure,
+identity mismatch, termination failure, wait timeout, or depleted budget is not
+completion and is decided only by the fresh snapshot and barrier; a target still
+present remains survivor evidence.
+
+The barrier rechecks recorded exact identities and fresh descendant edges.
+Planning and `Stop-Tree` remain separated by process scheduling, so a recorded
+parent may create a descendant after the plan; that unplanned descendant may
+survive because it was never a kill target, and the barrier catches it only to
+block launch. When a recorded PID has been recycled, an exact child start equal
+to or newer than the replacement is excluded from the retired-parent ownership
+edge; a child provably older than the replacement, or exact evidence that is
+missing/incomparable, remains conservative old-side survivor evidence. This
+split does not suppress independent barrier evidence: the replacement-side
+process still blocks if, for example, its command line parses as this agent's
+wrapper or wait process. The barrier never adds a kill target, proves teardown
+effect, or supplies closure evidence. The attended reset supplies an
+exact-identity-bound human escape, and the request-bound attended archive
+supplies retention; neither grants automatic teardown authority, closes child
+creation, or proves an automatic effect complete.
+
+**STATED merged behavioral delta:** Once #115 and a future conforming closure
+provider have independently authorized teardown, a planned target whose
+termination succeeds and which signals within #120's remaining wait budget no
+longer appears in the immediate post-kill snapshot, and an exact
+replacement-side child of a recycled PID no longer creates a sticky barrier
+HOLD solely through the retired-parent edge. When no independent barrier reason
+applies, such an already-authorized attempt may therefore reach `COMPLETE_GONE`
+where the pre-merge candidate would have held. This is
+strictly downstream of the capability gate: it does not make any currently
+`CAPABILITY_UNAVAILABLE` closure-dependent teardown start.
 
 The closure successor owns `OwnedTreeClosureV1`,
 `OwnedTreeClosureReconciliationV1`, action-scoped creation freeze, and the
-synchronous acquire/reconcile/release and effect-linearization adapters below.
-**No such extension or successor exists or has been reviewed as of
-2026-07-31.** Until one is implemented, independently reviewed, and available
-inside the absolute dependency-plane constraint below, a static
+synchronous acquire/reconcile/release and checked-continuation adapters below.
+Merged #120 partially strengthens effect execution at one target-local seam;
+it does not implement those attempt-bound contracts or prevent an owned parent
+from creating a new child between plan and effect. Until a conforming successor
+is implemented, independently reviewed, and available inside the absolute
+dependency-plane constraint below, a static
 pre-reservation capability gate returns
 `ClosureCapabilityV1.CAPABILITY_UNAVAILABLE` without creating a reservation,
 consuming an attempt, or making an external call. No closure-dependent named
@@ -127,14 +165,23 @@ teardown proceeds, and dependent recovery remains `POLICY_HELD` pending a
 human. Only `ClosureCapabilityV1.AVAILABLE` may reach acquisition. Once a
 conforming provider advertises availability, a synchronous transient acquire
 failure follows the ordinary closure-veto/attempt rules; structural inability
-never does.
+never does. Merged #120 narrows snapshot, target-identity, and post-effect
+ambiguity; it does not narrow this closure-capability refusal, and no formerly
+held closure-dependent teardown now proceeds. This structural refusal is scoped
+to the named closure-dependent path; it does not disable merged #120's
+snapshot, existing authorized exact-target execution, barrier, attended reset,
+or attended archive for their non-87-A callers.
 
 ```text
 MAX_OWNED_TREE_TARGETS_V1 = 64
 AUTOMATIC_CHILDLESS_ATTEMPT_CAP_V1 = 3
 
 ProcStartGuardV1 =
-  exact ordinal string emitted by the shipped Proc-Start producer
+  nonempty NFC UTF-8 process-start representation token of at most 256 bytes
+
+OwnedExactStartGuardV1 =
+  Windows ISO-start row: positive decimal exact creation FILETIME
+  other exact-start row: exact ordinal entries[].start token
 
 OwnedLaunchNonceProvenanceV1 {
   checked_managed_launch_nonce: ASCII [A-Za-z0-9_-]{16,128}
@@ -148,7 +195,8 @@ OwnedWrapperIdentityV1 {
   managed_generation: NFC UTF-8 string of at most 128 bytes
   runtime_wrapper_generation: NFC UTF-8 string of at most 128 bytes
   wrapper_pid: integer 1..4294967295
-  wrapper_start_guard: ProcStartGuardV1
+  wrapper_start_token: ProcStartGuardV1
+  wrapper_start_guard: OwnedExactStartGuardV1
   launch_nonce: ASCII [A-Za-z0-9_-]{16,128}
   nonce_provenance: OwnedLaunchNonceProvenanceV1
 }
@@ -168,9 +216,9 @@ StateLossQuarantineV1 =
 
 OwnedTreeTargetV1 {
   pid: integer 1..4294967295
-  start_guard: ProcStartGuardV1
+  start_guard: OwnedExactStartGuardV1
   parent_pid: integer 1..4294967295 | null
-  parent_start_guard: ProcStartGuardV1 | null
+  parent_start_guard: OwnedExactStartGuardV1 | null
   depth: uint32
   owner_launch_nonce: ASCII [A-Za-z0-9_-]{16,128}
 }
@@ -178,7 +226,7 @@ OwnedTreeTargetV1 {
 OwnedTreeCoverageV1 {
   observer_version: nonempty NFC UTF-8 string of at most 128 bytes
   process_source_digest: Hex64
-  ownership_rule_version: "owned-tree/v1"
+  ownership_rule_version: "owned-tree/v2"
 }
 
 LostOwnerExtinctionObservationV1 =
@@ -396,11 +444,16 @@ subset differs from the immutable authorized tuple.
 `CanonicalJsonV1` bytes of the core's `ObserverCoverageSignatureV1`; it
 identifies coverage semantics, not changing process contents.
 The 87-A adapter owns `observer_version`. For the mapping pinned above it is
-exactly `win-tree/v1`, which binds task #120's `schema_version`,
-`attribution_model`, enumeration/ownership algorithm, and pinned
-implementation revision. Any change to those inputs requires a different
-version value and renewed vectors/review. 87-A fixes the
-`ownership_rule_version`; neither value may be omitted or privately defaulted.
+exactly `win-tree/v2`, which binds merged task #120 at `587e7c1`, including its
+`schema_version`, `attribution_model`, exact-FILETIME kill projection,
+same-handle exact-check/termination plus conditional bounded wait attempt,
+recycle-aware enumeration/ownership algorithm, and pinned implementation
+revision. This replaces the pre-review `win-tree/v1`
+mapping; the chained module vectors below are renewed accordingly. Any later
+change to those inputs requires a different version value and renewed
+vectors/review. 87-A fixes `ownership_rule_version` to `owned-tree/v2` and the
+core coverage's `pid_start_guard_schema` to `2` for the exact-FILETIME mapping;
+none of those values may be omitted or privately defaulted.
 
 `parent_pid`/`parent_start_guard` record only an owned-parent edge at initial
 authorization, never the wrapper's external supervisor/console parent. In an
@@ -415,24 +468,39 @@ The initial tuple sorts by depth, then PID, then ordinal start guard. Image and
 command-line text do not participate.
 
 **ENFORCED positive owner join:** `OwnedWrapperIdentityV1` is constructed only
-when all of these independently captured values are present and exactly equal:
+when all of these independently captured values are present and satisfy the
+displayed relation:
 
 ```text
 checked managed agent/root == strict runtime agent/root == requested agent/root
 checked managed wrapper PID == strict runtime wrapper PID == observed root PID
-checked managed wrapper start guard
-  == strict runtime wrapper start guard == observed root start guard
+start_anchor := observed root reported start token
+StartRepresentationMatchV1(checked managed wrapper start token, start_anchor)
+StartRepresentationMatchV1(strict runtime wrapper start token, start_anchor)
+Windows observed root exact start guard == fresh #120 exact start_filetime
+non-Windows observed root exact start guard == exact observed-root start token
 checked managed wrapper generation
   == strict runtime wrapper generation == runtime_wrapper_generation
 checked managed launch nonce == parsed observed-root launch nonce
 ```
 
+`StartRepresentationMatchV1(a, anchor)` uses exact byte equality first; ISO
+tokens may represent the anchor's same instant within the shipped
+one-millisecond Windows representation tolerance; non-ISO tokens still require
+byte equality. Every representation is checked independently against the one
+named observed-root anchor—no chained or transitive inference is permitted. It
+joins the checked/runtime/CIM representations but grants no destructive
+authority. `wrapper_start_token` retains that anchor. On Windows, the retained
+`wrapper_start_guard` and every target/parent start guard are the positive
+decimal exact FILETIME from the complete #120 row and fresh exact probe. A
+rounded ISO token never substitutes for that guard.
+
 The checked managed identity also supplies `state_epoch`,
 `managed_generation`, and the expected launch nonce; the strict runtime record
-supplies the independently validated agent/PID/start/generation binding. The
-shipped strict runtime record has no launch-nonce field and is not an unstated
+supplies the independently validated agent/PID/start-representation/generation
+binding. The shipped strict runtime record has no launch-nonce field and is not an unstated
 nonce operand. The observed root is the exact guarded row in the same complete
-raw capture used for tree membership. The root target's PID, start guard, and
+raw capture used for tree membership. The root target's PID, exact start guard, and
 owner nonce equal those joined values. `nonce_provenance` retains both actual
 nonce sources and their fixed parser schema; each retained token equals the
 top-level `launch_nonce`. Every other target is bound by task #120 to that
@@ -451,23 +519,31 @@ an input to this join.
 The nonce equality is independent from the three-way runtime identity join,
 not a fabricated third nonce source. Removing either actual nonce source,
 changing either token, changing the parser schema, or failing any
-agent/PID/start/generation operand returns `INCOMPLETE`; an implementation may
+agent/PID/start-representation/exact-guard/generation operand returns
+`INCOMPLETE`; an implementation may
 not collapse provenance to the already-normalized top-level value.
 
 Every target's `owner_launch_nonce` equals the positively guarded wrapper's
 nonce. This does not claim that each descendant repeats the nonce in its
 command line; task #120's complete ownership mechanism binds the descendant to
 that owner.
-The `Stop-Tree` projection is exactly `{pid: target.pid, start:
-target.start_guard}` in root-first order. The existing primitive reverses that
-list, so leaves are attempted before the wrapper and its live PID/start check
-still skips reuse.
+For a Windows owned-tree target, the `Stop-Tree` projection is exactly
+`{pid: target.pid, start: <fresh validated #120 row.start>, start_filetime:
+target.start_guard, reason: "owned_process_tree", source:
+"owned_process_tree"}` in root-first order. The rounded `start` is retained
+only because the shipped executor's closed target shape requires it;
+`start_filetime` is the destructive identity. A non-Windows exact-start target
+uses its exact `start_guard` as `start` and omits `start_filetime`. The existing
+primitive reverses the list, so leaves are attempted before the wrapper; every
+owned Windows target missing its exact FILETIME is refused rather than falling
+back to the legacy rounded `Proc-Start`/`Stop-Process` path.
 
 `COMPLETE_RESIDUAL` is not an initial tree with its root omitted. The 87-A
 residual adapter over #120's retained snapshot and one fresh complete process
 capture must positively prove that every still-live owner member is an exact
 order-preserving subset of the debt's immutable authorized tuple, that every
-omitted authorized PID/start is gone, and that no new owner member exists. Its
+omitted authorized PID/exact-start-guard is gone, and that no new owner member
+exists. Its
 recorded owner and nonce come from the checked debt; every live target retains
 that nonce and its complete authorization-time target object. Residual
 parent/depth fields are never recomputed: a surviving depth-three target whose
@@ -559,8 +635,8 @@ action-scoped linearization primitive, crash/release behavior, compatibility
 evidence, and failure injection. It may use only existing checked supervisor
 state and transient caller-owned synchronization that leaves no durable helper
 or OS object. It may not add a daemon/service, durable helper, new durable
-file/database/registry/journal, durable named OS object, package, or runtime
-dependency.
+file/database/registry/journal outside that checked state, durable named OS
+object, package, or runtime dependency.
 
 The operator resolved delta-panel item M5 as Option A on 2026-07-31: this
 constraint is absolute, with no mechanism-specific or separately versioned
@@ -765,8 +841,13 @@ ChildlessClosureEvidenceV1 {
 
 With no teardown debt, `INITIAL` exists if and only if `childless_source` is
 true, presence is `PRESENT_TARGETABLE`, targetability is `COMPLETE` for the
-same wrapper PID/start, the current tree is `COMPLETE`, and every
-state/owner/capture binding above matches. A second relevant wrapper,
+same wrapper PID, and the targetability candidate's generic start token
+independently satisfies
+`StartRepresentationMatchV1(candidate.start_guard,
+owner.wrapper_start_token)` from the same complete raw capture. It is never
+compared directly with `owner.wrapper_start_guard`, which is the separate exact
+destructive identity. The current tree must be `COMPLETE`, and every
+state/owner/capture binding above must match. A second relevant wrapper,
 incomplete tree, unguarded target, or targetability mismatch is `BLOCKED`,
 never generic teardown fallback. `INITIAL` copies the current tree owner,
 capture, coverage, root-first targets, recomputed target digest, committed
@@ -940,6 +1021,10 @@ the successor revision that wrote that owner. `CLOSURE_ACQUIRE` and callable
 Non-destructive `CLOSURE_RECONCILE` and
 `CLOSURE_RELEASE` retain the current epoch when the latch is enabled and use
 null when cleanup is permitted under a disabled latch.
+Here `supervisor_start_guard` and the execution-gate supervisor start are both
+generic `ProcStartGuardV1` representation tokens. Their exact arm-time equality
+binds the live continuation; neither is compared with an owned-tree
+`OwnedExactStartGuardV1`.
 `STOP_TREE/CALL_RETURNED` retains the arm-time epoch as checked evidence that
 the destructive call already returned; a post-action capture under that state
 is non-destructive and may proceed through the narrow cleanup gate even if the
@@ -1043,13 +1128,19 @@ capture with the same
 state epoch, agent, and ordinary poll sequence whose ordinal is strictly
 greater than the action-ready closure capture. `COMPLETE_GONE` means every
 authorized PID/start is positively absent, closure membership is empty, and
-the #120 barrier finds neither a recorded-identity survivor nor a fresh
-descendant edge rooted at a recorded PID.
+the #120 barrier is clear: it finds no recorded-identity survivor,
+conservative old-side descendant edge, same-agent wrapper/wait process, or
+other blocking reason under its exact recycled-parent split.
 `COMPLETE_RESIDUAL.live_targets` is the exact order-preserving live subset of
 the immutable authorized tuple and its digest is a recomputed
 `OwnedTargetDigestV1`; any omitted target is positively absent. Any other fact
-is `INCOMPLETE`. An unavailable or ambiguous barrier is incomplete. A barrier
-blocked only by a late descendant that was absent from the planned target set
+is `INCOMPLETE`. Merged #120 issues a same-handle wait attempt after each
+successful planned Windows-target termination, using the remaining shared
+tree-wide budget before this fresh capture; presence after that budget remains
+residual evidence and never counts as completion. An unavailable or ambiguous
+barrier is incomplete.
+A barrier blocked only by an unplanned late descendant that was absent from the
+planned target set
 maps to `INCOMPLETE(POST_KILL_LAUNCH_BARRIER_BLOCKED)` and therefore
 `EFFECT_UNPROVEN`; that edge blocks launch but never becomes a target, proves
 `COMPLETE_GONE`, or clears debt. An unblocked barrier alone also cannot prove
@@ -1102,7 +1193,11 @@ At the initial arm, `debt_id` is SHA-256 over
 
 ### Chained digest conformance vector
 
-**ENFORCED:** The following one fixture fixes all seven module digest domains.
+**ENFORCED:** The following Revision 8 fixture fixes all seven module digest
+domains and renews the authority-dependent chain for merged #120's
+`win-tree/v2` adapter and the explicit representation-token/exact-guard split.
+The two banked core condition fingerprints are outside this chain and remain
+untouched.
 Each payload is the exact one-line ASCII/UTF-8 `CanonicalJsonV1` byte sequence
 shown, with no trailing LF. The hash input is the displayed ASCII domain,
 one NUL byte, then the payload bytes. Later payloads use earlier expected
@@ -1111,54 +1206,54 @@ serialization in any upstream domain.
 
 | Value | Domain | Payload bytes | Expected lowercase SHA-256 |
 | --- | --- | ---: | --- |
-| `owner_identity_id` | `agenttalk.supervisor.owned-wrapper-identity.v1` | 422 | `518060fcbb598848cf88341507926ec26206b849834ca1b716423c5d827f61fa` |
-| `target_digest` | `agenttalk.supervisor.owned-targets.v1` | 432 | `5bc298df725dc0237e2b9754bb272ac5909c6b1806c1a0b6daf3206bb232ed88` |
-| `process_source_digest` | `agenttalk.supervisor.owned-tree-coverage-source.v1` | 296 | `4da3e2ac677819a895069fd8f3793579816523d3596a67cc07a55baf59b95cf2` |
-| `owned_childless_basis_digest` | `agenttalk.supervisor.owned-childless-confirmation-basis.v1` | 988 | `b7428dc97d32430da14c113b57dbad04212d256a62a7a0bd40753ca9005fe21c` |
-| `basis_id` | `agenttalk.supervisor.childless-teardown-basis.v1` | 1,531 | `f0b172fae3b636fa6346a8fe6cb5a222f82b2977264a7cf637a0cd67d68c347e` |
-| `authority_id` | `agenttalk.supervisor.provably-childless-owned-wrapper-authority.v1` | 236 | `e183dfa336b1df96411d3bad843bfaf7a901fed6e9c6f42c55830175f43d19c7` |
-| `debt_id` | `agenttalk.supervisor.childless-teardown-debt.v1` | 374 | `8330f2c3ae6f3e334b47b84d4edabfc75b718ede724d42612d0c00c14a7029ab` |
+| `owner_identity_id` | `agenttalk.supervisor.owned-wrapper-identity.v1` | 475 | `dc2ec1dfec8ffc8cc405ec1713bc82392ecd09a07d9a069f7f11c125ef64b2c7` |
+| `target_digest` | `agenttalk.supervisor.owned-targets.v1` | 432 | `d6812412d8e4e97ca2ce99ff7e502de5ec82c8a74fff5f46c650960f5da8b459` |
+| `process_source_digest` | `agenttalk.supervisor.owned-tree-coverage-source.v1` | 296 | `a0761b7c59c6ccb30b50a3a76c0364bca6155e9c62d20e9fe4fe942711b53413` |
+| `owned_childless_basis_digest` | `agenttalk.supervisor.owned-childless-confirmation-basis.v1` | 988 | `2c5422c20ab4982928c678947c69162d94d996e5d41c8179a62a781abb107789` |
+| `basis_id` | `agenttalk.supervisor.childless-teardown-basis.v1` | 1,531 | `e03f4ea1f99aaf85411dfac6ca805c8ee8e5dbd0f95071ed6ed5d3d0b629e1a9` |
+| `authority_id` | `agenttalk.supervisor.provably-childless-owned-wrapper-authority.v1` | 236 | `42fe64c496d362d278bcd1d99ae2f441b7272441aff359e4233d2cf93de2c433` |
+| `debt_id` | `agenttalk.supervisor.childless-teardown-debt.v1` | 374 | `79aeba9dd6c25c15513890268c83a426bc20b68520c42eb900952cdc1640a4ed` |
 
 `owner_identity_id` payload:
 
 ```json
-{"agent_key":"agent-4","launch_nonce":"Nonce_0123456789AB","managed_generation":"mg-7","nonce_provenance":{"checked_managed_launch_nonce":"Nonce_0123456789AB","observed_parser_schema":"supervisor-launch-nonce/v1","parsed_observed_root_launch_nonce":"Nonce_0123456789AB"},"runtime_wrapper_generation":"wg-9","state_epoch":"11111111-2222-3333-4444-555555555555","wrapper_pid":4242,"wrapper_start_guard":"638920000000000000"}
+{"agent_key":"agent-4","launch_nonce":"Nonce_0123456789AB","managed_generation":"mg-7","nonce_provenance":{"checked_managed_launch_nonce":"Nonce_0123456789AB","observed_parser_schema":"supervisor-launch-nonce/v1","parsed_observed_root_launch_nonce":"Nonce_0123456789AB"},"runtime_wrapper_generation":"wg-9","state_epoch":"11111111-2222-3333-4444-555555555555","wrapper_pid":4242,"wrapper_start_guard":"638920000000000000","wrapper_start_token":"3625-08-28T17:46:40.0000000Z"}
 ```
 
 `target_digest` payload:
 
 ```json
-{"owner_identity_id":"518060fcbb598848cf88341507926ec26206b849834ca1b716423c5d827f61fa","schema":"owned-targets/v1","targets":[{"depth":0,"owner_launch_nonce":"Nonce_0123456789AB","parent_pid":null,"parent_start_guard":null,"pid":4242,"start_guard":"638920000000000000"},{"depth":1,"owner_launch_nonce":"Nonce_0123456789AB","parent_pid":4242,"parent_start_guard":"638920000000000000","pid":5151,"start_guard":"638920000000000111"}]}
+{"owner_identity_id":"dc2ec1dfec8ffc8cc405ec1713bc82392ecd09a07d9a069f7f11c125ef64b2c7","schema":"owned-targets/v1","targets":[{"depth":0,"owner_launch_nonce":"Nonce_0123456789AB","parent_pid":null,"parent_start_guard":null,"pid":4242,"start_guard":"638920000000000000"},{"depth":1,"owner_launch_nonce":"Nonce_0123456789AB","parent_pid":4242,"parent_start_guard":"638920000000000000","pid":5151,"start_guard":"638920000000000111"}]}
 ```
 
 `process_source_digest` payload:
 
 ```json
-{"ambiguity_scan_schema":1,"command_line_coverage":"complete","pid_start_guard_schema":1,"platform":"WINDOWS","process_row_schema":1,"process_source":"WIN32_PROCESS_CIM","recorded_identity_coverage":"complete","schema":"wrapper-observer-coverage/v1","wait_parser_schema":1,"wrap_parser_schema":1}
+{"ambiguity_scan_schema":1,"command_line_coverage":"complete","pid_start_guard_schema":2,"platform":"WINDOWS","process_row_schema":1,"process_source":"WIN32_PROCESS_CIM","recorded_identity_coverage":"complete","schema":"wrapper-observer-coverage/v1","wait_parser_schema":1,"wrap_parser_schema":1}
 ```
 
 `owned_childless_basis_digest` payload:
 
 ```json
-{"active_child_config_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","child_establishment_guard":{"active_age_grace_through_epoch_ms":2030000,"active_record_updated_at_epoch_ms":2000000,"close_evidence_epoch_ms":2120000,"generation_launch_grace_until_epoch_ms":2120000,"key":{"cli_launcher_pid":6001,"cli_launcher_start_guard":"638920000000000222","managed_generation":"mg-7","runtime_wrapper_generation":"wg-9","state_epoch":"11111111-2222-3333-4444-555555555555","turn_generation":12},"result":"NONRENEWABLE_GRACE_EXPIRED","variant":"CLOSED"},"coverage":{"observer_version":"win-tree/v1","ownership_rule_version":"owned-tree/v1","process_source_digest":"4da3e2ac677819a895069fd8f3793579816523d3596a67cc07a55baf59b95cf2"},"owner_identity_id":"518060fcbb598848cf88341507926ec26206b849834ca1b716423c5d827f61fa","runtime_child_dead_basis_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","schema":"owned-childless-confirmation-basis/v1"}
+{"active_child_config_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","child_establishment_guard":{"active_age_grace_through_epoch_ms":2030000,"active_record_updated_at_epoch_ms":2000000,"close_evidence_epoch_ms":2120000,"generation_launch_grace_until_epoch_ms":2120000,"key":{"cli_launcher_pid":6001,"cli_launcher_start_guard":"638920000000000222","managed_generation":"mg-7","runtime_wrapper_generation":"wg-9","state_epoch":"11111111-2222-3333-4444-555555555555","turn_generation":12},"result":"NONRENEWABLE_GRACE_EXPIRED","variant":"CLOSED"},"coverage":{"observer_version":"win-tree/v2","ownership_rule_version":"owned-tree/v2","process_source_digest":"a0761b7c59c6ccb30b50a3a76c0364bca6155e9c62d20e9fe4fe942711b53413"},"owner_identity_id":"dc2ec1dfec8ffc8cc405ec1713bc82392ecd09a07d9a069f7f11c125ef64b2c7","runtime_child_dead_basis_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","schema":"owned-childless-confirmation-basis/v1"}
 ```
 
 `basis_id` payload:
 
 ```json
-{"active_child_config_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","child_establishment_guard":{"active_age_grace_through_epoch_ms":2030000,"active_record_updated_at_epoch_ms":2000000,"close_evidence_epoch_ms":2120000,"generation_launch_grace_until_epoch_ms":2120000,"key":{"cli_launcher_pid":6001,"cli_launcher_start_guard":"638920000000000222","managed_generation":"mg-7","runtime_wrapper_generation":"wg-9","state_epoch":"11111111-2222-3333-4444-555555555555","turn_generation":12},"result":"NONRENEWABLE_GRACE_EXPIRED","variant":"CLOSED"},"debt_generation":null,"debt_id":null,"mode":"INITIAL","owned_childless_basis_digest":"b7428dc97d32430da14c113b57dbad04212d256a62a7a0bd40753ca9005fe21c","owner_identity_id":"518060fcbb598848cf88341507926ec26206b849834ca1b716423c5d827f61fa","runtime_child_dead_basis_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_capture_id":{"agent_key":"agent-4","capture_ordinal":0,"ordinary_poll_sequence":41,"state_epoch":"11111111-2222-3333-4444-555555555555"},"source_committed_revision":77,"source_condition_fingerprint":"recovery-condition-v1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","source_coverage":{"observer_version":"win-tree/v1","ownership_rule_version":"owned-tree/v1","process_source_digest":"4da3e2ac677819a895069fd8f3793579816523d3596a67cc07a55baf59b95cf2"},"state_epoch":"11111111-2222-3333-4444-555555555555","target_digest":"5bc298df725dc0237e2b9754bb272ac5909c6b1806c1a0b6daf3206bb232ed88"}
+{"active_child_config_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","child_establishment_guard":{"active_age_grace_through_epoch_ms":2030000,"active_record_updated_at_epoch_ms":2000000,"close_evidence_epoch_ms":2120000,"generation_launch_grace_until_epoch_ms":2120000,"key":{"cli_launcher_pid":6001,"cli_launcher_start_guard":"638920000000000222","managed_generation":"mg-7","runtime_wrapper_generation":"wg-9","state_epoch":"11111111-2222-3333-4444-555555555555","turn_generation":12},"result":"NONRENEWABLE_GRACE_EXPIRED","variant":"CLOSED"},"debt_generation":null,"debt_id":null,"mode":"INITIAL","owned_childless_basis_digest":"2c5422c20ab4982928c678947c69162d94d996e5d41c8179a62a781abb107789","owner_identity_id":"dc2ec1dfec8ffc8cc405ec1713bc82392ecd09a07d9a069f7f11c125ef64b2c7","runtime_child_dead_basis_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_capture_id":{"agent_key":"agent-4","capture_ordinal":0,"ordinary_poll_sequence":41,"state_epoch":"11111111-2222-3333-4444-555555555555"},"source_committed_revision":77,"source_condition_fingerprint":"recovery-condition-v1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","source_coverage":{"observer_version":"win-tree/v2","ownership_rule_version":"owned-tree/v2","process_source_digest":"a0761b7c59c6ccb30b50a3a76c0364bca6155e9c62d20e9fe4fe942711b53413"},"state_epoch":"11111111-2222-3333-4444-555555555555","target_digest":"d6812412d8e4e97ca2ce99ff7e502de5ec82c8a74fff5f46c650960f5da8b459"}
 ```
 
 `authority_id` payload:
 
 ```json
-{"basis_id":"f0b172fae3b636fa6346a8fe6cb5a222f82b2977264a7cf637a0cd67d68c347e","mode":"INITIAL","schema":"provably-childless-owned-wrapper-authority/v1","target_digest":"5bc298df725dc0237e2b9754bb272ac5909c6b1806c1a0b6daf3206bb232ed88"}
+{"basis_id":"e03f4ea1f99aaf85411dfac6ca805c8ee8e5dbd0f95071ed6ed5d3d0b629e1a9","mode":"INITIAL","schema":"provably-childless-owned-wrapper-authority/v1","target_digest":"d6812412d8e4e97ca2ce99ff7e502de5ec82c8a74fff5f46c650960f5da8b459"}
 ```
 
 `debt_id` payload:
 
 ```json
-{"initial_attempt_id":"99999999-aaaa-bbbb-cccc-dddddddddddd","initial_authority_id":"e183dfa336b1df96411d3bad843bfaf7a901fed6e9c6f42c55830175f43d19c7","owner_identity_id":"518060fcbb598848cf88341507926ec26206b849834ca1b716423c5d827f61fa","state_epoch":"11111111-2222-3333-4444-555555555555","target_digest":"5bc298df725dc0237e2b9754bb272ac5909c6b1806c1a0b6daf3206bb232ed88"}
+{"initial_attempt_id":"99999999-aaaa-bbbb-cccc-dddddddddddd","initial_authority_id":"42fe64c496d362d278bcd1d99ae2f441b7272441aff359e4233d2cf93de2c433","owner_identity_id":"dc2ec1dfec8ffc8cc405ec1713bc82392ecd09a07d9a069f7f11c125ef64b2c7","state_epoch":"11111111-2222-3333-4444-555555555555","target_digest":"d6812412d8e4e97ca2ce99ff7e502de5ec82c8a74fff5f46c650960f5da8b459"}
 ```
 
 Outstanding debt has precedence over every new owner, whole-wrapper absence,
@@ -1832,48 +1927,69 @@ transaction; no executor branch may save a cached whole state.
     ordinary sequence, exact attempt binding, and no reuse/wrap. Pair an
     ordinal-zero ordinary residual with a nonzero reload residual and prove
     each is accepted only in its stated context.
-22. Inspect task #120's and the closure successor's implementation, package,
-    state, and activated-platform diffs. Any daemon/service, durable helper,
-    new durable file/database/registry/journal, durable named OS object,
-    nonempty runtime dependency, or mechanism-specific exception is
-    nonconforming and makes the capability unavailable. Prove that an
+22. Inspect the 87-A adapter and closure successor's implementation, package,
+    state, and activated-platform diffs. Any new daemon/service, persistence
+    plane, durable helper, durable file/database/registry/journal, durable named
+    OS object, nonempty runtime dependency, or mechanism-specific exception
+    introduced by those mechanisms is nonconforming and makes the capability
+    unavailable. Existing request-bound attended archive/store surfaces may
+    remain for their shipped human workflows, but those surfaces may not carry
+    closure, authority, debt, or cap state or supply closure proof. Prove that an
     unprovable closure returns pre-reservation `CAPABILITY_UNAVAILABLE`, makes
     zero external calls, performs no named teardown, remains `POLICY_HELD`
     pending a human, and creates a task rather than an implementation-detail
     mechanism.
-23. Adapt task #120 candidate `28f663f` byte-for-byte. Accept only
+23. Adapt merged task #120 at `587e7c1` byte-for-byte. Accept only
     `owned_process_tree_v2`, schema 2, status `complete|absent|truncated|invalid`,
     exact limit 64, consistent counts, generation/nonce, and the stated field
-    projection. Freshly validate every live PID/start/filetime. Admit a
+    projection. Freshly validate every live PID/start/filetime; for every
+    complete/absent Windows ISO-start row, require a positive decimal exact
+    FILETIME and use it—not the rounded ISO value—as the destructive guard.
+    Require `observer_version=win-tree/v2`,
+    `ownership_rule_version=owned-tree/v2`, and
+    `pid_start_guard_schema=2`; the superseded v1 values are incompatible.
+    Admit a
     non-live ancestry bridge only from an exact prior complete
     generation/nonce/parent chain, exclude it from target tuples/digests and
     `Stop-Tree`, and normalize a live child behind it to the stated orphan
-    form. Validate but exclude role/discovery metadata from authority. Race
-    planning against a recorded parent that creates a late descendant and
-    exits: the descendant must miss the planned kill set, survive that
-    `Stop-Tree`, be found only by #120's fresh barrier, block launch, map the
-    post-action result to `EFFECT_UNPROVEN`, and never become a kill target,
-    prove `COMPLETE_GONE`, or clear debt. A clear barrier without the typed
-    closure/absence proof must also refuse debt clear.
+    form. Validate but exclude role/discovery metadata from authority. Prove an
+    openable exact-matching planned Windows target is verified and terminated
+    through one native handle, and every successful termination receives a wait
+    attempt within the remaining shared tree-wide budget. Check-to-kill PID
+    reuse must be impossible. Inject open failure, exact-identity mismatch,
+    termination failure, wait timeout, and depleted budget; each must defer
+    completion to the fresh snapshot/barrier, and a still-present target must
+    remain residual/HOLD. Race planning against a recorded
+    parent that creates a late descendant and exits: the unplanned descendant
+    must miss the kill set, survive that `Stop-Tree`, be found only by #120's
+    fresh barrier, block launch, map the post-action result to
+    `EFFECT_UNPROVEN`, and never become a kill target, prove `COMPLETE_GONE`, or
+    clear debt. Recycle the parent PID and prove an exact equal/newer child is
+    excluded from the retired-parent ownership edge, while a pre-recycle or
+    incomparable child stays conservative survivor evidence. Independently
+    classify the replacement-side child as this agent's wrapper/wait and prove
+    that ordinary barrier evidence still blocks. A clear barrier without the
+    typed closure/absence proof must also refuse debt clear. Attended reset/archive
+    evidence must never substitute for automatic closure or completion.
 
 ## Dependencies and release order
 
 | Property | Classification | Owner |
 | --- | --- | --- |
-| Two same-owner post-establishment complete child absences | ENFORCED after #115 and merged/reviewed #120 | 87-A reducer plus #120 snapshot adapter |
-| PID/start/nonce ownership; never pattern ownership | ENFORCED after merged/reviewed #120 | 87-A adapter over `owned_process_tree_v2` |
-| Complete 64-entry tree observation | ENFORCED after merged/reviewed #120 | #120 snapshot plus 87-A adapter |
-| Action-scoped creation closure | CURRENTLY UNAVAILABLE; ENFORCED after a conforming closure successor | No reviewed successor exists as of 2026-07-31; otherwise `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human |
+| Two same-owner post-establishment complete child absences | #120 INPUT DELIVERED; ENFORCED after #115 and the 87-A adapter | 87-A reducer plus merged #120 snapshot |
+| PID/start/nonce ownership; never pattern ownership | #120 INPUT DELIVERED; ENFORCED by the 87-A adapter | Adapter over merged `owned_process_tree_v2`, including exact Windows FILETIME |
+| Complete 64-entry tree observation | DELIVERED by merged #120; 87-A adapter validation remains required | #120 snapshot plus 87-A adapter |
+| Action-scoped creation closure | CURRENTLY UNAVAILABLE; ENFORCED after a conforming closure successor | Merged #120 does not freeze creation or expose attempt-keyed acquire/reconcile/release; otherwise `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human |
 | Atomic reservation/debt/cycle/terminal state | ENFORCED after #115 | Task #115 checked state owner |
-| External-call continuation/effect linearization | ENFORCED after #115 and the closure successor | Checked state plus successor-owned synchronous adapters |
+| External-call continuation/effect linearization | PARTIAL target-local primitive DELIVERED by #120; full contract ENFORCED after #115 and the closure successor | #120 same-handle exact check/terminate plus conditional bounded wait attempt, checked continuation state, and successor-owned attempt-bound synchronous adapters |
 | Fail-closed state-loss quarantine | ENFORCED after #115 | Task #115 checked state owner |
 | No daemon, persistence plane, durable helper or OS object, or runtime dependency | DECIDED ABSOLUTE by operator on 2026-07-31 (M5 Option A) | Project/package boundary; no mechanism-specific exception |
-| Sole leaves-first guarded kill | ENFORCED | Existing `Stop-Tree` |
+| Sole leaves-first guarded kill | ENFORCED; exact owned-target seam DELIVERED by #120 | Same-handle exact FILETIME check/terminate and conditional bounded wait attempt in existing `Stop-Tree` |
 | Three-attempt automatic cap and continuous typed attention | ENFORCED after #115 | 87-A state/output |
 | Durable human delivery and receipt | STATED out of scope | Future 87-B |
 
-Task #78 consumes the named authority only after #115, merged/reviewed #120,
-and the closure successor. Task #116 remains blocked only on #115 and
+Task #78 consumes the named authority only after #115, the adapter over merged
+#120, and the closure successor. Task #116 remains blocked only on #115 and
 independently stageable: an already-absent wrapper needs neither a target tree
 nor the closure successor. This preserves the
 task #94 ordering and #107's single contained kill site.
