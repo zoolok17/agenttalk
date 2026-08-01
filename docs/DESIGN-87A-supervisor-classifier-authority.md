@@ -2603,6 +2603,16 @@ tuple, authority, reservation, attempt, debt, or `Stop-Tree` call. The legacy
 rounded-start path and any weakening of the Windows FILETIME requirement remain
 forbidden.
 
+**OPERATOR-VISIBLE CAPABILITY CONSEQUENCE:** On Linux and macOS, every
+closure-dependent named teardown returns
+`CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` before action, and
+recovery remains `POLICY_HELD` pending a human. Under the current contract this
+hold is permanent until a real, independently reviewed exact-token kill adapter
+exists and satisfies the absolute M5 Option A constraint; accepting an identity
+token as parser or snapshot input does not make that token executable. 87-B
+projections and the required operator manual and tutorial must state this
+consequence explicitly.
+
 For `CONDITIONAL_POST_TEARDOWN`, the fresh post-teardown capture is also the
 final barrier. A survivor, unavailable/incomplete capture, or ambiguous
 candidate resolves the conditional to `NONE`.
