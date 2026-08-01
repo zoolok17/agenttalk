@@ -320,6 +320,51 @@ def validate_launch_request(
     revision = _as_dict(marker.get("scope")).get("revision")
     if current and revision != current:
         errors.append("scope.revision is stale for ephemeral_reviewers.current_revision")
+    # Round 17 connector finding, the fifth instance of one rule: the
+    # validator must accept exactly what the runtime resolver accepts.
+    # launch_spec() (round 13) and the wholesale entry persistence (round
+    # 14) both make module_args_from SURVIVE the launch pipeline faithfully
+    # - including when it is wrong. A malformed or wrong module_args_from
+    # here means the Python command still starts, nonce injection and
+    # bounded logging fail closed, and - because the value is now
+    # persisted - _wrapped_liveness can never establish teardown authority
+    # either, so the reviewer sticks in process_tree_hold. Validating this
+    # BEFORE the temporary identity is created and the review request is
+    # sent (here, not after) means a bad config is refused outright rather
+    # than launched into a stuck reviewer. Calls the SAME resolver
+    # bootstrap_check delegates to for regular agents (round 14/16) -
+    # not a parallel reimplementation. Deferred import: supervisor.py
+    # imports this module at module level, so importing it back at module
+    # level here would be circular; a function-local import (the same
+    # pattern already used above for lanes) resolves it cleanly since both
+    # modules are fully loaded by the time this function actually runs.
+    if profile is not None:
+        launch = _as_dict(profile.get("launch"))
+        windows_file = launch.get("windows_file")
+        windows_args = launch.get("windows_args")
+        module_args_from = launch.get("module_args_from")
+        if isinstance(windows_args, list):
+            from agenttalk import supervisor as _sup
+
+            if _sup._token_stem(windows_file) in {"python", "python3", "py"}:
+                if module_args_from is not None and (
+                    not isinstance(module_args_from, int)
+                    or isinstance(module_args_from, bool)
+                ):
+                    errors.append(
+                        f"profile {marker.get('profile')!r} launch.module_args_from "
+                        "must be an integer"
+                    )
+                elif _sup._resolve_module_flag_index(
+                    [str(token) for token in windows_args], module_args_from,
+                ) < 0:
+                    errors.append(
+                        f"profile {marker.get('profile')!r} launch.module_args_from "
+                        "does not resolve against launch.windows_args - nonce "
+                        "injection and bounded logging would silently fail, and "
+                        "the persisted entry would leave the reviewer stuck in "
+                        "process_tree_hold with no teardown authority"
+                    )
     return errors, profile
 
 
