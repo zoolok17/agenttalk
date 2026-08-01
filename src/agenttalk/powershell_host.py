@@ -490,10 +490,19 @@ def _run_probe(path: str, *, timeout: float) -> subprocess.CompletedProcess[str]
             # kill() can itself raise (PermissionError on Windows,
             # ProcessLookupError if the child already exited) - unguarded,
             # that secondary error would replace this OSError and skip the
-            # PowerShellHostError below entirely.
+            # PowerShellHostError below entirely. But suppressing it is not
+            # itself free: if kill() failed, proc is still running, and the
+            # unbounded communicate() that follows would then wait forever
+            # on a live process - strictly worse than the crash it
+            # replaced. Preserve the containment error as the raised cause,
+            # but bound the cleanup and fall back to a reap-only wait().
             with contextlib.suppress(OSError):
                 proc.kill()
-            proc.communicate()
+            try:
+                proc.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=25.0)
             raise PowerShellHostError(
                 f"probe process containment failed: {exc}"
             ) from exc

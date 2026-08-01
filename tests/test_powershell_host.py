@@ -664,3 +664,57 @@ def test_run_probe_kill_raising_does_not_replace_the_owner_exception(
 
     proc = created[0]
     assert proc.kill_called is True
+
+
+def test_run_probe_job_attach_failure_cleanup_is_bounded_when_kill_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 12 connector finding: suppressing kill()'s own OSError is not
+    itself free. If kill() fails, proc is still running, and the unbounded
+    communicate() that used to follow would then wait forever on a live
+    process - strictly worse than the crash it replaced. Bound the cleanup
+    and fall back to wait(), while still raising the original containment
+    OSError as the cause."""
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.kill_called = False
+            self.communicate_calls = 0
+            self.wait_calls = 0
+            self._returncode: int | None = None
+            self.args = ["pwsh"]
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            self.kill_called = True
+            raise PermissionError("simulated: kill also failed")
+
+        def communicate(self, timeout=None):
+            self.communicate_calls += 1
+            raise subprocess.TimeoutExpired(cmd=self.args, timeout=timeout or 0)
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            self._returncode = -9
+            return self._returncode
+
+    created: list[_FakeProc] = []
+
+    def _fake_popen(*args, **kwargs):
+        proc = _FakeProc()
+        created.append(proc)
+        return proc
+
+    def _raise_containment(proc):
+        raise OSError("simulated: job attach failed")
+
+    monkeypatch.setattr(psh.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(psh, "_attach_kill_on_close_job", _raise_containment)
+
+    with pytest.raises(psh.PowerShellHostError, match="probe process containment failed"):
+        psh._run_probe("pwsh", timeout=5.0)
+
+    proc = created[0]
+    assert proc.kill_called is True
+    assert proc.wait_calls == 1
