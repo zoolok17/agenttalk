@@ -2119,7 +2119,35 @@ def _token_stem(token: str) -> str:
     return _image_stem(token)
 
 
-def _agenttalk_argv(command_line: object) -> list[str] | None:
+# PR 98 connector, the seam finding: this grammar is implemented TWICE (here
+# and in PS_TEMPLATE's Test-AgenttalkAllowedInterpreterPrefixToken), and the
+# two implementations must agree - see
+# test_python_and_powershell_prefix_allowlists_agree, which drives both
+# sides through the same shared table. This constant is the single
+# PYTHON-side source of truth the test consumes (not a literal the test
+# redefines); the PowerShell side is the single source of truth for its own
+# language. Each entry's justification lives on the PowerShell function -
+# duplicating the reasoning here would just be a third place to drift.
+_ALLOWED_INTERPRETER_PREFIX_FLAGS = frozenset({"-u", "-I", "-S", "-B", "-E", "-P"})
+
+
+def _allowed_interpreter_prefix_token(token: str) -> bool:
+    if token in _ALLOWED_INTERPRETER_PREFIX_FLAGS:
+        return True
+    return len(token) > 2 and token.startswith("-X")
+
+
+def _module_args_from(cfg_agent: object) -> object:
+    """Extract the declared launch.module_args_from for one agent's config,
+    if any - the single place every attribution/provenance call site pulls
+    it from cfg_agent it already has in scope, so a malformed or absent
+    launch block degrades to None (the default 0-prefix case) rather than
+    raising."""
+    launch = cfg_agent.get("launch") if isinstance(cfg_agent, dict) else None
+    return launch.get("module_args_from") if isinstance(launch, dict) else None
+
+
+def _agenttalk_argv(command_line: object, module_args_from: object = None) -> list[str] | None:
     tokens = _split_command_line(command_line)
     if not tokens:
         return None
@@ -2127,8 +2155,27 @@ def _agenttalk_argv(command_line: object) -> list[str] | None:
     if first in _SHELL_HOSTS:
         return None
     if first in {"python", "python3", "py"}:
-        if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "agenttalk":
-            return tokens[3:]
+        # module_args_from is operator-declared config, not argv - a
+        # malformed value must fail closed (return None) here rather than
+        # throw, matching Resolve-AgenttalkModuleFlagIndex's own fail-soft
+        # cast on the PowerShell side.
+        offset = 0
+        if module_args_from is not None:
+            try:
+                offset = int(module_args_from)
+            except (TypeError, ValueError):
+                return None
+            if offset < 0:
+                return None
+        index = 1 + offset
+        if index >= len(tokens):
+            return None
+        for prefix_token in tokens[1:index]:
+            if not _allowed_interpreter_prefix_token(prefix_token):
+                return None
+        if (index + 1 < len(tokens) and tokens[index] == "-m"
+                and tokens[index + 1] == "agenttalk"):
+            return tokens[index + 2:]
         return None
     if first == "agenttalk":
         return tokens[1:]
@@ -2152,8 +2199,9 @@ def _has_option_token(tokens: list[str], option: str) -> bool:
     return any(arg == option or arg.startswith(option + "=") for arg in tokens)
 
 
-def _agenttalk_invocation(command_line: object, root_key: str | None) -> dict | None:
-    argv = _agenttalk_argv(command_line)
+def _agenttalk_invocation(command_line: object, root_key: str | None,
+                           module_args_from: object = None) -> dict | None:
+    argv = _agenttalk_argv(command_line, module_args_from)
     if argv is None:
         return None
     root = None
@@ -2187,8 +2235,10 @@ def _agenttalk_invocation(command_line: object, root_key: str | None) -> dict | 
     }
 
 
-def _parse_supervisor_launch_nonce(command_line: object) -> tuple[str | None, str | None]:
-    argv = _agenttalk_argv(command_line)
+def _parse_supervisor_launch_nonce(
+    command_line: object, module_args_from: object = None,
+) -> tuple[str | None, str | None]:
+    argv = _agenttalk_argv(command_line, module_args_from)
     if argv is None:
         return None, "launcher_wrap_parse_failed"
     nonce = None
@@ -2219,8 +2269,10 @@ def _parse_supervisor_launch_nonce(command_line: object) -> tuple[str | None, st
     return nonce, None
 
 
-def parse_supervisor_launch_nonce(command_line: object) -> str | None:
-    nonce, reason = _parse_supervisor_launch_nonce(command_line)
+def parse_supervisor_launch_nonce(
+    command_line: object, module_args_from: object = None,
+) -> str | None:
+    nonce, reason = _parse_supervisor_launch_nonce(command_line, module_args_from)
     return nonce if reason is None else None
 
 
@@ -2238,8 +2290,8 @@ def _agent_option(args: list[str], option: str) -> str | None:
 
 
 def parse_agenttalk_wait_invocation(command_line: object, root_key: str | None,
-                                    agent: str) -> bool:
-    inv = _agenttalk_invocation(command_line, root_key)
+                                    agent: str, module_args_from: object = None) -> bool:
+    inv = _agenttalk_invocation(command_line, root_key, module_args_from)
     if not inv or inv.get("subcommand") != "wait" or not inv.get("root_match"):
         return False
     args = inv.get("args") or []
@@ -2249,8 +2301,8 @@ def parse_agenttalk_wait_invocation(command_line: object, root_key: str | None,
 
 
 def parse_agenttalk_wrap_invocation(command_line: object, root_key: str | None,
-                                    agent: str) -> bool:
-    inv = _agenttalk_invocation(command_line, root_key)
+                                    agent: str, module_args_from: object = None) -> bool:
+    inv = _agenttalk_invocation(command_line, root_key, module_args_from)
     if not inv or inv.get("subcommand") != "wrap" or not inv.get("root_match"):
         return False
     args = inv.get("args") or []
@@ -2263,10 +2315,11 @@ def parse_agenttalk_wrap_invocation(command_line: object, root_key: str | None,
     return "--loop" in before_tail
 
 
-def _row_branch_reason(row: dict, root_key: str | None, agent: str) -> str | None:
+def _row_branch_reason(row: dict, root_key: str | None, agent: str,
+                        module_args_from: object = None) -> str | None:
     if _is_shell_host(row):
         return "shell_boundary"
-    inv = _agenttalk_invocation(row.get("command_line"), root_key)
+    inv = _agenttalk_invocation(row.get("command_line"), root_key, module_args_from)
     if not inv:
         return None
     if inv.get("root") and not inv.get("root_match"):
@@ -2327,12 +2380,13 @@ def _is_confirmed_launcher(
     root_key: str | None,
     agent: str,
     diagnostics: dict[str, int],
+    module_args_from: object = None,
 ) -> tuple[bool, dict | None]:
     pid = st.get("launcher_pid")
     start = st.get("launcher_start")
     if not _pid_alive_guarded(idx, pid, start):
         return False, None
-    branch = _row_branch_reason(row, root_key, agent)
+    branch = _row_branch_reason(row, root_key, agent, module_args_from)
     if branch is not None:
         _bump(diagnostics, "foreign_launcher_suppressed")
         return False, None
@@ -2353,7 +2407,7 @@ def _is_confirmed_launcher(
     if not isinstance(command_line, str) or not command_line.strip():
         _bump(diagnostics, "launcher_nonce_cmdline_unreadable")
         return False, None
-    actual, nonce_reason = _parse_supervisor_launch_nonce(command_line)
+    actual, nonce_reason = _parse_supervisor_launch_nonce(command_line, module_args_from)
     if nonce_reason in {
         "launcher_nonce_malformed",
         "launcher_nonce_duplicate",
@@ -2362,7 +2416,7 @@ def _is_confirmed_launcher(
     }:
         _bump(diagnostics, nonce_reason)
         return False, None
-    if not parse_agenttalk_wrap_invocation(command_line, root_key, agent):
+    if not parse_agenttalk_wrap_invocation(command_line, root_key, agent, module_args_from):
         _bump(diagnostics, "launcher_wrap_parse_failed")
         return False, None
     if nonce_reason == "launcher_nonce_absent":
@@ -2399,9 +2453,14 @@ def _record_target(targets: dict[int, dict], row: dict, reason: str,
 
 def _is_expected_seed_row(row: dict, cfg_agent: dict, agent: str,
                           root_key: str | None) -> bool:
-    if parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
+    module_args_from = _module_args_from(cfg_agent)
+    if parse_agenttalk_wait_invocation(
+        row.get("command_line"), root_key, agent, module_args_from,
+    ):
         return True
-    if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+    if parse_agenttalk_wrap_invocation(
+        row.get("command_line"), root_key, agent, module_args_from,
+    ):
         return True
     name = _image_stem(row)
     cli = cfg_agent.get("cli")
@@ -2547,10 +2606,11 @@ def _children_map(idx: dict[int, dict]) -> dict[int, list[int]]:
 
 def _strict_child_edge(parent: dict, child: dict, *,
                        root_key: str | None, agent: str,
-                       diagnostics: dict[str, int]) -> bool:
+                       diagnostics: dict[str, int],
+                       module_args_from: object = None) -> bool:
     if child.get("parent_pid") != parent.get("pid"):
         return False
-    branch = _row_branch_reason(child, root_key, agent)
+    branch = _row_branch_reason(child, root_key, agent, module_args_from)
     if branch is not None:
         _bump(diagnostics, branch)
         return False
@@ -2571,6 +2631,7 @@ def _strict_child_edge(parent: dict, child: dict, *,
 def _root_wait_brain(idx: dict[int, dict], wait_row: dict, cfg_agent: dict,
                      root_key: str | None, agent: str,
                      diagnostics: dict[str, int]) -> dict | None:
+    module_args_from = _module_args_from(cfg_agent)
     child = wait_row
     best = None
     seen: set[int] = set()
@@ -2583,7 +2644,7 @@ def _root_wait_brain(idx: dict[int, dict], wait_row: dict, cfg_agent: dict,
         if not isinstance(pid, int) or pid in seen:
             return best
         seen.add(pid)
-        branch = _row_branch_reason(parent, root_key, agent)
+        branch = _row_branch_reason(parent, root_key, agent, module_args_from)
         if branch is not None:
             _bump(diagnostics, branch)
             return best
@@ -2614,6 +2675,7 @@ def _attribution(
     now_epoch: float,
 ) -> dict:
     diagnostics = _diag()
+    module_args_from = _module_args_from(cfg_agent)
     prior_raw = st.get("managed_pids") if isinstance(st, dict) else None
     valid_priors, legacy_priors = _usable_priors(
         prior_raw,
@@ -2669,7 +2731,7 @@ def _attribution(
         _bump(diagnostics, "pid_reuse_suppressed")
     if isinstance(launcher_row, dict):
         confirmed_launcher, launcher_source = _is_confirmed_launcher(
-            idx, launcher_row, st, root_key, agent, diagnostics)
+            idx, launcher_row, st, root_key, agent, diagnostics, module_args_from)
     if confirmed_launcher:
         confirmed_launcher = True
         _record_target(targets_by_pid, launcher_row, "confirmed_launcher",
@@ -2685,14 +2747,18 @@ def _attribution(
             continue
         if isinstance(launcher_pid, int) and pid == launcher_pid:
             continue
-        branch = _row_branch_reason(row, root_key, agent)
+        branch = _row_branch_reason(row, root_key, agent, module_args_from)
         if branch is not None:
             _bump(diagnostics, branch)
             continue
-        if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+        if parse_agenttalk_wrap_invocation(
+            row.get("command_line"), root_key, agent, module_args_from,
+        ):
             _record_target(targets_by_pid, row, "own_wrapper", seed_descendants=True)
             seed_pids.add(pid)
-        elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
+        elif parse_agenttalk_wait_invocation(
+            row.get("command_line"), root_key, agent, module_args_from,
+        ):
             _record_target(targets_by_pid, row, "own_wait", seed_descendants=False)
             own_wait_rows.append(row)
 
@@ -2755,7 +2821,8 @@ def _attribution(
             if not isinstance(child, dict):
                 continue
             if not _strict_child_edge(parent, child, root_key=root_key,
-                                      agent=agent, diagnostics=diagnostics):
+                                      agent=agent, diagnostics=diagnostics,
+                                      module_args_from=module_args_from):
                 continue
             child_launcher_source = seed_launcher_sources.get(parent_pid)
             _record_target(targets_by_pid, child, "live_chain_descendant",
@@ -2887,6 +2954,8 @@ def evaluate_launch_barrier(
     same-agent wrapper or wait process survived before Start-Process runs.
     """
     root_key = root_key or _root_key(config.get("root") or config.get("root_key") or "")
+    config_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
+    module_args_from = _module_args_from(config_agents.get(agent) or {})
     st = _agent_state_entry(state, agent)
     if snapshot is None:
         blocked = _prior_wrapper_may_be_alive(st)
@@ -2904,9 +2973,13 @@ def evaluate_launch_barrier(
         if not isinstance(row, dict):
             continue
         kind = None
-        if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+        if parse_agenttalk_wrap_invocation(
+            row.get("command_line"), root_key, agent, module_args_from,
+        ):
             kind = "own_wrapper"
-        elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
+        elif parse_agenttalk_wait_invocation(
+            row.get("command_line"), root_key, agent, module_args_from,
+        ):
             kind = "own_wait"
         if kind is None:
             continue
@@ -2950,6 +3023,7 @@ def capture_launch_child_provenance(
     launcher_nonce_injected: bool = False,
 ) -> tuple[list[dict], dict[str, int]]:
     diagnostics = _diag()
+    module_args_from = _module_args_from(cfg_agent)
     if not isinstance(launcher_pid, int):
         return [], diagnostics
     launcher_epoch = _iso_epoch(launcher_start)
@@ -2988,7 +3062,7 @@ def capture_launch_child_provenance(
         if child_epoch < launcher_epoch:
             _bump(diagnostics, "inverted_start_edge")
             continue
-        branch = _row_branch_reason(row, root_key, agent)
+        branch = _row_branch_reason(row, root_key, agent, module_args_from)
         if branch is not None:
             _bump(diagnostics, branch)
             continue

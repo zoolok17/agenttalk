@@ -6062,6 +6062,49 @@ def _pslit(v: str) -> str:
     return "'" + str(v).replace("'", "''") + "'"
 
 
+# Shared test data for the cross-language agreement contract (PR 98
+# connector, the seam finding): PowerShell's
+# Test-AgenttalkAllowedInterpreterPrefixToken and Python's
+# supervisor._allowed_interpreter_prefix_token must classify every one of
+# these identically. ONE table, consumed by both
+# test_supervisor_allowed_interpreter_prefix_token_is_exhaustive
+# (PowerShell only) and test_python_and_powershell_prefix_allowlists_agree
+# (both, side by side) - not two independently maintained lists that could
+# themselves drift apart.
+_PREFIX_TOKEN_AGREEMENT_TABLE: list[tuple[str, bool]] = [
+    # allowed: this project's actual needs (I2, 5th-leak-round allowlist)
+    ("-u", True), ("-I", True), ("-S", True), ("-B", True), ("-E", True), ("-P", True),
+    ("-Xutf8", True), ("-Xdev", True), ("-X3", True),
+    # execution-mode tokens (I2, rounds 1-4)
+    ("-", False), ("-m", False), ("-mfoo", False), ("-magenttalk", False),
+    ("-c", False), ("-cprint(1)", False), ("--", False),
+    ("script.py", False), ("helper.py", False), ("agenttalk", False),
+    # terminating options - run NO program at all (I2, 5th leak)
+    ("--version", False), ("-V", False), ("-h", False), ("-?", False),
+    ("--help", False), ("--help-env", False), ("--help-xoptions", False),
+    ("--help-all", False),
+    # -X's own separate-token form (no attached value) is not supported
+    ("-X", False),
+    # deliberately excluded despite looking superficially safe
+    ("-O", False), ("-OO", False), ("-i", False),
+    # invented / never-real spellings
+    ("-Z", False), ("-3", False), ("-Q", False), ("-Wignore", False),
+]
+
+
+def _pick_pwsh_anywhere() -> str | None:
+    """Unlike _pick_powershell (deliberately Windows-only, for tests
+    exercising Windows-specific behavior like .cmd shims and Start-Process
+    quoting), this is for tests that only exercise pure PowerShell-language
+    logic - string/array comparisons with no OS-specific call underneath.
+    GitHub's ubuntu-latest and macos-latest runners ship pwsh too (checked
+    against actions/runner-images' own software manifests, not assumed),
+    so a test using this picker runs on every CI leg, not just Windows -
+    which matters for a cross-language AGREEMENT contract: a check that
+    silently skips on 8 of 12 legs is a check that is mostly not run."""
+    return shutil.which("pwsh")
+
+
 def test_supervisor_allowed_interpreter_prefix_token_is_exhaustive(tmp_path: Path) -> None:
     """I2, 5th leak (PR 98 connector re-review of 0c3179d): --version/-V/-h/
     -?/--help* run NO program at all - CPython prints and exits before ever
@@ -6080,21 +6123,8 @@ def test_supervisor_allowed_interpreter_prefix_token_is_exhaustive(tmp_path: Pat
         return
     helpers = _exec_helpers(tmp_path)
     out = tmp_path / "allowed_prefix_tokens.json"
-    allowed = ["-u", "-I", "-S", "-B", "-E", "-P", "-Xutf8", "-Xdev", "-X3"]
-    refused = [
-        # execution-mode tokens (I2, rounds 1-4)
-        "-", "-m", "-mfoo", "-magenttalk", "-c", "-cprint(1)", "--",
-        "script.py", "helper.py", "agenttalk",
-        # terminating options - run NO program at all (I2, 5th leak, this round)
-        "--version", "-V", "-h", "-?", "--help", "--help-env",
-        "--help-xoptions", "--help-all",
-        # -X's own separate-token form (no attached value) is not supported
-        "-X",
-        # deliberately excluded despite looking superficially safe
-        "-O", "-OO", "-i",
-        # invented / never-real spellings
-        "-Z", "-3", "-Q", "-Wignore",
-    ]
+    allowed = [tok for tok, expected in _PREFIX_TOKEN_AGREEMENT_TABLE if expected]
+    refused = [tok for tok, expected in _PREFIX_TOKEN_AGREEMENT_TABLE if not expected]
     harness = "\n".join([
         "$ErrorActionPreference = 'Stop'",
         helpers,
@@ -6118,6 +6148,67 @@ def test_supervisor_allowed_interpreter_prefix_token_is_exhaustive(tmp_path: Pat
     data = json.loads(out.read_text(encoding="utf-8-sig"))
     assert data["allowed"] == [True] * len(allowed), data
     assert data["refused"] == [False] * len(refused), data
+
+
+def test_python_and_powershell_prefix_allowlists_agree(tmp_path: Path) -> None:
+    """PR 98 connector, the seam finding: this argv grammar is implemented
+    TWICE - PowerShell's Test-AgenttalkAllowedInterpreterPrefixToken (used
+    at launch time) and Python's supervisor._allowed_interpreter_prefix_token
+    (used to re-parse an observed, live process's command line for
+    launcher attribution) - and a denylist-to-allowlist inversion on one
+    side is not complete until the other agrees. Unifying them is not
+    practical (one lives in an embedded PowerShell string template, the
+    other in ordinary Python; neither can call the other), so this drives
+    BOTH real implementations over the SAME shared table and asserts they
+    classify every entry identically. Python's side is consumed via its
+    actual module-level function - not redefined here, which would just be
+    a third copy of the grammar - so a real drift in either implementation
+    fails this test, not a future round.
+
+    Uses _pick_pwsh_anywhere (not the Windows-only _pick_powershell):
+    Test-AgenttalkAllowedInterpreterPrefixToken is pure string/array logic
+    with no OS-specific call in it, and pwsh is confirmed present on
+    ubuntu-latest and macos-latest runners too, so this agreement contract
+    is enforced on every CI leg, not just Windows."""
+    shell = _pick_pwsh_anywhere()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "prefix_agreement.json"
+    tokens = [token for token, _expected in _PREFIX_TOKEN_AGREEMENT_TABLE]
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        "$tokens = @(" + ",".join(_pslit(t) for t in tokens) + ")",
+        "$results = @($tokens | ForEach-Object { "
+        "Test-AgenttalkAllowedInterpreterPrefixToken $_ })",
+        "@{ results = $results } | ConvertTo-Json -Depth 3 | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    script = tmp_path / "prefix-agreement.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
+    ps_results = data["results"]
+    assert len(ps_results) == len(tokens)
+    for (token, expected), ps_accept in zip(
+        _PREFIX_TOKEN_AGREEMENT_TABLE, ps_results, strict=True,
+    ):
+        py_accept = sup._allowed_interpreter_prefix_token(token)
+        assert py_accept == expected, (
+            f"Python classifies {token!r} as {py_accept}, expected {expected}"
+        )
+        assert ps_accept == expected, (
+            f"PowerShell classifies {token!r} as {ps_accept}, expected {expected}"
+        )
+        assert py_accept == ps_accept, (
+            f"Python and PowerShell DISAGREE on {token!r}: "
+            f"Python={py_accept}, PowerShell={ps_accept}"
+        )
 
 
 def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> None:
@@ -9701,6 +9792,48 @@ def test_process_ownership_parse_agenttalk_wrap_fail_closed_matrix() -> None:
         f"python -m agenttalk --root {TEST_ROOT} wait --supervisor-launch-nonce {SUPERVISOR_NONCE} --for worker",
         sup._root_key(TEST_ROOT),
         "worker",
+    ) is False
+
+
+def test_process_ownership_parse_agenttalk_wrap_accepts_declared_prefix() -> None:
+    """PR 98 connector, the seam finding: this argv grammar is implemented
+    twice, and widening the PowerShell allowlist to accept a declared
+    interpreter-option prefix (I2) was not enough on its own -
+    _agenttalk_argv here never learned about module_args_from, so the
+    documented -Xutf8 launch config (module_args_from: 1) got nonce
+    injection and logging from the PowerShell side while this Python-side
+    re-parse of the OBSERVED, live process's command line silently
+    rejected it - disabling launcher-derived descendant attribution and
+    scoped cleanup for exactly the configuration this PR's own docs tell
+    operators to use."""
+    command_line = (
+        f"python -Xutf8 -m agenttalk --root {TEST_ROOT} wrap --for worker --loop -- codex"
+    )
+    root_key = sup._root_key(TEST_ROOT)
+    # Without the declared boundary (module_args_from omitted, the old
+    # behavior), -Xutf8 is indistinguishable from "this isn't a
+    # python -m agenttalk invocation at all" - fails closed, reproducing
+    # the documented config's real-world symptom.
+    assert sup.parse_agenttalk_wrap_invocation(command_line, root_key, "worker") is False
+    # With module_args_from declared - exactly the documented config -
+    # this must now be recognized.
+    assert sup.parse_agenttalk_wrap_invocation(
+        command_line, root_key, "worker", 1,
+    ) is True
+    # A declared boundary that does not actually hold '-m agenttalk' must
+    # still fail closed - the declaration is verified, not blindly
+    # trusted, matching Resolve-AgenttalkModuleFlagIndex's own position
+    # check on the PowerShell side.
+    assert sup.parse_agenttalk_wrap_invocation(
+        command_line, root_key, "worker", 99,
+    ) is False
+    # A prefix token not on the allowlist is refused even with a declared
+    # boundary - the allowlist applies regardless of where it points.
+    bad_prefix = (
+        f"python -Z -m agenttalk --root {TEST_ROOT} wrap --for worker --loop -- codex"
+    )
+    assert sup.parse_agenttalk_wrap_invocation(
+        bad_prefix, root_key, "worker", 1,
     ) is False
 
 
