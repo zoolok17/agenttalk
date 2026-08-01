@@ -1363,6 +1363,36 @@ def test_console_main_returns_main_result_unchanged_for_routine_exit_codes(
     assert cli.console_main(["wrap", "--for", "worker"]) == 130
 
 
+@pytest.mark.parametrize("patch_target", ["build_parser", "parse_args"])
+def test_keyboard_interrupt_before_dispatch_still_returns_130(
+    monkeypatch: pytest.MonkeyPatch, patch_target: str,
+) -> None:
+    """Round 24 connector finding: a KeyboardInterrupt raised while
+    build_parser() or parser.parse_args() is running happens BEFORE
+    main()'s own try ever started, so it used to propagate straight past
+    main() (as if main() had no exception handling at all) instead of
+    returning 130 like the contract table's KeyboardInterrupt row already
+    promises for every OTHER point in main(). Once console_main's broad
+    `except BaseException` was added (round 20), that same propagating
+    KeyboardInterrupt fell into ITS crash-reporting branch instead,
+    misreporting a Ctrl-C as an unexpected crash (return 1) rather than the
+    conventional cancellation status. The fix widens main()'s own try to
+    cover the whole function body - the SAME contract-table row now covers
+    this window too, rather than adding a second, special-cased catch in
+    console_main beside it."""
+
+    def raise_it(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    if patch_target == "build_parser":
+        monkeypatch.setattr(cli, "build_parser", raise_it)
+    else:
+        monkeypatch.setattr(argparse.ArgumentParser, "parse_args", raise_it)
+
+    assert cli.main([]) == 130
+    assert cli.console_main([]) == 130
+
+
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [

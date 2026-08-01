@@ -3408,6 +3408,21 @@ def _allowed_interpreter_prefix_token(token: str) -> bool:
         # the survey against every other -X sub-option this project knows.
         if token.startswith("-X") and token[2:].startswith("presite"):
             return False
+        # Round 24 connector finding: -W's value grammar is
+        # action:message:category:module:lineno, and warnings._getcategory
+        # IMPORTS a non-empty, dotted category (module, _, klass =
+        # category.rpartition('.'); __import__(module)) before -m agenttalk
+        # is ever reached - the same before-main, execution-mode-changing
+        # property as -X presite, just reachable through -W's own attached
+        # value instead of a sub-option. An empty category (no 3rd field,
+        # or an empty one) or a category with no dot never reaches that
+        # import branch (empty -> the default Warning class; no dot -> a
+        # plain attribute lookup on the builtins module) - refuse only the
+        # shape that actually imports.
+        if token.startswith("-W"):
+            parts = token[2:].split(":")
+            if len(parts) > 2 and "." in parts[2]:
+                return False
         return True
     return False
 
@@ -9219,7 +9234,21 @@ function Test-AgenttalkAllowedInterpreterPrefixToken([string]$token) {
   #       warning the launched code triggers becomes a crash instead of a
   #       log line - a launch-configuration risk for the operator to own,
   #       the same category as -S's and -E's own NOTE above, not a
-  #       security bypass of this check.
+  #       security bypass of this check. ROUND 24 CONNECTOR FINDING,
+  #       PROVEN not reasoned: -W's value grammar is
+  #       action:message:category:module:lineno, and
+  #       warnings._getcategory IMPORTS a non-empty, DOTTED category
+  #       (module, _, klass = category.rpartition('.');
+  #       __import__(module)) before -m agenttalk is ever reached - the
+  #       same before-main, execution-mode-changing property as -X
+  #       presite, just reachable through -W's own attached value instead
+  #       of a sub-option. Confirmed with `PYTHONPATH=. python3
+  #       -Wignore::evil.W -c "..."`: evil's top-level code runs before
+  #       the -c body does. An empty category (no 3rd field, or an empty
+  #       one) or a category with no dot never reaches that import branch
+  #       (empty -> the default Warning class; no dot -> a plain
+  #       attribute lookup on the builtins module, not an import) - the
+  #       refusal below is scoped to exactly the shape that imports.
   #
   # Deliberately excluded despite looking superficially safe:
   #   -O/-OO strips `assert` statements, and this codebase has already
@@ -9261,6 +9290,15 @@ function Test-AgenttalkAllowedInterpreterPrefixToken([string]$token) {
     if ($token.StartsWith('-X', [StringComparison]::Ordinal) -and
         $token.Substring(2) -clike 'presite*') {
       return $false
+    }
+    if ($token.StartsWith('-W', [StringComparison]::Ordinal)) {
+      # See the -W bullet above: refuse only when a category field (the
+      # 3rd colon-separated component of the value) is present AND
+      # dotted - that is the exact shape warnings._getcategory imports.
+      $categoryField = $token.Substring(2).Split(':')
+      if ($categoryField.Count -gt 2 -and $categoryField[2].Contains('.')) {
+        return $false
+      }
     }
     return $true
   }

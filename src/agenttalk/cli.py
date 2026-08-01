@@ -14928,22 +14928,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # On Windows the default console code page (cp1252) can't encode many
-    # characters that turn up in agent messages (arrows, em-dashes, etc.).
-    # Force UTF-8 on stdout/stderr so writes don't raise UnicodeEncodeError.
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-            except (ValueError, OSError):
-                pass
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    # Handle --here on init
-    if getattr(args, "cmd", None) == "init" and getattr(args, "here", False) and not args.path:
-        args.path = str(Path.cwd())
+    # Round 24 connector finding: this try used to wrap only args.func(args),
+    # so a KeyboardInterrupt during build_parser()/parse_args() - before this
+    # try ever started - propagated straight past main() (exiting 130 at
+    # Python's own top level, the conventional cancellation status). Once
+    # console_main's broad `except BaseException` was added (round 20), that
+    # same propagating KeyboardInterrupt fell into ITS crash-reporting branch
+    # instead, misreporting a Ctrl-C as an unexpected crash (return 1). Fixed
+    # by widening the try to cover the whole function body - the SAME
+    # KeyboardInterrupt row already in the contract table now covers this
+    # window too, rather than adding a second, special-cased catch in
+    # console_main beside it.
     try:
+        # On Windows the default console code page (cp1252) can't encode
+        # many characters that turn up in agent messages (arrows,
+        # em-dashes, etc.). Force UTF-8 on stdout/stderr so writes don't
+        # raise UnicodeEncodeError.
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                try:
+                    reconfigure(encoding="utf-8", errors="replace")
+                except (ValueError, OSError):
+                    pass
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        # Handle --here on init
+        if getattr(args, "cmd", None) == "init" and getattr(args, "here", False) and not args.path:
+            args.path = str(Path.cwd())
         return args.func(args)
     except KeyboardInterrupt:
         sys.stderr.write("\nagenttalk: interrupted\n")

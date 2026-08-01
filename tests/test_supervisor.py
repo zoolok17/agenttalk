@@ -6745,6 +6745,32 @@ _PREFIX_TOKEN_AGREEMENT_TABLE: list[tuple[str, bool]] = [
     # first few characters must still be allowed - the denial is scoped to
     # "presite" itself, not to a broad "-Xpre*" family.
     ("-Xpreflight", True),
+    # round 24 connector finding, PROVEN by running it: -Wignore::evil.W
+    # imports 'evil' (warnings._getcategory: category.rpartition('.') then
+    # __import__(module)) before -m agenttalk is ever reached - the same
+    # before-main property as -X presite=, just reachable through -W's own
+    # attached-value grammar (action:message:category:module:lineno)
+    # instead of a sub-option. Refuse whenever a category field (the 3rd
+    # colon-separated component) is present and dotted, regardless of
+    # action or how many trailing fields follow it.
+    ("-Wignore::evil.W", False), ("-Werror::evil.W", False),
+    ("-Wignore:msg:evil.W", False), ("-Wignore:msg:evil.W:mod:5", False),
+    # a category with NO dot never reaches _getcategory's import branch -
+    # only a plain attribute lookup on the builtins module - so this stays
+    # allowed even though a category field is present.
+    ("-Wignore::UserWarning", True), ("-Wignore::DeprecationWarning", True),
+    # a dot in the MESSAGE field (index 1, not the category field at index
+    # 2) never reaches the import branch at all - only 2 colon-separated
+    # parts means there IS no category field yet.
+    ("-Wignore:some.message.text", True),
+    # a dot in the MODULE field (index 3, used only as a regex match
+    # against the emitting frame's __name__, never imported) with a
+    # dot-free category must stay allowed.
+    ("-Wignore::UserWarning:some.module.path:5", True),
+    # an explicit but EMPTY category field ("::" with nothing between) is
+    # falsy - _getcategory returns the default Warning class without
+    # importing anything.
+    ("-Wignore::", True),
 ]
 
 
