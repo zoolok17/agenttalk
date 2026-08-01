@@ -147,7 +147,11 @@ def test_restrictive_file_opener_bakes_0o600_into_os_open(
     recorded = {}
     real_open = os.open
 
-    def spy(path: str, flags: int, mode: int = 0o777) -> int:
+    def spy(path: str, flags: int, mode: int) -> int:
+        # No permissive default: _restrictive_file_opener always passes an
+        # explicit mode, and a stray default here (e.g. 0o777) is itself
+        # the shape CodeQL flags as an overly permissive mask on open(),
+        # whether or not this test's own call path ever reaches it.
         recorded["mode"] = mode
         return real_open(path, flags, mode)
 
