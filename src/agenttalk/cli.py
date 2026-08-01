@@ -10743,10 +10743,29 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             # whatever eventually reports it, which would otherwise let
             # the one diagnostic anyone actually wants bypass the cap and
             # the tail rotation #117 exists to provide.
+            #
+            # Round 18: propagate the ORIGINAL exception, not a converted
+            # SystemExit(1) - the same argument that made the two branches
+            # above wrong, one row down. Before this PR, an unexpected
+            # exception left main() with its original type; an embedder
+            # or test runner calling cli.main([...]) could catch it,
+            # inspect it, log it, retry. Converting to SystemExit(1) threw
+            # that away twice: it destroys the type information a caller
+            # needs, and substitutes an exception class that terminates
+            # an unhandled process instead of being caught by an ordinary
+            # except Exception. The "one known exit code for any crash"
+            # goal is a CONSOLE concern the console already gets for
+            # free - Python exits 1 on any uncaught exception regardless
+            # - so propagating the original preserves console behavior
+            # exactly while restoring the contract for embedders. main()
+            # never had a special RETURN contract for this class either
+            # (it would have let the original type propagate uncaught),
+            # so this is not a new divergence to justify - it is the
+            # STATUS QUO main() always had, kept intact.
             if not lifecycle_log.terminal_emitted:
                 lifecycle_log.wrapper_exception(exc)
                 traceback.print_exc(file=sys.stderr)
-            raise SystemExit(1) from exc
+            raise
         finally:
             del args._wrapper_lifecycle_log
         if not lifecycle_log.terminal_emitted:
