@@ -1138,6 +1138,52 @@ def test_top_level_boundary_keeps_second_traceback_within_cap_and_preserves_exce
     assert sum(path.stat().st_size for path in files) <= 4096
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (
+            ["--root", "R", "wrap", "--for", "worker", "--loop",
+             "--", "codex", "exec", "--json"],
+            True,
+        ),
+        (["--root", "R", "wrap", "--help"], False),
+        (["--root", "R", "wrap", "-h"], False),
+        # --min-interval takes a value; a dangling flag with none is a
+        # parse error (argparse exits 2) before cmd_wrap is ever reached.
+        (["--root", "R", "wrap", "--min-interval"], False),
+        (["--root", "R", "wrap", "--nonexistent-flag"], False),
+        (["--root", "R", "status"], False),
+        # A --help intended for the WRAPPED cli (after --) is captured by
+        # wrap's own REMAINDER positional and never reaches agenttalk's
+        # own -h/--help recognition.
+        (
+            ["--root", "R", "wrap", "--for", "worker", "--", "codex", "--help"],
+            True,
+        ),
+    ],
+)
+def test_resolves_to_cmd_wrap_matches_whether_argparse_actually_dispatches(
+    argv: list[str],
+    expected: bool,
+) -> None:
+    assert cli._resolves_to_cmd_wrap(argv) is expected
+
+
+def test_internal_check_wrap_dispatch_exit_code_matches_resolution_and_is_silent(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main([
+        "_internal-check-wrap-dispatch", "--",
+        "--root", "R", "wrap", "--for", "worker", "--loop", "--", "codex",
+    ]) == 0
+    assert cli.main([
+        "_internal-check-wrap-dispatch", "--", "--root", "R", "wrap", "--help",
+    ]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
 def test_cmd_wrap_records_terminating_signal_without_exception_duplicate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

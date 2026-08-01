@@ -6771,6 +6771,76 @@ def test_python_and_powershell_prefix_allowlists_agree(tmp_path: Path) -> None:
         )
 
 
+def test_supervisor_wrap_argv_reaches_cmd_wrap_asks_the_real_parser(
+    tmp_path: Path,
+) -> None:
+    """Round 19 connector finding, supervisor.py:9562's class: the first
+    non-global-option token being literally 'wrap' (Test-AgenttalkWrapInvocation)
+    proves the subcommand name, not that agenttalk's own argparse ever
+    reaches cmd_wrap with it - `wrap --help`/a parse-invalid wrap tail both
+    exit via SystemExit before cmd_wrap's bounded streams install.
+    Test-AgenttalkWrapArgvReachesCmdWrap delegates that question to a real
+    `agenttalk _internal-check-wrap-dispatch` probe instead of re-deriving
+    argparse's own grammar here - drives the ACTUAL helper (not a
+    re-implementation), pinning both the probe interpreter and PYTHONPATH so
+    the result depends on this checkout, never on what the host machine
+    happens to have on PATH."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "wrap_dispatch.json"
+    src_dir = str(Path(__file__).resolve().parents[1] / "src")
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$env:PYTHONPATH = {_pslit(src_dir)} + "
+        "[System.IO.Path]::PathSeparator + $env:PYTHONPATH",
+        helpers,
+        f"$py = {_pslit(sys.executable)}",
+        "$normal = Test-AgenttalkWrapArgvReachesCmdWrap $py $null $false "
+        "'python.exe' @('-m','agenttalk','--root','R','wrap','--for','worker') $null",
+        "$help = Test-AgenttalkWrapArgvReachesCmdWrap $py $null $false "
+        "'python.exe' @('-m','agenttalk','--root','R','wrap','--help') $null",
+        "$dashH = Test-AgenttalkWrapArgvReachesCmdWrap $py $null $false "
+        "'python.exe' @('-m','agenttalk','--root','R','wrap','-h') $null",
+        "$badFlag = Test-AgenttalkWrapArgvReachesCmdWrap $py $null $false "
+        "'python.exe' @('-m','agenttalk','--root','R','wrap','--nonexistent-flag') $null",
+        "$notWrap = Test-AgenttalkWrapArgvReachesCmdWrap $py $null $false "
+        "'python.exe' @('-m','agenttalk','--root','R','status') $null",
+        # --help meant for the WRAPPED cli, after --, is captured by wrap's
+        # own REMAINDER positional and never reaches agenttalk's -h/--help.
+        "$helpInRemainder = Test-AgenttalkWrapArgvReachesCmdWrap $py $null $false "
+        "'python.exe' @('-m','agenttalk','--root','R','wrap','--for','worker',"
+        "'--','codex','--help') $null",
+        "$unreachable = Test-AgenttalkWrapArgvReachesCmdWrap $py $null $false "
+        "'python.exe' @('helper.py','-m','agenttalk','wrap') $null",
+        "$badProbe = Test-AgenttalkWrapArgvReachesCmdWrap "
+        "'definitely-not-a-real-interpreter.exe' $null $false "
+        "'python.exe' @('-m','agenttalk','--root','R','wrap') $null",
+        "@{ normal = $normal; help = $help; dash_h = $dashH; "
+        "bad_flag = $badFlag; not_wrap = $notWrap; "
+        "help_in_remainder = $helpInRemainder; unreachable = $unreachable; "
+        "bad_probe = $badProbe } | ConvertTo-Json -Depth 3 | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    script = tmp_path / "wrap-dispatch.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert data["normal"] is True, data
+    assert data["help"] is False, data
+    assert data["dash_h"] is False, data
+    assert data["bad_flag"] is False, data
+    assert data["not_wrap"] is False, data
+    assert data["help_in_remainder"] is True, data
+    assert data["unreachable"] is False, data
+    assert data["bad_probe"] is False, data
+
+
 def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
@@ -7006,8 +7076,20 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
     fake_stderr = tmp_path / "stderr.log"
     harness = "\n".join([
         "$ErrorActionPreference = 'Stop'",
+        # Round 19: Test-AgenttalkWrapArgvReachesCmdWrap actually SPAWNS
+        # $AgenttalkPython to ask the real parser whether a candidate argv
+        # dispatches to cmd_wrap - unlike every other helper this harness
+        # exercises, which are pure string/array logic and never cared
+        # whether $AgenttalkPython/$file were real, runnable paths. A bare
+        # 'python.exe' with no PYTHONPATH of its own is not a reliable probe
+        # target (whether it resolves to a real interpreter with agenttalk
+        # importable is an accident of the host running this test, not
+        # something this harness controls) - pin both explicitly so the
+        # probe is deterministic regardless of the ambient environment.
+        f"$env:PYTHONPATH = {_pslit(str(Path(__file__).resolve().parents[1] / 'src'))} + "
+        "[System.IO.Path]::PathSeparator + $env:PYTHONPATH",
         f"$Root = {_pslit(str(tmp_path))}",
-        "$AgenttalkPython = 'python.exe'",
+        f"$AgenttalkPython = {_pslit(sys.executable)}",
         "$SrcOnPyPath = $false",
         f"$WrapperLogMaxBytes = {sup.WRAPPER_LOG_MAX_BYTES}",
         f"$WrapperLogSegments = {sup.WRAPPER_LOG_SEGMENT_COUNT}",
@@ -7094,6 +7176,16 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "$env:AGENTTALK_WRAPPER_STDOUT_LOG = 'ambient-stdout'",
         "Invoke-RegularCase 'regular_python_wrap' 'python.exe' "
         "@('-m','agenttalk','wrap') $true 'wrap'",
+        # Round 19 (connector finding, one layer up from the interpreter
+        # check): the first token after the global options is literally
+        # 'wrap' in both of these, but argparse itself exits before
+        # cmd_wrap ever installs the bounded streams - --help via its own
+        # auto-added action, the bad flag via a parse error. A profile
+        # shaped like either of these must not commit a generation.
+        "Invoke-RegularCase 'regular_wrap_help' 'python.exe' "
+        "@('-m','agenttalk','wrap','--help') $true 'wrap'",
+        "Invoke-RegularCase 'regular_wrap_invalid_flag' 'python.exe' "
+        "@('-m','agenttalk','wrap','--nonexistent-flag') $true 'wrap'",
         "Invoke-RegularCase 'regular_unbuffered_wrap' 'python.exe' "
         "@('-u','-m','agenttalk','wrap') $true 'wrap' 1",
         "Invoke-RegularCase 'regular_xoption_wrap' 'python.exe' "
@@ -7155,6 +7247,8 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
     }
     assert {row["name"] for row in rows} == {
         "regular_python_wrap",
+        "regular_wrap_help",
+        "regular_wrap_invalid_flag",
         "regular_unbuffered_wrap",
         "regular_xoption_wrap",
         "regular_no_args",

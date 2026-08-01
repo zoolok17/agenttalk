@@ -10633,6 +10633,53 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     return _wrapper_exit(0, "loop_returned")
 
 
+def _resolves_to_cmd_wrap(argv: list[str]) -> bool:
+    """True iff parsing argv through this SAME parser resolves to cmd_wrap
+    without argparse exiting first. A terminal option (bare -h/--help
+    anywhere before the wrap subcommand's own `cmd` REMAINDER capture
+    starts, e.g. `wrap --help`) or a parse-invalid tail (a missing
+    required value, an unrecognized flag) both call sys.exit before
+    cmd_wrap - hence before the wrap subcommand's bounded logging would
+    ever install - so neither should count as reaching it.
+
+    argparse itself prints usage/help or an "error: ..." line for exactly
+    those two cases as part of raising SystemExit - suppressed here so
+    probing an arbitrary candidate argv (untrusted launch config, not a
+    real invocation) never writes anything to this process's own
+    stdout/stderr as a side effect of merely checking it.
+    """
+    parser = build_parser()
+    try:
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            args = parser.parse_args(argv)
+    except SystemExit:
+        return False
+    return getattr(args, "func", None) is cmd_wrap
+
+
+def cmd_internal_check_wrap_dispatch(args: argparse.Namespace) -> int:
+    """Supervisor-only probe, never documented as a stable CLI surface: exit
+    0 iff the given argv would dispatch to cmd_wrap, 1 otherwise. No
+    stdout/stderr output and no side effects - parsing argv does not call
+    args.func, only inspects what it resolves to.
+
+    Exists so the supervisor can ask this parser directly whether a
+    candidate launch argv actually reaches the wrap subcommand, instead of
+    re-deriving argparse's own grammar (nargs=REMAINDER's auto --help
+    recognition, required-value errors, subparser dispatch) in PowerShell -
+    the same class of leak this project has already paid for once at the
+    interpreter layer (module_args_from), and the reason to prefer asking
+    the real parser here rather than repeating that.
+    """
+    tail = list(args.argv or [])
+    if tail and tail[0] == "--":
+        tail = tail[1:]
+    return 0 if _resolves_to_cmd_wrap(tail) else 1
+
+
 def cmd_wrap(args: argparse.Namespace) -> int:
     """Install supervisor-authenticated logging before wrapper setup begins."""
     from .wrapper_logs import (
@@ -14251,6 +14298,13 @@ def build_parser() -> argparse.ArgumentParser:
                             "never -s workspace-write` (loop) or `-- codex ... exec "
                             "--json \"...\"` (one-shot).")
     pwrap.set_defaults(func=cmd_wrap)
+
+    pcheckwrap = sub.add_parser(
+        "_internal-check-wrap-dispatch",
+        help=argparse.SUPPRESS,
+    )
+    pcheckwrap.add_argument("argv", nargs=argparse.REMAINDER)
+    pcheckwrap.set_defaults(func=cmd_internal_check_wrap_dispatch)
 
     pdl = sub.add_parser(
         "dead-letter",

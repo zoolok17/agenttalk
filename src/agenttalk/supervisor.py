@@ -9520,21 +9520,35 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce, $moduleArgsFrom = $null
   }
   return $unsupported
 }
+function Resolve-AgenttalkOwnArgvIndex($file, [object[]]$argTokens, $moduleArgsFrom = $null) {
+  # Shared by both wrap-eligibility checks below (which token is the
+  # subcommand, and whether the tail from there actually dispatches to
+  # cmd_wrap): the index where agenttalk's OWN argv begins - after `-m
+  # agenttalk` for a python-stem launch, or 0 for a direct agenttalk exe.
+  # Returns -1 if this launch's argv never reaches agenttalk's parser at
+  # all (same fail-closed convention as Resolve-AgenttalkModuleFlagIndex).
+  #
+  # NOTE: the parameter is NOT named $args, same reason as
+  # Resolve-AgenttalkModuleFlagIndex's own note - PowerShell's automatic
+  # $args variable silently shadows a same-named formal parameter, and the
+  # function then sees an empty list regardless of what the caller passed.
+  $stem = File-StemLower ([string]$file)
+  if ($stem -in @('python','python3','py')) {
+    $flagIndex = Resolve-AgenttalkModuleFlagIndex $argTokens $moduleArgsFrom
+    if ($flagIndex -lt 0) { return -1 }
+    return $flagIndex + 2
+  }
+  $leaf = File-LeafLower ([string]$file)
+  if ($leaf -notin @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
+    return -1
+  }
+  return 0
+}
 function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFrom = $null) {
   if (-not $nonceResult.injected) { return $false }
   $args = @($argv)
-  $index = 0
-  $stem = File-StemLower ([string]$file)
-  if ($stem -in @('python','python3','py')) {
-    $flagIndex = Resolve-AgenttalkModuleFlagIndex $args $moduleArgsFrom
-    if ($flagIndex -lt 0) { return $false }
-    $index = $flagIndex + 2
-  } else {
-    $leaf = File-LeafLower ([string]$file)
-    if ($leaf -notin @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
-      return $false
-    }
-  }
+  $index = Resolve-AgenttalkOwnArgvIndex $file $args $moduleArgsFrom
+  if ($index -lt 0) { return $false }
   # The CLI has two value-taking global options. The first remaining token is
   # the subcommand; only a literal `wrap` there may receive the cooperative
   # byte-bound log capability.
@@ -9562,6 +9576,44 @@ function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFro
     return $token -ceq 'wrap'
   }
   return $false
+}
+function Test-AgenttalkWrapArgvReachesCmdWrap($probePython, $root, $srcOnPyPath, $file, $argv, $moduleArgsFrom = $null) {
+  # Round 19: knowing the tail's first token is literally 'wrap'
+  # (Test-AgenttalkWrapInvocation) proves the subcommand name, not that
+  # agenttalk's OWN argparse ever actually reaches cmd_wrap with it -
+  # `wrap --help`/`wrap -h`/any parse-invalid wrap tail (an unrecognized
+  # flag, a value-taking flag with none) all call sys.exit from inside
+  # argparse BEFORE cmd_wrap installs the bounded streams, exactly like
+  # `wrap` does not, and this call site had no way to tell those apart.
+  #
+  # Same disease as the interpreter layer (which tokens mean CPython never
+  # reaches -m agenttalk), one parser over - but a different remedy: that
+  # layer had no way to ask CPython directly, so the interpreter-prefix
+  # allowlist above is a deliberate, maintained model of its grammar.
+  # agenttalk's own parser is this project's code and can be asked
+  # directly instead of modeled a third time (module_args_from's own
+  # comment: two hand-modeled attempts at CPython's grammar already
+  # leaked this week) - so this delegates to a real `agenttalk
+  # _internal-check-wrap-dispatch` probe rather than re-deriving
+  # argparse's nargs=REMAINDER/help/error-exit behavior here.
+  $args = @($argv)
+  $index = Resolve-AgenttalkOwnArgvIndex $file $args $moduleArgsFrom
+  if ($index -lt 0) { return $false }
+  $tail = if ($index -lt $args.Count) { @($args[$index..($args.Count - 1)]) } else { @() }
+  if (-not $probePython) { return $false }
+  $savedPP = $env:PYTHONPATH
+  if ($srcOnPyPath) { $env:PYTHONPATH = (Join-Path $root 'src') + ';' + $env:PYTHONPATH }
+  try {
+    & $probePython -m agenttalk '_internal-check-wrap-dispatch' '--' @tail *>$null
+    return $LASTEXITCODE -eq 0
+  } catch {
+    # A probe that cannot even run (bad interpreter path, etc.) proves
+    # nothing about whether cmd_wrap is reachable - fail closed rather than
+    # grant the logging capability on an unconfirmed guess.
+    return $false
+  } finally {
+    if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
+  }
 }
 function Preflight($name, $plan, $file, $codexHome) {
   # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
@@ -10594,7 +10646,8 @@ function Launch($name, $plan, $codexHome) {
   $shouldLog = (
     [bool]$a.wrapped -and
     $plan.launch_mode -eq 'wrap' -and
-    (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom)
+    (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom) -and
+    (Test-AgenttalkWrapArgvReachesCmdWrap $AgenttalkPython $Root $SrcOnPyPath $file $argv $moduleArgsFrom)
   )
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
@@ -10705,7 +10758,10 @@ function Launch-Spec($name, $spec, $codexHome) {
   $launchNonce = [guid]::NewGuid().ToString('N')
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
   $argv = @($nonceResult.argv)
-  $shouldLog = Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom
+  $shouldLog = (
+    (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom) -and
+    (Test-AgenttalkWrapArgvReachesCmdWrap $AgenttalkPython $Root $SrcOnPyPath $file $argv $moduleArgsFrom)
+  )
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
   } else { $null }
