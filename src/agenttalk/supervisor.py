@@ -2056,6 +2056,22 @@ def _filetime_of(row: dict | None) -> str | None:
     return None
 
 
+def _filetime_start_token(value: object) -> str | None:
+    """Render exact Windows creation ticks as a comparable ISO start token."""
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[1-9][0-9]{0,19}", value) is None
+    ):
+        return None
+    try:
+        seconds = (int(value) / 10_000_000.0) - 11_644_473_600
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def _filetime_identity_matches(row: dict | None, expected: object) -> bool:
     """Check companion FILETIME only when the row uses Windows ISO identity."""
     start_key = _start_order_key(_start_of(row))
@@ -5171,6 +5187,22 @@ def _wrapped_liveness(
     candidate = None
     launcher_pid = record.get("cli_launcher_pid")
     launcher_start = record.get("cli_launcher_start")
+    launcher_lifetime = record.get("cli_launcher_lifetime")
+    ownership_record = record
+    if (
+        launcher_start is None
+        and isinstance(launcher_lifetime, dict)
+        and launcher_lifetime.get("source")
+        == runtime_obs.LAUNCHER_LIFETIME_SOURCE
+    ):
+        launcher_start = _filetime_start_token(
+            launcher_lifetime.get("creation_filetime")
+        )
+        if launcher_start is not None:
+            # The retained handle is stronger than the racy secondary PID
+            # lookup. Normalize only this planner copy; the runtime evidence
+            # remains an exact creation/exit certificate.
+            ownership_record = {**record, "cli_launcher_start": launcher_start}
     if phase == runtime_obs.PHASE_ACTIVE and (
         not isinstance(launcher_pid, int)
         or not isinstance(launcher_start, str)
@@ -5195,7 +5227,7 @@ def _wrapped_liveness(
     tree, kill_targets, tree_error = _owned_process_tree(
         snapshot,
         st=st,
-        record=record,
+        record=ownership_record,
         wrapper_row=wrapper_row,
         brain_row=candidate,
         agent=agent,

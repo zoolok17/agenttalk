@@ -8681,6 +8681,87 @@ def test_owned_process_tree_exact_launcher_lifetime_proves_first_forked_child() 
     assert plan["action"] == sup.RELAUNCH
 
 
+def test_owned_process_tree_exact_launcher_lifetime_replaces_missing_start_token() -> None:
+    snapshot = _codex_forked_brain_snap()
+    snapshot.launcher_lifetime = {
+        "source": wrt.LAUNCHER_LIFETIME_SOURCE,
+        "creation_filetime": "134276232316000000",
+        "exit_filetime": "134276232317500000",
+    }
+    snapshot[1]["start_filetime"] = "134276232317000000"
+    runtime = _wrapper_runtime_view(
+        phase="active",
+        launcher_pid=WRAP_CHILD_PID,
+        progress_sequence=2,
+    )
+    runtime["record"]["cli_launcher_start"] = None
+
+    plan = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-certified-missing-start"),
+            wrapper_runtime=runtime,
+        ),
+        {
+            "agents": {
+                "worker": _wrap_ready(
+                    runtime_wrapper_generation="wrapper-1",
+                    backoff_next_epoch=0,
+                )
+            }
+        },
+        snapshot=snapshot,
+    )
+
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    launcher = next(
+        entry for entry in tree["entries"] if entry["role"] == "cli_launcher"
+    )
+    assert sup._start_tokens_match(  # noqa: SLF001
+        launcher["start"], WRAP_CHILD_START
+    )
+    assert launcher["start_filetime"] == snapshot.launcher_lifetime[
+        "creation_filetime"
+    ]
+    assert [target["pid"] for target in plan["kill_targets"]] == [
+        WRAP_LAUNCHER_PID,
+        WRAP_TUI_PID,
+    ]
+    assert plan["action"] == sup.RELAUNCH
+
+
+def test_owned_process_tree_missing_launcher_identity_without_certificate_is_hold() -> None:
+    snapshot = list(_codex_forked_brain_snap())
+    runtime = _wrapper_runtime_view(
+        phase="active",
+        launcher_pid=WRAP_CHILD_PID,
+        progress_sequence=2,
+    )
+    runtime["record"]["cli_launcher_start"] = None
+
+    plan = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-uncertified-missing-start"),
+            wrapper_runtime=runtime,
+        ),
+        {
+            "agents": {
+                "worker": _wrap_ready(
+                    runtime_wrapper_generation="wrapper-1",
+                    backoff_next_epoch=0,
+                )
+            }
+        },
+        snapshot=snapshot,
+    )
+
+    assert plan["state"] == "PROCESS_TREE_INVALID"
+    assert plan["next_state"]["owned_process_tree"]["reason_code"] == (
+        "process_tree_invalid_launcher_identity_unavailable"
+    )
+    assert plan["kill_targets"] == []
+
+
 def test_owned_process_tree_recycled_launcher_ignores_foreign_children() -> None:
     snapshot = [
         _wrap_snap()[0],
