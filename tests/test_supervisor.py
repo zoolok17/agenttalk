@@ -2272,7 +2272,7 @@ def test_supervise_bootstrap_check_rejects_ambient_provider_key_for_qwen(
 
 def test_supervisor_template_checks_qwen_secrets_before_agent_env() -> None:
     ps = sup.PS_TEMPLATE
-    profile_check = ps.index("backend_profile -eq 'ovh-qwen'")
+    profile_check = ps.index("backend_profile -ceq 'ovh-qwen'")
     agent_env = ps.index("if ($a.env)")
     assert profile_check < agent_env
     assert "OVH_KEY" in ps[profile_check:agent_env]
@@ -2401,7 +2401,7 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     # not fail closed on a checkout where agenttalk is not globally installed.
     pf = ps[ps.index("function Preflight"):]
     pf = pf[:pf.index("\n:supervisorPoll do {")]             # before the poll body
-    ci = pf.index("$plan.cli -eq 'codex'")
+    ci = pf.index("$plan.cli -ceq 'codex'")
     codex_branch = pf[ci:pf.index("} else {", ci)]          # from codex to the codex/claude divider
     assert "'src') + ';' + $env:PYTHONPATH" in codex_branch
     # 0.31.1: the non-wrapped Codex preflight is the PLAIN import gate under the
@@ -6133,6 +6133,12 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "$py = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','R','wrap') $nonce",
         "$console = Add-SupervisorLaunchNonce 'agenttalk.exe' @('--root','R','wrap') $nonce",
         "$wait = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','R','wait') $nonce",
+        # PR 98 connector, supervisor.py:6483's class: argparse rejects
+        # 'WRAP' as an unrecognized subcommand - it must not be treated as
+        # 'wrap' here either, or the capability is granted to a launch the
+        # real CLI never actually executes.
+        "$upperCaseWrap = Add-SupervisorLaunchNonce 'python.exe' "
+        "@('-m','agenttalk','--root','R','WRAP') $nonce",
         "$rootNamedWrap = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','wrap','wait') $nonce",
         "$scriptPrefix = Add-SupervisorLaunchNonce 'python.exe' "
         "@('helper.py','-m','agenttalk','--root','R','wrap') $nonce",
@@ -6205,6 +6211,9 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
         "py_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $py.argv $py); "
         "console_wrap = (Test-AgenttalkWrapInvocation 'agenttalk.exe' $console.argv $console); "
         "wait_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $wait.argv $wait); "
+        "upper_case_wrap = $upperCaseWrap; "
+        "upper_case_wrap_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
+        "$upperCaseWrap.argv $upperCaseWrap); "
         "script_prefix = $scriptPrefix; "
         "script_prefix_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
         "$scriptPrefix.argv $scriptPrefix); "
@@ -6243,6 +6252,11 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     assert data["py_wrap"] is True
     assert data["console_wrap"] is True
     assert data["wait_wrap"] is False
+    # 'WRAP' is not 'wrap' to argparse - nonce injection succeeds (it does
+    # not care about the subcommand), but the wrap-invocation check itself
+    # must refuse it, exactly like the connector's supervisor.py:6483 finding.
+    assert data["upper_case_wrap"]["injected"] is True
+    assert data["upper_case_wrap_wrap"] is False
     assert data["root_value_wrap"] is False
     assert data["script_prefix"]["injected"] is False
     assert data["script_prefix_wrap"] is False
@@ -6940,8 +6954,17 @@ def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_p
         "'Altair','--cli','codex','--loop','--','codex.exe')",
         "$alreadyRooted = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','--root','R','wrap','--for','Vega','--loop')",
         "$nonWrap = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','wait','--for','Cygnus')",
+        # Case-sensitivity sweep (PR 98 connector, supervisor.py:6483's
+        # class): argparse would reject 'WRAP'/'--ROOT' as unrecognized -
+        # this helper must not treat them as the real 'wrap'/'--root'
+        # either, or it backfills --root into argv the CLI would refuse.
+        "$upperCaseWrap = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','WRAP','--for','Cygnus')",
+        "$upperCaseRootAlreadyPresent = Ensure-AgenttalkWrapRootArg "
+        "@('-m','agenttalk','--ROOT','R','wrap','--for','Vega')",
         "@{ legacyPy = $legacyPy; legacyConsole = $legacyConsole; "
-        "alreadyRooted = $alreadyRooted; nonWrap = $nonWrap } | ConvertTo-Json -Depth 6 | "
+        "alreadyRooted = $alreadyRooted; nonWrap = $nonWrap; "
+        "upperCaseWrap = $upperCaseWrap; "
+        "upperCaseRootAlreadyPresent = $upperCaseRootAlreadyPresent } | ConvertTo-Json -Depth 6 | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
     hp = tmp_path / "wrap_root.ps1"
@@ -6954,6 +6977,19 @@ def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_p
     assert data["legacyConsole"][:3] == ["--root", str(tmp_path), "wrap"]
     assert data["alreadyRooted"][:5] == ["-m", "agenttalk", "--root", "R", "wrap"]
     assert data["nonWrap"] == ["-m", "agenttalk", "wait", "--for", "Cygnus"]
+    # 'WRAP' is not 'wrap' to argparse - no insertion point is found, so
+    # the argv passes through unchanged (not backfilled as if it matched).
+    assert data["upperCaseWrap"] == ["-m", "agenttalk", "WRAP", "--for", "Cygnus"]
+    # '--ROOT' is not '--root' to argparse either - the scan does not
+    # recognize it as already having a root, but it also does not
+    # mis-detect the literal lowercase 'wrap' three tokens later as
+    # something to insert before without a root, since one search finds
+    # 'wrap' as the insertion point and inserts --root before it
+    # regardless of the (unrecognized) '--ROOT' token earlier - proving
+    # the '--ROOT' token was correctly NOT treated as already covering it.
+    assert data["upperCaseRootAlreadyPresent"][:6] == [
+        "-m", "agenttalk", "--ROOT", "R", "--root", str(tmp_path),
+    ]
 
 
 def test_launch_rechecks_kill_switch_after_branch_guard(tmp_path: Path) -> None:

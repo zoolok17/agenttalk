@@ -6288,19 +6288,23 @@ function Ensure-AgenttalkWrapRootArg($argv, $moduleArgsFrom = $null) {
   $wrapIndex = -1
   $i = $scan
   while ($i -lt $args.Count) {
+    # Case-sensitive throughout: these are the CLI's own global option and
+    # subcommand spellings, and argparse matches them case-sensitively -
+    # PowerShell's default -eq/-like would treat a differently-cased
+    # config token as if it matched, when the real CLI would reject it.
     $arg = [string]$args[$i]
-    if ($arg -eq '--') { break }
-    if ($arg -eq '--root') {
+    if ($arg -ceq '--') { break }
+    if ($arg -ceq '--root') {
       $rootPresent = $true
       $i += 2
       continue
     }
-    if ($arg -like '--root=*') {
+    if ($arg -clike '--root=*') {
       $rootPresent = $true
       $i += 1
       continue
     }
-    if ($arg -eq 'wrap') {
+    if ($arg -ceq 'wrap') {
       $wrapIndex = $i
       break
     }
@@ -6361,12 +6365,19 @@ function Test-WrappedBaseCli($name) {
     return $false
   }
   $base = [string]$args[$sep + 1]
+  # Deliberately case-insensitive: this is a FAIL-CLOSED refusal, not a
+  # capability grant - matching more spellings of an unfilled scaffold
+  # placeholder (REPLACE:/replace:/etc.) only widens what gets refused. A
+  # config that never had this placeholder is unaffected either way.
   if (-not $base -or $base -like 'REPLACE:*') {
     Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped launch CLI tail is not filled in; NOT launching (fail closed)" -f $name)
     return $false
   }
   $cmd = Get-Command $base -ErrorAction SilentlyContinue
   $resolved = if ($cmd) { $cmd.Source } else { $base }
+  # Deliberately case-insensitive: pre-lowercased via ToLowerInvariant, for
+  # the same reason as File-LeafLower/File-StemLower - a file EXTENSION is
+  # Windows filesystem semantics, not an argv/config token the CLI parses.
   $ext = [IO.Path]::GetExtension([string]$resolved).ToLowerInvariant()
   if ($ext -in @('.cmd','.bat','.ps1')) {
     Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped launch CLI tail resolves to shim '{1}', not a native executable; NOT launching (fail closed)" -f $name, $resolved)
@@ -6379,6 +6390,13 @@ function Test-WrappedBaseCli($name) {
   return $true
 }
 function File-LeafLower([string]$path) {
+  # Deliberately case-insensitive (pre-lowercased, then compared against
+  # all-lowercase literals wherever this is used): unlike argv/config
+  # tokens the CLI's own argparse matches case-sensitively, an executable
+  # NAME is resolved through the Windows filesystem/PATH, which is itself
+  # case-insensitive - `Python.EXE` and `python.exe` are the same file to
+  # Windows. Sensitizing this would make the supervisor MISS a real
+  # python.exe/agenttalk.exe launch that Windows itself would run fine.
   try { return ([IO.Path]::GetFileName($path)).ToLowerInvariant() }
   catch { return ([string]$path).ToLowerInvariant() }
 }
@@ -6398,8 +6416,12 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce, $moduleArgsFrom = $null
   if (-not $nonce) { return $unsupported }
   foreach ($token in $args) {
     $text = [string]$token
-    if ($text -eq '--supervisor-launch-nonce' -or
-        $text -like '--supervisor-launch-nonce=*') {
+    # Case-sensitive: this is the CLI's own reserved global option
+    # spelling, which argparse matches case-sensitively. A differently
+    # cased look-alike is not the real option to argparse either, so
+    # treating it as a collision here would refuse an ordinary token.
+    if ($text -ceq '--supervisor-launch-nonce' -or
+        $text -clike '--supervisor-launch-nonce=*') {
       # This is a supervisor-owned capability. Accepting an operator-supplied
       # duplicate would let argparse's last-value-wins behavior desynchronize
       # the CLI nonce from the logging environment and leave a direct redirect
@@ -6468,19 +6490,28 @@ function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFro
   # The CLI has two value-taking global options. The first remaining token is
   # the subcommand; only a literal `wrap` there may receive the cooperative
   # byte-bound log capability.
+  #
+  # Case-sensitive throughout this scan: argparse matches its own global
+  # options and subcommands case-sensitively, so a configured "WRAP" (or
+  # "--Root") is invalid argv to the real CLI - it would be rejected as an
+  # unrecognized argument, never reach the wrap subcommand, and never
+  # actually redirect anything. Matching it here as though it WERE 'wrap'
+  # granted the logging capability (nonce injection, generation commit) to
+  # a launch that CPython's own argparse would refuse - the same class of
+  # leak as I2's execution-mode prefix, one call site over.
   while ($index -lt $args.Count) {
     $token = [string]$args[$index]
-    if ($token -in @('--root','--supervisor-launch-nonce')) {
+    if ($token -cin @('--root','--supervisor-launch-nonce')) {
       if (($index + 1) -ge $args.Count) { return $false }
       $index += 2
       continue
     }
-    if ($token -like '--root=*' -or
-        $token -like '--supervisor-launch-nonce=*') {
+    if ($token -clike '--root=*' -or
+        $token -clike '--supervisor-launch-nonce=*') {
       $index += 1
       continue
     }
-    return $token -eq 'wrap'
+    return $token -ceq 'wrap'
   }
   return $false
 }
@@ -6489,6 +6520,12 @@ function Preflight($name, $plan, $file, $codexHome) {
   # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
   # the launch grace in a relaunch loop. Returns $true on success.
   try {
+    # Deliberately case-insensitive (here and every other launch_mode
+    # comparison): launch_mode is never operator-authored config text - it
+    # is a fixed string _launch_detail computes and writes itself
+    # ("wrap"/"fresh"/"resume"), an internal protocol value between our
+    # own Python and PowerShell with no external input path, unlike cli/
+    # backend_profile which pass a raw config field through verbatim.
     if ($plan.launch_mode -eq 'wrap') {
       # WRAPPED agent: $file is the PYTHON wrapper exe (it runs `agenttalk wrap
       # --loop`), NOT the CLI. Smoke-test both the configured wrapper python and
@@ -6512,7 +6549,12 @@ function Preflight($name, $plan, $file, $codexHome) {
       if (-not (Test-WrappedBaseCli $name)) { return $false }
       return $true
     }
-    if ($plan.cli -eq 'codex') {
+    # Case-sensitive: cli is passed through from config verbatim
+    # (cfg_agent.get("cli", "claude")), and the bootstrap validator's own
+    # Python check (`cli_name not in _BOOTSTRAP_SUPPORTED_CLIS`) is
+    # case-sensitive too - a config value the validator would reject
+    # should not be silently treated as a match here.
+    if ($plan.cli -ceq 'codex') {
       # Plain import hard gate under the Codex launch env: set the seeded CODEX_HOME
       # + PYTHONPATH (src on a checkout, the SAME way Launch() does) and run
       # `AGENTTALK_PY -m agenttalk --version` - exactly how the supervised agent reaches
@@ -6890,12 +6932,24 @@ function Start-WrapperProcess([hashtable]$startArgs) {
     # inheritance. Use an explicit three-handle allowlist so a long-lived
     # wrapper cannot retain the supervisor caller's capture pipes or locks.
     $startCommand = Get-Command Start-Process -ErrorAction Stop
+    # Deliberately case-insensitive: CommandType is a .NET CommandTypes
+    # enum from Get-Command's own reflection over Start-Process, not any
+    # form of caller/config input - there is no alternate spelling for
+    # PowerShell to have produced here.
     if ($startCommand.CommandType -eq 'Cmdlet' -and
         (Initialize-WrapperLogLauncherType)) {
       try {
         $argumentLine = if ($startArgs.ContainsKey('ArgumentList')) {
           [string]$startArgs.ArgumentList
         } else { '' }
+        # Deliberately case-insensitive: $window is config-supplied
+        # (window_style), but it is also handed to Start-Process's own
+        # -WindowStyle parameter on the fallback path below, whose .NET
+        # enum binding is inherently case-insensitive ('hidden' and
+        # 'Hidden' both resolve to ProcessWindowStyle.Hidden). Matching
+        # this switch case-sensitively would make the exact-handle path
+        # disagree with the fallback's own already-case-insensitive
+        # behavior for the identical value, not close a gap.
         $window = [string]$startArgs.WindowStyle
         $showWindow = switch ($window) {
           'Hidden' { 0 }
@@ -7321,6 +7375,10 @@ function Complete-WrapperLogTargets($targets) {
     $keep += @(
       $owned |
         Where-Object {
+          # Deliberately case-insensitive: this is a FILESYSTEM PATH
+          # identity check (NTFS is case-insensitive), not an argv/config
+          # token the CLI parses - the same directory reached via a
+          # differently-cased path must still be excluded.
           [IO.Path]::GetFullPath($_.item.FullName) -ne $generationDir
         } |
         Sort-Object { $_.sort_key } -Descending |
@@ -7330,6 +7388,8 @@ function Complete-WrapperLogTargets($targets) {
   }
   foreach ($record in $owned) {
     $full = [IO.Path]::GetFullPath($record.item.FullName)
+    # Deliberately case-insensitive - same filesystem-path-identity
+    # reasoning as $keep's own construction above.
     if ($keep -contains $full) { continue }
     try {
       Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
@@ -7364,7 +7424,11 @@ function Discard-PendingWrapperLogTargets($targets) {
 function Launch($name, $plan, $codexHome) {
   if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) { return $null }
   $a = $cfg.agents.$name
-  if ($a.backend_profile -eq 'ovh-qwen') {
+  # Case-sensitive, for consistency with the bootstrap validator's own
+  # Python check (`backend_profile != 'ovh-qwen'`, case-sensitive) -
+  # a config value the validator would already reject as invalid should
+  # not silently get the ovh-qwen trust-boundary treatment here either.
+  if ($a.backend_profile -ceq 'ovh-qwen') {
     if ($env:OVH_KEY -or $env:ANTHROPIC_API_KEY) {
       Write-Warning "supervisor: agent '$name': ovh-qwen refuses ambient OVH_KEY/ANTHROPIC_API_KEY; NOT launching"
       return $null
@@ -7375,6 +7439,9 @@ function Launch($name, $plan, $codexHome) {
     }
   }
   $file = $a.launch.windows_file
+  # Deliberately case-insensitive - see Test-WrappedBaseCli's REPLACE:*
+  # check: a fail-closed refusal only gets safer by matching more
+  # spellings of the unfilled scaffold placeholder.
   if (-not $file -or $file -like 'REPLACE:*') {
     Write-Warning "supervisor: agent '$name' has no real launch.windows_file (the agent EXECUTABLE) - fill supervisor.json"; return $null
   }
@@ -7385,16 +7452,21 @@ function Launch($name, $plan, $codexHome) {
   # (NOT string interpolation): each token is exactly one argument and nothing
   # needs quoting. On a FRESH Claude launch a '{SESSION_ID}' token is still
   # present -> mint + substitute a uuid; Codex has none (it doesn't pin).
+  # Case-sensitive: these placeholder tokens are a supervisor convention
+  # documented and typed by the operator exactly as {SESSION_ID}/
+  # {SESSION_ARGS} - session_args is overridable per-agent config, and a
+  # differently-cased typo should surface as a literal, unsubstituted
+  # argv token (visibly wrong) rather than silently matching anyway.
   $sid = $plan.session_id
   $tokens = @($plan.session_args)
-  if ($plan.launch_mode -eq 'fresh' -and ($tokens -contains '{SESSION_ID}')) {
+  if ($plan.launch_mode -eq 'fresh' -and ($tokens -ccontains '{SESSION_ID}')) {
     $sid = [guid]::NewGuid().ToString()
-    $tokens = $tokens | ForEach-Object { if ($_ -eq '{SESSION_ID}') { $sid } else { $_ } }
+    $tokens = $tokens | ForEach-Object { if ($_ -ceq '{SESSION_ID}') { $sid } else { $_ } }
   }
   $argv = @()
   $cwdToken = if ($a.cwd) { [string]$a.cwd } else { '' }
   foreach ($x in @($a.launch.windows_args)) {
-    if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
+    if ($x -ceq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
   }
   $moduleArgsFrom = $a.launch.module_args_from
   $argv = @(Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom)
@@ -7417,6 +7489,9 @@ function Launch($name, $plan, $codexHome) {
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
+  # Deliberately case-insensitive - see Start-WrapperProcess's own $window
+  # switch: this value feeds the same -WindowStyle enum parameter, whose
+  # .NET binding is inherently case-insensitive on the fallback path.
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
   foreach ($reserved in $WrapperLogEnvKeys) {
@@ -7496,6 +7571,9 @@ function Launch($name, $plan, $codexHome) {
 function Launch-Spec($name, $spec, $codexHome) {
   if (-not (Assert-ActionsEnabled ("launch-spec {0}" -f $name))) { return $null }
   $file = $spec.launch.windows_file
+  # Deliberately case-insensitive - see Test-WrappedBaseCli's REPLACE:*
+  # check: a fail-closed refusal only gets safer by matching more
+  # spellings of the unfilled scaffold placeholder.
   if (-not $file -or $file -like 'REPLACE:*') {
     Write-Warning "supervisor: ephemeral '$name' has no real launch.windows_file - fill supervisor.json ephemeral_reviewers.allowed_profiles"; return $null
   }
@@ -7517,6 +7595,9 @@ function Launch-Spec($name, $spec, $codexHome) {
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }
+  # Deliberately case-insensitive - see Start-WrapperProcess's own $window
+  # switch: this value feeds the same -WindowStyle enum parameter, whose
+  # .NET binding is inherently case-insensitive on the fallback path.
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }
   foreach ($reserved in $WrapperLogEnvKeys) {
@@ -7634,6 +7715,11 @@ $pollNum = 0
   foreach ($name in $plan.agents.PSObject.Properties.Name) {
     $p = $plan.agents.$name
     if ($DryRun) { Write-Host ("{0}: {1} ({2}) - {3}" -f $name, $p.action, $p.state, $p.reason); continue }
+    # Deliberately case-insensitive throughout this loop, and every other
+    # .action/.state comparison below: these are never operator-authored
+    # config text - they are Python's own decision-engine output, fixed
+    # named constants (e.g. eph.ACTION_NONE) with no external input path,
+    # not a config field passed through verbatim like cli/backend_profile.
     if (($p.action -ne 'none') -and (-not (Assert-ActionsEnabled ("agent {0} {1}" -f $name, $p.action)))) { continue }
     # Console action log: announce each action-taking decision (relaunch /
     # stuck_recover / clear_marker / backoff_wait) with state+reason; a steady
@@ -7684,13 +7770,15 @@ $pollNum = 0
         # merge {defaultMode} into the launch dir's .claude/settings.json. Then a
         # PREFLIGHT smoke-test in the EXACT seeded mode -> FAIL CLOSED (skip the
         # launch, do not burn the grace) on a broken config.
+        # Case-sensitive: cli is config verbatim, matching the bootstrap
+        # validator's own case-sensitive Python check - see Preflight.
         $homeEnv = $null; $seedOk = $true
-        if (($p.cli -eq 'codex') -and $p.codex_home_isolation) {
+        if (($p.cli -ceq 'codex') -and $p.codex_home_isolation) {
           $homeEnv = Seed-CodexHome $name $p.windows_sandbox
           if (-not $homeEnv) { $seedOk = $false }
         }
         $a = $cfg.agents.$name
-        if ($p.cli -eq 'claude') {
+        if ($p.cli -ceq 'claude') {
           $launchDir = if ($a.cwd) { $a.cwd } else { $Root }
           if (-not (Assert-ActionsEnabled ("seed-claude-settings {0}" -f $name))) { continue }
           & $AgenttalkCmd --root $Root supervise --seed-claude-settings --dir $launchDir --mode $p.perm_mode | Out-Null
@@ -7781,7 +7869,8 @@ $pollNum = 0
         }
         $prep = $prepText | ConvertFrom-Json
         $homeEnv = $null
-        if (($prep.cli -eq 'codex') -and $prep.codex_home_isolation) {
+        # Case-sensitive: same reasoning as Preflight/the poll loop above.
+        if (($prep.cli -ceq 'codex') -and $prep.codex_home_isolation) {
           $homeEnv = Seed-CodexHome $prep.agent $prep.windows_sandbox
           if (-not $homeEnv) {
             if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
