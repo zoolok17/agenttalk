@@ -1,6 +1,6 @@
 # Design 87-A: Supervisor classifier and recovery-authority totality
 
-**Status:** Proposed, Revision 8 with the operator-directed owned-childless
+**Status:** Proposed, Revision 9 with the operator-directed owned-childless
 wrapper authority; design only. This core and its
 [normative owned-childless module](DESIGN-87A-owned-childless-wrapper-authority.md)
 at the same commit constitute 87-A; neither is conforming alone.
@@ -71,12 +71,14 @@ not erase mandatory escalation.
   evidence, and a request-bound attended archive. It does not
   implement action-scoped
   child-creation closure, a checked continuation owner, or attempt-keyed
-  acquire/reconcile/release.
+  acquire/reconcile/release. It also does not implement a POSIX exact-token
+  kill adapter: its sole executor acts on Windows FILETIME and skips new
+  `owned_process_tree` targets without that field.
 - The **closure successor**—a separately reviewed extension to #120 or a
   successor task—owns that missing closure and the synchronous adapters needed
   to linearize its external effects with #115 checked state. Merged #120 is a
-  partial effect-side primitive, not that successor. Until a conforming
-  successor exists, a static
+  Windows-only partial effect-side primitive, not that successor. Until a
+  conforming successor exists, a static
   pre-reservation `ClosureCapabilityV1` returns `CAPABILITY_UNAVAILABLE`
   without an attempt or external call, and the dependent recovery remains
   `POLICY_HELD` pending a human. Task #78 consumes the
@@ -113,7 +115,7 @@ closure, debt, and cap contract; splitting task #120's snapshot/barrier and
 the closure-successor mechanism separately keeps platform implementation
 detail out without separating 87-A's authority.
 These independently reverified figures remain frozen historical panel
-evidence; Revision 8 does not recompute or replace them.
+evidence; Revision 9 does not recompute or replace them.
 
 **STATED non-goals:** 87-A does not specify notification routes, human receipt,
 incident retention, state-extension compatibility, executor capability
@@ -129,9 +131,10 @@ synchronization that leaves no durable helper or OS object. Neither task #120
 nor the closure successor relaxes this absolute promise. There is no
 mechanism-specific or separately versioned exception.
 
-If a platform cannot prove synchronous action-scoped closure inside that
-boundary, `ClosureCapabilityV1` is `CAPABILITY_UNAVAILABLE`. Merged #120 does
-not provide that proof, so the static pre-reservation refusal remains
+If a platform cannot prove an exact target executor or synchronous
+action-scoped closure inside that boundary, `ClosureCapabilityV1` is
+`CAPABILITY_UNAVAILABLE`. Merged #120 alone does not satisfy that conjunction,
+so the static pre-reservation refusal remains
 mandatory: create no reservation, consume no attempt, make no external call,
 perform no closure-dependent named teardown, and keep the dependent recovery
 `POLICY_HELD` with `CAPABILITY_UNAVAILABLE` pending a human. Structural
@@ -1178,14 +1181,18 @@ big-endian length plus bytes.
 
 **ENFORCED by the
 [normative module](DESIGN-87A-owned-childless-wrapper-authority.md):** The
-87-A adapter maps merged task #120's `owned_process_tree_v2` into at most 64
-exact PID/start/nonce-owned targets, requires exact Windows FILETIME where the
-merged schema does, and rejects every incomplete or incompatible snapshot. The
-closure successor separately supplies the action-scoped
+87-A adapter maps a merged task #120 Windows `owned_process_tree_v2` snapshot
+into at most 64 exact PID/start/nonce-owned targets, requires exact FILETIME for
+every live row, and rejects every incomplete or incompatible snapshot. A valid
+Linux exact token remains observation/barrier input; no macOS exact-token
+mapping is declared. No non-Windows named path constructs a destructive
+owner/target tuple or authority; each returns
+`CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` before reservation.
+The closure successor separately supplies the action-scoped
 non-destructive creation closure and effect-linearized adapters. Missing or
 unverifiable observation produces `OwnedWrapperTreeObservationV1.INCOMPLETE`;
-an unavailable successor produces `CAPABILITY_UNAVAILABLE`; a name or pattern
-never supplies ownership.
+an unavailable exact executor or successor produces `CAPABILITY_UNAVAILABLE`;
+a name or pattern never supplies ownership.
 
 ## Physical absence and launch timing
 
@@ -2190,6 +2197,10 @@ Escalation and action attention are independent boolean outputs. 87-B decides
 how to persist and deliver them. Recovery policy may narrow an action to
 `HOLD`; it cannot create teardown/replacement authority or change either
 mandatory output to false.
+When `CAPABILITY_UNAVAILABLE` is present, 87-B must join the action resolution
+to the exact matching fingerprint, name the held agent from
+`canonical_condition.agent_key`, and state that operator action is required. A
+bare enum is not a conforming operator projection.
 
 **ENFORCED manual-origin gates:** Manual origin retains current
 configuration/stand-down override, automatic-backoff bypass, readiness reset,
@@ -2476,6 +2487,11 @@ policy/execution resolution without pretending that result supplied authority.
 The normative module gives the result/code precedence.
 `action_attention_required == (action_attention_codes is nonempty)`. Neither
 field enters the banked condition fingerprint.
+For `CAPABILITY_UNAVAILABLE`, 87-B joins this resolution to the exact matching
+`RecoveryConditionV1.fingerprint`, renders
+`canonical_condition.agent_key`, and says explicitly that operator action is
+required. A projection that emits only the code or omits the agent is
+nonconforming.
 
 **ENFORCED diagnostic projection, not authority:** The shared observer also
 projects relevant and known-foreign rows into
@@ -2576,6 +2592,17 @@ the fresh final recheck immediately before spawn. No closure-dependent named
 teardown previously held by `CAPABILITY_UNAVAILABLE` becomes executable solely
 because #120 merged.
 
+That effect claim is grounded at its execution site:
+`src/agenttalk/supervisor.py:8900-8928` enters the exact destructive branch,
+while `8930-8932` skips an `owned_process_tree` target without
+`start_filetime`. The separate Linux-token acceptance paths are observation
+input, not a kill adapter. Accordingly a valid Linux-token snapshot receives
+pre-reservation
+`CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and no destructive
+tuple, authority, reservation, attempt, debt, or `Stop-Tree` call. The legacy
+rounded-start path and any weakening of the Windows FILETIME requirement remain
+forbidden.
+
 For `CONDITIONAL_POST_TEARDOWN`, the fresh post-teardown capture is also the
 final barrier. A survivor, unavailable/incomplete capture, or ambiguous
 candidate resolves the conditional to `NONE`.
@@ -2602,6 +2629,10 @@ projections are capability-active for the same supervisor generation,
 including first-managed grace and chronic snapshot-failure projection.
 Otherwise 87-C must retain shipped behavior; a silent cold-start strand is not
 an acceptable partial activation.
+87-A implementation close and 87-C activation additionally require reviewed
+87-B/follow-up operator-manual and tutorial evidence explaining that
+child-death recovery can remain indefinitely `POLICY_HELD` when capability is
+unavailable, naming the held agent, and directing the operator to act.
 
 ## Heartbeat boundary and task #116
 
@@ -2828,11 +2859,14 @@ without all of this executed evidence:
     Reload of a valid-guard standalone `SPAWN_IN_FLIGHT` is invalid and holds.
 35. Cross manual/automatic origin with confirmed whole-wrapper absence and
     child-death-sourced residue. With debt `NONE`, both select no-kill
-    `RELAUNCH_ONLY`; outstanding debt suppresses both. Recompute the module's
-    chained seven-domain vector and race nonordinary capture-ordinal
-    allocation as required by its conformance section.
+    `RELAUNCH_ONLY`; outstanding debt suppresses both. Independently construct,
+    production-encode, byte-compare, and hash the module's chained seven-domain
+    vector as required by its conformance item 20; treat its byte-flip chain as
+    change detection rather than independent codec correctness. Race
+    nonordinary capture-ordinal allocation as required by its conformance
+    section.
 36. Integrate the module's exact merged-#120 adapter and post-kill barrier
-    control. Prove an openable exact-matching planned Windows target uses one
+    control. Prove an openable exact-FILETIME planned Windows target uses one
     native handle for FILETIME verification and termination, and that every
     successful termination receives a wait attempt within the remaining shared
     tree-wide budget. Inject open failure, exact-identity mismatch, termination
@@ -2851,6 +2885,12 @@ without all of this executed evidence:
     or substituting for the closure successor. An unavailable/ambiguous barrier
     also holds, and an unblocked barrier without the typed post-action proof
     cannot clear debt or launch.
+    Feed a valid non-Windows `linux:<boot_id>:<start_ticks>` snapshot and require
+    pre-reservation
+    `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`, no destructive
+    tuple/authority, no reservation/attempt/debt, and no `Stop-Tree` call. The
+    legacy rounded-start branch and any relaxation of the Windows FILETIME
+    requirement are forbidden.
 37. Integrate every `ClosureCapabilityV1` reason before reservation and require
     zero reservation, attempt, continuation, external call, teardown, retry,
     and exhaustion with continuous `CAPABILITY_UNAVAILABLE`/`POLICY_HELD`
@@ -2860,6 +2900,8 @@ without all of this executed evidence:
     Export all applicable module attention codes in their exact order,
     including `CHILDLESS_STATE_PROVENANCE_LOST` and
     `CAPABILITY_UNAVAILABLE`, and require `action_attention_required=true`.
+    Join the exact fingerprint to `canonical_condition.agent_key`; every 87-B
+    rendering must name that agent and say operator action is required.
 
 ## Mechanism inventory
 
@@ -2890,12 +2932,14 @@ without all of this executed evidence:
 | Strict barrier is not silently partially activated | STATED for 87-C | Same-generation 87-B incident projection is an activation prerequisite. |
 | No daemon, persistence plane, durable helper or OS object, or runtime dependency | DECIDED ABSOLUTE by operator on 2026-07-31 (M5 Option A) | Pure code, existing checked state, and transient caller-owned synchronization only; there is no mechanism-specific exception, and missing conforming action-scoped closure remains `CAPABILITY_UNAVAILABLE` when that boundary cannot prove its contract. |
 | Earlier fresh-but-confirmed-absent recovery | STATED out of scope | Task #116, blocked on #115 but not #87, scheduled before 87-A implementation. |
-| Durable incident visibility/delivery | STATED out of scope | Future 87-B, dependent on tasks #114/#115. |
+| Durable incident visibility/delivery | STATED out of scope | Future 87-B, dependent on tasks #114/#115; every unavailable-capability projection names the held agent and required operator action. |
+| Operator documentation of indefinite capability holds | REQUIRED before implementation close/activation | 87-B/follow-up manual and tutorial evidence explains permanent `POLICY_HELD` availability cost and the human action required. |
 | Migration and rollback | STATED out of scope | Future 87-C after 87-A/87-B. |
 | Raw discovery stops flapping | STATED not promised | Process-discovery behavior is unchanged. |
-| Owned-childless teardown requires a nonce-owned complete tree and action-time closure | #120 INPUT DELIVERED; TEARDOWN CURRENTLY UNAVAILABLE until #115 and a conforming closure successor | Merged #120 supplies exact target/effect evidence but not action-scoped creation closure, so the named path remains `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human. |
+| Owned-childless teardown requires a nonce-owned complete tree, an exact target executor, and action-time closure | WINDOWS #120 INPUT/EFFECT DELIVERED; TEARDOWN CURRENTLY UNAVAILABLE until #115 and a conforming closure successor; POSIX executor unavailable independently | Merged #120 supplies exact Windows target/effect evidence but no POSIX exact-token executor or action-scoped creation closure, so the named path remains `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human. |
 | Child-establishment grace cannot be sampled away | ENFORCED after #115, the merged-#120 adapter, and the closure successor | Nonrenewable same-turn closed guard in observation, confirmation, reservation, and action equality. |
-| External childless calls cannot outlive their authority owner | PARTIAL #120 TARGET-LOCAL PRIMITIVE DELIVERED; full contract ENFORCED after #115 and the closure successor | For an openable exact-matching target, merged #120 binds identity-check and termination to one handle and issues a same-handle bounded wait attempt after successful termination; the exclusive effect guard, checked continuation owner/stage, stable attempt tombstones, and attempt-bound synchronous adapters remain absent. |
+| External childless calls cannot outlive their authority owner | PARTIAL WINDOWS #120 TARGET-LOCAL PRIMITIVE DELIVERED; full contract ENFORCED after #115 and the closure successor | For an openable exact-FILETIME Windows target, merged #120 binds identity-check and termination to one handle and issues a same-handle bounded wait attempt after successful termination; POSIX exact-token execution and the exclusive effect guard, checked continuation owner/stage, stable attempt tombstones, and attempt-bound synchronous adapters remain absent. |
+| POSIX named owned-childless teardown | CURRENTLY UNAVAILABLE | #120 accepts Linux exact observation tokens but declares no macOS mapping, and its sole executor skips the Linux-token target because it has no FILETIME; static `EXACT_TARGET_EXECUTOR_UNAVAILABLE` refuses every non-Windows path before target construction or reservation without weakening the Windows FILETIME guard. |
 | Partial owned-childless teardown cannot be laundered into launch | ENFORCED after #115, the merged-#120 adapter, and the closure successor | Origin-neutral durable teardown debt and debt-bound completion authority. |
 | Automatic owned-childless retry stops at three without fading from attention | ENFORCED after tasks #78/#115 | Durable childless-only cycle, hard cap, and independent action-attention output. |
 | State loss cannot reset a cap or erase teardown debt | ENFORCED after task #115 | Fail-closed quarantine until complete different-owner/extinction proof; no exact-restoration or valid-backup escape exists in this revision. |

@@ -1,6 +1,6 @@
 # Design 87-A module: owned-childless wrapper authority
 
-**Status:** Proposed, Revision 8; normative authority module of 87-A. This file
+**Status:** Proposed, Revision 9; normative authority module of 87-A. This file
 and
 [`DESIGN-87A-supervisor-classifier-authority.md`](DESIGN-87A-supervisor-classifier-authority.md)
 at the same commit form one specification. Neither is conforming alone.
@@ -29,6 +29,7 @@ This is a normative seam, not hand-waving:
 ```text
 87-A observes and classifies
   -> #120 publishes a bounded owned-tree snapshot or a closed refusal
+  -> 87-A proves an exact target executor or returns CAPABILITY_UNAVAILABLE
   -> the closure successor declares AVAILABLE or CAPABILITY_UNAVAILABLE
   -> only AVAILABLE may acquire HELD closure or a transient closed refusal
   -> 87-A constructs or refuses authority
@@ -100,7 +101,8 @@ as follows:
 | `status=complete`, `limit=64`, internally consistent counts, no omission/truncation, and valid generation/nonce | Candidate input to `OwnedWrapperTreeObservationV1.COMPLETE`; the adapter still performs the positive owner join and validates every live target against the same fresh complete raw process capture. |
 | `status=absent` | No-kill absence/barrier evidence only; never an initial owned-tree teardown authority. |
 | `status=truncated|invalid`, a non-64 limit, inconsistent counts, omitted entries, or an unreadable binding | `INCOMPLETE`; no teardown authority. |
-| Live `entries[].pid/start/start_filetime` | `OwnedTreeTargetV1.pid/start_guard` after exact live validation. On Windows the destructive guard is the positive decimal `start_filetime`; the rounded ISO `start` is capture/ordering corroboration and never substitutes for a missing FILETIME. On a platform whose exact start identity is carried directly in `start`, that exact token is the guard. The adapter derives and validates `parent_start_guard` and `depth` from the accepted live parent chain and projects the validated top-level owner nonce onto each target; it may not privately default any missing fact. |
+| Live Windows `entries[].pid/start/start_filetime` | `OwnedTreeTargetV1.pid/start_guard` after exact live validation. The destructive guard is the positive decimal `start_filetime`; the rounded ISO `start` is capture/ordering corroboration and never substitutes for a missing FILETIME. The adapter derives and validates `parent_start_guard` and `depth` from the accepted live parent chain and projects the validated top-level owner nonce onto each target; it may not privately default any missing fact. |
+| Non-Windows platform, including a live Linux `entries[].start` token | #120 recognizes Linux `linux:<boot_id>:<start_ticks>` as observation/barrier input; it declares no macOS exact-token mapping. The current sole kill primitive has no non-Windows exact-token execution branch, so 87-A returns pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`, short-circuits the named destructive constructor before `OwnedWrapperTreeObservationV1.COMPLETE`, and constructs no owner/target tuple, authority, reservation, attempt, debt, or external call. Input acceptance is not effect capability. |
 | Non-live virtual ancestry bridge | Admissible only when copied exactly from a prior complete record with unchanged wrapper generation, launch nonce, and parent chain. It is validation provenance only: exclude it from `root_first_targets`, every target digest, and `Stop-Tree`. A live child whose immediate owned parent is such a bridge uses the module's existing positively proven orphan form: null owned-parent fields and depth one. |
 
 `role` and `discovered_at` are validated bounded metadata but are excluded from
@@ -124,8 +126,9 @@ completion and is decided only by the fresh snapshot and barrier; a target still
 present remains survivor evidence.
 
 The barrier rechecks recorded exact identities and fresh descendant edges.
-Planning and `Stop-Tree` remain separated by process scheduling, so a recorded
-parent may create a descendant after the plan; that unplanned descendant may
+For an independently authorized Windows attempt, planning and `Stop-Tree`
+remain separated by process scheduling, so a recorded parent may create a
+descendant after the plan; that unplanned descendant may
 survive because it was never a kill target, and the barrier catches it only to
 block launch. When a recorded PID has been recycled, an exact child start equal
 to or newer than the replacement is excluded from the retired-parent ownership
@@ -153,8 +156,8 @@ strictly downstream of the capability gate: it does not make any currently
 The closure successor owns `OwnedTreeClosureV1`,
 `OwnedTreeClosureReconciliationV1`, action-scoped creation freeze, and the
 synchronous acquire/reconcile/release and checked-continuation adapters below.
-Merged #120 partially strengthens effect execution at one target-local seam;
-it does not implement those attempt-bound contracts or prevent an owned parent
+Merged #120 partially strengthens Windows effect execution at one target-local
+seam; it does not implement those attempt-bound contracts or prevent an owned parent
 from creating a new child between plan and effect. Until a conforming successor
 is implemented, independently reviewed, and available inside the absolute
 dependency-plane constraint below, a static
@@ -172,6 +175,19 @@ to the named closure-dependent path; it does not disable merged #120's
 snapshot, existing authorized exact-target execution, barrier, attended reset,
 or attended archive for their non-87-A callers.
 
+Capability claims are proved at the line where the effect happens, not where an
+input is accepted. Merged #120 accepts Linux `linux:<boot_id>:<start_ticks>` as
+an exact observation token (grammar at
+`src/agenttalk/supervisor.py:2187-2204`; exactness/record validation at
+`2087-2115`, `2438-2470` in `587e7c1`), but its sole executor enters the destructive branch only when
+`start_filetime` is present (`8900-8928`) and explicitly skips an
+`owned_process_tree` target without it (`8930-8932`). Therefore that accepted
+token is not a POSIX kill adapter. Linux and macOS are structurally unavailable
+for this named teardown until a separately reviewed exact-token executor is
+delivered; Revision 9 does not dependency-track or assume one. The Windows
+FILETIME requirement is immutable and is never weakened to make another
+platform appear available.
+
 ```text
 MAX_OWNED_TREE_TARGETS_V1 = 64
 AUTOMATIC_CHILDLESS_ATTEMPT_CAP_V1 = 3
@@ -181,7 +197,6 @@ ProcStartGuardV1 =
 
 OwnedExactStartGuardV1 =
   Windows ISO-start row: positive decimal exact creation FILETIME
-  other exact-start row: exact ordinal entries[].start token
 
 OwnedLaunchNonceProvenanceV1 {
   checked_managed_launch_nonce: ASCII [A-Za-z0-9_-]{16,128}
@@ -333,7 +348,8 @@ ClosureCapabilityV1 =
   }
   | CAPABILITY_UNAVAILABLE(
       ordered deduplicated nonempty tuple[
-        SUCCESSOR_MISSING
+        EXACT_TARGET_EXECUTOR_UNAVAILABLE
+        | SUCCESSOR_MISSING
         | SUCCESSOR_UNREVIEWED
         | PROVIDER_INCOMPATIBLE
         | CONTRACT_UNPROVABLE
@@ -411,6 +427,16 @@ ChildlessContinuationOwnerV1 =
     }
 ```
 
+The `ClosureCapabilityV1` constructor checks exact target execution before any
+closure-provider predicate. If that executor is unavailable, it returns
+`CAPABILITY_UNAVAILABLE` with the exact one-element reason tuple
+`(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and does not inspect or combine downstream
+successor reasons because that boundary is unreachable. Only an admitted
+executor proceeds to collect all true successor reasons in the displayed order
+or produce `AVAILABLE`. Under merged #120, every non-Windows named-teardown path
+takes the short-circuiting unavailable arm; only Linux has an admitted exact
+observation token.
+
 Every `COMPLETE`, `COMPLETE_GONE`, or `COMPLETE_RESIDUAL` ordinary tree/debt
 observation is well formed only when all of these hold:
 
@@ -443,7 +469,8 @@ subset differs from the immutable authorized tuple.
 `agenttalk.supervisor.owned-tree-coverage-source.v1\0` plus the exact
 `CanonicalJsonV1` bytes of the core's `ObserverCoverageSignatureV1`; it
 identifies coverage semantics, not changing process contents.
-The 87-A adapter owns `observer_version`. For the mapping pinned above it is
+The 87-A adapter owns `observer_version`. For the admitted Windows mapping
+pinned above it is
 exactly `win-tree/v2`, which binds merged task #120 at `587e7c1`, including its
 `schema_version`, `attribution_model`, exact-FILETIME kill projection,
 same-handle exact-check/termination plus conditional bounded wait attempt,
@@ -451,7 +478,9 @@ recycle-aware enumeration/ownership algorithm, and pinned implementation
 revision. This replaces the pre-review `win-tree/v1`
 mapping; the chained module vectors below are renewed accordingly. Any later
 change to those inputs requires a different version value and renewed
-vectors/review. 87-A fixes `ownership_rule_version` to `owned-tree/v2` and the
+vectors/review. Revision 9 narrows platform admission before target
+construction; it does not change the admitted Windows mapping or its fixed
+vector. 87-A fixes `ownership_rule_version` to `owned-tree/v2` and the
 core coverage's `pid_start_guard_schema` to `2` for the exact-FILETIME mapping;
 none of those values may be omitted or privately defaulted.
 
@@ -478,7 +507,6 @@ start_anchor := observed root reported start token
 StartRepresentationMatchV1(checked managed wrapper start token, start_anchor)
 StartRepresentationMatchV1(strict runtime wrapper start token, start_anchor)
 Windows observed root exact start guard == fresh #120 exact start_filetime
-non-Windows observed root exact start guard == exact observed-root start token
 checked managed wrapper generation
   == strict runtime wrapper generation == runtime_wrapper_generation
 checked managed launch nonce == parsed observed-root launch nonce
@@ -506,6 +534,14 @@ nonce sources and their fixed parser schema; each retained token equals the
 top-level `launch_nonce`. Every other target is bound by task #120 to that
 exact root and carries the same nonce.
 
+Only a Windows observation with a positive exact FILETIME for every live row
+may enter this positive owner/target join. A well-formed Linux exact token
+remains valid #120 observation input; other non-Windows platforms have no
+admitted exact-token mapping. In either case the static capability gate returns
+`CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` before this join.
+The raw observation remains available to no-kill/barrier consumers; the named
+destructive constructor is not invoked.
+
 The observed-root nonce parser reuses the shipped strict
 `--supervisor-launch-nonce` grammar: exactly one top-level option in either
 `--supervisor-launch-nonce TOKEN` or
@@ -532,11 +568,13 @@ For a Windows owned-tree target, the `Stop-Tree` projection is exactly
 target.start_guard, reason: "owned_process_tree", source:
 "owned_process_tree"}` in root-first order. The rounded `start` is retained
 only because the shipped executor's closed target shape requires it;
-`start_filetime` is the destructive identity. A non-Windows exact-start target
-uses its exact `start_guard` as `start` and omits `start_filetime`. The existing
-primitive reverses the list, so leaves are attempted before the wrapper; every
-owned Windows target missing its exact FILETIME is refused rather than falling
-back to the legacy rounded `Proc-Start`/`Stop-Process` path.
+`start_filetime` is the destructive identity. The existing primitive reverses
+the list, so leaves are attempted before the wrapper; every owned Windows target
+missing its exact FILETIME is refused rather than falling back to the legacy
+rounded `Proc-Start`/`Stop-Process` path. No non-Windows 87-A target projection
+exists: at merged `587e7c1`, `Stop-Tree` executes the exact check/termination
+only at `src/agenttalk/supervisor.py:8900-8928` and skips an
+`owned_process_tree` target with no FILETIME at `8930-8932`.
 
 `COMPLETE_RESIDUAL` is not an initial tree with its root omitted. The 87-A
 residual adapter over #120's retained snapshot and one fresh complete process
@@ -584,8 +622,11 @@ keyed by `acquisition_id`; release additionally requires the exact
 `closure_id`. `AVAILABLE` exposes one exact `ClosureProviderVersionV1` and is
 well formed only for an installed, independently reviewed implementation that
 can prove this contract inside the absolute dependency-plane constraint for
-every case it accepts. `CAPABILITY_UNAVAILABLE` is structural and may appear
-only before reservation. The caller persists an available version in
+every case it accepts **and** for a platform whose existing executor actually
+acts on the exact target token. A valid observation token without such an
+executor returns `EXACT_TARGET_EXECUTOR_UNAVAILABLE`; acceptance by a parser or
+snapshot producer is insufficient. `CAPABILITY_UNAVAILABLE` is structural and
+may appear only before reservation. The caller persists an available version in
 `ChildlessContinuationOwnerV1` before acquisition;
 every `HELD`, `NEVER_ACQUIRED`, `RELEASED`, reconcile result, release request,
 and held refresh must match it byte-for-byte. A provider contract change
@@ -1193,16 +1234,21 @@ At the initial arm, `debt_id` is SHA-256 over
 
 ### Chained digest conformance vector
 
-**ENFORCED:** The following Revision 8 fixture fixes all seven module digest
-domains and renews the authority-dependent chain for merged #120's
+**ENFORCED:** The following Revision 8 fixture is retained unchanged in
+Revision 9. It fixes all seven module digest domains and renews the
+authority-dependent chain for merged #120's
 `win-tree/v2` adapter and the explicit representation-token/exact-guard split.
 The two banked core condition fingerprints are outside this chain and remain
 untouched.
 Each payload is the exact one-line ASCII/UTF-8 `CanonicalJsonV1` byte sequence
 shown, with no trailing LF. The hash input is the displayed ASCII domain,
 one NUL byte, then the payload bytes. Later payloads use earlier expected
-digests, so recomputing this chain also detects a private field set or
-serialization in any upstream domain.
+digests. The displayed bytes, byte counts, and digests are fixed
+interoperability and change-detection anchors; they are not independent proof
+that an implementation selected the correct typed field set or implemented
+`CanonicalJsonV1` correctly. That proof comes from the independent typed-object
+construction required by conformance item 20. The upstream byte-flip control
+then verifies change propagation only.
 
 | Value | Domain | Payload bytes | Expected lowercase SHA-256 |
 | --- | --- | ---: | --- |
@@ -1518,6 +1564,12 @@ No code is emitted merely because a synchronous valid closure is briefly
 held. A retained acquiring/releasing uncertainty, debt, or failed/exhausted
 cycle is emitted on every poll, including polls where other policy gates hold.
 
+87-B must join an action resolution to the exact matching fingerprint and take
+the held agent name from `RecoveryConditionV1.canonical_condition.agent_key`.
+Every routine or incident rendering of `CAPABILITY_UNAVAILABLE` must name that
+agent and state explicitly that operator action is required. A bare enum or a
+message that omits either fact is nonconforming.
+
 In the original surviving live invocation, a successful gone proof after
 verified release has no terminal module result: the core's final barrier/spawn
 determines `BARRIER_VETOED`, `SPAWN_FAILED`,
@@ -1792,9 +1844,10 @@ transaction; no executor branch may save a cached whole state.
     either counter at count one before closure; equal basis digests must not
     substitute for count two, and the action must veto before debt or
     `Stop-Tree`.
-5. Prove the initial root-first tuple and inherited-order residual tuple reach
-   only the existing leaves-first `Stop-Tree` adapter. No process name/pattern
-   or second kill path may reach an authority target.
+5. Prove the admitted Windows initial root-first tuple and inherited-order
+   residual tuple reach only the existing leaves-first `Stop-Tree` adapter. No
+   process name/pattern, non-Windows token projection, or second kill path may
+   reach an authority target.
 6. Failure-inject before and after the debt commit and after every target
    attempt. Partial kill retains debt and blocks every launch. A later ordinary
    `COMPLETE_RESIDUAL` observation—not a preexisting closure—constructs exact
@@ -1812,6 +1865,9 @@ transaction; no executor branch may save a cached whole state.
     attention. Manual veto/failure always uses manual result precedence and
     leaves either cycle byte-identical. Attention remains true on every
     incomplete, debt, active-failure, and exhaustion poll.
+    For `CAPABILITY_UNAVAILABLE`, join the exact fingerprint to the canonical
+    agent key and require every 87-B rendering to name the held agent and say
+    operator action is required; a bare code must fail conformance.
     Seed a future generic recovery-backoff deadline and nonzero exponent with
     cycle `NONE`, `ACTIVE/failure`, and `EXHAUSTED`. An otherwise eligible
     named attempt must bypass that deadline for `NONE` and `ACTIVE`; exhaustion
@@ -1919,9 +1975,16 @@ transaction; no executor branch may save a cached whole state.
     no-kill `RELAUNCH_ONLY`. With outstanding debt, both must hold or select
     exact `DEBT_COMPLETION`; with a present childless wrapper, both must require
     the named `INITIAL` authority before any kill.
-20. Recompute every row of the chained module digest vector from the exact
-    displayed payload bytes and expected upstream digest. Change one upstream
-    byte at each stage and prove every dependent identifier changes.
+20. Construct each of the seven typed payload objects from the displayed
+    fixture values without parsing or copying the displayed JSON strings.
+    Encode each object through the implementation's production
+    `CanonicalJsonV1`; require exact displayed byte and byte-count equality,
+    then compute `SHA-256(domain || NUL || produced_bytes)` and require the
+    displayed digest. Each downstream object embeds the upstream digest just
+    recomputed by the implementation, never the displayed upstream digest.
+    As a secondary change-detection control, change one upstream byte at each
+    stage and prove every dependent identifier changes; that mutation control
+    is not independent codec or field-set correctness evidence.
 21. Race two reload reconcilers reserving nonordinary capture ordinals.
     Require distinct CAS-allocated values greater than zero at the current
     ordinary sequence, exact attempt binding, and no reuse/wrap. Pair an
@@ -1948,6 +2011,12 @@ transaction; no executor branch may save a cached whole state.
     Require `observer_version=win-tree/v2`,
     `ownership_rule_version=owned-tree/v2`, and
     `pid_start_guard_schema=2`; the superseded v1 values are incompatible.
+    Feed a valid non-Windows `linux:<boot_id>:<start_ticks>` token through the
+    accepted #120 input path and require pre-reservation
+    `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)`: construct no
+    owner/target tuple or authority, consume no attempt, create no debt, and
+    make no `Stop-Tree` call. Prove the implementation neither falls back to
+    the legacy rounded-start executor nor weakens the Windows FILETIME guard.
     Admit a
     non-live ancestry bridge only from an exact prior complete
     generation/nonce/parent chain, exclude it from target tuples/digests and
@@ -1979,14 +2048,16 @@ transaction; no executor branch may save a cached whole state.
 | Two same-owner post-establishment complete child absences | #120 INPUT DELIVERED; ENFORCED after #115 and the 87-A adapter | 87-A reducer plus merged #120 snapshot |
 | PID/start/nonce ownership; never pattern ownership | #120 INPUT DELIVERED; ENFORCED by the 87-A adapter | Adapter over merged `owned_process_tree_v2`, including exact Windows FILETIME |
 | Complete 64-entry tree observation | DELIVERED by merged #120; 87-A adapter validation remains required | #120 snapshot plus 87-A adapter |
+| POSIX exact-target execution for named teardown | CURRENTLY UNAVAILABLE | #120 accepts Linux exact observation tokens but declares no macOS token and has no non-Windows executor branch; return pre-reservation `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` and `POLICY_HELD` pending a human |
 | Action-scoped creation closure | CURRENTLY UNAVAILABLE; ENFORCED after a conforming closure successor | Merged #120 does not freeze creation or expose attempt-keyed acquire/reconcile/release; otherwise `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human |
 | Atomic reservation/debt/cycle/terminal state | ENFORCED after #115 | Task #115 checked state owner |
-| External-call continuation/effect linearization | PARTIAL target-local primitive DELIVERED by #120; full contract ENFORCED after #115 and the closure successor | #120 same-handle exact check/terminate plus conditional bounded wait attempt, checked continuation state, and successor-owned attempt-bound synchronous adapters |
+| External-call continuation/effect linearization | PARTIAL Windows target-local primitive DELIVERED by #120; full contract ENFORCED after #115 and the closure successor | #120 same-handle exact FILETIME check/terminate plus conditional bounded wait attempt, checked continuation state, and successor-owned attempt-bound synchronous adapters |
 | Fail-closed state-loss quarantine | ENFORCED after #115 | Task #115 checked state owner |
 | No daemon, persistence plane, durable helper or OS object, or runtime dependency | DECIDED ABSOLUTE by operator on 2026-07-31 (M5 Option A) | Project/package boundary; no mechanism-specific exception |
-| Sole leaves-first guarded kill | ENFORCED; exact owned-target seam DELIVERED by #120 | Same-handle exact FILETIME check/terminate and conditional bounded wait attempt in existing `Stop-Tree` |
+| Sole leaves-first guarded kill | ENFORCED for admitted Windows targets; POSIX unavailable | Same-handle exact FILETIME check/terminate and conditional bounded wait attempt in existing `Stop-Tree`; no non-Windows exact-token execution branch |
 | Three-attempt automatic cap and continuous typed attention | ENFORCED after #115 | 87-A state/output |
-| Durable human delivery and receipt | STATED out of scope | Future 87-B |
+| Durable human delivery and receipt | STATED out of scope | Future 87-B; every `CAPABILITY_UNAVAILABLE` rendering names the held agent and required operator action |
+| Operator explanation of indefinite capability holds | REQUIRED before 87-A implementation close and activation | 87-B/follow-up operator manual and tutorial evidence must explain that child-death recovery may remain indefinitely `POLICY_HELD` and requires human action |
 
 Task #78 consumes the named authority only after #115, the adapter over merged
 #120, and the closure successor. Task #116 remains blocked only on #115 and
