@@ -1328,13 +1328,16 @@ authority path and persist the freshly revalidated tree before `Stop-Tree`.
 
 On Windows, `cli_launcher_lifetime` is a nullable all-or-nothing certificate.
 When present, it contains positive decimal creation/exit FILETIMEs from
-`GetProcessTimes`, with creation strictly before exit. A tree entry's
-`start_filetime` is also nullable; null supplies no exact FILETIME proof, so
-PID/start remains required. If a prior identity recorded an exact FILETIME, a
-current row with that field missing is ambiguous. A complete prior tree can
-bridge an exited intermediate process only for the same wrapper generation and
-launch nonce, using the exact previously recorded child identity and parent
-edge. New or reparented descendants make the tree invalid.
+`GetProcessTimes`, with creation strictly before exit. Authoritative
+`complete`/`absent` Windows tree entries require a positive decimal
+`start_filetime`. `invalid`/`truncated` HOLD entries may retain null so their
+failure evidence stays readable, but null grants no identity authority. Linux
+boot-ID/start-ticks tokens are exact without FILETIME. If a prior identity
+recorded an exact FILETIME, a current row with that field missing is ambiguous.
+A complete prior tree can bridge an exited intermediate process only for the
+same wrapper generation and launch nonce, using the exact previously recorded
+child identity and parent edge. New or reparented descendants make the tree
+invalid.
 
 If a snapshot proves every identity from a previously complete tree absent or
 definitively recycled, the supervisor retains those rows as a generation-bound

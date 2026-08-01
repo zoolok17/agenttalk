@@ -202,11 +202,13 @@ FILETIMEs from `GetProcessTimes`; a descendant behind an already-exited
 launcher is admissible only when its exact `start_filetime` lies strictly
 between those bounds. The lifetime object is all-or-nothing: its source and both
 positive decimal FILETIMEs are required, and creation must precede exit.
-Owned-tree `start_filetime` fields are independently nullable. Null carries no
-exact FILETIME proof, so PID/start remains required; if prior proof recorded an
-exact FILETIME, a current row with that field missing is ambiguous. Schema-v1
-files remain read-compatible and are normalized to schema v2 with a null
-lifetime, but all new writes are v2. Booleans are not accepted as
+Authoritative `complete`/`absent` Windows owned-tree entries require a positive
+decimal `start_filetime`. `invalid`/`truncated` HOLD entries may retain null so
+their failure evidence stays readable, but null grants no identity authority.
+Linux boot-ID/start-ticks tokens are exact without FILETIME. If prior proof
+recorded an exact FILETIME, a current row with that field missing is ambiguous.
+Schema-v1 files remain read-compatible and are normalized to schema v2 with a
+null lifetime, but all new writes are v2. Booleans are not accepted as
 schema-version integers.
 
 The record contains no prompt, model output, command, or tool output. Writes

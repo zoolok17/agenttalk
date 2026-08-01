@@ -56,13 +56,15 @@ design. The item that did ship is the one measured to cost the most in the field
   line; process names never authorize teardown. Windows launcher handoff uses a
   nullable, generation-fenced `GetProcessTimes` lifetime certificate; when that
   certificate is present, an exited launcher's first child must carry an exact
-  FILETIME strictly inside the launcher's creation/exit interval. Tree-entry
-  `start_filetime` is also nullable; null supplies no exact FILETIME proof, so
-  PID/start remains required, and a missing current FILETIME is ambiguous when
-  the prior identity recorded one. A prior complete tree can bridge an exited
-  intermediate process only for the same generation and nonce, with the exact
-  previously recorded child identity and parent edge; a new or reparented child
-  fails closed. A complete tree feeds the existing leaves-first `Stop-Tree`.
+  FILETIME strictly inside the launcher's creation/exit interval. Authoritative
+  `complete`/`absent` Windows tree entries require an exact `start_filetime`;
+  `invalid`/`truncated` HOLD entries may retain null as readable failure
+  evidence, but null grants no identity authority. Linux boot-ID/start-ticks
+  tokens are exact without FILETIME. A missing current FILETIME is ambiguous
+  when the prior identity recorded one. A prior complete tree can bridge an
+  exited intermediate process only for the same generation and nonce, with the
+  exact previously recorded child identity and parent edge; a new or reparented
+  child fails closed. A complete tree feeds the existing leaves-first `Stop-Tree`.
   An invalid or truncated tree takes precedence over restart markers and
   child-liveness verdicts, grants no automatic kill authority, and creates a
   durable, nondismissible supervisor HOLD in `agenttalk attention` and the

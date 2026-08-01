@@ -546,15 +546,17 @@ validation runs first: an invalid or truncated tree reports
 `PROCESS_TREE_INVALID` or `PROCESS_TREE_TRUNCATED`, authorizes no kill, and
 leaves any restart marker unconsumed.
 
-Windows exact-time fields are deliberately nullable. A non-null
-`cli_launcher_lifetime` is an all-or-nothing `GetProcessTimes` certificate with
-positive decimal creation/exit FILETIMEs and creation before exit. A tree
-entry's `start_filetime` may be null; null supplies no exact FILETIME proof, so
-PID/start remains required. If a prior identity recorded an exact FILETIME, a
-current row with that field missing is ambiguous. A prior complete tree bridges
-an exited intermediate process only for the same wrapper generation and launch
-nonce, with the exact previously recorded child identity and parent edge. A new
-or reparented child invalidates the tree.
+On Windows, `cli_launcher_lifetime` is deliberately nullable. A non-null value
+is an all-or-nothing `GetProcessTimes` certificate with positive decimal
+creation/exit FILETIMEs and creation before exit. Authoritative
+`complete`/`absent` Windows tree entries require a positive decimal
+`start_filetime`. `invalid`/`truncated` HOLD entries may retain null so their
+failure evidence stays readable, but null grants no identity authority. Linux
+boot-ID/start-ticks tokens are exact without FILETIME. If a prior identity
+recorded an exact FILETIME, a current row with that field missing is ambiguous.
+A prior complete tree bridges an exited intermediate process only for the same
+wrapper generation and launch nonce, with the exact previously recorded child
+identity and parent edge. A new or reparented child invalidates the tree.
 
 ### Recover an owned-process-tree HOLD
 

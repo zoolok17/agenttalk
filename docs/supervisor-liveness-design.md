@@ -204,13 +204,15 @@ identities and newly observed descendant edges rooted at any recorded PID.
 
 On Windows, `cli_launcher_lifetime` is nullable. When present it is an
 all-or-nothing retained-handle certificate: source plus positive decimal
-creation and exit FILETIMEs, with creation strictly before exit. Tree-entry
-`start_filetime` is independently nullable; null supplies no exact FILETIME
-proof, so PID/start remains required. If prior proof recorded a FILETIME, a
-current row missing it is ambiguous. A previous complete tree may bridge an
-exited intermediate process only for the same wrapper generation and launch
-nonce, with the exact previously recorded child identity and parent edge. A
-new or reparented child invalidates the tree.
+creation and exit FILETIMEs, with creation strictly before exit. Authoritative
+`complete`/`absent` Windows tree entries require a positive decimal
+`start_filetime`. `invalid`/`truncated` HOLD entries may retain null so their
+failure evidence stays readable, but null grants no identity authority. Linux
+boot-ID/start-ticks tokens are exact without FILETIME. If prior proof recorded
+a FILETIME, a current row missing it is ambiguous. A previous complete tree may
+bridge an exited intermediate process only for the same wrapper generation and
+launch nonce, with the exact previously recorded child identity and parent
+edge. A new or reparented child invalidates the tree.
 
 For `status=complete|absent|truncated`, `wrapper_generation` and `launch_nonce`
 are required, non-null identity values. An `invalid` HOLD may store either as

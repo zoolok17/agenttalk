@@ -596,14 +596,16 @@ without ever rebuilding state.
   wrapper without `wrapper-runtime.json` reports `CLI_CHILD_UNKNOWN`, even with
   a fresh heartbeat. Use the attended migration sequence above; a plain
   refresh/restart cannot clear legacy ownership evidence.
-- **Windows exact-time proof is nullable.** `cli_launcher_lifetime` is either
-  null or a complete positive-decimal `GetProcessTimes` creation/exit interval.
-  Tree-entry `start_filetime` is also nullable; null supplies no exact FILETIME
-  proof, so PID/start remains required. If a prior identity recorded a
-  FILETIME, a current row missing it is ambiguous. A prior complete tree
-  bridges an exited intermediate only for the same wrapper generation and
-  launch nonce, with the exact previously recorded child and parent edge. New
-  or reparented children fail closed.
+- **Windows launcher-lifetime proof is nullable.** `cli_launcher_lifetime` is
+  either null or a complete positive-decimal `GetProcessTimes` creation/exit
+  interval. Authoritative `complete`/`absent` Windows tree entries require a
+  positive decimal `start_filetime`. `invalid`/`truncated` HOLD entries may
+  retain null so failure evidence stays readable, but null grants no identity
+  authority. Linux boot-ID/start-ticks tokens are exact without FILETIME. If a
+  prior identity recorded a FILETIME, a current row missing it is ambiguous. A
+  prior complete tree bridges an exited intermediate only for the same wrapper
+  generation and launch nonce, with the exact previously recorded child and
+  parent edge. New or reparented children fail closed.
 - **Generation-bound waiter teardown.** A wrapper loop writes a unique token in
   its waiting marker and clears only that token in `finally`. An old wrapper
   therefore cannot erase a replacement marker. This protects observability; it
