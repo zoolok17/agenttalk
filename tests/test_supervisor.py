@@ -2271,6 +2271,33 @@ def test_supervise_bootstrap_check_validates_module_args_from(
     by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
     assert ("supervisor_agent_launch_module_args_from_wrong_token", "Zeno") in by_id_agent
 
+    # Round 14 connector finding, the fourth instance of the same class:
+    # module_args_from ABSENT (not merely present-and-wrong) while
+    # windows_args carries an undeclared prefix. The runtime resolver
+    # defaults an absent field to offset 0 and rejects this exact
+    # invocation - the validator must too, rather than skipping the
+    # resolver call entirely whenever the field is unset.
+    absent_with_prefix = _wrapped_supervisor_agent("Zeno", "codex")
+    absent_with_prefix["launch"]["windows_args"].insert(0, "-u")
+    assert "module_args_from" not in absent_with_prefix["launch"]
+    _write_supervisor_config(s, {"Zeno": absent_with_prefix})
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
+    assert ("supervisor_agent_launch_module_args_from_wrong_token", "Zeno") in by_id_agent
+
+    # And the companion positive: absent module_args_from with a genuinely
+    # plain, undeclared windows_args (no prefix at all) must still report
+    # valid - the fix must not turn every ordinary launch into an error.
+    plain_no_prefix = _wrapped_supervisor_agent("Zeno", "codex")
+    assert "module_args_from" not in plain_no_prefix["launch"]
+    _write_supervisor_config(s, {"Zeno": plain_no_prefix})
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+    payload = json.loads(capsys.readouterr().out)
+    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
+    assert ("supervisor_agent_launch_module_args_from_valid", "Zeno") in by_id_agent
+
 
 def test_supervise_bootstrap_check_accepts_constrained_ovh_qwen_profile(
     tmp_path: Path,
@@ -13325,6 +13352,71 @@ def test_ephemeral_launch_spec_preserves_declared_module_args_from() -> None:
     assert spec["launch"]["module_args_from"] == 1
     assert spec["launch"]["windows_file"] == "python.exe"
     assert spec["launch"]["windows_args"][-1] == "adversary-1"
+
+
+def test_ephemeral_record_prepared_persists_declared_module_args_from() -> None:
+    """Round 14 connector finding, the persistence half of the rebuild
+    class: launch_spec() (round 13) lets Launch-Spec inject the nonce and
+    start logging at launch time, but module_args_from was never
+    PERSISTED in the active ephemeral entry - record_prepared hand-listed
+    individual fields (request_id, agent, ..., cli) rather than carrying
+    the profile's own launch config wholesale, so the field survived the
+    launch and died in the record the moment the next poll needed it.
+    Stored wholesale here (entry["launch"] = dict(launch)), not as a
+    hand-picked key, so a future field of launch survives the same way."""
+    state: dict = {}
+    eph.record_prepared(
+        state,
+        request_id="R1",
+        agent="adversary-1",
+        requested_by="lead",
+        profile="codex-evidence-reviewer",
+        timeout_seconds=1800,
+        now_epoch=NOW,
+        review_request_id="m1",
+        cli="codex",
+        launch={"windows_file": "python.exe", "module_args_from": 1},
+    )
+    entry = state["ephemeral_reviewers"]["active"]["R1"]
+    assert entry["launch"] == {"windows_file": "python.exe", "module_args_from": 1}
+
+
+def test_ephemeral_owned_process_view_reconstructs_declared_module_args_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same finding, the read side: _ephemeral_owned_process_view rebuilt
+    cfg_agent as {"cli": ..., "wrapped": True} - two hand-picked keys, no
+    launch sub-dict at all - so _wrapped_liveness's _is_confirmed_launcher
+    call always resolved module_args_from to None regardless of what the
+    profile declared, and a declared-prefix launcher's nonce was rejected
+    at offset 0 on every poll after the first. Captures the actual
+    cfg_agent _wrapped_liveness is called with, rather than driving a full
+    runtime-record scenario end to end, to isolate exactly this
+    reconstruction step."""
+    captured: dict = {}
+
+    def _fake_wrapped_liveness(snapshot, entry, cfg_agent, agent, now_epoch,
+                               runtime_view, *, root_key):
+        captured["cfg_agent"] = cfg_agent
+        return {
+            "kill_targets": [],
+            "owned_process_tree": None,
+            "owned_process_tree_refreshed": False,
+            "child_reason": "test_capture",
+        }
+
+    monkeypatch.setattr(sup, "_wrapped_liveness", _fake_wrapped_liveness)
+
+    entry = {
+        "request_id": "R1",
+        "agent": "adversary-1",
+        "cli": "codex",
+        "launch": {"module_args_from": 1},
+    }
+    sup._ephemeral_owned_process_view(
+        None, entry, {}, NOW, root_key=sup._root_key(TEST_ROOT),
+    )
+    assert captured["cfg_agent"]["launch"]["module_args_from"] == 1
 
 
 def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> None:

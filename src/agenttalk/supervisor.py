@@ -5855,6 +5855,7 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                                "launch.windows_args is filled", agent=name)
 
             module_args_from = launch.get("module_args_from")
+            module_args_from_type_or_range_error = False
             if module_args_from is not None:
                 if not isinstance(module_args_from, int) or isinstance(module_args_from, bool):
                     _bootstrap_add(
@@ -5865,6 +5866,7 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                         suggestion="set module_args_from to the index of '-m' in windows_args, "
                                    "or remove it",
                     )
+                    module_args_from_type_or_range_error = True
                 elif isinstance(windows_args, list) and not (
                     0 <= module_args_from < len(windows_args)
                 ):
@@ -5876,26 +5878,41 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                                "windows_args_len": len(windows_args)},
                         suggestion="point module_args_from at the index of '-m' in windows_args",
                     )
-                # In-range is necessary but not sufficient (PR 98
-                # connector, round 9): the validator must accept exactly
-                # what the runtime resolver accepts, no more - an
-                # in-range module_args_from pointing at the wrong token,
-                # or a declared prefix containing a token outside the
-                # supported interpreter-flag allowlist, launches fine
-                # (the Python invocation still runs) while nonce
-                # injection, bounded logging, and launcher attribution
-                # are all silently disabled. Delegate to the SAME
-                # resolver the runtime uses instead of reimplementing
-                # this judgment a third time.
-                elif isinstance(windows_args, list) and _resolve_module_flag_index(
+                    module_args_from_type_or_range_error = True
+            # In-range is necessary but not sufficient (PR 98 connector,
+            # round 9): the validator must accept exactly what the runtime
+            # resolver accepts, no more - an in-range module_args_from
+            # pointing at the wrong token, or a declared prefix containing
+            # a token outside the supported interpreter-flag allowlist,
+            # launches fine (the Python invocation still runs) while
+            # nonce injection, bounded logging, and launcher attribution
+            # are all silently disabled. Round 14: that includes
+            # module_args_from being ABSENT while windows_args carries an
+            # undeclared prefix (e.g. ["-u", "-m", "agenttalk", ...]) - the
+            # resolver defaults an absent field to offset 0 exactly like
+            # this call does, so skipping the check whenever the field is
+            # merely unset let that exact shape report clean. Run
+            # unconditionally (any type/range error above already fully
+            # explains the config; no need to also run this). Delegate to
+            # the SAME resolver the runtime uses instead of reimplementing
+            # this judgment a third time.
+            if not module_args_from_type_or_range_error and isinstance(windows_args, list):
+                if _resolve_module_flag_index(
                     [str(token) for token in windows_args], module_args_from,
                 ) < 0:
                     _bootstrap_add(
                         checks, "supervisor_agent_launch_module_args_from_wrong_token",
                         "error",
-                        "launch.module_args_from is in range but does not point at "
-                        "'-m' 'agenttalk', or its declared prefix contains a token "
-                        "outside the supported interpreter-flag set",
+                        (
+                            "launch.module_args_from is in range but does not point at "
+                            "'-m' 'agenttalk', or its declared prefix contains a token "
+                            "outside the supported interpreter-flag set"
+                            if module_args_from is not None else
+                            "launch.module_args_from is not set and windows_args does "
+                            "not start with '-m' 'agenttalk' - the runtime resolver "
+                            "defaults an absent declaration to offset 0 and will reject "
+                            "this exact invocation the same way"
+                        ),
                         agent=name,
                         facts={"module_args_from": module_args_from,
                                "windows_args": windows_args},
@@ -5907,7 +5924,13 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                 else:
                     _bootstrap_add(
                         checks, "supervisor_agent_launch_module_args_from_valid", "ok",
-                        "launch.module_args_from is a valid index", agent=name,
+                        (
+                            "launch.module_args_from is a valid index"
+                            if module_args_from is not None else
+                            "windows_args resolves as the plain, undeclared "
+                            "'-m' 'agenttalk' form"
+                        ),
+                        agent=name,
                     )
 
             if wrapped and isinstance(windows_args, list):
@@ -7006,6 +7029,12 @@ def _ephemeral_owned_process_view(
             else "codex"
         ),
         "wrapped": True,
+        # Carried WHOLESALE from the persisted entry (round 14, the
+        # persistence half of the rebuild class) rather than re-listing
+        # individual fields here - module_args_from is the immediate case,
+        # but this way a future field of the profile's own launch config
+        # survives this reconstruction too, without another site-by-site fix.
+        "launch": entry.get("launch") if isinstance(entry.get("launch"), dict) else {},
     }
     liveness = _wrapped_liveness(
         snapshot,
@@ -7936,6 +7965,11 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
             profile.get("cli")
             if isinstance(profile.get("cli"), str)
             else "codex"
+        ),
+        launch=(
+            profile.get("launch")
+            if isinstance(profile.get("launch"), dict)
+            else None
         ),
     )
     spec = eph.launch_spec(marker, profile, agent)
