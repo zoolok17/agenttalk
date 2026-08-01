@@ -9868,6 +9868,51 @@ def test_process_ownership_parse_agenttalk_wrap_accepts_declared_prefix() -> Non
     ) is False
 
 
+def test_process_ownership_declared_prefix_does_not_leak_into_other_agents_branch() -> None:
+    """Round 10 connector finding, the cross-agent kill: module_args_from
+    describes THIS agent's configured launcher and nothing else. worker
+    declares module_args_from=1 (the documented -Xutf8 config from the
+    prior test). A sibling process is agent "other"'s own ordinary,
+    undeclared invocation - python -m agenttalk ... wait --for other -
+    which made no declaration of its own. Before the fix, _strict_child_edge
+    parsed that sibling using worker's declared offset anyway: at offset 1
+    the sibling's leading '-m' reads as an unverified prefix token, fails
+    the allowlist, and _agenttalk_invocation returns None - "not recognized
+    as agenttalk at all" - rather than "recognized, and it's not mine".
+    _row_branch_reason then returned None instead of
+    same_root_other_agent_branch, so _strict_child_edge raised no
+    objection and accepted the sibling as worker's own live chain
+    descendant: a foreign agent's process, one scoped-cleanup pass away
+    from being killed."""
+    config = {
+        **_WRAP_CONFIG,
+        "agents": {
+            "worker": {**_WRAP_CONFIG["agents"]["worker"],
+                      "launch": {"module_args_from": 1}},
+        },
+    }
+    launcher_start = _ps_iso(100000)
+    other_start = _ps_iso(200000)
+    snap = [
+        _proc(10, 1, "python.exe",
+              f"python -Xutf8 -m agenttalk --supervisor-launch-nonce {SUPERVISOR_NONCE} "
+              f"--root {TEST_ROOT} wrap --for worker --loop",
+              launcher_start),
+        _proc(11, 10, "python.exe",
+              f"python -m agenttalk --root {TEST_ROOT} wait --for other",
+              other_start),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(launcher_pid=10, launcher_start=launcher_start),
+        config,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert {t["pid"] for t in p["kill_targets"]} == {10}
+    assert p["diagnostics"]["same_root_other_agent_branch"] >= 1
+
+
 def test_process_ownership_launcher_pid_reuse_cannot_be_rescued_by_wrap_text() -> None:
     snap = [
         _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(200000)),

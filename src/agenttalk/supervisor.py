@@ -2476,14 +2476,12 @@ def _record_target(targets: dict[int, dict], row: dict, reason: str,
 
 def _is_expected_seed_row(row: dict, cfg_agent: dict, agent: str,
                           root_key: str | None) -> bool:
-    module_args_from = _module_args_from(cfg_agent)
-    if parse_agenttalk_wait_invocation(
-        row.get("command_line"), root_key, agent, module_args_from,
-    ):
+    # row is an arbitrary ancestor/descendant, not a confirmed launcher - a
+    # declared module_args_from describes THIS agent's configured launcher
+    # only, so it must not be applied here (see _strict_child_edge).
+    if parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
         return True
-    if parse_agenttalk_wrap_invocation(
-        row.get("command_line"), root_key, agent, module_args_from,
-    ):
+    if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
         return True
     name = _image_stem(row)
     cli = cfg_agent.get("cli")
@@ -2629,11 +2627,13 @@ def _children_map(idx: dict[int, dict]) -> dict[int, list[int]]:
 
 def _strict_child_edge(parent: dict, child: dict, *,
                        root_key: str | None, agent: str,
-                       diagnostics: dict[str, int],
-                       module_args_from: object = None) -> bool:
+                       diagnostics: dict[str, int]) -> bool:
     if child.get("parent_pid") != parent.get("pid"):
         return False
-    branch = _row_branch_reason(child, root_key, agent, module_args_from)
+    # child is an arbitrary descendant, never the confirmed launcher itself -
+    # it made no declaration of its own, so it is parsed by its own argv
+    # shape (module_args_from=None), not this agent's declared prefix.
+    branch = _row_branch_reason(child, root_key, agent)
     if branch is not None:
         _bump(diagnostics, branch)
         return False
@@ -2654,7 +2654,8 @@ def _strict_child_edge(parent: dict, child: dict, *,
 def _root_wait_brain(idx: dict[int, dict], wait_row: dict, cfg_agent: dict,
                      root_key: str | None, agent: str,
                      diagnostics: dict[str, int]) -> dict | None:
-    module_args_from = _module_args_from(cfg_agent)
+    # Walks arbitrary ancestor rows - none of them is the confirmed
+    # launcher, so no declared module_args_from applies to any of them.
     child = wait_row
     best = None
     seen: set[int] = set()
@@ -2667,7 +2668,7 @@ def _root_wait_brain(idx: dict[int, dict], wait_row: dict, cfg_agent: dict,
         if not isinstance(pid, int) or pid in seen:
             return best
         seen.add(pid)
-        branch = _row_branch_reason(parent, root_key, agent, module_args_from)
+        branch = _row_branch_reason(parent, root_key, agent)
         if branch is not None:
             _bump(diagnostics, branch)
             return best
@@ -2770,18 +2771,16 @@ def _attribution(
             continue
         if isinstance(launcher_pid, int) and pid == launcher_pid:
             continue
-        branch = _row_branch_reason(row, root_key, agent, module_args_from)
+        # row is an arbitrary snapshot entry, not the confirmed launcher -
+        # parse it by its own argv shape, not this agent's declared prefix.
+        branch = _row_branch_reason(row, root_key, agent)
         if branch is not None:
             _bump(diagnostics, branch)
             continue
-        if parse_agenttalk_wrap_invocation(
-            row.get("command_line"), root_key, agent, module_args_from,
-        ):
+        if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
             _record_target(targets_by_pid, row, "own_wrapper", seed_descendants=True)
             seed_pids.add(pid)
-        elif parse_agenttalk_wait_invocation(
-            row.get("command_line"), root_key, agent, module_args_from,
-        ):
+        elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
             _record_target(targets_by_pid, row, "own_wait", seed_descendants=False)
             own_wait_rows.append(row)
 
@@ -2844,8 +2843,7 @@ def _attribution(
             if not isinstance(child, dict):
                 continue
             if not _strict_child_edge(parent, child, root_key=root_key,
-                                      agent=agent, diagnostics=diagnostics,
-                                      module_args_from=module_args_from):
+                                      agent=agent, diagnostics=diagnostics):
                 continue
             child_launcher_source = seed_launcher_sources.get(parent_pid)
             _record_target(targets_by_pid, child, "live_chain_descendant",
@@ -2977,8 +2975,6 @@ def evaluate_launch_barrier(
     same-agent wrapper or wait process survived before Start-Process runs.
     """
     root_key = root_key or _root_key(config.get("root") or config.get("root_key") or "")
-    config_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
-    module_args_from = _module_args_from(config_agents.get(agent) or {})
     st = _agent_state_entry(state, agent)
     if snapshot is None:
         blocked = _prior_wrapper_may_be_alive(st)
@@ -2996,13 +2992,11 @@ def evaluate_launch_barrier(
         if not isinstance(row, dict):
             continue
         kind = None
-        if parse_agenttalk_wrap_invocation(
-            row.get("command_line"), root_key, agent, module_args_from,
-        ):
+        # row is an arbitrary post-kill survivor, not a confirmed launcher -
+        # parsed by its own argv shape, not this agent's declared prefix.
+        if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
             kind = "own_wrapper"
-        elif parse_agenttalk_wait_invocation(
-            row.get("command_line"), root_key, agent, module_args_from,
-        ):
+        elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
             kind = "own_wait"
         if kind is None:
             continue
@@ -3046,7 +3040,6 @@ def capture_launch_child_provenance(
     launcher_nonce_injected: bool = False,
 ) -> tuple[list[dict], dict[str, int]]:
     diagnostics = _diag()
-    module_args_from = _module_args_from(cfg_agent)
     if not isinstance(launcher_pid, int):
         return [], diagnostics
     launcher_epoch = _iso_epoch(launcher_start)
@@ -3085,7 +3078,10 @@ def capture_launch_child_provenance(
         if child_epoch < launcher_epoch:
             _bump(diagnostics, "inverted_start_edge")
             continue
-        branch = _row_branch_reason(row, root_key, agent, module_args_from)
+        # row is a child of the confirmed launcher, but its OWN argv shape
+        # was never declared - the launcher's declared prefix describes the
+        # launcher, not its children, so it does not apply here either.
+        branch = _row_branch_reason(row, root_key, agent)
         if branch is not None:
             _bump(diagnostics, branch)
             continue
