@@ -6003,6 +6003,38 @@ def test_wrapped_comparable_linux_start_tokens_bind_current_turn_brain() -> None
     assert plan["action"] == sup.NONE
     assert plan["state"] == "HEALTHY_WORKING"
     assert plan["next_state"]["brain_pid"] == 920
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert all(entry["start_filetime"] is None for entry in tree["entries"][1:])
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        tree,
+        agent="worker",
+        root_key=sup._root_key(TEST_ROOT),
+        wrapper_generation=tree["wrapper_generation"],
+        launch_nonce=tree["launch_nonce"],
+    ) is not None
+
+    brain_entry = next(entry for entry in tree["entries"] if entry["pid"] == 920)
+    brain_entry["start_filetime"] = "999"
+    second = _plan_wrap(
+        _report(
+            heartbeat_stale=False,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 1,
+                updated_age=1.0,
+                progress_age=1.0,
+                progress_sequence=3,
+                wrapper_start=wrapper_start,
+                launcher_start=f"linux:{boot_id}:100",
+            ),
+        ),
+        {"agents": {"worker": plan["next_state"]}},
+        now=NOW + 1,
+        snapshot=snapshot,
+    )
+
+    assert second["next_state"]["owned_process_tree"]["status"] == "complete"
 
 
 def test_wrapped_active_absent_brain_requires_two_same_generation_polls() -> None:
@@ -7938,6 +7970,28 @@ def test_process_ownership_strict_live_chain_reaps_multi_hop_when_ordered() -> N
     assert [t["pid"] for t in p["kill_targets"]] == [10, 11, 12]
     assert p["kill_targets"][1]["reason"] == "live_chain_descendant"
     assert p["kill_targets"][2]["reason"] == "live_chain_descendant"
+    snapshot_by_pid = {row["pid"]: row for row in snap}
+    assert all(
+        target["start_filetime"]
+        == snapshot_by_pid[target["pid"]]["start_filetime"]
+        for target in p["kill_targets"]
+    )
+
+
+def test_process_ownership_fresh_kill_target_retains_snapshot_filetime() -> None:
+    start = _ps_iso(100000)
+    snapshot = [_proc(10, 1, "python.exe", _wrap_cmd(), start)]
+
+    plan = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(launcher_pid=10, launcher_start=start),
+        _OWNERSHIP_ATTR_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+
+    target = next(item for item in plan["kill_targets"] if item["pid"] == 10)
+    assert target["start_filetime"] == snapshot[0]["start_filetime"]
 
 
 def _owned_tree_plan(
@@ -8034,6 +8088,201 @@ def test_owned_process_tree_kill_targets_retain_exact_start_filetime() -> None:
         target["start_filetime"] == entries[target["pid"]]["start_filetime"]
         for target in plan["kill_targets"]
     )
+
+
+def test_owned_process_tree_accepts_exact_child_order_inside_same_iso_tick() -> None:
+    snapshot = _wrap_snap()
+    launcher = snapshot[-1]
+    child = _proc(
+        303,
+        launcher["pid"],
+        "node.exe",
+        "node tool.js",
+        launcher["start_time"],
+        start_filetime=str(int(launcher["start_filetime"]) + 1),
+    )
+
+    plan = _owned_tree_plan(
+        [*snapshot, child],
+        request_id="rr-exact-child-order",
+    )
+
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert [entry["pid"] for entry in tree["entries"]] == [
+        WRAP_LAUNCHER_PID,
+        WRAP_CHILD_PID,
+        child["pid"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("filetime_delta", "reason_code"),
+    [
+        (0, "process_tree_invalid_equal_start_edge"),
+        (-1, "process_tree_invalid_inverted_start_edge"),
+    ],
+    ids=["equal", "inverted"],
+)
+def test_owned_process_tree_rejects_nonincreasing_exact_child_order(
+    filetime_delta: int,
+    reason_code: str,
+) -> None:
+    snapshot = _wrap_snap()
+    launcher = snapshot[-1]
+    child = _proc(
+        303,
+        launcher["pid"],
+        "node.exe",
+        "node tool.js",
+        _ps_iso(700000),
+        start_filetime=str(int(launcher["start_filetime"]) + filetime_delta),
+    )
+
+    plan = _owned_tree_plan(
+        [*snapshot, child],
+        request_id="rr-inverted-exact-child-order",
+    )
+
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["reason_code"] == reason_code
+    assert plan["kill_targets"] == []
+
+
+def test_strict_child_order_keeps_linux_token_exact_when_filetime_is_stale() -> None:
+    boot_id = "12345678-1234-1234-1234-123456789abc"
+    parent = {
+        "pid": 10,
+        "parent_pid": 1,
+        "start_time": f"linux:{boot_id}:100",
+        "start_filetime": "999",
+    }
+    child = {
+        "pid": 11,
+        "parent_pid": 10,
+        "start_time": f"linux:{boot_id}:101",
+        "start_filetime": "1",
+    }
+
+    assert sup._strict_owned_child_edge(parent, child) is None  # noqa: SLF001
+
+
+def test_recorded_identity_prefers_linux_token_over_stale_filetime() -> None:
+    boot_id = "12345678-1234-1234-1234-123456789abc"
+    expected_start = f"linux:{boot_id}:100"
+    recycled = {
+        "start_time": f"linux:{boot_id}:101",
+        "start_filetime": "999",
+    }
+    same = {
+        "start_time": expected_start,
+        "start_filetime": "1000",
+    }
+
+    assert sup._recorded_process_identity_state(  # noqa: SLF001
+        recycled,
+        expected_start=expected_start,
+        expected_filetime="999",
+    ) == "different"
+    assert sup._recorded_process_identity_state(  # noqa: SLF001
+        same,
+        expected_start=expected_start,
+        expected_filetime="999",
+    ) == "same"
+
+
+def test_valid_owned_process_tree_prefers_exact_child_order() -> None:
+    snapshot = [
+        *_wrap_snap(),
+        _proc(303, WRAP_CHILD_PID, "node.exe", "node tool.js", _ps_iso(700000)),
+    ]
+    tree = _owned_tree_plan(
+        snapshot,
+        request_id="rr-valid-exact-order",
+    )["next_state"]["owned_process_tree"]
+    same_tick = json.loads(json.dumps(tree))
+    parent, child = same_tick["entries"][-2:]
+    child["start"] = parent["start"]
+    child["start_filetime"] = str(int(parent["start_filetime"]) + 1)
+
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        same_tick,
+        agent="worker",
+        root_key=sup._root_key(TEST_ROOT),
+        wrapper_generation=same_tick["wrapper_generation"],
+        launch_nonce=same_tick["launch_nonce"],
+    ) is not None
+
+
+@pytest.mark.parametrize("status", ["complete", "absent"])
+def test_valid_owned_process_tree_requires_filetime_for_windows_authority(
+    status: str,
+) -> None:
+    tree = _owned_tree_plan(
+        _wrap_snap(),
+        request_id="rr-valid-authoritative-filetime",
+    )["next_state"]["owned_process_tree"]
+    tree["status"] = status
+    tree["reason_code"] = "process_tree_absent" if status == "absent" else None
+    tree["entries"][-1]["start_filetime"] = None
+
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        tree,
+        agent="worker",
+        root_key=sup._root_key(TEST_ROOT),
+        wrapper_generation=tree["wrapper_generation"],
+        launch_nonce=tree["launch_nonce"],
+    ) is None
+
+
+@pytest.mark.parametrize("status", ["invalid", "truncated"])
+def test_valid_owned_process_tree_keeps_nullable_hold_evidence_readable(
+    status: str,
+) -> None:
+    tree = _owned_tree_plan(
+        _wrap_snap(),
+        request_id="rr-valid-nullable-hold",
+    )["next_state"]["owned_process_tree"]
+    tree["status"] = status
+    tree["reason_code"] = (
+        "process_tree_invalid_exact_start_filetime_unavailable"
+        if status == "invalid"
+        else "process_tree_truncated"
+    )
+    tree["entries"][-1]["start_filetime"] = None
+    if status == "truncated":
+        tree["observed_count"] += 1
+        tree["omitted_count"] = 1
+        tree["truncated"] = True
+
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        tree,
+        agent="worker",
+        root_key=sup._root_key(TEST_ROOT),
+        wrapper_generation=tree["wrapper_generation"],
+        launch_nonce=tree["launch_nonce"],
+    ) is not None
+
+
+def test_valid_owned_process_tree_keeps_nullable_hold_evidence_strictly_ordered() -> None:
+    tree = _owned_tree_plan(
+        _wrap_snap(),
+        request_id="rr-valid-nullable-hold-order",
+    )["next_state"]["owned_process_tree"]
+    tree["status"] = "invalid"
+    tree["reason_code"] = "process_tree_invalid_exact_start_filetime_unavailable"
+    parent, child = tree["entries"][-2:]
+    child["start"] = parent["start"]
+    child["start_filetime"] = None
+
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        tree,
+        agent="worker",
+        root_key=sup._root_key(TEST_ROOT),
+        wrapper_generation=tree["wrapper_generation"],
+        launch_nonce=tree["launch_nonce"],
+    ) is None
 
 
 def test_owned_process_tree_holds_when_windows_filetime_is_unavailable() -> None:
@@ -8471,6 +8720,63 @@ def test_owned_process_tree_recycled_launcher_ignores_foreign_children() -> None
     assert plan["action"] == sup.RELAUNCH
 
 
+def test_owned_process_tree_recycled_launcher_collision_uses_exact_filetime() -> None:
+    recorded_filetime = _ps_filetime(600000)
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            1,
+            "unrelated.exe",
+            "unrelated replacement",
+            WRAP_CHILD_START,
+            start_filetime=str(int(recorded_filetime) + 10),
+        ),
+    ]
+
+    plan = _owned_tree_plan(
+        snapshot,
+        request_id="rr-recycled-launcher-collision",
+        runtime_overrides={
+            "launcher_creation_filetime": recorded_filetime,
+            "launcher_exit_filetime": _ps_filetime(750000),
+        },
+    )
+
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert [target["pid"] for target in plan["kill_targets"]] == [
+        WRAP_LAUNCHER_PID,
+    ]
+    assert plan["action"] == sup.RELAUNCH
+
+
+def test_owned_process_tree_ambiguous_launcher_keeps_parent_mismatch_hold() -> None:
+    recorded_filetime = _ps_filetime(600000)
+    ambiguous_launcher = _proc(
+        WRAP_CHILD_PID,
+        1,
+        "codex.exe",
+        "codex exec --json",
+        WRAP_CHILD_START,
+    )
+    ambiguous_launcher["start_filetime"] = None
+
+    plan = _owned_tree_plan(
+        [_wrap_snap()[0], ambiguous_launcher],
+        request_id="rr-ambiguous-launcher-parent-mismatch",
+        runtime_overrides={
+            "launcher_creation_filetime": recorded_filetime,
+            "launcher_exit_filetime": _ps_filetime(750000),
+        },
+    )
+
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["reason_code"] == "process_tree_invalid_launcher_parent_mismatch"
+    assert plan["kill_targets"] == []
+
+
 @pytest.mark.parametrize(
     "child_filetime",
     [
@@ -8549,6 +8855,86 @@ def test_owned_process_tree_prior_identity_bridges_exited_intermediate() -> None
         304,
     ]
     assert second["action"] == sup.RELAUNCH
+
+
+def test_owned_process_tree_linux_prior_identity_bridges_exited_intermediate() -> None:
+    boot_id = "12345678-1234-1234-1234-123456789abc"
+    wrapper_start = f"linux:{boot_id}:90"
+    launcher_start = f"linux:{boot_id}:100"
+    parent_start = f"linux:{boot_id}:101"
+    child_start = f"linux:{boot_id}:102"
+    wrapper = {
+        **_wrap_snap()[0],
+        "start_time": wrapper_start,
+        "start_filetime": None,
+    }
+    snapshot = [
+        wrapper,
+        _proc(
+            WRAP_CHILD_PID,
+            WRAP_LAUNCHER_PID,
+            "codex.exe",
+            "codex exec --json",
+            launcher_start,
+        ),
+        _proc(303, WRAP_CHILD_PID, "pwsh", "pwsh tool.ps1", parent_start),
+        _proc(304, 303, "node", "node repl.js", child_start),
+    ]
+    first = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-linux-earned-tree"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                wrapper_start=wrapper_start,
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=launcher_start,
+                progress_sequence=2,
+            ),
+        ),
+        {
+            "agents": {
+                "worker": _wrap_ready(
+                    launcher_start=wrapper_start,
+                    backoff_next_epoch=0,
+                )
+            }
+        },
+        snapshot=snapshot,
+    )
+    first_tree = first["next_state"]["owned_process_tree"]
+    prior_child = next(entry for entry in first_tree["entries"] if entry["pid"] == 304)
+    prior_child["start_filetime"] = "999"
+
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-linux-bridge-tree"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 1,
+                wrapper_start=wrapper_start,
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=launcher_start,
+                progress_sequence=3,
+            ),
+        ),
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=[snapshot[0], snapshot[1], snapshot[3]],
+    )
+
+    tree = second["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert [entry["pid"] for entry in tree["entries"]] == [
+        WRAP_LAUNCHER_PID,
+        WRAP_CHILD_PID,
+        303,
+        304,
+    ]
+    assert [target["pid"] for target in second["kill_targets"]] == [
+        WRAP_LAUNCHER_PID,
+        WRAP_CHILD_PID,
+        304,
+    ]
 
 
 def test_owned_process_tree_recycled_virtual_parent_ignores_replacement_child() -> None:
@@ -8679,6 +9065,63 @@ def test_owned_process_tree_live_parent_adopts_recycled_child_pid() -> None:
         (303, replacement["start_time"]),
     ]
     assert second["action"] == sup.RELAUNCH
+
+
+def test_owned_process_tree_recycled_child_resets_discovery_time() -> None:
+    snapshot = [
+        *_wrap_snap(),
+        _proc(302, WRAP_CHILD_PID, "codex.exe", "codex tui", _ps_iso(700000)),
+        _proc(303, 302, "pwsh.exe", "pwsh old.ps1", _ps_iso(800000)),
+    ]
+    first = _owned_tree_plan(
+        snapshot,
+        request_id="rr-recycled-child-discovery",
+    )
+    prior_entries = {
+        entry["pid"]: entry
+        for entry in first["next_state"]["owned_process_tree"]["entries"]
+    }
+    prior = next(
+        entry
+        for entry in first["next_state"]["owned_process_tree"]["entries"]
+        if entry["pid"] == 303
+    )
+    replacement = _proc(
+        303,
+        302,
+        "pwsh.exe",
+        "pwsh new.ps1",
+        prior["start"],
+        start_filetime=str(int(prior["start_filetime"]) + 10),
+    )
+
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-recycled-child-discovery-2"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 1,
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=[*snapshot[:-1], replacement],
+    )
+
+    second_tree = second["next_state"]["owned_process_tree"]
+    current = next(
+        entry
+        for entry in second_tree["entries"]
+        if entry["pid"] == replacement["pid"]
+    )
+    assert current["start_filetime"] == replacement["start_filetime"]
+    assert current["discovered_at"] == second_tree["refreshed_at"]
+    current_entries = {entry["pid"]: entry for entry in second_tree["entries"]}
+    for pid in (WRAP_LAUNCHER_PID, WRAP_CHILD_PID, 302):
+        assert current_entries[pid]["discovered_at"] == prior_entries[pid]["discovered_at"]
 
 
 def test_owned_process_tree_virtual_parent_rejects_new_unearned_child() -> None:
@@ -10279,9 +10722,13 @@ def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> N
         now_epoch=NOW,
         snapshot=snap,
     )["agents"]["worker"]
-    assert p["kill_targets"] == [{"pid": 11, "start": _ps_iso(200000),
-                                  "reason": "launch_child_provenance",
-                                  "source": "launch_child_provenance"}]
+    assert p["kill_targets"] == [{
+        "pid": 11,
+        "start": _ps_iso(200000),
+        "start_filetime": _ps_filetime(200000),
+        "reason": "launch_child_provenance",
+        "source": "launch_child_provenance",
+    }]
     p_fresh = sup.plan_actions(
         _ownership_report(stale=False),
         _ownership_state(
@@ -10473,6 +10920,163 @@ def test_launch_barrier_exact_state_launcher_blocks_without_command_line() -> No
     assert result["survivors"] == [
         {"kind": "state_launcher", "pid": 10, "name": "python.exe"}
     ]
+
+
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_launch_barrier_reuses_tree_exact_state_launcher_identity(
+    ephemeral: bool,
+) -> None:
+    entry = _owned_tree_plan(
+        _wrap_snap(),
+        request_id="rr-barrier-exact-state-launcher",
+    )["next_state"]
+    recorded = entry["owned_process_tree"]["entries"][0]
+    replacement = _proc(
+        recorded["pid"],
+        1,
+        "unrelated.exe",
+        None,
+        recorded["start"],
+        start_filetime=str(int(recorded["start_filetime"]) + 10),
+    )
+    state = (
+        {"ephemeral_reviewers": {"active": {"lr-barrier": entry}}}
+        if ephemeral
+        else {"agents": {"worker": entry}}
+    )
+
+    assert sup._start_tokens_match(  # noqa: SLF001
+        replacement["start_time"],
+        recorded["start"],
+    )
+    result = sup.evaluate_launch_barrier(
+        [replacement],
+        state,
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+        request_id="lr-barrier" if ephemeral else None,
+    )
+
+    assert result == {
+        "allow_launch": True,
+        "blocked": False,
+        "reason": "clear",
+        "snapshot_available": True,
+        "survivor_count": 0,
+        "survivors": [],
+    }
+
+
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_launch_barrier_tree_same_state_launcher_blocks_once(
+    ephemeral: bool,
+) -> None:
+    entry = _owned_tree_plan(
+        _wrap_snap(),
+        request_id="rr-barrier-same-state-launcher",
+    )["next_state"]
+    live = dict(_wrap_snap()[0])
+    live["command_line"] = None
+    state = (
+        {"ephemeral_reviewers": {"active": {"lr-barrier": entry}}}
+        if ephemeral
+        else {"agents": {"worker": entry}}
+    )
+
+    result = sup.evaluate_launch_barrier(
+        [live],
+        state,
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+        request_id="lr-barrier" if ephemeral else None,
+    )
+
+    assert result["allow_launch"] is False
+    assert result["reason"] == "owned_process_survived"
+    assert result["survivors"] == [
+        {"kind": "owned_process", "pid": live["pid"], "name": "python.exe"}
+    ]
+
+
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_launch_barrier_does_not_reuse_nonroot_tree_pid_judgment(
+    ephemeral: bool,
+) -> None:
+    snapshot = [
+        *_wrap_snap(),
+        _proc(302, WRAP_CHILD_PID, "node.exe", "node tool.js", _ps_iso(700000)),
+    ]
+    entry = _owned_tree_plan(
+        snapshot,
+        request_id="rr-barrier-nonroot-state-alias",
+    )["next_state"]
+    replacement = _proc(
+        302,
+        1,
+        "unrelated.exe",
+        None,
+        _ps_iso(800000),
+    )
+    entry["launcher_pid"] = replacement["pid"]
+    entry["launcher_start"] = replacement["start_time"]
+    state = (
+        {"ephemeral_reviewers": {"active": {"lr-barrier": entry}}}
+        if ephemeral
+        else {"agents": {"worker": entry}}
+    )
+
+    result = sup.evaluate_launch_barrier(
+        [replacement],
+        state,
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+        request_id="lr-barrier" if ephemeral else None,
+    )
+
+    assert result["allow_launch"] is False
+    assert result["reason"] == "state_launcher_survived"
+    assert result["survivors"] == [
+        {
+            "kind": "state_launcher",
+            "pid": replacement["pid"],
+            "name": "unrelated.exe",
+        }
+    ]
+
+
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_launch_barrier_rejects_nullable_authoritative_tree(
+    ephemeral: bool,
+) -> None:
+    entry = _owned_tree_plan(
+        _wrap_snap(),
+        request_id="rr-barrier-nullable-state-launcher",
+    )["next_state"]
+    recorded = entry["owned_process_tree"]["entries"][0]
+    recorded["start_filetime"] = None
+    live = dict(_wrap_snap()[0])
+    live["command_line"] = None
+    state = (
+        {"ephemeral_reviewers": {"active": {"lr-barrier": entry}}}
+        if ephemeral
+        else {"agents": {"worker": entry}}
+    )
+
+    result = sup.evaluate_launch_barrier(
+        [live],
+        state,
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+        request_id="lr-barrier" if ephemeral else None,
+    )
+
+    assert result["allow_launch"] is False
+    assert result["reason"] == "owned_process_tree_unavailable"
+    assert result["survivors"] == []
 
 
 @pytest.mark.parametrize("ephemeral", [False, True])

@@ -2057,7 +2057,12 @@ def _filetime_of(row: dict | None) -> str | None:
 
 
 def _filetime_identity_matches(row: dict | None, expected: object) -> bool:
-    """Exact Windows creation identity when prior proof carries FILETIME."""
+    """Check companion FILETIME only when the row uses Windows ISO identity."""
+    start_key = _start_order_key(_start_of(row))
+    if start_key is not None and start_key[0] != "iso":
+        # Linux boot-id/start-ticks is already exact. A stale incidental
+        # FILETIME-shaped field must not override the platform identity.
+        return True
     if expected is None:
         return True
     return isinstance(expected, str) and _filetime_of(row) == expected
@@ -2074,17 +2079,31 @@ def _has_exact_start_identity(row: dict | None) -> bool:
     return key[0] != "iso" or _filetime_of(row) is not None
 
 
+def _exact_start_order_key_values(
+    start: object,
+    start_filetime: object,
+) -> tuple[str, int | float] | None:
+    """Return a platform-exact process-start key when one was captured."""
+    key = _start_order_key(start)
+    if key is None:
+        return None
+    if key[0] != "iso":
+        # Linux's boot-id/start-ticks token is already exact. Ignore any stale
+        # FILETIME-shaped field rather than changing the token's platform.
+        return key
+    if (
+        isinstance(start_filetime, str)
+        and re.fullmatch(r"[1-9][0-9]{0,19}", start_filetime)
+    ):
+        return ("win32-filetime", int(start_filetime))
+    return None
+
+
 def _exact_start_order_key(
     row: dict | None,
 ) -> tuple[str, int | float] | None:
     """Comparable exact process-start key, never a rounded Windows timestamp."""
-    filetime = _filetime_of(row)
-    if filetime is not None:
-        return ("win32-filetime", int(filetime))
-    key = _start_order_key(_start_of(row))
-    if key is None or key[0] == "iso":
-        return None
-    return key
+    return _exact_start_order_key_values(_start_of(row), _filetime_of(row))
 
 
 def _iso_epoch(value) -> float | None:
@@ -2169,12 +2188,22 @@ def _start_order_key(value: object) -> tuple[str, int | float] | None:
         return None
 
 
-def _strict_owned_child_edge(parent: dict, child: dict) -> str | None:
-    """Return a reason code unless ``child`` is a strict live child of ``parent``."""
-    if child.get("parent_pid") != parent.get("pid"):
-        return "parent_mismatch"
-    parent_key = _start_order_key(_start_of(parent))
-    child_key = _start_order_key(_start_of(child))
+def _strict_start_order_reason(
+    parent_start: object,
+    parent_filetime: object,
+    child_start: object,
+    child_filetime: object,
+) -> str | None:
+    """Return why a child does not start strictly after its parent."""
+    parent_key = _exact_start_order_key_values(parent_start, parent_filetime)
+    child_key = _exact_start_order_key_values(child_start, child_filetime)
+    if parent_key is None or child_key is None:
+        # Rounded chronology remains useful for structural diagnostics when an
+        # exact Windows identity could not be captured. Live-tree construction
+        # marks that row invalid, while validation permits it only in durable
+        # invalid/truncated HOLD evidence; this fallback grants no authority.
+        parent_key = _start_order_key(parent_start)
+        child_key = _start_order_key(child_start)
     if parent_key is None or child_key is None:
         return "unparseable_start_edge"
     if parent_key[0] != child_key[0]:
@@ -2184,6 +2213,18 @@ def _strict_owned_child_edge(parent: dict, child: dict) -> str | None:
     if child_key[1] < parent_key[1]:
         return "inverted_start_edge"
     return None
+
+
+def _strict_owned_child_edge(parent: dict, child: dict) -> str | None:
+    """Return a reason code unless ``child`` is a strict live child of ``parent``."""
+    if child.get("parent_pid") != parent.get("pid"):
+        return "parent_mismatch"
+    return _strict_start_order_reason(
+        _start_of(parent),
+        _filetime_of(parent),
+        _start_of(child),
+        _filetime_of(child),
+    )
 
 
 def _valid_wrapper_generation(value: object) -> bool:
@@ -2381,8 +2422,12 @@ def _valid_owned_process_tree(
             return None
         pid = entry.get("pid")
         start = entry.get("start")
+        start_key = _start_order_key(start)
         start_filetime = entry.get("start_filetime")
         parent_pid = entry.get("parent_pid")
+        # Complete/absent trees grant future launch and teardown authority, so
+        # Windows entries need exact FILETIME identity. Nullable entries remain
+        # readable in invalid/truncated records as durable HOLD diagnostics.
         if (
             not isinstance(pid, int)
             or isinstance(pid, bool)
@@ -2393,13 +2438,19 @@ def _valid_owned_process_tree(
             or not isinstance(start, str)
             or not start
             or len(start) > 256
-            or _start_order_key(start) is None
+            or start_key is None
             or (
                 start_filetime is not None
                 and (
                     not isinstance(start_filetime, str)
                     or re.fullmatch(r"[1-9][0-9]{0,19}", start_filetime) is None
                 )
+            )
+            or (
+                status in {"complete", "absent"}
+                and start_key is not None
+                and start_key[0] == "iso"
+                and start_filetime is None
             )
             or entry.get("role") not in _OWNED_PROCESS_TREE_ROLES
             or not isinstance(entry.get("discovered_at"), str)
@@ -2419,21 +2470,13 @@ def _valid_owned_process_tree(
             parent = entries_by_pid.get(parent_pid)
             if parent is None:
                 return None
-            parent_key = _start_order_key(parent["start"])
-            child_key = _start_order_key(start)
-            if (
-                parent_key is None
-                or child_key is None
-                or parent_key[0] != child_key[0]
-                or child_key[1] <= parent_key[1]
-            ):
-                return None
-            parent_filetime = parent.get("start_filetime")
-            if (
-                parent_filetime is not None
-                and start_filetime is not None
-                and int(start_filetime) <= int(parent_filetime)
-            ):
+            edge_reason = _strict_start_order_reason(
+                parent["start"],
+                parent.get("start_filetime"),
+                start,
+                start_filetime,
+            )
+            if edge_reason is not None:
                 return None
         seen.add((pid, start))
         seen_pids.add(pid)
@@ -2654,6 +2697,12 @@ def _recorded_process_identity_state(
         return "absent"
     observed_start = _start_of(row)
     observed_filetime = _filetime_of(row)
+    expected_key = _start_order_key(expected_start)
+    if expected_key is not None and expected_key[0] != "iso":
+        observed_key = _start_order_key(observed_start)
+        if observed_key is None:
+            return "ambiguous"
+        return "same" if observed_key == expected_key else "different"
     if expected_filetime is not None:
         if observed_filetime is None:
             return "ambiguous"
@@ -2980,9 +3029,15 @@ def _owned_process_tree(
         else:
             if (
                 isinstance(current_launcher, dict)
-                and _start_tokens_match(
-                    _start_of(current_launcher),
-                    launcher_start,
+                and (
+                    current_launcher_identity == "same"
+                    or (
+                        current_launcher_identity == "ambiguous"
+                        and _start_tokens_match(
+                            _start_of(current_launcher),
+                            launcher_start,
+                        )
+                    )
                 )
                 and current_launcher.get("parent_pid") != wrapper_pid
             ):
@@ -3167,7 +3222,12 @@ def _owned_process_tree(
         discovered_at = (
             prior_entry["discovered_at"]
             if prior_entry is not None
-            and _start_tokens_match(prior_entry["start"], start)
+            and _recorded_process_identity_state(
+                row,
+                expected_start=prior_entry["start"],
+                expected_filetime=prior_entry.get("start_filetime"),
+            )
+            == "same"
             else refreshed_at
         )
         entries.append({
@@ -3574,6 +3634,9 @@ def _record_target(targets: dict[int, dict], row: dict, reason: str,
         "source": reason,
         "seed_descendants": bool(seed_descendants),
     }
+    start_filetime = _filetime_of(row)
+    if start_filetime is not None:
+        target["start_filetime"] = start_filetime
     if isinstance(launcher_source, dict):
         target.update({
             "source_launcher_pid": launcher_source.get("pid"),
@@ -4160,11 +4223,12 @@ def evaluate_launch_barrier(
             "survivors": [],
         }
     idx = _snap_index(snapshot)
+    tree_judged_state_launcher = False
     if isinstance(tree, dict):
         tree_entries = tree.get("entries", [])
         closure_seed_pids: set[int] = set()
         recycled_parent_rows: dict[int, dict] = {}
-        for entry in tree_entries:
+        for entry_index, entry in enumerate(tree_entries):
             row = idx.get(entry.get("pid"))
             identity_state = _recorded_process_identity_state(
                 row,
@@ -4172,6 +4236,16 @@ def evaluate_launch_barrier(
                 expected_filetime=entry.get("start_filetime"),
             )
             pid = entry.get("pid")
+            if (
+                entry_index == 0
+                and entry.get("role") == "wrapper"
+                and pid == st.get("launcher_pid")
+                and _start_tokens_match(
+                    entry.get("start"),
+                    st.get("launcher_start"),
+                )
+            ):
+                tree_judged_state_launcher = True
             if (
                 identity_state != "different"
                 and isinstance(pid, int)
@@ -4256,12 +4330,16 @@ def evaluate_launch_barrier(
         if not isinstance(row, dict):
             continue
         kind = None
-        if row.get("pid") == st.get("launcher_pid") and (
-            _recorded_process_identity_state(
-                row,
-                expected_start=st.get("launcher_start"),
+        if (
+            row.get("pid") == st.get("launcher_pid")
+            and not tree_judged_state_launcher
+            and (
+                _recorded_process_identity_state(
+                    row,
+                    expected_start=st.get("launcher_start"),
+                )
+                in {"same", "ambiguous"}
             )
-            in {"same", "ambiguous"}
         ):
             # Blocking a second launch needs no command-line authority. The
             # exact state pid/start identity is sufficient to prove that the
