@@ -18,6 +18,15 @@ from agenttalk import wrapper_runtime as runtime
 NOW = 1_800_000_000.0
 
 
+def _log_glob(root: Path, pattern: str) -> list[Path]:
+    """Same as sorted(root.glob(pattern)), excluding the round-29 tail-ring
+    cursor sibling (base_path.name + '.cursor') - a bare 'stdout.log*' or
+    'stderr.log.*' glob sweeps it in too since it lives right alongside
+    the numbered tail segments, but it holds a bare index, not log
+    content, and is not a segment any of these tests mean to count."""
+    return sorted(p for p in root.glob(pattern) if not p.name.endswith(".cursor"))
+
+
 def test_default_wrapper_log_root_is_project_scoped_and_outside_checkout(
     tmp_path: Path,
 ) -> None:
@@ -180,7 +189,7 @@ def test_bounded_stream_tee_keeps_each_file_and_generation_within_cap(
     tee.flush()
     tee.close()
 
-    files = sorted(tmp_path.glob("stdout.log*"))
+    files = _log_glob(tmp_path, "stdout.log*")
     assert files
     assert all(path.stat().st_size <= 1024 for path in files)
     assert sum(path.stat().st_size for path in files) <= 3072
@@ -359,8 +368,14 @@ def test_bounded_stream_tee_resume_appends_to_newest_segment_instead_of_truncati
     was there regardless of whether it was the OLDEST content (as normal
     rotation would discard anyway) or the NEWEST (a live wrapper's own
     lifecycle output, written moments before the crash). resume=True must
-    probe the filesystem for the most-recently-written segment and APPEND
-    to it instead."""
+    find the segment the FIRST instance was actually writing to and APPEND
+    to it instead.
+
+    Round 29 correction: this only ever exercised the single-candidate
+    case (one short write never rotates past .1), so it never actually
+    proved which SELECTION mechanism resume used - see
+    test_bounded_stream_tee_resume_follows_cursor_not_misleading_mtime for
+    the adversarial case that does."""
     base = tmp_path / "stderr.log"
     original = io.StringIO()
     first = wrapper_logs.BoundedStreamTee(
@@ -369,9 +384,9 @@ def test_bounded_stream_tee_resume_appends_to_newest_segment_instead_of_truncati
     first.write("FIRST-INSTANCE-NEWEST-LIFECYCLE-OUTPUT\n")
     first.close()
 
-    tail_files = sorted(tmp_path.glob("stderr.log.*"))
-    assert tail_files
-    newest = max(tail_files, key=lambda p: p.stat().st_mtime)
+    tail_files = _log_glob(tmp_path, "stderr.log.*")
+    assert len(tail_files) == 1
+    newest = tail_files[0]
     newest_content_before = newest.read_bytes()
     assert b"FIRST-INSTANCE-NEWEST-LIFECYCLE-OUTPUT" in newest_content_before
 
@@ -386,6 +401,63 @@ def test_bounded_stream_tee_resume_appends_to_newest_segment_instead_of_truncati
         "resume must APPEND to the newest segment, not truncate it"
     )
     assert b"SECOND-INSTANCE-CRASH-SENTINEL" in combined
+
+
+def test_bounded_stream_tee_resume_follows_cursor_not_misleading_mtime(
+    tmp_path: Path,
+) -> None:
+    """Round 29 connector finding (P2, against the round-21 fix above):
+    choosing the current segment by st_mtime is ambiguous on filesystems
+    with coarse timestamp resolution and wrong after a backward clock
+    adjustment - on a tie the highest index wins even when a DIFFERENT
+    suffix holds the newest output, and if that wrongly-chosen suffix is
+    already near full, the next write truncates the segment that actually
+    held the newest crash evidence. Proves the fix by constructing exactly
+    that adversarial mtime shape and showing resume follows the persisted
+    cursor instead: segment .1 is made to look newer BY MTIME than the
+    segment the first instance actually finished writing to (.2); resume
+    must still append to .2, the one recorded in the cursor file, not .1."""
+    base = tmp_path / "stderr.log"
+    first = wrapper_logs.BoundedStreamTee(
+        io.StringIO(), base, max_bytes=4096, segment_count=4,
+    )
+    # segment_bytes = 4096 // 4 = 1024. Fill .1 then rotate into .2 - the
+    # cursor now records index 1 (".2"), while .1 sits untouched since.
+    first.write("A" * 1024)
+    first.write("FIRST-INSTANCE-NEWEST-LIFECYCLE-OUTPUT\n")
+    first.close()
+
+    tail_files = {p.name: p for p in _log_glob(tmp_path, "stderr.log.*")}
+    assert set(tail_files) == {"stderr.log.1", "stderr.log.2"}
+    cursor_before = (tmp_path / "stderr.log.cursor").read_text(encoding="utf-8")
+    assert cursor_before == "1"          # 0-based index for .2, the current one
+    newest_content_before = tail_files["stderr.log.2"].read_bytes()
+    assert b"FIRST-INSTANCE-NEWEST-LIFECYCLE-OUTPUT" in newest_content_before
+
+    # Make the OLDER, already-superseded .1 look newer than .2 by mtime -
+    # exactly the ambiguous shape a coarse filesystem clock or a backward
+    # wall-clock adjustment can produce for real, without needing either.
+    newer_than_now = os.path.getmtime(tail_files["stderr.log.2"]) + 5
+    os.utime(tail_files["stderr.log.1"], (newer_than_now, newer_than_now))
+    assert (
+        tail_files["stderr.log.1"].stat().st_mtime
+        > tail_files["stderr.log.2"].stat().st_mtime
+    )
+
+    second = wrapper_logs.BoundedStreamTee(
+        io.StringIO(), base, max_bytes=4096, segment_count=4, resume=True,
+    )
+    second.write("SECOND-INSTANCE-CRASH-SENTINEL\n")
+    second.close()
+
+    # .2 (the cursor-recorded segment) got the append - the mtime-newer .1
+    # was never touched, still holds only its original "A"*1024.
+    combined = tail_files["stderr.log.2"].read_bytes()
+    assert combined.startswith(newest_content_before), (
+        "resume must follow the recorded cursor, not the misleading mtime"
+    )
+    assert b"SECOND-INSTANCE-CRASH-SENTINEL" in combined
+    assert tail_files["stderr.log.1"].read_bytes() == b"A" * 1024
 
 
 def test_bounded_stream_tee_resume_still_rotates_and_truncates_the_next_segment(
@@ -405,7 +477,7 @@ def test_bounded_stream_tee_resume_still_rotates_and_truncates_the_next_segment(
     first.write("old-content-that-must-be-evicted-by-rotation " * 200)
     first.close()
 
-    tail_files = sorted(tmp_path.glob("stderr.log.*"))
+    tail_files = _log_glob(tmp_path, "stderr.log.*")
     assert len(tail_files) == 3
     before = {p.name: p.read_bytes() for p in tail_files}
     assert all(b"old-content" in content for content in before.values())
@@ -746,10 +818,10 @@ def test_stream_environment_context_restores_process_streams(
     assert sys.stdout is before_out
     assert sys.stderr is before_err
     assert "child-output" in "".join(
-        path.read_text(encoding="utf-8") for path in tmp_path.glob("stdout.log*")
+        path.read_text(encoding="utf-8") for path in _log_glob(tmp_path, "stdout.log*")
     )
     assert "child-error" in "".join(
-        path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
+        path.read_text(encoding="utf-8") for path in _log_glob(tmp_path, "stderr.log*")
     )
     assert os.environ[wrapper_logs.ENV_STDOUT_PATH] == str(out_path)
 
@@ -850,7 +922,7 @@ def test_cmd_wrap_records_setup_exception_before_loop_exists(
         cli.cmd_wrap(args)
 
     tail = "".join(
-        path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
+        path.read_text(encoding="utf-8") for path in _log_glob(tmp_path, "stderr.log*")
     )
     rows = [json.loads(line) for line in tail.splitlines() if line.startswith("{")]
     assert [row["event"] for row in rows] == ["wrapper_exception"]
@@ -905,7 +977,7 @@ def test_cmd_wrap_routine_system_exit_emits_exited_fact_without_traceback(
     assert exc_info.value.code == 2
 
     tail = "".join(
-        path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
+        path.read_text(encoding="utf-8") for path in _log_glob(tmp_path, "stderr.log*")
     )
     rows = [json.loads(line) for line in tail.splitlines() if line.startswith("{")]
     assert [row["event"] for row in rows] == ["wrapper_exited"]
@@ -975,7 +1047,7 @@ def test_cmd_wrap_routine_exception_types_skip_crash_reporting(
     assert cli.cmd_wrap(args) == expected_code
 
     tail = "".join(
-        path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
+        path.read_text(encoding="utf-8") for path in _log_glob(tmp_path, "stderr.log*")
     )
     rows = [json.loads(line) for line in tail.splitlines() if line.startswith("{")]
     assert [row["event"] for row in rows] == ["wrapper_exited"]
@@ -1104,7 +1176,7 @@ def test_cmd_wrap_unclassified_exception_still_gets_crash_reporting(
         cli.cmd_wrap(args)
 
     tail = "".join(
-        path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
+        path.read_text(encoding="utf-8") for path in _log_glob(tmp_path, "stderr.log*")
     )
     rows = [json.loads(line) for line in tail.splitlines() if line.startswith("{")]
     assert [row["event"] for row in rows] == ["wrapper_exception"]
@@ -1140,7 +1212,7 @@ def test_cmd_wrap_entry_bounds_python_level_wrapper_output(
 
     assert cli.cmd_wrap(args) == 0
 
-    files = sorted(tmp_path.glob("stdout.log*"))
+    files = _log_glob(tmp_path, "stdout.log*")
     assert all(path.stat().st_size <= 1024 for path in files)
     assert sum(path.stat().st_size for path in files) <= 4096
     assert "FINAL-SENTINEL" in "".join(
@@ -1182,7 +1254,7 @@ def test_cmd_wrap_uncaught_exception_traceback_is_bounded_and_in_tail(
     with pytest.raises(RuntimeError, match="TRACEBACK-SENTINEL-BOOM"):
         cli.cmd_wrap(args)
 
-    files = sorted(tmp_path.glob("stderr.log*"))
+    files = _log_glob(tmp_path, "stderr.log*")
     assert all(path.stat().st_size <= 1024 for path in files)
     assert sum(path.stat().st_size for path in files) <= 4096
     tail = "".join(
@@ -1225,7 +1297,7 @@ def test_print_bounded_uncaught_exception_writes_into_tail_ring_when_config_is_s
     except RuntimeError:
         wrapper_logs.print_bounded_uncaught_exception()
 
-    files = sorted(tmp_path.glob("stderr.log*"))
+    files = _log_glob(tmp_path, "stderr.log*")
     assert all(path.stat().st_size <= 1024 for path in files)
     assert sum(path.stat().st_size for path in files) <= 4096
     tail = "".join(
@@ -1301,7 +1373,7 @@ def test_console_main_bounds_the_top_level_traceback_and_returns_1(
     )
 
     assert result == 1
-    files = sorted(tmp_path.glob("stderr.log*"))
+    files = _log_glob(tmp_path, "stderr.log*")
     assert all(path.stat().st_size <= 1024 for path in files)
     assert sum(path.stat().st_size for path in files) <= 4096
 
@@ -1466,7 +1538,7 @@ def test_cmd_wrap_records_terminating_signal_without_exception_duplicate(
 
     rows = [
         json.loads(line)
-        for path in tmp_path.glob("stderr.log*")
+        for path in _log_glob(tmp_path, "stderr.log*")
         for line in path.read_text(encoding="utf-8").splitlines()
     ]
     assert [row["event"] for row in rows] == ["wrapper_signal_received"]
@@ -1537,7 +1609,7 @@ def test_bounded_stream_tee_creates_tail_path_restrictively_not_via_later_chmod(
     finally:
         os.umask(old_umask)
 
-    tail_files = sorted(base.parent.glob("stderr.log.*"))
+    tail_files = _log_glob(base.parent, "stderr.log.*")
     assert tail_files
     for path in tail_files:
         assert stat.S_IMODE(path.stat().st_mode) == 0o600, path

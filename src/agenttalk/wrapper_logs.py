@@ -273,33 +273,75 @@ class BoundedStreamTee:
         self._closed = False
         self._lock = threading.Lock()
 
+    def _tail_cursor_path(self) -> Path:
+        return self.base_path.with_name(f"{self.base_path.name}.cursor")
+
+    def _write_tail_cursor(self) -> None:
+        # Best-effort, same as the rest of this ring: a failure here must
+        # not crash a wrapper that is otherwise fine - it only leaves a
+        # LATER resumed instance unable to find a recorded cursor, which
+        # _resume_tail_position already treats as "start fresh" rather
+        # than truncating anything (see its own comment).
+        opener = _restrictive_file_opener if os.name != "nt" else None
+        try:
+            with open(str(self._tail_cursor_path()), "w", opener=opener) as f:
+                f.write(str(self._tail_index))
+        except OSError:
+            pass
+
     def _resume_tail_position(self) -> None:
-        # A fresh instance re-constructed against a base_path a PRIOR
-        # instance already wrote into (print_bounded_uncaught_exception's
-        # second, top-level tee is the one real caller of this) has no
-        # memory of where that prior instance left off. Defaulting to
-        # _tail_index=0 and opening .1 with "wb" would TRUNCATE whichever
-        # segment happens to sit there - which, after a normal rotation
-        # cycle, is as likely to be the NEWEST content as the oldest.
-        # Probe the filesystem instead (the only source of truth a fresh
-        # instance has): resume writing into whichever suffix has the
-        # newest mtime, appending rather than truncating it - only a LATER
-        # rotation (triggered by this segment filling up) truncates the
-        # NEXT one, exactly the same as an uninterrupted single instance
-        # would have done.
-        best_index, best_mtime, best_size = None, -1.0, 0
-        for i in range(self._tail_count):
-            candidate = self.base_path.with_name(f"{self.base_path.name}.{i + 1}")
-            try:
-                stat = candidate.stat()
-            except OSError:
-                continue
-            if stat.st_mtime >= best_mtime:
-                best_index, best_mtime, best_size = i, stat.st_mtime, stat.st_size
-        if best_index is not None:
-            self._tail_index = best_index
-            self._tail_size = best_size
-            self._tail_resume_append = True
+        # PR 98 round 29 connector finding: a fresh instance re-constructed
+        # against a base_path a PRIOR instance already wrote into
+        # (print_bounded_uncaught_exception's second, top-level tee is the
+        # one real caller of this) has no memory of where that prior
+        # instance left off. Defaulting to _tail_index=0 and opening .1
+        # with "wb" would TRUNCATE whichever segment happens to sit there -
+        # which, after a normal rotation cycle, is as likely to be the
+        # NEWEST content as the oldest.
+        #
+        # This USED to probe the filesystem for the suffix with the newest
+        # st_mtime - a fragile INFERENCE, not a recorded fact: on a
+        # filesystem with coarse timestamp resolution, or across a
+        # backward clock adjustment, that inference can name the WRONG
+        # suffix as current even though a different one holds the actual
+        # newest output. If that wrongly-chosen suffix is already near
+        # full, the very next write advances past it and opens the
+        # following suffix with "wb" - truncating the real newest lifecycle
+        # and crash evidence this whole module exists to preserve. Sharper
+        # tie-breaking narrows the odds without closing the class - the
+        # same lesson this project already learned once at a larger scale
+        # (supervisor liveness moved from PID/process-tree inference to
+        # heartbeat staleness for exactly this reason).
+        #
+        # Fixed by RECORDING the fact instead of inferring it:
+        # _write_tail_cursor persists which suffix is current every time
+        # _open_tail actually opens one (first activation and every
+        # rotation), and this reads that recorded index back - no mtime,
+        # no tie-break, nothing wall-clock-dependent. A missing or
+        # unreadable cursor (no prior instance ever wrote one, or it
+        # predates this fix) is not treated as "fall back to guessing" -
+        # it is treated exactly like _resume_tail_position never having
+        # been called at all: __init__'s own defaults stand, and the first
+        # write opens .1 fresh with "wb", same as an uninterrupted single
+        # instance's own first write. That is a possible loss of an
+        # in-progress segment's content on the FIRST resume after
+        # upgrading past this fix, never a truncation of content this
+        # process has any recorded fact about.
+        try:
+            raw = self._tail_cursor_path().read_text(encoding="utf-8").strip()
+            index = int(raw)
+        except (OSError, ValueError):
+            return
+        if not (0 <= index < self._tail_count):
+            return
+        candidate = self.base_path.with_name(f"{self.base_path.name}.{index + 1}")
+        try:
+            size = candidate.stat().st_size
+        except OSError:
+            size = 0
+        self._tail_index = index
+        self._tail_size = size
+        self._tail_resume_append = True
 
     @property
     def encoding(self) -> str:
@@ -361,6 +403,10 @@ class BoundedStreamTee:
             # agenttalk version that predates this fix.
             with contextlib.suppress(OSError):
                 os.chmod(path, 0o600)
+        # Record which suffix is now current AFTER it is actually open, not
+        # before - a failed open here must never leave a cursor pointing at
+        # a suffix this instance does not actually hold open.
+        self._write_tail_cursor()
 
     def _advance_tail(self) -> None:
         if self._tail is not None:
