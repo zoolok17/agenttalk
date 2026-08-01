@@ -317,23 +317,37 @@ class BoundedStreamTee:
         # _write_tail_cursor persists which suffix is current every time
         # _open_tail actually opens one (first activation and every
         # rotation), and this reads that recorded index back - no mtime,
-        # no tie-break, nothing wall-clock-dependent. A missing or
-        # unreadable cursor (no prior instance ever wrote one, or it
-        # predates this fix) is not treated as "fall back to guessing" -
-        # it is treated exactly like _resume_tail_position never having
-        # been called at all: __init__'s own defaults stand, and the first
-        # write opens .1 fresh with "wb", same as an uninterrupted single
-        # instance's own first write. That is a possible loss of an
-        # in-progress segment's content on the FIRST resume after
-        # upgrading past this fix, never a truncation of content this
-        # process has any recorded fact about.
+        # no tie-break, nothing wall-clock-dependent.
+        #
+        # A missing or unreadable cursor (no prior instance ever wrote
+        # one, or it predates this fix - true of every generation on disk
+        # at the moment this fix ships) falls back to index 0 - but
+        # ALWAYS in append mode, never "wb". A round-29 rereview caught my
+        # first draft's fallback treating a missing cursor as "resume was
+        # never called at all", defaulting straight back to the ORIGINAL
+        # truncate-on-first-write behavior - which is strictly WORSE than
+        # the mtime scan it replaced on precisely the generations that
+        # predate this fix (every one on disk at upgrade time), and worse
+        # specifically in the crash path this whole module exists for: the
+        # mtime scan was USUALLY right, "no cursor -> wb" is truncated
+        # EVERY time. "Never touch content this process has no recorded
+        # fact about" is the right bar for this ring; it is not the same
+        # as "truncate whenever there is no fact", which is what my first
+        # draft actually did. Appending onto index 0 blind (no fact about
+        # whether it is really the segment a prior instance last used) can
+        # still produce a wrong ORDER - old content from an unrelated
+        # earlier rotation, followed by this instance's new content, in
+        # one file - but it can never DESTROY content, which is the
+        # property this whole fix exists to guarantee. No wall-clock
+        # dependency either way, unlike the mtime-scan alternative.
+        index = 0
         try:
             raw = self._tail_cursor_path().read_text(encoding="utf-8").strip()
-            index = int(raw)
+            parsed = int(raw)
+            if 0 <= parsed < self._tail_count:
+                index = parsed
         except (OSError, ValueError):
-            return
-        if not (0 <= index < self._tail_count):
-            return
+            pass
         candidate = self.base_path.with_name(f"{self.base_path.name}.{index + 1}")
         try:
             size = candidate.stat().st_size

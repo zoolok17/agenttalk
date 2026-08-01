@@ -460,6 +460,40 @@ def test_bounded_stream_tee_resume_follows_cursor_not_misleading_mtime(
     assert tail_files["stderr.log.1"].read_bytes() == b"A" * 1024
 
 
+def test_bounded_stream_tee_resume_appends_not_truncates_when_no_cursor_exists(
+    tmp_path: Path,
+) -> None:
+    """Round 29 rereview: the missing-cursor fallback - true of every
+    generation already on disk the moment cursor-recording ships - must
+    never truncate. My first draft treated "no cursor" as "resume was
+    never requested at all", defaulting straight back to the ORIGINAL
+    truncate-on-first-write behavior - which is strictly WORSE than the
+    mtime scan it replaced on precisely the generations that predate this
+    fix (every one on disk at upgrade time), and worse specifically in the
+    crash path this module exists for: the mtime scan was USUALLY right,
+    "no cursor -> wb" is wrong every time. Simulates a pre-fix generation
+    directly - write .1's content by hand, with NO cursor file, exactly
+    what an old-code generation looks like - then resumes into it and
+    confirms the existing content survives, appended to rather than
+    overwritten."""
+    base = tmp_path / "stderr.log"
+    pre_fix_tail = base.with_name("stderr.log.1")
+    pre_fix_tail.write_bytes(b"PRE-FIX-GENERATION-CONTENT-NO-CURSOR-EXISTS\n")
+    assert not (tmp_path / "stderr.log.cursor").exists()
+
+    second = wrapper_logs.BoundedStreamTee(
+        io.StringIO(), base, max_bytes=4096, segment_count=4, resume=True,
+    )
+    second.write("SECOND-INSTANCE-CRASH-SENTINEL\n")
+    second.close()
+
+    combined = pre_fix_tail.read_bytes()
+    assert combined.startswith(b"PRE-FIX-GENERATION-CONTENT-NO-CURSOR-EXISTS\n"), (
+        "a missing cursor must never truncate pre-existing content"
+    )
+    assert b"SECOND-INSTANCE-CRASH-SENTINEL" in combined
+
+
 def test_bounded_stream_tee_resume_still_rotates_and_truncates_the_next_segment(
     tmp_path: Path,
 ) -> None:

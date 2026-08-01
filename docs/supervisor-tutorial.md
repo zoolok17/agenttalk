@@ -196,6 +196,18 @@ remain exceeded (independent of the off-by-one above) until that filesystem
 problem is resolved. If neither root can accept a new generation, recovery
 launches without redirection.
 
+Which of the three tail segments (`.1`-`.3`) is currently being written to is
+itself recorded in a sibling `<segment-base>.cursor` file, updated every time
+a segment is opened - not inferred from filesystem modification times, which
+are ambiguous on coarse-resolution filesystems and wrong across a backward
+clock adjustment. A missing cursor - true of every generation already on
+disk the moment this recording was added - falls back to segment `.1`, but
+always in append mode, never by truncating it: the worst case on an upgrade
+boundary is old, unrelated content from an earlier rotation followed by the
+new instance's content in one file, never destroyed content. This preserves
+the property the quota+1 paragraph above does not: this ring never trades
+away crash evidence for a tidier bound.
+
 On Windows the generated supervisor gives the child an explicit allowlist of
 only stdin (`NUL`) and the two log handles. This avoids leaking the
 supervisor's caller pipes or state-file locks into a long-lived wrapper. If the
