@@ -4844,24 +4844,35 @@ def test_stop_tree_verifies_and_terminates_through_one_native_handle(
     if not shell:
         return
     helpers = _exec_helpers(tmp_path)
+    assert "WaitForSingleObject" in helpers
+    assert "[uint32]0x101001" in helpers
+    assert "$terminationWaitBudgetMilliseconds = 5000" in helpers
     out = tmp_path / "stop-tree-native-handle.json"
     harness = "\n".join([
         "$ErrorActionPreference = 'Stop'",
         helpers,
         "$script:ticks = '133960872315767870'",
         "$script:opened = @(); $script:verified = @(); "
-        "$script:terminated = @(); $script:closed = @(); "
+        "$script:terminated = @(); $script:waited = @(); "
+        "$script:closed = @(); $script:events = @(); "
         "$script:stopProcessCalls = 0",
         "function Proc-Start { param($procId) return "
         "'2026-07-04T07:20:31.5767870+00:00' }",
         "function Open-AgenttalkProcessHandle { param($procId); "
-        "$h = 'handle-' + [string]$procId; $script:opened += $h; return $h }",
+        "$h = 'handle-' + [string]$procId; $script:opened += $h; "
+        "$script:events += ('open:' + $h); return $h }",
         "function Get-AgenttalkProcessHandleStartFiletime { param($handle); "
-        "$script:verified += $handle; return $script:ticks }",
+        "$script:verified += $handle; $script:events += ('verify:' + $handle); "
+        "return $script:ticks }",
         "function Stop-AgenttalkProcessHandle { param($handle); "
-        "$script:terminated += $handle; return $true }",
+        "$script:terminated += $handle; $script:events += ('terminate:' + $handle); "
+        "return $true }",
+        "function Wait-AgenttalkProcessHandleExit { "
+        "param($handle, $timeoutMilliseconds); "
+        "$script:waited += @{ handle = $handle; timeout = $timeoutMilliseconds }; "
+        "$script:events += ('wait:' + $handle); return $true }",
         "function Close-AgenttalkProcessHandle { param($handle); "
-        "$script:closed += $handle }",
+        "$script:closed += $handle; $script:events += ('close:' + $handle) }",
         "function Get-Process { param($Id, $ErrorAction); "
         "return [pscustomobject]@{ Id = $Id; "
         "StartTime = [datetime]::FromFileTimeUtc([long]$script:ticks) } }",
@@ -4872,7 +4883,8 @@ def test_stop_tree_verifies_and_terminates_through_one_native_handle(
         "start_filetime = $script:ticks })",
         "Stop-Tree $target",
         "@{ opened = $script:opened; verified = $script:verified; "
-        "terminated = $script:terminated; closed = $script:closed; "
+        "terminated = $script:terminated; waited = $script:waited; "
+        "closed = $script:closed; events = $script:events; "
         "stop_process_calls = $script:stopProcessCalls } | "
         "ConvertTo-Json -Depth 4 | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
@@ -4889,13 +4901,20 @@ def test_stop_tree_verifies_and_terminates_through_one_native_handle(
 
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
     payload = json.loads(out.read_text(encoding="utf-8-sig"))
-    assert payload == {
-        "opened": ["handle-4321"],
-        "verified": ["handle-4321"],
-        "terminated": ["handle-4321"],
-        "closed": ["handle-4321"],
-        "stop_process_calls": 0,
-    }
+    assert payload["opened"] == ["handle-4321"]
+    assert payload["verified"] == ["handle-4321"]
+    assert payload["terminated"] == ["handle-4321"]
+    assert payload["waited"][0]["handle"] == "handle-4321"
+    assert 0 < payload["waited"][0]["timeout"] <= 5000
+    assert payload["closed"] == ["handle-4321"]
+    assert payload["events"] == [
+        "open:handle-4321",
+        "verify:handle-4321",
+        "terminate:handle-4321",
+        "wait:handle-4321",
+        "close:handle-4321",
+    ]
+    assert payload["stop_process_calls"] == 0
 
 
 def test_generated_ps1_tamper_refuses_before_claim(tmp_path: Path) -> None:
@@ -8532,6 +8551,136 @@ def test_owned_process_tree_prior_identity_bridges_exited_intermediate() -> None
     assert second["action"] == sup.RELAUNCH
 
 
+def test_owned_process_tree_recycled_virtual_parent_ignores_replacement_child() -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            WRAP_LAUNCHER_PID,
+            "codex.exe",
+            "codex exec --json",
+            WRAP_CHILD_START,
+        ),
+        _proc(302, WRAP_CHILD_PID, "codex.exe", "codex tui", _ps_iso(700000)),
+        _proc(303, 302, "pwsh.exe", "pwsh -File tool.ps1", _ps_iso(800000)),
+        _proc(304, 303, "node.exe", "node old.js", _ps_iso(800200)),
+    ]
+    first = _owned_tree_plan(
+        snapshot,
+        request_id="rr-earned-recycled-parent",
+    )
+    replacement = _proc(
+        303,
+        1,
+        "unrelated.exe",
+        "unrelated replacement",
+        _ps_iso(800500),
+    )
+    assert sup._start_tokens_match(  # noqa: SLF001
+        replacement["start_time"],
+        snapshot[3]["start_time"],
+    )
+    second_snapshot = [
+        snapshot[0],
+        snapshot[1],
+        snapshot[2],
+        replacement,
+        snapshot[4],
+        _proc(305, 303, "node.exe", "node new.js", _ps_iso(800600)),
+    ]
+
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-recycled-parent"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 1,
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=second_snapshot,
+    )
+
+    tree = second["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert [(entry["pid"], entry["start"]) for entry in tree["entries"]] == [
+        (WRAP_LAUNCHER_PID, WRAP_START),
+        (WRAP_CHILD_PID, WRAP_CHILD_START),
+        (302, _ps_iso(700000)),
+        (303, _ps_iso(800000)),
+        (304, _ps_iso(800200)),
+    ]
+    assert [(target["pid"], target["start"]) for target in second["kill_targets"]] == [
+        (WRAP_LAUNCHER_PID, WRAP_START),
+        (WRAP_CHILD_PID, WRAP_CHILD_START),
+        (302, _ps_iso(700000)),
+        (304, _ps_iso(800200)),
+    ]
+    assert second["action"] == sup.RELAUNCH
+
+
+def test_owned_process_tree_live_parent_adopts_recycled_child_pid() -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            WRAP_LAUNCHER_PID,
+            "codex.exe",
+            "codex exec --json",
+            WRAP_CHILD_START,
+        ),
+        _proc(302, WRAP_CHILD_PID, "codex.exe", "codex tui", _ps_iso(700000)),
+        _proc(303, 302, "pwsh.exe", "pwsh old.ps1", _ps_iso(800000)),
+    ]
+    first = _owned_tree_plan(
+        snapshot,
+        request_id="rr-live-parent-recycled-child",
+    )
+    replacement = _proc(
+        303,
+        302,
+        "pwsh.exe",
+        "pwsh new.ps1",
+        _ps_iso(850000),
+    )
+
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-live-parent-new-child"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 1,
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=[snapshot[0], snapshot[1], snapshot[2], replacement],
+    )
+
+    tree = second["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert [(entry["pid"], entry["start"]) for entry in tree["entries"]] == [
+        (WRAP_LAUNCHER_PID, WRAP_START),
+        (WRAP_CHILD_PID, WRAP_CHILD_START),
+        (302, _ps_iso(700000)),
+        (303, replacement["start_time"]),
+    ]
+    assert [(target["pid"], target["start"]) for target in second["kill_targets"]] == [
+        (WRAP_LAUNCHER_PID, WRAP_START),
+        (WRAP_CHILD_PID, WRAP_CHILD_START),
+        (302, _ps_iso(700000)),
+        (303, replacement["start_time"]),
+    ]
+    assert second["action"] == sup.RELAUNCH
+
+
 def test_owned_process_tree_virtual_parent_rejects_new_unearned_child() -> None:
     snapshot = [
         _wrap_snap()[0],
@@ -10556,6 +10705,167 @@ def test_launch_barrier_excludes_definitively_recycled_closure_seed(
         "survivor_count": 0,
         "survivors": [],
     }
+
+
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_launch_barrier_retains_pre_recycle_descendant_of_recycled_seed(
+    ephemeral: bool,
+) -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            WRAP_LAUNCHER_PID,
+            "codex.exe",
+            "codex exec --json",
+            WRAP_CHILD_START,
+        ),
+        _proc(302, WRAP_CHILD_PID, "node.exe", "node tool.js", _ps_iso(700000)),
+    ]
+    entry = _owned_tree_plan(
+        snapshot,
+        request_id="rr-barrier-pre-recycle-child",
+    )["next_state"]
+    state = (
+        {"ephemeral_reviewers": {"active": {"lr-barrier": entry}}}
+        if ephemeral
+        else {"agents": {"worker": entry}}
+    )
+    recorded = entry["owned_process_tree"]["entries"][-1]
+    recycled = _proc(
+        recorded["pid"],
+        1,
+        "unrelated.exe",
+        "unrelated replacement",
+        _ps_iso(900000),
+    )
+    replacement_filetime = int(recycled["start_filetime"])
+    old_child = _proc(
+        303,
+        recycled["pid"],
+        "old-child.exe",
+        "old child",
+        recycled["start_time"],
+        start_filetime=str(replacement_filetime - 10),
+    )
+    old_grandchild = _proc(
+        304,
+        old_child["pid"],
+        "old-grandchild.exe",
+        "old grandchild",
+        _ps_iso(920000),
+    )
+    foreign_child = _proc(
+        305,
+        recycled["pid"],
+        "foreign.exe",
+        "foreign child",
+        recycled["start_time"],
+        start_filetime=str(replacement_filetime + 10),
+    )
+    equal_child = _proc(
+        306,
+        recycled["pid"],
+        "equal.exe",
+        "equal child",
+        recycled["start_time"],
+        start_filetime=str(replacement_filetime),
+    )
+    ambiguous_child = _proc(
+        307,
+        recycled["pid"],
+        "ambiguous.exe",
+        "ambiguous child",
+        recycled["start_time"],
+    )
+    ambiguous_child["start_filetime"] = None
+
+    result = sup.evaluate_launch_barrier(
+        [
+            recycled,
+            old_child,
+            old_grandchild,
+            foreign_child,
+            equal_child,
+            ambiguous_child,
+        ],
+        state,
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+        request_id="lr-barrier" if ephemeral else None,
+    )
+
+    assert result["blocked"] is True
+    assert result["reason"] == "owned_descendant_edge_survived"
+    assert result["survivor_count"] == 3
+    assert {item["pid"] for item in result["survivors"]} == {303, 304, 307}
+    assert all(
+        item["kind"] == "owned_descendant_edge"
+        for item in result["survivors"]
+    )
+
+
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_launch_barrier_retains_old_branch_with_nested_recycled_pid(
+    ephemeral: bool,
+) -> None:
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(
+            WRAP_CHILD_PID,
+            WRAP_LAUNCHER_PID,
+            "codex.exe",
+            "codex exec --json",
+            WRAP_CHILD_START,
+        ),
+        _proc(302, WRAP_CHILD_PID, "node.exe", "node tool.js", _ps_iso(700000)),
+        _proc(303, 302, "pwsh.exe", "pwsh old.ps1", _ps_iso(800000)),
+    ]
+    entry = _owned_tree_plan(
+        snapshot,
+        request_id="rr-barrier-nested-recycle",
+    )["next_state"]
+    state = (
+        {"ephemeral_reviewers": {"active": {"lr-barrier": entry}}}
+        if ephemeral
+        else {"agents": {"worker": entry}}
+    )
+    recycled_parent = _proc(
+        302,
+        1,
+        "unrelated.exe",
+        "unrelated parent replacement",
+        _ps_iso(900000),
+    )
+    parent_filetime = int(recycled_parent["start_filetime"])
+    recycled_child = _proc(
+        303,
+        recycled_parent["pid"],
+        "pwsh.exe",
+        "pwsh old-branch.ps1",
+        recycled_parent["start_time"],
+        start_filetime=str(parent_filetime - 10),
+    )
+
+    result = sup.evaluate_launch_barrier(
+        [recycled_parent, recycled_child],
+        state,
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+        request_id="lr-barrier" if ephemeral else None,
+    )
+
+    assert result["blocked"] is True
+    assert result["reason"] == "owned_descendant_edge_survived"
+    assert result["survivors"] == [
+        {
+            "kind": "owned_descendant_edge",
+            "pid": recycled_child["pid"],
+            "name": "pwsh.exe",
+        }
+    ]
 
 
 def test_owned_process_absence_certificate_requires_definite_identity_result() -> None:

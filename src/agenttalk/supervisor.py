@@ -2074,6 +2074,19 @@ def _has_exact_start_identity(row: dict | None) -> bool:
     return key[0] != "iso" or _filetime_of(row) is not None
 
 
+def _exact_start_order_key(
+    row: dict | None,
+) -> tuple[str, int | float] | None:
+    """Comparable exact process-start key, never a rounded Windows timestamp."""
+    filetime = _filetime_of(row)
+    if filetime is not None:
+        return ("win32-filetime", int(filetime))
+    key = _start_order_key(_start_of(row))
+    if key is None or key[0] == "iso":
+        return None
+    return key
+
+
 def _iso_epoch(value) -> float | None:
     """Parse an ISO-8601 start-time to epoch seconds.
 
@@ -2850,6 +2863,7 @@ def _owned_process_tree(
 
     add_node(wrapper_row, role="wrapper", depth=0, live=True)
     wrapper_pid = wrapper_row.get("pid")
+    recycled_parent_pids: set[int] = set()
 
     # Rehydrate exact live identities from the previous complete tree. A live
     # descendant whose intermediate parent exited remains owned only because
@@ -2870,6 +2884,18 @@ def _owned_process_tree(
             live_prior: set[int] = set()
             for entry in prior_entries:
                 row = idx.get(entry["pid"])
+                identity_state = _recorded_process_identity_state(
+                    row,
+                    expected_start=entry["start"],
+                    expected_filetime=entry.get("start_filetime"),
+                )
+                if (
+                    entry["pid"] != wrapper_pid
+                    and identity_state == "different"
+                    and _has_exact_start_identity(row)
+                ):
+                    recycled_parent_pids.add(entry["pid"])
+                    continue
                 if not isinstance(row, dict) or not _start_tokens_match(
                     _start_of(row),
                     entry["start"],
@@ -2912,8 +2938,6 @@ def _owned_process_tree(
                     depth=depth,
                     live=is_live,
                 )
-
-    recycled_parent_pids: set[int] = set()
     launcher_pid = record.get("cli_launcher_pid")
     launcher_start = record.get("cli_launcher_start")
     launcher_lifetime = record.get("cli_launcher_lifetime")
@@ -3027,10 +3051,6 @@ def _owned_process_tree(
             child = idx.get(child_pid)
             if not isinstance(child, dict):
                 invalid_reason = invalid_reason or "missing_child_row"
-                continue
-            if child_pid in recycled_parent_pids:
-                # This numeric PID now names a different exact identity. It is
-                # neither the recorded launcher nor an ownership bridge.
                 continue
             if not parent["live"]:
                 prior_parent = prior_by_pid.get(parent_pid)
@@ -4143,6 +4163,7 @@ def evaluate_launch_barrier(
     if isinstance(tree, dict):
         tree_entries = tree.get("entries", [])
         closure_seed_pids: set[int] = set()
+        recycled_parent_rows: dict[int, dict] = {}
         for entry in tree_entries:
             row = idx.get(entry.get("pid"))
             identity_state = _recorded_process_identity_state(
@@ -4161,6 +4182,13 @@ def evaluate_launch_barrier(
                 # A definitively different exact identity is a recycled PID,
                 # however, and grants no ownership of its current children.
                 closure_seed_pids.add(pid)
+            elif (
+                identity_state == "different"
+                and isinstance(pid, int)
+                and not isinstance(pid, bool)
+                and isinstance(row, dict)
+            ):
+                recycled_parent_rows[pid] = row
             if identity_state in {"absent", "different"}:
                 continue
             add_survivor({
@@ -4184,6 +4212,33 @@ def evaluate_launch_barrier(
         closure_seen = set(recorded_pids)
         frontier = list(recorded_pids)
         children = _children_map(idx)
+        # A recorded parent may spawn an unplanned child, exit, and have its
+        # PID recycled before this barrier snapshot. The replacement PID is
+        # not an ownership root, but a child whose exact start strictly
+        # predates it belongs to the old side of the edge. Exact equal/newer
+        # children belong to the replacement; missing/incomparable exact
+        # evidence remains conservative because this barrier never kills.
+        for parent_pid, replacement in recycled_parent_rows.items():
+            replacement_key = _exact_start_order_key(replacement)
+            for pid in children.get(parent_pid, []):
+                row = idx[pid]
+                child_key = _exact_start_order_key(row)
+                if (
+                    replacement_key is not None
+                    and child_key is not None
+                    and child_key[0] == replacement_key[0]
+                    and child_key[1] >= replacement_key[1]
+                ):
+                    continue
+                if pid in closure_seen:
+                    continue
+                closure_seen.add(pid)
+                frontier.append(pid)
+                add_survivor({
+                    "kind": "owned_descendant_edge",
+                    "pid": pid,
+                    "name": _event_token(row.get("name"), "unknown"),
+                })
         while frontier:
             parent_pid = frontier.pop()
             for pid in children.get(parent_pid, []):
@@ -8580,12 +8635,12 @@ function Quote-Arg([string]$a) {
 }
 # endregion quote-arg
 # region exec-helpers  (extracted verbatim by the test harness with kill-switch stubs)
-if (-not ('AgenttalkSupervisorNativeV1' -as [type])) {
+if (-not ('AgenttalkSupervisorNativeV2' -as [type])) {
   Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
-public static class AgenttalkSupervisorNativeV1 {
+public static class AgenttalkSupervisorNativeV2 {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr OpenProcess(
         UInt32 desiredAccess, bool inheritHandle, UInt32 processId);
@@ -8602,6 +8657,10 @@ public static class AgenttalkSupervisorNativeV1 {
         IntPtr processHandle, UInt32 exitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern UInt32 WaitForSingleObject(
+        IntPtr handle, UInt32 milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseHandle(IntPtr handle);
 }
@@ -8609,10 +8668,11 @@ public static class AgenttalkSupervisorNativeV1 {
 }
 function Open-AgenttalkProcessHandle($procId) {
   if (-not $procId) { return $null }
-  # PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION. The one returned
-  # handle is both the identity certificate and the destructive capability.
-  $handle = [AgenttalkSupervisorNativeV1]::OpenProcess(
-    [uint32]0x1001, $false, [uint32]$procId)
+  # SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION. The
+  # one returned handle is the identity certificate, destructive capability,
+  # and termination-completion signal.
+  $handle = [AgenttalkSupervisorNativeV2]::OpenProcess(
+    [uint32]0x101001, $false, [uint32]$procId)
   if ($handle -eq [IntPtr]::Zero) { return $null }
   return $handle
 }
@@ -8622,7 +8682,7 @@ function Get-AgenttalkProcessHandleStartFiletime($handle) {
   [long]$exit = 0
   [long]$kernel = 0
   [long]$user = 0
-  if (-not [AgenttalkSupervisorNativeV1]::GetProcessTimes(
+  if (-not [AgenttalkSupervisorNativeV2]::GetProcessTimes(
       $handle, [ref]$creation, [ref]$exit, [ref]$kernel, [ref]$user)) {
     return $null
   }
@@ -8630,11 +8690,16 @@ function Get-AgenttalkProcessHandleStartFiletime($handle) {
 }
 function Stop-AgenttalkProcessHandle($handle) {
   if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $false }
-  return [AgenttalkSupervisorNativeV1]::TerminateProcess($handle, [uint32]1)
+  return [AgenttalkSupervisorNativeV2]::TerminateProcess($handle, [uint32]1)
+}
+function Wait-AgenttalkProcessHandleExit($handle, $timeoutMilliseconds) {
+  if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $false }
+  return [AgenttalkSupervisorNativeV2]::WaitForSingleObject(
+    $handle, [uint32]$timeoutMilliseconds) -eq [uint32]0
 }
 function Close-AgenttalkProcessHandle($handle) {
   if ($null -ne $handle -and $handle -ne [IntPtr]::Zero) {
-    [void][AgenttalkSupervisorNativeV1]::CloseHandle($handle)
+    [void][AgenttalkSupervisorNativeV2]::CloseHandle($handle)
   }
 }
 function Proc-Start($procId) {
@@ -8716,6 +8781,11 @@ function Stop-Tree($targets) {
   # so we kill in REVERSE (managed descendants/leaves before the brain). A target
   # whose live start-time no longer matches is a RECYCLED pid -> never killed.
   $arr = @($targets); [array]::Reverse($arr)
+  # Share five seconds across the whole tree: enough for ordinary pending-I/O
+  # cancellation, bounded to one third of the default 15-second poll, and not
+  # multiplied by the 64-target tree limit.
+  $terminationWaitBudgetMilliseconds = 5000
+  $terminationWaitStopwatch = [Diagnostics.Stopwatch]::StartNew()
   foreach ($t in $arr) {
     if (-not $t.pid) { continue }
     if (-not $t.start) { continue }
@@ -8730,7 +8800,14 @@ function Stop-Tree($targets) {
         if ($null -eq $processHandle) { continue }
         $liveFiletime = Get-AgenttalkProcessHandleStartFiletime $processHandle
         if ($null -eq $liveFiletime -or $liveFiletime -ne $exact) { continue }
-        [void](Stop-AgenttalkProcessHandle $processHandle)
+        if (Stop-AgenttalkProcessHandle $processHandle) {
+          $remainingWaitMilliseconds = [math]::Max(
+            0,
+            $terminationWaitBudgetMilliseconds -
+              [int]$terminationWaitStopwatch.ElapsedMilliseconds)
+          [void](Wait-AgenttalkProcessHandleExit `
+            $processHandle $remainingWaitMilliseconds)
+        }
       } catch {
       } finally {
         if ($null -ne $processHandle) {
