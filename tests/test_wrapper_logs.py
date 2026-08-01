@@ -720,16 +720,27 @@ def test_cmd_wrap_routine_exception_types_skip_crash_reporting(
 ) -> None:
     # I2's shape, one layer up: main() already has a concise, actionable
     # diagnostic for KeyboardInterrupt and (ValueError, FileNotFoundError,
-    # OSError) - cmd_wrap's except block converts them to the SAME
-    # SystemExit codes at the bottom, but the crash-reporting block above
-    # that conversion ran unconditionally for anything that wasn't
-    # SystemExit, so an OSError got wrapper_exception + a full Python
-    # traceback BEFORE being converted to the CLI's normal one-line error.
-    # The property: the crash path runs ONLY for exceptions not in this
-    # known, concise-diagnostic set - enumerated as a set (this
-    # parametrize), not patched type by type. A future exception type
-    # that gains a concise diagnostic elsewhere and is not added here
-    # must fail this test, not silently fall through to the crash path.
+    # OSError) - cmd_wrap's except block converts them to the SAME exit
+    # codes at the bottom, but the crash-reporting block above that
+    # conversion ran unconditionally for anything that wasn't SystemExit,
+    # so an OSError got wrapper_exception + a full Python traceback BEFORE
+    # being converted to the CLI's normal one-line error. The property:
+    # the crash path runs ONLY for exceptions not in this known,
+    # concise-diagnostic set - enumerated as a set (this parametrize), not
+    # patched type by type. A future exception type that gains a concise
+    # diagnostic elsewhere and is not added here must fail this test, not
+    # silently fall through to the crash path.
+    #
+    # Round 17 connector finding: this used to assert cmd_wrap RAISES
+    # SystemExit(expected_code) for all four - which was itself the bug.
+    # main() previously RETURNED an int for exactly these two classes
+    # (KeyboardInterrupt, and ValueError/FileNotFoundError/OSError); a
+    # raised SystemExit is not an Exception subclass, so it bypasses
+    # main()'s own except clauses entirely and can escape a caller that
+    # invokes cli.main([...]) programmatically expecting an int back
+    # (an embedder, or a test runner). cmd_wrap now RETURNS the code
+    # instead, restoring that contract regardless of whether cmd_wrap's
+    # own exception handling sits in front of main()'s.
     out_path = tmp_path / "stdout.log"
     err_path = tmp_path / "stderr.log"
     nonce = "f" * 32
@@ -745,9 +756,7 @@ def test_cmd_wrap_routine_exception_types_skip_crash_reporting(
     monkeypatch.setattr(cli, "_cmd_wrap_with_logging", raiser)
     args = argparse.Namespace(agent="worker", supervisor_launch_nonce=nonce)
 
-    with pytest.raises(SystemExit) as exc_info:
-        cli.cmd_wrap(args)
-    assert exc_info.value.code == expected_code
+    assert cli.cmd_wrap(args) == expected_code
 
     tail = "".join(
         path.read_text(encoding="utf-8") for path in tmp_path.glob("stderr.log*")
@@ -758,6 +767,87 @@ def test_cmd_wrap_routine_exception_types_skip_crash_reporting(
     assert rows[0]["reason"] == expected_reason
     assert expected_text in tail
     assert "Traceback (most recent call last)" not in tail
+
+
+@pytest.mark.parametrize(
+    "raise_exc,expected_code,expect_raise",
+    [
+        (lambda: SystemExit(2), 2, True),
+        (lambda: KeyboardInterrupt(), 130, False),
+        (lambda: ValueError("bad value"), 2, False),
+        (lambda: FileNotFoundError("missing.toml"), 2, False),
+        (lambda: OSError("disk full"), 2, False),
+        (lambda: RuntimeError("truly unexpected"), 1, True),
+    ],
+    ids=["SystemExit", "KeyboardInterrupt", "ValueError", "FileNotFoundError",
+         "OSError", "RuntimeError"],
+)
+def test_cmd_wrap_and_main_exception_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raise_exc,
+    expected_code: int,
+    expect_raise: bool,
+) -> None:
+    """Round 17 connector finding: the stated contract, tested end to end
+    through cli.main() - not just cmd_wrap in isolation - because the
+    property that actually matters is what an embedder or a test runner
+    calling cli.main([...]) programmatically observes, and that can only
+    be proven by calling main() itself.
+
+    THE CONTRACT (exception classes that can reach cmd_wrap's handler):
+
+    | class                        | cmd_wrap/main() | lifecycle fact             | tb  |
+    |-------------------------------|-----------------|-----------------------------|-----|
+    | SystemExit (deliberate)       | raises          | wrapper_exited(code,"system_exit") | no |
+    | KeyboardInterrupt             | returns 130     | wrapper_exited(130,"keyboard_interrupt") | no |
+    | ValueError/FileNotFoundError/ | returns 2       | wrapper_exited(2,"mapped_cli_exception") | no |
+    | OSError                       |                 |                             |     |
+    | anything else (unexpected)    | raises SystemExit(1) | wrapper_exception(exc) | yes |
+
+    SystemExit is deliberately left raising, not converted to a return:
+    main() has never caught bare SystemExit (no except clause for it, ever,
+    before this PR touched cmd_wrap at all) - letting it propagate matches
+    what would happen with no exception handling here at all, so there is
+    no pre-existing RETURN contract to restore for it.
+
+    The "anything else" row is deliberately left raising SystemExit(1),
+    not converted to a return, for a different reason: main() has no
+    pre-existing RETURN contract for an unexpected exception either - it
+    would have let the ORIGINAL exception type propagate uncaught. Wrapping
+    it as SystemExit(1) is this PR's own crash-reporting design (a single,
+    known exit code for any crash, after the diagnostic is recorded) - it
+    was never main()'s job to return an int for a type it never handled,
+    so there is nothing to restore here. If this is wrong, it needs its
+    own explicit decision, not a silent inclusion in this fix.
+
+    Only the middle two rows changed this round: cmd_wrap used to RAISE
+    SystemExit for them too, which bypassed main()'s own except clauses
+    entirely (SystemExit is not an Exception subclass) and let a call to
+    cli.main([...]) propagate SystemExit instead of returning an int -
+    the exact regression this test exists to make impossible to
+    reintroduce."""
+    out_path = tmp_path / "stdout.log"
+    err_path = tmp_path / "stderr.log"
+    nonce = "3" * 32
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(out_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(err_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+
+    def raiser(_args: argparse.Namespace) -> int:
+        raise raise_exc()
+
+    monkeypatch.setattr(cli, "_cmd_wrap_with_logging", raiser)
+
+    argv = ["--supervisor-launch-nonce", nonce, "wrap", "--for", "worker"]
+    if expect_raise:
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(argv)
+        assert exc_info.value.code == expected_code
+    else:
+        assert cli.main(argv) == expected_code
 
 
 def test_cmd_wrap_unclassified_exception_still_gets_crash_reporting(

@@ -10710,16 +10710,32 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             # (this set) and
             # test_cmd_wrap_unclassified_exception_still_gets_crash_reporting
             # (the other half of the property).
+            # Round 17 connector finding: raising SystemExit here for a
+            # class main() itself handles bypasses main()'s own handler for
+            # it - main() never has a chance to run its except clause,
+            # because SystemExit is not a subclass of Exception and simply
+            # propagates through main()'s try/except untouched, all the way
+            # out of main() itself. main() previously RETURNED an int for
+            # exactly these two classes (see the contract table in
+            # test_cmd_wrap_and_main_exception_contract); that RETURN is
+            # the actual contract an embedder or a test runner calling
+            # cli.main([...]) programmatically depends on, not a
+            # SystemExit with a matching code - the two look the same at a
+            # console (the process exits N either way) but are NOT the
+            # same to anything catching Exception around a call to main().
+            # Return the SAME int main() would have, so main()'s contract
+            # holds regardless of whether cmd_wrap's own exception handling
+            # sits in front of it.
             if isinstance(exc, KeyboardInterrupt):
                 sys.stderr.write("\nagenttalk: interrupted\n")
                 if not lifecycle_log.terminal_emitted:
                     lifecycle_log.wrapper_exited(130, reason="keyboard_interrupt")
-                raise SystemExit(130) from exc
+                return 130
             if isinstance(exc, (ValueError, FileNotFoundError, OSError)):
                 sys.stderr.write(f"agenttalk: {exc}\n")
                 if not lifecycle_log.terminal_emitted:
                     lifecycle_log.wrapper_exited(2, reason="mapped_cli_exception")
-                raise SystemExit(2) from exc
+                return 2
             # Genuinely unexpected: record the crash fact and print the
             # traceback here, while sys.stderr is still the bounded tee
             # installed above - the "finally" of that context manager
