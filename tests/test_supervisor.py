@@ -2597,7 +2597,11 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     # Phase C: a WRAPPED agent ($file is python, not the CLI) is preflighted BEFORE
     # the codex branch and validates the python wrapper, NOT the codex sandbox.
     wrap_branch = pf[pf.index("$plan.launch_mode -eq 'wrap'"):ci]
-    assert "& $file -m agenttalk --version" in wrap_branch
+    # round 24 connector finding: the wrapped probe must carry the SAME
+    # declared prefix tokens the real launch uses, not a fixed
+    # `-m agenttalk --version` stand-in - see
+    # test_preflight_wrapped_smoke_test_uses_the_configured_prefix.
+    assert "& $file @prefixTokens -m agenttalk --version" in wrap_branch
     assert "Test-WrappedBaseCli" in wrap_branch
     assert "& $file sandbox" not in wrap_branch    # never treats $file as the codex CLI
 
@@ -5368,13 +5372,83 @@ def test_ps_wrapper_log_targets_preserve_output_and_prune_old_generations(
     # Round 23: retention now prunes to the newest ALREADY-CONFIRMED
     # WRAPPER_LOG_GENERATIONS, not (WRAPPER_LOG_GENERATIONS - 1) reserving
     # a slot for the one just created (see Invoke-WrapperLogRetentionPrune's
-    # own comment) - a run that ends right after this test's own final
-    # confirm can observe one MORE than quota (self-corrects on the next
-    # launch's own prune), never fewer and never unbounded.
+    # own comment). Round 24 CORRECTION: this was originally described here
+    # as "one more than quota for one cycle, self-corrects on the next
+    # launch's own prune" - the connector proved by execution that this is
+    # wrong: it is STEADY STATE, not a transient, for as long as launches
+    # keep confirming - see
+    # test_ps_wrapper_log_retention_settles_one_over_quota_not_at_quota for
+    # the dedicated proof (10 cycles, quota+1 from cycle 5 onward, never
+    # quota again). Kept as a loose bound here since THIS test's own point
+    # is the byte-level tee behavior, not the retention count.
     assert sup.WRAPPER_LOG_GENERATIONS <= payload["count"] <= sup.WRAPPER_LOG_GENERATIONS + 1
     assert "ACTUAL-STDOUT" in payload["stdout"]
     assert "ACTUAL-STDERR" in payload["stderr"]
     assert "ACTUAL-STDOUT" in payload["preserved"]
+
+
+def test_ps_wrapper_log_retention_settles_one_over_quota_not_at_quota(
+    tmp_path: Path,
+) -> None:
+    """Round 24 connector finding, settled by EXECUTION rather than
+    re-reading: my own round-23 report claimed an all-confirming string
+    sits at quota+1 for ONE cycle, self-correcting on the next launch's own
+    prune. That claim is wrong. Invoke-WrapperLogRetentionPrune runs BEFORE
+    the generation it just created is confirmed, so it can only ever trim
+    EXISTING (already-resolved) generations down to the quota - the one
+    just created then becomes a (quota+1)-th confirmed generation once it
+    succeeds, and nothing prunes again until the NEXT launch repeats
+    exactly the same pattern. That is a permanent steady state for as long
+    as launches keep confirming, not a one-off overshoot: this drives 10
+    consecutive create-then-confirm cycles against a quota of 4 and asserts
+    the trajectory outright (not just a bound) - count climbs 1,2,3,4 while
+    still under quota, then sits at 5 from the point it first exceeds quota
+    through the last cycle, never dropping back to 4."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    log_root = tmp_path / "wrapper logs"
+    result_path = tmp_path / "settle.json"
+    quota = 4
+    cycles = 10
+    rows = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(log_root))}",
+        f"$WrapperLogGenerations = {quota}",
+        helpers,
+        _CONFIRM_WRAPPER_LOG_TARGET_PS,
+        "$counts = @()",
+    ]
+    for _ in range(cycles):
+        rows.extend([
+            "$target = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+            "Confirm-WrapperLogTarget $target",
+            "$dirs = @(Get-ChildItem -LiteralPath "
+            f"(Join-Path $WrapperLogRoot {_pslit(_wrapper_log_agent_dir('worker'))}) "
+            "-Directory)",
+            "$counts += $dirs.Count",
+        ])
+    rows.append(
+        "@{ counts = $counts } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8"
+    )
+    script = tmp_path / "settle-retention.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    counts = json.loads(result_path.read_text(encoding="utf-8-sig"))["counts"]
+    # Climbing to quota while under it, then PERMANENTLY at quota+1 - never
+    # back down to quota once it first overshoots.
+    assert counts == [1, 2, 3, 4, 5, 5, 5, 5, 5, 5]
 
 
 def test_ps_wrapper_log_prune_survives_backward_clock_correction(
@@ -14904,6 +14978,104 @@ def test_preflight_wrapped_codex_validates_python_not_codex_sandbox(tmp_path: Pa
     # the $file stub is never invoked, so its log has no 'sandbox'. (codexOk depends
     # on the ambient python having agenttalk importable, so it is not asserted.)
     assert "sandbox" not in codex_args
+
+
+def test_preflight_wrapped_smoke_test_uses_the_configured_prefix(tmp_path: Path) -> None:
+    """Round 24 connector finding: Preflight used to smoke-test a fixed
+    `-m agenttalk --version` regardless of the agent's declared
+    launch.module_args_from prefix - so an allowed -E/-I/-S that breaks the
+    REAL launch's import (on a source checkout resolving agenttalk via
+    injected PYTHONPATH) went undetected, because Preflight never used the
+    prefix it was supposed to be validating. Drives Resolve-
+    AgenttalkLaunchPrefixTokens (the extraction) and Preflight (the
+    consumer) together against a config declaring an -E prefix, and checks
+    the stub's OWN logged argv - not just Preflight's return value - so a
+    regression back to the fixed-invocation shape fails this test even if
+    it happens to still return $true."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    wlog = tmp_path / "wrap.log"
+    wstub = tmp_path / "pywrap.cmd"
+    _stub_cmd(wstub, wlog)
+    native_cli = tmp_path / "claude.exe"      # Test-WrappedBaseCli needs a real tail
+    native_cli.write_text("", encoding="utf-8")
+    out = tmp_path / "pf_prefix.json"
+    preamble = [
+        f"$Root = {_pslit(str(tmp_path))}",
+        "$SrcOnPyPath = $false",
+        f"$AgenttalkPython = {_pslit(str(wstub))}",
+        (
+            # Test-WrappedBaseCli reads $cfg.agents.$name from OUTER SCOPE
+            # (not a Preflight parameter) - $a must be the SAME object so
+            # both it and Resolve-AgenttalkLaunchPrefixTokens see one
+            # config, not two independently-typed ones.
+            "$cfg = @{ agents = @{ 'wrapped' = @{ launch = @{ "
+            "windows_args = @('-E','-m','agenttalk','wrap','--loop','--',"
+            f"{_pslit(str(native_cli))}" "); module_args_from = 1 } } } }"
+        ),
+        "$a = $cfg.agents.'wrapped'",
+    ]
+    harness = "\n".join([
+        helpers, *preamble,
+        "$prefixTokens = Resolve-AgenttalkLaunchPrefixTokens $a",
+        f"$wrapOk = Preflight 'wrapped' (@{{ cli='claude'; launch_mode='wrap' }}) "
+        f"{_pslit(str(wstub))} $null $prefixTokens",
+        "@{ wrapOk=$wrapOk; prefixTokens=$prefixTokens } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    hp = tmp_path / "pf_prefix_harness.ps1"
+    hp.write_text(harness, encoding="utf-8-sig")
+    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
+    d = json.loads(out.read_text(encoding="utf-8-sig"))
+    wrap_args = wlog.read_text(encoding="utf-8") if wlog.exists() else ""
+    assert d["wrapOk"] is True
+    assert d["prefixTokens"] == ["-E"]
+    # THE property under test: the stub actually SAW -E ahead of -m agenttalk,
+    # not just that Preflight returned true.
+    assert "-E -m agenttalk --version" in wrap_args
+
+
+def test_resolve_agenttalk_launch_prefix_tokens_fails_closed_on_bad_declaration(
+    tmp_path: Path,
+) -> None:
+    """The other half of the property: a module_args_from that does not
+    resolve against windows_args (out of range, or pointing at a token this
+    project does not affirmatively allow) must come back $null, not an
+    empty/no-prefix fallback - a caller silently falling back to no prefix
+    would just reintroduce the exact fidelity gap this function exists to
+    close."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "resolve_prefix.json"
+    harness = "\n".join([
+        helpers,
+        # out of range
+        "$a1 = @{ launch = @{ windows_args = @('-m','agenttalk'); module_args_from = 5 } }",
+        # module_args_from points past a token this allowlist refuses (-O strips asserts)
+        "$a2 = @{ launch = @{ windows_args = @('-O','-m','agenttalk'); module_args_from = 1 } }",
+        # the ordinary, overwhelmingly common case: no declared prefix at all
+        "$a3 = @{ launch = @{ windows_args = @('-m','agenttalk') } }",
+        "$r1 = Resolve-AgenttalkLaunchPrefixTokens $a1",
+        "$r2 = Resolve-AgenttalkLaunchPrefixTokens $a2",
+        "$r3 = Resolve-AgenttalkLaunchPrefixTokens $a3",
+        "@{ r1=$r1; r2=$r2; r3=$r3 } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    hp = tmp_path / "resolve_prefix_harness.ps1"
+    hp.write_text(harness, encoding="utf-8-sig")
+    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
+    d = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert d["r1"] is None
+    assert d["r2"] is None
+    assert d["r3"] == []
 
 
 # ----------------------------------------- WP2: lead-loop controller exit-marker rules

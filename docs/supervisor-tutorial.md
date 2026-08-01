@@ -159,22 +159,42 @@ agent name, prefixed with `agent-`; hashing avoids Windows reserved-name and
 trailing-dot aliases.
 
 Before starting the process, the supervisor creates a new immutable generation
-and then retains that generation plus the three newest prior generations across
-both the persistent and temporary fallback roots. Once `agenttalk wrap` begins
-command dispatch, Python-level writes through its standard streams are bounded
-to 1 MiB per stream using four fixed segments; suffixes `.1` through `.3`
-retain the newest output after the initial redirect segment fills.
-Interpreter/package bootstrap output written before that entry point, and
-direct native/file-descriptor writes, are not intercepted by the cooperative
-Python stream bound. The switch to a new immutable destination happens before
-the relaunch, so the wrapper that just died is never overwritten. Retention
-pruning commits only after the launch returns a PID; repeated launch failures
-therefore cannot evict the prior evidence. If the persistent root is
-unavailable, the supervisor warns and tries the OS temporary directory. If a
-stale handle or filesystem error prevents cleanup, the recovery launch
-continues with a unique generation and warns; the quota can remain exceeded
-until that filesystem problem is resolved. If neither root can accept a new
-generation, recovery launches without redirection.
+across both the persistent and temporary fallback roots and prunes older
+generations back toward a quota of four (`WRAPPER_LOG_GENERATIONS`). Once
+`agenttalk wrap` begins command dispatch, Python-level writes through its
+standard streams are bounded to 1 MiB per stream using four fixed segments;
+suffixes `.1` through `.3` retain the newest output after the initial
+redirect segment fills. Interpreter/package bootstrap output written before
+that entry point, and direct native/file-descriptor writes, are not
+intercepted by the cooperative Python stream bound. The switch to a new
+immutable destination happens before the relaunch, so the wrapper that just
+died is never overwritten.
+
+A generation is retained forever, uncounted against the quota, until the
+wrapper process itself confirms it - from inside `agenttalk wrap`, right
+after authenticating and installing both bounded stream tees, which is the
+earliest point that proves this launch actually reached command dispatch.
+The supervisor never commits a generation on the launcher's behalf (a
+process existing, or even returning a PID, is not proof the wrapper reached
+that point), so a wrapper that dies before confirming leaves its generation
+preserved and unpruned rather than evicting real evidence for a launch
+attempt whose outcome was never known. Because pruning runs when a new
+generation is created - before that new generation's own fate is decided -
+a string of launches that all successfully confirm settles at one MORE than
+the quota (five, by default) rather than exactly the quota: pruning trims
+existing CONFIRMED generations down to four before creating the next one,
+which itself becomes a fifth confirmed generation once it succeeds, and
+nothing prunes again until the next launch repeats the same pattern. This
+is a known, currently-accepted bound violation, not a rare edge case -
+proven by running repeated successful launches against the code as shipped
+and counting the generations left on disk - to be revisited alongside the
+broader retention-timing question in a follow-up round. If the persistent
+root is unavailable, the supervisor warns and tries the OS temporary
+directory. If a stale handle or filesystem error prevents cleanup, the
+recovery launch continues with a unique generation and warns; the quota can
+remain exceeded (independent of the off-by-one above) until that filesystem
+problem is resolved. If neither root can accept a new generation, recovery
+launches without redirection.
 
 On Windows the generated supervisor gives the child an explicit allowlist of
 only stdin (`NUL`) and the two log handles. This avoids leaking the

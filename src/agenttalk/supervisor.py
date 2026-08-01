@@ -9207,12 +9207,36 @@ function Test-AgenttalkAllowedInterpreterPrefixToken([string]$token) {
   #       resolving `agenttalk` itself if it is installed via
   #       site-packages rather than reachable without site processing -
   #       a launch-configuration footgun for the operator to own, not a
-  #       security bypass of this check (CPython still reaches -m
-  #       agenttalk, or fails loudly with ModuleNotFoundError).
+  #       security bypass of this check.
   #   -B  never write .pyc files - no execution-mode or security effect.
   #   -E  ignore PYTHON* environment variables - hardening. NOTE: can
   #       break a dev checkout relying on PYTHONPATH (SrcOnPyPath) - same
   #       kind of launch-configuration caveat as -S, not a check gap.
+  #
+  #   ROUND 24 CORRECTION to the -S/-E footgun classification above: the
+  #   original wording ("CPython still reaches -m agenttalk, or fails
+  #   loudly with ModuleNotFoundError") assumed that failure would be
+  #   OBSERVED somewhere before it mattered. The connector proved a third
+  #   outcome that assumption missed: on a source checkout resolving
+  #   `agenttalk` only via injected PYTHONPATH, an allowed -E/-S/-I broke
+  #   the REAL wrapped launch's import while Preflight - which ran a bare
+  #   `-m agenttalk --version` with NO declared prefix - never exercised
+  #   the failure and reported success anyway, so the supervisor relaunched
+  #   a wrapper that exits before cmd_wrap, SILENTLY, in a loop. That is a
+  #   genuinely different failure mode than "fails loudly", not a smaller
+  #   version of it. The footgun classification holds again now that
+  #   Preflight tests the CONFIGURED invocation (see
+  #   Resolve-AgenttalkLaunchPrefixTokens) - CPython really does either
+  #   reach -m agenttalk or fail loudly, because Preflight's own probe
+  #   fails the SAME way the real launch would, before a relaunch loop
+  #   ever starts. That guarantee is now Preflight's job, not an assumption
+  #   this allowlist gets to make on its own: if Preflight is ever called
+  #   without the declared prefix again (a fidelity regression), -S/-E/-I
+  #   silently fail-open the same way, and this classification is wrong
+  #   again. NOTE this guarantee does not extend to ephemeral reviewer
+  #   launches (Launch-Spec) - that path has no Preflight call at all,
+  #   for any prefix or any other misconfiguration, a broader and
+  #   pre-existing gap this round's fix does not close.
   #   -P  don't prepend a possibly-unsafe path to sys.path - hardening.
   #   -X  implementation-specific options, ATTACHED form only (e.g.
   #       -Xutf8) - CPython's own scanner always continues past -X to the
@@ -9379,6 +9403,36 @@ function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom 
     return $index
   }
   return -1
+}
+function Resolve-AgenttalkLaunchPrefixTokens($agentConfig) {
+  # THE tokens Preflight must smoke-test WITH, so it tests the CONFIGURED
+  # invocation rather than a fixed stand-in for it (round 24 connector
+  # finding on supervisor.py:3400's -E/-I/-S justification). Reuses
+  # Resolve-AgenttalkModuleFlagIndex - the SAME resolution every other
+  # module_args_from consumer performs - rather than re-deriving where the
+  # prefix ends. Returns @() for the overwhelmingly common case (no
+  # declared prefix, or module_args_from absent/0), and $null if the
+  # declaration does not resolve (out of range, or a token in the prefix
+  # this project does not affirmatively allow) - the caller's job is to
+  # treat $null as the CONFIG ERROR it is, not silently fall back to no
+  # prefix, which would just reintroduce the exact fidelity gap this
+  # exists to close.
+  #
+  # The leading commas below are load-bearing, not style: PowerShell
+  # UNROLLS an array onto the pipeline on `return`, so a caller assigning
+  # the result of a bare `return @()` sees $null, and a bare
+  # `return @('-E')` sees the SCALAR string '-E', not a one-element array
+  # - which then makes `& $file @prefixTokens ...` splat the STRING's
+  # individual CHARACTERS as separate argv tokens (confirmed empirically:
+  # `-E` became two tokens, `-` and `E`). The unary comma operator wraps
+  # the array as a single pipeline object so it survives `return` intact,
+  # at every length including zero and one.
+  $windowsArgs = @($agentConfig.launch.windows_args)
+  $moduleArgsFrom = $agentConfig.launch.module_args_from
+  $mIdx = Resolve-AgenttalkModuleFlagIndex $windowsArgs $moduleArgsFrom
+  if ($mIdx -lt 0) { return $null }
+  if ($mIdx -eq 0) { return ,@() }
+  return ,@($windowsArgs[0..($mIdx - 1)])
 }
 function Ensure-AgenttalkWrapRootArg($argv, $moduleArgsFrom = $null) {
   # Older supervisor.json files launched wrappers as:
@@ -9637,10 +9691,29 @@ function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFro
   }
   return $false
 }
-function Preflight($name, $plan, $file, $codexHome) {
+function Preflight($name, $plan, $file, $codexHome, [object[]]$prefixTokens = @()) {
   # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
   # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
   # the launch grace in a relaunch loop. Returns $true on success.
+  #
+  # Round 24 connector finding: the wrapped-mode probe below used to run
+  # `-m agenttalk --version` with NO prefix, while the REAL launch runs
+  # $a.launch.windows_args verbatim - including any declared -E/-I/-S/...
+  # tokens before -m. On a source checkout that only resolves `agenttalk`
+  # via injected PYTHONPATH, an allowed -E (ignores PYTHON* env vars) or -I
+  # (implies -E) breaks the REAL launch's import while this probe, never
+  # having used the prefix, succeeds anyway - the third outcome round 15's
+  # -E/-I/-S justification ("CPython still reaches -m OR fails loudly")
+  # missed: it can fail SILENTLY, in a process this exact check was
+  # supposed to catch before it started looping. $prefixTokens (the
+  # caller's resolved windows_args[0:module_args_from], the SAME
+  # resolution Resolve-AgenttalkModuleFlagIndex performs for every other
+  # consumer of module_args_from - not a second, divergent extraction) is
+  # spliced into the wrapped probe below so it tests the CONFIGURED
+  # invocation, not a fixed stand-in for it. The $AgenttalkPython probes
+  # elsewhere in this function are deliberately left alone: they smoke-test
+  # THIS supervisor's own pinned interpreter/environment, which no
+  # per-agent windows_args prefix ever governs.
   try {
     # Deliberately case-insensitive (here and every other launch_mode
     # comparison): launch_mode is never operator-authored config text - it
@@ -9657,7 +9730,7 @@ function Preflight($name, $plan, $file, $codexHome) {
       if ($codexHome) { $env:CODEX_HOME = $codexHome }
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
       try {
-        & $file -m agenttalk --version | Out-Null
+        & $file @prefixTokens -m agenttalk --version | Out-Null
         $rc = $LASTEXITCODE
         if ($rc -eq 0) {
           & $AgenttalkPython -m agenttalk --version | Out-Null
@@ -11071,8 +11144,24 @@ $pollNum = 0
           & $AgenttalkCmd --root $Root supervise --seed-claude-settings --dir $launchDir --mode $p.perm_mode | Out-Null
         }
         $file = $a.launch.windows_file
+        # Round 24: prefix-token resolution only means anything for a
+        # WRAPPED launch - Preflight's only branch that consumes
+        # $prefixTokens is the one testing $file (the wrapper python) with
+        # `-m agenttalk`. A non-wrapped agent's windows_args is not
+        # required to invoke `-m agenttalk` at all (a legacy direct launch
+        # of some other module, or a CLI exe with a `--` tail) - resolving
+        # against a grammar that does not apply is not a config error to
+        # fail closed on, it is just "no prefix to test here".
+        $prefixTokens = @()
+        if ($p.launch_mode -eq 'wrap') {
+          $prefixTokens = Resolve-AgenttalkLaunchPrefixTokens $a
+          if ($null -eq $prefixTokens) {
+            Write-Warning ("supervisor: {0}: CONFIG ERROR - launch.module_args_from does not resolve against launch.windows_args; NOT launching (fail closed)" -f $name)
+            $seedOk = $false
+          }
+        }
         if ($seedOk -and -not (Assert-ActionsEnabled ("preflight {0}" -f $name))) { $seedOk = $false }
-        if ($seedOk -and -not (Preflight $name $p $file $homeEnv)) { $seedOk = $false }
+        if ($seedOk -and -not (Preflight $name $p $file $homeEnv $prefixTokens)) { $seedOk = $false }
         if (-not $seedOk) {
           Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
           Set-AgentState $state $name $p.next_state
