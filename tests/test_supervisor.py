@@ -5537,6 +5537,103 @@ def test_ps_wrapper_log_sequence_write_failure_marks_uncertain_and_defers_prune(
     assert payload["g2Name"] in payload["survivors"]
 
 
+def test_ps_wrapper_log_sequence_uncertainty_persists_to_the_next_launch(
+    tmp_path: Path,
+) -> None:
+    """Round 13 connector finding: round 12's sequence_uncertain does not
+    outlive its own launch. It exists only in the return value of the ONE
+    New-WrapperLogTargets call that hit the write failure - nothing
+    persists it to disk - so once that generation commits without a
+    .sequence file, Get-NextWrapperLogSequence's scan on the NEXT launch
+    silently skips it (missing .sequence -> continue, no uncertain flag)
+    and treats ordering as reliable again. Concretely: G1/G2/G3 commit
+    with real sequence numbers, G4's write fails and commits without one
+    (uncertain on G4's own launch, pruning deferred that cycle per round
+    12), then G5 launches normally with a REAL sequence write. Before this
+    fix G5 is NOT uncertain (its own write succeeded and the scan does not
+    look back), so retention proceeds and ranks G4 - chronologically
+    between G3 and G5 - below every sequence-bearing entry: G1 (the
+    OLDEST) and G4 (NEWER than G2/G3) both get pruned while G2/G3 survive.
+    After this fix a missing/unreadable .sequence file on a COMMITTED
+    generation propagates into uncertain on every SUBSEQUENT scan until
+    that generation is gone, so G5 is uncertain too and pruning keeps
+    deferring - G4 survives."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    primary = tmp_path / "primary"
+    fallback = tmp_path / "fallback"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    result_path = tmp_path / "sequence-uncertainty-persists.json"
+    rows: list[str] = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$WrapperLogRoot = {_pslit(str(primary))}",
+        f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+        "$WrapperLogGenerations = 3",
+        helpers,
+        "1..3 | ForEach-Object {",
+        "  $t = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "  Complete-WrapperLogTargets $t",
+        "}",
+        "function Write-WrapperLogSequenceFile([string]$path, [long]$value) {",
+        "  throw 'simulated transient .sequence write failure'",
+        "}",
+        "$t4 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "Complete-WrapperLogTargets $t4",
+        # Redefine back to the real body (a later same-name function
+        # definition overwrites the earlier one in place in PowerShell's
+        # function: drive - Remove-Item would delete it entirely, leaving
+        # nothing callable, not "restore the original").
+        "function Write-WrapperLogSequenceFile([string]$path, [long]$value) {",
+        "  [IO.File]::WriteAllText($path, [string]$value, (New-Object Text.UTF8Encoding($false)))",
+        "}",
+        "$t5 = New-WrapperLogTargets 'worker' ([Guid]::NewGuid().ToString('N'))",
+        "Complete-WrapperLogTargets $t5",
+        f"$agentDir = Join-Path {_pslit(str(primary))} {_pslit(agent_leaf)}",
+        "$survivors = @(Get-ChildItem -LiteralPath $agentDir -Directory | "
+        "  ForEach-Object { $_.Name })",
+        "$g4Name = (Split-Path ([string]$t4.generation_dir) -Leaf)",
+        "@{ uncertain4 = [bool]$t4.sequence_uncertain; "
+        "uncertain5 = [bool]$t5.sequence_uncertain; "
+        "survivorCount = $survivors.Count; "
+        "g4Name = $g4Name; "
+        "survivors = $survivors } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "sequence-uncertainty-persists.ps1"
+    script.write_text("\n".join(rows), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["uncertain4"] is True
+    assert payload["uncertain5"] is True, (
+        "a missing .sequence file on a committed generation must make the "
+        "NEXT launch's scan uncertain too, not just the launch that hit "
+        "the write failure"
+    )
+    assert payload["g4Name"] in payload["survivors"], (
+        "G4 has no .sequence file but is chronologically newer than G2/G3 "
+        "- retention must not prune it while an older sequence-bearing "
+        "generation survives"
+    )
+    assert payload["survivorCount"] == 5, (
+        "pruning should still be deferred at G5's commit since ordering "
+        "remains unreliable while G4's missing sequence is unresolved"
+    )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
 def test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker(
     tmp_path: Path,
@@ -10185,6 +10282,32 @@ def test_process_ownership_ephemeral_launch_spec_records_and_checks_nonce() -> N
     assert timeout_suppressed["kill_targets"] == []
     diag = missing["ephemeral_reviewers"]["active"]["R1"]["provenance_diagnostics"]
     assert diag["launcher_nonce_missing_state"] == 1
+
+
+def test_ephemeral_launch_spec_preserves_declared_module_args_from() -> None:
+    """Round 13 connector finding, the third location this field has been
+    lost: launch_spec() rebuilt its "launch" sub-dict from only
+    windows_file and windows_args, silently dropping module_args_from (and
+    any other field of the profile's launch config) - an ephemeral
+    reviewer configured with the documented -Xutf8 prefix ran fine as
+    Python but got index 0 checked, nonce injection and bounded logging
+    disabled, and was recorded WITHOUT nonce-backed process attribution.
+    launch_spec now starts the rebuild from a COPY of the profile's launch
+    dict rather than two hand-picked keys, so a field nobody remembers to
+    list here survives rather than reading as unset."""
+    marker = {"request_id": "R1", "skill": "review", "profile": "codex-evidence-reviewer"}
+    profile = {
+        "cli": "codex",
+        "launch": {
+            "windows_file": "python.exe",
+            "windows_args": ["-Xutf8", "-m", "agenttalk", "wrap", "--for", "{AGENT}"],
+            "module_args_from": 1,
+        },
+    }
+    spec = eph.launch_spec(marker, profile, "adversary-1")
+    assert spec["launch"]["module_args_from"] == 1
+    assert spec["launch"]["windows_file"] == "python.exe"
+    assert spec["launch"]["windows_args"][-1] == "adversary-1"
 
 
 def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> None:

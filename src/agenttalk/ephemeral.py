@@ -343,6 +343,12 @@ def launch_spec(marker: dict, profile: dict, agent: str) -> dict:
         "groups": effective_groups(marker, profile),
         "timeout_seconds": int(marker.get("timeout_seconds") or 1800),
         "launch": {
+            # Start from a COPY of the profile's own launch dict, not a
+            # hand-picked pair of keys - module_args_from (and any future
+            # declared field nobody remembers to list here) is a fact
+            # about this profile's launcher and must survive this rebuild
+            # rather than being silently dropped and read as unset.
+            **launch,
             "windows_file": sub(launch.get("windows_file", "")),
             "windows_args": [sub(x) for x in args],
         },
