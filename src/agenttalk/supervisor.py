@@ -564,6 +564,7 @@ _DIAGNOSTIC_COUNTERS = (
     "launcher_nonce_duplicate",
     "launcher_nonce_after_subcommand_or_tail",
     "launcher_wrap_parse_failed",
+    "excluded_live_descendant_unaccounted",
 )
 
 
@@ -3055,6 +3056,20 @@ def _unverified_owned_process_tree(
         else reason_code
     )
     held["refreshed_at"] = _event_now(now_epoch)
+    # Task #150 round 11 connector finding: this relabels a PRIOR poll's
+    # entries as THIS poll's invalid record without ever walking the
+    # current process graph - the same "a producer that doesn't walk must
+    # not claim to have walked" rule round 4 already applied to the
+    # PowerShell post-kill barrier, which strips this same field at its own
+    # mutation sites for the identical reason. rejected_count == 0 was true
+    # of the walk that produced `prior`; it says nothing about THIS poll,
+    # which performed no walk at all. Left uncorrected, a LATER poll's
+    # entries_are_complete check reads that stale zero as proof this
+    # invalid record is complete, re-admitting it for absence-promotion on
+    # an accounting question nobody actually asked this poll. Missing reads
+    # as unknown - already ineligible for re-derivation - which is the
+    # correct meaning: we genuinely do not know.
+    held.pop("rejected_count", None)
     return held
 
 
@@ -4503,10 +4518,12 @@ def _attribution(
     # see the two fixes below. excluded_pids is no longer discarded.
     idx, excluded_pids = _snap_index_and_excluded(snapshot)
     kids = _children_map(idx)
+    all_edges = _snap_all_edges(snapshot)
     targets_by_pid: dict[int, dict] = {}
     seed_pids: set[int] = set()
     seed_launcher_sources: dict[int, dict] = {}
     seed_synthetic_rows: dict[int, dict] = {}
+    unaccounted_excluded_children: set[int] = set()
     launcher_pid = st.get("launcher_pid")
     launcher_start = st.get("launcher_start")
     launcher_row = idx.get(launcher_pid) if isinstance(launcher_pid, int) else None
@@ -4662,6 +4679,32 @@ def _attribution(
             if child_launcher_source is not None:
                 seed_launcher_sources[child_pid] = child_launcher_source
             queue.append(child_pid)
+        # Task #150 round 11 connector finding: kids (_children_map(idx))
+        # is built only from idx.items() - a child excluded this poll
+        # (duplicate/ambiguous rows) never contributed a row to idx at all,
+        # so it never contributes an edge here either, regardless of the
+        # parent. This is a DIFFERENT gap than the one above: an excluded
+        # PARENT still has a trusted prior identity to fall back on
+        # (seed_synthetic_rows); a brand-new, never-before-tracked
+        # EXCLUDED CHILD has no such independent anchor - the ambiguous
+        # current-poll rows are the only information that exists about it,
+        # which is the same "no snapshot-only signal to disambiguate a
+        # first-time-seen identity" residual already documented in
+        # _snap_all_edges for a malformed pid. Inventing a synthetic child
+        # row from one of the ambiguous rows would extend trust exactly
+        # where round 1's original incident began. Cannot safely target or
+        # persist it - but it must not vanish silently either: the
+        # permissive all_edges map still sees it, so surface it as a known
+        # gap rather than a total loss.
+        for child_pid in all_edges.get(parent_pid, []):
+            if (
+                child_pid not in excluded_pids
+                or child_pid in targets_by_pid
+                or child_pid in unaccounted_excluded_children
+            ):
+                continue
+            unaccounted_excluded_children.add(child_pid)
+            _bump(diagnostics, "excluded_live_descendant_unaccounted")
 
     fresh_pids = set(targets_by_pid)
     managed_by_pid: dict[int, dict] = {}

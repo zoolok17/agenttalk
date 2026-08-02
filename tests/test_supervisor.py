@@ -14023,6 +14023,62 @@ def test_process_ownership_opaque_child_of_excluded_seed_still_killed_with_launc
     assert {11, 12} <= kill_target_pids  # opaque child killed in the SAME operation as the excluded seed
 
 
+def test_process_ownership_excluded_opaque_child_is_unaccounted_not_lost() -> None:
+    """Task #150 round 11 finding 2: _children_map(idx) is built only from
+    idx.items() - a newly discovered child excluded this poll (duplicate/
+    ambiguous rows) never contributed a row to idx, so it never
+    contributes an edge either, regardless of its parent's own trust
+    state. A valid, non-excluded seed_descendants root's opaque child is
+    therefore invisible to the BFS discovery entirely, not merely skipped
+    after being found - a structurally different gap than round 10's
+    finding 1 (an excluded PARENT still has a trusted prior identity to
+    fall back on; a first-time-seen EXCLUDED CHILD has no independent
+    anchor at all, the same "no snapshot-only signal to disambiguate a
+    first-time-seen identity" residual _snap_all_edges already documents
+    for a malformed pid). Asserts the operator-visible outcome: the child
+    is never invented as an untrustworthy kill target (which of the
+    ambiguous rows is real cannot be verified), but it is also never
+    silently lost - diagnostics surfaces it as an accounted-for gap
+    rather than a total loss."""
+    prior = {
+        "attribution_model": "process_ownership_v1",
+        "root_key": sup._root_key(TEST_ROOT),
+        "agent": "worker",
+        "request_id": None,
+        "pid": 11,
+        "start": _ps_iso(200000),
+        "source": "launch_child_provenance",
+        "captured_at_epoch": NOW - 10,
+        "last_fresh_attribution_epoch": NOW - 10,
+        "seed_descendants": True,
+        "source_launcher_pid": 10,
+        "source_launcher_start": _ps_iso(100000),
+        "source_launcher_nonce": SUPERVISOR_NONCE,
+    }
+    opaque_child = _proc(12, 11, "node.exe", "node worker.js", _ps_iso(250000))
+    snap = [
+        _proc(10, 1, "codex.exe", "codex exec", _ps_iso(100000)),
+        _proc(11, 1, "codex.exe", "codex exec --json", _ps_iso(200000)),
+        opaque_child,
+        dict(opaque_child),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(
+            launcher_pid=10,
+            launcher_start=_ps_iso(100000),
+            managed_pids=[json.loads(json.dumps(prior))],
+        ),
+        _OWNERSHIP_ATTR_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    kill_target_pids = {t["pid"] for t in p["kill_targets"]}
+    assert 11 in kill_target_pids  # the trusted root is still targeted
+    assert 12 not in kill_target_pids  # never invent trust from ambiguous rows
+    assert p["diagnostics"]["excluded_live_descendant_unaccounted"] == 1
+
+
 def test_process_ownership_stale_launcher_prior_does_not_rescue_row_without_nonce() -> None:
     prior = {
         "attribution_model": "process_ownership_v1",
@@ -14856,6 +14912,34 @@ def test_unverified_owned_process_tree_invalid_with_no_entries_never_promotes() 
         placeholder, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
     )
     assert result["status"] == "invalid"
+
+
+def test_unverified_owned_process_tree_invalid_conversion_does_not_inherit_rejected_count() -> None:
+    """Task #150 round 11 finding 1: converting a previously COMPLETE tree
+    to invalid (because THIS poll's runtime record is invalid or
+    mismatched, not because of anything about the entries themselves)
+    performs no walk of its own - the resulting record must not carry the
+    original walk's rejected_count forward as if it were this poll's own
+    answer. Left uncorrected, a LATER poll's entries_are_complete check
+    would read that stale zero as proof this invalid record is complete,
+    re-admitting it for absence-promotion on an accounting question
+    nobody actually asked this poll. Missing reads as unknown - already
+    ineligible for re-derivation - which is the correct meaning: this
+    poll genuinely does not know. Same "a producer that doesn't walk must
+    not claim to have walked" rule round 4 already applied to the
+    PowerShell post-kill barrier's own mutation sites."""
+    tree = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-round11-rejected-count-carry",
+    )["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert tree.get("rejected_count") == 0
+
+    result = sup._unverified_owned_process_tree(  # noqa: SLF001
+        tree, _wrap_snap(), now_epoch=NOW + 1,
+        reason_code="process_tree_invalid_test",
+    )
+    assert result["status"] == "invalid"
+    assert "rejected_count" not in result
 
 
 def test_unverified_owned_process_tree_invalid_stays_held_when_entry_still_alive() -> None:
