@@ -10993,6 +10993,10 @@ def test_valid_owned_process_tree_keeps_nullable_hold_evidence_readable(
         tree["observed_count"] += 1
         tree["omitted_count"] = 1
         tree["truncated"] = True
+        # The source tree was a genuine "complete" walk (walk_complete
+        # True) - a real truncated result never carries that forward,
+        # since its own omitted_count > 0 already contradicts it.
+        tree.pop("walk_complete", None)
 
     assert sup._valid_owned_process_tree(  # noqa: SLF001
         tree,
@@ -12308,6 +12312,12 @@ def _write_attended_process_tree_reset_fixture(store: Store) -> tuple[dict, str]
         "omitted_count": 1,
         "truncated": True,
     })
+    # The source tree was a genuine "complete" walk (walk_complete True),
+    # but truncating it by hand here does not re-run that walk - a real
+    # truncated result would never carry walk_complete True forward (its
+    # own omitted_count > 0 already contradicts it). Same "a producer that
+    # doesn't walk must not claim to have walked" rule as the fix itself.
+    tree.pop("walk_complete", None)
     state = {"agents": {"worker": entry}}
     state_path = store.dir / "supervisor-state.json"
     sup.save_supervisor_state(state_path, state)
@@ -12604,6 +12614,10 @@ def test_malformed_runtime_revocation_boundary_remains_hold(
         "omitted_count": 1,
         "truncated": True,
     })
+    # The source tree was a genuine "complete" walk (walk_complete True) -
+    # a real truncated result never carries that forward, since its own
+    # omitted_count > 0 already contradicts it.
+    tree.pop("walk_complete", None)
     runtime = _wrapper_runtime_view()["record"]
     sup.reset_process_tree_ownership_after_attended_teardown(
         state,
@@ -15478,6 +15492,114 @@ def test_validator_refuses_complete_or_absent_with_nonzero_rejected_count() -> N
         clean, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
         wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
     ) is not None
+
+
+def test_validator_refuses_walk_complete_true_with_false_preconditions() -> None:
+    """Task #150 walk_complete inversion connector finding: without this
+    check the inversion is a REGRESSION, not hardening. The argument for
+    walk_complete is that a reader should trust one positive flag rather
+    than re-derive completeness from fields that can be inherited or
+    defaulted - but a validator that only checks the field's TYPE lets a
+    persisted record claim walk_complete True while omitted_count or
+    rejected_count is actually nonzero, or entries is empty. The old
+    entries_are_complete re-derivation would have caught exactly that
+    record; a bare type-check on a lone boolean does not - strictly worse
+    than what it replaced. Uses status "invalid" throughout (not complete/
+    absent) so this asserts the NEW True-implies-conjunction check in
+    isolation from the existing nonzero-rejected_count-on-complete/absent
+    check tested above."""
+    tree = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-walkcomplete-validator-constraint",
+    )["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert tree["walk_complete"] is True
+
+    def as_invalid_with(**overrides: object) -> dict:
+        corrupted = dict(tree)
+        corrupted["status"] = "invalid"
+        corrupted["reason_code"] = "process_tree_invalid_test"
+        corrupted.update(overrides)
+        return corrupted
+
+    # walk_complete True but rejected_count says otherwise.
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        as_invalid_with(rejected_count=1), agent="worker",
+        root_key=sup._root_key(TEST_ROOT), wrapper_generation="wrapper-1",  # noqa: SLF001
+        launch_nonce=SUPERVISOR_NONCE,
+    ) is None
+    # walk_complete True but omitted_count says otherwise (also bumping
+    # observed_count/truncated to keep the OTHER count cross-checks from
+    # masking this one behind an unrelated rejection).
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        as_invalid_with(
+            omitted_count=1, observed_count=tree["observed_count"] + 1, truncated=True,
+        ),
+        agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is None
+    # walk_complete True but rejected_count is UNKNOWN (missing) - the walk
+    # that supposedly earned the flag could not have known rejected_count
+    # was zero without recording it.
+    walk_complete_no_rejected = as_invalid_with()
+    del walk_complete_no_rejected["rejected_count"]
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        walk_complete_no_rejected, agent="worker",
+        root_key=sup._root_key(TEST_ROOT), wrapper_generation="wrapper-1",  # noqa: SLF001
+        launch_nonce=SUPERVISOR_NONCE,
+    ) is None
+    # walk_complete True but entries is empty (only legal for status
+    # "invalid", which this already is - isolates entries specifically).
+    empty_entries = as_invalid_with()
+    empty_entries["entries"] = []
+    empty_entries["recorded_count"] = 0
+    empty_entries["omitted_count"] = empty_entries["observed_count"]
+    empty_entries["truncated"] = empty_entries["observed_count"] > 0
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        empty_entries, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is None
+
+    # The inverse direction, explicitly: a clean conjunction with
+    # walk_complete absent or False must stay VALID (not rejected) and
+    # simply unknown/ineligible - the validator must never demand the
+    # flag be present.
+    missing_flag = as_invalid_with()
+    del missing_flag["walk_complete"]
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        missing_flag, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is not None
+    false_flag = as_invalid_with(walk_complete=False)
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        false_flag, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is not None
+
+    # The control: a genuinely clean, honestly-earned walk_complete True
+    # keeps validating - the fix must not reject real construction sites.
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        as_invalid_with(), agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is not None
+
+    # The operator-visible outcome: a contradictory record can never even
+    # become `prior` for eligibility - it fails the trust boundary
+    # (_valid_owned_process_tree) before _unverified_owned_process_tree
+    # ever reads walk_complete, so a wrapped poll HOLDS
+    # (process_tree_invalid_prior_record_invalid) rather than promoting to
+    # absent, exactly as if the record were malformed any other way.
+    state = _wrap_ready(runtime_wrapper_generation="wrapper-1")
+    state["owned_process_tree"] = as_invalid_with(rejected_count=1)
+    plan = _plan_wrap(
+        _report(heartbeat_stale=False, wrapper_runtime=_wrapper_runtime_view(phase="idle")),
+        {"agents": {"worker": state}},
+        snapshot=_wrap_snap(),
+    )
+    assert plan["action"] == sup.WARN_ONLY
+    assert plan["state"] == "PROCESS_TREE_INVALID"
+    assert plan["next_state"]["owned_process_tree"]["reason_code"] == (
+        "process_tree_invalid_prior_record_invalid"
+    )
 
 
 def test_snap_index_excludes_rather_than_picks_a_duplicate_pid() -> None:

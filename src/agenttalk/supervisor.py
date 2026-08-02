@@ -2675,6 +2675,25 @@ def _valid_owned_process_tree(
         or value.get("truncated") is not (omitted_count > 0)
     ):
         return None
+    # Task #150 follow-up connector finding: the checks above only typed
+    # walk_complete and rejected the False-with-complete/absent
+    # contradiction - they never constrained True against the conjunction
+    # that is supposed to have earned it. A persisted record claiming
+    # walk_complete True while omitted_count/rejected_count are nonzero, or
+    # rejected_count is unknown, or entries is empty, is exactly as
+    # internally contradictory as the existing nonzero-rejected_count-on-
+    # complete/absent check above (same shape, same round-3 precedent) -
+    # and reading it as authoritative here would make the inversion WORSE
+    # than the re-derivation it replaced: the old entries_are_complete
+    # re-derivation would have caught this record; a bare type-check on a
+    # single boolean would not. This does not require the flag to be
+    # PRESENT - only present-and-True must match its own preconditions;
+    # absent or False stays eligible-by-nothing (unknown), never rejected
+    # for a conjunction the record never claimed to have earned.
+    if walk_complete is True and not (
+        bool(entries) and omitted_count == 0 and rejected_count == 0
+    ):
+        return None
     reason_code = value.get("reason_code")
     if value.get("status") == "complete":
         if reason_code is not None or omitted_count:
