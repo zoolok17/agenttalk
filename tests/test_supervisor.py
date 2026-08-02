@@ -13136,6 +13136,63 @@ def test_owned_process_tree_identity_drift_is_sticky_hold(
     assert tree["reason_code"] == "process_tree_invalid_prior_record_invalid"
 
 
+def test_owned_process_tree_narrowed_rebuild_does_not_promote_to_absent() -> None:
+    """The walk_complete inversion, finding 3 from the round that preceded
+    it: a malformed prior discards its own historical entries entirely
+    (prior_by_pid empty) before _owned_process_tree's walk even starts, so
+    the walk can only rediscover whatever is CURRENTLY reachable live from
+    the wrapper - a narrower graph than whatever the ORIGINAL, pre-
+    malformation tree tracked. That narrowed walk can admit everything IT
+    saw cleanly (rejected_count == 0, omitted_count == 0, non-empty
+    entries) and used to read exactly as "complete" as a genuine full
+    walk, even though it never had the chance to check on anything the
+    malformation caused it to forget (a live descendant of an
+    already-exited, no-longer-verifiable intermediate, say - unreachable
+    from the wrapper by a live strict edge, never rejected because
+    discovery never had a seed to reach it from).
+
+    walk_complete closes this by construction (not prior_record_invalid is
+    one of its own terms). Asserts the operator-visible outcome: a later
+    poll where this narrowed record's own entries all read absent must NOT
+    promote to absent (declaring the whole tree gone), because the record
+    never proved completeness over the graph that matters, only over the
+    smaller one it was able to rebuild."""
+    healthy = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-walkcomplete-narrowed-rebuild",
+    )
+    tree = healthy["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    assert tree.get("walk_complete") is True
+
+    corrupted = dict(tree)
+    corrupted["root_key"] = "c:/some/other/root"  # fails _valid_owned_process_tree
+    state = _wrap_ready(runtime_wrapper_generation="wrapper-1")
+    state["owned_process_tree"] = corrupted
+
+    rebuilt = _plan_wrap(
+        _report(heartbeat_stale=False, wrapper_runtime=_wrapper_runtime_view(phase="idle")),
+        {"agents": {"worker": state}},
+        snapshot=_wrap_snap(),
+    )
+    narrowed = rebuilt["next_state"]["owned_process_tree"]
+    assert narrowed["status"] == "invalid"
+    assert narrowed["reason_code"] == "process_tree_invalid_prior_record_invalid"
+    assert narrowed["rejected_count"] == 0
+    assert narrowed["omitted_count"] == 0
+    assert narrowed["entries"]
+    # The exact gap this closes: rejected_count/omitted_count alone read as
+    # a complete, trustworthy walk here - walk_complete correctly does not.
+    assert narrowed.get("walk_complete") is not True
+
+    # The operator-visible outcome: even with the narrowed record's own
+    # entries all now absent, this must NOT promote to absent - it never
+    # proved completeness over the graph that matters.
+    later = sup._unverified_owned_process_tree(  # noqa: SLF001
+        narrowed, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
+    )
+    assert later["status"] == "invalid"
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -15316,31 +15373,42 @@ def test_v2_record_missing_rejected_count_stays_valid_but_ineligible() -> None:
     healthy. rejected_count is therefore OPTIONAL in the persisted schema:
     a v2-shaped record (missing it entirely) must still validate as
     authoritative - proving the upgrade itself does not brick a healthy
-    fleet - while remaining ineligible for the NEW absence-promotion
-    eligibility this round grants, because "missing" must mean unknown,
-    never zero."""
+    fleet.
+
+    The walk_complete inversion: eligibility now reads walk_complete, not
+    rejected_count/omitted_count directly, so a genuinely pre-inversion
+    record must be missing BOTH optional fields to correctly read as
+    unknown/ineligible - a record missing only rejected_count (walk_complete
+    still True, honestly earned by whatever walk set it) is a schema state
+    the inversion says IS eligible, since rejected_count stopped being
+    independently load-bearing for the safety decision. Case (d) asserts
+    that directly: it is the inversion's own defining property, not
+    incidental behavior."""
     tree = _owned_tree_plan(
         _wrap_snap(), request_id="rr-150-v2-migration",
     )["next_state"]["owned_process_tree"]
     assert tree["status"] == "complete"
-    v2_shaped = dict(tree)
-    del v2_shaped["rejected_count"]
+    assert tree["walk_complete"] is True
+    pre_inversion_shaped = dict(tree)
+    del pre_inversion_shaped["rejected_count"]
+    del pre_inversion_shaped["walk_complete"]
 
     # (a) still readable/valid authority - the upgrade itself must not
     # brick a healthy agent's own persisted record.
     validated = sup._valid_owned_process_tree(  # noqa: SLF001
-        v2_shaped, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        pre_inversion_shaped, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
         wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
     )
     assert validated is not None
     assert "rejected_count" not in validated
+    assert "walk_complete" not in validated
 
-    # (b) a healthy, ALIVE wrapper polling against this v2-shaped prior
+    # (b) a healthy, ALIVE wrapper polling against this pre-inversion prior
     # must NOT be forced into PROCESS_TREE_INVALID merely because its own
-    # persisted record predates rejected_count - the exact self-inflicted
-    # regression the bare version bump caused.
+    # persisted record predates rejected_count/walk_complete - the exact
+    # self-inflicted regression the bare version bump caused.
     st = _wrap_ready(runtime_wrapper_generation="wrapper-1")
-    st["owned_process_tree"] = v2_shaped
+    st["owned_process_tree"] = pre_inversion_shaped
     healthy_plan = _plan_wrap(
         _report(wrapper_runtime=_wrapper_runtime_view(phase="idle", now=NOW)),
         {"agents": {"worker": st}},
@@ -15349,17 +15417,32 @@ def test_v2_record_missing_rejected_count_stays_valid_but_ineligible() -> None:
     assert healthy_plan["state"] != "PROCESS_TREE_INVALID"
     assert healthy_plan["next_state"]["owned_process_tree"]["status"] == "complete"
 
-    # (c) once invalid for an UNRELATED reason, a v2-shaped prior must not
-    # be promoted to absent just because omitted_count reads 0 - unknown
-    # rejected_count must block eligibility exactly like a real nonzero
-    # count would.
-    poisoned = dict(v2_shaped)
+    # (c) once invalid for an UNRELATED reason, a pre-inversion prior must
+    # not be promoted to absent just because omitted_count reads 0 - a
+    # missing walk_complete must block eligibility exactly like an explicit
+    # False would.
+    poisoned = dict(pre_inversion_shaped)
     poisoned["status"] = "invalid"
     poisoned["reason_code"] = "process_tree_invalid_snapshot_invalid_process_row"
     result = sup._unverified_owned_process_tree(  # noqa: SLF001
         poisoned, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
     )
     assert result["status"] == "invalid"
+
+    # (d) the inversion's own defining property: a record missing ONLY
+    # rejected_count (walk_complete still True, honestly earned by the walk
+    # that set it) IS eligible - rejected_count stopped being independently
+    # load-bearing for this decision the moment walk_complete existed to
+    # carry it. Same snapshot, same poisoning, only the missing field
+    # differs from case (c).
+    missing_rejected_only = dict(tree)
+    del missing_rejected_only["rejected_count"]
+    missing_rejected_only["status"] = "invalid"
+    missing_rejected_only["reason_code"] = "process_tree_invalid_snapshot_invalid_process_row"
+    promoted = sup._unverified_owned_process_tree(  # noqa: SLF001
+        missing_rejected_only, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
+    )
+    assert promoted["status"] == "absent"
 
 
 def test_validator_refuses_complete_or_absent_with_nonzero_rejected_count() -> None:
@@ -15507,24 +15590,37 @@ def test_post_kill_barrier_hold_cannot_present_a_trustworthy_zero() -> None:
     removes the property entirely rather than writing a number - the same
     "missing means unknown, not zero" shape the v2-migration fix already
     established for a field a record simply never had, reused here for a
-    field this record's PRODUCER never computed."""
+    field this record's PRODUCER never computed.
+
+    The walk_complete inversion added a sibling removal at the same two
+    mutation sites: this relabeling is a status change by the BARRIER's
+    own accounting, not a Python walk, so a stale walk_complete=True would
+    now be the load-bearing lie removing only rejected_count used to be -
+    the fixed shape below must strip both to accurately represent what the
+    barrier actually does today."""
     ps1_source = sup.PS_TEMPLATE
     assert ps1_source.count(
         "owned_process_tree.PSObject.Properties.Remove('rejected_count')",
+    ) == 2
+    assert ps1_source.count(
+        "owned_process_tree.PSObject.Properties.Remove('walk_complete')",
     ) == 2
 
     tree = _owned_tree_plan(
         _wrap_snap(), request_id="rr-150-post-kill-producer",
     )["next_state"]["owned_process_tree"]
     assert tree["status"] == "complete"
+    assert tree["walk_complete"] is True
 
-    # The FIXED shape: the barrier removed rejected_count entirely when it
-    # externally invalidated the tree. Still valid, readable authority -
-    # just not eligible for the walk's own re-derivation.
+    # The FIXED shape: the barrier removed rejected_count AND walk_complete
+    # entirely when it externally invalidated the tree. Still valid,
+    # readable authority - just not eligible for the walk's own
+    # re-derivation.
     post_kill_fixed = dict(tree)
     post_kill_fixed["status"] = "invalid"
     post_kill_fixed["reason_code"] = "process_tree_invalid_post_kill_launch_barrier_unavailable"
     del post_kill_fixed["rejected_count"]
+    del post_kill_fixed["walk_complete"]
     assert sup._valid_owned_process_tree(  # noqa: SLF001
         post_kill_fixed, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
         wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
@@ -15534,10 +15630,10 @@ def test_post_kill_barrier_hold_cannot_present_a_trustworthy_zero() -> None:
     )
     assert held["status"] == "invalid"
 
-    # The PRE-FIX shape, for contrast: rejected_count left at its stale
-    # "complete" value of 0 - this is exactly the hazard finding 3 named,
-    # and it genuinely does promote, proving the fix closes a real gap
-    # rather than a hypothetical one.
+    # The PRE-FIX shape, for contrast: rejected_count AND walk_complete
+    # both left at their stale "complete" values - this is exactly the
+    # hazard finding 3 named, and it genuinely does promote, proving the
+    # fix closes a real gap rather than a hypothetical one.
     post_kill_stale = dict(tree)
     post_kill_stale["status"] = "invalid"
     post_kill_stale["reason_code"] = "process_tree_invalid_post_kill_launch_barrier_unavailable"
