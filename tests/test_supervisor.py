@@ -14537,6 +14537,166 @@ def test_owned_process_absence_certificate_requires_definite_identity_result() -
     )
 
 
+# ------------------------------------------------------ Task #150: the HOLD
+# must not pre-empt the LAUNCH path for a confirmed-absent agent.
+
+
+def test_unverified_owned_process_tree_promotes_invalid_to_absent_when_entries_complete_and_gone() -> None:
+    """Task #150 connector finding: an invalid tree is not categorically
+    excluded from absence re-derivation - only an invalid tree whose
+    entries are a COMPLETE description of what was found (omitted_count ==
+    0, at least one entry) qualifies, the same evidentiary bar the
+    complete/absent case already trusts. The production incident: a single
+    UNRELATED row elsewhere in that poll's whole-host snapshot failed
+    _snapshot_pid_integrity_error and marked EVERY currently-polled agent's
+    tree invalid that poll, even though each agent's own entries were
+    untouched and remained a complete, faithful record."""
+    tree = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-invalid-promotes",
+    )["next_state"]["owned_process_tree"]
+    poisoned = dict(tree)
+    poisoned["status"] = "invalid"
+    poisoned["reason_code"] = "process_tree_invalid_snapshot_invalid_process_row"
+    assert poisoned["omitted_count"] == 0
+    assert poisoned["entries"]
+
+    result = sup._unverified_owned_process_tree(  # noqa: SLF001
+        poisoned, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
+    )
+    assert result["status"] == "absent"
+    assert result["reason_code"] == "process_tree_absent"
+
+
+def test_unverified_owned_process_tree_truncated_never_promotes_even_when_gone() -> None:
+    """A truncated prior's entries are incomplete by definition
+    (omitted_count > 0) - proving the RECORDED subset gone says nothing
+    about whatever the size cap dropped, so it must never promote to
+    absent, unlike an invalid-but-complete prior."""
+    tree = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-truncated-never",
+    )["next_state"]["owned_process_tree"]
+    truncated = dict(tree)
+    truncated["status"] = "truncated"
+    truncated["reason_code"] = "process_tree_truncated"
+    truncated["omitted_count"] = 3
+    truncated["observed_count"] = truncated["recorded_count"] + 3
+
+    result = sup._unverified_owned_process_tree(  # noqa: SLF001
+        truncated, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
+    )
+    assert result["status"] == "truncated"
+
+
+def test_unverified_owned_process_tree_invalid_with_no_entries_never_promotes() -> None:
+    """A schema-drift/generation-adoption placeholder (built by
+    _invalid_owned_process_tree_record, entries always []) never had a real
+    tree walk to begin with - there is nothing to disprove against, so it
+    must stay sticky HOLD evidence even against a fully empty snapshot,
+    guarding the vacuous-truth trap (all(state in ... for state in []) is
+    True)."""
+    placeholder = sup._invalid_owned_process_tree_record(  # noqa: SLF001
+        agent="worker",
+        root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation=None,
+        launch_nonce=None,
+        now_epoch=NOW,
+        reason_code="process_tree_invalid_prior_record_invalid",
+    )
+    result = sup._unverified_owned_process_tree(  # noqa: SLF001
+        placeholder, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
+    )
+    assert result["status"] == "invalid"
+
+
+def test_unverified_owned_process_tree_invalid_stays_held_when_entry_still_alive() -> None:
+    """The safety half: an invalid-but-complete prior must NOT promote to
+    absent when the current snapshot proves an entry is still alive -
+    exactly the same bar the complete/absent case already uses."""
+    tree = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-still-alive",
+    )["next_state"]["owned_process_tree"]
+    poisoned = dict(tree)
+    poisoned["status"] = "invalid"
+    poisoned["reason_code"] = "process_tree_invalid_snapshot_invalid_process_row"
+
+    result = sup._unverified_owned_process_tree(  # noqa: SLF001
+        poisoned, _wrap_snap(), now_epoch=NOW + 1,
+        reason_code="process_tree_invalid_test",
+    )
+    assert result["status"] == "invalid"
+
+
+def test_plan_actions_confirmed_absent_wrapper_recovers_despite_unrelated_snapshot_poisoning() -> None:
+    """Task #150, the production incident reproduced end to end. Poll 1: one
+    UNRELATED process row on the same host (e.g. a system process CIM could
+    not resolve a parent for) fails _snapshot_pid_integrity_error for that
+    WHOLE poll, marking this otherwise-healthy idle wrapped agent's owned
+    tree invalid even though its own row was clean - matching the
+    production report exactly ("276 rows, zero failures... the detail
+    string is actively misleading"). Poll 2, much later: the SAME agent is
+    now confirmed completely absent from an entirely empty snapshot, yet
+    the persisted tree is still that sticky invalid record from poll 1. It
+    must still reach a relaunch decision (STUCK_OR_DEAD / stuck_recover)
+    rather than being held on PROCESS_TREE_INVALID forever - the exact
+    defect: a confirmed-absent agent could not self-heal by any means."""
+    poisoning_row = {
+        "pid": 4, "parent_pid": None, "name": "System",
+        "command_line": None,
+        "start_time": "2026-01-01T00:00:00.0000000+00:00",
+        "start_filetime": None,
+    }
+    wrapper_row = _wrap_snap()[0]
+    poisoned_snapshot = [wrapper_row, poisoning_row]
+
+    state = {"agents": {"worker": _wrap_ready(runtime_wrapper_generation="wrapper-1")}}
+    poll1 = _plan_wrap(
+        _report(wrapper_runtime=_wrapper_runtime_view(phase="idle", now=NOW)),
+        state,
+        snapshot=poisoned_snapshot,
+    )
+    assert poll1["state"] == "PROCESS_TREE_INVALID"
+    assert poll1["next_state"]["owned_process_tree"]["status"] == "invalid"
+    assert poll1["next_state"]["owned_process_tree"]["reason_code"] == (
+        "process_tree_invalid_snapshot_invalid_process_row"
+    )
+    # Task #150 priority 4: the HOLD message must name the remedy, not just
+    # announce that it is holding.
+    assert "--reset-process-tree-ownership" in poll1["reason"]
+    assert "do NOT kill the wrapper" in poll1["reason"]
+
+    state_after_poll1 = {
+        "agents": {
+            "worker": {**state["agents"]["worker"], **poll1["next_state"]},
+        }
+    }
+    later = NOW + 600
+    poll2 = _plan_wrap(
+        _report(
+            heartbeat_stale=True,
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="idle", now=later, updated_age=600,
+            ),
+        ),
+        state_after_poll1,
+        snapshot=[],
+        now=later,
+    )
+
+    assert poll2["state"] == "STUCK_OR_DEAD"
+    assert poll2["action"] == sup.STUCK_RECOVER
+    assert poll2["next_state"]["owned_process_tree"]["status"] == "absent"
+
+    barrier = sup.evaluate_launch_barrier(
+        [],
+        {"agents": {"worker": {**state_after_poll1["agents"]["worker"], **poll2["next_state"]}}},
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+    )
+    assert barrier["allow_launch"] is True
+    assert barrier["blocked"] is False
+
+
 def test_launch_barrier_same_agent_wait_survivor_blocks_replacement() -> None:
     snap = [
         _proc(31, 1, "python.exe",

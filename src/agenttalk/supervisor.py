@@ -2746,14 +2746,37 @@ def _unverified_owned_process_tree(
 ) -> dict | None:
     """Fail closed when current proof cannot safely reuse a prior tree.
 
-    A complete prior remains the durable absence certificate when a current
-    snapshot proves every recorded pid/start identity absent. Any prior identity
-    still present, or an unavailable snapshot, converts it to sticky invalid
-    HOLD evidence. Existing truncated/invalid records are already sticky.
+    A complete or absent prior remains the durable absence certificate when a
+    current snapshot proves every recorded pid/start identity absent or
+    replaced. Task #150 connector finding: an INVALID prior is not
+    categorically excluded from that same re-derivation - only when its own
+    entries are a COMPLETE description of what was found (omitted_count == 0,
+    at least one entry recorded). Whatever made the tree invalid in the first
+    place (in the production incident, a single UNRELATED row elsewhere in
+    that poll's whole-host snapshot failing _snapshot_pid_integrity_error, not
+    anything about this agent's own identities) says nothing about whether
+    those SPECIFIC recorded identities are still alive - the same evidentiary
+    bar the complete/absent case already trusts. A TRUNCATED prior's entries
+    are incomplete by definition (omitted_count > 0) and never qualifies:
+    proving the recorded subset gone says nothing about whatever the size cap
+    dropped. A prior with no entries at all (schema-drift/generation-adoption
+    placeholders built by _invalid_owned_process_tree_record, never a real
+    tree walk) has nothing to disprove against and never qualifies either.
+    Any prior identity still present, or an unavailable/poisoned CURRENT
+    snapshot, remains sticky HOLD evidence exactly as before.
     """
     if prior is None:
         return None
-    if prior.get("status") not in {"complete", "absent"}:
+    entries = prior.get("entries")
+    entries_are_complete = (
+        isinstance(entries, list)
+        and bool(entries)
+        and prior.get("omitted_count") == 0
+    )
+    eligible_for_rederivation = prior.get("status") in {"complete", "absent"} or (
+        prior.get("status") == "invalid" and entries_are_complete
+    )
+    if not eligible_for_rederivation:
         held = copy.deepcopy(prior)
         if (
             held.get("status") == "invalid"
@@ -2776,10 +2799,12 @@ def _unverified_owned_process_tree(
                 expected_start=entry.get("start"),
                 expected_filetime=entry.get("start_filetime"),
             )
-            for entry in prior.get("entries", [])
+            for entry in entries or []
             if isinstance(entry, dict)
         ]
-        if all(state in {"absent", "different"} for state in identity_states):
+        if identity_states and all(
+            state in {"absent", "different"} for state in identity_states
+        ):
             absent = copy.deepcopy(prior)
             absent["status"] = "absent"
             absent["reason_code"] = "process_tree_absent"
@@ -2865,10 +2890,21 @@ def _owned_process_tree(
     # pid -> {row, role, depth, live}; exited, previously earned identities may
     # remain as virtual ancestry bridges, but are never emitted as kill targets.
     owned: dict[int, dict] = {}
+    # Task #150 connector finding: a WHOLE-SNAPSHOT integrity failure (one
+    # unrelated row anywhere on the host - a system process CIM could not
+    # resolve a parent for, say - fails _snapshot_pid_integrity_error for
+    # EVERY agent polled this cycle) and a per-row admission failure inside
+    # add_node's own check below used to both surface as the exact same
+    # "process_tree_invalid_invalid_process_row" text, even though one is
+    # "something elsewhere on this host is malformed" and the other is
+    # "one of THIS agent's own tracked rows is malformed" - different
+    # operator situations with different remedies. The "snapshot_" prefix
+    # matches _unverified_owned_process_tree's own existing convention for
+    # the identical distinction, so this is a naming fix, not a new one.
     invalid_reason = (
         "prior_record_invalid"
         if prior_record_invalid
-        else snapshot_error
+        else (f"snapshot_{snapshot_error}" if snapshot_error is not None else None)
     )
     role_rank = {
         "tool_descendant": 0,
@@ -6488,20 +6524,35 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         notify = now_epoch - last_warn >= suspect_interval
         if notify:
             nxt["last_warn_epoch"] = now_epoch
+        # Task #150: name the remedy. A held state that does not tell the
+        # operator how to leave it is a defect on its own - especially since
+        # the obvious guess (kill the wrapper, expecting the supervisor to
+        # see it absent and relaunch) makes this WORSE, not better: a
+        # wrapper this is still holding for is exempt from this HOLD the
+        # moment it is independently confirmed absent (see
+        # _unverified_owned_process_tree); a wrapper that is still present,
+        # or whose absence this record cannot yet prove on its own, needs
+        # the attended reset named below.
+        remedy = (
+            "recovery: if every process this record names is confirmed gone, "
+            "run `agenttalk supervise --reset-process-tree-ownership` (see "
+            "--help for the required --acknowledge-* flags); do NOT kill the "
+            "wrapper expecting an automatic relaunch - that is only safe once "
+            "this record already reflects the wrapper as absent"
+        )
         if tree_status == "truncated":
             tree_state = "PROCESS_TREE_TRUNCATED"
             tree_reason = (
                 f"owned process tree observed {observed} identities over cap "
                 f"{limit}; HOLDING automatic teardown because a partial kill "
-                "could strand descendants; operator attention required"
+                f"could strand descendants; {remedy}"
             )
         else:
             tree_state = "PROCESS_TREE_INVALID"
             tree_reason = (
                 "owned process tree failed strict parent/start validation "
                 f"({owned_tree.get('reason_code')}); HOLDING automatic teardown "
-                "because a partial kill could strand descendants; operator "
-                "attention required"
+                f"because a partial kill could strand descendants; {remedy}"
             )
         return _result(
             WARN_ONLY,
