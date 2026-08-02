@@ -3703,9 +3703,12 @@ raw call or reuse across revisions.
   guarded managed-identity checkpoint. While `AMBIGUOUS_LAUNCH`, every manual
   and automatic teardown/replacement attempt is `HOLD`; marker deletion does
   not clear the hold.
-- A later strict checkpoint whose PID/start guard and launch reservation ID
-  are source-equal to `SpawnGuardV1` is adopted through the common guarded-launch
-  commit below. Childless adoption requires a fresh matching
+- A later strict checkpoint is adopted through the common guarded-launch commit
+  below only when `SpawnGuardMatchV1(checkpoint.spawn_guard,
+  retained_spawn_guard)` holds: the checkpoint PID, start guard, and launch
+  reservation ID each match the corresponding field of the non-null
+  `SpawnGuardV1` retained by the matching `AMBIGUOUS_LAUNCH` envelope. Childless
+  adoption requires a fresh matching
   `SPAWN_IDENTITY_COMMIT/STATE_MUTATION` permit over the matching envelope and
   checkpoint; any mismatch or missing permit remains ambiguous.
 - Otherwise only a new `PhysicalAbsenceProofV1.CONFIRMED`, built from two
