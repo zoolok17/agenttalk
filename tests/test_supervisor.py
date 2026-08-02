@@ -13971,20 +13971,23 @@ def test_process_ownership_duplicated_prior_descendant_still_killed_with_launche
 
 
 def test_process_ownership_opaque_child_of_excluded_seed_still_killed_with_launcher() -> None:
-    """Task #150 round 10 finding 1: round 8's synthetic-row fix (above)
-    made an excluded tracked pid a kill target again, but the BFS
-    descendant-walk a few lines later still looked it up via idx.get and
-    skipped it as a BFS parent for the identical reason - so a live,
-    never-recorded child of that excluded pid (opaque: not itself a prior
-    entry, not an agenttalk wrap/wait invocation, discoverable only by
-    walking down from pid 11) was never even queried, let alone targeted.
-    The connector's scenario: tracked pid 11 has duplicate rows this poll
-    (excluded) and an untracked child pid 12 underneath it. This asserts
-    the operator-visible outcome the lead named - a surviving opaque
-    child preventing the clear - not a changed internal set: pid 12 must
-    be a kill target in the SAME operation that kills pid 11, so Stop-Tree
-    takes both out together and no replacement launches alongside a still
-    -live child of the pid it just replaced."""
+    """Task #150 round 10 finding 1, corrected by round 12 finding 2:
+    round 10 made an excluded tracked pid's opaque child a kill target in
+    the SAME operation, by reusing the excluded seed's synthetic row
+    (prior pid/start) as the _strict_child_edge PARENT for BFS discovery.
+    That synthetic identity is only ever re-verified by Stop-Tree, at kill
+    time, for the SEED's own kill - nothing re-verifies it before it feeds
+    an independent kill decision about the CHILD. If pid 11 has been
+    RECYCLED (a genuinely different process now holds it), the synthetic
+    row's stale start time is almost always earlier than any of the
+    replacement's own children, so the ordering check meant to REJECT an
+    unrelated descendant would instead pass every one of them - a new
+    hazard round 10's fix itself created. Round 12 stopped descending
+    through an excluded parent at all: pid 12 is neither invented as a
+    kill target nor silently lost - it is unaccounted, which now correctly
+    HOLDS the whole poll (no kill, no relaunch, not even the seed) rather
+    than proceeding on a kill decision made from an unverifiable identity.
+    Asserts the operator-visible outcome: the poll holds."""
     prior = {
         "attribution_model": "process_ownership_v1",
         "root_key": sup._root_key(TEST_ROOT),
@@ -14019,12 +14022,15 @@ def test_process_ownership_opaque_child_of_excluded_seed_still_killed_with_launc
         now_epoch=NOW,
         snapshot=snap,
     )["agents"]["worker"]
-    kill_target_pids = {t["pid"] for t in p["kill_targets"]}
-    assert {11, 12} <= kill_target_pids  # opaque child killed in the SAME operation as the excluded seed
+    assert p["action"] == sup.WARN_ONLY
+    assert p["state"] == "UNACCOUNTED_LIVE_DESCENDANT"
+    assert p["kill_targets"] == []  # not even the excluded seed itself is killed
+    assert p["diagnostics"]["excluded_live_descendant_unaccounted"] == 1
 
 
 def test_process_ownership_excluded_opaque_child_is_unaccounted_not_lost() -> None:
-    """Task #150 round 11 finding 2: _children_map(idx) is built only from
+    """Task #150 round 11 finding 2 (discovery), corrected by round 12
+    finding 1 (the remedy): _children_map(idx) is built only from
     idx.items() - a newly discovered child excluded this poll (duplicate/
     ambiguous rows) never contributed a row to idx, so it never
     contributes an edge either, regardless of its parent's own trust
@@ -14035,11 +14041,16 @@ def test_process_ownership_excluded_opaque_child_is_unaccounted_not_lost() -> No
     fall back on; a first-time-seen EXCLUDED CHILD has no independent
     anchor at all, the same "no snapshot-only signal to disambiguate a
     first-time-seen identity" residual _snap_all_edges already documents
-    for a malformed pid). Asserts the operator-visible outcome: the child
-    is never invented as an untrustworthy kill target (which of the
-    ambiguous rows is real cannot be verified), but it is also never
-    silently lost - diagnostics surfaces it as an accounted-for gap
-    rather than a total loss."""
+    for a malformed pid).
+
+    Round 11 surfaced this via a diagnostic counter alone, which round 12
+    correctly called out as a check that runs and is never acted on: a
+    manual restart request would still have killed only the trusted
+    parent and relaunched, stranding the unaccounted child exactly as
+    before. Asserts the ACTUAL operator-visible outcome now: the poll
+    HOLDS (no kill, no relaunch) rather than proceeding on partial
+    accounting, while still never inventing an untrustworthy kill target
+    for the ambiguous child itself."""
     prior = {
         "attribution_model": "process_ownership_v1",
         "root_key": sup._root_key(TEST_ROOT),
@@ -14073,9 +14084,9 @@ def test_process_ownership_excluded_opaque_child_is_unaccounted_not_lost() -> No
         now_epoch=NOW,
         snapshot=snap,
     )["agents"]["worker"]
-    kill_target_pids = {t["pid"] for t in p["kill_targets"]}
-    assert 11 in kill_target_pids  # the trusted root is still targeted
-    assert 12 not in kill_target_pids  # never invent trust from ambiguous rows
+    assert p["action"] == sup.WARN_ONLY
+    assert p["state"] == "UNACCOUNTED_LIVE_DESCENDANT"
+    assert p["kill_targets"] == []  # HOLD - not even the trusted parent is killed
     assert p["diagnostics"]["excluded_live_descendant_unaccounted"] == 1
 
 

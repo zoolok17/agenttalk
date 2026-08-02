@@ -4522,7 +4522,6 @@ def _attribution(
     targets_by_pid: dict[int, dict] = {}
     seed_pids: set[int] = set()
     seed_launcher_sources: dict[int, dict] = {}
-    seed_synthetic_rows: dict[int, dict] = {}
     unaccounted_excluded_children: set[int] = set()
     launcher_pid = st.get("launcher_pid")
     launcher_start = st.get("launcher_start")
@@ -4607,22 +4606,16 @@ def _attribution(
             # target here.
             if isinstance(entry_pid, int) and entry_pid in excluded_pids:
                 row = {"pid": entry_pid, "start_time": entry.get("start")}
-                # Task #150 round 10 connector finding: this same excluded
-                # seed can go on to be a BFS parent below (seed_descendants),
-                # and idx.get(parent_pid) will fail there for the identical
-                # reason it failed here. _strict_child_edge only ever reads
-                # parent["pid"] and _start_of(parent) - the same two fields
-                # this synthetic row already carries and that Stop-Tree
-                # already trusts to order this pid's own kill - so it is
-                # sufficient to stand in as the BFS parent too. Without this,
-                # an opaque, never-recorded child living under an excluded
-                # tracked pid (e.g. a duplicate-row ambiguity) is never even
-                # looked up, let alone targeted: the tracked pid gets killed
-                # and the child survives it, unseen by evaluate_launch_barrier
-                # (which has no tree evidence to block on for this path
-                # either) - a replacement launches alongside a live child of
-                # the pid it just replaced.
-                seed_synthetic_rows[entry_pid] = row
+                # Task #150 round 10 connector finding (later corrected by
+                # round 12, see the BFS loop below): this synthetic row is
+                # ONLY safe as a KILL TARGET here - Stop-Tree re-verifies
+                # the live process's actual start time against it before
+                # acting, so a recycled pid (a genuinely different process
+                # now holding it) is protected against by Stop-Tree's own
+                # real-time check. It is NOT safe to reuse as a
+                # _strict_child_edge PARENT for further BFS discovery:
+                # nothing re-verifies that time-ordering claim before it
+                # feeds an INDEPENDENT kill decision about a DIFFERENT pid.
             else:
                 continue
         if entry["pid"] in targets_by_pid:
@@ -4652,17 +4645,31 @@ def _attribution(
         visited_seed.add(parent_pid)
         parent = idx.get(parent_pid)
         if not isinstance(parent, dict):
-            # An excluded seed (see seed_synthetic_rows above) has no row
-            # in idx by construction, not because it is absent - fall back
-            # to the same synthetic identity already trusted to kill it.
-            # Every other pid that ever reaches this queue was admitted via
-            # a real idx row (the child-admission check below requires
-            # isinstance(child, dict) before queue.append), so a seed with
-            # neither a real row nor a synthetic one is unreachable here;
-            # this continue is a defensive backstop, not a live branch.
-            parent = seed_synthetic_rows.get(parent_pid)
-            if not isinstance(parent, dict):
-                continue
+            # Task #150 round 12 connector finding: round 10 fell back to
+            # the excluded seed's own synthetic row (pid/start from the
+            # PRIOR record) as the _strict_child_edge PARENT here - but
+            # that identity is only ever re-verified by STOP-TREE, at KILL
+            # time, for THIS pid's own kill (see the comment above where
+            # the synthetic row is built). Nothing re-verifies it before
+            # it feeds a FURTHER, independent kill decision about a
+            # DIFFERENT pid. If this pid has been RECYCLED (a genuinely
+            # different, unrelated process now holds it), the synthetic
+            # row's stale start time is almost always EARLIER than any of
+            # the replacement's own children - the ordering check that
+            # exists to REJECT an unrelated descendant would instead PASS
+            # every one of them, misattributing a recycled process's own
+            # children as ours. Do not descend through an excluded parent
+            # at all: every current child reported under it - real row or
+            # itself excluded - is unaccounted, not merely unreached.
+            for child_pid in all_edges.get(parent_pid, []):
+                if (
+                    child_pid in targets_by_pid
+                    or child_pid in unaccounted_excluded_children
+                ):
+                    continue
+                unaccounted_excluded_children.add(child_pid)
+                _bump(diagnostics, "excluded_live_descendant_unaccounted")
+            continue
         for child_pid in kids.get(parent_pid, []):
             if child_pid in targets_by_pid:
                 continue
@@ -4683,10 +4690,10 @@ def _attribution(
         # is built only from idx.items() - a child excluded this poll
         # (duplicate/ambiguous rows) never contributed a row to idx at all,
         # so it never contributes an edge here either, regardless of the
-        # parent. This is a DIFFERENT gap than the one above: an excluded
-        # PARENT still has a trusted prior identity to fall back on
-        # (seed_synthetic_rows); a brand-new, never-before-tracked
-        # EXCLUDED CHILD has no such independent anchor - the ambiguous
+        # parent. This is a DIFFERENT gap than the one above (which
+        # applies when the PARENT itself is excluded): here the parent is
+        # a REAL, trusted row, but a brand-new, never-before-tracked
+        # EXCLUDED CHILD has no independent anchor - the ambiguous
         # current-poll rows are the only information that exists about it,
         # which is the same "no snapshot-only signal to disambiguate a
         # first-time-seen identity" residual already documented in
@@ -7296,6 +7303,34 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             state=tree_state,
             notify=notify,
             reason=tree_reason,
+        )
+
+    # Task #150 round 12 connector finding: excluded_live_descendant_
+    # unaccounted (see _attribution's BFS loop) was computed and then never
+    # read by anything - the manual-restart-request path below still
+    # killed only the trusted, accounted-for root and relaunched, exactly
+    # the outcome the diagnostic exists to prevent. A check that runs and
+    # is never acted on is not a check. HOLD here, at the SAME precedence
+    # the wrapped tree_status check above already has over even an
+    # authorized restart marker: a partial kill can strand an unaccounted
+    # descendant exactly as a partial wrapped tree can.
+    if not wrapped and int(diagnostics.get("excluded_live_descendant_unaccounted") or 0) > 0:
+        notify = now_epoch - last_warn >= suspect_interval
+        if notify:
+            nxt["last_warn_epoch"] = now_epoch
+        return _result(
+            WARN_ONLY,
+            state="UNACCOUNTED_LIVE_DESCENDANT",
+            notify=notify,
+            reason=(
+                "a live descendant of a tracked process could not be "
+                "verified this poll (its own identity is ambiguous - "
+                "duplicate/conflicting rows this poll) and cannot safely "
+                "be targeted or ruled out; HOLDING automatic teardown/"
+                "relaunch because killing only the accounted-for parent "
+                "could strand it - this should clear on its own once the "
+                "ambiguity resolves on a later, clean poll"
+            ),
         )
 
     # 0) Manual restart-request marker (highest priority).
