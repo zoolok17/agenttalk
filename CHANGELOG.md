@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.81.0] - 2026-08-02
+
+Theme: **the supervisor knows what it owns, and says so when it cannot.** 0.80.0 deferred three
+supervisor items because their independent-review findings were growing rather than shrinking. Two of
+them converged and ship here; the third (the supervisor-state lock, and the kill-switch startup
+persistence alongside it) still has not, and is deferred again rather than shipped half-converged.
+
+The recovery fix in this release was found in production on the maintainers' own fleet: a single
+transient malformed row in one whole-host process snapshot invalidated the owned-process-tree check for
+**every** agent planned in that poll, and because an invalid record was never re-derived, a
+roughly one-second glitch disabled automatic recovery fleet-wide indefinitely. Every later poll was
+clean and it made no difference.
+
+### Fixed
+
+- **A confirmed-absent wrapper is now launchable under a sticky invalid owned-process tree** (#150).
+  Previously the HOLD pre-empted the LAUNCH path, so the state was self-sealing: the fleet could not
+  heal, and the intuitive operator remedy — stopping the wrapper — converted an unrecoverable but
+  *working* agent into a dead one with no automatic path back. Verified by canary before and after.
+- **Ownership accounting no longer reports a clean walk it did not perform.** A `rejected_count` is
+  fed by a single choke point with `discovered == admitted + rejected` checked after the walk; a
+  missing count reads as *unknown*, never as zero; and producers that relabel a record without walking
+  (the PowerShell post-kill barrier, held conversions, narrowed rebuilds) no longer carry a previous
+  walk's answer forward.
+- **"Excluded because ambiguous" is no longer read as "gone."** Duplicate snapshot rows for a PID used
+  to make it indistinguishable from an exited one across eight consumers, variously producing a
+  permanently failed ephemeral review, a dropped kill target, lost provenance, or a replacement wrapper
+  launched alongside a live process. The bare index accessor was removed so no caller can obtain an
+  index without the exclusion set.
+- **Recovery holds no longer expire while the condition causing them is still observed.** An ambiguity
+  that persisted past the provenance TTL used to silently drop the evidence and release the hold.
+- **Operator remedies are gated on the command's real admission predicate.** Messages previously named
+  `supervise --reset-process-tree-ownership` in states where the CLI would refuse it; the message and
+  the command now share one predicate, and where the preconditions cannot be evaluated the message
+  says what is known instead of naming a command.
+
+### Added
+
+- **Bounded per-agent wrapper stdout/stderr capture with factual lifecycle events** (#117), deferred
+  here from 0.80.0. A dying wrapper's traceback previously had no destination. Includes a shared
+  `console_main` entry point so an uncaught exception is bounded on every launch path, Preflight
+  fidelity for declared interpreter prefixes, and wrap-dispatch validation that asks agenttalk's own
+  parser rather than modelling its grammar a third time.
+- **The whole owned process tree is registered per agent, with exact process identity** (#120). Kill
+  targets carry the exact creation FILETIME rather than a rounded timestamp, so a recycled PID whose
+  creation time renders identically can no longer be terminated in place of the original.
+
+### Known limitations
+
+- Wrapper-log retention settles at quota+1 rather than quota, documented and regression-pinned rather
+  than silently wrong: the prune runs before the new generation's fate is known, so the trim always
+  precedes the add. A trigger that runs after a generation resolves is required and is not in this
+  release.
+- A first-time-seen snapshot row whose own PID field is malformed cannot be attributed from
+  snapshot-only evidence, and is recorded as an accepted residual rather than guessed at.
+- Ephemeral launches still run no Preflight.
+
 ## [0.80.0] - 2026-07-31
 
 Theme: **a watchdog kill must fail the turn.** Scoped down from four items to one during the release
