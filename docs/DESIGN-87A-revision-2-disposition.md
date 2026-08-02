@@ -179,7 +179,9 @@ reviewed adapter is delivered. Across all four documents, the **exact** stem is
 reserved for named identity types/adapters or direct references to those
 identity contracts, and ordinary cardinality/multiplicity (`exactly one` /
 `exactly once`). Source bindings use **source-equal**; canonical serialization
-and preservation use **byte-identical**. Revision 16 completes that vocabulary sweep
+and preservation use **byte-identical**. Calculated values use **matching**, never
+**source-equal**; a later carried copy may be source-equal only to an
+already-produced named source value. Revision 16 completes that vocabulary sweep
 without changing authority or lifecycle semantics. The audit
 records all four permanent V1 capability limitations together: POSIX named
 teardown, automatic-quarantine retirement, declared same-platform

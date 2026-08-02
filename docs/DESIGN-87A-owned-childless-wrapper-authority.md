@@ -100,7 +100,11 @@ applies to canonical serialized bytes and byte-for-byte preservation; **closed**
 applies to a complete displayed algebra. “Exactly one” and “exactly once” remain
 ordinary cardinality or multiplicity phrases. In particular,
 `ExecutionGateCaptureV1.guarded_start` is generic `ProcStartGuardV1`-shaped
-audit evidence, not `OwnedExactStartGuardV1` and not a PID-reuse comparator.
+audit evidence, not `OwnedExactStartGuardV1` and not a PID-reuse comparator. A
+recomputed, derived, calculated, or execution-produced value is never
+source-equal to the operand or expected result; it must match under the
+displayed predicate. A later field may be source-equal only when it carries
+that already-produced value from a named source.
 
 ## Safety decision
 
@@ -678,8 +682,9 @@ ChildlessEffectEnvelopeV1 {
 
 ExecutableOwnedTargetSetV1 =
   private, nonserializable, noncopyable, deeply immutable, alias-free
-  root-first target tuple and recomputed target digest source-equal to the
-  authorized source
+  root-first target tuple source-equal to the permit's authorized source tuple,
+  with a recomputed OwnedTargetDigestV1 over that tuple matching the permit's
+  ExactTargetExecutorBindingV1.authorized_target_digest,
   bound to one ExactTargetExecutorPermitV1(
     operation = STOP_TREE, use = EXTERNAL_CALL)
 
@@ -957,8 +962,10 @@ SupervisorOwnedTreeNativeKnownNoEffectV1 =
 SupervisorOwnedTreeDispatchReceiptV1 =
   private, nonserializable, noncopyable, deeply immutable, alias-free result
   bound to the same consumed native invocation and call; its variant, target
-  tuple, use/lineage identity, and native outcomes are source-equal to the
-  corresponding fields of that invocation; only
+  tuple, and use/lineage identity are source-equal to the corresponding fields
+  carried by that invocation. Its native outcomes are produced by executing
+  and remain bound to that invocation under the closed native-result algebra;
+  only
   CHILDLESS projects into
   ChildlessExternalEffectReceiptV1
 
@@ -1189,7 +1196,7 @@ transition is the safety boundary.
 The winner then revalidates the complete sealed call and variant-specific
 provenance while the owner remains `DISPATCHING`. For `EPHEMERAL_TERMINAL` it
 acquires the action-latch read guard and requires `ENABLED` with an epoch
-source-equal to `EphemeralTerminalFinalActionGateV1.action_latch_epoch`, then
+matching `EphemeralTerminalFinalActionGateV1.action_latch_epoch`, then
 retains that guard through native
 issuance. Separately, it freshly requires the kill switch to remain clear before
 native-plan construction and preserves the private native body's equivalent
@@ -1382,8 +1389,8 @@ observation revisions. The live-scope operand is a closed discriminated value:
   `IDLE`, with no current attempt, closure, pending disposition, continuation,
   or `RELEASE_PENDING` tombstone. For initial-mode retry with debt `NONE`, it
   may atomically replace the envelope's current binding with the prospective
-  fresh tree binding only when the prospective owner identity is source-equal to
-  the old binding owner. It keeps the same-owner cycle and terminal
+  fresh tree binding only when the prospective owner identity matches the old
+  binding owner. It keeps the same-owner cycle and terminal
   tombstones byte-identical under their own historical bindings. A physically different owner
   must first use `OWNER_TRANSITION` and then `RESERVE/INITIAL`; `CONTINUE` cannot
   bypass that boundary. For `DEBT_COMPLETION`, the prospective
@@ -1453,10 +1460,11 @@ observation revisions. The live-scope operand is a closed discriminated value:
   authorized `SPAWN_RESERVATION/SPAWN/TAKEOVER_CHECKPOINT/RECONCILER` derived
   from that predecessor. It is a `STATE_MUTATION`, not a receipt mutation.
   `SPAWN_IDENTITY_COMMIT` also
-  requires a guarded identity checkpoint source-equal to the one returned for that spawn.
+  requires a guarded identity checkpoint matching the one returned for that
+  spawn.
   Two other no-receipt state-only scopes are closed: a later strict checkpoint
-  may construct `SPAWN_IDENTITY_COMMIT/STATE_MUTATION` only when it is
-  source-equal to the guard retained in `AMBIGUOUS_LAUNCH`; and two compatible ordinary
+  may construct `SPAWN_IDENTITY_COMMIT/STATE_MUTATION` only when it matches the
+  guard retained in `AMBIGUOUS_LAUNCH`; and two compatible ordinary
   absence captures strictly after the ambiguity boundary may construct
   `SPAWN_RESULT_COMMIT/STATE_MUTATION` only to resolve that matching envelope to
   `IDLE` without launch. None may be built from a persisted
@@ -1920,7 +1928,7 @@ that prevent 87-A activation:
   conforming V1 activation occurred.
 - If any process is present at a configured PRE_BARRIER issuer PID, V1 cannot
   distinguish the original issuer from PID reuse. A live observation's generic
-  start token may be source-equal to the checkpoint token only as audit evidence;
+  start token may match the checkpoint token only as audit evidence;
   neither value is an exact-identity type or comparator. Attended disposal is
   `CAPABILITY_UNAVAILABLE(ExactIssuerIdentityAdapterV1)` and the hold persists
   until that separately reviewed adapter is delivered. A generic token/start
@@ -2483,10 +2491,11 @@ tombstone, or the spawn reservation required by its operation; and
 `armed_state_revision` is the successor revision that wrote that owner.
 `CLOSURE_ACQUIRE`, callable `STOP_TREE/ARMED`, and `SPAWN/ARMED` require
 `role=ISSUER` and non-null
-`action_latch_epoch` source-equal to the epoch of a fresh enabled action latch.
+`action_latch_epoch` matching the epoch of a fresh enabled action latch.
 Non-destructive `CLOSURE_RECONCILE` and
 `CLOSURE_RELEASE`, `RETIRED_ATTEMPT_RECONCILE`, and
-`POST_ACTION_CAPTURE` keep an action-latch epoch source-equal to the current epoch when the latch is enabled and
+`POST_ACTION_CAPTURE` keep an action-latch epoch source-equal to the current
+epoch when the latch is enabled and
 use null when cleanup is permitted under a disabled latch.
 Here `supervisor_start_guard` and the execution-gate supervisor start are both
 generic `ProcStartGuardV1` representation tokens. Their arm-time fields are
@@ -4019,7 +4028,7 @@ transaction; no executor branch may save a cached whole state.
     zero. From top-level `IDLE`, race one attended rollover request and a second
     whose fields are source-equal to the first:
     exactly one checked replacement may install a fresh epoch at revision and
-    sequence zero. Require the reset capture-derived fields to be source-equal to
+    sequence zero. Require the reset capture-derived fields to match
     their specified reset values and the preserved managed/manual/quarantine
     fields to remain byte-identical to their predecessor values. With a non-null
     configured prior-effect fence, preserve its complete audit/source/effect

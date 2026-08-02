@@ -181,7 +181,9 @@ disposition is therefore `CAPABILITY_UNAVAILABLE` until the named, undelivered
 the **exact** stem is reserved for named identity types/adapters or direct
 references to those identity contracts, and ordinary cardinality/multiplicity
 (`exactly one` / `exactly once`). Source bindings use **source-equal**; canonical
-serialization, payload preservation, and digest input use **byte-identical**. The attended
+serialization, payload preservation, and digest input use **byte-identical**.
+Calculated values use **matching**, never **source-equal**; a later carried copy
+may be source-equal only to an already-produced named source value. The attended
 command remains GONE-only, preserves all three replay gates, and constructs no
 kill or launch.
 

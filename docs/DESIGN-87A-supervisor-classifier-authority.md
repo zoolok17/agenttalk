@@ -66,7 +66,11 @@ equality grants no process-identity comparator. **Byte-identical** means equal
 canonical serialized bytes or byte-for-byte preservation. **Matching** names
 an ordinary predicate without granting identity authority, and **closed** means
 that the displayed algebra has no other variants. No other use of the exact
-stem is admitted in these four documents.
+stem is admitted in these four documents. A recomputed, derived, calculated,
+or execution-produced value is never source-equal to the operand or expected
+result; it must match under the displayed predicate. A later field may be
+source-equal only when it carries that already-produced value from a named
+source.
 
 ## Split, decision, and scope
 
@@ -690,8 +694,8 @@ ConfiguredPriorEffectUnknownFenceV1 {
   source_checkpoint:
     source-equal to the disposed ConfiguredActionIssuerCheckpointV1
   source_targets:
-    source-equal to module-typed source_checkpoint.source_targets; its digest is
-    source-equal to source_checkpoint.target_digest
+    source-equal to module-typed source_checkpoint.source_targets; a recomputed
+    OwnedTargetDigestV1(source_targets) matches source_checkpoint.target_digest
   disposed_state_epoch: source-equal to checked ClassifierStateV1.state_epoch
   disposed_revision: source-equal to the successor revision that installs this fence
   disposed_ordinary_poll_sequence:
@@ -2064,15 +2068,16 @@ adapter progress exists, the normalized `updated_at` is the wrapper-published
 `active_age_grace_through_epoch_ms =
 active_record_updated_at_epoch_ms + 30000` using checked addition. The same
 transaction captures the applicable checked generation launch fence:
-`generation_launch_grace_until_epoch_ms` is source-equal to the normalized
-`launch_grace_until` only when the managed generation is the guard key's
-generation and checked state says `launching=true` and `readiness_seen=false`;
-otherwise it is null. A missing, malformed, generation-mismatched, or changing
-same-key launch-fence input cannot construct or close the guard: the active
-child remains `UNKNOWN`, both child-death counters reset, and no authority is
-created. The checked owner persists both anchors on first observation of the
-key. Heartbeat writes, ordinary polls, absence, snapshot changes, and repeated
-runtime reads cannot move them. A same-key `ACTIVE` record that changes
+`generation_launch_grace_until_epoch_ms` is the validated Unix-millisecond
+value derived by normalizing checked `launch_grace_until` only when the managed
+generation is the guard key's generation and checked state says
+`launching=true` and `readiness_seen=false`; otherwise it is null. A missing,
+malformed, generation-mismatched, or changing same-key launch-fence input
+cannot construct or close the guard: the active child remains `UNKNOWN`, both
+child-death counters reset, and no authority is created. The checked owner
+persists both anchors on first observation of the key. Heartbeat writes,
+ordinary polls, absence, snapshot changes, and repeated runtime reads cannot
+move them. A same-key `ACTIVE` record that changes
 `updated_at` without positive current-turn adapter progress is likewise
 invalid for child-death qualification and resets both counters; it never
 renews either grace.
@@ -3012,8 +3017,9 @@ executor recaptures eligibility and requires `ELIGIBLE` with the same semantic
 snapshot ID immediately before issuing any guarded termination and again
 immediately before `Start-Process`; manual origin also repeats live
 authorization. At both manual fences, raw capture must still be
-`PRESENT_VALID` with request ID and `revision_sha256` source-equal to the
-reservation, and authorization must still be `AVAILABLE` with
+`PRESENT_VALID` with `marker.request_id` source-equal to
+`reservation.request_id` and its recomputed `revision_sha256` matching
+`reservation.marker_revision_sha256`, and authorization must still be `AVAILABLE` with
 `snapshot_id == reservation.authorization_snapshot_id`. Deletion, replacement,
 unreadability, or any semantically different authorization snapshot is a
 veto—even when the new requester would independently be authorized.
@@ -3574,7 +3580,7 @@ bookkeeping during a later launch cannot make its consumed request ID reusable.
 | Proven no-spawn failure | Only an OS/API result that positively proves no child was created may set `launching=false`, release reservation, preserve any marker, attempt/backoff bookkeeping, and prior guarded identity byte-identically, clear the pending deadline, and record the typed failure result. For childless origin, the matching typed receipt and a fresh receipt-derived `SPAWN_RESULT_COMMIT/RECEIPT_MUTATION` permit whose call-issuance binding is source-equal to that receipt are mandatory. Timeout, exception, lost return, or any uncertain post-issuance effect enters `AMBIGUOUS_LAUNCH` instead. |
 | Spawn returned but guarded identity is ambiguous | For childless origin, consume a fresh receipt-derived `SPAWN_RESULT_COMMIT/RECEIPT_MUTATION` permit whose call-issuance binding is source-equal to the matching typed spawn receipt and persist `AMBIGUOUS_LAUNCH` with continuation `NONE`, the complete envelope reservation, null pending deadline, and `ambiguity_boundary_poll_sequence=ordinary_poll_sequence`; reset `absence_confirmation` to `EMPTY`. For `IDENTITY_COMMIT_FAILED`, set `reservation.spawned_guard` and `evidence.observed_guard` source-equal to the returned non-null `SpawnGuardV1`; for `START_RETURNED_WITHOUT_GUARD`, keep both null. The receipt-free crash conversion instead requires the module's persisted SPAWN issuer subject plus positive dead-issuer scope. Non-childless origin uses its private typed transition. Do not release authority ownership or permit another launch. |
 | New guarded identity commits | In one checked transaction replace the managed identity, reset the establishment guard, and update launch/readiness state. `GuardedLaunchCommitV1` is inert checkpoint input only. For childless spawn origin, only the matching typed spawn receipt + checkpoint + fresh receipt-derived `SPAWN_IDENTITY_COMMIT/RECEIPT_MUTATION` permit whose call-issuance binding is source-equal to that receipt may construct the mutation and remove the envelope, after debt is `NONE`, no closure remains, and all retired-attempt obligations are terminal; the spawn continuation is consumed by that same commit. A physically different guarded owner observed outside that spawn may clear an old-owner `IDLE` envelope/cycle only through the module's state-only `OWNER_TRANSITION` permit with the same no-debt/no-obligation predicates. Non-childless origin returns directly to top-level `IDLE`. Manual spawn origin also records its consumed request and pending readiness. |
-| Readiness observed | Only guarded readiness whose managed generation is source-equal to `committed_managed_generation` sets `readiness_seen=true` and `launching=false`, and it alone satisfies a pending manual-readiness value. Compare-clear that marker using request ID plus revision and set `manual_readiness=NONE`; a replaced marker is untouched. Readiness for any other generation cannot change launch state, clear the marker, or satisfy the request. |
+| Readiness observed | Only guarded readiness whose managed generation matches `committed_managed_generation` sets `readiness_seen=true` and `launching=false`, and it alone satisfies a pending manual-readiness value. Compare-clear that marker using request ID plus revision and set `manual_readiness=NONE`; a replaced marker is untouched. Readiness for any other generation cannot change launch state, clear the marker, or satisfy the request. |
 
 The consumed set retains the latest 128 IDs in checked commit-revision order
 and evicts the oldest; the five-minute TTL prevents an evicted ancient marker
@@ -5026,7 +5032,7 @@ without all of this executed evidence:
     action; require no acquisition handle, observation, receipt, mutation, 87-A
     action, or wrap. From top-level `IDLE`, race two byte-identical attended rollover
     requests: exactly one checked replacement wins. Require the displayed
-    reset field set to be source-equal to its specified values and the preserved
+    reset field set to match its specified values and the preserved
     field set to remain byte-identical to its predecessor values.
     With a non-null prior-effect fence at the
     maximum sequence, require every disposition/audit/source/effect field to be
