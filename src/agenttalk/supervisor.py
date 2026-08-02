@@ -2073,6 +2073,36 @@ def _snap_index(snapshot: list[dict] | None) -> dict[int, dict]:
     return idx
 
 
+def _snap_all_edges(snapshot: list[dict] | None) -> dict[int, list[int]]:
+    """Permissive parent -> children edges, straight from every row's own
+    pid/parent_pid - including a pid _snap_index excluded for identity
+    ambiguity (a duplicate or malformed row).
+
+    Task #150 round 4 connector finding 1: _snap_index's exclusion popped
+    the excluded pid's row out of idx BEFORE _children_map(idx) was built,
+    which destroyed the only edge connecting it to its own parent - so
+    neither the main walk nor the discovery-closure invariant could ever
+    reach it, or reach anything further below it, to reject it. A
+    candidate the walk cannot trust to ADMIT is still a candidate it must
+    ACCOUNT for. This map is never used for admission or identity lookups
+    (idx/_children_map(idx) still own that, unchanged) - only to seed what
+    the discovery-closure invariant reconciles against, where routing
+    through an untrusted edge is exactly the point.
+    """
+    kids: dict[int, list[int]] = {}
+    for row in snapshot or []:
+        if not isinstance(row, dict):
+            continue
+        pid = row.get("pid")
+        parent_pid = row.get("parent_pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        if not isinstance(parent_pid, int) or isinstance(parent_pid, bool):
+            continue
+        kids.setdefault(parent_pid, []).append(pid)
+    return kids
+
+
 def _snapshot_pid_integrity_error(snapshot: list[dict]) -> str | None:
     """Validate the PID/parent graph before any last-row-wins indexing.
 
@@ -3097,6 +3127,11 @@ def _owned_process_tree(
     add_node(wrapper_row, role="wrapper", depth=0, live=True)
     wrapper_pid = wrapper_row.get("pid")
     recycled_parent_pids: set[int] = set()
+    # Task #150 round 4 connector finding 2: the replacement's own row, kept
+    # alongside the pid, so the discovery-closure invariant can draw the
+    # same old-side/new-side line evaluate_launch_barrier already draws
+    # instead of excluding every child of a recycled root.
+    recycled_parent_rows: dict[int, dict] = {}
 
     # Rehydrate exact live identities from the previous complete tree. A live
     # descendant whose intermediate parent exited remains owned only because
@@ -3128,6 +3163,7 @@ def _owned_process_tree(
                     and _has_exact_start_identity(row)
                 ):
                     recycled_parent_pids.add(entry["pid"])
+                    recycled_parent_rows[entry["pid"]] = row
                     continue
                 if not isinstance(row, dict) or not _start_tokens_match(
                     _start_of(row),
@@ -3195,6 +3231,8 @@ def _owned_process_tree(
         )
         if current_launcher_identity == "different":
             recycled_parent_pids.add(launcher_pid)
+            if isinstance(current_launcher, dict):
+                recycled_parent_rows[launcher_pid] = current_launcher
         launcher_live = bool(
             isinstance(current_launcher, dict)
             and current_launcher.get("parent_pid") == wrapper_pid
@@ -3366,11 +3404,11 @@ def _owned_process_tree(
     # simply exited) of a known root - the wrapper, the declared launcher,
     # the discovered brain, and every PRIOR entry, whether or not
     # prior_authority ended up trusted - reachable via the CURRENT
-    # snapshot's raw parent-child edges, regardless of whether admission
-    # logic actually walked into it. children.get(pid, ...) still returns a
-    # live child whose OWN row names pid as parent even when pid itself is
-    # absent or was never visited, so an orphaned intermediate's live child
-    # - or a rejected launcher's live child - is still IN this closure. Any
+    # snapshot's raw parent-child edges (discovery_edges below), regardless
+    # of whether admission logic actually walked into it. A live child whose
+    # OWN row names pid as parent is found even when pid itself is absent
+    # or was never visited, so an orphaned intermediate's live child - or a
+    # rejected launcher's live child - is still IN this closure. Any
     # such descendant that never made it into "owned" is unaccounted -
     # either a case already flagged above (harmless double count;
     # rejected_count is a gate, not an exact tally) or exactly the silent-
@@ -3389,28 +3427,57 @@ def _owned_process_tree(
         _prior_pid = _prior_entry.get("pid") if isinstance(_prior_entry, dict) else None
         if isinstance(_prior_pid, int) and not isinstance(_prior_pid, bool):
             discovery_roots.add(_prior_pid)
-    # A root already PROVEN to be a different, recycled process (exact
-    # identity mismatch, not merely absent) is not a candidate this agent
-    # has any claim to - its current children are a REPLACEMENT process's
-    # own descendants, not ours, and the existing recycled_parent_pids
-    # check a few lines above already treats them as foreign on purpose
-    # (test: test_owned_process_tree_recycled_launcher_ignores_foreign_
-    # children / ..._recycled_virtual_parent_ignores_replacement_child).
-    # Expanding into a recycled root's children here would flag someone
-    # else's process tree as our own unaccounted loss.
+    # Task #150 round 4 connector finding 1: children.get(...) above is
+    # _children_map(idx) - built from the DEDUPED idx, so a pid _snap_index
+    # excluded for identity ambiguity (a duplicate or malformed row) has no
+    # row left in idx to contribute its own edge to that map. Its parent
+    # never learns it exists, and neither does anything below it - the
+    # exact silent loss this invariant exists to close, just moved one
+    # level earlier than round 3 checked. discovery_edges is built straight
+    # from the raw snapshot instead, so an excluded pid's edge to its OWN
+    # parent survives for discovery/rejection purposes (never for
+    # admission - idx/children, used everywhere above this block, are
+    # unchanged and still the strict, trusted source).
+    discovery_edges = _snap_all_edges(snapshot)
+    # Task #150 round 4 connector finding 2 (round 3's own exclusion was too
+    # blanket): a root already PROVEN to be a different, recycled process
+    # does not make EVERY current child foreign - evaluate_launch_barrier
+    # already draws the old-side/new-side line for exactly this situation
+    # (a child whose exact start strictly predates the replacement belongs
+    # to the process this agent actually owned; only a child at or after
+    # the replacement's own exact start belongs to the replacement).
+    # Missing/incomparable exact evidence stays conservative - treated as
+    # ours - matching the barrier's own default. Applying that same test
+    # here, rather than excluding wholesale, is what the two tests that
+    # forced the round-3 exclusion actually needed: they construct a
+    # replacement whose OWN current children postdate it, which this still
+    # excludes correctly.
     discovered_descendants: set[int] = set()
-    frontier = [
-        pid
-        for root in discovery_roots
-        if root not in recycled_parent_pids
-        for pid in children.get(root, [])
-    ]
+    frontier: list[int] = []
+    for root in discovery_roots:
+        if root not in recycled_parent_pids:
+            frontier.extend(discovery_edges.get(root, []))
+            continue
+        replacement_key = _exact_start_order_key(recycled_parent_rows.get(root))
+        for pid in discovery_edges.get(root, []):
+            child_key = _exact_start_order_key(idx.get(pid))
+            if (
+                replacement_key is not None
+                and child_key is not None
+                and child_key[0] == replacement_key[0]
+                and child_key[1] >= replacement_key[1]
+            ):
+                # At or after the replacement's own exact start: the
+                # replacement's own descendant, not a candidate we ever
+                # owned.
+                continue
+            frontier.append(pid)
     while frontier:
         candidate_pid = frontier.pop()
         if candidate_pid in discovered_descendants:
             continue
         discovered_descendants.add(candidate_pid)
-        frontier.extend(children.get(candidate_pid, []))
+        frontier.extend(discovery_edges.get(candidate_pid, []))
     for _ in sorted(discovered_descendants - set(owned)):
         mark_rejected("unaccounted_discovery")
 
@@ -11400,6 +11467,14 @@ $pollNum = 0
             $p.barrier_state.owned_process_tree.truncated = $false
             $p.barrier_state.owned_process_tree.omitted_count = 0
             $p.barrier_state.owned_process_tree.observed_count = [int]$p.barrier_state.owned_process_tree.recorded_count
+            # Task #150 round 4 connector finding 3: this barrier observed
+            # survivors by its OWN accounting, not the Python walk's - it
+            # must not leave a stale rejected_count (0, from whenever this
+            # tree was last complete) presenting as "the walk found nothing
+            # unaccounted". Removing the property entirely reads as unknown
+            # downstream, never zero - the same shape the v2-migration fix
+            # already relies on for a field a record simply never had.
+            $p.barrier_state.owned_process_tree.PSObject.Properties.Remove('rejected_count')
           }
           if ($p.barrier_state) { Set-AgentState $state $name $p.barrier_state } else { Set-AgentState $state $name $p.next_state }
           if (-not (Save-StateForPoll $state)) {
@@ -11616,6 +11691,10 @@ $pollNum = 0
             $p.next_entry.owned_process_tree.truncated = $false
             $p.next_entry.owned_process_tree.omitted_count = 0
             $p.next_entry.owned_process_tree.observed_count = [int]$p.next_entry.owned_process_tree.recorded_count
+            # Task #150 round 4 connector finding 3: see the matching
+            # comment on the relaunch/stuck_recover barrier above - same
+            # second-producer shape, same fix.
+            $p.next_entry.owned_process_tree.PSObject.Properties.Remove('rejected_count')
           }
           $p.next_entry | Add-Member -NotePropertyName process_tree_hold_reason `
             -NotePropertyValue ("process_tree_invalid_post_kill_{0}" -f $why) -Force

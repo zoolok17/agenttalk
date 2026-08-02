@@ -14996,6 +14996,141 @@ def test_snap_index_excludes_rather_than_picks_a_duplicate_pid() -> None:
     assert WRAP_LAUNCHER_PID in idx  # unrelated pids are unaffected
 
 
+def test_owned_process_tree_duplicate_pid_orphan_still_rejected() -> None:
+    """Task #150 round 4 connector finding 1: _snap_index's own exclusion
+    popped the duplicated pid's row out of idx BEFORE _children_map(idx)
+    was built (round 3's `children`), which destroyed the only edge
+    connecting the duplicated pid to its OWN parent - so neither the main
+    walk nor the discovery-closure invariant could ever reach it, or
+    anything below it. The whole-snapshot "duplicate_pid" fact still set
+    the tree invalid, but rejected_count stayed 0 - a path that lost two
+    real candidates (the duplicated intermediate and its live child)
+    without saying so, the exact silent-loss class this invariant exists
+    to close, just one level earlier than round 3 checked."""
+    intermediate_pid = 500
+    live_child_pid = 501
+    duplicated_intermediate = _proc(
+        intermediate_pid, WRAP_CHILD_PID, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000),
+    )
+    duplicate_of_same_pid = {
+        **duplicated_intermediate,
+        "start_time": _ps_iso(700001),
+    }
+    snapshot = [
+        *_wrap_snap(),
+        duplicated_intermediate,
+        duplicate_of_same_pid,
+        _proc(live_child_pid, intermediate_pid, "node.exe", "node build.js", _ps_iso(800000)),
+    ]
+    plan = _owned_tree_plan(snapshot, request_id="rr-150-duplicate-pid-orphan")
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert "duplicate_pid" in tree["reason_code"]
+    assert tree["rejected_count"] >= 1
+    assert intermediate_pid not in [e["pid"] for e in tree["entries"]]
+    assert live_child_pid not in [e["pid"] for e in tree["entries"]]
+
+
+def test_owned_process_tree_recycled_root_old_side_child_still_counted() -> None:
+    """Task #150 round 4 connector finding 2: round 3's recycled-root
+    exclusion was too blanket - it treated EVERY current child of a
+    recycled pid as the replacement's foreign descendant, but a child
+    whose exact start strictly PREDATES the replacement belongs to the
+    OLD, genuinely-owned process, not the new one. evaluate_launch_barrier
+    already draws exactly this line (see its recycled_parent_rows/
+    replacement_key handling); the discovery-closure invariant must agree
+    with it rather than drawing its own, wider one.
+
+    Modeled directly on test_owned_process_tree_recycled_launcher_ignores_
+    foreign_children (the test whose "990" fixture forced round 3's
+    blanket exclusion): the replacement's own parent_pid is unrelated
+    (not the wrapper), and no lifetime certificate is configured, so
+    launcher_pid is admitted by NEITHER the declared-launcher path NOR
+    generic BFS - the discovery-closure invariant is the only thing that
+    can reach anything below it at all. That test's own foreign child
+    postdates the replacement and must stay excluded (unchanged here);
+    this test adds a second child that PREDATES the replacement and must
+    now be caught as a real, unaccounted loss instead of silently
+    dropped alongside it."""
+    old_child_pid = 890
+    old_child_start = _ps_iso(700000)  # predates the replacement below
+    replacement_start = _ps_iso(800000)
+    foreign_child_pid = 990
+    foreign_child_start = _ps_iso(900000)  # postdates the replacement
+
+    snapshot = [
+        _wrap_snap()[0],
+        _proc(WRAP_CHILD_PID, 1, "unrelated.exe", "unrelated replacement", replacement_start),
+        _proc(old_child_pid, WRAP_CHILD_PID, "node.exe", "node build.js", old_child_start),
+        _proc(foreign_child_pid, WRAP_CHILD_PID, "node.exe", "node foreign.js", foreign_child_start),
+    ]
+    plan = _owned_tree_plan(snapshot, request_id="rr-150-recycled-old-side")
+    tree = plan["next_state"]["owned_process_tree"]
+    # The old-side child is a real, unaccounted loss (its true parent is
+    # gone, replaced) - the invariant must now catch it.
+    assert tree["status"] == "invalid"
+    assert tree["rejected_count"] >= 1
+    entry_pids = {e["pid"] for e in tree["entries"]}
+    assert old_child_pid not in entry_pids  # rejected, never admitted
+    # The replacement's OWN (foreign) child must still NOT be counted as
+    # ours - unchanged from the existing sibling test's own assertion.
+    assert foreign_child_pid not in entry_pids
+
+
+def test_post_kill_barrier_hold_cannot_present_a_trustworthy_zero() -> None:
+    """Task #150 round 4 connector finding 3: the post-kill and ephemeral
+    teardown barriers (the .ps1 template, around the relaunch/stuck_recover
+    and ephemeral_complete/timeout/failed branches) are a SECOND producer
+    of invalid owned_process_tree records - they mutate a formerly-complete
+    tree's status/reason_code straight in PowerShell, entirely outside
+    _owned_process_tree's own walk, and never ran any accounting of their
+    own. Before this fix they left rejected_count untouched at its old
+    "complete" value (0), so process_tree_invalid_post_kill_* sailed
+    through _unverified_owned_process_tree's eligibility bar even though
+    the barrier's own survivors were never counted anywhere. The fix
+    removes the property entirely rather than writing a number - the same
+    "missing means unknown, not zero" shape the v2-migration fix already
+    established for a field a record simply never had, reused here for a
+    field this record's PRODUCER never computed."""
+    ps1_source = sup.PS_TEMPLATE
+    assert ps1_source.count(
+        "owned_process_tree.PSObject.Properties.Remove('rejected_count')",
+    ) == 2
+
+    tree = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-post-kill-producer",
+    )["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+
+    # The FIXED shape: the barrier removed rejected_count entirely when it
+    # externally invalidated the tree. Still valid, readable authority -
+    # just not eligible for the walk's own re-derivation.
+    post_kill_fixed = dict(tree)
+    post_kill_fixed["status"] = "invalid"
+    post_kill_fixed["reason_code"] = "process_tree_invalid_post_kill_launch_barrier_unavailable"
+    del post_kill_fixed["rejected_count"]
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        post_kill_fixed, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is not None
+    held = sup._unverified_owned_process_tree(  # noqa: SLF001
+        post_kill_fixed, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
+    )
+    assert held["status"] == "invalid"
+
+    # The PRE-FIX shape, for contrast: rejected_count left at its stale
+    # "complete" value of 0 - this is exactly the hazard finding 3 named,
+    # and it genuinely does promote, proving the fix closes a real gap
+    # rather than a hypothetical one.
+    post_kill_stale = dict(tree)
+    post_kill_stale["status"] = "invalid"
+    post_kill_stale["reason_code"] = "process_tree_invalid_post_kill_launch_barrier_unavailable"
+    promoted = sup._unverified_owned_process_tree(  # noqa: SLF001
+        post_kill_stale, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
+    )
+    assert promoted["status"] == "absent"
+
+
 def test_owned_process_tree_rejects_walk_when_launcher_missing_exact_filetime() -> None:
     """Task #150 round 3 connector finding 3: a Windows row lacking exact
     start_filetime used to be ADMITTED by add_node while
