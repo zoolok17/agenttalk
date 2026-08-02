@@ -15341,6 +15341,67 @@ def test_owned_process_tree_rejects_prior_entry_with_malformed_parent_pid() -> N
     assert intermediate_pid not in [e["pid"] for e in tree["entries"]]
 
 
+def test_owned_process_tree_rejects_prior_entry_excluded_by_snap_index() -> None:
+    """Task #150 round 6 connector finding: "unindexable" and "invalid
+    parent" are different failure modes, and round 5's fix only covered
+    the second. When a PREVIOUSLY OWNED pid's row is DUPLICATED this
+    poll, _snap_index correctly excludes it entirely (ambiguous, not
+    "not found") - idx.get(that_pid) then returns None, same as a
+    genuinely exited descendant would. Round 5's check only inspects
+    parent_pid on a row it can actually retrieve, so it silently
+    `continue`s past an excluded pid exactly like it would past one that
+    simply exited - even though this one is present, not gone. Bounded
+    strictly to prior_entries (via the pid, not by trusting the excluded
+    row's own content, which does not exist), this cannot poison an
+    unrelated agent's count: it only ever inspects a pid already
+    recorded as one of ours."""
+    intermediate_pid = 500
+    first_snapshot = [
+        *_wrap_snap(),
+        _proc(intermediate_pid, WRAP_CHILD_PID, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000)),
+    ]
+    first = _owned_tree_plan(first_snapshot, request_id="rr-150-excluded-prior-first")
+    complete_tree = first["next_state"]["owned_process_tree"]
+    assert complete_tree["status"] == "complete"
+    assert intermediate_pid in [e["pid"] for e in complete_tree["entries"]]
+
+    untrusted_state = dict(first["next_state"])
+    untrusted_tree = dict(complete_tree)
+    untrusted_tree["status"] = "invalid"
+    untrusted_tree["reason_code"] = "process_tree_invalid_generation_adoption_pending"
+    untrusted_state["owned_process_tree"] = untrusted_tree
+
+    # Second poll: the SAME pid appears twice, both rows now claiming an
+    # UNRELATED parent (matching the round-5 isolation technique) rather
+    # than the launcher - so this pid contributes no edge to EITHER idx
+    # (excluded, ambiguous) OR the permissive discovery_edges map (its
+    # declared parent no longer connects it to the wrapper at all), and
+    # round 4's own discovery-closure fix - which finds a duplicated pid
+    # via a STILL-VALID edge from a root - plays no part. The only path
+    # left is prior_entries seeding it as a root directly.
+    duplicated_row = _proc(intermediate_pid, 1, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000))
+    duplicate_of_same_pid = {**duplicated_row, "start_time": _ps_iso(700001)}
+    second_snapshot = [*_wrap_snap(), duplicated_row, duplicate_of_same_pid]
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-150-excluded-prior-second"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                now=NOW + 1,
+            ),
+        ),
+        {"agents": {"worker": untrusted_state}},
+        now=NOW + 1,
+        snapshot=second_snapshot,
+    )
+    tree = second["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["rejected_count"] >= 1
+    assert intermediate_pid not in [e["pid"] for e in tree["entries"]]
+
+
 def test_reset_remedy_names_rejected_candidates_separately_from_omitted() -> None:
     """Task #150 round 3 connector finding 6, the same wrong direction as
     round 2's own finding 2: a rejected candidate is precisely what this

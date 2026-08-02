@@ -2041,7 +2041,9 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
 # (access-limited): we then degrade to name+ancestry only and NEVER match/kill a
 # process by a guessed name (codex discipline note 3).
 
-def _snap_index(snapshot: list[dict] | None) -> dict[int, dict]:
+def _snap_index_and_excluded(
+    snapshot: list[dict] | None,
+) -> tuple[dict[int, dict], set[int]]:
     # Task #150 connector finding 1: last-write-wins on a duplicate pid
     # silently picks ONE of two rows - if the winner happens to be a
     # malformed/unrelated row while the loser was a genuinely live child,
@@ -2053,6 +2055,14 @@ def _snap_index(snapshot: list[dict] | None) -> dict[int, dict]:
     # to keep - makes it "not found" for every caller, which is exactly
     # the shape the existing missing_child_row/add_node rejection sites
     # already handle correctly; no caller needs new logic to benefit.
+    #
+    # Task #150 round 6 connector finding: "not found" and "never existed"
+    # are different facts to a caller checking a PRIOR entry's current row
+    # - a prior identity whose row was excluded here (present, ambiguous)
+    # must be rejected, not silently treated the same as one that simply
+    # exited (absent, normal). The excluded set is the one piece of that
+    # distinction only this function has; _snap_index stays the thin,
+    # unchanged accessor every other caller already uses.
     idx: dict[int, dict] = {}
     seen: set[int] = set()
     excluded: set[int] = set()
@@ -2070,7 +2080,11 @@ def _snap_index(snapshot: list[dict] | None) -> dict[int, dict]:
             continue
         seen.add(pid)
         idx[pid] = row
-    return idx
+    return idx, excluded
+
+
+def _snap_index(snapshot: list[dict] | None) -> dict[int, dict]:
+    return _snap_index_and_excluded(snapshot)[0]
 
 
 def _snap_all_edges(snapshot: list[dict] | None) -> dict[int, list[int]]:
@@ -3015,7 +3029,7 @@ def _owned_process_tree(
     )
 
     snapshot_error = _snapshot_pid_integrity_error(snapshot)
-    idx = _snap_index(snapshot)
+    idx, excluded_pids = _snap_index_and_excluded(snapshot)
     children = _children_map(idx)
 
     # pid -> {row, role, depth, live}; exited, previously earned identities may
@@ -3446,6 +3460,19 @@ def _owned_process_tree(
             continue
         _prior_row = idx.get(_prior_pid)
         if not isinstance(_prior_row, dict):
+            # Task #150 round 6 connector finding: "not indexable" and
+            # "never existed" are different facts for a PREVIOUSLY OWNED
+            # identity. _snap_index excludes a pid entirely when its rows
+            # disagree (a duplicate, or a row whose own parent no longer
+            # connects it) - that pid is PRESENT this poll, just ambiguous,
+            # not gone. A genuinely absent prior descendant (no row at all,
+            # never in excluded_pids either) simply exited, which is normal
+            # and already safe. Bounded strictly to prior_entries - this
+            # cannot poison an unrelated agent's count, since it never
+            # examines a pid that isn't already a recorded identity of
+            # ours.
+            if _prior_pid in excluded_pids:
+                mark_rejected("prior_entry_row_unindexable")
             continue
         _prior_parent_pid = _prior_row.get("parent_pid")
         if not isinstance(_prior_parent_pid, int) or isinstance(_prior_parent_pid, bool):
