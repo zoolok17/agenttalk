@@ -2334,6 +2334,34 @@ def _start_tokens_match(observed, expected) -> bool:
     return abs(observed_epoch - expected_epoch) <= 0.001
 
 
+def _wrapper_identity_matches_state(record: dict, st: dict) -> bool:
+    """True iff a wrapper runtime record's own identity agrees with the
+    launcher pid/start a supervisor state dict has stored for it.
+
+    Task #150 round 10 connector finding: this is the actual conjunct
+    process_tree_ownership_reset_evidence requires (a fresh record read at
+    reset time, against the state passed to that call) before it will admit
+    a reset - a DIFFERENT conjunct from runtime_status/STATUS_VALID, which
+    only proves the record parses. _wrapped_liveness's own
+    wrapper_state_mismatch HOLD branch and the remedy message that names
+    --reset-process-tree-ownership must both trust the SAME check the
+    command itself runs, not independently re-derive it: one drifts free of
+    the others otherwise, exactly what happened when the message only
+    checked runtime_status.
+    """
+    wrapper_pid = record.get("wrapper_pid")
+    wrapper_start = record.get("wrapper_start")
+    return (
+        isinstance(wrapper_pid, int)
+        and not isinstance(wrapper_pid, bool)
+        and wrapper_pid > 0
+        and isinstance(wrapper_start, str)
+        and bool(wrapper_start)
+        and st.get("launcher_pid") == wrapper_pid
+        and _start_tokens_match(st.get("launcher_start"), wrapper_start)
+    )
+
+
 def _start_order_key(value: object) -> tuple[str, int | float] | None:
     """Comparable process-start key for known snapshot/token schemes."""
     if not isinstance(value, str) or not value.strip() or len(value) > 256:
@@ -4478,6 +4506,7 @@ def _attribution(
     targets_by_pid: dict[int, dict] = {}
     seed_pids: set[int] = set()
     seed_launcher_sources: dict[int, dict] = {}
+    seed_synthetic_rows: dict[int, dict] = {}
     launcher_pid = st.get("launcher_pid")
     launcher_start = st.get("launcher_start")
     launcher_row = idx.get(launcher_pid) if isinstance(launcher_pid, int) else None
@@ -4561,6 +4590,22 @@ def _attribution(
             # target here.
             if isinstance(entry_pid, int) and entry_pid in excluded_pids:
                 row = {"pid": entry_pid, "start_time": entry.get("start")}
+                # Task #150 round 10 connector finding: this same excluded
+                # seed can go on to be a BFS parent below (seed_descendants),
+                # and idx.get(parent_pid) will fail there for the identical
+                # reason it failed here. _strict_child_edge only ever reads
+                # parent["pid"] and _start_of(parent) - the same two fields
+                # this synthetic row already carries and that Stop-Tree
+                # already trusts to order this pid's own kill - so it is
+                # sufficient to stand in as the BFS parent too. Without this,
+                # an opaque, never-recorded child living under an excluded
+                # tracked pid (e.g. a duplicate-row ambiguity) is never even
+                # looked up, let alone targeted: the tracked pid gets killed
+                # and the child survives it, unseen by evaluate_launch_barrier
+                # (which has no tree evidence to block on for this path
+                # either) - a replacement launches alongside a live child of
+                # the pid it just replaced.
+                seed_synthetic_rows[entry_pid] = row
             else:
                 continue
         if entry["pid"] in targets_by_pid:
@@ -4590,7 +4635,17 @@ def _attribution(
         visited_seed.add(parent_pid)
         parent = idx.get(parent_pid)
         if not isinstance(parent, dict):
-            continue
+            # An excluded seed (see seed_synthetic_rows above) has no row
+            # in idx by construction, not because it is absent - fall back
+            # to the same synthetic identity already trusted to kill it.
+            # Every other pid that ever reaches this queue was admitted via
+            # a real idx row (the child-admission check below requires
+            # isinstance(child, dict) before queue.append), so a seed with
+            # neither a real row nor a synthetic one is unreachable here;
+            # this continue is a defensive backstop, not a live branch.
+            parent = seed_synthetic_rows.get(parent_pid)
+            if not isinstance(parent, dict):
+                continue
         for child_pid in kids.get(parent_pid, []):
             if child_pid in targets_by_pid:
                 continue
@@ -5788,10 +5843,7 @@ def _wrapped_liveness(
     idx, excluded_pids = _snap_index_and_excluded(snapshot)
     wrapper_pid = record.get("wrapper_pid")
     wrapper_start = record.get("wrapper_start")
-    if (
-        wrapper_pid != st.get("launcher_pid")
-        or not _start_tokens_match(wrapper_start, st.get("launcher_start"))
-    ):
+    if not _wrapper_identity_matches_state(record, st):
         return _current_proof_failed(
             "wrapper_state_mismatch",
             hold_reason="process_tree_invalid_wrapper_state_mismatch",
@@ -7080,8 +7132,28 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         # this poll and when the operator acts - unavoidable from where the
         # message is produced - but it is never wrong about what THIS poll
         # already knows, which is what "must never guess" means here.
+        #
+        # Round 10 (connector finding, a fourth instance of the same wrong
+        # direction, this time in the predicate's own precision rather than
+        # a missing precondition): STATUS_VALID only proves the runtime
+        # record parses - a wrapper runtime record can be STATUS_VALID while
+        # its OWN wrapper_pid/wrapper_start disagrees with this state's
+        # stored launcher_pid/launcher_start, which is exactly what sends
+        # _wrapped_liveness down wrapper_state_mismatch
+        # (process_tree_invalid_wrapper_state_mismatch) with a nonempty
+        # inherited tree. process_tree_ownership_reset_evidence rejects that
+        # case on wrapper identity agreement, a DIFFERENT conjunct than
+        # runtime_status - so "one predicate" needed to mean the actual
+        # admission predicate, not one signal that happens to correlate with
+        # it. _wrapper_identity_matches_state is now the single function
+        # both process_tree_ownership_reset_evidence and this check call -
+        # not a second hand-written comparison that could drift from the
+        # first the way runtime_status alone already did once.
+        runtime_record = liveness.get("runtime_record")
         runtime_currently_valid = (
             liveness.get("runtime_status") == runtime_obs.STATUS_VALID
+            and isinstance(runtime_record, dict)
+            and _wrapper_identity_matches_state(runtime_record, st)
         )
         has_entries = bool(owned_tree.get("entries"))
         rejected_count = owned_tree.get("rejected_count")
@@ -7125,7 +7197,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 "expecting an automatic relaunch - that is only safe once "
                 "this record already reflects the wrapper as absent"
             )
-        elif has_entries:
+        elif has_entries and liveness.get("runtime_status") != runtime_obs.STATUS_VALID:
             remedy = (
                 "recovery: this record has named identities, but the "
                 "current wrapper runtime record is not valid "
@@ -7136,6 +7208,22 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 f"{owned_tree.get('reason_code')} (a valid runtime record "
                 "recovering on its own is what would let a scripted reset "
                 "apply here, not a --acknowledge-* flag)"
+            )
+        elif has_entries:
+            # Round 10: runtime_status is valid but wrapper_identity_matches_state
+            # is not - the record parses, yet its own wrapper pid/start
+            # disagrees with what this state has stored, which is a
+            # separate refusal reason the command checks independently.
+            remedy = (
+                "recovery: this record has named identities and the "
+                "current wrapper runtime record reads valid, but its own "
+                "wrapper identity (pid/start) does not agree with this "
+                "state's stored launcher identity, and --reset-process-"
+                "tree-ownership refuses on exactly that disagreement - it "
+                "will refuse; this needs operator investigation of "
+                f"{owned_tree.get('reason_code')} (the two identities need "
+                "to agree again - on their own, or via an attended reset - "
+                "before a scripted reset can apply here)"
             )
         else:
             remedy = (
@@ -8150,13 +8238,7 @@ def process_tree_ownership_reset_evidence(
     wrapper_start = runtime.get("wrapper_start")
     if (
         runtime.get("wrapper_generation") != wrapper_generation
-        or not isinstance(wrapper_pid, int)
-        or isinstance(wrapper_pid, bool)
-        or wrapper_pid <= 0
-        or not isinstance(wrapper_start, str)
-        or not wrapper_start
-        or entry.get("launcher_pid") != wrapper_pid
-        or not _start_tokens_match(entry.get("launcher_start"), wrapper_start)
+        or not _wrapper_identity_matches_state(runtime, entry)
     ):
         raise ValueError(
             "supervisor state and strict wrapper runtime record do not agree "

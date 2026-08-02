@@ -10010,6 +10010,45 @@ def test_reset_remedy_does_not_name_command_when_runtime_currently_invalid() -> 
     assert "runtime record is not valid" in plan["reason"]
 
 
+def test_reset_remedy_does_not_name_command_when_wrapper_identity_mismatches_state() -> None:
+    """Task #150 round 10 finding 2: round 9's fix gated the remedy on
+    runtime_status == STATUS_VALID alone - one signal _wrapped_liveness
+    computes, not the reset command's actual admission predicate.
+    --reset-process-tree-ownership (cli.py,
+    process_tree_ownership_reset_evidence) also refuses when a STATUS_VALID
+    runtime record's own wrapper_pid/wrapper_start disagrees with this
+    state's stored launcher_pid/launcher_start - a record can parse fine
+    (STATUS_VALID) while still failing that agreement, which is exactly
+    what sends _wrapped_liveness down wrapper_state_mismatch
+    (process_tree_invalid_wrapper_state_mismatch) with a nonempty inherited
+    tree. The remedy must not recommend a command that refuses for that
+    reason either. Asserts the operator-visible message, not the internal
+    predicate."""
+    earned = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-reset-remedy-wrapper-mismatch",
+    )["next_state"]["owned_process_tree"]
+    assert earned["status"] == "complete"
+    assert earned["entries"]
+
+    mismatched_runtime = _wrapper_runtime_view(
+        wrapper_pid=WRAP_LAUNCHER_PID + 500,
+        wrapper_start=_ps_iso(999000),
+    )
+    plan = sup.plan_actions(
+        _report(heartbeat_stale=False, wrapper_runtime=mismatched_runtime),
+        {"agents": {"worker": _wrap_ready(owned_process_tree=earned)}},
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=_wrap_snap()[:1],
+    )["agents"]["worker"]
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["entries"]  # has_entries branch, not the entryless one
+    assert tree["reason_code"] == "process_tree_invalid_wrapper_state_mismatch"
+    assert "run `agenttalk supervise --reset-process-tree-ownership`" not in plan["reason"]
+    assert "does not agree with this state's stored launcher identity" in plan["reason"]
+
+
 def test_wrapped_torn_runtime_read_is_unknown_without_partial_fields(
     tmp_path: Path,
 ) -> None:
@@ -13929,6 +13968,59 @@ def test_process_ownership_duplicated_prior_descendant_still_killed_with_launche
     )["agents"]["worker"]
     managed_pids_after = {m["pid"] for m in p_routine["next_state"]["managed_pids"]}
     assert 11 in managed_pids_after  # provenance survives the glitched poll
+
+
+def test_process_ownership_opaque_child_of_excluded_seed_still_killed_with_launcher() -> None:
+    """Task #150 round 10 finding 1: round 8's synthetic-row fix (above)
+    made an excluded tracked pid a kill target again, but the BFS
+    descendant-walk a few lines later still looked it up via idx.get and
+    skipped it as a BFS parent for the identical reason - so a live,
+    never-recorded child of that excluded pid (opaque: not itself a prior
+    entry, not an agenttalk wrap/wait invocation, discoverable only by
+    walking down from pid 11) was never even queried, let alone targeted.
+    The connector's scenario: tracked pid 11 has duplicate rows this poll
+    (excluded) and an untracked child pid 12 underneath it. This asserts
+    the operator-visible outcome the lead named - a surviving opaque
+    child preventing the clear - not a changed internal set: pid 12 must
+    be a kill target in the SAME operation that kills pid 11, so Stop-Tree
+    takes both out together and no replacement launches alongside a still
+    -live child of the pid it just replaced."""
+    prior = {
+        "attribution_model": "process_ownership_v1",
+        "root_key": sup._root_key(TEST_ROOT),
+        "agent": "worker",
+        "request_id": None,
+        "pid": 11,
+        "start": _ps_iso(200000),
+        "source": "launch_child_provenance",
+        "captured_at_epoch": NOW - 10,
+        "last_fresh_attribution_epoch": NOW - 10,
+        "seed_descendants": True,
+        "source_launcher_pid": 10,
+        "source_launcher_start": _ps_iso(100000),
+        "source_launcher_nonce": SUPERVISOR_NONCE,
+    }
+    duplicated_descendant = _proc(11, 1, "codex.exe", "codex exec --json", _ps_iso(200000))
+    opaque_child = _proc(12, 11, "node.exe", "node worker.js", _ps_iso(250000))
+    snap = [
+        _proc(10, 1, "codex.exe", "codex exec", _ps_iso(100000)),
+        duplicated_descendant,
+        dict(duplicated_descendant),
+        opaque_child,
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(
+            launcher_pid=10,
+            launcher_start=_ps_iso(100000),
+            managed_pids=[json.loads(json.dumps(prior))],
+        ),
+        _OWNERSHIP_ATTR_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    kill_target_pids = {t["pid"] for t in p["kill_targets"]}
+    assert {11, 12} <= kill_target_pids  # opaque child killed in the SAME operation as the excluded seed
 
 
 def test_process_ownership_stale_launcher_prior_does_not_rescue_row_without_nonce() -> None:
