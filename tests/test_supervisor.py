@@ -14090,6 +14090,77 @@ def test_process_ownership_excluded_opaque_child_is_unaccounted_not_lost() -> No
     assert p["diagnostics"]["excluded_live_descendant_unaccounted"] == 1
 
 
+def test_process_ownership_ambiguous_seed_hold_survives_the_provenance_ttl() -> None:
+    """Task #150 round 13 connector finding: keeping an excluded prior
+    entry UNCHANGED across polls (round 8's fix) left its own
+    last_fresh_attribution_epoch frozen at whenever it was last
+    unambiguous - _prior_valid's TTL check then expires it after
+    _PROVENANCE_TTL_SECONDS of CONTINUOUS ambiguity, even though the pid
+    is present in conflicting rows on every single one of those polls. A
+    TTL is the right instrument for evidence nobody has rechecked; this
+    pid IS rechecked every poll, it just cannot be disambiguated - a live
+    observation of an unresolved condition, not aging evidence. Expiring
+    it drops the seed the UNACCOUNTED_LIVE_DESCENDANT HOLD (round 12)
+    depends on to discover its own child at all, so a pending authorized
+    restart relaunches without targeting either process.
+
+    Simulates three consecutive polls with the identical ambiguity present
+    throughout (same duplicate-rowed seed, same opaque child), spaced
+    2000 seconds apart - each individual gap is under the one-hour TTL,
+    but the CUMULATIVE gap from the first poll to the third (4000s)
+    exceeds it. Asserts the operator-visible outcome on the THIRD poll:
+    the HOLD still fires - not a changed epoch value."""
+    prior = {
+        "attribution_model": "process_ownership_v1",
+        "root_key": sup._root_key(TEST_ROOT),
+        "agent": "worker",
+        "request_id": None,
+        "pid": 11,
+        "start": _ps_iso(200000),
+        "source": "launch_child_provenance",
+        "captured_at_epoch": NOW - 10,
+        "last_fresh_attribution_epoch": NOW - 10,
+        "seed_descendants": True,
+        "source_launcher_pid": 10,
+        "source_launcher_start": _ps_iso(100000),
+        "source_launcher_nonce": SUPERVISOR_NONCE,
+    }
+    duplicated_seed = _proc(11, 1, "codex.exe", "codex exec --json", _ps_iso(200000))
+    opaque_child = _proc(12, 11, "node.exe", "node worker.js", _ps_iso(250000))
+    snap = [
+        _proc(10, 1, "codex.exe", "codex exec", _ps_iso(100000)),
+        duplicated_seed,
+        dict(duplicated_seed),
+        opaque_child,
+    ]
+    assert sup._PROVENANCE_TTL_SECONDS == 3600.0  # noqa: SLF001
+
+    state = _ownership_state(
+        launcher_pid=10,
+        launcher_start=_ps_iso(100000),
+        managed_pids=[json.loads(json.dumps(prior))],
+    )
+    poll_epochs = [NOW, NOW + 2000, NOW + 4000]
+    p = None
+    for epoch in poll_epochs:
+        p = sup.plan_actions(
+            _ownership_report(),
+            state,
+            _OWNERSHIP_ATTR_CONFIG,
+            now_epoch=epoch,
+            snapshot=snap,
+        )["agents"]["worker"]
+        state = {"agents": {"worker": {**state["agents"]["worker"], **p["next_state"]}}}
+
+    assert poll_epochs[-1] - poll_epochs[0] > sup._PROVENANCE_TTL_SECONDS  # noqa: SLF001
+    assert p["action"] == sup.WARN_ONLY
+    assert p["state"] == "UNACCOUNTED_LIVE_DESCENDANT"
+    assert p["kill_targets"] == []
+    assert p["diagnostics"]["excluded_live_descendant_unaccounted"] == 1
+    managed_after = {m["pid"]: m for m in p["next_state"]["managed_pids"]}
+    assert managed_after[11]["last_fresh_attribution_epoch"] == poll_epochs[-1]
+
+
 def test_process_ownership_stale_launcher_prior_does_not_rescue_row_without_nonce() -> None:
     prior = {
         "attribution_model": "process_ownership_v1",

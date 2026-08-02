@@ -4754,6 +4754,18 @@ def _attribution(
             continue
         row = idx.get(entry["pid"])
         if isinstance(row, dict) and _start_of(row) == entry["start"]:
+            # Deliberately UNCHANGED (see
+            # test_process_ownership_provenanced_prior_exact_fields_
+            # request_and_ttl): a validly-matching prior is not itself
+            # ambiguous, so its own last_fresh_attribution_epoch is left
+            # to age normally toward _PROVENANCE_TTL_SECONDS - the TTL
+            # bounds how long an identity may be passively carried forward
+            # without a fresh, independently-earned re-derivation, and an
+            # unambiguous match is exactly the case that DOES have another
+            # path to re-earn one (own_wrapper/own_wait/live_chain_
+            # descendant/legacy_rederived). Round 13 only touches the
+            # EXCLUDED branch below, where no such alternative path exists
+            # while the ambiguity persists - see that branch's own comment.
             managed_by_pid[entry["pid"]] = entry
         elif entry["pid"] in excluded_pids:
             # Task #150 round 8 connector finding: idx.get(pid) is None
@@ -4762,9 +4774,33 @@ def _attribution(
             # managed_by_pid here is what actually persists the loss: the
             # NEXT poll's valid_priors would no longer carry this
             # identity at all, even once the ambiguity clears. Keep it
-            # unchanged as ambiguous HOLD evidence rather than silently
-            # forgetting a still-tracked descendant.
-            managed_by_pid[entry["pid"]] = entry
+            # as ambiguous HOLD evidence rather than silently forgetting a
+            # still-tracked descendant.
+            #
+            # Task #150 round 13 connector finding: keeping the entry
+            # UNCHANGED left its own last_fresh_attribution_epoch frozen at
+            # whenever it was last unambiguous - _prior_valid's TTL check
+            # then expires it after _PROVENANCE_TTL_SECONDS of continuous
+            # ambiguity, even though the pid is present in conflicting rows
+            # on EVERY one of those polls. Unlike the matching branch
+            # above, an excluded identity has NO alternative path to earn
+            # a fresh stamp while the ambiguity persists - own_wrapper/
+            # own_wait/live_chain_descendant/legacy_rederived all require
+            # a real idx row, which this pid does not have by construction.
+            # A TTL is the right instrument for evidence nobody has
+            # rechecked; it is the wrong instrument for an identity
+            # rechecked every poll that just cannot be disambiguated - a
+            # live observation of an unresolved condition, not aging
+            # evidence. Expiring it converts "we still cannot tell" into
+            # "there was never anything here", dropping the seed the very
+            # UNACCOUNTED_LIVE_DESCENDANT HOLD depends on to discover its
+            # own child. Refresh the epoch on every poll the ambiguity is
+            # still directly observed, so the entry cannot lapse while the
+            # condition producing it is still present.
+            managed_by_pid[entry["pid"]] = {
+                **entry,
+                "last_fresh_attribution_epoch": now_epoch,
+            }
 
     for legacy in legacy_priors:
         pid = legacy.get("pid")
