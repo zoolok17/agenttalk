@@ -13825,6 +13825,74 @@ def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> N
     assert p_missing["diagnostics"]["prior_ttl_expired"] == 1
 
 
+def test_process_ownership_duplicated_prior_descendant_still_killed_with_launcher() -> None:
+    """Task #150 round 8 connector finding: the SAME idx.get(pid)-is-None
+    conflation round 7 fixed for the ephemeral path also reaches the
+    legacy (non-wrapped) attribution model, arriving in TWO valid_priors
+    loops instead of one - dropping both the kill target AND the
+    persisted provenance for a tracked descendant whose row is merely
+    duplicated this poll, not gone. The observable failure this produces
+    is exactly the duplicate-wrapper hazard the whole PR exists to
+    prevent: a recovery kills the launcher, the glitch clears before the
+    next snapshot, and the untargeted descendant is left alive alongside
+    a freshly launched replacement. This asserts the outcome an operator
+    would see - the descendant IS a kill target, killed in the SAME
+    operation as the launcher, and its provenance survives the glitched
+    poll - not _attribution's own internal classification."""
+    prior = {
+        "attribution_model": "process_ownership_v1",
+        "root_key": sup._root_key(TEST_ROOT),
+        "agent": "worker",
+        "request_id": None,
+        "pid": 11,
+        "start": _ps_iso(200000),
+        "source": "launch_child_provenance",
+        "captured_at_epoch": NOW - 10,
+        "last_fresh_attribution_epoch": NOW - 10,
+        "seed_descendants": False,
+        "source_launcher_pid": 10,
+        "source_launcher_start": _ps_iso(100000),
+        "source_launcher_nonce": SUPERVISOR_NONCE,
+    }
+    duplicated_descendant = _proc(11, 1, "codex.exe", "codex exec --json", _ps_iso(200000))
+    snap = [
+        _proc(10, 1, "codex.exe", "codex exec", _ps_iso(100000)),
+        duplicated_descendant,
+        dict(duplicated_descendant),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(
+            launcher_pid=10,
+            launcher_start=_ps_iso(100000),
+            managed_pids=[json.loads(json.dumps(prior))],
+        ),
+        _OWNERSHIP_ATTR_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    kill_target_pids = {t["pid"] for t in p["kill_targets"]}
+    assert 11 in kill_target_pids  # the ambiguous descendant, killed alongside the launcher
+
+    # Separately: a ROUTINE poll (fresh heartbeat, no restart decision) must
+    # not lose this descendant's provenance either - a manual-restart poll
+    # legitimately starts managed_pids fresh on relaunch, so it cannot
+    # isolate the persistence half of this fix on its own.
+    p_routine = sup.plan_actions(
+        _ownership_report(stale=False),
+        _ownership_state(
+            launcher_pid=10,
+            launcher_start=_ps_iso(100000),
+            managed_pids=[json.loads(json.dumps(prior))],
+        ),
+        _OWNERSHIP_ATTR_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    managed_pids_after = {m["pid"] for m in p_routine["next_state"]["managed_pids"]}
+    assert 11 in managed_pids_after  # provenance survives the glitched poll
+
+
 def test_process_ownership_stale_launcher_prior_does_not_rescue_row_without_nonce() -> None:
     prior = {
         "attribution_model": "process_ownership_v1",

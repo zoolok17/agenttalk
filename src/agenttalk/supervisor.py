@@ -4403,19 +4403,18 @@ def _attribution(
             "discovered_brain": False,
         }
 
-    # Task #150 round 7 connector finding survey: an excluded launcher pid
-    # reads as absent here exactly like everywhere else _snap_index is
-    # consumed, but the ONLY effect is _is_confirmed_launcher returning
-    # False - this agent's launcher is left out of kill_targets/seed_pids
-    # for THIS poll. Failing to confirm an ambiguous identity for kill-
-    # targeting is already this file's stated default (an ambiguous
-    # identity "grants no kill authority" - see _owned_process_tree's own
-    # recycled-parent handling); it never asserts the agent is dead, and
-    # nothing downstream of _attribution's return treats an unconfirmed
-    # launcher as death. Genuinely indifferent - kept on _snap_index_and_
-    # excluded only so the bare, silently-lossy _snap_index wrapper can be
-    # retired now that every consumer has been surveyed.
-    idx, _excluded_pids = _snap_index_and_excluded(snapshot)
+    # Task #150 round 7 connector finding survey (revised round 8): an
+    # excluded LAUNCHER pid reads as absent here exactly like everywhere
+    # else _snap_index is consumed, but the only effect on the launcher
+    # itself is _is_confirmed_launcher returning False - failing to
+    # confirm an ambiguous identity for kill-targeting is already this
+    # file's stated default. That classification was correct for the
+    # launcher specifically but was wrongly generalized to the whole
+    # function: round 8 found the SAME idx.get miss, applied to a
+    # PRIOR-TRACKED descendant a few lines below instead of the launcher,
+    # silently drops both its kill target and its persisted provenance -
+    # see the two fixes below. excluded_pids is no longer discarded.
+    idx, excluded_pids = _snap_index_and_excluded(snapshot)
     kids = _children_map(idx)
     targets_by_pid: dict[int, dict] = {}
     seed_pids: set[int] = set()
@@ -4486,9 +4485,25 @@ def _attribution(
     for entry in valid_priors:
         if entry.get("pid") == launcher_pid:
             continue
-        row = idx.get(entry.get("pid"))
+        entry_pid = entry.get("pid")
+        row = idx.get(entry_pid)
         if not isinstance(row, dict) or _start_of(row) != entry.get("start"):
-            continue
+            # Task #150 round 8 connector finding: idx.get(pid) is None
+            # both for a genuinely absent prior identity AND one
+            # _snap_index excluded this poll (a duplicate/ambiguous row) -
+            # dropping BOTH here the same way loses a live, still-tracked
+            # descendant's kill target on a poll that goes on to kill the
+            # launcher and relaunch, leaving that descendant alive
+            # alongside the replacement. An excluded pid is present, not
+            # gone - trust the prior record's own pid/start (the only
+            # identity this attribution model ever carried for it) as a
+            # synthetic row; Stop-Tree's own start-time guard is what
+            # actually decides whether to kill it, same as any other
+            # target here.
+            if isinstance(entry_pid, int) and entry_pid in excluded_pids:
+                row = {"pid": entry_pid, "start_time": entry.get("start")}
+            else:
+                continue
         if entry["pid"] in targets_by_pid:
             continue
         reason = str(entry.get("source") or "provenanced_prior")
@@ -4575,6 +4590,16 @@ def _attribution(
             continue
         row = idx.get(entry["pid"])
         if isinstance(row, dict) and _start_of(row) == entry["start"]:
+            managed_by_pid[entry["pid"]] = entry
+        elif entry["pid"] in excluded_pids:
+            # Task #150 round 8 connector finding: idx.get(pid) is None
+            # both for a genuinely absent prior identity AND one
+            # _snap_index excluded this poll - dropping this entry from
+            # managed_by_pid here is what actually persists the loss: the
+            # NEXT poll's valid_priors would no longer carry this
+            # identity at all, even once the ambiguity clears. Keep it
+            # unchanged as ambiguous HOLD evidence rather than silently
+            # forgetting a still-tracked descendant.
             managed_by_pid[entry["pid"]] = entry
 
     for legacy in legacy_priors:
