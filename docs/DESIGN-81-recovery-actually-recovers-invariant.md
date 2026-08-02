@@ -317,8 +317,9 @@ cardinalities are not admitted.
 Broker observation is insufficient if the SUT can bypass the broker.
 `ExternalNativeEffectFenceV1` must make the named adapter the exhaustive native-
 effect capability and independently reconcile every target state transition
-with a broker receipt. The first Windows design uses a harness-owned restricted
-test token/job: the SUT lacks target termination handles and permissions, the
+with a broker receipt. The initially proposed Windows shape would use a harness-
+owned restricted test token/job: the SUT lacks target termination handles and
+permissions, the
 broker alone retains the permitted handle, the harness owns console and input
 signals, and the deterministic target cannot self-exit inside the bound. The
 harness observes exact target identity, exit transition, code, and sequence.
@@ -329,6 +330,16 @@ cannot prove exhaustiveness on the CI host, the entry is `UNAVAILABLE`.
 
 Until the process trace, actuator adapter, native-effect fence, and negative
 fixture all exist, #112 remains blocked and the registry remains empty.
+
+`ExternalNativeEffectFenceV1` is the single unbounded dependency for the first
+enabled entry. It is not currently feasible alongside an exact, unmodified
+historical parent: `_ProcStream` creates the child with `subprocess.Popen` and
+retains a termination-capable Windows process handle, existing paths call
+`terminate()` or `kill()`, and the watchdog calls `os.kill(SIGTERM)`; a later
+DACL or restricted-token step cannot revoke the retained handle. This note does
+not select a resolution. The registry remains `UNAVAILABLE` until an operator-
+scoped feasibility spike selects and proves a boundary compatible with the
+historical-parent requirement.
 
 ## Global semantic multiplicity
 
@@ -577,7 +588,7 @@ zero enabled entries, no issue is claimed as caught today.
 
 | Issue | Local establishment | Revision-2 gate today | Honest future disposition |
 | --- | --- | --- | --- |
-| #112 — watchdog kill wedges its wrapper | **ESTABLISHED.** Reviewer execution against the pre-fix parent passed the three existing regression tests that reproduce the known contract, but those tests mock process/effect boundaries. | **NO — UNAVAILABLE.** | First candidate. It may become `WATCHDOG_HELD_PIPE_RECOVERY_V1` only after real inherited-writer subprocess, external process/effect attribution, raw journal, bounds, and historical-parent evidence exist. The historical parent must fail the exact challenge conjunct. |
+| #112 — watchdog kill wedges its wrapper | **ESTABLISHED as an injected-boundary regression, not as historical-parent evidence.** Reviewer-1 ran the three existing tests against the current `2f95def` workspace (3/3); they emulate the historical failure through injected process/effect boundaries. No historical-parent gate run has been executed. | **NO — UNAVAILABLE.** | First candidate. It may become `WATCHDOG_HELD_PIPE_RECOVERY_V1` only after real inherited-writer subprocess, external process/effect attribution, raw journal, bounds, and historical-parent evidence exist. The historical parent must fail the exact challenge conjunct. |
 | #156 — invalid owned tree is not re-walked while a wrapper stays healthy | **ESTABLISHED** for the live-wrapper predicate. | **NO — UNAVAILABLE.** | A later row needs independent raw set-cover, the null-FILETIME exclusion, and an attributed downstream authority action. The production `complete` field is not evidence. |
 | #158 — successor adoption of a surviving wrapper | **CANNOT-ESTABLISH.** No independent local task, test, logbook, or commit evidence establishes the reported incident or internal cause. | **NO.** | Do not create a registry entry from the current record. First obtain an independently reproducible incident and exact restart/adoption oracle. |
 | #116 — confirmed-absent wrapper waits for heartbeat staleness | Locally described recovery candidate; no closed attributed relaunch fixture is bound here. | **NO — UNAVAILABLE.** | Requires a real absence proof, externally attributed replacement generation, attributed challenge, and measured absence-policy bound. |
@@ -825,9 +836,8 @@ enabled, reviewers must settle:
    identity to terminal bytes and publication sequence;
 4. how the native watchdog boundary exposes an externally verifiable closed
    actuator-path ID without substituting a test controller;
-5. the exact restricted-token/job/handle policy that makes
-   `ExternalNativeEffectFenceV1` exhaustive without changing the watchdog's
-   production control flow;
+5. the feasibility-spike result that selects and proves an exhaustive native-
+   effect boundary compatible with exact historical-parent execution;
 6. the exact notification-to-broker reconciliation rules and buffer sizing for
    `WindowsIsolatedStoreChangeJournalV1`;
 7. measured poll and wall bounds for the real inherited-writer fixture; and
