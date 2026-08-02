@@ -143,7 +143,7 @@ _COORDINATION_BARRIER_FIELDS = frozenset({
     "last_observed_epoch",
     "consecutive_blocked_polls",
 })
-_OWNED_PROCESS_TREE_SCHEMA = 3
+_OWNED_PROCESS_TREE_SCHEMA = 2
 _OWNED_PROCESS_TREE_MODEL = "owned_process_tree_v2"
 _OWNED_PROCESS_TREE_LIMIT = 64
 _LEGACY_PROCESS_EVIDENCE_SCHEMA = 1
@@ -181,6 +181,23 @@ _SAFE_WRAPPER_GENERATION_RE = re.compile(
 # with omitted_count == 0 and at least one entry) means this record is a
 # complete, trustworthy description of everything the walk found - the bar
 # _unverified_owned_process_tree's re-derivation now actually checks.
+#
+# Round 3 connector finding (blocker, on the finding above): a bare
+# schema_version bump made every pre-existing v2 record fail validation
+# SOLELY on the new field's absence, and a live wrapper then rebuilds that
+# now-"invalid" prior into process_tree_invalid_prior_record_invalid on
+# EVERY poll from then on via the very seed this PR added - reintroducing
+# the sticky fleet-wide HOLD this PR exists to remove, at the moment of
+# upgrade, for agents that were never anything but healthy. A v2 record
+# is READABLE; what it lacks is one fact, not its validity. rejected_count
+# is therefore OPTIONAL in the persisted field set: a record missing it is
+# still valid authority (kept as before-this-PR, unrestricted by rejection
+# accounting), but _unverified_owned_process_tree treats a missing count as
+# UNKNOWN, not zero - unknown must never grant the new eligibility a v2
+# record never earned. schema_version is deliberately NOT bumped: the
+# field's own optionality is the migration, so there is nothing for a
+# version bump to gate that isn't already handled without one.
+_OWNED_PROCESS_TREE_OPTIONAL_FIELDS = frozenset({"rejected_count"})
 _OWNED_PROCESS_TREE_FIELDS = frozenset({
     "schema_version",
     "attribution_model",
@@ -2025,13 +2042,34 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
 # process by a guessed name (codex discipline note 3).
 
 def _snap_index(snapshot: list[dict] | None) -> dict[int, dict]:
+    # Task #150 connector finding 1: last-write-wins on a duplicate pid
+    # silently picks ONE of two rows - if the winner happens to be a
+    # malformed/unrelated row while the loser was a genuinely live child,
+    # every later idx.get(that_pid) call sees the wrong identity with no
+    # signal anything was lost, and _snapshot_pid_integrity_error's own
+    # "duplicate_pid" detection (a separate, whole-snapshot-level check)
+    # never told THIS specific lookup that its answer is unreliable.
+    # Excluding a duplicated pid entirely - rather than guessing which row
+    # to keep - makes it "not found" for every caller, which is exactly
+    # the shape the existing missing_child_row/add_node rejection sites
+    # already handle correctly; no caller needs new logic to benefit.
     idx: dict[int, dict] = {}
+    seen: set[int] = set()
+    excluded: set[int] = set()
     for row in snapshot or []:
         if not isinstance(row, dict):
             continue
         pid = row.get("pid")
-        if isinstance(pid, int):
-            idx[pid] = row
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        if pid in excluded:
+            continue
+        if pid in seen:
+            excluded.add(pid)
+            idx.pop(pid, None)
+            continue
+        seen.add(pid)
+        idx[pid] = row
     return idx
 
 
@@ -2369,7 +2407,16 @@ def _valid_owned_process_tree(
     duplicate identities, and a changed wrapper generation/nonce all invalidate
     carry-forward rather than silently widening authority.
     """
-    if not isinstance(value, dict) or frozenset(value) != _OWNED_PROCESS_TREE_FIELDS:
+    if not isinstance(value, dict):
+        return None
+    value_keys = frozenset(value)
+    # A v2 record (predates rejected_count) is missing exactly one optional
+    # key - still a complete, valid schema for everything it DOES claim; see
+    # _OWNED_PROCESS_TREE_OPTIONAL_FIELDS' own comment for why that must not
+    # collapse to schema-invalid.
+    if value_keys != _OWNED_PROCESS_TREE_FIELDS and value_keys != (
+        _OWNED_PROCESS_TREE_FIELDS - _OWNED_PROCESS_TREE_OPTIONAL_FIELDS
+    ):
         return None
     status = value.get("status")
     record_generation = value.get("wrapper_generation")
@@ -2416,12 +2463,41 @@ def _valid_owned_process_tree(
     ):
         return None
     counts: list[int] = []
-    for field in ("observed_count", "recorded_count", "omitted_count", "rejected_count"):
+    for field in ("observed_count", "recorded_count", "omitted_count"):
         count = value.get(field)
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             return None
         counts.append(count)
-    observed_count, recorded_count, omitted_count, _rejected_count = counts
+    observed_count, recorded_count, omitted_count = counts
+    # rejected_count is the one OPTIONAL field (see _OWNED_PROCESS_TREE_
+    # OPTIONAL_FIELDS) - absent on a v2 record means UNKNOWN, not zero, so
+    # this stores None rather than defaulting it, and every reader (the
+    # eligibility check, the status/count cross-check below) must treat
+    # None as "cannot be trusted", never as "0 rejections".
+    if "rejected_count" in value:
+        rejected_count = value.get("rejected_count")
+        if (
+            not isinstance(rejected_count, int)
+            or isinstance(rejected_count, bool)
+            or rejected_count < 0
+        ):
+            return None
+    else:
+        rejected_count = None
+    # Round 3 connector finding 4: complete/absent are the two statuses
+    # that grant future launch/teardown authority - a record claiming one
+    # of them while also recording a nonzero rejection is internally
+    # contradictory (a rejection means the walk excluded a candidate it
+    # could not vouch for, which is precisely what "complete" and
+    # "absent" both promise did not happen). A corrupted or partially-
+    # written record must not read as authoritative just because the
+    # count field itself still parses.
+    if (
+        status in {"complete", "absent"}
+        and rejected_count is not None
+        and rejected_count != 0
+    ):
+        return None
     entries = value.get("entries")
     if (
         not isinstance(entries, list)
@@ -2981,9 +3057,19 @@ def _owned_process_tree(
             # Any retained Windows row therefore needs the exact kernel
             # FILETIME; childless absent launchers are omitted before reaching
             # add_node rather than persisted as future ownership authority.
-            invalid_reason = (
-                invalid_reason or "exact_start_filetime_unavailable"
-            )
+            #
+            # Task #150 connector finding 3: this used to flag invalid_reason
+            # but still ADMIT the node - yet _valid_owned_process_tree
+            # independently REFUSES an ISO-style entry missing start_filetime
+            # for status complete/absent. A tree carrying this exact entry
+            # could reach "absent" under round 2's own eligibility check
+            # (rejected_count stayed 0 for this case) and then fail its own
+            # schema validation the moment anything re-read it - admitted
+            # and refused, disagreeing with each other. mark_rejected makes
+            # both sides agree: an entry this imprecise never contributes to
+            # a rejected_count of 0, so it can never reach a status the
+            # validator would then refuse.
+            mark_rejected("exact_start_filetime_unavailable")
         existing = owned.get(pid)
         if existing is not None:
             if (
@@ -3268,6 +3354,65 @@ def _owned_process_tree(
             mark_rejected("brain_outside_owned_tree")
         elif owned[brain_pid]["role"] == "tool_descendant":
             owned[brain_pid]["role"] = "cli_brain"
+
+    # Task #150 connector findings 1, 3, 5 (round 3): three MORE sites lose
+    # a candidate without incrementing rejected_count, found by review after
+    # round 2 hand-enumerated sixteen invalid_reason sites and missed these
+    # - two of which are not invalid_reason sites at all. Hand enumeration
+    # is the wrong instrument for a universal claim; replace it with
+    # construction. Compute every DESCENDANT (not the roots themselves - a
+    # root simply being absent/exited is normal and already handled at its
+    # own site, e.g. a childless absent launcher, or a prior descendant that
+    # simply exited) of a known root - the wrapper, the declared launcher,
+    # the discovered brain, and every PRIOR entry, whether or not
+    # prior_authority ended up trusted - reachable via the CURRENT
+    # snapshot's raw parent-child edges, regardless of whether admission
+    # logic actually walked into it. children.get(pid, ...) still returns a
+    # live child whose OWN row names pid as parent even when pid itself is
+    # absent or was never visited, so an orphaned intermediate's live child
+    # - or a rejected launcher's live child - is still IN this closure. Any
+    # such descendant that never made it into "owned" is unaccounted -
+    # either a case already flagged above (harmless double count;
+    # rejected_count is a gate, not an exact tally) or exactly the silent-
+    # loss class hand enumeration cannot bound. Either way it becomes a
+    # rejection here, mechanically, rather than by finding a fourth site.
+    discovery_roots: set[int] = set()
+    if isinstance(wrapper_pid, int) and not isinstance(wrapper_pid, bool):
+        discovery_roots.add(wrapper_pid)
+    if isinstance(launcher_pid, int) and not isinstance(launcher_pid, bool):
+        discovery_roots.add(launcher_pid)
+    if isinstance(brain_row, dict):
+        _brain_pid = brain_row.get("pid")
+        if isinstance(_brain_pid, int) and not isinstance(_brain_pid, bool):
+            discovery_roots.add(_brain_pid)
+    for _prior_entry in prior_entries:
+        _prior_pid = _prior_entry.get("pid") if isinstance(_prior_entry, dict) else None
+        if isinstance(_prior_pid, int) and not isinstance(_prior_pid, bool):
+            discovery_roots.add(_prior_pid)
+    # A root already PROVEN to be a different, recycled process (exact
+    # identity mismatch, not merely absent) is not a candidate this agent
+    # has any claim to - its current children are a REPLACEMENT process's
+    # own descendants, not ours, and the existing recycled_parent_pids
+    # check a few lines above already treats them as foreign on purpose
+    # (test: test_owned_process_tree_recycled_launcher_ignores_foreign_
+    # children / ..._recycled_virtual_parent_ignores_replacement_child).
+    # Expanding into a recycled root's children here would flag someone
+    # else's process tree as our own unaccounted loss.
+    discovered_descendants: set[int] = set()
+    frontier = [
+        pid
+        for root in discovery_roots
+        if root not in recycled_parent_pids
+        for pid in children.get(root, [])
+    ]
+    while frontier:
+        candidate_pid = frontier.pop()
+        if candidate_pid in discovered_descendants:
+            continue
+        discovered_descendants.add(candidate_pid)
+        frontier.extend(children.get(candidate_pid, []))
+    for _ in sorted(discovered_descendants - set(owned)):
+        mark_rejected("unaccounted_discovery")
 
     observed_count = len(owned)
     mandatory: set[int] = set()
@@ -6588,13 +6733,33 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         # than naming none, so the entryless case gets an honest "no
         # verified one-line fix" message instead of a command that would
         # frustrate the operator a second time.
+        #
+        # Round 3 (connector finding 6, the same wrong direction again): a
+        # REJECTED candidate is precisely what this record's own entries
+        # never named either, same as a truncated record's omitted ones -
+        # but the reset command's own identity list is built from entries
+        # alone, so it has no way to know about a rejected candidate at
+        # all. The flag's own text only mentions omitted identities; a
+        # nonzero rejected_count needs the same warning stated explicitly,
+        # not folded silently into "every process this record could name".
         has_entries = bool(owned_tree.get("entries"))
+        rejected_count = owned_tree.get("rejected_count")
         if has_entries:
+            rejected_clause = (
+                f" This record also excluded {rejected_count} candidate(s) "
+                "the walk could not admit (rejected_count) - the reset "
+                "command's own identity list does not include them, so "
+                "confirming those specifically gone is on you, not the "
+                "command."
+                if isinstance(rejected_count, int) and rejected_count > 0
+                else ""
+            )
             remedy = (
                 "recovery: if every process this record could name is "
                 "confirmed gone - including any omitted by a truncated "
                 "record, which is exactly what --acknowledge-owned-"
-                "processes-stopped attests to - run `agenttalk supervise "
+                "processes-stopped attests to -"
+                f"{rejected_clause} run `agenttalk supervise "
                 "--reset-process-tree-ownership` (see --help for the "
                 "required --acknowledge-* flags); do NOT kill the wrapper "
                 "expecting an automatic relaunch - that is only safe once "

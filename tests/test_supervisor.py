@@ -14888,6 +14888,239 @@ def test_process_tree_truncated_remedy_covers_omitted_identities_too() -> None:
     assert "--acknowledge-owned-processes-stopped" in plan["reason"]
 
 
+def test_v2_record_missing_rejected_count_stays_valid_but_ineligible() -> None:
+    """Task #150 round 3 connector finding 2, the blocker on round 2's own
+    blocker fix: a bare schema_version bump would have made every record
+    persisted before rejected_count existed fail validation SOLELY on the
+    new field's absence - and on the wrapped-liveness path a live,
+    healthy wrapper then rebuilds that now-"invalid" prior into a fresh
+    process_tree_invalid_prior_record_invalid on EVERY poll from then on,
+    reintroducing the sticky fleet-wide HOLD this PR exists to remove, at
+    the moment of upgrade, for agents that were never anything but
+    healthy. rejected_count is therefore OPTIONAL in the persisted schema:
+    a v2-shaped record (missing it entirely) must still validate as
+    authoritative - proving the upgrade itself does not brick a healthy
+    fleet - while remaining ineligible for the NEW absence-promotion
+    eligibility this round grants, because "missing" must mean unknown,
+    never zero."""
+    tree = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-v2-migration",
+    )["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    v2_shaped = dict(tree)
+    del v2_shaped["rejected_count"]
+
+    # (a) still readable/valid authority - the upgrade itself must not
+    # brick a healthy agent's own persisted record.
+    validated = sup._valid_owned_process_tree(  # noqa: SLF001
+        v2_shaped, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    )
+    assert validated is not None
+    assert "rejected_count" not in validated
+
+    # (b) a healthy, ALIVE wrapper polling against this v2-shaped prior
+    # must NOT be forced into PROCESS_TREE_INVALID merely because its own
+    # persisted record predates rejected_count - the exact self-inflicted
+    # regression the bare version bump caused.
+    st = _wrap_ready(runtime_wrapper_generation="wrapper-1")
+    st["owned_process_tree"] = v2_shaped
+    healthy_plan = _plan_wrap(
+        _report(wrapper_runtime=_wrapper_runtime_view(phase="idle", now=NOW)),
+        {"agents": {"worker": st}},
+        snapshot=_wrap_snap(),
+    )
+    assert healthy_plan["state"] != "PROCESS_TREE_INVALID"
+    assert healthy_plan["next_state"]["owned_process_tree"]["status"] == "complete"
+
+    # (c) once invalid for an UNRELATED reason, a v2-shaped prior must not
+    # be promoted to absent just because omitted_count reads 0 - unknown
+    # rejected_count must block eligibility exactly like a real nonzero
+    # count would.
+    poisoned = dict(v2_shaped)
+    poisoned["status"] = "invalid"
+    poisoned["reason_code"] = "process_tree_invalid_snapshot_invalid_process_row"
+    result = sup._unverified_owned_process_tree(  # noqa: SLF001
+        poisoned, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
+    )
+    assert result["status"] == "invalid"
+
+
+def test_validator_refuses_complete_or_absent_with_nonzero_rejected_count() -> None:
+    """Task #150 round 3 connector finding 4: the validator parsed
+    rejected_count but never constrained it against status - a corrupted
+    or partially-updated record claiming complete/absent while also
+    recording a nonzero rejection is internally contradictory (those two
+    statuses both promise nothing was excluded) and must not read as
+    authoritative just because the count field itself still parses."""
+    tree = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-validator-constraint",
+    )["next_state"]["owned_process_tree"]
+    assert tree["status"] == "complete"
+    corrupted = dict(tree)
+    corrupted["rejected_count"] = 1
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        corrupted, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is None
+
+    absent_tree = dict(corrupted)
+    absent_tree["status"] = "absent"
+    absent_tree["reason_code"] = "process_tree_absent"
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        absent_tree, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is None
+
+    # The control: rejected_count == 0 on complete/absent is exactly what
+    # every real construction site already writes, and must keep validating.
+    clean = dict(tree)
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        clean, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is not None
+
+
+def test_snap_index_excludes_rather_than_picks_a_duplicate_pid() -> None:
+    """Task #150 round 3 connector finding 1: last-write-wins on a
+    duplicate pid silently picks ONE of two rows - if a malformed or
+    unrelated row wins over a genuinely live child, every later
+    idx.get(that_pid) call sees the wrong identity with no signal
+    anything was lost. Excluding the duplicated pid entirely makes it
+    "not found" for every caller, which the existing missing_child_row
+    rejection already handles correctly."""
+    good_child = _proc(999, WRAP_LAUNCHER_PID, "node.exe", "node tool.js", _ps_iso(700000))
+    duplicate_bad_row = {**good_child, "parent_pid": None}
+    idx = sup._snap_index([_wrap_snap()[0], good_child, duplicate_bad_row])  # noqa: SLF001
+    assert 999 not in idx
+    assert WRAP_LAUNCHER_PID in idx  # unrelated pids are unaffected
+
+
+def test_owned_process_tree_rejects_walk_when_launcher_missing_exact_filetime() -> None:
+    """Task #150 round 3 connector finding 3: a Windows row lacking exact
+    start_filetime used to be ADMITTED by add_node while
+    _valid_owned_process_tree independently REFUSES that same entry for
+    status complete/absent - the two disagreeing with each other meant a
+    tree carrying this entry could reach "absent" under round 2's own
+    eligibility check and then fail its own schema validation the moment
+    anything re-read it. mark_rejected on this path means such an entry
+    can never contribute to a rejected_count of 0, so it can never reach
+    a status the validator would then refuse."""
+    launcher_no_filetime = {
+        **_proc(WRAP_CHILD_PID, WRAP_LAUNCHER_PID, "codex.exe", "codex exec --json", WRAP_CHILD_START),
+        "start_filetime": None,
+    }
+    snapshot = [_wrap_snap()[0], launcher_no_filetime]
+    plan = _owned_tree_plan(snapshot, request_id="rr-150-imprecise-filetime")
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["rejected_count"] >= 1
+    # The entry is still captured (admitted), just never eligible to reach
+    # a status the validator would then refuse.
+    assert WRAP_CHILD_PID in [e["pid"] for e in tree["entries"]]
+
+
+def test_owned_process_tree_accounts_for_orphaned_intermediates_live_child() -> None:
+    """Task #150 round 3 connector finding 5: a rebuild after a corrupt
+    prior cannot reach an orphan below an already-exited intermediate
+    parent, because the rehydration loop that would normally re-admit a
+    prior descendant as a virtual bridge is gated entirely behind a
+    TRUSTED prior_authority (status == "complete"). An invalid prior that
+    is still READABLE (schema-valid, non-empty entries, just not trusted
+    for rehydration - the generation-adoption-pending exemption is the
+    one invalid reason_code this walk still rebuilds against instead of
+    holding on) never runs that rehydration loop at all, so a live
+    descendant whose ONLY evidence is the untrusted prior's own entries
+    goes completely unaccounted: not admitted, not omitted, not rejected
+    - simply invisible. The discovery-closure reconciliation catches this
+    mechanically because it seeds discovery roots from every prior entry
+    regardless of whether prior_authority ended up trusted, then expands
+    through the CURRENT snapshot's raw parent-child edges - which still
+    names the orphan's live child even though admission logic never
+    walks into it."""
+    orphaned_intermediate_pid = 500
+    live_grandchild_pid = 501
+    first_snapshot = [
+        *_wrap_snap(),
+        _proc(orphaned_intermediate_pid, WRAP_CHILD_PID, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000)),
+        _proc(live_grandchild_pid, orphaned_intermediate_pid, "node.exe", "node build.js", _ps_iso(800000)),
+    ]
+    first = _owned_tree_plan(first_snapshot, request_id="rr-150-orphan-first")
+    complete_tree = first["next_state"]["owned_process_tree"]
+    assert complete_tree["status"] == "complete"
+    assert {e["pid"] for e in complete_tree["entries"]} >= {
+        orphaned_intermediate_pid,
+        live_grandchild_pid,
+    }
+
+    # Recast the same, otherwise-untouched complete tree as an untrusted-
+    # but-readable prior - the one invalid reason_code this walk rebuilds
+    # against rather than holding on - so prior_authority becomes None
+    # while prior_entries (still carrying the orphan and its child) stays
+    # populated. This is deliberately hand-built rather than reached via
+    # a real generation-adoption poll: the mechanism under test is
+    # whether the WALK correctly ignores an untrusted prior's rehydration
+    # authority while still using its entries for discovery, not whether
+    # this exact status/reason_code/entries combination is reachable
+    # through today's callers.
+    untrusted_state = dict(first["next_state"])
+    untrusted_tree = dict(complete_tree)
+    untrusted_tree["status"] = "invalid"
+    untrusted_tree["reason_code"] = "process_tree_invalid_generation_adoption_pending"
+    untrusted_state["owned_process_tree"] = untrusted_tree
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        untrusted_tree, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is not None
+
+    # Second poll: the intermediate has exited (no row at all); its child
+    # remains live, now a true orphan in the CURRENT snapshot - exactly
+    # the shape an untrusted prior's own rehydration can no longer reach.
+    second_snapshot = [
+        *_wrap_snap(),
+        _proc(live_grandchild_pid, orphaned_intermediate_pid, "node.exe", "node build.js", _ps_iso(800000)),
+    ]
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-150-orphan-second"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                now=NOW + 1,
+            ),
+        ),
+        {"agents": {"worker": untrusted_state}},
+        now=NOW + 1,
+        snapshot=second_snapshot,
+    )
+    tree = second["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["rejected_count"] >= 1
+    assert live_grandchild_pid not in [e["pid"] for e in tree["entries"]]
+
+
+def test_reset_remedy_names_rejected_candidates_separately_from_omitted() -> None:
+    """Task #150 round 3 connector finding 6, the same wrong direction as
+    round 2's own finding 2: a rejected candidate is precisely what this
+    record's entries never named at all, same as a truncated record's
+    omitted ones - but the reset command's own identity list is built
+    from entries alone, so it cannot know about a rejected candidate
+    either. The message must say so explicitly rather than folding it
+    silently into "every process this record could name"."""
+    launcher_no_filetime = {
+        **_proc(WRAP_CHILD_PID, WRAP_LAUNCHER_PID, "codex.exe", "codex exec --json", WRAP_CHILD_START),
+        "start_filetime": None,
+    }
+    snapshot = [_wrap_snap()[0], launcher_no_filetime]
+    plan = _owned_tree_plan(snapshot, request_id="rr-150-reset-remedy-rejected")
+    assert plan["state"] == "PROCESS_TREE_INVALID"
+    assert plan["next_state"]["owned_process_tree"]["rejected_count"] >= 1
+    assert "rejected_count" in plan["reason"]
+    assert "does not include them" in plan["reason"]
+    assert "--reset-process-tree-ownership" in plan["reason"]
+
+
 def test_launch_barrier_same_agent_wait_survivor_blocks_replacement() -> None:
     snap = [
         _proc(31, 1, "python.exe",
