@@ -143,7 +143,7 @@ _COORDINATION_BARRIER_FIELDS = frozenset({
     "last_observed_epoch",
     "consecutive_blocked_polls",
 })
-_OWNED_PROCESS_TREE_SCHEMA = 2
+_OWNED_PROCESS_TREE_SCHEMA = 3
 _OWNED_PROCESS_TREE_MODEL = "owned_process_tree_v2"
 _OWNED_PROCESS_TREE_LIMIT = 64
 _LEGACY_PROCESS_EVIDENCE_SCHEMA = 1
@@ -168,6 +168,19 @@ _OWNED_PROCESS_TREE_STATUSES = frozenset({
 _SAFE_WRAPPER_GENERATION_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z"
 )
+# Task #150 connector finding (blocker): observed_count/omitted_count only
+# ever counted ADMITTED nodes vs the size-cap truncation of already-admitted
+# nodes - they say nothing about a candidate branch the walk SAW and
+# explicitly excluded for any other reason (an unproven virtual-parent
+# descendant, a failed strict edge, a missing child row, ...). rejected_count
+# is that missing signal: incremented at every site in _owned_process_tree
+# where a specific candidate is excluded rather than admitted, independently
+# of whatever reason_code text ends up chosen (first-write-wins there would
+# otherwise mask a later rejection once an earlier one - even a whole-
+# snapshot one - had already set it). Only rejected_count == 0 (together
+# with omitted_count == 0 and at least one entry) means this record is a
+# complete, trustworthy description of everything the walk found - the bar
+# _unverified_owned_process_tree's re-derivation now actually checks.
 _OWNED_PROCESS_TREE_FIELDS = frozenset({
     "schema_version",
     "attribution_model",
@@ -179,6 +192,7 @@ _OWNED_PROCESS_TREE_FIELDS = frozenset({
     "observed_count",
     "recorded_count",
     "omitted_count",
+    "rejected_count",
     "truncated",
     "refreshed_at",
     "wrapper_generation",
@@ -2402,12 +2416,12 @@ def _valid_owned_process_tree(
     ):
         return None
     counts: list[int] = []
-    for field in ("observed_count", "recorded_count", "omitted_count"):
+    for field in ("observed_count", "recorded_count", "omitted_count", "rejected_count"):
         count = value.get(field)
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             return None
         counts.append(count)
-    observed_count, recorded_count, omitted_count = counts
+    observed_count, recorded_count, omitted_count, _rejected_count = counts
     entries = value.get("entries")
     if (
         not isinstance(entries, list)
@@ -2530,6 +2544,7 @@ def _invalid_owned_process_tree_record(
         "observed_count": 0,
         "recorded_count": 0,
         "omitted_count": 0,
+        "rejected_count": 0,
         "truncated": False,
         "refreshed_at": _event_now(now_epoch),
         "wrapper_generation": wrapper_generation,
@@ -2750,14 +2765,23 @@ def _unverified_owned_process_tree(
     current snapshot proves every recorded pid/start identity absent or
     replaced. Task #150 connector finding: an INVALID prior is not
     categorically excluded from that same re-derivation - only when its own
-    entries are a COMPLETE description of what was found (omitted_count == 0,
-    at least one entry recorded). Whatever made the tree invalid in the first
-    place (in the production incident, a single UNRELATED row elsewhere in
-    that poll's whole-host snapshot failing _snapshot_pid_integrity_error, not
-    anything about this agent's own identities) says nothing about whether
-    those SPECIFIC recorded identities are still alive - the same evidentiary
-    bar the complete/absent case already trusts. A TRUNCATED prior's entries
-    are incomplete by definition (omitted_count > 0) and never qualifies:
+    entries are a COMPLETE description of what was found. Whatever made the
+    tree invalid in the first place (in the production incident, a single
+    UNRELATED row elsewhere in that poll's whole-host snapshot failing
+    _snapshot_pid_integrity_error, not anything about this agent's own
+    identities) says nothing about whether those SPECIFIC recorded identities
+    are still alive - the same evidentiary bar the complete/absent case
+    already trusts.
+
+    Round 2 (connector blocker): omitted_count alone is NOT that bar - it
+    only counts the size-cap gap between admitted nodes and recorded entries,
+    never a candidate branch the walk SAW and explicitly excluded for any
+    other reason (an unproven virtual-parent descendant with a live child,
+    say). rejected_count (see _OWNED_PROCESS_TREE_FIELDS) is the field that
+    actually means "nothing the walk considered was left unaccounted for" -
+    both it and omitted_count must be zero, with at least one entry recorded,
+    for an invalid prior to qualify. A TRUNCATED prior's entries are
+    incomplete by definition (omitted_count > 0) and never qualifies:
     proving the recorded subset gone says nothing about whatever the size cap
     dropped. A prior with no entries at all (schema-drift/generation-adoption
     placeholders built by _invalid_owned_process_tree_record, never a real
@@ -2772,6 +2796,7 @@ def _unverified_owned_process_tree(
         isinstance(entries, list)
         and bool(entries)
         and prior.get("omitted_count") == 0
+        and prior.get("rejected_count") == 0
     )
     eligible_for_rederivation = prior.get("status") in {"complete", "absent"} or (
         prior.get("status") == "invalid" and entries_are_complete
@@ -2906,6 +2931,22 @@ def _owned_process_tree(
         if prior_record_invalid
         else (f"snapshot_{snapshot_error}" if snapshot_error is not None else None)
     )
+    # Task #150 connector finding (blocker): see _OWNED_PROCESS_TREE_FIELDS'
+    # own comment. mark_rejected is the ONE place a specific candidate branch
+    # gets excluded from this tree - every such site below calls it instead
+    # of setting invalid_reason directly, so rejected_count can never miss
+    # one by construction, the same way add_node is the one place a node
+    # gets admitted. A whole-snapshot/prior-record issue (the two branches
+    # above, seeded before this point) never calls it - that distinction is
+    # exactly what makes the "invalid but re-derivable" case in
+    # _unverified_owned_process_tree safe.
+    rejected_count = 0
+
+    def mark_rejected(reason: str) -> None:
+        nonlocal invalid_reason, rejected_count
+        rejected_count += 1
+        invalid_reason = invalid_reason or reason
+
     role_rank = {
         "tool_descendant": 0,
         "detached_gate_runner": 1,
@@ -2932,7 +2973,7 @@ def _owned_process_tree(
             or not start
             or start_key is None
         ):
-            invalid_reason = invalid_reason or "invalid_process_row"
+            mark_rejected("invalid_process_row")
             return False
         if not _has_exact_start_identity(row):
             # Windows' CIM timestamp is rounded. It can identify graph edges,
@@ -2950,7 +2991,7 @@ def _owned_process_tree(
                 or _filetime_of(existing["row"]) != start_filetime
                 or existing["row"].get("parent_pid") != parent_pid
             ):
-                invalid_reason = invalid_reason or "pid_identity_collision"
+                mark_rejected("pid_identity_collision")
                 return False
             existing["depth"] = min(int(existing["depth"]), depth)
             if role_rank[role] > role_rank[existing["role"]]:
@@ -2984,7 +3025,7 @@ def _owned_process_tree(
                 _start_of(wrapper_row),
             )
         ):
-            invalid_reason = invalid_reason or "prior_wrapper_mismatch"
+            mark_rejected("prior_wrapper_mismatch")
             prior_authority = None
         else:
             live_prior: set[int] = set()
@@ -3008,13 +3049,13 @@ def _owned_process_tree(
                 ):
                     continue
                 if row.get("parent_pid") != entry["parent_pid"]:
-                    invalid_reason = invalid_reason or "prior_parent_drift"
+                    mark_rejected("prior_parent_drift")
                     continue
                 if not _filetime_identity_matches(
                     row,
                     entry.get("start_filetime"),
                 ):
-                    invalid_reason = invalid_reason or "prior_filetime_drift"
+                    mark_rejected("prior_filetime_drift")
                     continue
                 live_prior.add(entry["pid"])
             needed = set(live_prior)
@@ -3098,7 +3139,7 @@ def _owned_process_tree(
                 )
                 and current_launcher.get("parent_pid") != wrapper_pid
             ):
-                invalid_reason = invalid_reason or "launcher_parent_mismatch"
+                mark_rejected("launcher_parent_mismatch")
             launcher_row = {
                 "pid": launcher_pid,
                 "parent_pid": wrapper_pid,
@@ -3121,17 +3162,13 @@ def _owned_process_tree(
                     # authority.
                     launcher_row = None
                 elif current_launcher is not None:
-                    invalid_reason = (
-                        invalid_reason or "exact_start_filetime_unavailable"
-                    )
+                    mark_rejected("exact_start_filetime_unavailable")
                     launcher_row = None
                 elif children.get(launcher_pid):
                     # Windows retains PPID edges after a parent exits. Without
                     # an exact lifetime/prior certificate those children are
                     # ambiguous.
-                    invalid_reason = (
-                        invalid_reason or "unproven_virtual_parent_descendant"
-                    )
+                    mark_rejected("unproven_virtual_parent_descendant")
                     launcher_row = None
                 else:
                     # A childless, absent launcher cannot be killed and its
@@ -3139,11 +3176,11 @@ def _owned_process_tree(
                     # ownership authority.
                     launcher_row = None
         if launcher_pid == wrapper_pid:
-            invalid_reason = invalid_reason or "launcher_equals_wrapper"
+            mark_rejected("launcher_equals_wrapper")
         elif launcher_row is not None:
             edge_reason = _strict_owned_child_edge(wrapper_row, launcher_row)
             if edge_reason is not None:
-                invalid_reason = invalid_reason or edge_reason
+                mark_rejected(edge_reason)
             add_node(
                 launcher_row,
                 role="cli_launcher",
@@ -3162,7 +3199,7 @@ def _owned_process_tree(
         for child_pid in sorted(children.get(parent_pid, [])):
             child = idx.get(child_pid)
             if not isinstance(child, dict):
-                invalid_reason = invalid_reason or "missing_child_row"
+                mark_rejected("missing_child_row")
                 continue
             if not parent["live"]:
                 prior_parent = prior_by_pid.get(parent_pid)
@@ -3205,14 +3242,11 @@ def _owned_process_tree(
                     # or by the exited launcher's exact lifetime bounds.
                     continue
                 if not certified_launcher_child and not prior_owned_child:
-                    invalid_reason = (
-                        invalid_reason
-                        or "unproven_virtual_parent_descendant"
-                    )
+                    mark_rejected("unproven_virtual_parent_descendant")
                     continue
             edge_reason = _strict_owned_child_edge(parent_row, child)
             if edge_reason is not None:
-                invalid_reason = invalid_reason or edge_reason
+                mark_rejected(edge_reason)
                 continue
             role = (
                 "cli_brain"
@@ -3231,7 +3265,7 @@ def _owned_process_tree(
     if isinstance(brain_row, dict):
         brain_pid = brain_row.get("pid")
         if brain_pid not in owned:
-            invalid_reason = invalid_reason or "brain_outside_owned_tree"
+            mark_rejected("brain_outside_owned_tree")
         elif owned[brain_pid]["role"] == "tool_descendant":
             owned[brain_pid]["role"] = "cli_brain"
 
@@ -3257,7 +3291,7 @@ def _owned_process_tree(
     )
     if len(selected) > _OWNED_PROCESS_TREE_LIMIT:
         # A mandatory identity plus its ancestor closure must never be sliced.
-        invalid_reason = invalid_reason or "mandatory_tree_exceeds_limit"
+        mark_rejected("mandatory_tree_exceeds_limit")
         selected = set(parent_first[:_OWNED_PROCESS_TREE_LIMIT])
     else:
         for pid in parent_first:
@@ -3317,6 +3351,7 @@ def _owned_process_tree(
         "observed_count": observed_count,
         "recorded_count": len(entries),
         "omitted_count": omitted_count,
+        "rejected_count": rejected_count,
         "truncated": bool(omitted_count),
         "refreshed_at": refreshed_at,
         "wrapper_generation": wrapper_generation,
@@ -5148,13 +5183,16 @@ def _wrapped_liveness(
             now_epoch=now_epoch,
             reason_code=hold_reason,
         )
-        if (
-            isinstance(prior_for_check, dict)
-            and prior_for_check.get("status") in {"complete", "absent"}
-            and isinstance(tree, dict)
-            and tree.get("status") == "absent"
-            and snapshot is not None
-        ):
+        # Task #150 connector finding 4: this used to re-check
+        # prior_for_check.get("status") against {"complete", "absent"} -
+        # duplicating _unverified_owned_process_tree's OWN eligibility gate
+        # with a copy that drifted the moment that gate widened to admit an
+        # invalid-but-complete prior too. tree.get("status") == "absent" is
+        # already the complete, self-contained signal: it is the ONLY value
+        # _unverified_owned_process_tree ever returns for "absent", and it
+        # already re-checked eligibility internally - a second, independent
+        # copy of that check here can only go stale, not add safety.
+        if isinstance(tree, dict) and tree.get("status") == "absent" and snapshot is not None:
             base["owned_process_tree_refreshed"] = True
         adopted_tree_missing = bool(
             prior_for_check is None
@@ -6532,14 +6570,45 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         # moment it is independently confirmed absent (see
         # _unverified_owned_process_tree); a wrapper that is still present,
         # or whose absence this record cannot yet prove on its own, needs
-        # the attended reset named below.
-        remedy = (
-            "recovery: if every process this record names is confirmed gone, "
-            "run `agenttalk supervise --reset-process-tree-ownership` (see "
-            "--help for the required --acknowledge-* flags); do NOT kill the "
-            "wrapper expecting an automatic relaunch - that is only safe once "
-            "this record already reflects the wrapper as absent"
-        )
+        # the attended reset.
+        #
+        # Round 2 (connector findings 2 and 3): the FIRST version of this
+        # remedy named --reset-process-tree-ownership unconditionally and
+        # was wrong twice over. (a) --acknowledge-owned-processes-stopped's
+        # own contract already covers "any identities omitted by a
+        # truncated record" - the message must not narrow that to only the
+        # NAMED ones. (b) --reset-process-tree-ownership requires the tree
+        # evidence to carry a real wrapper_generation/launch_nonce that
+        # agrees with a CURRENT, valid runtime record - true for a tree
+        # _owned_process_tree itself walked (non-empty entries), but an
+        # entryless placeholder (_invalid_owned_process_tree_record - schema
+        # drift, a revoked runtime, legacy migration evidence) usually has
+        # no such nonce to agree with, so the command fails for precisely
+        # the case that names it. Naming a remedy that cannot work is worse
+        # than naming none, so the entryless case gets an honest "no
+        # verified one-line fix" message instead of a command that would
+        # frustrate the operator a second time.
+        has_entries = bool(owned_tree.get("entries"))
+        if has_entries:
+            remedy = (
+                "recovery: if every process this record could name is "
+                "confirmed gone - including any omitted by a truncated "
+                "record, which is exactly what --acknowledge-owned-"
+                "processes-stopped attests to - run `agenttalk supervise "
+                "--reset-process-tree-ownership` (see --help for the "
+                "required --acknowledge-* flags); do NOT kill the wrapper "
+                "expecting an automatic relaunch - that is only safe once "
+                "this record already reflects the wrapper as absent"
+            )
+        else:
+            remedy = (
+                "recovery: this record has no observed process identities "
+                "to reset against, so --reset-process-tree-ownership will "
+                "refuse it; a new wrapper generation replaces this record "
+                "automatically once adopted - if it does not clear on its "
+                "own, this needs operator investigation of "
+                f"{owned_tree.get('reason_code')}, not a scripted remedy"
+            )
         if tree_status == "truncated":
             tree_state = "PROCESS_TREE_TRUNCATED"
             tree_reason = (

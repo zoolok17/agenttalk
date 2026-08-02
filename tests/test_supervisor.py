@@ -14697,6 +14697,197 @@ def test_plan_actions_confirmed_absent_wrapper_recovers_despite_unrelated_snapsh
     assert barrier["blocked"] is False
 
 
+def test_owned_process_tree_rejected_child_blocks_absence_promotion_blocker() -> None:
+    """Task #150 connector finding 1, the BLOCKER: omitted_count only ever
+    counted the gap between ADMITTED nodes and the size-cap truncation of
+    already-admitted nodes - never a candidate branch the walk SAW and
+    explicitly excluded for an unrelated reason. Reproduces the exact
+    duplicate-wrapper hazard: the CLI launcher has exited (absent from the
+    snapshot), carries no exact lifetime certificate, and left a LIVE
+    child behind. The launcher is excluded as an unproven virtual-parent
+    descendant - so its child is never even reached by the walk - while
+    omitted_count stays 0 (only the wrapper was ever admitted, so there is
+    no size-cap gap to report). Without rejected_count, this record would
+    satisfy the round-1 eligibility bar and promote to absent the moment
+    the wrapper also exits, even though the launcher's child is still
+    alive and would then get orphaned by a replacement wrapper launching
+    alongside it."""
+    exited_launcher_pid = WRAP_CHILD_PID  # the CLI launcher, per _owned_process_tree's terms
+    live_grandchild_pid = 999
+    snapshot = [
+        _wrap_snap()[0],  # the wrapper - alive
+        # exited_launcher_pid itself is deliberately ABSENT from the snapshot.
+        _proc(
+            live_grandchild_pid, exited_launcher_pid, "node.exe", "node tool.js",
+            _ps_iso(700000),
+        ),
+    ]
+    plan = _owned_tree_plan(
+        snapshot,
+        request_id="rr-150-blocker-rejected-child",
+        # No cli_launcher_lifetime override - no exact lifetime certificate,
+        # exactly the finding's precondition.
+    )
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["reason_code"] == (
+        "process_tree_invalid_unproven_virtual_parent_descendant"
+    )
+    assert [entry["pid"] for entry in tree["entries"]] == [WRAP_LAUNCHER_PID]
+    assert tree["omitted_count"] == 0, (
+        "the exact hazard: the size-cap counter alone looks like a complete "
+        "record even though a live child was excluded"
+    )
+    assert tree["rejected_count"] >= 1, (
+        "the fix: a candidate the walk saw and excluded must be counted "
+        "even when omitted_count cannot see it"
+    )
+
+    # The blocker, made concrete: if the wrapper ALSO now disappears, this
+    # record must NOT promote to absent - the live grandchild is still
+    # unaccounted for.
+    result = sup._unverified_owned_process_tree(  # noqa: SLF001
+        tree, [], now_epoch=NOW + 1, reason_code="process_tree_invalid_test",
+    )
+    assert result["status"] == "invalid", (
+        "a rejected branch must keep this record sticky - promoting it here "
+        "is the duplicate-wrapper hazard arriving through the round-1 fix"
+    )
+
+
+def test_wrapped_liveness_sets_refreshed_flag_when_invalid_promotes_to_absent() -> None:
+    """Task #150 connector finding 4: _current_proof_failed used to set
+    owned_process_tree_refreshed only when the PRIOR status was already
+    {complete, absent} - a stale duplicate of _unverified_owned_process_
+    tree's own eligibility gate that drifted the moment that gate widened
+    to admit an invalid-but-complete prior too. A promoted-invalid record
+    (tree.status becomes "absent") must set this flag exactly like a
+    promoted-complete one does - it is the same call, the same real
+    _wrapped_liveness (shared by configured AND ephemeral agents), driven
+    through the identical poisoned-poll-then-absent-poll sequence as the
+    end-to-end test above, but reading the intermediate liveness dict
+    directly rather than the final plan."""
+    poisoning_row = {
+        "pid": 4, "parent_pid": None, "name": "System",
+        "command_line": None,
+        "start_time": "2026-01-01T00:00:00.0000000+00:00",
+        "start_filetime": None,
+    }
+    st = _wrap_ready(runtime_wrapper_generation="wrapper-1")
+    cfg_agent = _WRAP_CONFIG["agents"]["worker"]
+    liveness1 = sup._wrapped_liveness(  # noqa: SLF001
+        [_wrap_snap()[0], poisoning_row],
+        st, cfg_agent, "worker", NOW,
+        _wrapper_runtime_view(phase="idle", now=NOW),
+        root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+    )
+    assert liveness1["owned_process_tree"]["status"] == "invalid"
+
+    st_after_poll1 = {**st, "owned_process_tree": liveness1["owned_process_tree"]}
+    later = NOW + 600
+    liveness2 = sup._wrapped_liveness(  # noqa: SLF001
+        [],
+        st_after_poll1, cfg_agent, "worker", later,
+        _wrapper_runtime_view(phase="idle", now=later, updated_age=600),
+        root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+    )
+    assert liveness2["owned_process_tree"]["status"] == "absent"
+    assert liveness2["owned_process_tree_refreshed"] is True, (
+        "an ephemeral reviewer reads exactly this flag to decide "
+        "teardown_ready - unset here means held rather than archived, "
+        "indefinitely, under supervise --once"
+    )
+
+
+def test_ephemeral_teardown_ready_when_wrapped_liveness_reports_refreshed_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of finding 4, isolating _ephemeral_owned_process_view's
+    OWN consumption of the flag (unchanged by this fix) via the same
+    fake-_wrapped_liveness pattern the existing module_args_from
+    reconstruction test uses - so a regression in either the producer
+    (_wrapped_liveness, tested above) or this consumer is caught
+    independently."""
+    def _fake_wrapped_liveness(snapshot, entry, cfg_agent, agent, now_epoch,
+                               runtime_view, *, root_key):
+        return {
+            "kill_targets": [],
+            "owned_process_tree": {"status": "absent", "reason_code": "process_tree_absent"},
+            "owned_process_tree_refreshed": True,
+            "child_reason": "test_absent",
+        }
+
+    monkeypatch.setattr(sup, "_wrapped_liveness", _fake_wrapped_liveness)
+    entry = {
+        "request_id": "R1", "agent": "adversary-1", "cli": "codex",
+        "launch": {},
+    }
+    _next_entry, _liveness, teardown_ready = sup._ephemeral_owned_process_view(  # noqa: SLF001
+        [], entry, {}, NOW, root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+    )
+    assert teardown_ready is True
+
+
+def test_process_tree_hold_message_names_no_remedy_for_entryless_placeholder() -> None:
+    """Task #150 connector finding 3: --reset-process-tree-ownership requires
+    the tree evidence to carry a wrapper_generation/launch_nonce that agrees
+    with a CURRENT, valid runtime record - true for a tree
+    _owned_process_tree itself walked, but an entryless placeholder
+    (_invalid_owned_process_tree_record - schema drift, a revoked runtime,
+    legacy migration evidence) has no such nonce to agree with, so the
+    command fails for precisely the case that names it. The HOLD message
+    for an entryless record must say so rather than naming a command that
+    cannot work."""
+    st = _wrap_ready(runtime_wrapper_generation="wrapper-1")
+    # A schema-drifted persisted record - _valid_owned_process_tree returns
+    # None for it. Reaching the EMPTY-entries placeholder specifically
+    # requires a FAILED wrapper-liveness check (here: the wrapper is fully
+    # absent) - a HEALTHY wrapper reaches _owned_process_tree's own fresh
+    # walk instead, which still populates real entries even with the same
+    # malformed prior (a different mechanism, same reason_code text - not
+    # this finding).
+    st["owned_process_tree"] = {"not": "the expected schema at all"}
+    plan = _plan_wrap(
+        _report(
+            heartbeat_stale=True,
+            wrapper_runtime=_wrapper_runtime_view(phase="idle", now=NOW),
+        ),
+        {"agents": {"worker": st}},
+        snapshot=[],
+    )
+    assert plan["state"] == "PROCESS_TREE_INVALID"
+    assert plan["next_state"]["owned_process_tree"]["reason_code"] == (
+        "process_tree_invalid_prior_record_invalid"
+    )
+    assert not plan["next_state"]["owned_process_tree"]["entries"]
+    # It may NAME the command to explain why it will not help, but must
+    # never tell the operator to run it - that is the exact "worse than
+    # naming none" failure mode finding 3 identified.
+    assert "run `agenttalk supervise --reset-process-tree-ownership`" not in plan["reason"]
+    assert "will refuse it" in plan["reason"]
+    assert "not a scripted remedy" in plan["reason"]
+    assert "process_tree_invalid_prior_record_invalid" in plan["reason"]
+
+
+def test_process_tree_truncated_remedy_covers_omitted_identities_too() -> None:
+    """Task #150 connector finding 2: the truncated-tree remedy must not
+    read as "confirm only the NAMED processes are gone" -
+    --acknowledge-owned-processes-stopped's own contract explicitly covers
+    "any identities omitted by a truncated record", and the message must
+    say so rather than narrowing the precondition to what the record
+    happens to name."""
+    limit = sup._OWNED_PROCESS_TREE_LIMIT  # noqa: SLF001
+    snapshot = [_wrap_snap()[0]] + [
+        _proc(400 + i, WRAP_LAUNCHER_PID, "node.exe", "node tool.js", _ps_iso(700000 + i))
+        for i in range(limit)
+    ]
+    plan = _owned_tree_plan(snapshot, request_id="rr-150-truncated-remedy")
+    assert plan["state"] == "PROCESS_TREE_TRUNCATED"
+    assert plan["next_state"]["owned_process_tree"]["omitted_count"] > 0
+    assert "omitted by a truncated record" in plan["reason"]
+    assert "--acknowledge-owned-processes-stopped" in plan["reason"]
+
+
 def test_launch_barrier_same_agent_wait_survivor_blocks_replacement() -> None:
     snap = [
         _proc(31, 1, "python.exe",
