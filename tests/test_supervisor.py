@@ -9972,6 +9972,44 @@ def test_wrapped_missing_runtime_is_unknown_with_rollout_remediation() -> None:
     )
 
 
+def test_reset_remedy_does_not_name_command_when_runtime_currently_invalid() -> None:
+    """Task #150 round 9 connector finding, the third instance of the same
+    wrong direction: --reset-process-tree-ownership (cli.py) requires the
+    CURRENT wrapper runtime record to read STATUS_VALID before it will
+    act on a configured agent, entirely independent of the tree's own
+    entries/rejected_count - round 2 and round 3 each closed the ONE
+    precondition that had actually bitten (an entryless placeholder's
+    missing nonce; a rejected candidate outside the identity list) by
+    patching that specific case, leaving this one unclosed. A tree can
+    hold real, non-empty entries (inherited from an earlier complete
+    poll) while the runtime record is exactly what made THIS poll
+    invalid - the remedy must not name a command that will refuse the
+    operator for that reason. Asserts the operator-visible message, not
+    the internal predicate."""
+    earned = _owned_tree_plan(
+        _wrap_snap(), request_id="rr-150-reset-remedy-runtime-invalid",
+    )["next_state"]["owned_process_tree"]
+    assert earned["status"] == "complete"
+    assert earned["entries"]
+
+    plan = sup.plan_actions(
+        _report(heartbeat_stale=False),
+        {"agents": {"worker": _wrap_ready(owned_process_tree=earned)}},
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=_wrap_snap()[:1],
+    )["agents"]["worker"]
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["entries"]  # has_entries branch, not the entryless one
+    assert tree["reason_code"] == "process_tree_invalid_runtime_absent"
+    # The command may still be NAMED for context (same as the established
+    # entryless-placeholder wording), but must never be RECOMMENDED to run
+    # when this poll already knows it would refuse.
+    assert "run `agenttalk supervise --reset-process-tree-ownership`" not in plan["reason"]
+    assert "runtime record is not valid" in plan["reason"]
+
+
 def test_wrapped_torn_runtime_read_is_unknown_without_partial_fields(
     tmp_path: Path,
 ) -> None:
@@ -15401,6 +15439,167 @@ def test_owned_process_tree_accounts_for_orphaned_intermediates_live_child() -> 
     assert tree["status"] == "invalid"
     assert tree["rejected_count"] >= 1
     assert live_grandchild_pid not in [e["pid"] for e in tree["entries"]]
+
+
+def test_owned_process_tree_does_not_double_count_same_rejected_candidate() -> None:
+    """Task #150 round 9 connector finding: a candidate rejected once
+    during the main walk (here, an unproven virtual-parent descendant
+    below a TRUSTED but now-exited intermediate) is ALSO absent from
+    `owned`, so the discovery-closure loop finds it again and used to
+    call mark_rejected a second time for the identical pid - one lost
+    candidate reported as two. Round 3's own "harmless, rejected_count
+    is a gate not a tally" justification for this was true when written
+    and stopped being true the moment round 3 (and round 5) added an
+    operator-facing message that reports the number as a count - a
+    value's tolerance for imprecision is a property of its consumers,
+    not the value itself. Asserts the operator-visible outcome: the
+    remedy message reports ONE excluded candidate, not two."""
+    intermediate_pid = 500
+    anchor_child_pid = 501
+    new_child_pid = 502
+    first_snapshot = [
+        *_wrap_snap(),
+        _proc(intermediate_pid, WRAP_CHILD_PID, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000)),
+        _proc(anchor_child_pid, intermediate_pid, "node.exe", "node anchor.js", _ps_iso(800000)),
+    ]
+    first = _owned_tree_plan(first_snapshot, request_id="rr-150-no-double-count-first")
+    complete_tree = first["next_state"]["owned_process_tree"]
+    assert complete_tree["status"] == "complete"
+    assert {e["pid"] for e in complete_tree["entries"]} >= {intermediate_pid, anchor_child_pid}
+
+    # Second poll: the intermediate itself has exited (no row at all, so
+    # prior_authority's own rehydration must rebuild it as a virtual
+    # bridge via anchor_child_pid, still alive, needing it as an
+    # ancestor). A brand-new live child - never recorded in the prior -
+    # appears below that same virtual bridge: unproven at the main-walk
+    # site (line ~3455) AND separately reachable via discovery_edges
+    # from the same intermediate_pid discovery root.
+    second_snapshot = [
+        *_wrap_snap(),
+        _proc(anchor_child_pid, intermediate_pid, "node.exe", "node anchor.js", _ps_iso(800000)),
+        _proc(new_child_pid, intermediate_pid, "node.exe", "node new.js", _ps_iso(900000)),
+    ]
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-150-no-double-count-second"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                now=NOW + 1,
+            ),
+        ),
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=second_snapshot,
+    )
+    tree = second["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert new_child_pid not in [e["pid"] for e in tree["entries"]]
+    # The internal counter, checked once for context:
+    assert tree["rejected_count"] == 1
+    # The operator-visible outcome the standing test rule asks for: the
+    # remedy message must report ONE excluded candidate, not two.
+    assert "excluded 1 candidate(s)" in second["reason"]
+    assert "excluded 2 candidate(s)" not in second["reason"]
+
+
+def test_owned_process_tree_prior_entry_malformed_pid_still_finds_live_child() -> None:
+    """Task #150 round 9 connector finding 3: a row whose OWN pid field is
+    malformed (as opposed to round 5's malformed parent_pid) contributes
+    no edge either direction, since there is no valid pid to key it by.
+    This test confirms the case the connector says is already safe: for
+    a PRIOR-TRACKED intermediate, the trusted-rehydration block never
+    even looks at this poll's malformed row - it reconstructs the
+    intermediate's identity from the prior record's own start/filetime
+    and re-verifies the live child against that same prior chain,
+    bypassing the malformed current row entirely. Locks in behavior that
+    was already correct by construction (not a new fix) so it cannot
+    silently regress."""
+    intermediate_pid = 500
+    live_child_pid = 501
+    first_snapshot = [
+        *_wrap_snap(),
+        _proc(intermediate_pid, WRAP_CHILD_PID, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000)),
+        _proc(live_child_pid, intermediate_pid, "node.exe", "node build.js", _ps_iso(800000)),
+    ]
+    first = _owned_tree_plan(first_snapshot, request_id="rr-150-malformed-pid-prior-first")
+    complete_tree = first["next_state"]["owned_process_tree"]
+    assert complete_tree["status"] == "complete"
+    assert {e["pid"] for e in complete_tree["entries"]} >= {intermediate_pid, live_child_pid}
+
+    # Second poll: same trusted prior, but the intermediate's own row now
+    # has a malformed pid field - the child is unchanged and still alive.
+    malformed_intermediate = {
+        **_proc(intermediate_pid, WRAP_CHILD_PID, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000)),
+        "pid": None,
+    }
+    second_snapshot = [
+        *_wrap_snap(),
+        malformed_intermediate,
+        _proc(live_child_pid, intermediate_pid, "node.exe", "node build.js", _ps_iso(800000)),
+    ]
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-150-malformed-pid-prior-second"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                now=NOW + 1,
+            ),
+        ),
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=second_snapshot,
+    )
+    tree = second["next_state"]["owned_process_tree"]
+    # The whole-snapshot integrity check still (correctly) sees a
+    # malformed row and marks the tree invalid this poll - that is
+    # orthogonal to whether the specific tracked identities were lost.
+    assert tree["status"] == "invalid"
+    assert tree["reason_code"] == "process_tree_invalid_snapshot_invalid_process_row"
+    assert {intermediate_pid, live_child_pid} <= {e["pid"] for e in tree["entries"]}
+
+
+def test_owned_process_tree_first_seen_malformed_pid_is_a_documented_residual() -> None:
+    """Task #150 round 9 connector finding 3, the genuinely unbounded half:
+    a first-time-seen intermediate (never a prior entry) whose row has a
+    malformed pid contributes no edge either direction, so nothing ever
+    learns it exists at all - not as a root (no prior_entries pid to seed
+    it), not as anyone's discovered child (the one edge that would have
+    named it depends on ITS OWN row, which is unusable). Its own live
+    child is consequently unreachable too. Every other fix in this
+    family works by looking a row up BY its own intact pid field; that
+    is exactly the field missing here, and there is no snapshot-only
+    signal to distinguish this row from an unrelated malformed row
+    elsewhere on the host. This test documents the residual by
+    execution rather than asserting a fix - see _snap_all_edges's own
+    comment for why treating this as boundable would revive the
+    host-wide-poisoning failure mode round 5 already ruled out."""
+    intermediate_pid = 500
+    live_child_pid = 501
+    malformed_intermediate = {
+        **_proc(intermediate_pid, WRAP_CHILD_PID, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000)),
+        "pid": None,
+    }
+    snapshot = [
+        *_wrap_snap(),
+        malformed_intermediate,
+        _proc(live_child_pid, intermediate_pid, "node.exe", "node build.js", _ps_iso(800000)),
+    ]
+    plan = _owned_tree_plan(snapshot, request_id="rr-150-malformed-pid-first-seen")
+    tree = plan["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["reason_code"] == "process_tree_invalid_snapshot_invalid_process_row"
+    # The documented gap: neither identity is accounted for, and the
+    # whole-snapshot fact that produced "invalid" is not itself a
+    # per-candidate rejection (matching every other whole-snapshot site
+    # in this file), so rejected_count stays 0 despite a real, live,
+    # untracked descendant.
+    assert tree["rejected_count"] == 0
+    assert intermediate_pid not in [e["pid"] for e in tree["entries"]]
+    assert live_child_pid not in [e["pid"] for e in tree["entries"]]
 
 
 def test_owned_process_tree_rejects_prior_entry_with_malformed_parent_pid() -> None:

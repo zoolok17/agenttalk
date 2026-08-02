@@ -2131,6 +2131,27 @@ def _snap_all_edges(snapshot: list[dict] | None) -> dict[int, list[int]]:
     the discovery-closure invariant reconciles against, where routing
     through an untrusted edge is exactly the point.
     """
+    # Task #150 round 9 connector finding (documented residual, not fixed):
+    # a row whose own PID field is malformed - as opposed to round 5's
+    # malformed PARENT_PID - contributes no edge either direction, since
+    # there is no valid pid to key it by. For a row bearing a PRIOR-ENTRY
+    # pid this is already safe: the trusted-rehydration block above never
+    # looks at this row at all - it reconstructs the intermediate's
+    # identity straight from the prior record's own start/filetime and
+    # re-verifies any live child against that same prior chain, bypassing
+    # the malformed current row entirely (confirmed by direct execution,
+    # not merely reasoned). For a row that has NEVER been a prior entry -
+    # no independently-trusted pid to reconcile it against - there is no
+    # snapshot-only signal distinguishing "this malformed-pid row is a
+    # lost candidate of ours" from "this malformed-pid row belongs to an
+    # unrelated process elsewhere on the host": every other fix in this
+    # family works by looking a row up BY its own intact pid field
+    # (idx.get(known_pid)), and that is exactly the field missing here.
+    # Treating every malformed-pid row as ours would revive the exact
+    # host-wide-poisoning failure mode round 5 already ruled out for the
+    # analogous malformed-parent_pid case. Genuinely unbounded for a
+    # first-time-seen intermediate; accepted as a residual rather than
+    # patched speculatively.
     kids: dict[int, list[int]] = {}
     for row in snapshot or []:
         if not isinstance(row, dict):
@@ -3104,9 +3125,29 @@ def _owned_process_tree(
     # exactly what makes the "invalid but re-derivable" case in
     # _unverified_owned_process_tree safe.
     rejected_count = 0
+    # Task #150 round 9 connector finding: rejected_count's own "harmless
+    # double count, this is a gate not a tally" justification (round 3)
+    # stopped being true the moment round 3 (and round 5) added an
+    # operator-facing message that reports the number - a value's
+    # tolerance for imprecision is a property of its CONSUMERS, not of
+    # the value, and a new, more precise consumer retroactively
+    # invalidates an old "close enough" judgement. A live child behind an
+    # unproven virtual-parent bridge (or any other candidate rejected
+    # once during the main walk) is also absent from `owned`, so the
+    # discovery-closure loop below finds it AGAIN and would double-count
+    # it. Dedupe by pid wherever a call site has one: the same candidate
+    # is only ever one exclusion, however many different checks noticed
+    # it. Calls with no single identifiable candidate (a whole-snapshot
+    # fact, or the mandatory-closure size cap) pass no pid and are never
+    # deduped against each other.
+    rejected_pids: set[int] = set()
 
-    def mark_rejected(reason: str) -> None:
+    def mark_rejected(reason: str, pid: int | None = None) -> None:
         nonlocal invalid_reason, rejected_count
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            if pid in rejected_pids:
+                return
+            rejected_pids.add(pid)
         rejected_count += 1
         invalid_reason = invalid_reason or reason
 
@@ -3136,7 +3177,10 @@ def _owned_process_tree(
             or not start
             or start_key is None
         ):
-            mark_rejected("invalid_process_row")
+            mark_rejected(
+                "invalid_process_row",
+                pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+            )
             return False
         if not _has_exact_start_identity(row):
             # Windows' CIM timestamp is rounded. It can identify graph edges,
@@ -3156,7 +3200,7 @@ def _owned_process_tree(
             # both sides agree: an entry this imprecise never contributes to
             # a rejected_count of 0, so it can never reach a status the
             # validator would then refuse.
-            mark_rejected("exact_start_filetime_unavailable")
+            mark_rejected("exact_start_filetime_unavailable", pid)
         existing = owned.get(pid)
         if existing is not None:
             if (
@@ -3164,7 +3208,7 @@ def _owned_process_tree(
                 or _filetime_of(existing["row"]) != start_filetime
                 or existing["row"].get("parent_pid") != parent_pid
             ):
-                mark_rejected("pid_identity_collision")
+                mark_rejected("pid_identity_collision", pid)
                 return False
             existing["depth"] = min(int(existing["depth"]), depth)
             if role_rank[role] > role_rank[existing["role"]]:
@@ -3196,14 +3240,20 @@ def _owned_process_tree(
     # already earned. Missing ancestors are retained as non-killable bridges.
     if prior_authority is not None and prior_entries:
         prior_root = prior_entries[0]
+        prior_root_pid = prior_root.get("pid")
         if (
-            prior_root.get("pid") != wrapper_pid
+            prior_root_pid != wrapper_pid
             or not _start_tokens_match(
                 prior_root.get("start"),
                 _start_of(wrapper_row),
             )
         ):
-            mark_rejected("prior_wrapper_mismatch")
+            mark_rejected(
+                "prior_wrapper_mismatch",
+                prior_root_pid
+                if isinstance(prior_root_pid, int) and not isinstance(prior_root_pid, bool)
+                else None,
+            )
             prior_authority = None
         else:
             live_prior: set[int] = set()
@@ -3228,13 +3278,13 @@ def _owned_process_tree(
                 ):
                     continue
                 if row.get("parent_pid") != entry["parent_pid"]:
-                    mark_rejected("prior_parent_drift")
+                    mark_rejected("prior_parent_drift", entry["pid"])
                     continue
                 if not _filetime_identity_matches(
                     row,
                     entry.get("start_filetime"),
                 ):
-                    mark_rejected("prior_filetime_drift")
+                    mark_rejected("prior_filetime_drift", entry["pid"])
                     continue
                 live_prior.add(entry["pid"])
             needed = set(live_prior)
@@ -3320,7 +3370,7 @@ def _owned_process_tree(
                 )
                 and current_launcher.get("parent_pid") != wrapper_pid
             ):
-                mark_rejected("launcher_parent_mismatch")
+                mark_rejected("launcher_parent_mismatch", launcher_pid)
             launcher_row = {
                 "pid": launcher_pid,
                 "parent_pid": wrapper_pid,
@@ -3343,13 +3393,13 @@ def _owned_process_tree(
                     # authority.
                     launcher_row = None
                 elif current_launcher is not None:
-                    mark_rejected("exact_start_filetime_unavailable")
+                    mark_rejected("exact_start_filetime_unavailable", launcher_pid)
                     launcher_row = None
                 elif children.get(launcher_pid):
                     # Windows retains PPID edges after a parent exits. Without
                     # an exact lifetime/prior certificate those children are
                     # ambiguous.
-                    mark_rejected("unproven_virtual_parent_descendant")
+                    mark_rejected("unproven_virtual_parent_descendant", launcher_pid)
                     launcher_row = None
                 else:
                     # A childless, absent launcher cannot be killed and its
@@ -3357,11 +3407,11 @@ def _owned_process_tree(
                     # ownership authority.
                     launcher_row = None
         if launcher_pid == wrapper_pid:
-            mark_rejected("launcher_equals_wrapper")
+            mark_rejected("launcher_equals_wrapper", launcher_pid)
         elif launcher_row is not None:
             edge_reason = _strict_owned_child_edge(wrapper_row, launcher_row)
             if edge_reason is not None:
-                mark_rejected(edge_reason)
+                mark_rejected(edge_reason, launcher_pid)
             add_node(
                 launcher_row,
                 role="cli_launcher",
@@ -3380,7 +3430,7 @@ def _owned_process_tree(
         for child_pid in sorted(children.get(parent_pid, [])):
             child = idx.get(child_pid)
             if not isinstance(child, dict):
-                mark_rejected("missing_child_row")
+                mark_rejected("missing_child_row", child_pid)
                 continue
             if not parent["live"]:
                 prior_parent = prior_by_pid.get(parent_pid)
@@ -3423,11 +3473,11 @@ def _owned_process_tree(
                     # or by the exited launcher's exact lifetime bounds.
                     continue
                 if not certified_launcher_child and not prior_owned_child:
-                    mark_rejected("unproven_virtual_parent_descendant")
+                    mark_rejected("unproven_virtual_parent_descendant", child_pid)
                     continue
             edge_reason = _strict_owned_child_edge(parent_row, child)
             if edge_reason is not None:
-                mark_rejected(edge_reason)
+                mark_rejected(edge_reason, child_pid)
                 continue
             role = (
                 "cli_brain"
@@ -3446,7 +3496,10 @@ def _owned_process_tree(
     if isinstance(brain_row, dict):
         brain_pid = brain_row.get("pid")
         if brain_pid not in owned:
-            mark_rejected("brain_outside_owned_tree")
+            mark_rejected(
+                "brain_outside_owned_tree",
+                brain_pid if isinstance(brain_pid, int) and not isinstance(brain_pid, bool) else None,
+            )
         elif owned[brain_pid]["role"] == "tool_descendant":
             owned[brain_pid]["role"] = "cli_brain"
 
@@ -3467,10 +3520,15 @@ def _owned_process_tree(
     # or was never visited, so an orphaned intermediate's live child - or a
     # rejected launcher's live child - is still IN this closure. Any
     # such descendant that never made it into "owned" is unaccounted -
-    # either a case already flagged above (harmless double count;
-    # rejected_count is a gate, not an exact tally) or exactly the silent-
-    # loss class hand enumeration cannot bound. Either way it becomes a
-    # rejection here, mechanically, rather than by finding a fourth site.
+    # either a case already flagged above by pid (mark_rejected's own
+    # dedup means re-flagging the same pid here is a no-op, not a double
+    # count - round 9 connector finding retracted round 3's "harmless,
+    # rejected_count is a gate not a tally" call: that was true before
+    # round 3 itself added an operator-facing message reporting the
+    # number, and stopped being true the moment it did) or exactly the
+    # silent-loss class hand enumeration cannot bound. Either way it
+    # becomes a rejection here, mechanically, rather than by finding a
+    # fourth site.
     discovery_roots: set[int] = set()
     if isinstance(wrapper_pid, int) and not isinstance(wrapper_pid, bool):
         discovery_roots.add(wrapper_pid)
@@ -3495,8 +3553,9 @@ def _owned_process_tree(
     # a since-corrupted intermediate the prior once recorded would
     # otherwise sit at rejected_count 0 forever. This check is independent
     # of that trust gate on purpose - it does NOT retire the rehydration
-    # block's own check (a double-count there is harmless; rejected_count
-    # is a gate, not an exact tally).
+    # block's own check. Both pass the same entry pid to mark_rejected, so
+    # a poll where BOTH fire for the same identity is deduped by pid
+    # rather than double-counted (round 9 connector finding).
     for _prior_entry in prior_entries:
         _prior_pid = _prior_entry.get("pid") if isinstance(_prior_entry, dict) else None
         if not isinstance(_prior_pid, int) or isinstance(_prior_pid, bool):
@@ -3515,11 +3574,11 @@ def _owned_process_tree(
             # examines a pid that isn't already a recorded identity of
             # ours.
             if _prior_pid in excluded_pids:
-                mark_rejected("prior_entry_row_unindexable")
+                mark_rejected("prior_entry_row_unindexable", _prior_pid)
             continue
         _prior_parent_pid = _prior_row.get("parent_pid")
         if not isinstance(_prior_parent_pid, int) or isinstance(_prior_parent_pid, bool):
-            mark_rejected("prior_entry_parent_pid_malformed")
+            mark_rejected("prior_entry_parent_pid_malformed", _prior_pid)
     # Task #150 round 4 connector finding 1: children.get(...) above is
     # _children_map(idx) - built from the DEDUPED idx, so a pid _snap_index
     # excluded for identity ambiguity (a duplicate or malformed row) has no
@@ -3571,8 +3630,8 @@ def _owned_process_tree(
             continue
         discovered_descendants.add(candidate_pid)
         frontier.extend(discovery_edges.get(candidate_pid, []))
-    for _ in sorted(discovered_descendants - set(owned)):
-        mark_rejected("unaccounted_discovery")
+    for _unaccounted_pid in sorted(discovered_descendants - set(owned)):
+        mark_rejected("unaccounted_discovery", _unaccounted_pid)
 
     observed_count = len(owned)
     mandatory: set[int] = set()
@@ -7003,9 +7062,30 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         # all. The flag's own text only mentions omitted identities; a
         # nonzero rejected_count needs the same warning stated explicitly,
         # not folded silently into "every process this record could name".
+        # Round 9 (connector finding, the third instance of the same wrong
+        # direction): the first two rounds each closed the ONE precondition
+        # that had actually bitten - an entryless placeholder's missing
+        # nonce (round 2), a rejected candidate the command's identity list
+        # can't see (round 3) - by patching that specific case, which is
+        # why there was a third: a configured-agent reset ALSO requires
+        # (cli.py, --reset-process-tree-ownership) the CURRENT wrapper
+        # runtime record to read STATUS_VALID, entirely independent of the
+        # tree's own entries/rejected_count. A tree can hold non-empty
+        # entries while the runtime record is exactly what made it invalid
+        # in the first place (process_tree_invalid_runtime_absent/invalid/
+        # record_missing/record_invalid) - the remedy named the command for
+        # precisely that case. One predicate now gates naming the command
+        # at all: this poll's own liveness read of the SAME runtime record
+        # the command re-reads at reset time. It can still go stale between
+        # this poll and when the operator acts - unavoidable from where the
+        # message is produced - but it is never wrong about what THIS poll
+        # already knows, which is what "must never guess" means here.
+        runtime_currently_valid = (
+            liveness.get("runtime_status") == runtime_obs.STATUS_VALID
+        )
         has_entries = bool(owned_tree.get("entries"))
         rejected_count = owned_tree.get("rejected_count")
-        if has_entries:
+        if has_entries and runtime_currently_valid:
             # Round 4 (connector finding 2, the same wrong direction a third
             # time): a legacy v2 record predates rejected_count entirely -
             # missing, not zero, is what keeps it out of absence-promotion
@@ -7044,6 +7124,18 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 "required --acknowledge-* flags); do NOT kill the wrapper "
                 "expecting an automatic relaunch - that is only safe once "
                 "this record already reflects the wrapper as absent"
+            )
+        elif has_entries:
+            remedy = (
+                "recovery: this record has named identities, but the "
+                "current wrapper runtime record is not valid "
+                f"({liveness.get('runtime_status')}) and --reset-process-"
+                "tree-ownership requires exactly that record to read valid "
+                "before it will act - it will refuse; this needs operator "
+                "investigation of "
+                f"{owned_tree.get('reason_code')} (a valid runtime record "
+                "recovering on its own is what would let a scripted reset "
+                "apply here, not a --acknowledge-* flag)"
             )
         else:
             remedy = (
