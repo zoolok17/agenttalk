@@ -1,6 +1,6 @@
 # Design 87-A: Supervisor classifier and recovery-authority totality
 
-**Design status:** Proposed, Revision 15; candidate for
+**Design status:** Proposed, Revision 16; candidate for
 **NORMATIVE-SPECIFICATION COMPLETE** with the operator-directed owned-childless
 wrapper authority. This core and its
 [normative owned-childless module](DESIGN-87A-owned-childless-wrapper-authority.md)
@@ -9,7 +9,7 @@ at the same commit constitute 87-A; neither is conforming alone.
 **Delivery status:** **IMPLEMENTATION BLOCKED** on task #115, task #146, task
 #57, `ExactIssuerIdentityAdapterV1`, and the closure successor. Revision 15
 specifies the definitive-`GONE` attended owner-death escape and names, but does
-not define or deliver, the exact-issuer-identity adapter required to classify a
+not define or deliver, `ExactIssuerIdentityAdapterV1`, which is required to classify a
 reused issuer PID.
 
 **Conformance status:** **UNAVAILABLE.** Neither Q4 nor 87-A is complete,
@@ -47,7 +47,7 @@ Every asserted property in this document has one of these labels:
   implementable contract and its mandatory evidence. It does not assert that
   executable enforcement exists.
 - **IMPLEMENTATION BLOCKED** means at least one named prerequisite required for
-  conformance is absent from merged code. Revision 15 is independently blocked
+  conformance is absent from merged code. Revision 16 is independently blocked
   on #115, #146, #57, `ExactIssuerIdentityAdapterV1`, and the closure successor.
 
 An implementation may claim conformance to 87-A only when every ENFORCED rule
@@ -56,17 +56,17 @@ described here remains proposed.
 
 ### Identity and equality vocabulary
 
-This specification reserves **exact identity** and compounds such as
-**exact-FILETIME target** for a named type or adapter whose comparator proves
-process identity. `OwnedExactStartGuardV1` is such a type;
-`ProcStartGuardV1` and `ExecutionGateCaptureV1.guarded_start` are not. A field
-described as **source-equal** carries the same typed value as the named source,
-but that equality grants no process-identity comparator. **Byte-identical**
-means identical canonical serialized bytes, and **closed** means that the
-displayed algebra has no other variants. Cardinality phrases such as “exactly
-one” retain their ordinary meaning. Unqualified “exact” must not be used as a
-synonym for source-field equality anywhere in the Revision 15 owner-loss,
-attended-disposition, or prior-effect-fence contracts.
+Across this atomic four-document set, the **exact** stem is reserved for named
+identity types/adapters or direct references to those identity contracts, and
+ordinary cardinality/multiplicity (`exactly one` / `exactly once`).
+`OwnedExactStartGuardV1` is such a type; `ProcStartGuardV1` and
+`ExecutionGateCaptureV1.guarded_start` are not. A field described as
+**source-equal** carries the same typed value as the named source, but that
+equality grants no process-identity comparator. **Byte-identical** means equal
+canonical serialized bytes or byte-for-byte preservation. **Matching** names
+an ordinary predicate without granting identity authority, and **closed** means
+that the displayed algebra has no other variants. No other use of the exact
+stem is admitted in these four documents.
 
 ## Split, decision, and scope
 
@@ -107,15 +107,15 @@ not erase mandatory escalation.
   is scheduled immediately after #115 and before 87-A implementation. It
   remains independently stageable.
 - Task #120 shipped on master as squash commit `587e7c1`. It owns a bounded
-  64-entry nonce-anchored tree snapshot, exact Windows FILETIME target
-  identity, same-handle identity-check/termination for an openable
-  exact-matching target, a bounded wait attempt after successful termination,
+  64-entry nonce-anchored tree snapshot, Windows FILETIME target identity,
+  same-handle identity-check/termination for an openable target whose live
+  creation FILETIME matches its `OwnedExactStartGuardV1`, a bounded wait attempt after successful termination,
   a recycle-aware deny-only post-kill launch barrier, attended-reset
   evidence, and a request-bound attended archive. It does not
   implement action-scoped
   child-creation closure, a checked continuation owner, or attempt-keyed
-  acquire/reconcile/release. It also does not implement a POSIX exact-token
-  kill adapter: its current supervisor owned-tree native body acts on Windows
+  acquire/reconcile/release. It also does not implement a named POSIX
+  exact-target-identity kill adapter: its current supervisor owned-tree native body acts on Windows
   FILETIME and skips new
   `owned_process_tree` targets without that field.
 - Task #146 owns the supervisor owned-tree effect-entry migration. Merged code
@@ -148,8 +148,8 @@ not erase mandatory escalation.
   `CAPABILITY_UNAVAILABLE(ExactIssuerIdentityAdapterV1)`, and no `RECYCLED`
   result is admitted. The checkpoint's
   token digest, PID, and `ProcStartGuardV1` are source-equal audit fields from
-  the live issuer's `ExecutionGateCaptureV1`, not an exact process-identity
-  contract and not disposal authority.
+  the live issuer's `ExecutionGateCaptureV1`, not evidence admitted by
+  `ExactIssuerIdentityAdapterV1` and not disposal authority.
 - `ConfiguredPreBarrierRetrySuccessorV1` is the named, separately reviewed
   optional implementation seam for any future **automatic** retry after the
   configured action issuer dies while durable state remains
@@ -228,8 +228,8 @@ synchronization that leaves no durable helper or OS object. Neither task #120
 nor the closure successor relaxes this absolute promise. There is no
 mechanism-specific or separately versioned exception.
 
-If a platform cannot prove an exact target executor or synchronous
-action-scoped closure inside that boundary, `ClosureCapabilityV1` is
+If a platform cannot construct `CurrentExactTargetExecutorWitnessV1` or prove
+synchronous action-scoped closure inside that boundary, `ClosureCapabilityV1` is
 `CAPABILITY_UNAVAILABLE`. Merged #120 alone does not satisfy that conjunction,
 so the static pre-reservation refusal remains mandatory: create no childless
 effect envelope or reservation, consume no attempt, make no external call,
@@ -237,8 +237,8 @@ perform no closure-dependent named teardown, and keep the dependent recovery
 `POLICY_HELD` with `CAPABILITY_UNAVAILABLE` pending a human. Structural
 unavailability is never an ordinary closure veto, retry, or exhaustion.
 
-Revision 10 replaced Revision 9's path-enumerated whole-state byte-identity
-claim. That claim is withdrawn: an ordinary observation may legitimately
+Revision 10 replaced Revision 9's path-enumerated whole-state
+byte-identical-preservation claim. That claim is withdrawn: an ordinary observation may legitimately
 advance poll identity, reset the ordinary capture ordinal, clear a prior-poll
 terminal, and update continuity or confirmation state while an executor is
 unavailable. The narrower universal is structural and stronger: without a
@@ -344,7 +344,7 @@ RuntimeObservationV1 {
 
 The constructor evaluates every predicate, substitutes
 `CURRENT_UNKNOWN_OTHER` if none matches, deduplicates matches, sorts them by
-this exact rank, and sets `dominant = reasons[0]`:
+this displayed rank, and sets `dominant = reasons[0]`:
 
 1. `CURRENT_UNKNOWN_SEQUENCE_REGRESSION`
 2. `CURRENT_UNKNOWN_BINDING`
@@ -366,7 +366,7 @@ cannot construct this type directly.
 classifier. “Strict” means that neither heartbeat nor wrapper-presence policy
 may rewrite it.
 
-| State | Exact meaning |
+| State | Normative meaning |
 | --- | --- |
 | `CURRENT_PROGRESS_HEALTHY` | The complete current schema and binding are valid, and positive current evidence such as advancing adapter progress or bounded spawn grace determines health without heartbeat staleness. |
 | `CURRENT_STALE_RECOVERABLE` | The complete current schema and binding are valid, and the phase/configuration permits authoritative stale heartbeat to complete recovery proof. This includes idle, terminal, and a confirmed active stall whose static guards permit heartbeat recovery. It means “eligible if stale,” not “heartbeat is stale.” Idle and terminal map here for both freshness values. |
@@ -452,7 +452,7 @@ reason/action.
    nonempty `brain_pattern` of at most 128 UTF-8 bytes. Invalid launcher fields
    or matcher config return the corresponding `UNKNOWN`.
 3. `ProcessObservationV1` carries every raw snapshot row through
-   `active_child_rows`. Exact duplicate normalized rows collapse. Conflicting
+   `active_child_rows`. Normalized rows with matching field values collapse. Conflicting
    rows with the same positive PID, or two rows that make parentage cyclic,
    make `active_child_availability=INCOMPLETE` and return
    `UNKNOWN(OBSERVATION_INCONSISTENT)`. Active-child capture
@@ -460,7 +460,7 @@ reason/action.
    OBSERVATION_INCONSISTENT)`; it never returns absence. Presence-only candidate
    inconsistency cannot change this projection.
 4. When a row with the launcher PID exists, its start guard must match the
-   runtime launcher guard by exact token or the existing ISO representation
+   runtime launcher guard by a literal token match or the existing ISO representation
    tolerance of one millisecond. A mismatch is
    `UNKNOWN(LAUNCHER_IDENTITY_MISMATCH)`. The row may be absent for a forking
    launcher; direct parent references to its recorded PID remain usable.
@@ -491,7 +491,7 @@ are bounded operator diagnostics; all normalize to the single semantic runtime
 reason `CURRENT_UNKNOWN_ACTIVE_CHILD` and do not independently alter the
 banked `RecoveryConditionFingerprintV1` payload.
 
-The runtime mapping is exact:
+The runtime mapping is closed:
 
 - `UNKNOWN` contributes `CURRENT_UNKNOWN_ACTIVE_CHILD`;
 - `LIVE_GUARDED` feeds the existing progress/stall predicates;
@@ -501,7 +501,7 @@ The runtime mapping is exact:
 - `NOT_EVALUATED` and `NOT_APPLICABLE` contribute no active-child reason.
 
 The presence and active-child projections may consume the same immutable raw
-capture but may not consume each other's result. Process-row order, exact
+capture but may not consume each other's result. Process-row order, field-matching
 duplicates, and candidates unrelated to the runtime launcher lineage and brain
 matcher cannot change `ActiveChildObservationV1`; relevant lineage evidence
 may change it. This is the permitted snapshot-to-runtime flow used by
@@ -561,8 +561,8 @@ Guard `NOT_APPLICABLE` means that no strict active establishment key has yet
 been accepted in the current runtime-wrapper/high-water-turn binding. It is
 not written merely because a later record for that same binding is non-active.
 
-When embedded in a canonical hash payload, the closed variant is exactly the
-`CanonicalJsonV1` object:
+When embedded in a canonical hash payload, the closed variant serializes as the
+following `CanonicalJsonV1` object:
 
 ```text
 {
@@ -608,7 +608,7 @@ ConfiguredActionIssuerCheckpointV1 {
     source-equal to the persisted configured planner barrier-state identity
   source_targets:
     deeply immutable ordered module-typed #120 configured target tuple of length 1..64
-    copied from that persisted barrier state by the same checked transition
+    source-equal to that persisted barrier state's target tuple
   target_digest: module OwnedTargetDigestV1 computed over source_targets
   issuer_supervisor_instance_token_digest:
     source-equal to the ExecutionGateCaptureV1 token digest
@@ -620,12 +620,13 @@ ConfiguredActionIssuerCheckpointV1 {
     source-equal to the enabled ExecutionGateCaptureV1 action epoch
   invariant:
     issuer_supervisor_start_guard is a ProcStartGuardV1-shaped audit value,
-    not OwnedExactStartGuardV1 and not an exact process-identity comparator
+    not OwnedExactStartGuardV1 and not evidence produced by
+    ExactIssuerIdentityAdapterV1
 }
 
 ExactIssuerIdentityAdapterV1 =
   named undelivered implementation dependency for a separately reviewed
-  exact-identity decision when issuer_supervisor_pid is presently occupied;
+  issuer-identity decision when issuer_supervisor_pid is presently occupied;
   this revision defines no platform identity schema, provider binding,
   serialization, comparator, or RECYCLED constructor for that adapter
 
@@ -670,8 +671,8 @@ ConfiguredPreBarrierOwnerLossHoldV1 {
   )
   invariant: source_hash excludes issuer_extinction, present_pid_reuse_disposition,
              attended_action, and source_hash itself; LIVE_OR_UNPROVEN and
-             PROVED_GONE projections of one unchanged checkpoint therefore
-             have the same source_hash
+             PROVED_GONE projections of one byte-identical checkpoint therefore
+             have matching source_hash values
   invariant: PROVED_GONE requires a fresh independent OS result that the PID is
              absent; a present PID always remains LIVE_OR_UNPROVEN in this
              revision, even when generic token/start values differ
@@ -684,13 +685,13 @@ ConfiguredPreBarrierOwnerLossHoldV1 {
 ConfiguredPriorEffectUnknownFenceV1 {
   disposition_id: lowercase hyphenated UUID
   disposition_request:
-    complete byte-identical AttendedConfiguredPreBarrierDispositionRequestV1, including
+    source-equal to the complete AttendedConfiguredPreBarrierDispositionRequestV1 input, including
     request ID, expected hold source hash, actor, acknowledgements, and reason
   source_checkpoint:
     source-equal to the disposed ConfiguredActionIssuerCheckpointV1
   source_targets:
-    module-typed source_checkpoint.source_targets copied byte-identically; its digest
-    equals source_checkpoint.target_digest
+    source-equal to module-typed source_checkpoint.source_targets; its digest is
+    source-equal to source_checkpoint.target_digest
   disposed_state_epoch: source-equal to checked ClassifierStateV1.state_epoch
   disposed_revision: source-equal to the successor revision that installs this fence
   disposed_ordinary_poll_sequence:
@@ -723,7 +724,7 @@ CommittedOrdinaryFenceCaptureV1 =
     source_target_digest: source-equal to committed successor fence target digest
     source_targets: source-equal to committed successor fence source_targets
     sealed_capture:
-      immutable raw and owned-tree observation operands copied byte-identically from the
+      immutable raw and owned-tree observation operands source-equal to those in the
       winning OrdinaryClassifierObservationReceiptV1 for #120 deny-only checking
     invariant: a stale/CAS-losing observation lineage publishes no witness;
                a prospective capture ID without the winning committed revision
@@ -868,7 +869,7 @@ non-null managed generation, non-null launch-grace deadline, and
 `readiness_seen=false`. `readiness_seen=true` requires a non-null managed
 generation and `launching=false`; `false/false` remains valid before a launch,
 after a positively proven no-spawn failure, or while readiness for the current
-generation has not been observed. Only the exact launch and
+generation has not been observed. Only the named launch and
 matching-generation readiness transitions below may change these fields.
 
 `recovery_poll_terminal_sequence` is null or at most
@@ -877,7 +878,7 @@ outcome and every permit-bound debt reconciliation from ordinary residual
 evidence writes the current
 `ordinary_poll_sequence` there in the same checked transaction. Pure refusal,
 retained closure uncertainty, prior-poll exhaustion, and no-op
-`NOT_ATTEMPTED` results that leave childless debt/cycle/execution unchanged do
+   `NOT_ATTEMPTED` results that leave childless debt/cycle/execution byte-identical do
 not. Successful permit-bound ordinary-evidence or reload cleanup also exports
 `NOT_ATTEMPTED`, but it is a finalized reconciliation and does write the
 terminal. It is
@@ -896,11 +897,11 @@ no-kill, and `MANUAL_TARGETS` otherwise.
 `authority_case=PROVABLY_CHILDLESS_OWNED_WRAPPER`. Its execution value owns no
 module binding, debt, cycle, continuation, or retired attempt. `CHILDLESS`
 requires `ChildlessEffectEnvelopeV1` and the envelope's execution is either
-`IDLE`, a `RESERVED` value whose authority case is exactly
+`IDLE`, a `RESERVED` value whose authority case is
 `PROVABLY_CHILDLESS_OWNED_WRAPPER`, or the matching `AMBIGUOUS_LAUNCH` value.
 Its required `childless_evidence` satisfies the module's mode/nullability rules
-and its `authority_id` equals `evidence_id`. For automatic origin
-`authority_id` also equals that module ID; for manual origin it remains the
+and its `authority_id` is source-equal to `evidence_id`. For automatic origin
+`authority_id` is also source-equal to that module ID; for manual origin it remains the
 distinct manual authority ID. No childless execution, debt, cycle,
 continuation, or retired-attempt value exists outside that one envelope.
 
@@ -1045,9 +1046,9 @@ subject closes the phase pairing:
 
 The module-defined `TAKEOVER_CHECKPOINT` is the sole intermediate pairing.
 It requires `role=RECONCILER`, `takeover_origin=FROM` with the source-equal immediate
-predecessor continuation ID/operation/stage, the current operation equal to
-that predecessor operation, and the no-call takeover mapping to match byte-for-
-byte. No external adapter accepts it. A later operation-specific
+predecessor continuation ID/operation/stage, the current operation source-equal
+to that predecessor operation, and a byte-identical no-call takeover mapping.
+No external adapter accepts it. A later operation-specific
 `STATE_MUTATION` permit must replace it with the module table's specified next arm
 before any call, and that arm/`CALL_RETURNED` checkpoint retains the origin.
 `role=ISSUER` instead requires `takeover_origin=NONE`; every noncheckpoint
@@ -1059,26 +1060,26 @@ below apply otherwise.
   and `POST_ACTION_CAPTURE`.
 - `TREE_CLOSURE_ACQUIRING` admits issuer `CLOSURE_ACQUIRE` or table-authorized
   reconciler `CLOSURE_RECONCILE`, each only at `ARMED`/`CALL_RETURNED`.
-  `TREE_CLOSURE_HELD` admits the exact acquire/reconcile `CALL_RETURNED`
+  `TREE_CLOSURE_HELD` admits the matching acquire/reconcile `CALL_RETURNED`
   checkpoint and its permit-bound next arm. A live issuer may arm `STOP_TREE`
   or release; a takeover reconciler may reconcile and, after matching `HELD`,
   may arm release but never teardown.
-- `TREE_CLOSURE_RELEASING` admits the exact acquire/reconcile/post-capture
+- `TREE_CLOSURE_RELEASING` admits the matching acquire/reconcile/post-capture
   `CALL_RETURNED` checkpoint, table-authorized reconciler
   `CLOSURE_RECONCILE/ARMED`, or `CLOSURE_RELEASE` at
   `ARMED`/`CALL_RETURNED`; no other continuation is valid.
 - `TEARDOWN_IN_FLIGHT` admits issuer `STOP_TREE` at
-  `ARMED`/`CALL_RETURNED`. Exact `STOP_TREE/CALL_RETURNED` may be replaced by
+  `ARMED`/`CALL_RETURNED`. Matching `STOP_TREE/CALL_RETURNED` may be replaced by
   `POST_ACTION_CAPTURE/ARMED`; its receipt moves to releasing. After takeover
   of that returned call, only reconciler `CLOSURE_RECONCILE` may be
   `ARMED`/`CALL_RETURNED`; matching `HELD` may next arm
   `POST_ACTION_CAPTURE`. Matching `RELEASED` instead finalizes conservatively as
   `EFFECT_UNPROVEN` without another external capture. Those capture arms and
   returned checkpoints require
-  the exact permit/receipt lineage and cannot arise from `STOP_TREE/ARMED`.
+  the matching permit/receipt lineage and cannot arise from `STOP_TREE/ARMED`.
 - `RETIRED_ATTEMPT` is source-equal to one retained tombstone. It is permitted while
   envelope execution is `IDLE` only for `RETIRED_ATTEMPT_RECONCILE`, its
-  `CALL_RETURNED` checkpoint, or exact `CLOSURE_RELEASE` of that tombstone's
+  `CALL_RETURNED` checkpoint, or matching `CLOSURE_RELEASE` of that tombstone's
   `RELEASE_PENDING` closure.
 - `SPAWN_RESERVATION` is source-equal to the childless reservation and is required
   for `SPAWN/ARMED` while execution is `SPAWN_IN_FLIGHT`. A typed spawn receipt
@@ -1086,7 +1087,7 @@ below apply otherwise.
   `AMBIGUOUS_LAUNCH`; that phase requires continuation `NONE`.
 
 `PRE_BARRIER` requires continuation `NONE`. Childless `IDLE` requires `NONE`
-except for the exact retired-attempt cleanup above, and every non-childless
+except for the matching retired-attempt cleanup above, and every non-childless
 state requires `NONE`. Every other phase/subject/operation/stage/origin pairing
 is invalid and `POLICY_HELD`.
 
@@ -1118,19 +1119,20 @@ shape is invalid and `POLICY_HELD`.
 The envelope's `retired_attempts` receives a
 `BoundRetiredChildlessAttemptV1` in the same checked transaction that finally
 releases its reservation. No external adapter accepts a raw retired ID.
-Its attempt revision and provider version are retained with its binding and
-typed cleanup state. Reconcile requires a `STATE_MUTATION` permit that installs
-an exact `RETIRED_ATTEMPT/RETIRED_ATTEMPT_RECONCILE/ARMED` continuation, a
+Its attempt revision and provider version are source-equal to those in its binding and
+are retained with typed cleanup state. Reconcile requires a `STATE_MUTATION` permit that installs
+a `RETIRED_ATTEMPT/RETIRED_ATTEMPT_RECONCILE/ARMED` continuation bound to that retired attempt, a
 fresh post-CAS `EXTERNAL_CALL` permit and typed call, then a fresh matching
-  receipt-derived `RECEIPT_MUTATION` permit preserving the call issuance.
+  receipt-derived `RECEIPT_MUTATION` permit whose call-issuance binding is
+  source-equal to the corresponding typed receipt.
   `NEVER_ACQUIRED`/`RELEASED` restores terminal state
   and clears the continuation; unexpected `HELD` persists
   `RELEASE_PENDING(closure_id)` with the reconcile continuation at
   `CALL_RETURNED`. A later `CLOSURE_RELEASE/STATE_MUTATION` permit replaces that
-  checkpoint with exact typed `CLOSURE_RELEASE/ARMED`; its release follows the
+  checkpoint with typed `CLOSURE_RELEASE/ARMED` bound to that retired attempt; its release follows the
   same three-stage sequence. A crash leaves the typed
 continuation and cleanup state inert for guarded takeover/reconciliation.
-Without each fresh permit, the envelope remains exactly retained and no call
+Without each fresh permit, the envelope is retained byte-identically and no call
 occurs; ordinary observation bookkeeping outside the envelope may still
 advance. Eviction follows checked commit-revision order and is permitted only
 by the same permit-bound finalization transaction that inserts a new terminal
@@ -1138,13 +1140,13 @@ attempt, when the evicted tombstone is `TERMINAL` and owns no continuation.
 There is no background or maintenance eviction; otherwise the set is full and
 named recovery holds.
 
-Every normal or reload result first requires the returned acquisition ID to
-equal the persisted attempt ID. In `TREE_CLOSURE_ACQUIRING`, the first
+Every normal or reload result first requires the returned acquisition ID to be
+source-equal to the persisted attempt ID. In `TREE_CLOSURE_ACQUIRING`, the first
 well-formed `HELD`/`RELEASED` may bind its non-null closure ID in the same
 checked transition; reload binding is release-only. After that binding, every
 `HELD`/`RELEASED` must be source-equal to the persisted pair. Null, mismatch,
-conflict, or unreadable reconciliation is `UNKNOWN`, retains the phase,
-reservation, debt, cycle, and current-attempt fields, and holds every action.
+conflict, or unreadable reconciliation is `UNKNOWN`, keeps the phase,
+reservation, debt, cycle, and current-attempt fields byte-identical, and holds every action.
 
 `SPAWN_IN_FLIGHT` requires a non-null deadline and a null spawned guard. In a
 childless envelope it also requires null childless attempt
@@ -1155,8 +1157,9 @@ is source-equal to `evidence.observed_guard` while its deadline is null.
 `IDENTITY_COMMIT_FAILED` requires that shared guard non-null;
 `START_RETURNED_WITHOUT_GUARD` and `CRASHED_DURING_SPAWN` require both copies
 null. Any other combination holds. A childless `SPAWN_IN_FLIGHT` or
-`AMBIGUOUS_LAUNCH` remains inside the same envelope and retains its exact inert
-executor binding. Manual origin never increments or failure-updates the
+`AMBIGUOUS_LAUNCH` remains inside the same envelope and retains its
+`ExactTargetExecutorBindingV1` byte-identically. Manual origin never increments
+or failure-updates the
 automatic cycle; an origin-neutral successful debt-clear may clear it. The
 module validates envelope execution, debt, cycle, continuation, and retired
 attempts as one checked value; an invalid pairing selects no action and
@@ -1301,8 +1304,8 @@ NonChildlessAuthorityDeltaV1 =
              field subset and values from the normative transition table;
              callers cannot construct a map or choose arbitrary values
   invariant: next recovery_execution is IDLE or NON_CHILDLESS
-  invariant: state_loss_quarantine is unchanged
-  invariant: configured_prior_effect_unknown_fence is unchanged except that
+  invariant: state_loss_quarantine is preserved byte-identically
+  invariant: configured_prior_effect_unknown_fence is preserved byte-identically except that
              PRIOR_EFFECT_FENCE_CLEAR may clear one matching non-null fence only
              with the matching committed-successor barrier custody specified
              below
@@ -1348,7 +1351,7 @@ AttendedConfiguredPreBarrierDispositionRequestV1 {
   expected_checkpoint_id: lowercase hyphenated UUID
   expected_hold_source_hash: Hex64 from the current operator-visible hold
   acknowledged_by: current operator-facing liaison or sole lead
-  acknowledgements: exactly ordered tuple[
+  acknowledgements: ordered tuple, in this order, [
     ACKNOWLEDGE_NO_LIVE_ISSUER,
     ACKNOWLEDGE_PRIOR_STOP_TREE_EFFECT_UNKNOWN,
     ACKNOWLEDGE_FRESH_OBSERVATION_REQUIRED
@@ -1364,7 +1367,7 @@ AttendedConfiguredPreBarrierDispositionDeltaV1 =
     precondition: request agent/epoch/revision/reservation/checkpoint are
                   source-equal to the current hold and request.expected_hold_source_hash
                   is source-equal to hold.source_hash
-    precondition: current recovery_execution is byte-identical to the hold's
+    precondition: current recovery_execution is source-equal to the hold's
                    NON_CHILDLESS/RESERVED/PRE_BARRIER value
     precondition: state_loss_quarantine is NONE
     precondition: configured_prior_effect_unknown_fence is null
@@ -1376,7 +1379,7 @@ AttendedConfiguredPreBarrierDispositionDeltaV1 =
                   values differ
     precondition: acknowledged_by resolves under the current configuration lock
                   to the operator-facing liaison or sole lead
-    allowed_updates: exactly
+    allowed_updates (closed list):
       recovery_execution = IDLE;
       recovery_poll_terminal_sequence = current ordinary_poll_sequence;
       child_dead_confirmation = {count: 0, basis_digest: null,
@@ -1389,8 +1392,8 @@ AttendedConfiguredPreBarrierDispositionDeltaV1 =
         new ConfiguredPriorEffectUnknownFenceV1 over the complete request/audit,
         checkpoint and its complete persisted #120 source target tuple,
         successor revision,
-        current epoch/current ordinary poll sequence, and freshness floor equal
-        to that same current epoch/sequence;
+        current epoch/current ordinary poll sequence, and freshness-floor fields
+        source-equal to that current epoch/sequence;
       revision = checked predecessor revision + 1
     invariant: every other ClassifierStateV1 field is preserved byte-identically
     invariant: the consumed reservation/absence proof is not restored and no
@@ -1530,7 +1533,7 @@ ConfiguredPriorEffectFenceClearanceResultV1 =
     custody_disposition: CLOSED
   }
   | POLICY_HELD_GATE {
-      fence: source-equal current ConfiguredPriorEffectUnknownFenceV1
+      fence: source-equal to current ConfiguredPriorEffectUnknownFenceV1
       gate: PriorEffectFenceClearanceGateHoldV1
       custody_disposition: CLOSED_FRESH_CAPTURE_REQUIRED
     }
@@ -1543,7 +1546,7 @@ ConfiguredPriorEffectFenceClearanceResultV1 =
       next_required_step: COMPLETE_ATTENDED_STATE_PROVENANCE_HANDLING
     }
   | POLICY_HELD_BARRIER {
-      fence: source-equal current ConfiguredPriorEffectUnknownFenceV1
+      fence: source-equal to current ConfiguredPriorEffectUnknownFenceV1
       barrier: PriorEffectFenceBarrierHoldV1
       custody_disposition: CLOSED_FRESH_CAPTURE_REQUIRED
     }
@@ -1552,7 +1555,7 @@ ConfiguredPriorEffectFenceClearanceResultV1 =
       custody_disposition: CLOSED_FRESH_CAPTURE_REQUIRED
     }
   | FAILED_PROVED_NO_COMMIT {
-      current_fence: source-equal current ConfiguredPriorEffectUnknownFenceV1
+      current_fence: source-equal to current ConfiguredPriorEffectUnknownFenceV1
       reason: CHECKED_MUTATION_REJECTED | PRE_COMMIT_EXCEPTION_PROVED_NO_WRITE
       custody_disposition: CLOSED_FRESH_CAPTURE_REQUIRED
       next_required_step: OBTAIN_FRESH_COMMITTED_CAPTURE
@@ -1599,7 +1602,7 @@ ChildlessOuterStateDeltaV1 =
                field subset and values; callers cannot construct a map or
                choose arbitrary values
     invariant: state_epoch, agent_key, ordinary_poll_sequence, and
-               state_loss_quarantine are unchanged; the
+               state_loss_quarantine are source-equal to their predecessor fields; the
                configured_prior_effect_unknown_fence is preserved byte-identically
   }
 
@@ -1611,7 +1614,7 @@ StateLossQuarantineCreationDeltaV1 =
   new_state_epoch: lowercase hyphenated UUID
   quarantine_id: lowercase hyphenated UUID distinct from new_state_epoch
   decision_now_epoch: finite nonnegative Unix seconds
-  replacement_state: complete ClassifierStateV1 with exactly:
+  replacement_state: complete ClassifierStateV1 with only:
     state_epoch = new_state_epoch; revision = 0; agent_key = current target;
     managed_generation = null; first_managed_epoch = decision_now_epoch;
     launch_grace_until = null; launching = false; readiness_seen = false;
@@ -1653,19 +1656,21 @@ AttendedCaptureSequenceRolloverRequestV1 {
 CaptureSequenceRolloverDeltaV1 =
   private, nonserializable, noncopyable, deeply immutable, alias-free #115
   checked-replacement result {
-    request: exact AttendedCaptureSequenceRolloverRequestV1
-    precondition: exact expected agent/epoch/revision/maximum sequence match
+    request: source-equal to the validated AttendedCaptureSequenceRolloverRequestV1 input
+    precondition: checked agent/epoch/revision/maximum-sequence values are
+                  source-equal to the request's expected values
     precondition: persisted recovery_execution == IDLE; a transient
                   EPHEMERAL_TERMINAL action owner is not persisted execution
     new_state_epoch: fresh lowercase hyphenated UUID distinct from old epoch
-    replacement_state: complete ClassifierStateV1 with exactly:
+    replacement_state: complete ClassifierStateV1 with only:
       state_epoch = new_state_epoch; revision = 0;
       agent_key, managed_generation, first_managed_epoch, launch_grace_until,
         launching, readiness_seen, consumed_manual_request_ids,
         state_loss_quarantine, and manual_readiness preserved byte-identically;
       configured_prior_effect_unknown_fence =
-        null when the predecessor field is null, otherwise the exact predecessor
-        fence with only freshness_floor_state_epoch = new_state_epoch and
+        null when the predecessor field is null, otherwise copy the predecessor
+        fence, preserving every other field byte-identically, with only
+        freshness_floor_state_epoch = new_state_epoch and
         freshness_floor_after_ordinary_poll_sequence = 0;
       ordinary_poll_sequence = 0; next_capture_ordinal = 1;
       recovery_poll_terminal_sequence = null;
@@ -1749,7 +1754,8 @@ transient observation handles.
 An ephemeral receipt application and rollover race through #115's checked-state
 compare-and-swap boundary. If rollover is visible at the dispatcher's final
 classifier-provenance read before plan ownership, the old binding is
-`REJECTED_NO_EFFECT(VARIANT_PROVENANCE_STALE)` and retains `next_entry`. Once
+`REJECTED_NO_EFFECT(VARIANT_PROVENANCE_STALE)` and preserves `next_entry`
+byte-identically. Once
 that read has passed, rollover may win during the post-read portion of
 `DISPATCHING`, or while the call is `PLAN_OWNED` or `INVOKING`; the invocation
 may proceed and no branch claims no effect merely because the eventual receipt
@@ -1767,7 +1773,7 @@ specified below. If rollover's checked-state CAS wins first, exactly one receipt
 moves `CONSUMING_RECEIPT -> CLOSED`, preserves the persisted `next_entry` byte-identically,
 and performs no old/new-epoch state write, archive, launch, or other receipt-
 driven behavior. If receipt application wins first, it returns `APPLIED`, closes
-the owner, and the original exact-revision rollover request returns
+the owner, and the original revision-bound rollover request returns
 `REJECTED_STALE_OR_INVALID`; a fresh exhaustion result and attended request
 against the successor revision are required. An unknown receipt-state commit
 outcome moves the owner to `POISONED(PLANNER_COMMIT_UNCERTAIN)`. A read-only
@@ -1795,16 +1801,17 @@ derivation or field application. A same-reference custody-handle alias or
 sequential replay loses without mutation. The winner validates the intact
 receipt seal, lineage, expected predecessor, prospective capture ID, and raw
 capture ID against the still-current predecessor. It derives one candidate
-observation successor whose sequence is exactly that begin-bound ID and the
-predecessor sequence plus one, copies the ID unchanged into
-`PrivateClassifierObservationMutationV1`, and derives continuity,
+observation successor whose `CaptureIdV1` is source-equal to that begin-bound ID
+and whose ordinary poll sequence is the predecessor sequence plus one, sets the
+`PrivateClassifierObservationMutationV1.capture_id` source-equal to that
+successor ID, and derives continuity,
 establishment guard, and every
 confirmation successor from the checked predecessor plus the receipt's raw
 operands. Commit never mints, replaces, reseals, or restamps a completed
 acquisition's `CaptureIdV1`. The owner applies the mutation before leaving that
 same transaction. A caller cannot submit that mutation or choose any derived
 field. The committed module overlay is reduced from the same receipt and never
-feeds or rewrites either banked child counter. It may advance exactly the
+feeds or rewrites either banked child counter. It may advance only the
 displayed fields while a childless executor is unavailable, but cannot alter
 `ChildlessEffectEnvelopeV1`, consumed manual IDs, `manual_readiness`,
 launch/backoff/readiness, marker/configuration state, allocate a nonordinary
@@ -1812,7 +1819,7 @@ effect capture, or write an effect terminal.
 
 When the checked predecessor carries a non-null configured prior-effect fence,
 #115 also fully constructs one dormant `CommittedOrdinaryFenceCaptureV1` and
-its separate use owner from that exact receipt, prospective successor revision,
+its separate use owner from that sealed receipt, prospective successor revision,
 and byte-identically preserved fence before the state compare-and-swap. Only the
 winning commit activates and publishes the witness after the successor is
 durably installed; a CAS loser activates no witness and returns none. Thus two lineages may
@@ -1848,7 +1855,7 @@ private constructor requires a fresh non-serializable
 `ExactTargetExecutorPermitV1` whose binding, operation scope, and expected
 revision match the current envelope, or whose `RESERVE` scope matches the
 absence of one. The permit-bound delta may change that envelope and only the
-exact `ChildlessOuterStateDeltaV1` projection named by the module's closed
+`ChildlessOuterStateDeltaV1` projection named by the module's closed
 transition.
 `StateLossQuarantineCreationDeltaV1` is the exclusive fail-closed state-loss
 constructor; it cannot compose with an observation, authority, or effect delta.
@@ -1890,8 +1897,8 @@ Revision 15 specifies one new attended operation,
 `dispose_configured_pre_barrier(AttendedConfiguredPreBarrierDispositionRequestV1)`.
 It is modeled only on the attended, no-effect, state-clearing posture of merged
 `agenttalk supervise --reset-process-tree-ownership`; that shipped command's
-conservative generic start-token fallback is neither exact-identity evidence
-nor disposal authority. The shipped command is not this new operation and does
+conservative generic start-token fallback is neither evidence from
+`ExactIssuerIdentityAdapterV1` nor disposal authority. The shipped command is not this new operation and does
 not already implement it. Before invoking it,
 the operator creates or preserves `supervisor.kill`, stops every project
 supervisor, and confirms the current singleton marker is absent. The operation
@@ -1915,7 +1922,7 @@ the same-poll terminal, resets only the displayed selection confirmations, and
 installs `ConfiguredPriorEffectUnknownFenceV1`; it never kills or launches.
 Afterward the system may assume only that the definitively absent issuer owns
 no reservation or action custody. The persistent fence records the complete
-request/audit binding, source-equal checkpoint, module-typed source targets,
+request/audit binding, a checkpoint source-equal to the disposed checkpoint, module-typed source targets,
 immutable prior-effect-unknown disposition, and
 current-epoch freshness floor. It globally blocks every configured or childless
 reservation/effect/launch; it cannot be replaced by another disposition. The
@@ -1929,7 +1936,7 @@ publishes `CommittedOrdinaryFenceCaptureV1`; #115's private deny-only reducer
 consumes that witness and yields the matching barrier-receipt custody. Private
 `PRIOR_EFFECT_FENCE_CLEAR` may remove the fence only from top-level `IDLE`
 when narrow fence-clearance eligibility is `ELIGIBLE`, current revision still
-equals the receipt's committed successor revision, and that receipt is clear for every
+matches the receipt's committed successor revision, and that receipt is clear for every
 source target/descendant and strictly newer than the current freshness floor.
 It never kills or launches. A blocked/ambiguous/unavailable receipt keeps
 `POLICY_HELD` and names attended target handling. Until the automatic retry
@@ -1979,7 +1986,7 @@ committed projection into an effect mutation. Authority and policy functions
 remain mutation-free. `decision_now_epoch` is the poll's one captured finite
 nonnegative UTC Unix-seconds value. The task #115 owner compares
 `(state_epoch, revision)`, commits with `revision + 1`, and makes a stale writer
-recapture/reduce or fail closed. State-loss creation instead compares the exact
+recapture/reduce or fail closed. State-loss creation instead compares the observed
 unavailable outer-state condition and atomically installs the complete displayed
 replacement at revision zero; no field from the unavailable state participates.
 The owner exposes no raw whole-state write and never lets a cached whole-state
@@ -1987,8 +1994,8 @@ save roll back a newer field. It returns only the committed read-only observatio
 projection and successor revision, never a resubmittable mutation. A dry-run
 may preview the same private equations and discard the output, but it consumes
 or poisons its receipt and exposes no commit-shaped value. A recovery plan binds
-to the committed successor revision and cannot execute if that exact
-transaction did not commit; it must reload/recapture rather than combine an old
+to the committed successor revision and cannot execute unless that
+transaction committed; it must reload/recapture rather than combine an old
 runtime/freshness result with newer absence or manual state.
 
 The module's ordinary residual observation is captured input only. Clearing
@@ -2057,7 +2064,7 @@ adapter progress exists, the normalized `updated_at` is the wrapper-published
 `active_age_grace_through_epoch_ms =
 active_record_updated_at_epoch_ms + 30000` using checked addition. The same
 transaction captures the applicable checked generation launch fence:
-`generation_launch_grace_until_epoch_ms` is the exact normalized
+`generation_launch_grace_until_epoch_ms` is source-equal to the normalized
 `launch_grace_until` only when the managed generation is the guard key's
 generation and checked state says `launching=true` and `readiness_seen=false`;
 otherwise it is null. A missing, malformed, generation-mismatched, or changing
@@ -2085,9 +2092,9 @@ and (
 )
 ```
 
-The active-record grace is therefore inclusive at exactly 30 seconds, while
-the generation launch fence is exclusive at its exact deadline, matching the
-shipped predicates. The closed variant retains both exact opening anchors and
+The active-record grace is therefore inclusive through the 30-second boundary,
+while the generation launch fence is exclusive at its stored deadline, matching
+the shipped predicates. The closed variant retains both opening anchors byte-identically and
 sets `close_evidence_epoch_ms` to the earliest integer millisecond satisfying
 that conjunction:
 `max(active_age_grace_through_epoch_ms + 1,
@@ -2108,13 +2115,13 @@ retained `OPEN` or `CLOSED` guard; missing or unreadable retained state is
 While the guard is `OPEN`, a complete zero-child capture is
 `UNKNOWN(CHILD_ESTABLISHMENT_OPEN)`, contributes
 `CURRENT_UNKNOWN_ACTIVE_CHILD`, and resets both the banked `CHILD_DEAD`
-counter and the module overlay. At exactly 30 seconds it remains open. If a
+counter and the module overlay. At the 30-second boundary it remains open. If a
 longer generation launch fence applies, two complete absences after 30 seconds
 but before that fence also remain open. The first capture at or after the
 exclusive launch-fence deadline is the first `ABSENT` sample only when the
 inclusive active-age grace has also ended. No pre-close capture carries into a
-closed confirmation. The complete closed guard object is copied into the
-module confirmation basis, reservation, and action-time equality; a key,
+closed confirmation. The module confirmation basis, reservation, and
+action-time guard fields are source-equal to the complete closed guard object; a key,
 result, either anchor, or close-evidence change vetoes the named action.
 
 Child-death confirmation increments only on qualifying consecutive
@@ -2127,7 +2134,7 @@ nonconforming.
 
 For either counter, `basis_digest` is SHA-256 over
 `agenttalk.supervisor.consecutive-evidence-basis.v1\0` plus
-`CanonicalJsonV1` of exactly:
+`CanonicalJsonV1` of the following closed object:
 
 ```text
 {
@@ -2145,9 +2152,10 @@ For either counter, `basis_digest` is SHA-256 over
 
 The config digest covers the canonical brain matcher, launcher-self policy,
 row schema, ancestry algorithm version, and start-guard schema. A qualifying
-capture has `capture_ordinal=0`. Replay of `last_capture_id` is unchanged. A
+capture has `capture_ordinal=0`. Replay leaves `last_capture_id` byte-identical. A
 distinct capture with the same basis advances only when its committed ordinary
-poll sequence is exactly one greater; a gap or changed basis restarts at count
+poll sequence equals the predecessor sequence plus one; a gap or changed basis
+restarts at count
 1. Nonqualifying evidence resets to `(0, null, null)`. Count 2 is the only
 confirmed value. Cached capture replay and stale re-reduction therefore cannot
 manufacture teardown proof.
@@ -2159,7 +2167,7 @@ manufacture teardown proof.
 `RecoveryConditionFingerprintV1`, never teardown, replacement, escalation, or
 policy gates.
 
-This exact counterexample is normative:
+This concrete counterexample is normative:
 
 ```text
 runtime.reasons = (
@@ -2201,7 +2209,7 @@ rejection, and top-level-object requirement. The envelope may inspect only
 (`src/agenttalk/wrapper_runtime.py:28` and
 `src/agenttalk/wrapper_runtime.py:302-321`).
 
-- Exact current version `1` enters the full closed-record validator. Unknown or
+- Current `schema_version == 1` enters the full closed-record validator. Unknown or
   missing keys there remain `INVALID_CONTRACT`.
 - A well-formed noncurrent version produces `UNSUPPORTED_CONTRACT` and exposes
   only that numeric version as bounded diagnostic evidence.
@@ -2361,8 +2369,8 @@ consumed only by `ActiveChildObservationV1`. Its allowed combinations mirror
 the three availability forms above: complete has the full normalized row tuple
 and no failure; unavailable has an empty row tuple and only
 `SNAPSHOT_UNAVAILABLE`; incomplete retains all safely representable rows and
-has only `OBSERVATION_INCONSISTENT`. A global raw snapshot acquisition failure
-is copied into both availability projections. A presence-only candidate parse,
+has only `OBSERVATION_INCONSISTENT`. Both availability projections carry a
+failure source-equal to a global raw snapshot acquisition failure. A presence-only candidate parse,
 recognition, ownership, or deduplication defect cannot alter the active-child
 projection; an active-child-only lineage/matcher defect cannot alter
 `availability`, `observer_reasons`, `candidates`, wrapper presence, or
@@ -2386,7 +2394,7 @@ unreadable or ambiguous. Known foreign evidence may be retained diagnostically
 outside `ProcessObservationV1.candidates`; it is neither authority evidence nor
 input to `RecoveryConditionFingerprintV1`.
 
-Before classification, the observer groups candidate rows by PID. Exact
+Before classification, the observer groups candidate rows by PID. Full-field-matching
 duplicates, including the same PID/start guard and every derived field, collapse
 to one candidate. Two rows for the same PID that disagree on start guard,
 agent/root match, shape, ownership, or failure-code tuple make the observation
@@ -2435,7 +2443,7 @@ No capture matches more than one state after this precedence. In particular:
 - an empty but incomplete capture is `UNKNOWN`, never `ABSENT`.
 
 `WrapperPresenceResultV1` also carries a deduplicated tuple of closed reason
-codes in this exact order:
+codes in the following prescribed order:
 
 1. `SNAPSHOT_UNAVAILABLE`
 2. `COVERAGE_INCOMPLETE`
@@ -2480,7 +2488,7 @@ TargetabilityProofV1 =
   | NO_TARGETS(capture_id)
 ```
 
-Each canonical target is exactly
+Each canonical target is the following closed object:
 `{"pid": <integer 1..4294967295>, "start_guard": <NFC UTF-8 string of at most
 128 bytes>}` and appears in the same canonical order as its relevant candidate.
 
@@ -2502,7 +2510,7 @@ immediately before termination (`src/agenttalk/supervisor.py:6073-6085`).
 
 `candidate_digest` is SHA-256 over the domain
 `agenttalk.supervisor.targetability-candidates.v1\0` followed by the complete,
-exact-deduplicated candidate sequence (not the first-eight diagnostic
+byte-identically deduplicated candidate sequence (not the first-eight diagnostic
 truncation) after the per-field bounds defined under
 `RecoveryConditionFingerprintV1`, each canonical object encoded as a four-byte
 big-endian length plus bytes.
@@ -2512,10 +2520,12 @@ big-endian length plus bytes.
 **ENFORCED by the
 [normative module](DESIGN-87A-owned-childless-wrapper-authority.md):** The
 87-A adapter maps a merged task #120 Windows `owned_process_tree_v2` snapshot
-into at most 64 exact PID/start/nonce-owned targets, requires exact FILETIME for
-every live row, and rejects every incomplete or incompatible snapshot. A valid
-Linux exact token remains observation/barrier input; no macOS exact-token
-mapping is declared. No non-Windows named path constructs a destructive
+into at most 64 `OwnedTreeTargetV1` values, each carrying an
+`OwnedExactStartGuardV1` and nonce ownership, requires
+`OwnedExactStartGuardV1` for every live row, and rejects every incomplete or
+incompatible snapshot. A valid Linux `linux:<boot_id>:<start_ticks>`
+process-identity token remains observation/barrier input; no macOS
+process-identity-token mapping is declared. No non-Windows named path constructs a destructive
 owner/target tuple or authority; with quarantine `NONE`, each fresh path returns
 `CAPABILITY_UNAVAILABLE(EXACT_TARGET_EXECUTOR_UNAVAILABLE)` before a fresh
 reservation. The adapter may persist only an inert
@@ -2532,7 +2542,7 @@ fail-closed path and has no automatic V1 retirement transition.
 The closure successor separately supplies the action-scoped
 non-destructive creation closure and effect-linearized adapters. Missing or
 unverifiable observation produces `OwnedWrapperTreeObservationV1.INCOMPLETE`;
-an unavailable exact executor or successor produces `CAPABILITY_UNAVAILABLE`;
+an unavailable target-executor witness or successor produces `CAPABILITY_UNAVAILABLE`;
 a name or pattern never supplies ownership.
 
 ## Physical absence and launch timing
@@ -2579,11 +2589,11 @@ physical; eligibility is temporal/policy evidence.
 **ENFORCED by one shared codec:** Every “canonical JSON” or “canonical
 serialized bytes” reference in 87-A means `CanonicalJsonV1`: values are limited
 to objects, arrays, strings, integers, Booleans, and null; strings are Unicode
-NFC; object keys sort by their NFC UTF-8 bytes; arrays preserve specified
+NFC; object keys sort by their NFC UTF-8 bytes; arrays emit elements in specified
 order; integers use shortest base-10 with no leading zero or plus sign; and
 `true`, `false`, and `null` are lowercase. There is no whitespace.
 
-String encoding is exact: printable ASCII is literal except `"` and `\`, which
+String encoding follows these byte-level rules: printable ASCII is literal except `"` and `\`, which
 use `\"` and `\\`; `/` is never escaped; backspace, tab, LF, form feed, and CR
 use `\b`, `\t`, `\n`, `\f`, and `\r`; other controls use lowercase
 `\u00xx`; and every non-ASCII code point uses lowercase four-hex-digit UTF-16
@@ -2607,7 +2617,7 @@ CaptureIdV1 {
 
 For an ordinary observation, #115 computes the prospective `CaptureIdV1` at
 begin from the checked predecessor and binds it into the private lineage before
-acquisition. The installed observer writes that exact ID into
+acquisition. The installed observer writes that source-equal ID into
 `ProcessObservationV1`. Persisted `ordinary_poll_sequence` advances only if the
 matching receipt wins commit; commit validates and preserves the ID rather than
 restamping the completed capture. A stale acquisition cannot be rebound to a
@@ -2623,7 +2633,7 @@ The checked owner resets `next_capture_ordinal=1` in the same transaction that
 increments `ordinary_poll_sequence`. Before every nonordinary closure,
 post-action, reload-reconciliation, or final-barrier capture, it atomically
 reserves the current value as that capture's ordinal and increments the stored
-value. The capture must use that exact reserved `CaptureIdV1`; a caller may not
+value. The capture's ID must be source-equal to that reserved `CaptureIdV1`; a caller may not
 invent or reuse an ordinal. `next_capture_ordinal=65536` is a typed incomplete
 hold until the next ordinary poll, never wraparound. Thus concurrent callers
 cannot assign the same nonzero ID, and every reload post-action or reconciliation
@@ -2653,7 +2663,7 @@ ObserverCoverageSignatureV1 {
 The initial value of every `*_schema` field is `1`; a semantic parser,
 recognition, row-shape, or PID/start-guard change increments its owning field.
 A new platform or process source requires `ObserverCoverageSignatureV2`.
-Equality is byte-for-byte equality of `CanonicalJsonV1` bytes. A version or capability
+Equality requires byte-identical `CanonicalJsonV1` bytes. A version or capability
 change is unequal even when both captures happen to be empty.
 
 ### Typed one-use confirmation
@@ -2696,7 +2706,7 @@ AbsenceConfirmationV1 {
 `launch_reservation_id` is a lowercase hyphenated UUID minted by the checked
 state owner. The optional guarded-launcher digest is SHA-256 over
 `agenttalk.supervisor.guarded-launcher-identity.v1\0` plus
-`CanonicalJsonV1` bytes of exactly:
+`CanonicalJsonV1` bytes for the following closed object:
 
 ```text
 {
@@ -2708,7 +2718,7 @@ state owner. The optional guarded-launcher digest is SHA-256 over
 It is null only when no guarded managed launcher identity exists. The
 recognition-config digest is SHA-256 over
 `agenttalk.supervisor.wrapper-recognition-config.v1\0` plus
-`CanonicalJsonV1` bytes of exactly:
+`CanonicalJsonV1` bytes for the following closed object:
 
 ```text
 {
@@ -2724,7 +2734,7 @@ a new `recognition_rules_schema` value before capture.
 
 `confirmation_id` is SHA-256 over the domain
 `agenttalk.supervisor.absence-confirmation.v1\0` plus `CanonicalJsonV1` bytes
-of exactly:
+for the following closed object:
 
 ```text
 {
@@ -2743,7 +2753,7 @@ of exactly:
 `latest_compatible_capture_id` is deliberately excluded so extension does not
 change the one-use proof identity.
 
-The binding tuple is exactly `(agent_key, state_epoch, managed_generation,
+The binding tuple comprises, in order, `(agent_key, state_epoch, managed_generation,
 guarded_launcher_identity_digest, recognition_config_digest, coverage)`.
 “Compatible” means field-for-field equality of that tuple.
 
@@ -2753,16 +2763,16 @@ guarded_launcher_identity_digest, recognition_config_digest, coverage)`.
 | --- | --- |
 | Any state + changed agent key, state epoch, managed generation, guarded launcher identity, recognition config, or coverage | Discard the prior state, then reduce the current input from `EMPTY`: a qualifying ordinary `ABSENT` becomes `OBSERVED_ONCE(input)`; every other input becomes `EMPTY`. |
 | `CONFIRMED` + atomic launch reservation | `CONSUMED(confirmation, reservation_id)`; retain the complete binding for later comparisons. |
-| Any state other than `CONFIRMED` + launch-reservation attempt | Refuse the reservation and leave state unchanged. |
+| Any state other than `CONFIRMED` + launch-reservation attempt | Refuse the reservation and leave state byte-identical. |
 | `CONSUMED` + successful launch whose new guarded managed identity is not yet atomically committed | Remain `CONSUMED`; success alone cannot revive the proof. |
 | `CONSUMED` + atomic commit of the new guarded managed identity | The binding-change rule above yields `EMPTY`. |
 | Any unconsumed state + `PRESENT_TARGETABLE`, `PRESENT_UNTARGETABLE`, `UNKNOWN`, unavailable/incomplete observation, or any other nonqualifying ordinary observation | `EMPTY`. |
 | `CONSUMED` + a nonqualifying observation under the same binding | Remain `CONSUMED`. |
 | `EMPTY` + qualifying ordinary `ABSENT` | `OBSERVED_ONCE(input)` |
-| `OBSERVED_ONCE` + replay of the same capture ID | Unchanged; never confirmed. |
-| `OBSERVED_ONCE` + a qualifying `ABSENT` from the next committed ordinary poll, distinct capture ID, and source-equal binding/coverage | `CONFIRMED(first, second)` |
+| `OBSERVED_ONCE` + replay of the same capture ID | State remains byte-identical; never confirmed. |
+| `OBSERVED_ONCE` + a qualifying `ABSENT` from the next committed ordinary poll, distinct capture ID, and matching binding/coverage | `CONFIRMED(first, second)` |
 | `OBSERVED_ONCE` + any other qualifying ordinary `ABSENT` | New `OBSERVED_ONCE(input)`; changed compatibility or a sequence gap cannot complete the old sample. |
-| `CONFIRMED` + replay of its first, second, or latest-compatible capture ID, or an older capture ID | Unchanged; replay cannot extend freshness. |
+| `CONFIRMED` + replay of its first, second, or latest-compatible capture ID, or an older capture ID | State remains byte-identical; replay cannot extend freshness. |
 | `CONFIRMED` + the next consecutive compatible ordinary `ABSENT` after `latest_compatible_capture_id` | Retain `confirmation_id`; advance `latest_compatible_capture_id`. |
 | `CONFIRMED` + any other qualifying ordinary `ABSENT` | New `OBSERVED_ONCE(input)`; changed compatibility or a sequence gap starts a new proof. |
 | `CONSUMED` + any qualifying ordinary `ABSENT` under the same binding | New `OBSERVED_ONCE(input)`; it is the first of two new polls. |
@@ -2771,7 +2781,7 @@ guarded_launcher_identity_digest, recognition_config_digest, coverage)`.
 “Consecutive” means adjacent committed `ordinary_poll_sequence` values for the
 same `agent_key` and `state_epoch`. Heartbeat, runtime-reason, and restart-marker
 changes do not reset physical evidence. A qualifying capture has
-the exact #115 begin-bound ordinal-zero `CaptureIdV1` validated unchanged at
+the source-equal #115 begin-bound ordinal-zero `CaptureIdV1` validated unchanged at
 commit, complete coverage, presence `ABSENT`, and the reducer's agent key and
 state epoch. Dry run and recovery-policy `HOLD` do not request a
 launch reservation and therefore do not consume.
@@ -2859,12 +2869,12 @@ fatal executor-state failure. The action issuer takes its shared read guard;
 shutdown/disabling takes the exclusive write guard. `report_membership` comes
 from one freshly validated report image and is `UNREADABLE` on read/schema
 failure. `auto_restart` comes from the same configuration-lock image used for
-manual authorization and is enabled only for exact Boolean `true`; a
+manual authorization and is enabled only for the Boolean value `true`; a
 read/schema failure is disabled.
 
 `snapshot_id` hashes
 `agenttalk.supervisor.execution-gate-snapshot.v1\0` plus `CanonicalJsonV1` of
-exactly:
+the following closed object:
 
 ```text
 {
@@ -2910,7 +2920,7 @@ The eligibility constructor then evaluates the displayed variant precedence:
 is clear; `SUPERVISOR_STOPPED` unless the instance is current;
 `ACTIONS_DISABLED` when the action latch is disabled or report/config capture
 is unreadable; `AGENT_NOT_REPORTED` for report absence;
-`AUTO_RESTART_DISABLED` unless exact Boolean true; otherwise `ELIGIBLE`. Only
+`AUTO_RESTART_DISABLED` unless the value is Boolean true; otherwise `ELIGIBLE`. Only
 `ELIGIBLE` may reserve/consume authority, mutate a restart marker, teardown,
 launch, seed managed identity, or update launch/backoff/readiness state.
 
@@ -3015,14 +3025,15 @@ them before any process-completion wait. A mismatch or noneligible result
 aborts the next action and records a typed veto. A non-childless action releases
 A no-kill non-childless reservation may release through its private
 `NonChildlessAuthorityDeltaV1` transition. A kill-bearing configured action may
-do so only in the original live invocation while the exact custody remains
+do so only in the original live invocation while the original source-bound custody remains
 `READY`, by atomically closing that custody as positive no-effect in the same
 checked commit. Custody unavailability, any later owner stage, or reload instead
 derives `ConfiguredPreBarrierOwnerLossHoldV1` and cannot release.
-A named childless pre-closure veto instead requires the exact
+A named childless pre-closure veto instead requires a matching
 `PRE_BARRIER_RELEASE/STATE_MUTATION` permit to remove its effect envelope,
 release its reservation, write its same-poll terminal, and consume no automatic
-attempt. Static executor unavailability retains the complete envelope; a stale
+attempt. Static executor unavailability preserves the complete envelope
+byte-identically; a stale
 revision reloads/re-reduces, and any other rejected private operand performs no
 mutation. Both branches leave any still-matching manual marker pending and any
 one-use absence proof consumed.
@@ -3035,14 +3046,15 @@ same enabled action-latch epoch under the latch read guard and separately
 requires the kill switch to remain clear. It retains the latch guard through
 issuance and preserves the private native body's final kill-switch check. A
 post-construction latch or kill-switch change consumes the call as a typed
-pre-effect rejection, preserves persisted `next_entry`, and produces no plan,
+pre-effect rejection, preserves persisted `next_entry` byte-identically, and produces no plan,
 raw array, or effect. The disabled-latch exception above is non-destructive
 fence cleanup and never authorizes this destructive ephemeral variant.
 If the kill switch changes after the outer check or plan construction but before
 the native body's final check, that body returns the invocation-bound typed
 `ACTIONS_DISABLED_NO_EFFECT` result before lexical raw-array materialization.
 The dispatcher consumes the call as
-`REJECTED_NO_EFFECT(FINAL_ACTION_GATE_CHANGED)`, retains `next_entry`, and
+`REJECTED_NO_EFFECT(FINAL_ACTION_GATE_CHANGED)`, preserves `next_entry`
+byte-identically, and
 produces no receipt, raw array, or effect.
 An exception while evaluating that gate or entering the private body maps to
 `NATIVE_ENTRY_FAILED_NO_EFFECT` only when the private wrapper positively proves
@@ -3065,7 +3077,7 @@ spawn; later recovery must rebuild ordinary absence proof.
 **SPECIFIED abrupt-death split for non-childless dispatch:** Transient action
 custody is not serialized and cannot itself prevent a restart retry. For
 `EPHEMERAL_TERMINAL`, retry after a new #115 checked transition is intentionally
-safe only for the exact Windows kill subphase proved by merged #120: null
+safe only for the Windows FILETIME-guarded kill subphase proved by merged #120: null
 `OpenProcess` for a gone PID is a no-op (`587e7c1:8908-8911`), a different
 creation FILETIME is refused (`8912-8913`), and the same FILETIME is the same
 process instance terminated through that validated handle (`8912-8921`). The
@@ -3133,7 +3145,8 @@ stale_uncertainty =
 escalation_required = recovery_blocked or stale_uncertainty
 ```
 
-`COMPLETE` already guarantees nonempty exact targets and positive start guards;
+`COMPLETE` already guarantees a nonempty `OwnedTreeTargetV1` tuple whose start
+guards are `OwnedExactStartGuardV1` values;
 the automatic equation must not reconstruct that invariant.
 
 ### Provably-childless owned-wrapper authority
@@ -3187,8 +3200,8 @@ rejects a directory, symlink/reparse point, or other non-regular file, and
 reads at most 16 KiB. Empty/oversized content is
 `PRESENT_INVALID(SIZE)`. It requires UTF-8 without BOM, a single JSON top-level
 object, and duplicate-key rejection. I/O or path-generation races are
-`UNREADABLE`, never `ABSENT`. An accepted object carries SHA-256 of its exact
-bytes as `revision_sha256`; reservation and compare-clear match both request ID
+`UNREADABLE`, never `ABSENT`. An accepted object carries SHA-256 of the captured
+source bytes as `revision_sha256`; reservation and compare-clear match both request ID
 and revision.
 
 Implementation has one private `capture_manual_marker_locked` primitive whose
@@ -3196,7 +3209,7 @@ precondition is “configuration lock held” and one public wrapper that acquir
 the lock. Write, reservation, and compare-clear call the private primitive;
 they never recursively acquire the non-reentrant configuration lock.
 
-**ENFORCED exact marker schema:** Unknown or missing keys are invalid.
+**ENFORCED closed marker schema:** Unknown or missing keys are invalid.
 
 ```text
 ManualRestartMarkerV1 {
@@ -3220,8 +3233,8 @@ ManualRestartMarkerV1 {
 }
 ```
 
-`AgentName` matches `\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\z`; marker `agent`
-equals the configured target. `RequestId` matches `\Arr-[0-9a-f]{12}\z`,
+`AgentName` matches `\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\z`; marker `agent` is
+source-equal to the configured target. `RequestId` matches `\Arr-[0-9a-f]{12}\z`,
 matching the current producer shape. `requested_by == authorized_by`;
 `authority_result == "authorized"`. `reason` is at most 1,024 UTF-8 bytes and
 contains no NUL. For each protection/acknowledgement triple, a false requested
@@ -3244,14 +3257,14 @@ issued_at_epoch_ms <= decision_now_epoch_ms + MAX_FUTURE_SKEW_MS_V1
 not_expired = decision_now_epoch_ms < expires_at_epoch_ms
 ```
 
-Both timestamps must be exact JSON integers (not Boolean), addition must not
+Both timestamps must be JSON integer values (not Boolean), addition must not
 overflow `uint64`, and both displayed relations must hold. Overflow, a
 mismatched expiry, or issue time beyond allowed future skew is
 `PRESENT_INVALID(TIMESTAMP)` and therefore `INVALID_HELD`; it never reaches the
 gate list as a valid marker. A structurally valid marker with
 `decision_now_epoch_ms >= expires_at_epoch_ms` is `EXPIRED_HELD`.
 
-The marker expires at the exact deadline. Five minutes is five times the
+The marker expires when decision time reaches the stored deadline. Five minutes is five times the
 maximum 60-second restart cooldown: it permits a bounded retry window without
 preserving destructive intent indefinitely. An expired marker remains a
 visible manual hold until removed or replaced; it cannot fall through to
@@ -3281,14 +3294,14 @@ For an available snapshot:
   validated roster, otherwise null;
 - `sole_lead` is the roster member whose role case-folds to `lead` only when
   exactly one such member exists, otherwise null; and
-- `protected` is true exactly when the target is `operator_facing` or any
+- `protected` is true iff the target is `operator_facing` or any
   roster member whose role case-folds to `lead`. Multiple leads therefore all
   remain protected even though `sole_lead` is null.
 
 These values come from the same configuration image as `auto_restart` and
 cannot come from a cached report Boolean. `snapshot_id` hashes the domain
 `agenttalk.supervisor.manual-authorization-snapshot.v1\0` plus
-`CanonicalJsonV1` of exactly:
+`CanonicalJsonV1` of the following closed object:
 
 ```text
 {
@@ -3386,7 +3399,7 @@ A protected confirmed-absence no-kill restart needs force authorization, but
 not acknowledgement of a kill that will not occur. Freshness alone never makes
 the live-kill acknowledgement applicable. Manual-wins origin selection does
 not weaken childless execution evidence: an overlapping authorized marker
-wraps the same initial-tree or debt-residual proof and exact action-time
+wraps the same initial-tree or debt-residual proof and the required action-time
 recapture. Outstanding debt is evaluated first and blocks every relaunch-only
 proof. With debt `NONE`, confirmed whole-wrapper absence is evaluated before
 the live-wrapper child-death kill gate, so manual and automatic origins retain
@@ -3416,7 +3429,7 @@ ManualMarkerDispositionV1 =
   | PENDING_AUTHORIZED(KILL_THEN_RELAUNCH | RELAUNCH_ONLY)
 ```
 
-Its `CanonicalJsonV1` form is exactly
+Its byte-identical `CanonicalJsonV1` form is
 `{"candidate": <action or null>, "reason": <reason enum or null>,
 "state": <variant name>}`. `reason` is non-null only for `INVALID_HELD` and
 `UNREADABLE_HELD`; `candidate` is non-null only for `PENDING_AUTHORIZED`.
@@ -3461,7 +3474,7 @@ origin = MANUAL_AUTHORIZED
 ```
 
 The authority ID is SHA-256 over
-`agenttalk.supervisor.manual-authority.v1\0` plus `CanonicalJsonV1` of exactly:
+`agenttalk.supervisor.manual-authority.v1\0` plus `CanonicalJsonV1` of the following closed object:
 
 ```text
 {
@@ -3481,7 +3494,7 @@ The authority ID is SHA-256 over
 Automatic origin outside the named owned-childless case uses
 `AutomaticAuthorityIdV1`, SHA-256 over
 `agenttalk.supervisor.automatic-authority.v1\0` plus `CanonicalJsonV1` of
-exactly:
+the following closed object:
 
 ```text
 {
@@ -3495,11 +3508,11 @@ exactly:
 }
 ```
 
-Automatic `PROVABLY_CHILDLESS_OWNED_WRAPPER` uses the module's separately
-domained proof `authority_id` as both selected authority ID and evidence ID.
+Automatic `PROVABLY_CHILDLESS_OWNED_WRAPPER` sets both selected authority ID
+and evidence ID source-equal to the module's separately domained proof `authority_id`.
 Manual-wins instead stores the manual authority ID as selected authority and
-the source-equal module proof ID as evidence. Either origin also copies the complete
-module `ChildlessReservationEvidenceV1` into the reservation; hashes are not
+the source-equal module proof ID as evidence. Either origin sets the reservation's
+complete `ChildlessReservationEvidenceV1` source-equal to the module evidence; hashes are not
 decoded to recover its owner, mode, basis, debt, or target tuple/digest. Their
 constructors and fields are disjoint; no implementation
 may compare the manual wrapper ID to the module proof ID or substitute the
@@ -3519,7 +3532,7 @@ envelope. Each external adapter accepts only
 `ChildlessExternalEffectReceiptV1`; raw IDs, targets, bindings, or persisted
 state cannot reach an effect.
 
-Reservation has the exact precondition
+Reservation has the following precondition:
 `recovery_poll_terminal_sequence != ordinary_poll_sequence` and either
 top-level `recovery_execution == IDLE` or
 `recovery_execution == CHILDLESS(envelope)` with envelope execution `IDLE`
@@ -3534,33 +3547,33 @@ fence permits ordinary observation and its private source-bound
 `AMBIGUOUS_LAUNCH` reject every new automatic or manual reservation without
 mutation, even after a CAS loser reloads and re-reduces. `manual_readiness` is
 orthogonal bookkeeping: `NONE` and `APPLIED_PENDING_READINESS` both permit a
-new reservation only under that same exact precondition; replacing that
+new reservation only under that same precondition; replacing that
 bookkeeping during a later launch cannot make its consumed request ID reusable.
 
-| Transition | Exact delta |
+| Transition | Normative delta |
 | --- | --- |
-| Refused/held | Retain marker/revision. Do not reserve, consume, kill, launch, reset readiness, or mutate automatic backoff. |
+| Refused/held | Preserve marker/revision byte-identically. Do not reserve, consume, kill, launch, reset readiness, or mutate automatic backoff. |
 | Irrecoverable checked-state loss | Dry run returns only a simulated `STATE_PROVENANCE_LOST`/`POLICY_HELD` result. Otherwise apply only `StateLossQuarantineCreationDeltaV1`: create a new epoch with `StateLossQuarantineV1.UNRESOLVED`, select `STATE_PROVENANCE_LOST`, emit mandatory attention, and deny every kill, launch, closure, authority-enabling/effect-owned mutation, marker consumption, identity commit, and grace recovery. Construct no childless envelope, permit, usable debt/cycle, or attempt budget. V1 has no automatic retirement constructor; a valid backup or local extinction is not restoration proof. |
-| Maximum ordinary capture sequence | Ordinary begin returns exact `ATTENDED_REQUIRED(CaptureSequenceExhaustionV1)` before acquisition and performs no mutation or action. An attended request may apply `CAPTURE_SEQUENCE_ROLLOVER` only through #115's checked compare-and-swap from the exact maximum-sequence top-level `IDLE` predecessor, installing the displayed fresh-epoch replacement. Any stale request, non-childless execution, or childless envelope/debt/cycle/continuation/retired attempt returns the typed rejection/blocker and leaves the complete checked state byte-identical. |
-| Childless capability or exact executor unavailable | A missing `ClosureCapabilityV1` or permit construction result `CAPABILITY_UNAVAILABLE` cannot construct `ChildlessEffectEnvelopeV1` for a fresh reservation, `ExactTargetExecutorPermitV1` for persisted state, any permit-bound mutation, executable target/call, or receipt-consuming transition. Preserve an existing envelope exactly, allow only the separate #115 owner-private observation mutation, emit continuous `CAPABILITY_UNAVAILABLE`, and remain `POLICY_HELD`. This never becomes `CLOSURE_VETOED`, retry, or exhaustion. |
+| Maximum ordinary capture sequence | Ordinary begin returns the typed `ATTENDED_REQUIRED(CaptureSequenceExhaustionV1)` before acquisition and performs no mutation or action. An attended request may apply `CAPTURE_SEQUENCE_ROLLOVER` only through #115's checked compare-and-swap from a matching maximum-sequence top-level `IDLE` predecessor, installing the displayed fresh-epoch replacement. Any stale request, non-childless execution, or childless envelope/debt/cycle/continuation/retired attempt returns the typed rejection/blocker and leaves the complete checked state byte-identical. |
+| Childless capability or target-executor witness unavailable | A missing `ClosureCapabilityV1` or permit construction result `CAPABILITY_UNAVAILABLE` cannot construct `ChildlessEffectEnvelopeV1` for a fresh reservation, `ExactTargetExecutorPermitV1` for persisted state, any permit-bound mutation, executable target/call, or receipt-consuming transition. Preserve an existing envelope byte-identically, allow only the separate #115 owner-private observation mutation, emit continuous `CAPABILITY_UNAVAILABLE`, and remain `POLICY_HELD`. This never becomes `CLOSURE_VETOED`, retry, or exhaustion. |
 | Childless permit rejected | A stale checked revision reloads/re-reduces. A copied, replayed, consumed, wrong-use, mismatched, or invalid-scope private operand is rejected with zero mutation/call and never becomes operator-facing `CAPABILITY_UNAVAILABLE`. Malformed checked state follows the invalid-fence row instead. |
-| Prior-effect fence reconciliation | From top-level `IDLE` with a non-null fence, the winning ordinary-observation commit may publish one `CommittedOrdinaryFenceCaptureV1`; a same-predecessor CAS loser publishes none. #115's unexported deny-only reducer consumes that witness and applies merged #120 rules over its sealed capture and module-typed fence targets. Every clearance custody first requires the sole `RECEIPT -> COMMITTING` winner; losers read no state. Only a matching `CLEAR` winner bound to the source-equal current committed revision, capture epoch at the freshness-floor epoch, and sequence strictly above its floor may construct private `NonChildlessAuthorityDeltaV1(PRIOR_EFFECT_FENCE_CLEAR)` and atomically clear. Blocked/ambiguous/unavailable receipts return their corresponding closed `POLICY_HELD_BARRIER` variant; dry-run/kill-switch/supervisor gates return `POLICY_HELD_GATE`; untrustworthy state, stale/mismatched input, proved no-commit failure, replay, and state-CAS outcome uncertainty use their separate closed result and custody disposition. Deterministic no-commit outcomes over a trustworthy current fence preserve it; provenance loss, replay losers, and an outcome-unknown state CAS claim neither preservation nor clearance until checked reread reconciliation. This row constructs no action custody, reservation, permit, kill, spawn, archive, identity commit, or launch. |
-| Reserve selected authority | Only with `configured_prior_effect_unknown_fence=null`, a non-childless selection from top-level `IDLE` records `NON_CHILDLESS/RESERVED/PRE_BARRIER`. For a kill-bearing configured relaunch/stuck-recovery action, that same winning #115 checked transition atomically yields exactly one `ConfiguredOwnedTreeActionCommitV1` with its owner in `READY`; a no-kill selection yields no dispatch custody. A childless selection requires `ClosureCapabilityV1.AVAILABLE` and consumes its one-shot `RESERVE` permit. `INITIAL` creates the complete envelope/binding. `CONTINUE` starts from childless `IDLE`: initial-mode retry may atomically rebind only the fresh target tree for the same source-bound owner while preserving cycle and terminal historical tombstones; a physically different owner must first use `OWNER_TRANSITION` and a later `INITIAL`. Debt completion must retain the immutable envelope/debt binding and source-equal residual subset. Both enter `RESERVED/PRE_BARRIER` with null spawn guard/deadline/attempt/revision/closure/pending disposition; neither is allowed with a continuation or `RELEASE_PENDING` tombstone. The live witness, permit, and action custody are not persisted. Consume the selected proof according to its mode; retain the separate module confirmation for live equality. Do not add a manual request ID to the consumed set. |
-| Begin childless closure acquisition | Acquire the exclusive effect guard, live-recompute the reservation/binding, and consume a `CLOSURE_ACQUIRE/STATE_MUTATION` permit to commit `TREE_CLOSURE_ACQUIRING` plus the exact `ACTIVE_ATTEMPT/CLOSURE_ACQUIRE/ARMED` continuation. At the successor revision construct a distinct fresh `CLOSURE_ACQUIRE/EXTERNAL_CALL` permit, then invoke the typed closure call while retaining the guard. Apply its receipt only through a third fresh receipt-derived `RECEIPT_MUTATION` permit preserving the call issuance. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin leaves the cycle unchanged. Preserve existing debt. |
-| Childless closure transiently absent/blocked | Only after the current-host executor gate passes, under the same guard, a conforming transient refusal plus terminal matching `NEVER_ACQUIRED`, or matching `RELEASED` while still acquiring, retires the attempt and finalizes `CLOSURE_VETOED`. A reload-held closure, live joined-evidence mismatch, or late execution/manual/policy veto commits `TREE_CLOSURE_RELEASING/CLOSURE_VETOED`; exact release/reconcile calls each use the effect guard and finalize only after matching `RELEASED`. `HELD`, `UNKNOWN`, a live foreign continuation, or current-host executor unavailability retains every fence. A post-reservation structural-unavailability claim from the successor remains malformed; the independently reconstructed current-host unavailable fact uses the prior row. No kill or launch occurs. |
-| Childless closure held | Only a matching permit plus the fresh raw-capture/live-basis/target-equality join may construct the mutation to `TREE_CLOSURE_HELD`, bind its closure ID, and apply the matching acquire/reconcile receipt at `CALL_RETURNED`. A later operation-specific `STATE_MUTATION` permit replaces that checkpoint atomically with `STOP_TREE/ARMED` or `CLOSURE_RELEASE/ARMED`; the receipt permit cannot arm the next call. Preserve existing debt and cycle count. |
-| Childless teardown action-ready | Under the effect guard, consume a `STOP_TREE/STATE_MUTATION` permit to enter `TEARDOWN_IN_FLIGHT`, create/update origin-neutral debt, and arm the exact continuation. At the successor revision, only a distinct fresh `STOP_TREE/EXTERNAL_CALL` permit can construct `ExecutableOwnedTargetSetV1` and invoke the typed call. A third fresh receipt-derived mutation permit preserving that call issuance applies its receipt to enter `CALL_RETURNED`; a stale/nonowner caller, consumed permit, or raw persisted value cannot invoke/apply the adapter. Exact invocation-bound `NATIVE_ENTRY_FAILED_NO_EFFECT` returns one successor custody and retains `ARMED`; an uncertain/maybe-crossed native-effect frontier poisons the lineage and retains the fence. |
-| Childless post-action observation | A `POST_ACTION_CAPTURE/STATE_MUTATION` permit and exact `STOP_TREE/CALL_RETURNED` fact reserve the next nonordinary ordinal and arm the typed capture. A distinct fresh post-CAS call permit obtains the observation receipt; a third fresh receipt-derived mutation permit preserving that call issuance maps it and enters `TREE_CLOSURE_RELEASING` with `POST_ACTION_CAPTURE/CALL_RETURNED` while retaining debt/current attempt and automatic `ISSUED`. Only a later `CLOSURE_RELEASE/STATE_MUTATION` permit arms typed release, which then repeats the three-stage pattern. |
-| Childless exact-release finalization | A matching permit, effect guard, and exact `RELEASED` receipt are required to apply the module event table, clear current-attempt fields, record failure/exhaustion, retire the attempt, release the reservation, clear the continuation, or clear debt/cycle. For reload/takeover retained `STOP_TREE/CALL_RETURNED`, a matching `CLOSURE_RECONCILE` receipt that proves `RELEASED` finalizes conservatively as `EFFECT_UNPROVEN`, enters childless `IDLE`, retains debt, and makes no residual-capture call; the next ordinary poll may clear debt only through the module's debt-only finalize scope. Live `COMPLETE_GONE` after a typed post-action capture may normalize within the same envelope to `PRE_BARRIER`; other reload cleanup enters envelope execution `IDLE` without launch. Every finalized branch writes the same-poll terminal through a permit-bound mutation. |
-| Ephemeral terminal action becomes exact | The winning #115 checked COMPLETE/TIMEOUT/FAILED transition persists the exact `next_entry` and atomically yields one `EphemeralTerminalActionCommitV1` with its action owner in `READY`. A stale CAS loser and every replay of the same transition yield no custody. Only the private call constructor's `READY -> CALL` winner may submit the kill; persisted `next_entry` and request/action provenance alone remain inert. |
-| Non-childless no-kill veto | A reservation that minted no action custody may release through its private `PRE_BARRIER_RELEASE` delta. Retain any marker and leave launch/readiness/backoff fields unchanged. A reserved no-kill absence proof remains consumed. |
+| Prior-effect fence reconciliation | From top-level `IDLE` with a non-null fence, the winning ordinary-observation commit may publish one `CommittedOrdinaryFenceCaptureV1`; a same-predecessor CAS loser publishes none. #115's unexported deny-only reducer consumes that witness and applies merged #120 rules over its sealed capture and module-typed fence targets. Every clearance custody first requires the sole `RECEIPT -> COMMITTING` winner; losers read no state. Only a matching `CLEAR` winner whose committed revision is source-equal to the current revision, whose capture epoch is at the freshness-floor epoch, and whose sequence is strictly above its floor may construct private `NonChildlessAuthorityDeltaV1(PRIOR_EFFECT_FENCE_CLEAR)` and atomically clear. Blocked/ambiguous/unavailable receipts return their corresponding closed `POLICY_HELD_BARRIER` variant; dry-run/kill-switch/supervisor gates return `POLICY_HELD_GATE`; untrustworthy state, stale/mismatched input, proved no-commit failure, replay, and state-CAS outcome uncertainty use their separate closed result and custody disposition. Deterministic no-commit outcomes over a trustworthy current fence preserve it byte-identically; provenance loss, replay losers, and an outcome-unknown state CAS claim neither preservation nor clearance until checked reread reconciliation. This row constructs no action custody, reservation, permit, kill, spawn, archive, identity commit, or launch. |
+| Reserve selected authority | Only with `configured_prior_effect_unknown_fence=null`, a non-childless selection from top-level `IDLE` records `NON_CHILDLESS/RESERVED/PRE_BARRIER`. For a kill-bearing configured relaunch/stuck-recovery action, that same winning #115 checked transition atomically yields exactly one `ConfiguredOwnedTreeActionCommitV1` with its owner in `READY`; a no-kill selection yields no dispatch custody. A childless selection requires `ClosureCapabilityV1.AVAILABLE` and consumes its one-shot `RESERVE` permit. `INITIAL` creates the complete envelope/binding. `CONTINUE` starts from childless `IDLE`: initial-mode retry may atomically rebind only the fresh target tree for the same source-bound owner while preserving cycle and terminal historical tombstones byte-identically; a physically different owner must first use `OWNER_TRANSITION` and a later `INITIAL`. Debt completion keeps the immutable envelope/debt binding source-equal to its predecessor and retains the residual subset whose members are source-equal to the corresponding authorized tuple members. Both enter `RESERVED/PRE_BARRIER` with null spawn guard/deadline/attempt/revision/closure/pending disposition; neither is allowed with a continuation or `RELEASE_PENDING` tombstone. The live witness, permit, and action custody are not persisted. Consume the selected proof according to its mode; preserve the separate module confirmation byte-identically for a live match. Do not add a manual request ID to the consumed set. |
+| Begin childless closure acquisition | Acquire the exclusive effect guard, live-recompute the reservation/binding, and consume a `CLOSURE_ACQUIRE/STATE_MUTATION` permit to commit `TREE_CLOSURE_ACQUIRING` plus the `ACTIVE_ATTEMPT/CLOSURE_ACQUIRE/ARMED` continuation bound to that active attempt. At the successor revision construct a distinct fresh `CLOSURE_ACQUIRE/EXTERNAL_CALL` permit, then invoke the typed closure call while retaining the guard. Apply its receipt only through a third fresh receipt-derived `RECEIPT_MUTATION` permit whose call-issuance binding is source-equal to that receipt. Automatic origin creates/increments `ACTIVE/ISSUED`; manual origin leaves the cycle byte-identical. Preserve existing debt byte-identically. |
+| Childless closure transiently absent/blocked | Only after the current-host executor gate passes, under the same guard, a conforming transient refusal plus terminal matching `NEVER_ACQUIRED`, or matching `RELEASED` while still acquiring, retires the attempt and finalizes `CLOSURE_VETOED`. A reload-held closure, live joined-evidence mismatch, or late execution/manual/policy veto commits `TREE_CLOSURE_RELEASING/CLOSURE_VETOED`; matching release/reconcile calls each use the effect guard and finalize only after matching `RELEASED`. `HELD`, `UNKNOWN`, a live foreign continuation, or current-host executor unavailability preserves every fence byte-identically. A post-reservation structural-unavailability claim from the successor remains malformed; the independently reconstructed current-host unavailable fact uses the prior row. No kill or launch occurs. |
+| Childless closure held | Only a matching permit plus the fresh raw-capture/live-basis/target-matching join may construct the mutation to `TREE_CLOSURE_HELD`, bind its closure ID, and apply the matching acquire/reconcile receipt at `CALL_RETURNED`. A later operation-specific `STATE_MUTATION` permit replaces that checkpoint atomically with `STOP_TREE/ARMED` or `CLOSURE_RELEASE/ARMED`; the receipt permit cannot arm the next call. Preserve existing debt and cycle count byte-identically. |
+| Childless teardown action-ready | Under the effect guard, consume a `STOP_TREE/STATE_MUTATION` permit to enter `TEARDOWN_IN_FLIGHT`, create/update origin-neutral debt, and arm the matching continuation. At the successor revision, only a distinct fresh `STOP_TREE/EXTERNAL_CALL` permit can construct `ExecutableOwnedTargetSetV1` and invoke the typed call. A third fresh receipt-derived mutation permit whose call-issuance binding is source-equal to that receipt applies it to enter `CALL_RETURNED`; a stale/nonowner caller, consumed permit, or raw persisted value cannot invoke/apply the adapter. The invocation-bound typed `NATIVE_ENTRY_FAILED_NO_EFFECT` result returns one successor custody and preserves `ARMED` byte-identically; an uncertain/maybe-crossed native-effect frontier poisons the lineage and preserves the fence byte-identically. |
+| Childless post-action observation | A `POST_ACTION_CAPTURE/STATE_MUTATION` permit and matching `STOP_TREE/CALL_RETURNED` fact reserve the next nonordinary ordinal and arm the typed capture. A distinct fresh post-CAS call permit obtains the observation receipt; a third fresh receipt-derived mutation permit whose call-issuance binding is source-equal to that receipt maps it and enters `TREE_CLOSURE_RELEASING` with `POST_ACTION_CAPTURE/CALL_RETURNED` while preserving debt/current attempt and automatic `ISSUED` byte-identically. Only a later `CLOSURE_RELEASE/STATE_MUTATION` permit arms typed release, which then repeats the three-stage pattern. |
+| Childless matching-release finalization | A matching permit, effect guard, and typed `RELEASED` receipt are required to apply the module event table, clear current-attempt fields, record failure/exhaustion, retire the attempt, release the reservation, clear the continuation, or clear debt/cycle. For reload/takeover retained `STOP_TREE/CALL_RETURNED`, a matching `CLOSURE_RECONCILE` receipt that proves `RELEASED` finalizes conservatively as `EFFECT_UNPROVEN`, enters childless `IDLE`, keeps debt outstanding, and makes no residual-capture call; the next ordinary poll may clear debt only through the module's debt-only finalize scope. Live `COMPLETE_GONE` after a typed post-action capture may normalize within the same envelope to `PRE_BARRIER`; other reload cleanup enters envelope execution `IDLE` without launch. Every finalized branch writes the same-poll terminal through a permit-bound mutation. |
+| Ephemeral terminal action becomes committed | The winning #115 checked COMPLETE/TIMEOUT/FAILED transition persists the source-equal `next_entry` and atomically yields one `EphemeralTerminalActionCommitV1` with its action owner in `READY`. A stale CAS loser and every replay of the same transition yield no custody. Only the private call constructor's `READY -> CALL` winner may submit the kill; persisted `next_entry` and request/action provenance alone remain inert. |
+| Non-childless no-kill veto | A reservation that minted no action custody may release through its private `PRE_BARRIER_RELEASE` delta. Preserve any marker and launch/readiness/backoff fields byte-identically. A reserved no-kill absence proof remains consumed. |
 | Kill-bearing configured live-invocation veto | Only while the captured issuer is positively live and its action custody remains `READY`, atomically close that custody as typed no-effect and apply private `PRE_BARRIER_RELEASE` in the same #115 commit. Both happen or neither; no call, plan, or effect is constructed. |
-| Kill-bearing configured issuer unavailable/reload | Derive `ConfiguredPreBarrierOwnerLossHoldV1` with current extinction status. Preserve reservation/checkpoint/barrier/targets and prior-effect unknown. No generic release, custody remint, second reserve, kill, or launch exists. Only the GONE-only attended disposition or optional future `ConfiguredPreBarrierRetrySuccessorV1` can leave this hold. |
-| Childless final-barrier veto at `PRE_BARRIER` | Consume a fresh matching `PRE_BARRIER_RELEASE/STATE_MUTATION` permit to release/remove the childless envelope and write the terminal. Static executor unavailability retains the complete envelope and remains `POLICY_HELD`; a stale/replayed/mismatched constructor is `REJECTED` and reloads/re-reduces with the envelope unchanged. No generic/direct release path exists. |
-| Barrier passed, immediately before spawn | Require `configured_prior_effect_unknown_fence=null` for every origin. When #120 owned-tree state or post-kill provenance applies, require its fresh deny-only launch barrier to be unblocked and unambiguous. A blocked/ambiguous result retains the hold and cannot clear debt. For childless origin, consume `SPAWN/STATE_MUTATION` to update the exact outer projection, enter envelope `SPAWN_IN_FLIGHT`, and install `SPAWN_RESERVATION/SPAWN/ARMED`; at the successor revision a distinct fresh `SPAWN/EXTERNAL_CALL` permit is the only constructor for `Start-Process`. Non-childless origin uses its private typed delta/call. The childless envelope and inert binding remain present through the call and any ambiguity. |
-| Proven no-spawn failure | Only an OS/API result that positively proves no child was created may set `launching=false`, release reservation, retain any marker and attempt/backoff bookkeeping, preserve prior guarded identity, clear the pending deadline, and record the typed failure result. For childless origin, the matching typed receipt and a fresh receipt-derived `SPAWN_RESULT_COMMIT/RECEIPT_MUTATION` permit preserving the call issuance are mandatory. Timeout, exception, lost return, or any uncertain post-issuance effect enters `AMBIGUOUS_LAUNCH` instead. |
-| Spawn returned but guarded identity is ambiguous | For childless origin, consume a fresh receipt-derived `SPAWN_RESULT_COMMIT/RECEIPT_MUTATION` permit that preserves the matching typed spawn receipt's call issuance and persist `AMBIGUOUS_LAUNCH` with continuation `NONE`, the complete envelope reservation, null pending deadline, and `ambiguity_boundary_poll_sequence=ordinary_poll_sequence`; reset `absence_confirmation` to `EMPTY`. For `IDENTITY_COMMIT_FAILED`, copy the returned non-null `SpawnGuardV1` identically into `reservation.spawned_guard` and `evidence.observed_guard`; for `START_RETURNED_WITHOUT_GUARD`, keep both null. The receipt-free crash conversion instead requires the module's persisted SPAWN issuer subject plus positive dead-issuer scope. Non-childless origin uses its private typed transition. Do not release authority ownership or permit another launch. |
-| New guarded identity commits | In one checked transaction replace the managed identity, reset the establishment guard, and update launch/readiness state. `GuardedLaunchCommitV1` is inert checkpoint input only. For childless spawn origin, only the matching typed spawn receipt + checkpoint + fresh receipt-derived `SPAWN_IDENTITY_COMMIT/RECEIPT_MUTATION` permit preserving the call issuance may construct the mutation and remove the envelope, after debt is `NONE`, no closure remains, and all retired-attempt obligations are terminal; the spawn continuation is consumed by that same commit. A physically different guarded owner observed outside that spawn may clear an old-owner `IDLE` envelope/cycle only through the module's state-only `OWNER_TRANSITION` permit with the same no-debt/no-obligation predicates. Non-childless origin returns directly to top-level `IDLE`. Manual spawn origin also records its consumed request and pending readiness. |
+| Kill-bearing configured issuer unavailable/reload | Derive `ConfiguredPreBarrierOwnerLossHoldV1` with current extinction status. Preserve reservation/checkpoint/barrier/targets and prior-effect-unknown fields byte-identically. No generic release, custody remint, second reserve, kill, or launch exists. Only the GONE-only attended disposition or optional future `ConfiguredPreBarrierRetrySuccessorV1` can leave this hold. |
+| Childless final-barrier veto at `PRE_BARRIER` | Consume a fresh matching `PRE_BARRIER_RELEASE/STATE_MUTATION` permit to release/remove the childless envelope and write the terminal. Static executor unavailability preserves the complete envelope byte-identically and remains `POLICY_HELD`; a stale/replayed/mismatched constructor is `REJECTED` and reloads/re-reduces with the envelope byte-identical. No generic/direct release path exists. |
+| Barrier passed, immediately before spawn | Require `configured_prior_effect_unknown_fence=null` for every origin. When #120 owned-tree state or post-kill provenance applies, require its fresh deny-only launch barrier to be unblocked and unambiguous. A blocked/ambiguous result preserves the hold byte-identically and cannot clear debt. For childless origin, consume `SPAWN/STATE_MUTATION` to update the module-named `ChildlessOuterStateDeltaV1` projection, enter envelope `SPAWN_IN_FLIGHT`, and install `SPAWN_RESERVATION/SPAWN/ARMED`; at the successor revision a distinct fresh `SPAWN/EXTERNAL_CALL` permit is the only constructor for `Start-Process`. Non-childless origin uses its private typed delta/call. The childless envelope and inert binding remain byte-identical through the call and any ambiguity. |
+| Proven no-spawn failure | Only an OS/API result that positively proves no child was created may set `launching=false`, release reservation, preserve any marker, attempt/backoff bookkeeping, and prior guarded identity byte-identically, clear the pending deadline, and record the typed failure result. For childless origin, the matching typed receipt and a fresh receipt-derived `SPAWN_RESULT_COMMIT/RECEIPT_MUTATION` permit whose call-issuance binding is source-equal to that receipt are mandatory. Timeout, exception, lost return, or any uncertain post-issuance effect enters `AMBIGUOUS_LAUNCH` instead. |
+| Spawn returned but guarded identity is ambiguous | For childless origin, consume a fresh receipt-derived `SPAWN_RESULT_COMMIT/RECEIPT_MUTATION` permit whose call-issuance binding is source-equal to the matching typed spawn receipt and persist `AMBIGUOUS_LAUNCH` with continuation `NONE`, the complete envelope reservation, null pending deadline, and `ambiguity_boundary_poll_sequence=ordinary_poll_sequence`; reset `absence_confirmation` to `EMPTY`. For `IDENTITY_COMMIT_FAILED`, set `reservation.spawned_guard` and `evidence.observed_guard` source-equal to the returned non-null `SpawnGuardV1`; for `START_RETURNED_WITHOUT_GUARD`, keep both null. The receipt-free crash conversion instead requires the module's persisted SPAWN issuer subject plus positive dead-issuer scope. Non-childless origin uses its private typed transition. Do not release authority ownership or permit another launch. |
+| New guarded identity commits | In one checked transaction replace the managed identity, reset the establishment guard, and update launch/readiness state. `GuardedLaunchCommitV1` is inert checkpoint input only. For childless spawn origin, only the matching typed spawn receipt + checkpoint + fresh receipt-derived `SPAWN_IDENTITY_COMMIT/RECEIPT_MUTATION` permit whose call-issuance binding is source-equal to that receipt may construct the mutation and remove the envelope, after debt is `NONE`, no closure remains, and all retired-attempt obligations are terminal; the spawn continuation is consumed by that same commit. A physically different guarded owner observed outside that spawn may clear an old-owner `IDLE` envelope/cycle only through the module's state-only `OWNER_TRANSITION` permit with the same no-debt/no-obligation predicates. Non-childless origin returns directly to top-level `IDLE`. Manual spawn origin also records its consumed request and pending readiness. |
 | Readiness observed | Only guarded readiness whose managed generation is source-equal to `committed_managed_generation` sets `readiness_seen=true` and `launching=false`, and it alone satisfies a pending manual-readiness value. Compare-clear that marker using request ID plus revision and set `manual_readiness=NONE`; a replaced marker is untouched. Readiness for any other generation cannot change launch state, clear the marker, or satisfy the request. |
 
 The consumed set retains the latest 128 IDs in checked commit-revision order
@@ -3611,7 +3624,7 @@ add reviewed source-universe semantics within M5 Option A or keep copied state
 inert. The non-Windows inherited-state rule below remains independently
 structural because no matching V1 action-site executor witness exists there.
 
-Without a `PERMITTED` construction, the envelope is retained exactly and no
+Without a `PERMITTED` construction, the envelope is retained byte-identically and no
 adapter is callable. Static witness/executor inability emits
 `CAPABILITY_UNAVAILABLE`/`POLICY_HELD`; stale, copied, replayed, consumed, or
 mismatched construction is `REJECTED` and reloads/re-reduces without that
@@ -3624,8 +3637,8 @@ The following phase semantics apply only after the matching permit exists; they
 do not form the proof of universal coverage.
 Whenever a bullet invokes reconcile, release, capture, or another adapter,
 “matching permit” means the module's three distinct arm-mutation, fresh post-
-CAS external-call, and fresh receipt-derived mutation permits (the last
-preserving the call issuance); no bullet authorizes a
+CAS external-call, and fresh receipt-derived mutation permits (the last carrying
+a call-issuance binding source-equal to its receipt); no bullet authorizes a
 raw call or reuse across revisions.
 
 - Reload of childless `RESERVED/PRE_BARRIER` may use only its fresh permit-bound
@@ -3636,39 +3649,41 @@ raw call or reuse across revisions.
   release with the same consumed-proof rule. A kill-bearing configured
   reservation with an issuer checkpoint never uses either release: custody
   unavailability derives `ConfiguredPreBarrierOwnerLossHoldV1`, preserves the
-  complete checkpoint/barrier/targets, and permits only the GONE-only attended
+  complete checkpoint/barrier/targets byte-identically, and permits only the GONE-only attended
   disposition or optional future `ConfiguredPreBarrierRetrySuccessorV1`.
 - Reload of `RESERVED/TREE_CLOSURE_ACQUIRING` invokes only the closure successor's
   attempt-keyed `OwnedTreeClosureReconciliationV1`. Matching
   `NEVER_ACQUIRED` finalizes `CLOSURE_VETOED`; matching `RELEASED` binds its
   returned closure ID and finalizes the same veto; matching `HELD` is persisted
   as `TREE_CLOSURE_RELEASING/CLOSURE_VETOED` and released without termination.
-  `UNKNOWN` retains the reservation and automatic `ISSUED`.
+  `UNKNOWN` preserves the reservation and automatic `ISSUED` byte-identically.
 - Reload of `RESERVED/TREE_CLOSURE_HELD` never terminates. After any required
   no-call takeover checkpoint, a distinct `CLOSURE_RECONCILE` arm reconciles
   the source-equal persisted pair. It persists
   `TREE_CLOSURE_RELEASING/CLOSURE_VETOED`; matching `RELEASED` may then
-  finalize directly, while matching `HELD` requires a later distinct exact
-  release arm and a later matching `RELEASED`. `UNKNOWN` retains the held state.
-- Reload of `RESERVED/TREE_CLOSURE_RELEASING` likewise reconciles the exact
+  finalize directly, while matching `HELD` requires a later distinct source-bound
+  release arm and a later matching `RELEASED`. `UNKNOWN` preserves the held state
+  byte-identically.
+- Reload of `RESERVED/TREE_CLOSURE_RELEASING` likewise reconciles the source-equal
   persisted pair before any release arm. `HELD` or `UNKNOWN` preserves the
   reservation, pending disposition, debt/current attempt, and automatic
-  `ISSUED`. Only matching `RELEASED` applies the module's pending-disposition
+  `ISSUED` byte-identically. Only matching `RELEASED` applies the module's pending-disposition
   finalizer; matching `HELD` requires a later distinct release arm.
 - Reload of childless `RESERVED/TEARDOWN_IN_FLIGHT` never reissues
   `Stop-Tree`. Matching `HELD` takes a fresh typed post-action observation
-  under that closure, persists its releasing disposition, and follows exact
-  release. Matching `RELEASED` consumes the exact reconcile receipt only
+  under that closure, persists its releasing disposition, and follows matching
+  release. Matching `RELEASED` consumes the matching reconcile receipt only
   through a fresh `EFFECT_FINALIZE` permit, conservatively records
-  `EFFECT_UNPROVEN`, enters childless `IDLE`, retains debt, clears its current
+  `EFFECT_UNPROVEN`, enters childless `IDLE`, keeps debt outstanding, clears its current
   attempt, records the origin-sensitive failure/exhaustion result, and makes no
   residual-capture call or launch. The next ordinary poll may clear that debt
   only through the existing debt-only finalize scope and matching
   `OwnedDebtResidualObservationV1.COMPLETE_GONE`.
   `UNKNOWN` preserves the reservation, debt/current attempt, and automatic
-  `ISSUED`; `NEVER_ACQUIRED` after debt is invalid and preserves the fence.
+  `ISSUED` byte-identically; `NEVER_ACQUIRED` after debt is invalid and preserves
+  the fence byte-identically.
 - Before invoking `Start-Process`, the checked state must already say
-  `SPAWN_IN_FLIGHT` with the exact typed `SPAWN/ARMED` issuer continuation. For
+  `SPAWN_IN_FLIGHT` with the typed `SPAWN/ARMED` issuer continuation bound to that spawn reservation. For
   childless origin, the arm mutation and launch call require distinct fresh
   permits at their respective revisions. Reload of childless
   `SPAWN_IN_FLIGHT` becomes `AMBIGUOUS_LAUNCH(CRASHED_DURING_SPAWN)` only
@@ -3710,7 +3725,8 @@ and manual launches construct one inert `GuardedLaunchCommitV1` checkpoint.
 It is input, not an independently applicable state delta. For non-childless
 origin the private `IDENTITY_COMMIT` transition applies it. For childless
 origin only a matching typed spawn receipt plus a fresh receipt-derived
-`SPAWN_IDENTITY_COMMIT/RECEIPT_MUTATION` permit preserving the call issuance may apply it through
+`SPAWN_IDENTITY_COMMIT/RECEIPT_MUTATION` permit whose call-issuance binding is
+source-equal to that receipt may apply it through
 `PermitBoundChildlessMutationV1`. Only after the final barrier, spawn, and a
 strict PID/start/reservation checkpoint does that checked transaction replace managed identity, establish the real
 `launch_grace_until`, reset child confirmation, and retain `launching=true`
@@ -3771,7 +3787,7 @@ how to persist and deliver them. Recovery policy may narrow an action to
 `HOLD`; it cannot create teardown/replacement authority or change either
 mandatory output to false.
 When `CAPABILITY_UNAVAILABLE` is present, 87-B must join the action resolution
-to the source-equal matching fingerprint, name the held agent from
+to the matching fingerprint, name the held agent from
 `canonical_condition.agent_key`, and state that operator action is required. A
 bare enum is not a conforming operator projection.
 
@@ -3888,7 +3904,7 @@ RecoveryConditionFingerprintV1 =
   )
 ```
 
-The payload has this exact schema:
+The payload has the following closed schema:
 
 ```text
 {
@@ -3910,14 +3926,14 @@ The payload has this exact schema:
 }
 ```
 
-`canonical_payload_bytes` are the `CanonicalJsonV1` encoding of that exact
+`canonical_payload_bytes` are byte-identical to the `CanonicalJsonV1` encoding of that
 payload. Presence coverage is null if and only if
 `ProcessObservationV1.coverage` is null.
 
 **ENFORCED candidate normalization:**
 
 1. Convert each authority-normalized relevant candidate, and no known-foreign
-   diagnostic evidence, into exactly this closed object:
+   diagnostic evidence, into the following closed object:
 
    ```text
    {
@@ -3949,9 +3965,9 @@ payload. Presence coverage is null if and only if
    `PID_START_AMBIGUOUS`; an identity guard is never truncated. Command
    arguments and credentials never enter the object or its hash; the closed
    `shape` and match/failure fields are their only semantic projection.
-3. Canonically serialize each object, exact-deduplicate those bytes, and sort
+3. Canonically serialize each object, deduplicate byte-identical byte strings, and sort
    bytewise before truncation.
-4. Define `total_count` as the number after exact deduplication. Persist the
+4. Define `total_count` as the number after byte-identical deduplication. Persist the
    first eight objects. `CandidateSummaryV1` also contains `total_count`,
    `omitted_count = max(total_count - 8, 0)`, and `omitted_sha256`.
 5. When candidates are omitted, compute `omitted_sha256` over the domain
@@ -3960,7 +3976,7 @@ payload. Presence coverage is null if and only if
    Store the digest as 64 lowercase hexadecimal characters. Otherwise it is
    null.
 
-`CandidateSummaryV1` serializes exactly as:
+`CandidateSummaryV1` has this byte-identical serialization:
 
 ```text
 {
@@ -3980,7 +3996,7 @@ SHA-256 collision risk.
 candidates, freshness `FRESH`, unavailable/unknown presence with reasons
 `SNAPSHOT_UNAVAILABLE`, `COVERAGE_INCOMPLETE`, and
 `RECORDED_IDENTITY_UNKNOWN`, and runtime `CURRENT_UNKNOWN_OTHER`, the canonical
-payload is exactly these 433 ASCII bytes:
+payload is byte-identical to these 433 ASCII bytes:
 
 ```text
 {"agent_key":"agent\u00e9/root","candidates":{"items":[],"omitted_count":0,"omitted_sha256":null,"total_count":0},"freshness":"FRESH","presence":{"coverage":null,"reasons":["SNAPSHOT_UNAVAILABLE","COVERAGE_INCOMPLETE","RECORDED_IDENTITY_UNKNOWN"],"state":"UNKNOWN"},"recovery_blocked":false,"runtime":{"dominant":"CURRENT_UNKNOWN_OTHER","reasons":["CURRENT_UNKNOWN_OTHER"]},"schema":"recovery-condition/v1","stale_uncertainty":false}
@@ -3993,7 +4009,7 @@ Every implementation must reproduce both the bytes and digest.
 A candidate-bearing vector uses agent key `a/root`, one unowned PID 42
 `python.exe` wrapper with the shown guarded start and ownership failure,
 complete initial V1 coverage, `PRESENT_UNTARGETABLE`, fresh
-`CURRENT_TEARDOWN_PROOF`, `recovery_blocked=true`, and this exact 875-byte
+`CURRENT_TEARDOWN_PROOF`, `recovery_blocked=true`, and this byte-identical 875-byte
 payload:
 
 ```text
@@ -4016,7 +4032,7 @@ carry the durable redacted condition evidence that 87-B must project.
 RecoveryConditionV1 {
   schema: "recovery-condition-export/v1"
   fingerprint: RecoveryConditionFingerprintV1
-  canonical_condition: the source-equal fingerprint payload object above
+  canonical_condition: source-equal to the fingerprint payload object above
   escalation_required: bool
   condition_codes: ordered tuple of length 0..2[
     "RECOVERY_BLOCKED" | "STALE_UNCERTAINTY"
@@ -4101,17 +4117,17 @@ RecoveryActionResolutionV1 {
 ```
 
 `condition_codes` includes each true predicate in the displayed order.
-`canonical_condition` must reproduce the fingerprint bytes exactly; 87-B may
+`canonical_condition` must reproduce the fingerprint bytes byte-identically; 87-B may
 persist it but cannot mutate and rehash it. The action record binds later
 policy/execution resolution without pretending that result supplied authority.
 The normative module gives the result/code precedence.
 `action_attention_required == (action_attention_codes is nonempty)`. Neither
 field enters the banked condition fingerprint.
-At maximum ordinary sequence, `capture_sequence_exhaustion` is the exact typed
+At maximum ordinary sequence, `capture_sequence_exhaustion` is source-equal to the typed
 begin result, intent is `HOLD`, result is `POLICY_HELD`, and
 `CAPTURE_SEQUENCE_EXHAUSTED` is present. Otherwise the field is null and that
 code is absent. 87-B must name the agent, exhausted epoch/revision, `READY` or
-the exact blocker tuple, and the required attended rollover action; a bare enum
+the source-equal blocker tuple, and the required attended rollover action; a bare enum
 is nonconforming.
 When configured issuer custody is unavailable,
 `configured_pre_barrier_owner_loss` is the bounded redacted projection
@@ -4156,7 +4172,7 @@ redaction is independent of the attended command's separate authorization
 check: even an authorized 87-B renderer receives only the summary, while an
 unauthorized disposition request receives the still narrower
 `REDACTED_UNAUTHORIZED` result.
-For `CAPABILITY_UNAVAILABLE`, 87-B joins this resolution to the source-equal matching
+For `CAPABILITY_UNAVAILABLE`, 87-B joins this resolution to the matching
 `RecoveryConditionV1.fingerprint`, renders
 `canonical_condition.agent_key`, and says explicitly that operator action is
 required. A projection that emits only the code or omits the agent is
@@ -4182,11 +4198,11 @@ projects relevant and known-foreign rows into
 }
 ```
 
-The command fragment contains no raw argument values. It is exactly
+The command fragment contains no raw argument values. It has the following closed form:
 `"<exe> <shape> --for=<MATCH|MISMATCH|UNKNOWN>
 --root=<MATCH|MISMATCH|MISSING|UNKNOWN>"`, where `<exe>` and `<shape>` are the
 already-normalized basename and `WRAP|WAIT|UNKNOWN`. It is capped at 256 UTF-8
-bytes at a code-point boundary. Rows are canonicalized, exact-deduplicated,
+bytes at a code-point boundary. Rows are canonicalized, byte-identically deduplicated,
 byte-sorted, capped at eight, and carry total/omitted counts plus a SHA-256 tail
 digest using domain
 `agenttalk.supervisor.operator-diagnostic-candidates.v1\0` and the same
@@ -4201,7 +4217,7 @@ OperatorDiagnosticCandidateSummaryV1 {
 }
 ```
 
-`omitted_count = total_count - len(items)` and the digest is null exactly when
+`omitted_count = total_count - len(items)` and the digest is null iff
 that value is zero.
 
 This diagnostic summary restores Revision 2's bounded rootless, foreign-root,
@@ -4229,7 +4245,7 @@ granting authority from known-foreign rows.
 For `PROVABLY_CHILDLESS_OWNED_WRAPPER`, the normative module structurally owns
 steps 2, 3, and 8. Step 2 consumes the one-shot `RESERVE/STATE_MUTATION` permit
 to create the complete effect envelope. Step 3 uses the closure successor's
-action-time tree closure, exact reserved-target digest check, checked
+action-time tree closure, matching reserved-target digest check, checked
 debt/attempt commit, #146 closed dispatcher's childless variant, and
 complete-gone proof.
 Step 8 first consumes `SPAWN/STATE_MUTATION` to arm the persisted issuer and
@@ -4241,7 +4257,7 @@ debt-bound residual cleanup, so neither manual nor automatic absence can
 bypass a partial kill.
 
 #120's barrier is not the closure successor. At merged `587e7c1`, an openable
-Windows owned-tree target whose exact creation FILETIME matches is verified and
+Windows owned-tree target whose `OwnedExactStartGuardV1` creation FILETIME matches is verified and
 terminated through one native handle. Each successful termination receives a
 wait attempt within the remaining shared tree-wide budget before the fresh
 snapshot. That removes the target-local check-to-kill PID-reuse gap; when the
@@ -4253,14 +4269,15 @@ between planning and effect: a
 recorded parent may create an unplanned descendant after planning and then
 exit, leaving a process outside the target set that may survive `Stop-Tree`.
 The recycle-aware barrier catches the old-side descendant only to block launch;
-a same-or-newer exact-FILETIME child of a replacement PID is excluded from that
-retired-parent ownership edge, while missing/incomparable exact evidence
+a child of a replacement PID whose `OwnedExactStartGuardV1` creation FILETIME is
+at or after the replacement PID's is excluded from that
+retired-parent ownership edge, while missing/incomparable FILETIME identity evidence
 remains conservative. The split does not suppress independent barrier evidence:
 the replacement-side process still blocks if, for example, its command line
 parses as this agent's wrapper or wait process. The barrier
 never adds a kill target, proves `COMPLETE_GONE`, clears debt, or substitutes
 for the successor's pre-effect creation closure. Attended reset is an
-exact-identity-bound human escape, and the request-bound archive is retention;
+human escape bound to a named process-identity adapter, and the request-bound archive is retention;
 neither is automatic closure evidence. For the named childless path, the module
 consumes the first barrier result in its typed post-action observation; step 6 performs
 the fresh final recheck immediately before spawn. No closure-dependent named
@@ -4268,7 +4285,7 @@ teardown previously held by `CAPABILITY_UNAVAILABLE` becomes executable solely
 because #120 merged.
 
 That effect claim is grounded at its execution site:
-`src/agenttalk/supervisor.py:8900-8928` enters the exact destructive branch,
+`src/agenttalk/supervisor.py:8900-8928` enters the FILETIME-guarded destructive branch,
 while `8930-8932` skips an `owned_process_tree` target without
 `start_filetime`. The separate Linux-token acceptance paths are observation
 input, not a kill adapter. Accordingly a valid Linux-token snapshot receives
@@ -4291,7 +4308,8 @@ configured-action residuals:
    inert because the host cannot construct a matching permit. If Windows
    already returned from `Stop-Tree`, the non-Windows host neither repeats the
    call nor clears debt. Ordinary observation may advance, but recovery remains
-   `POLICY_HELD` until a reviewed exact-token adapter exists under M5 Option A.
+   `POLICY_HELD` until a reviewed named POSIX exact-target-identity adapter exists
+   under M5 Option A.
 2. On every platform, automatic `StateLossQuarantineV1.UNRESOLVED` retirement
    is unavailable in V1. Merged #120 supplies no trustworthy process-universe
    token, so local evidence cannot prove that the lost owner and every residual
@@ -4321,8 +4339,8 @@ configured-action residuals:
    `ConfiguredPreBarrierOwnerLossHoldV1` and
    `POLICY_HELD(CONFIGURED_PRE_BARRIER_OWNER_LOST)`. It names whether issuer
    extinction is proved, the checkpoint/source hash, prior-effect-unknown fact,
-   absent `ConfiguredPreBarrierRetrySuccessorV1`, the exact-issuer-identity
-   adapter limitation, and the complete prospective attended remedy. Only a
+   absent `ConfiguredPreBarrierRetrySuccessorV1`, the
+   `ExactIssuerIdentityAdapterV1` limitation, and the complete prospective attended remedy. Only a
    fresh independent definitive PID-absent `GONE` result admits disposition; a
    present PID remains blocked under item 4. The disposition never kills or
    launches; it installs
@@ -4340,8 +4358,9 @@ configured-action residuals:
    automatic configured relaunch is unavailable for activation. A crash or hard
    cancellation after `Start-Process` but before launch-result persistence can
    leave a live wrapper while the checkpoint remains replayable, so retry may
-   create a duplicate wrapper. #120 makes the preceding exact-FILETIME kill
-   target-safe to retry; it does not make launch idempotent. This is an
+   create a duplicate wrapper. #120 makes the preceding
+   `OwnedExactStartGuardV1`-guarded kill target-safe to retry; it does not make
+   launch idempotent. This is an
    implementation/activation blocker rather than an active-agent held result.
 
 The following are explicitly insufficient as a process-universe proof: PID and
@@ -4435,12 +4454,12 @@ widened. A silent-forever claim is deliberately not made.
 **ENFORCED release barrier:** No implementation may claim 87-A conformance
 without all of this executed evidence:
 
-1. Generate the 96 dominant-projection cells and assert the exact distributions,
+1. Generate the 96 dominant-projection cells and assert the specified distributions,
    formula parity, and zero missing/duplicate/extra cells.
 2. Generate canonical overlapping reason sets. Secondary-reason permutation
    cannot change authority, action, or escalation; adding/removing a secondary
    reason must change `RecoveryConditionFingerprintV1`.
-3. Execute Lens C's exact
+3. Execute Lens C's concrete
    `{CURRENT_UNKNOWN_SEQUENCE_REGRESSION, CURRENT_TEARDOWN_PROOF}` fresh/stale
    counterexample.
 4. Prove heartbeat permutations cannot change `RuntimeObservationV1`; runtime
@@ -4454,10 +4473,10 @@ without all of this executed evidence:
 5. Cover targetable plus unreadable, targetable plus definite unowned,
    all-owned guarded, duplicate, rootless, PID-reused, unreadable-only,
    snapshot-unavailable, incomplete-empty, and complete-empty candidate sets.
-   An exact duplicate owned/guarded row must collapse to one target and remain
+   A full-field-matching duplicate owned/guarded row must collapse to one target and remain
    `PRESENT_TARGETABLE`; a conflicting same-PID duplicate must be `UNKNOWN`
    with incomplete targetability.
-6. Assert `TargetabilityProofV1.COMPLETE` has an exact candidate-to-target
+6. Assert `TargetabilityProofV1.COMPLETE` has a candidate-to-target
    bijection. Every other proof variant denies both automatic and manual
    teardown.
 7. Cross every current runtime dominant with reachable `ABSENT`, plus all
@@ -4485,7 +4504,7 @@ without all of this executed evidence:
     changed coverage, and a clear scan after failed teardown. Each contributes
     zero polls; the next ordinary clear scan is only `OBSERVED_ONCE`.
 14. Execute fixed fingerprint vectors across every supported implementation.
-    Candidate permutation and exact duplicates must be invariant; changing the
+    Candidate permutation and full-field-matching duplicates must be invariant; changing the
     semantic `RuntimeObservationV1.reasons` tuple, a presence reason, or an
     overflow-tail item must change the fingerprint. Active-child diagnostic
     subreason changes alone must not, because they normalize to one banked
@@ -4499,8 +4518,8 @@ without all of this executed evidence:
     salvaged.
 18. Cover the accepted stale healthy/unknown-child escalation-latency residual
     without converting either cell into kill authority.
-19. Cover first-managed and real-launch grace just before and exactly at
-    expiry; heartbeat exactly at and just over threshold; missing,
+19. Cover first-managed and real-launch grace just before and at
+    expiry; heartbeat at and just over the threshold; missing,
     malformed/future-skew/overflow heartbeat; repeated snapshot failure;
     accepted future skew at and rejected skew just over the configured bound;
     restart persistence; and one observation-only bounded grace after state
@@ -4523,14 +4542,14 @@ without all of this executed evidence:
     absence state, and consumed marker IDs. A cached whole-state save cannot
     roll any field back.
 22. Cover guarded live child, ancestry-ambiguous child, first/confirmed
-    complete child absence, unrelated rootless wrapper, row shuffle/exact
+    complete child absence, unrelated rootless wrapper, row shuffle/full-field-matching
     duplicate, and relevant lineage change. Assert the independent presence
     and active-child projections and their permitted runtime effects.
 23. Inject `snapshot unavailable + no prior process state` at the final
     barrier and require veto. Prove 87-C activation refuses the strict barrier
     when matching-generation 87-B incident projections are not active.
 24. Reconstruct `RecoveryConditionV1` and
-    `RecoveryActionResolutionV1`; assert the canonical condition exactly
+    `RecoveryActionResolutionV1`; assert the canonical condition byte-identically
     reproduces the banked fingerprint and that bounded relevant, rootless,
     foreign-root, unreadable, structural-command, and overflow-tail diagnostic
     evidence reaches the typed 87-B boundary without changing authority.
@@ -4584,7 +4603,7 @@ without all of this executed evidence:
     and native-plan construction but before that inner check: the typed result
     must be `ACTIONS_DISABLED_NO_EFFECT`, the call must become
     `REJECTED_NO_EFFECT(FINAL_ACTION_GATE_CHANGED)`, `next_entry` must remain
-    exact, and no lexical raw array or native effect may exist.
+    byte-identical, and no lexical raw array or native effect may exist.
 29. Execute every mandatory case in the normative owned-childless module,
      including initial versus rootless debt-residual observation, joined
      action-time evidence, tree-closure races, action-time target-rebinding
@@ -4600,7 +4619,7 @@ without all of this executed evidence:
 31. Produce two complete zero-child captures before the same strict turn's
     nonrenewable child-establishment closure. Both map to
     `UNKNOWN(CHILD_ESTABLISHMENT_OPEN)` and neither counter advances. Repeat at
-    exactly active age 30 seconds and after 30 seconds but before a longer
+    at active age 30 seconds and after 30 seconds but before a longer
     generation launch fence; all remain open. Prove the exclusive launch-fence
     deadline is the first eligible count-one capture after the inclusive
     active-age grace ends, all closed-guard fields participate in
@@ -4615,15 +4634,15 @@ without all of this executed evidence:
 32. With fresh operation-scoped permits, pause two pollers at the
     closure-acquire commit/effect gap and at the teardown-arm/`Stop-Tree` gap.
     A live foreign continuation retains every
-    fence. After positive predecessor-death proof, only exact idempotent
+    fence. After positive predecessor-death proof, only matching idempotent
     reconciliation may proceed; `ARMED` teardown never proves completion or
     permits reissue, and `CALL_RETURNED` alone permits post-action capture.
     From retained `STOP_TREE/CALL_RETURNED`, make reconciliation return matching
     `RELEASED`; require receipt-bound finalization as `EFFECT_UNPROVEN`, retained
     debt, childless `IDLE`, and zero residual-capture calls or launch.
-    Exercise the state-only `PRE_BARRIER` release and every exact no-call
+    Exercise the state-only `PRE_BARRIER` release and every prescribed no-call
     takeover mapping with its distinct permit before only the closed table's
-    exact next reconcile, release, retired-cleanup, or crash-result operation.
+    table-prescribed next reconcile, release, retired-cleanup, or crash-result operation.
     For acquire, reconcile, release, retired reconcile, `Stop-Tree`,
     post-action capture, and spawn, require three distinct permits: arm-state
     mutation, post-CAS external call, and receipt mutation. A consumed arm
@@ -4645,24 +4664,25 @@ without all of this executed evidence:
 35. Cross manual/automatic origin with confirmed whole-wrapper absence and
     child-death-sourced residue. With debt `NONE`, both select no-kill
     `RELAUNCH_ONLY`; outstanding debt suppresses both. Independently construct,
-    production-encode, byte-compare, and hash the module's chained seven-domain
+    production-encode, require byte-identical payloads, and hash the module's chained seven-domain
     vector as required by its conformance item 20; treat its byte-flip chain as
     change detection rather than independent codec correctness. Race
     nonordinary capture-ordinal allocation as required by its conformance
     section.
-36. Integrate the module's exact merged-#120 adapter and post-kill barrier
+36. Integrate the module's merged-#120 FILETIME-identity adapter and post-kill barrier
     control through the appropriate sealed #146 dispatcher variant. Prove an
-    openable exact-FILETIME planned Windows target uses one
+    openable planned Windows target guarded by `OwnedExactStartGuardV1` uses one
     native handle for FILETIME verification and termination, and that every
     successful termination receives a wait attempt within the remaining shared
-    tree-wide budget. Inject open failure, exact-identity mismatch, termination
+    tree-wide budget. Inject open failure, `OwnedExactStartGuardV1` mismatch, termination
     failure, wait timeout, and depleted budget; each must defer completion to
     the fresh snapshot and barrier. Race a
     recorded parent that creates a descendant after planning and exits during
     `Stop-Tree`; require the unplanned descendant to miss the target set,
     survive, and be detected only by the fresh deny-only barrier before
-    `SPAWN_IN_FLIGHT`. Recycle that parent PID: a same-or-newer exact-FILETIME replacement
-    child must be excluded from the retired-parent ownership edge, while a
+    `SPAWN_IN_FLIGHT`. Recycle that parent PID: a replacement child with the
+    same-or-newer Windows creation FILETIME must be excluded from the
+    retired-parent ownership edge, while a
     pre-recycle or incomparable child remains conservative survivor evidence.
     Independently classify the replacement-side child as this agent's
     wrapper/wait and require the ordinary barrier evidence still to block. The
@@ -4682,25 +4702,25 @@ without all of this executed evidence:
     zero reservation, attempt, continuation, external call, teardown, retry,
     and exhaustion with continuous `CAPABILITY_UNAVAILABLE`/`POLICY_HELD`
     pending a human. Inject a post-reservation structural-unavailability claim
-    and `UNKNOWN(CAPABILITY_UNAVAILABLE)` reconciliation; retain every exact
-    fence and forbid `CLOSURE_VETOED`, retry, exhaustion, kill, and launch.
-    Export all applicable module attention codes in their exact order,
+    and `UNKNOWN(CAPABILITY_UNAVAILABLE)` reconciliation; retain every fence
+    byte-identically and forbid `CLOSURE_VETOED`, retry, exhaustion, kill, and launch.
+    Export all applicable module attention codes in their prescribed order,
     including `CHILDLESS_STATE_PROVENANCE_LOST` and
     `CAPABILITY_UNAVAILABLE`, and require `action_attention_required=true`.
-    Join the source-equal fingerprint to `canonical_condition.agent_key`; every 87-B
-    rendering must name that agent and say operator action is required.
-    Exercise exact preflight direction, not only generic zero-effect behavior.
-    On a staged Windows path with valid exact-FILETIME semantics and no #146
+    Join the action resolution to the matching `canonical_condition.fingerprint`; every 87-B
+    rendering must name `canonical_condition.agent_key` and say operator action is required.
+    Exercise the required preflight direction, not only generic zero-effect behavior.
+    On a staged Windows path with valid `OwnedExactStartGuardV1` semantics and no #146
     dispatcher seal, require witness construction and fresh capability to return
-    exactly `DISPATCHER_SEAL_UNDELIVERED` before permit or closure-provider
+    `DISPATCHER_SEAL_UNDELIVERED` before permit or closure-provider
     evaluation. Repeat from a retained Windows effect envelope: preserve the
-    envelope exactly except the separately permitted #115 observation
+    envelope byte-identically except the separately permitted #115 observation
     projection, export generic `CAPABILITY_UNAVAILABLE` attention, and construct
-    no permit, mutation, call, or effect. On Linux and macOS, where the exact
-    executor and seal are both absent, require
+    no permit, mutation, call, or effect. On Linux and macOS, where the named
+    target executor and seal are both absent, require
     `EXACT_TARGET_EXECUTOR_UNAVAILABLE` to take precedence. With a staged
     conforming Windows seal present but the closure successor absent, require an
-    available witness followed by exactly `SUCCESSOR_MISSING`, never
+    available witness followed by `SUCCESSOR_MISSING`, never
     `DISPATCHER_SEAL_UNDELIVERED`. These are proposed conformance outcomes, not
     runtime behavior at merged `587e7c1`.
 38. Integrate the module's construction-seal suite. Prove the checked owner has
@@ -4719,8 +4739,8 @@ without all of this executed evidence:
     private native body, zero public raw-array termination entry, zero direct
     `Stop-Tree $p.kill_targets` call, and zero route from planner targets to the
     body except one `SupervisorOwnedTreeNativeInvocationV1` produced by the
-    winning atomic admission and plan-ownership transitions over the exact
-    call's private submission/use-owner pair. Reject raw
+    winning atomic admission and plan-ownership transitions over the call's private
+    submission/use-owner pair, whose call binding is source-equal to the call. Reject raw
     arrays, caller-settable tags, wrappers around `kill_targets`, and
     field-equivalent fake variants. Prove configured-agent and ephemeral-terminal
     authorization/persistence/barrier parity through their independent private
@@ -4782,7 +4802,7 @@ without all of this executed evidence:
     For EPHEMERAL_TERMINAL, separately change the action-latch epoch and activate
     the kill switch after legitimate call construction but before dispatch.
     Each case must permit exactly one winning admission, consume the call as
-    `REJECTED_NO_EFFECT`, preserve exact `next_entry`, and create no native plan,
+    `REJECTED_NO_EFFECT`, preserve `next_entry` byte-identically, and create no native plan,
     raw array, or effect; a second admission or replay remains rejected.
     With both unchanged, require the same enabled latch epoch under its read
     guard immediately before plan construction, a separately fresh clear
@@ -4790,7 +4810,7 @@ without all of this executed evidence:
     native body's final kill-switch check. Pause after the outer checks and plan
     construction but before that inner check, activate the kill switch, and
     require the invocation-bound typed `ACTIONS_DISABLED_NO_EFFECT` result, one
-    `REJECTED_NO_EFFECT(FINAL_ACTION_GATE_CHANGED)` transition, retained
+    `REJECTED_NO_EFFECT(FINAL_ACTION_GATE_CHANGED)` transition, byte-identical
     `next_entry`, no lexical raw-array materialization or native effect, and
     zero-effect replay.
 
@@ -4798,7 +4818,7 @@ without all of this executed evidence:
     `INVOKING`, `RECEIPT`, and `CONSUMING_RECEIPT`—terminate the supervisor
     process or abandon its worker before receipt/poison publication and reload
     the persisted checkpoint. For EPHEMERAL_TERMINAL, a new #115 checked action may retry only
-    the exact #120 target tuple: gone PID is a no-op, recycled PID/different
+    the source-equal #120 target tuple: gone PID is a no-op, recycled PID/different
     FILETIME is refused, and the same live PID/same FILETIME remains the intended
     same-handle target; only the fresh teardown barrier may permit archive.
     For CONFIGURED_AGENT_RELAUNCH, require the source-equal persisted issuer checkpoint
@@ -4815,7 +4835,7 @@ without all of this executed evidence:
     forms render the remedy, but only definitive PID absence admits
     disposition. Recompute the domain-separated source hash from the canonical
     persisted-field projection displayed in the type;
-    require the same hash before and after the extinction refresh, and reject
+    require matching hashes before and after the extinction refresh, and reject
     inclusion of volatile extinction/action fields, hash-including/fixed-point,
     or partial alternatives. Neither hold may remint custody,
     invoke `PRE_BARRIER_RELEASE`, silently release and reserve again, kill, or
@@ -4879,7 +4899,7 @@ without all of this executed evidence:
     Any point at which the state CAS may have run must return or reconcile as
     `CLEAR_COMMIT_OUTCOME_UNKNOWN`, never assert fence preservation; require
     `POISONED`, `CLOSED_RESPONSE_LOST`, or `OWNER_LOST_WITH_PROCESS` according
-    to the exact failure point. A checked reload must derive exactly
+    to the injected failure point. A checked reload must derive whichever of
     `FENCE_STILL_CURRENT`, `FENCE_CLEARED`, or
     `STATE_OR_FENCE_UNTRUSTWORTHY`. Every wrong-source, alias, or replay receipt
     produces no additional transition. Verify
@@ -4904,7 +4924,7 @@ without all of this executed evidence:
     `OrdinaryObservationCommitCustodyV1`, derive/commit only the private
     `OBSERVATION` mutation, reload its successor revision, and then construct at most one
     later authority/effect delta against that revision. Prove every childless
-    outer-field update is present in the exact private
+    outer-field update is present in the private
     `ChildlessOuterStateDeltaV1` projection for its permit operation, and reject
     omitted, extra, or caller-selected fields/values.
 
@@ -4915,22 +4935,23 @@ without all of this executed evidence:
     `CHILDLESS_EFFECT` delta may replace or remove the envelope.
 
     Construct `StateLossQuarantineCreationDeltaV1` from every outer-state loss
-    and byte-compare the complete replacement state against the displayed
+    and require the complete replacement state to be byte-identical to the displayed
     quarantined genesis; reject a partial/default-from-lost-state object.
 
     For every `ExactTargetExecutorOperationV1` and permit use, construct the
-    object only from a fresh action-site witness plus exact inert binding,
+    object only from a fresh action-site witness plus an inert binding source-equal
+    to the current envelope's binding,
     current revision, and closed operation scope. Normally require the
     authorized tuple or residual subset; for the closed targetless old-side
-    rebind, retired-cleanup, and owner-transition scopes require the exact
-    historical tombstone/envelope binding plus the complete prospective proof
+    rebind, retired-cleanup, and owner-transition scopes require a binding source-equal
+    to the selected historical tombstone/envelope binding plus the complete prospective proof
     or typed subject/checkpoint instead. Consume it
     once; replay and cross-operation use must fail. Feed an unknown future
     childless execution variant through the compatibility boundary and require
     closed rejection or inert evidence, never an action object. Use fresh
     selection, an inherited external-effect envelope, childless
     `SPAWN_IN_FLIGHT`, `AMBIGUOUS_LAUNCH`, and a retired tombstone as direction
-    controls on Linux and macOS: the effect envelope remains exact, no adapter
+    controls on Linux and macOS: the effect envelope remains byte-identical, no adapter
     runs, and only the separately typed observation projection may advance.
     From one guard acquisition, race two issuers and attempt B1/P1 then B2/P2
     before P1 resolves. Exactly one `AVAILABLE -> OUTSTANDING` issuance wins;
@@ -4941,13 +4962,13 @@ without all of this executed evidence:
     admission-result handoff failure and plan/invocation-handle construction or
     handoff failure. For every variant, throw deterministically during final-gate
     evaluation and on private-body entry after `INVOKING` but before the native-
-    effect frontier; require exact invocation-bound
+    effect frontier; require the invocation-bound typed
     `NATIVE_ENTRY_FAILED_NO_EFFECT` and the displayed childless/non-childless
     owner transition. Retain and replay two result aliases; only one transition
     or custody return may occur. Throw at/after the frontier and at an unknown
-    locus; require exact `ADAPTER_EFFECT_UNCERTAIN` or
+    locus; require the applicable `ADAPTER_EFFECT_UNCERTAIN` or
     `NATIVE_EFFECT_UNCERTAIN` poison. Fail construction/handoff/owner resolution
-    of a positively pre-frontier result and require exact
+    of a positively pre-frontier result and require the applicable
     `CUSTODY_PROTOCOL_BROKEN` or `DISPATCH_PROTOCOL_BROKEN`. Keep
     `ACTIONS_DISABLED_NO_EFFECT` as a separate false-gate oracle. Continue
     failures after native return, during receipt handoff, receipt consumption,
@@ -4961,14 +4982,15 @@ without all of this executed evidence:
     whose nested target PID is 101, tamper it to 202 through the controlled
     unsafe hook, and require consumer rejection before native effect. Public
     mutation must fail, and mutating the original caller alias after construction
-    must leave the call unchanged. Repeat for permit proof/residual, target set,
+    must leave every sealed field of the constructed call unchanged. Repeat for
+    permit proof/residual, target set,
     mutation next state, call arguments, receipt result, and both non-childless
     provenance variants. A frozen outer record or digest-only check is
     insufficient. Inspect every sealed graph and prove the atomic lineage owner
     and non-childless dispatch-use owner cells are unreachable; only immutable
     custody/use proofs are present. Prove the private submission, admission, and
     invocation and receipt-custody handles are the only associations between
-    their exact immutable values and owner, and each holder transition changes the separate cell
+    their source-bound immutable values and owner, and each holder transition changes the separate cell
     exactly once.
 
     Submit the former public observation-record shape with forged child-dead
@@ -4989,22 +5011,24 @@ without all of this executed evidence:
     `RECEIPT -> COMMITTING` transition may win before
     reducer derivation or field application; the loser and sequential replay
     perform zero mutation. Require that
-    lineage to contain the exact prospective ordinal-zero `CaptureIdV1` before
+    lineage to contain the source-equal prospective ordinal-zero `CaptureIdV1` before
     acquisition begins. Prove `ProcessObservationV1.capture_id`,
     `receipt.prospective_capture_id`,
     `PrivateClassifierObservationMutationV1.capture_id`, and every non-null
-    successor capture-ID field that records the current sample equal that
-    begin-bound ID byte-for-byte. Empty/reset successors retain null IDs; no
+    successor capture-ID field that records the current sample to be source-equal
+    to that begin-bound ID. Empty/reset successors retain null IDs; no
     successor may synthesize a different ID or restamp at commit. From a checked
     predecessor sequence `n`, require the begin-bound ID, raw/tree displayed
     sequence, and candidate mutation sequence to equal checked `n + 1`; only
     after the winning commit may current equal `n + 1`. At maximum `uint64`,
-    require exact `ATTENDED_REQUIRED(CaptureSequenceExhaustionV1)` with the
+    require the typed `ATTENDED_REQUIRED(CaptureSequenceExhaustionV1)` with the
     agent/epoch/revision, maximum value, `READY` or ordered blockers, and attended
     action; require no acquisition handle, observation, receipt, mutation, 87-A
     action, or wrap. From top-level `IDLE`, race two byte-identical attended rollover
-    requests: exactly one checked replacement wins. Byte-compare the displayed
-    reset and preserved field sets. With a non-null prior-effect fence at the
+    requests: exactly one checked replacement wins. Require the displayed
+    reset field set to be source-equal to its specified values and the preserved
+    field set to remain byte-identical to its predecessor values.
+    With a non-null prior-effect fence at the
     maximum sequence, require every disposition/audit/source/effect field to be
     byte-identical and only its freshness floor to become `(new epoch, 0)`;
     a null fence remains null. Require the first new ordinary ID to be
@@ -5041,7 +5065,8 @@ without all of this executed evidence:
     `CALL`, `DISPATCHING`, `PLAN_OWNED`, `INVOKING`, `RECEIPT`, and
     `CONSUMING_RECEIPT`. Rollover visible at the final provenance read before
     plan ownership must yield one
-    `REJECTED_NO_EFFECT(VARIANT_PROVENANCE_STALE)` and retain `next_entry`. If
+    `REJECTED_NO_EFFECT(VARIANT_PROVENANCE_STALE)` and preserve `next_entry`
+    byte-identically. If
     rollover wins after that read, including during post-read `DISPATCHING`
     before plan ownership, allow invocation to resolve normally and do not infer
     no effect. At receipt, make each CAS order deterministic: rollover
@@ -5080,7 +5105,7 @@ without all of this executed evidence:
 | Runtime/presence independence with explicit child evidence | ENFORCED | Separate runtime, active-child, and presence constructors plus narrowed permutation tests. |
 | One result for overlapping runtime reasons | ENFORCED | Ranked tuple plus dominant-only authority operands. |
 | Runtime high-water and sticky regression survive torn reads | ENFORCED after task #115 | Pure continuity reducer plus checked state revision; only new bound generation clears latch. |
-| Missing heartbeat becomes stale after finite grace | ENFORCED after task #115 | Nonrenewable `first_managed_epoch`, guarded launch deadline, and exact freshness formula. |
+| Missing heartbeat becomes stale after finite grace | ENFORCED after task #115 | Nonrenewable `first_managed_epoch`, guarded launch deadline, and specified freshness formula. |
 | Child confirmation cannot cross uncertainty or replay | NORMATIVE CONTRACT SPECIFIED; implementation blocked on task #115 | #115 owner-private reducer over sealed one-use observation receipts derives basis-bound counters, durable capture ID, and adjacent poll sequence; none is caller input. |
 | Total mixed-candidate presence | ENFORCED | Ordered aggregation and closed reason codes. |
 | No partial-target kill | ENFORCED | `TargetabilityProofV1.COMPLETE` bijection invariant. |
@@ -5090,7 +5115,7 @@ without all of this executed evidence:
 | Consumed marker cannot replay | ENFORCED after task #115 | Revision-bound reservation, bounded committed ID set, and compare-clear. |
 | Ambiguous spawn cannot release authority or duplicate-launch | ENFORCED after task #115 | Durable `AMBIGUOUS_LAUNCH` tombstone, guarded reconciliation, and no second reservation. |
 | Physical proof independent from timing | ENFORCED | Separate closed values and reducers. |
-| Two independent compatible absence polls | NORMATIVE CONTRACT SPECIFIED; implementation blocked on task #115 | Two distinct sealed receipt acquisitions, owner-derived capture IDs, exact coverage equality, adjacent poll sequence, and one winning CAS per predecessor revision. |
+| Two independent compatible absence polls | NORMATIVE CONTRACT SPECIFIED; implementation blocked on task #115 | Two distinct sealed receipt acquisitions, owner-derived capture IDs, matching coverage, adjacent poll sequence, and one winning CAS per predecessor revision. |
 | Absence proof is one use | ENFORCED after task #115 | Atomic `CONFIRMED -> CONSUMED` launch reservation. |
 | New guarded managed identity commits atomically | ENFORCED after task #115 | One checked transaction commits identity, manual consumption, launch grace, and reservation resolution. |
 | Failed post-teardown scan contributes no counter | ENFORCED | Separate action-scoped reducer path. |
@@ -5104,15 +5129,15 @@ without all of this executed evidence:
 | Operator documentation of permanent capability limitations and configured-action residuals | REQUIRED before implementation close/activation | 87-B/follow-up manual and tutorial evidence states all four permanent limitations together plus both configured residuals: POSIX teardown unavailability, quarantine-retirement unavailability, the declared transfer/restore/rollback/migration activation refusal, present-issuer-PID/reuse disposal unavailability pending `ExactIssuerIdentityAdapterV1`, the GONE-only owner-loss HOLD remedy and subsequent fence-clearance sequence, and configured relaunch unavailable for activation until the durable per-agent singleton lands. |
 | Same-platform state-file/workspace transfer, restore, rollback, and migration activation | UNAVAILABLE IN V1; DECLARED ACTIVATION REFUSES | A conforming activation path refuses before imported bytes become the active checked store and constructs no 87-A witness, mutation, effect, or launch. An out-of-band replacement may be undetectable, is nonconforming, and has no 87-A guarantee. Future 87-C must bind the source universe within M5 Option A or keep imported state inert. |
 | Raw discovery stops flapping | STATED not promised | Process-discovery behavior is unchanged. |
-| Owned-childless teardown requires a nonce-owned complete tree, an exact target executor, and action-time closure | WINDOWS #120 INPUT/TARGET-LOCAL EFFECT DELIVERED; NORMATIVE CONTRACT SPECIFIED; TEARDOWN IMPLEMENTATION BLOCKED on #115, #146, and the closure successor; POSIX unavailable independently | Merged #120 supplies exact Windows target/effect evidence but exposes a raw entry, supplies no POSIX exact-token executor, and supplies no action-scoped creation closure. A fresh proof cannot create an envelope without a `RESERVE` permit; deserialized evidence cannot construct a witness, lineage, sealed call, receipt, or effect mutation. Unresolved named paths remain `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human. |
+| Owned-childless teardown requires a nonce-owned complete tree, a named target executor, and action-time closure | WINDOWS #120 INPUT/TARGET-LOCAL EFFECT DELIVERED; NORMATIVE CONTRACT SPECIFIED; TEARDOWN IMPLEMENTATION BLOCKED on #115, #146, and the closure successor; POSIX unavailable independently | Merged #120 supplies `OwnedExactStartGuardV1` Windows target/effect evidence but exposes a raw entry, supplies no POSIX process-identity target executor, and supplies no action-scoped creation closure. A fresh proof cannot create an envelope without a `RESERVE` permit; deserialized evidence cannot construct a witness, lineage, sealed call, receipt, or effect mutation. Unresolved named paths remain `CAPABILITY_UNAVAILABLE` and `POLICY_HELD` pending a human. |
 | Supervisor owned-tree termination dispatch | NORMATIVE CONTRACT SPECIFIED; IMPLEMENTATION BLOCKED ON #115 AND #146 | One closed sum admits permit-bound childless, independently authorized configured-agent, and independently authorized ephemeral-terminal calls. #115 mints exactly one non-childless action owner in `READY` at the checked logical-action transition; only one constructor consumes it to `CALL`. Submission aliases then race for one admission, admission aliases for one plan, invocation aliases for one native entry, and receipt aliases before receipt-driven behavior. Replay or same-reference races at every boundary produce zero additional mutation, launch, or effect. The ephemeral variant repeats its narrow action-latch and kill-switch gates. Merged raw `Stop-Tree($targets)` and both raw callers make the seal absent until #146 migrates them and proves the private native body has no other entry. Scope excludes the turn watchdog. |
-| Configured issuer PID reuse classification | CAPABILITY UNAVAILABLE; Q4 IMPLEMENTATION BLOCKED ON `ExactIssuerIdentityAdapterV1` | Only a fresh independent definitive PID-absent OS result may produce `PROVED_GONE`. Any process present at that PID, including suspected reuse from a generic start-token mismatch, remains `LIVE_OR_UNPROVEN`; attended disposal is unavailable and the hold persists. Revision 15 names but does not define the exact-identity adapter. |
+| Configured issuer PID reuse classification | CAPABILITY UNAVAILABLE; Q4 IMPLEMENTATION BLOCKED ON `ExactIssuerIdentityAdapterV1` | Only a fresh independent definitive PID-absent OS result may produce `PROVED_GONE`. Any process present at that PID, including suspected reuse from a generic start-token mismatch, remains `LIVE_OR_UNPROVEN`; attended disposal is unavailable and the hold persists. Revision 15 names but does not define `ExactIssuerIdentityAdapterV1`. |
 | Configured PRE_BARRIER owner loss | NORMATIVE HOLD, GONE-ONLY ATTENDED ESCAPE, AND GLOBAL FENCE CLEARANCE SPECIFIED; IMPLEMENTATION BLOCKED ON #115 AND `ExactIssuerIdentityAdapterV1`; AUTOMATIC RETRY OPTIONAL/UNDELIVERED AS `ConfiguredPreBarrierRetrySuccessorV1` | Reload cannot reconstruct transient custody. It derives the complete operator-visible hold in proved or unproven extinction form; only definitive PID absence admits the future checked attended disposition. Disposal attests only `PRIOR_EFFECT_UNKNOWN`, never kills or launches, and persists request/audit/source targets plus an epoch-aware freshness floor. A present PID never admits disposal without the separately reviewed adapter. The singular fence pairs only with `IDLE` and globally blocks every configured/childless action, so it cannot be replaced or bypassed. After kill-switch removal and one-current-supervisor restart, #115's winning ordinary commit alone may publish the post-commit witness; #115's narrow unexported reducer over its sealed merged-#120 operands yields the source-bound barrier custody that alone may clear the fence through a no-effect checked transition. This narrow producer belongs to #115's Q4 delivery; the general adapter remains an overall 87-A dependency. |
-| Configured-agent relaunch crash replay | NORMATIVE RISK SPLIT SPECIFIED; IMPLEMENTATION/ACTIVATION BLOCKED ON #57 | #120 makes the exact-FILETIME kill subphase target-safe for an independently authorized retry, not authority to remint that retry and not `Start-Process` idempotence. The optional automatic retry successor remains absent. Task #57's project-level singleton per wrapped agent must close the durable duplicate-wrapper window; 87-A does not respecify it. |
-| Maximum ordinary capture sequence | NORMATIVE ATTENDED PATH SPECIFIED; implementation blocked on #115 | Typed exhaustion attention and one checked persisted-top-level-`IDLE` epoch rollover reset capture-derived evidence while preserving managed/manual/quarantine state. A non-null configured prior-effect fence preserves every audit/source/effect byte and rebases only its freshness floor to `(new epoch, 0)`. Non-childless execution and every childless envelope/debt/cycle/continuation/retired attempt block byte-identically; an in-flight ephemeral transient owner instead resolves through the closed stale-epoch receipt result with no new-epoch receipt behavior. No budget or fence is laundered. |
+| Configured-agent relaunch crash replay | NORMATIVE RISK SPLIT SPECIFIED; IMPLEMENTATION/ACTIVATION BLOCKED ON #57 | #120 makes the `OwnedExactStartGuardV1`-guarded kill subphase target-safe for an independently authorized retry, not authority to remint that retry and not `Start-Process` idempotence. The optional automatic retry successor remains absent. Task #57's project-level singleton per wrapped agent must close the durable duplicate-wrapper window; 87-A does not respecify it. |
+| Maximum ordinary capture sequence | NORMATIVE ATTENDED PATH SPECIFIED; implementation blocked on #115 | Typed exhaustion attention and one checked persisted-top-level-`IDLE` epoch rollover reset capture-derived evidence while keeping the managed/manual/quarantine fields byte-identical. A non-null configured prior-effect fence preserves every audit/source/effect field byte-identically and rebases only its freshness floor to `(new epoch, 0)`. Non-childless execution and every childless envelope/debt/cycle/continuation/retired attempt block rollover and remain byte-identical; an in-flight ephemeral transient owner instead resolves through the closed stale-epoch receipt result with no new-epoch receipt behavior. No budget or fence is laundered. |
 | Child-establishment grace cannot be sampled away | NORMATIVE CONTRACT SPECIFIED; implementation blocked on #115, #146, the merged-#120 adapter, and the closure successor for effect conformance | Nonrenewable same-turn closed guard in observation, confirmation, reservation, and action equality. |
-| External childless calls cannot outlive their authority owner | PARTIAL WINDOWS #120 TARGET-LOCAL PRIMITIVE DELIVERED; full normative contract specified; implementation blocked on #115, #146, and the closure successor | For an openable exact-FILETIME Windows target, merged #120 binds identity-check and termination to one handle and attempts the bounded same-handle wait. Unique lineage custody, deep seals, closed dispatch, checked continuation owner/stage, stable tombstones, and attempt-bound synchronous adapters remain absent. |
-| POSIX named owned-childless teardown and inherited cleanup | CURRENTLY UNAVAILABLE | #120 accepts Linux exact observation tokens but declares no macOS mapping, and the merged supervisor owned-tree body skips the Linux-token target because it has no FILETIME. No POSIX childless dispatcher witness exists, so neither fresh authority nor a deserialized `PRE_BARRIER`, external-effect phase, debt-only state, spawn ambiguity, or retired tombstone can construct the permit and typed object required to act. The Windows FILETIME guard is unchanged. |
+| External childless calls cannot outlive their authority owner | PARTIAL WINDOWS #120 TARGET-LOCAL PRIMITIVE DELIVERED; full normative contract specified; implementation blocked on #115, #146, and the closure successor | For an openable Windows target guarded by `OwnedExactStartGuardV1`, merged #120 binds identity-check and termination to one handle and attempts the bounded same-handle wait. Unique lineage custody, deep seals, closed dispatch, checked continuation owner/stage, stable tombstones, and attempt-bound synchronous adapters remain absent. |
+| POSIX named owned-childless teardown and inherited cleanup | CURRENTLY UNAVAILABLE | #120 accepts Linux `linux:<boot_id>:<start_ticks>` observation tokens but declares no macOS mapping, and the merged supervisor owned-tree body skips the Linux-token target because it has no FILETIME. No POSIX childless dispatcher witness exists, so neither fresh authority nor a deserialized `PRE_BARRIER`, external-effect phase, debt-only state, spawn ambiguity, or retired tombstone can construct the permit and typed object required to act. The Windows FILETIME guard is unchanged. |
 | Partial owned-childless teardown cannot be laundered into launch | NORMATIVE CONTRACT SPECIFIED; implementation blocked on #115, #146, the merged-#120 adapter, and the closure successor | Origin-neutral durable teardown debt, closed dispatch, and debt-bound completion authority. |
 | Automatic owned-childless retry stops at three without fading from attention | ENFORCED after tasks #78/#115 | Durable childless-only cycle, hard cap, and independent action-attention output. |
 | State loss cannot reset a cap or erase teardown debt | ENFORCED after task #115, with automatic V1 retirement unavailable | Fail-closed quarantine has no automatic retirement constructor on any platform. It remains `STATE_PROVENANCE_LOST`/`POLICY_HELD` pending attended handling; local different-owner or extinction evidence and a structurally valid backup cannot clear it. |
