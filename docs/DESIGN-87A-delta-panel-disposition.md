@@ -223,7 +223,7 @@ row uses exactly one permitted disposition:
 
 Lifecycle status is orthogonal to row disposition:
 
-- **NORMATIVE-SPECIFICATION COMPLETE** means a panel accepted a closed,
+- **NORMATIVE-SPECIFICATION COMPLETE** means a panel accepted a complete,
   implementable contract and its mandatory evidence; it does not mean code
   enforcement exists.
 - **IMPLEMENTATION BLOCKED** means named executable prerequisites are absent.

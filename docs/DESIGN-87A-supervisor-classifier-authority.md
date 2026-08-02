@@ -38,7 +38,7 @@ exist.
 
 Every asserted property in this document has one of these labels:
 
-- **ENFORCED** means this document defines a type, constructor, equation,
+- **ENFORCED** means this document defines a closed type algebra, constructor, equation,
   invariant, or mandatory conformance test that mechanically decides the
   property. It means “implementable and test-gated,” not “currently shipped.”
 - **STATED** means a verified current fact, scope boundary, dependency, ordering
@@ -1876,8 +1876,9 @@ For a kill-bearing configured reservation, #115 fully constructs one dormant
 `ConfiguredOwnedTreeActionCommitV1` before its checked compare-and-swap. The
 winning checked commit both installs the configured reservation/barrier successor and
 its source-equal `ConfiguredActionIssuerCheckpointV1` and atomically activates/yields
-its single action custody in `READY`; a CAS loser activates nothing. The closed ephemeral terminal transition applies the same
-rule to `EphemeralTerminalActionCommitV1`: it persists that `next_entry` and
+its single action custody in `READY`; a CAS loser activates nothing. The winning
+#115 checked `COMPLETE`/`TIMEOUT`/`FAILED` terminal transition applies the same rule
+to `EphemeralTerminalActionCommitV1`: it persists that `next_entry` and
 yields one `READY` custody for that request/action. Neither constructor may mint
 custody after the fact from the persisted successor. A crash between commit and
 caller receipt may lose the action, but reload sees only inert provenance and

@@ -1173,7 +1173,7 @@ every family property; silence is nonconforming:
 | --- | --- | --- | --- |
 | `CHILDLESS` | **KEEP** the stronger unique live effect-guard lineage and one outstanding loan per acquisition; **SKIP** a second non-childless `READY` token because planner provenance is never its issuer. | **KEEP** every seal, admission, plan, invocation, receipt, and poison rule. | **KEEP** permit/witness/closure requirements; **SKIP** non-childless planner provenance. |
 | `CONFIGURED_AGENT_RELAUNCH` | **KEEP** one #115-minted configured action owner in `READY`, bound to the checked reservation/barrier transition, plus one atomically persisted inert `ConfiguredActionIssuerCheckpointV1`. | **KEEP** every seal and owner transition; **KEEP** exact-FILETIME target semantics but **SKIP** automatic remint after issuer loss pending optional `ConfiguredPreBarrierRetrySuccessorV1`. | **KEEP** the owner-lost hold and definitive-`GONE` attended disposition; **KEEP** present-PID/reuse disposal unavailable pending `ExactIssuerIdentityAdapterV1`; **KEEP** #57's durable per-agent launch singleton; **SKIP** `EphemeralTerminalFinalActionGateV1` because its checked configured reservation/barrier gates are the independent authorization. |
-| `EPHEMERAL_TERMINAL` | **KEEP** one #115-minted ephemeral action owner in `READY`, bound to the closed checked terminal transition. | **KEEP** every seal and owner transition; **KEEP** exact-FILETIME restart retry. | **KEEP** the terminal latch/kill-switch gate and stale-classifier-epoch receipt result; **SKIP** #57 because this variant never launches a wrapper and archives only after its fresh teardown barrier. |
+| `EPHEMERAL_TERMINAL` | **KEEP** one #115-minted ephemeral action owner in `READY`, bound to the winning #115 checked `COMPLETE`/`TIMEOUT`/`FAILED` terminal transition. | **KEEP** every seal and owner transition; **KEEP** exact-FILETIME restart retry. | **KEEP** the terminal latch/kill-switch gate and stale-classifier-epoch receipt result; **SKIP** #57 because this variant never launches a wrapper and archives only after its fresh teardown barrier. |
 
 The #146 dispatcher accepts only `SupervisorOwnedTreeDispatchSubmissionV1`.
 After validating the handle's private provenance and owner binding, it must win
@@ -3978,7 +3978,7 @@ transaction; no executor branch may save a cached whole state.
     owner nor a non-childless dispatch-use owner cell is reachable; only the
     immutable custody/use proof is present. Prove the opaque submission,
     admission, invocation, and receipt-custody handles are the only private
-    associations between their corresponding immutable values and that owner,
+    associations between their source-bound immutable values and that same owner,
     and that each holder transition
     changes the separate cell exactly once. A caller
     mutex, external call-ID registry, or unstated dispatcher lock must fail the
