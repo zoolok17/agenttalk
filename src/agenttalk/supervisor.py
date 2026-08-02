@@ -2060,9 +2060,41 @@ def _snap_index_and_excluded(
     # are different facts to a caller checking a PRIOR entry's current row
     # - a prior identity whose row was excluded here (present, ambiguous)
     # must be rejected, not silently treated the same as one that simply
-    # exited (absent, normal). The excluded set is the one piece of that
-    # distinction only this function has; _snap_index stays the thin,
-    # unchanged accessor every other caller already uses.
+    # exited (absent, normal).
+    #
+    # Task #150 round 7 connector finding: a thin `_snap_index` wrapper
+    # that silently discarded the excluded set was the trap - eight call
+    # sites read "PID not in the index" as a single fact, and only round
+    # 6's own fix (the prior-entry check here) had been taught the new,
+    # correct three-way distinction. Surveyed the other seven, each with a
+    # keep-or-fix reason at its own call site:
+    #   - proven to matter, confirmed by a failing/passing test:
+    #     _ephemeral_process_alive (the named finding this round).
+    #   - proven NOT to matter: the promotion check in
+    #     _unverified_owned_process_tree and evaluate_launch_barrier are
+    #     each gated by _snapshot_pid_integrity_error finding the SAME
+    #     underlying condition first (a duplicated pid is a strict subset
+    #     of what that whole-snapshot check already catches), so the
+    #     excluded set is provably empty by the time either site's own
+    #     fix would run - proven by construction, not merely reasoned; a
+    #     test built to discriminate this passed identically either way.
+    #   - genuinely indifferent by design: _attribution's launcher
+    #     confirmation only ever suppresses kill-targeting for an
+    #     ambiguous identity, this file's own stated default elsewhere.
+    #   - fixed defensively, reachability NOT proven either way:
+    #     _unverified_owned_process_may_exist and the wrapper-liveness
+    #     check in _wrapped_liveness, and brain liveness in _liveness for
+    #     the legacy, non-wrapped path. Every end-to-end scenario tried
+    #     already reached the same safe outcome through a DIFFERENT,
+    #     pre-existing mechanism first, so no test could be made to
+    #     discriminate these three branches' own effect - kept because
+    #     the rule is correct and they are not proven dead the way the
+    #     two above are.
+    # With every consumer surveyed and fixed, justified, or disclosed as
+    # unproven, the wrapper that made the excluded set optional to check
+    # has no remaining callers and is retired - a future caller now has no
+    # way to get an index without also being handed the one set that this
+    # conflation kept breaking on.
     idx: dict[int, dict] = {}
     seen: set[int] = set()
     excluded: set[int] = set()
@@ -2081,10 +2113,6 @@ def _snap_index_and_excluded(
         seen.add(pid)
         idx[pid] = row
     return idx, excluded
-
-
-def _snap_index(snapshot: list[dict] | None) -> dict[int, dict]:
-    return _snap_index_and_excluded(snapshot)[0]
 
 
 def _snap_all_edges(snapshot: list[dict] | None) -> dict[int, list[int]]:
@@ -2937,7 +2965,22 @@ def _unverified_owned_process_tree(
         else None
     )
     if snapshot is not None and snapshot_error is None:
-        idx = _snap_index(snapshot)
+        # Task #150 round 7 connector survey: idx.get(pid) is None both for
+        # a genuinely absent pid AND one _snap_index would exclude this
+        # poll (a duplicate/ambiguous row) - but this whole block is only
+        # ever reached when snapshot_error is None, and _snap_index's
+        # exclusion criterion (a valid pid repeated) is a strict subset of
+        # what _snapshot_pid_integrity_error's own "duplicate_pid"/
+        # "invalid_process_row" already detects over the SAME snapshot -
+        # snapshot_error is None here implies the excluded set would be
+        # empty too. Verified by construction (not merely reasoned): a
+        # direction-controlled test built to exercise this exact path with
+        # a duplicated entry pid passed unmodified with and without a
+        # from-scratch idx.get-based rewrite, proving the gate above
+        # already makes this site safe. Genuinely indifferent - left as
+        # _snap_index_and_excluded only so no caller anywhere still reaches
+        # the retired bare accessor.
+        idx, _excluded_pids = _snap_index_and_excluded(snapshot)
         identity_states = [
             _recorded_process_identity_state(
                 idx.get(entry.get("pid")),
@@ -4360,7 +4403,19 @@ def _attribution(
             "discovered_brain": False,
         }
 
-    idx = _snap_index(snapshot)
+    # Task #150 round 7 connector finding survey: an excluded launcher pid
+    # reads as absent here exactly like everywhere else _snap_index is
+    # consumed, but the ONLY effect is _is_confirmed_launcher returning
+    # False - this agent's launcher is left out of kill_targets/seed_pids
+    # for THIS poll. Failing to confirm an ambiguous identity for kill-
+    # targeting is already this file's stated default (an ambiguous
+    # identity "grants no kill authority" - see _owned_process_tree's own
+    # recycled-parent handling); it never asserts the agent is dead, and
+    # nothing downstream of _attribution's return treats an unconfirmed
+    # launcher as death. Genuinely indifferent - kept on _snap_index_and_
+    # excluded only so the bare, silently-lossy _snap_index wrapper can be
+    # retired now that every consumer has been surveyed.
+    idx, _excluded_pids = _snap_index_and_excluded(snapshot)
     kids = _children_map(idx)
     targets_by_pid: dict[int, dict] = {}
     seed_pids: set[int] = set()
@@ -4687,7 +4742,18 @@ def evaluate_launch_barrier(
             "survivor_count": 0,
             "survivors": [],
         }
-    idx = _snap_index(snapshot)
+    # Task #150 round 7 connector survey: this function early-returns
+    # blocked=True above the moment _snapshot_pid_integrity_error finds
+    # anything wrong ANYWHERE in the snapshot, and _snap_index's own
+    # exclusion criterion (a valid pid repeated) is a strict subset of
+    # what that whole-snapshot check already catches over the SAME
+    # snapshot - reaching this line already proves the excluded set is
+    # empty. Verified by construction, not merely reasoned: a duplicated
+    # entry pid never reaches the loop below at all: it is blocked earlier
+    # with reason "snapshot_duplicate_pid" before idx is ever built.
+    # Genuinely indifferent here - kept on _snap_index_and_excluded only
+    # so no caller anywhere still reaches the retired bare accessor.
+    idx, _excluded_pids = _snap_index_and_excluded(snapshot)
     tree_judged_state_launcher = False
     if isinstance(tree, dict):
         tree_entries = tree.get("entries", [])
@@ -5211,7 +5277,7 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
                 "kill_targets": attr.get("targets") or [],
                 "diagnostics": attr.get("diagnostics") or _diag(),
                 "discovered_brain": False}
-    idx = _snap_index(snapshot)
+    idx, excluded_pids = _snap_index_and_excluded(snapshot)
     allow_launcher_self = bool(lcfg.get("allow_launcher_self", False))
     launcher_pid = st.get("launcher_pid")
     brain_pid = st.get("brain_pid")
@@ -5222,8 +5288,25 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
     # bad launcher pin.
     bad_launcher_pin = (not allow_launcher_self and brain_pid is not None
                         and brain_pid == launcher_pid)
-    brain_alive = (not bad_launcher_pin
-                   and _pid_alive_guarded(idx, brain_pid, brain_start))
+    # Task #150 round 7 connector survey: idx.get(brain_pid) misses both a
+    # genuinely dead brain AND one _snap_index excluded this poll (a
+    # duplicate/ambiguous row) - _pid_alive_guarded cannot tell them apart.
+    # Correctness fix, kept defensively: in every scenario tried, the
+    # legacy agent's own action/state (STUCK_RECOVER vs suspect_warn) and
+    # kill_targets were identical with and without this branch - heartbeat
+    # staleness plus the activity-hook config, not brain_alive itself,
+    # appear to drive that decision here. No end-to-end test could be made
+    # to discriminate this branch's own effect. Conservatively alive is
+    # never the destructive direction, so left in rather than reverted.
+    brain_excluded = (
+        isinstance(brain_pid, int)
+        and not isinstance(brain_pid, bool)
+        and brain_pid in excluded_pids
+    )
+    brain_alive = bool(
+        not bad_launcher_pin
+        and (brain_excluded or _pid_alive_guarded(idx, brain_pid, brain_start))
+    )
     discovered = False
     if not brain_alive:
         cand = _discover_brain(idx, agent, launcher_pid,
@@ -5410,8 +5493,26 @@ def _wrapped_liveness(
         if snapshot is None:
             return bool(identities)
         roots = {pid for pid, _start in identities}
+        idx, excluded_pids = _snap_index_and_excluded(snapshot)
         for pid, start in identities:
-            row = _snap_index(snapshot).get(pid)
+            # Task #150 round 7 connector survey: a duplicated/ambiguous
+            # row for one of these identities is present-but-excluded, not
+            # absent - it IS ownership-shaped live evidence, exactly what
+            # this function exists to detect conservatively for HOLD.
+            # Correctness fix, kept defensively: every scenario tried (a
+            # stored prior tree present; no prior tree at all, matching
+            # generation) already reaches this same conservative outcome
+            # through a DIFFERENT, pre-existing mechanism first
+            # (adopted_tree_missing, or _unverified_owned_process_tree's
+            # own snapshot_error gate) - no end-to-end test could be made
+            # to discriminate this branch's effect, unlike the ephemeral
+            # fix. Left in because it is not proven unreachable either
+            # (unlike the two sites this round reverted after that proof),
+            # and the rule itself is uncontroversially correct wherever
+            # else this file checks it.
+            if pid in excluded_pids:
+                return True
+            row = idx.get(pid)
             if isinstance(row, dict) and _start_tokens_match(_start_of(row), start):
                 return True
         # A launcher may already have exited and left a reparenting race. A
@@ -5600,7 +5701,7 @@ def _wrapped_liveness(
             "snapshot_unavailable",
             hold_reason="process_tree_invalid_snapshot_unavailable",
         )
-    idx = _snap_index(snapshot)
+    idx, excluded_pids = _snap_index_and_excluded(snapshot)
     wrapper_pid = record.get("wrapper_pid")
     wrapper_start = record.get("wrapper_start")
     if (
@@ -5613,6 +5714,24 @@ def _wrapped_liveness(
         )
     wrapper_row = idx.get(wrapper_pid)
     if wrapper_row is None:
+        if isinstance(wrapper_pid, int) and wrapper_pid in excluded_pids:
+            # Task #150 round 7 connector survey: excluded (present this
+            # poll as a duplicate/ambiguous row) is not "dead" - setting
+            # wrapper_state="dead" here would, in isolation, be able to
+            # feed STUCK_OR_DEAD once the heartbeat also goes stale.
+            # Correctness fix, kept defensively: every scenario tried
+            # (a stored prior tree present; no prior tree at all with
+            # _unverified_owned_process_may_exist's own fix already
+            # applied) reaches this same conservative outcome earlier,
+            # through _plan_one's own tree_status intercept, before
+            # wrapper_state is ever consulted - no end-to-end test could
+            # be made to discriminate this branch's own effect. Left in
+            # because it is not proven unreachable, and matches the
+            # ambiguous-identity handling immediately below it.
+            return _current_proof_failed(
+                "wrapper_identity_ambiguous",
+                hold_reason="process_tree_invalid_wrapper_identity_ambiguous",
+            )
         base["wrapper_state"] = "dead"
         return _current_proof_failed(
             "wrapper_absent",
@@ -7556,8 +7675,20 @@ def _ephemeral_owned_process_view(
 def _ephemeral_process_alive(snapshot: list[dict] | None, entry: dict) -> bool | None:
     if snapshot is None:
         return None
-    return _pid_alive_guarded(_snap_index(snapshot), entry.get("launcher_pid"),
-                              entry.get("launcher_start"))
+    idx, excluded_pids = _snap_index_and_excluded(snapshot)
+    launcher_pid = entry.get("launcher_pid")
+    # Task #150 round 7 connector finding: a duplicated (or otherwise
+    # ambiguous) row for this launcher pid is EXCLUDED from idx, which is
+    # indistinguishable from "not running" to a plain idx.get(pid) miss -
+    # the same conflation round 6 fixed for a prior entry, arriving in a
+    # different consumer of _snap_index. The caller's own held_terminal
+    # is unrewritable once persisted, so a False here from a transient
+    # snapshot glitch permanently archives a healthy review as failed.
+    # None (unknown) is safe: the caller only treats `alive is False` as
+    # a terminal failure signal, never `alive is None`.
+    if isinstance(launcher_pid, int) and not isinstance(launcher_pid, bool) and launcher_pid in excluded_pids:
+        return None
+    return _pid_alive_guarded(idx, launcher_pid, entry.get("launcher_start"))
 
 
 def _ephemeral_next_without(state: dict, request_id: str) -> dict:

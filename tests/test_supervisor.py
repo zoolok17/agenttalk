@@ -1950,19 +1950,19 @@ def test_discover_brain_picks_tui_not_launcher() -> None:
     NEVER the forking launcher (199, which exits after handoff). The
     codex-command-runner.exe (300, also matches the 'codex' substring) is below
     the TUI so it never wins either."""
-    idx = sup._snap_index(_codex_tree())
+    idx = sup._snap_index_and_excluded(_codex_tree())[0]
     b = sup._discover_brain(idx, "codex-test", LAUNCHER_PID, "codex",
                             allow_launcher_self=False)
     assert b["pid"] == BRAIN_PID                      # the TUI, not 199 / not 300
 
 
 def test_discover_brain_tui_wins_even_when_launcher_iterates_first() -> None:
-    idx = sup._snap_index(_codex_tree(order_launcher_first=True))
+    idx = sup._snap_index_and_excluded(_codex_tree(order_launcher_first=True))[0]
     b = sup._discover_brain(idx, "codex-test", LAUNCHER_PID, "codex",
                             allow_launcher_self=False)
     assert b["pid"] == BRAIN_PID
     # and after the launcher has EXITED, the TUI is still found (parent_pid persists)
-    idx2 = sup._snap_index(_codex_tree(launcher=False))
+    idx2 = sup._snap_index_and_excluded(_codex_tree(launcher=False))[0]
     assert sup._discover_brain(idx2, "codex-test", LAUNCHER_PID, "codex",
                                allow_launcher_self=False)["pid"] == BRAIN_PID
 
@@ -1970,7 +1970,7 @@ def test_discover_brain_tui_wins_even_when_launcher_iterates_first() -> None:
 def test_allow_launcher_self_true_picks_launcher() -> None:
     """A non-forking CLI (allow_launcher_self=true) still selects the launcher as
     its own brain (claude.exe) - the codex exclusion must not regress it."""
-    idx = sup._snap_index(_codex_tree())
+    idx = sup._snap_index_and_excluded(_codex_tree())[0]
     b = sup._discover_brain(idx, "codex-test", LAUNCHER_PID, "codex",
                             allow_launcher_self=True)
     assert b["pid"] == LAUNCHER_PID
@@ -8560,7 +8560,7 @@ def test_wrapped_unbound_wait_tree_cannot_certify_current_turn_brain(
             "start_time": _ps_iso(910000),
         },
     ]
-    wait = sup._wait_row_for(sup._snap_index(snapshot), "worker")
+    wait = sup._wait_row_for(sup._snap_index_and_excluded(snapshot)[0], "worker")
     assert (wait is not None) is (wait_agent == "worker")
 
     plan = _plan_wrap(
@@ -13600,6 +13600,58 @@ def test_ephemeral_launch_uses_no_legacy_or_command_line_kill_authority() -> Non
     assert timeout_suppressed["archive"] is False
 
 
+def test_ephemeral_review_survives_duplicate_row_poll_not_archived_failed() -> None:
+    """Task #150 round 7 connector finding: a snapshot containing two rows
+    for an ACTIVE EPHEMERAL REVIEWER's launcher pid (even identical rows)
+    made _snap_index exclude that pid, and _ephemeral_process_alive read
+    the resulting idx.get(pid)-is-None the same as "process exited" -
+    permanently archiving a healthy review as failed, since a persisted
+    held_terminal is deliberately unrewritable by any later report. This
+    tests the OUTCOME an operator would see - the review survives the
+    glitched poll and is still active, not the internal alive-flag value
+    - per the explicit instruction that a test proving _ephemeral_process_
+    alive now returns None is not the same as a test proving the review
+    is not archived."""
+    start = _ps_iso(100000)
+    state = {
+        "ephemeral_reviewers": {
+            "active": {
+                "R1": {
+                    "request_id": "R1",
+                    "agent": "worker",
+                    "phase": eph.STATE_REQUESTED,
+                }
+            }
+        }
+    }
+    sup.record_ephemeral_launch(
+        state,
+        "R1",
+        pid=10,
+        pid_start=start,
+        now_epoch=NOW,
+        timeout_seconds=100000,  # far from expiring on this poll
+        root_key=sup._root_key(TEST_ROOT),
+        launcher_nonce=SUPERVISOR_NONCE,
+        launcher_nonce_injected=True,
+        launcher_nonce_source="agenttalk_global_arg",
+    )
+    report = {
+        "root_key": sup._root_key(TEST_ROOT),
+        "agents": {},
+        "launch_requests": [],
+        "ephemeral_reviewers": {"active": {"R1": {}}},
+    }
+    duplicated_launcher = _proc(10, 1, "codex.exe", "codex exec", start)
+    glitched_snapshot = [duplicated_launcher, dict(duplicated_launcher)]
+    plan = sup.plan_actions(
+        report, state, _WRAP_CONFIG, now_epoch=NOW + 1, snapshot=glitched_snapshot,
+    )
+    result = plan["ephemeral_reviewers"]["R1"]
+    assert result["action"] != eph.ACTION_FAILED
+    assert result["next_entry"].get("held_terminal") is None
+
+
 def test_ephemeral_launch_spec_preserves_declared_module_args_from() -> None:
     """Round 13 connector finding, the third location this field has been
     lost: launch_spec() rebuilt its "launch" sub-dict from only
@@ -14991,7 +15043,7 @@ def test_snap_index_excludes_rather_than_picks_a_duplicate_pid() -> None:
     rejection already handles correctly."""
     good_child = _proc(999, WRAP_LAUNCHER_PID, "node.exe", "node tool.js", _ps_iso(700000))
     duplicate_bad_row = {**good_child, "parent_pid": None}
-    idx = sup._snap_index([_wrap_snap()[0], good_child, duplicate_bad_row])  # noqa: SLF001
+    idx = sup._snap_index_and_excluded([_wrap_snap()[0], good_child, duplicate_bad_row])[0]  # noqa: SLF001
     assert 999 not in idx
     assert WRAP_LAUNCHER_PID in idx  # unrelated pids are unaffected
 
