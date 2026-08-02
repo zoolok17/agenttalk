@@ -1,0 +1,7 @@
+{
+  "canonicalization": "agenttalk-nfc-sorted-json-v1",
+  "preservation_registry_sha256": "df371ee1a79ec2be155cbf64bebd9eb10cf26f7e41b9c2f56a9a1219188fd730",
+  "registry_path": "docs/recovery-gates/recovery-ci-registry-v1.json",
+  "registry_sha256": "548f8f6a409521cc3e0995224d015707b27abc33419cbae9eb81c740817e8bd1",
+  "schema_version": 1
+}

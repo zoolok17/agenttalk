@@ -1,664 +1,837 @@
-# DESIGN — #81 recovery actually recovers
+# DESIGN — #81 recovery CI conformance gate
 
-**Status:** design candidate; no production mechanism is claimed by this note
+Audience: maintainers implementing or reviewing recovery behavior, the release
+owner, and CI owners deciding whether a recovery scenario may become a release
+gate.
 
-**Mode:** reference
+Status: revision 2 design; no production implementation is claimed.
 
-**Audience:** recovery implementers, integration-test authors, and release reviewers
+This revision withdraws the earlier general claim that runtime recovery is
+terminal, preserves all durable work, and restores capability. The earlier
+definition had concrete false-green executions. This note specifies a smaller
+claim that can be made mechanically: a finite, versioned set of real CI
+scenarios may prove recovery for only the scenarios, platforms, durable
+families, and semantic work keys they enumerate.
 
-**Goal:** give CI a falsifiable answer to “did recovery restore the capability it
-claimed to restore without losing committed work?”
+The registry currently has no enabled scenario. Its result is therefore
+`UNAVAILABLE`, not `PASS`. `WATCHDOG_HELD_PIPE_RECOVERY_V1` (#112) is the first
+blocked candidate. This is intentional non-vacuity, not a placeholder green.
 
-**Base:** `2f95def62f67bcba39a481eb116143435219b6a8`
+The normative machine-readable registry for this revision is
+`docs/recovery-gates/recovery-ci-registry-v1.json`. Its canonical digest is
+published beside it. Prose and registry disagreement is a gate error.
 
 ## Decision
 
-Recovery worked only when an externally observed, pre-bound challenge for the
-failed capability completes through the production path after the recovery
-action, and every commitment made before that action remains semantically
-present exactly once.
+The observable that distinguishes recovery from an appearance of recovery is:
 
-That is a conjunction, not a choice:
+> In a registry-selected real-subprocess scenario whose negative control has
+> first proved the broken baseline cannot satisfy its challenge, the exact
+> recovered process generation must execute the named production actuator path
+> and complete the challenge within the CI bound; an independent harness must
+> attribute both facts to that execution; globally keyed terminal work and
+> effects must occur exactly once across the whole run; and the explicitly
+> enumerated baseline durable families must survive.
+
+For enabled registry entry `s` and isolated run `r`:
 
 ```text
-RECOVERED =
-    intended_effect_observed
-    AND capability_challenge_committed_after_effect
-    AND committed_work_preserved
-    AND no_duplicate_effect_or_completion
+CI_RECOVERED_V1(s, r) :=
+    REGISTRY_BOUND(s, r)
+  ∧ FAILED_BASELINE_ORACLE(s, r)
+  ∧ ATTRIBUTED_EFFECT_CARDINALITIES_HOLD(s, r)
+  ∧ ATTRIBUTED_CHALLENGE_TERMINAL_COUNT(s, r) = 1
+  ∧ GLOBAL_TERMINAL_MULTIPLICITY(s, r)
+  ∧ GLOBAL_EFFECT_MULTIPLICITY(s, r)
+  ∧ ENUMERATED_BASELINE_PRESERVED(s, r)
+  ∧ CI_PARENT_REACHED_PASS_WITHIN_BOUNDS(s, r)
 ```
 
-The challenge must have been impossible for the proved failed baseline to
-complete. It is normally a new deterministic stub-agent turn for wrapper and
-CLI-child recovery. It is deliberately capability-specific: for owned-tree
-recovery, a healthy incumbent can complete an ordinary turn before and after the
-purported fix, so the challenge must exercise the recovered owned-tree authority.
+The suite is `PASS` only when all enabled entries are `CI_RECOVERED_V1` and at
+least one entry is enabled. A failed conjunct is `FAIL`. An empty registry,
+missing adapter, unsupported platform, digest drift, incomplete evidence, or
+unavailable historical parent is `UNAVAILABLE`; none is converted to `PASS`.
 
-None of these facts is recovery proof by itself:
+This is a CI conformance statement. It is not a statement that every runtime
+recovery episode terminates. Runtime terminality remains a named residual in
+this revision.
 
-- a warning disappeared;
-- a health or readiness field became green;
-- the recovery function returned success;
-- a process was launched;
-- a state record says `terminal` or `recovered`; or
-- an unaffected incumbent completed an ordinary turn.
+## Why the scope is deliberately narrow
 
-The system under test may emit evidence, but it does not award itself the gate
-verdict. An external harness derives the verdict from real process observations,
-validated store records, and the pre-bound scenario contract.
+Warning absence is compatible with a dead supervisor. Health is compatible
+with a dead CLI child. A later turn can be completed by a healthy incumbent
+that never exercised the repaired dispatcher. A nonce correlates data but does
+not identify the process that executed it. A production-written `complete`
+field can repeat the bug being tested. None is sufficient alone.
 
-## Scope: what creates a recovery episode
+The gate therefore admits only scenarios for which all of these are available:
 
-This design is intentionally narrower than “anything went wrong.” A
-`RecoveryEpisodeV1` exists only when all of the following are true:
+1. a failed-baseline oracle that is executable on a historical broken parent;
+2. independent process and effect attribution through an exhaustive native-
+   effect boundary;
+3. a real challenge through the named production path;
+4. whole-run semantic multiplicity;
+5. raw discovery and comparison for the enumerated durable families; and
+6. hard CI parent bounds.
 
-1. The subject previously reached a proved usable generation. First launch and
-   installation are not recovery.
-2. A typed observation proves that one declared recoverable capability is
-   unavailable or that an already-accepted recovery intent must be resolved.
-3. AgentTalk owns an automatic actuator or an existing accepted control-plane
-   intent for that capability. Observing a provider outage is not ownership of
-   provider recovery.
-4. A durable baseline binds the subject, generation, fault fingerprint,
-   preservation fence, challenge contract, and finite budget before the first
-   recovery action.
+The registry does not infer coverage from an issue label or prose fixture. A
+scenario that lacks one item remains a blocked candidate.
 
-The subject is `(project, agent, capability, generation)`, not just an agent
-name. Capabilities include wrapper execution, CLI-child execution, owned-tree
-authority, supervisor adoption, and exact inbound reconciliation. This prevents
-an unrelated healthy capability from satisfying a failed one.
+## Closed scenario registry
 
-An automatic detector and an already-accepted `request-restart` may both open an
-episode. This does not add an operator ritual: it only makes the outcome of the
-existing intent bounded and testable. A planned stop, a kill switch, and a
-deliberately stood-down agent do not open one.
+### Registry identity
 
-### Baseline and challenge binding
+`RecoveryCiScenarioRegistryV1` is a finite document, not an extensible name
+map. An implementation must exhaustively dispatch every `enabled_entries[].id`
+known to schema version 1. Unknown IDs, normalized-key collisions, missing
+required fields, extra executable oracle names without a reviewed dispatch
+case, or schema drift make the registry unavailable.
 
-The baseline must contain:
+Every enabled entry must bind all fields listed by
+`enabled_entry_required_fields`, including:
+
+- supported platforms;
+- failed-baseline, effect, and challenge oracles plus the closed effect-contract
+  family;
+- the digest of every executable oracle module;
+- the protected-opener selector and opener-derived terminal-contract family;
+- the terminal and protected-work resolvers, external execution-attribution
+  adapter, actuator adapter, publication-attribution adapter, raw-event journal
+  adapter, cursor-attribution adapter, preservation-verifier bundle, and
+  immutable-SUT-bundle builder, each by closed ID and executable SHA-256;
+- the participant resolver by closed ID and executable SHA-256, plus its
+  exhaustive, nonempty participant set when cursor preservation is named;
+- the deterministic fixture builder/input and projected-baseline equivalence
+  comparator, each digest-bound;
+- global terminal and effect key definitions;
+- the exact preservation-family IDs;
+- poll and wall bounds; and
+- the immutable historical parent expected to fail.
+
+The baseline manifest, every trace record, and the final evidence envelope must
+carry the same registry digest and candidate commit. The verifier must resolve
+through the closed dispatch and clean-checkout rehash every enabled-entry field
+ending in `*_sha256`, plus every member of `oracle_module_digests`. This includes
+the contract families, resolvers, attribution/publication/cursor adapters,
+actuator adapter, native-effect fence, raw-event adapter, preservation bundle,
+SUT-bundle and fixture builders, and baseline-equivalence comparator. A missing
+component, unresolvable ID, or byte mismatch is `UNAVAILABLE`. A SUT-authored
+digest is not accepted as evidence of those bytes.
+
+### Canonical digest
+
+`agenttalk-nfc-sorted-json-v1` means:
+
+1. parse JSON while rejecting duplicate object keys;
+2. NFC-normalize every string and object key, then reject any key collision
+   introduced by normalization;
+3. admit only objects, arrays, strings, integers, booleans, and null; floats are
+   rejected;
+4. order object keys by normalized Unicode scalar sequence;
+5. encode UTF-8 JSON with `,` and `:` separators, no insignificant whitespace,
+   no ASCII escaping, and no trailing newline; and
+6. compute SHA-256 over those bytes.
+
+The sidecar digest is a review aid. The clean-checkout rehash is the oracle.
+For this revision the canonical registry SHA-256 is
+`548f8f6a409521cc3e0995224d015707b27abc33419cbae9eb81c740817e8bd1`;
+the embedded preservation-algebra SHA-256 is
+`df371ee1a79ec2be155cbf64bebd9eb10cf26f7e41b9c2f56a9a1219188fd730`.
+
+### Non-vacuity
+
+`enabled_entries` is empty in this revision. Availability is derived by the
+closed `enabled-entry-nonvacuity-v1` algorithm; it is not an independently
+authored status that may drift. The registry explicitly specifies
+`minimum_enabled_entries: 1` and `empty_result: UNAVAILABLE`. CI must not skip an
+empty parameterization and report the job green. The job must emit a typed
+`UNAVAILABLE(empty_registry)` result and remain incapable of satisfying a
+release rule that requires this gate.
+
+The blocked #112 row is not executed and cannot contribute to pass cardinality.
+
+### Admission procedure
+
+A blocked candidate becomes enabled only in a change that supplies and reviews:
+
+1. the closed dispatch case and canonical registry update;
+2. executable negative and positive oracles plus the effect-contract family;
+3. external attribution, native-effect fence, and raw-journal adapters on every
+   declared platform;
+4. a digest-bound fixture pair whose pre-recovery projections compare equal;
+5. a run on the immutable historical parent that fails for the intended
+   conjunct;
+6. a run on the candidate that passes;
+7. mutation evidence for attribution, multiplicity, preservation, and bounds;
+8. measured poll and wall limits; and
+9. a release-gate review of the resulting evidence envelope.
+
+An issue description, a hand-built record, a mocked process table, or a test
+that exercises only the recovery function is not admission evidence.
+
+## Failed-baseline oracle
+
+Each scenario owns a typed negative-control oracle. It must establish the
+specific broken precondition and then demonstrate, on the historical parent,
+that the exact challenge predicate is unsatisfied for that cause.
+
+The oracle cannot be only “no response arrived before timeout.” Death also
+satisfies absence. It must combine the missing result with positive external
+facts defined by the entry, such as the relevant process still existing in the
+blocked wait, the exact native effect having occurred, or the repaired
+dispatcher path remaining unexecuted.
+
+The same oracle module and inputs run against historical parent and candidate.
+Changing the predicate between runs changes its digest and invalidates the
+comparison. The historical run must produce the entry's expected failing
+conjunct; an unrelated crash or harness failure is `UNAVAILABLE`, not a useful
+negative.
+
+For `WATCHDOG_HELD_PIPE_RECOVERY_V1`, an admissible negative fixture still needs
+to reproduce the real inherited-writer shape with real subprocesses and prove
+the wrapper remains blocked after the named watchdog effect. Existing tests
+that replace process creation, process probes, or kill behavior do not close
+that oracle.
+
+### Historical/candidate fixture equivalence
+
+`DeterministicRecoveryFixtureV1` builds the historical-parent and candidate
+roots from the same canonical fixture input. The enabled entry binds the
+builder ID/SHA-256, input SHA-256, and a projected-baseline comparator ID/SHA-
+256. A harness-owned start barrier prevents either SUT from beginning recovery
+until its raw baseline and broken-state observations are sealed.
+
+The evidence carries separate historical-parent and candidate baseline
+manifests. `ScenarioBaselineProjectionV1` must compare them equal for every
+challenge, protected opener, durable family, logical process role, held
+resource, failure predicate, and policy input. Platform-assigned PID/FILETIME
+values may differ only through an explicit one-to-one logical-role mapping;
+they are retained in the role-specific manifests rather than discarded. SUT
+revision and immutable bundle are the intended differing inputs.
+
+The failed-baseline precondition must hold externally in both roles before the
+barrier releases. If the historical fixture is broken but the candidate fixture
+starts healthy, the comparator fails. One unqualified baseline digest is never
+sufficient.
+
+## External execution attribution
+
+### `ExternalProcessExecutionTraceV1`
+
+The independent harness, not the SUT, owns the attribution channel and records:
 
 ```text
-RecoveryBaselineV1 {
-  episode_id
-  subject                    # project + agent + capability + generation
-  trigger_code
-  trigger_evidence_ref       # real observation, not a copied boolean
-  fault_fingerprint
-  challenge_contract {
-    predicate_id, predicate_version
-    semantic_key_binding =
-      CONCRETE { semantic_key, raw_input_manifest_ref }
-      | DEFERRED {
-          derivation_id, derivation_version
-          semantic_key_namespace, raw_input_schema_id
-        }
-    instantiation_phase      # BEFORE_FAULT | BEFORE_ACTION | AFTER_EFFECT
-  }
-  publication_fence_ref
-  attempt_limit
-  deadline
-  expected_terminal          # MUST_RECOVER | EXPECT_VISIBLE_BLOCK
-  capability_matrix_ref      # authoritative required platforms/adapters
+ExternalProcessExecutionTraceV1 {
+  test_run_id
+  registry_digest
+  run_role: HISTORICAL_PARENT | CANDIDATE
+  sut_revision
+  immutable_sut_bundle_digest
+  import_path_manifest_digest
+  harness_generation_token
+  process_identity
+  parent_process_identity
+  executable_path
+  executable_sha256
+  argv_digest
+  isolated_store_root_digest
+  scenario_id
+  challenge_id
+  publication_receipt_id
+  event_kind
+  monotonic_sequence
 }
 ```
 
-The challenge contract, rather than necessarily the concrete work id, is bound
-before the first action. Its predicate and semantic-key derivation come from
-closed registries. A `CONCRETE` binding fixes its key and raw inputs immediately.
-A `DEFERRED` binding is admitted only when the scenario cannot know the concrete
-input until a registered earlier effect exists; it fixes the derivation,
-namespace, schema, and phase in advance, and the external harness—not the
-implementation—later supplies the raw manifest and derives the key. The
-external verifier recomputes both predicates from those raw inputs. A fixture
-may bind a pending inbound before the fault (#112), enqueue it after the fault
-but before action (#116/#150), or instantiate a deterministic key after an
-earlier effect (#156). The scenario registry fixes that ordering; the
-implementation may not choose it after seeing the result.
+On Windows, `process_identity` is PID plus positive decimal creation FILETIME
+read from the same live process handle. Other platforms require a registry-
+named exact adapter before an entry may declare them. Rounded ISO start tokens
+are not process identity.
 
-The predicate answers the counterfactual question: why could the failed
-baseline not have produced this challenge result? A free-form explanation or a
-later success without that binding is merely correlation.
+The harness first creates an immutable, isolated SUT bundle from the exact
+historical-parent or candidate tree. `ImmutableSutBundleV1` hashes the canonical
+source/package manifest, entry point, interpreter, environment import paths,
+and every loadable AgentTalk module, then makes the bundle read-only for the
+run. The launch trace binds `run_role` and `sut_revision` to that bundle. A
+generic `python.exe` hash or a harness-declared commit string alone does not
+prove which AgentTalk bytes ran.
 
-### Publication fence and action reservation
+The harness mints a non-refreshable generation token before spawn and binds it
+to the exact OS process identity, executable and immutable-bundle digests, SUT
+revision and role, parent identity, and isolated root. Possession of a payload
+nonce is insufficient.
+The attribution endpoint must independently recover and compare the peer's OS
+identity; an inherited token presented by a different process fails.
 
-A read followed by an actuator has a TOCTOU gap: a response can commit between
-the read and a kill. Therefore every destructive or retrying action consumes a
-`RecoveryActionReservationV1` created under the same serialization boundary as
-terminal publication:
+The challenge terminal is counted only if the externally observed writer is
+the process generation, SUT bundle, and executable required by the entry and
+its ancestry shows the intended recovered path. A healthy incumbent, a helper
+process, or a different checkout can publish a semantically valid reply and
+still fail this conjunct.
+
+### Writer-to-terminal join
+
+`ExternalAttributedPublicationBrokerV1` must observe the actual production
+publication boundary and atomically bind all of these in one harness-owned
+receipt:
+
+- exact writer PID and creation identity, generation, SUT bundle, and role;
+- scenario, challenge, exact opener, and obligated responder;
+- terminal message ID and canonical raw payload SHA-256;
+- final store path and publication-order sequence/event ID;
+- closed publication-path ID; and
+- the immutable raw bytes retained by the harness.
+
+The terminal resolver must join that receipt to byte-identical raw store or
+raw-event-journal content and to `publication_receipt_id` in the process trace.
+A trace from the recovered process plus a terminal written by an incumbent is
+not a join and fails. If the production publication path cannot expose this
+external atomic binding without substitution, the scenario remains
+`UNAVAILABLE`.
+
+### Exact effect and actuator path
+
+`WatchdogActuatorBrokerV1` is the first proposed effect adapter. It remains a
+dependency. It must sit at the native boundary reached by the actual production
+watchdog path, verify the caller's externally bound identity, execute or observe
+the OS effect, and append a harness-owned record containing:
+
+- process generation and executable binding;
+- closed actuator-path ID;
+- semantic target identity;
+- requested and observed native operation;
+- native result; and
+- monotonic event sequence.
+
+An alternate test-only recovery controller is not equivalent. A production
+receipt copied into the harness is not attribution. A nonce proves correlation,
+not which generation, executable, or path caused the effect.
+
+Every enabled entry binds a closed effect-contract family and executable
+digest. It enumerates the allowed actuator kinds, externally resolved semantic
+targets, and required cardinality for each resulting `RecoveryEffectKeyV1`.
+For the #112 candidate, `WATCHDOG_STOP_EFFECT_FAMILY_V1` requires exactly one
+watchdog stop for the pre-bound target; caller-selected actuator names or
+cardinalities are not admitted.
+
+Broker observation is insufficient if the SUT can bypass the broker.
+`ExternalNativeEffectFenceV1` must make the named adapter the exhaustive native-
+effect capability and independently reconcile every target state transition
+with a broker receipt. The first Windows design uses a harness-owned restricted
+test token/job: the SUT lacks target termination handles and permissions, the
+broker alone retains the permitted handle, the harness owns console and input
+signals, and the deterministic target cannot self-exit inside the bound. The
+harness observes exact target identity, exit transition, code, and sequence.
+
+One brokered stop plus any direct, unmatched, or unexplained target exit fails.
+If the restricted boundary, process permissions, or independent exit observer
+cannot prove exhaustiveness on the CI host, the entry is `UNAVAILABLE`.
+
+Until the process trace, actuator adapter, native-effect fence, and negative
+fixture all exist, #112 remains blocked and the registry remains empty.
+
+## Global semantic multiplicity
+
+Exactly-once is evaluated across the entire isolated store session and the
+external raw-event journal, not separately per recovery episode.
+
+### Terminal assignments
 
 ```text
-RecoveryActionReservationV1 {
-  episode_id, action_sequence
-  publication_cut
-  protected_commitment_manifest_ref
-  semantic_effect_key
-  state = RESERVED | CONSUMED | RETIRED
+TerminalAssignmentKeyV1 = (
+  store_session_id,
+  exact_opener_message_id,
+  obligated_responder,
+  opener_derived_obligation_kind
+)
+```
+
+The terminal message ID, operation nonce, recovery episode ID, and wrapper
+generation are not members. A duplicate terminal sent under a fresh message ID
+therefore collides with the first terminal. A different recovery episode does
+not mint a new obligation.
+
+Each enabled entry binds a `protected_opener_selector` that runs over every
+strictly validated raw message in the baseline and raw-event journal. It returns
+`PROTECTED(opener_id, responder, obligation_kind)` or `NOT_PROTECTED`; unknown or
+ambiguous input is a gate failure. The selected opener, not a later terminal,
+determines `opener_derived_obligation_kind`.
+
+The entry also binds a closed `terminal_contract_family` and terminal-resolver
+module. That family enumerates every mutually exclusive terminal variant for
+the obligation. Accepted, rejected, error, or any other allowed terminal
+variant for one opener therefore resolves to the same assignment key. More
+than one variant is cardinality greater than one, not two valid keys. A raw
+opener-linked message that resembles a terminal but is outside the closed
+family fails classification; it is not ignored.
+
+The protected opener set is discovered from the raw baseline plus all raw
+events in the run. It includes work already terminal at the baseline cut as
+well as work pending at that cut or created later. For every protected opener,
+the verifier resolves terminal messages back to the exact opener using the
+stored origin binding and requires cardinality exactly one. Request IDs may be
+checked for consistency but do not replace the opener identity.
+
+### Recovery effects
+
+```text
+RecoveryEffectKeyV1 = (
+  test_run_id,
+  registry_digest,
+  scenario_id,
+  protected_work_key,
+  actuator_kind,
+  semantic_target
+)
+```
+
+`episode_id` is deliberately absent. Two episodes that perform the same
+semantic effect for the same protected work collide. Different required effect
+kinds, such as one stop and one later launch, have distinct keys and distinct
+entry-specified cardinalities.
+
+`protected_work_key` is not SUT-authored. Each entry binds a closed
+`protected_work_resolver` and its executable digest. It derives the key from the
+strict raw opener/obligation and the entry's semantic target. Episode, attempt,
+wrapper generation, output message ID, operation nonce, timestamp, and any
+caller-selected recovery identifier are forbidden inputs. Unknown or ambiguous
+derivation fails the gate. For the first candidate, the proposed protected work
+is the opener-derived terminal assignment plus the watchdog's exact semantic
+target.
+
+Effect counts come from the external actuator journal. Terminal counts come
+from strict raw store discovery plus the external raw-event journal. Final
+state alone is insufficient because a duplicate could be created and later
+deleted.
+
+## Explicit preservation-family algebra
+
+Revision 1 incorrectly spoke of all protected durable work. Revision 2 protects
+only the two families named by `RecoveryPreservationFamilyV1` for an isolated,
+quiescent CI store.
+
+The preservation registry is itself a closed dispatch. Its machine record
+enumerates the only admitted family, validator, and comparator IDs and the
+required fields of each case. Each family record must be field-for-field equal
+to its compiled dispatch case, including family-specific fields such as
+`integrity_paths` and `session_binding`; the generic required-field list is only
+a minimum. Unknown IDs, an incomplete or altered case, or an enabled entry
+whose preservation-verifier bundle digest does not implement every named case
+is `UNAVAILABLE`.
+
+Each scenario dispatch case pins an exact, nonempty preservation-family set.
+The enabled entry's `preservation_families` must be set-equal to that case; an
+empty or selective list is `UNAVAILABLE`. The proposed #112 case pins both
+`HOT_BUS_MESSAGE_V1` and `AGENT_CURSOR_V1`.
+
+### `HOT_BUS_MESSAGE_V1`
+
+Raw discovery reads every `messages/*.json` file, the publication-order sidecar
+and anchor, and `config.session_id`. The verifier uses strict message schema,
+signature, filename, session, and publication-chain validation; it does not
+consume a filtered production `valid_messages()` view.
+
+The closed comparator
+`baseline-byte-identical-and-global-terminal-multiplicity-v1` requires every
+valid baseline message to remain byte-for-byte unchanged and present.
+Messages created during the run must form a valid append to the publication
+chain. Semantic terminal multiplicity is checked independently, so preserving
+two duplicate messages does not pass.
+
+The baseline and final cuts are made while the harness has stopped new writers.
+This avoids claiming that message publication and cursor updates form one
+transaction when they do not.
+
+### `AGENT_CURSOR_V1`
+
+Raw discovery reads the exact `state/{registry_participant}.cursor` file for
+every member of the enabled entry's registry-bound, exhaustive, nonempty
+`registry_participants` set. A clean-checkout participant resolver independently
+derives the mandatory union of every protected opener's sender and obligated
+responder, every attributed challenge writer, and every scenario control actor.
+The registry set must contain that union; the SUT cannot select or reduce it.
+Naming `AGENT_CURSOR_V1` with a missing, empty, or incomplete participant set is
+`UNAVAILABLE`, not vacuous preservation. The verifier accepts only empty
+or a syntactically valid generated message ID. It does not inherit the
+production reader's malformed-as-empty fallback.
+
+A cursor may stay or advance, never regress. Every crossed addressed input must
+have the entry-required terminal or disposition witness, and the destination
+must exist in the validated message chain. Advancing a cursor merely because a
+later healthy process wrote it is not preservation.
+
+`ExternalAttributedCursorBrokerV1` observes the actual production cursor-write
+boundary. It retains exact before/after bytes and atomically binds the write to
+the peer's exact process/generation/SUT identity, participant, destination, and
+closed cursor-path ID. A cursor mutation without a matching broker receipt
+fails.
+
+### Explicit exclusions
+
+The following are not protected by version 1 and must not be described as
+preserved by this gate:
+
+- cold compacted messages;
+- dead letters and dead-letter attempt ledgers;
+- thread-state files;
+- awaiting records;
+- wrapper session records;
+- operation markers;
+- owed-action ledgers;
+- supervisor ownership records; and
+- any durable family added after this registry version.
+
+Their paths are listed as `out_of_scope_paths` where a stable path is known.
+Discovery of one does not make the gate fail; deletion of one is simply outside
+the claim. Protecting another family requires a new versioned family case, raw
+discovery rule, validator, comparator, mutation tests, and registry digest.
+
+### Raw-event journal dependency
+
+`ExternalRawEventJournalV1` remains required before any entry is enabled. On
+Windows, the first implementable case is
+`WindowsIsolatedStoreChangeJournalV1`, a harness-owned
+`ReadDirectoryChangesW` watcher over the isolated root with an explicit
+overflow/loss result. It monotonically records path, operation, rename pairing,
+and sequence for creation, replacement, rename, and deletion, including
+transient files between cuts. It is tamper/loss evidence, not actor attribution:
+ordinary directory notifications do not identify the writer.
+
+Exact actor identity and raw pre/post content come from the publication and
+cursor brokers at their actual production write boundaries. Their immutable
+receipts retain the raw bytes in a harness-owned blob store. The closed Windows
+adapter reconciles every notification and final-manifest change one-to-one with
+the expected broker receipt sequence. An unmatched write, unmatched receipt,
+rename mismatch, sequence gap, or watcher overflow is `UNAVAILABLE`; it is not
+ignored. A brokered create-then-delete terminal remains keyable from its retained
+bytes. An unbrokered create-then-delete produces an unmatched notification and
+fails without needing to trust its content.
+
+The SUT cannot author or truncate the watcher log, broker receipts, or blob
+store. Other platforms remain unavailable until they supply an equivalent
+closed watcher-and-broker reconciliation adapter.
+
+## CI terminality and the runtime residual
+
+The CI parent owns a hard wall bound and a finite poll bound from the registry.
+It kills the isolated process tree after collecting failure evidence if the
+scenario does not pass. Thus the *test* reaches `PASS`, `FAIL`, or `UNAVAILABLE`
+in bounded time.
+
+This does not prove runtime recovery reaches a terminal outcome. If the runtime
+reconciler dies while the rest of the host continues, no independently owned
+component currently guarantees a terminal recovery record or a visible named
+blocker.
+
+```text
+RUNTIME_RECOVERY_TERMINALITY_UNENFORCED
+  blocked_on: independently owned durable reconciler
+```
+
+Runtime visibility and automatic resumption remain release residuals. This gate
+does not introduce an operator ritual, and an operator action cannot satisfy a
+CI scenario.
+
+## #156 checked witness and inherited identity defect
+
+#156 fits the conceptual class but is not an enabled version-1 scenario. Its
+future verifier must independently reconstruct the set cover from raw manifests
+and live OS observations. It must never trust production `status == complete`,
+`walk_complete`, `rejected_count`, or a copied tree digest as the proof.
+
+For prior entry set `P`, the verifier constructs disjoint sets:
+
+```text
+R = entries re-admitted by a fresh live-edge walk from the wrapper
+A = entries independently confirmed absent or occupied by a different identity
+X = every remaining entry, reported as a named rejection
+
+P = R ⊎ A ⊎ X
+successful_repair iff X = ∅
+```
+
+Re-admission requires an exact live process identity and fresh ancestry. A
+prior row whose `start_filetime` is null is categorically ineligible for `R`.
+Because no exact prior identity exists to compare, such a row may enter `A`
+only when the OS definitively reports its PID absent. A present PID, access
+failure, current exact identity, or any ambiguity enters `X`; observing the
+current process cannot prove it differs from an unidentified prior process.
+Falling back to rounded `_start_tokens_match` can call two different processes
+“same” and is forbidden for the witness.
+
+After set-cover repair, a second attributed challenge must exercise the checked
+authority/dispatcher path that consumes the repaired tree. An incumbent turn,
+raw OS disappearance, or a copied repaired digest cannot satisfy it.
+
+Current field data also limits what #156 represents: six fleet trees are
+invalid and three complete across four causes; two invalid cases have no live
+wrapper and are outside #156's live-wrapper predicate. The live-wrapper case is
+therefore not representative by volume. Wrapper-gone recovery belongs to the
+#150 candidate or another explicitly admitted row.
+
+## Retroactive issue ledger
+
+“Would catch” below means the current revision-2 gate as actually available,
+not the behavior of a hypothetical completed fixture. Because the registry has
+zero enabled entries, no issue is claimed as caught today.
+
+| Issue | Local establishment | Revision-2 gate today | Honest future disposition |
+| --- | --- | --- | --- |
+| #112 — watchdog kill wedges its wrapper | **ESTABLISHED.** Reviewer execution against the pre-fix parent passed the three existing regression tests that reproduce the known contract, but those tests mock process/effect boundaries. | **NO — UNAVAILABLE.** | First candidate. It may become `WATCHDOG_HELD_PIPE_RECOVERY_V1` only after real inherited-writer subprocess, external process/effect attribution, raw journal, bounds, and historical-parent evidence exist. The historical parent must fail the exact challenge conjunct. |
+| #156 — invalid owned tree is not re-walked while a wrapper stays healthy | **ESTABLISHED** for the live-wrapper predicate. | **NO — UNAVAILABLE.** | A later row needs independent raw set-cover, the null-FILETIME exclusion, and an attributed downstream authority action. The production `complete` field is not evidence. |
+| #158 — successor adoption of a surviving wrapper | **CANNOT-ESTABLISH.** No independent local task, test, logbook, or commit evidence establishes the reported incident or internal cause. | **NO.** | Do not create a registry entry from the current record. First obtain an independently reproducible incident and exact restart/adoption oracle. |
+| #116 — confirmed-absent wrapper waits for heartbeat staleness | Locally described recovery candidate; no closed attributed relaunch fixture is bound here. | **NO — UNAVAILABLE.** | Requires a real absence proof, externally attributed replacement generation, attributed challenge, and measured absence-policy bound. |
+| #129 — refused restart remains latched and retries | Locally described visible-block candidate. | **NO — OUT OF SCOPE.** | Version 1 proves successful recovery entries, not runtime visible-block terminality. Admission waits for the independently owned durable reconciler and a closed blocker oracle. |
+| #150 — invalid-tree HOLD pre-empts relaunch after wrapper absence | Field shape exists, including current wrapper-gone invalid trees, but no attributed relaunch fixture is registered. | **NO — UNAVAILABLE.** | Requires independent whole-tree absence, attributed successor launch and challenge, and a preservation family for any ownership state the scenario promises to retain. |
+| #73 — response lands before failed turn is parked/redriven | Locally described concurrency/preservation candidate. | **NO — UNAVAILABLE.** | Requires a complete external raw-event journal and global terminal index across the race. The two version-1 preservation families and quiescent cuts do not prove concurrent publication fencing. |
+
+This ledger prevents retrospective theatre: #112 and #156 are established
+instances, but the design does not claim a gate catches them before the gate can
+actually execute.
+
+## Mechanical check
+
+### Substrate
+
+Each enabled row runs in an isolated temporary store against real source-layout
+entry points and real subprocesses. The stub agent (#34) supplies deterministic
+turn behavior without model spend. Process creation, termination, filesystem,
+CLI, and store boundaries remain real unless the registry explicitly declares
+an external observing adapter. A hand-built Python dictionary cannot stand in
+for a production-written store artifact.
+
+The run has four phases:
+
+1. **Bind:** clean-checkout hash, registry/oracle hashes, platform adapters,
+   isolated root, raw baseline, and global key index.
+2. **Negative control:** run the historical parent and require the typed failed-
+   baseline oracle rather than an unrelated timeout.
+3. **Candidate:** reproduce the same baseline, permit automatic recovery, and
+   inject the exact challenge. No operator action is available.
+4. **Verify:** stop writers, close journals, recompute attribution, multiplicity,
+   and preservation independently, then emit one evidence envelope.
+
+The verifier consumes raw files and harness-owned traces. Production summaries
+may be compared for diagnostics but cannot discharge a conjunct.
+
+### Evidence envelope
+
+```text
+RecoveryCiEvidenceV1 {
+  schema_version
+  registry_digest
+  preservation_registry_digest
+  scenario_id
+  platform
+  candidate_commit
+  historical_parent_commit
+  oracle_module_digests
+  verifier_and_adapter_digests
+  historical_parent_sut_bundle_digest
+  candidate_sut_bundle_digest
+  fixture_builder_digest
+  fixture_input_sha256
+  baseline_equivalence_comparator_digest
+  historical_parent_baseline_manifest_digest
+  candidate_baseline_manifest_digest
+  projected_baseline_equivalence_result
+  external_process_trace_digest
+  external_actuator_journal_digest
+  external_publication_journal_digest
+  external_cursor_journal_digest
+  external_raw_event_journal_digest
+  terminal_key_index_digest
+  effect_key_index_digest
+  poll_count
+  elapsed_monotonic
+  conjunct_results
+  result: PASS | FAIL | UNAVAILABLE
 }
 ```
 
-At reservation, the manifest contains every authoritative committed-work entry
-at or before `publication_cut`. While any reservation for the episode is active,
-the publication writer atomically adds every later terminal commitment for the
-subject to that protected manifest. Those entries are pinned against compaction
-until the terminal gate evidence is committed. The actuator cannot run until
-the reservation is durable.
-
-Both `RESERVED` and `CONSUMED` are active fence states: `CONSUMED` means the
-actuator claimed the reservation, not that publication protection ended. Only
-the transaction which durably commits the product terminal disposition and its
-final protected manifest may move the reservation to `RETIRED`. The external
-evaluation then verifies that committed cut; an actuator return cannot retire
-its own fence early.
-
-This is the no-gap rule: if a commitment becomes durable before or during
-recovery, the same publication transaction protects it; if it never becomes
-durable, it is not “work already done.” A response which lands during detection
-is therefore covered, which is required for #73.
-
-## Terminality invariant
-
-Every episode must reach exactly one terminal disposition within both its
-persisted attempt limit and its persisted deadline:
-
-```text
-RECOVERED {
-  effect_witness_ref
-  challenge_receipt_ref
-  preservation_witness_ref
-}
-
-BLOCKED {
-  blocker_code
-  blocked_stage
-  owning_component_or_dependency
-  evidence_ref
-  attempts_used
-  automatic_retry = NONE
-}
-
-FAILED {
-  failure_code
-  failed_stage
-  owning_component_or_dependency
-  evidence_ref
-  attempts_used
-  automatic_retry = NONE
-}
-```
-
-An action still scheduled for automatic retry is not terminal `BLOCKED`.
-Retries remain in the same episode and consume the same budget; a controller
-restart cannot reset either bound. Coalesced triggers for the same
-subject/fingerprint join the episode rather than starting an unbounded chain.
-After a terminal blocker changes, a new episode may be linked to the old one.
-The old terminal record is never reopened.
-
-`BLOCKED` is a valid fail-visible disposition, not successful recovery. It may
-pass a fixture whose purpose is to prove safe visible refusal. It fails every
-`MUST_RECOVER` fixture and cannot support a release claim that the agent returned
-to work. `FAILED` always fails the recovery gate.
-
-The gate mapping is closed:
-
-| Scenario expectation | Passing observed terminal |
-|---|---|
-| `MUST_RECOVER` | `RECOVERED` with all three witnesses |
-| `EXPECT_VISIBLE_BLOCK` | `BLOCKED` with the complete visible-blocker contract and no forbidden effect |
-
-Every other pairing fails. In particular, always emitting a well-worded blocker
-cannot turn an unavailable recovery implementation green.
-
-`RecoveryEvaluationV1` is the external, immutable, exactly-once evaluation for
-one `(candidate SHA, platform, scenario, episode)`. Its closed outcomes are
-`RECOVERED`, `EXPECTED_BLOCK`, `FAILED`, `OVERDUE`, and `INVALID_EVIDENCE`.
-Only the first two can match the passing rows above. This evaluation—not a
-SUT-authored status field—owns CI terminality.
-
-If the recovery owner dies, silence is not a terminal result. An independent
-reconciler—not the action owner—must, at its first eligible startup or poll after
-the persisted deadline, atomically commit
-`ACTIVE -> FAILED{failure_code=RECOVERY_OVERDUE}`. The compare-and-swap makes
-that transition exactly once. Until it is materialized, read-only status may
-derive `RECOVERY_OVERDUE`, but that projection does not discharge terminality.
-
-In CI the parent harness independently commits a terminal
-`RecoveryEvaluationV1` of `OVERDUE` at its hard bound and fails the scenario; it
-does not wait forever for the SUT to describe its own death. At runtime the
-reconciler's committed failure feeds structured status, doctor, and dashboard
-surfaces. The component that may be wedged is never the sole author of its own
-health.
-
-### Visible non-success contract
-
-A `BLOCKED` or `FAILED` projection is conforming only when a reader can obtain
-all of these positive facts from one structured record:
-
-- episode and subject identity;
-- stable blocker/failure code and failed stage;
-- the component or named dependency that prevents automatic progress;
-- the observation that justified refusal;
-- attempts used and when the episode became blocked; and
-- `automatic_retry=NONE`.
-
-Console prose may render that record but is not the authority. “Operator
-attention required,” warning cessation, an empty event list, or a dead
-supervisor does not satisfy the contract. A remedy may be shown when a real one
-exists, but this design introduces no required operator command. In a
-`MUST_RECOVER` scenario, either non-success terminal is a gate failure.
-
-## The three recovery witnesses
-
-### 1. Intended-effect witness
-
-The witness is registered per capability and binds to the episode subject. It
-proves the actuator changed the failed resource, not merely that an action was
-requested.
-
-Examples:
-
-- wrapper recovery: the old exact process identity is gone, one replacement
-  generation owns the wrapper, and no same-agent survivor remains;
-- supervisor adoption: a successor supervisor has consumed the persisted
-  ownership input through the real adoption path and can use it;
-- owned-tree repair: a fresh production walk, based on a post-trigger process
-  snapshot, proves set coverage over the prior `(pid, start)` identities—each is
-  re-admitted or independently proved absent/different—and emits a complete
-  valid tree for the same wrapper generation. Any leftover identity keeps the
-  result incomplete and names the blocker. The external verifier recomputes
-  this set relation from the captured OS snapshot and persisted rows; it never
-  trusts `walk_complete=true` by itself;
-- inbound reconciliation: validated replay proves the exact terminal response
-  for the exact inbound and the guarded commit advances past it.
-
-A PID, warning, launch call, or hand-built “valid” record is not an effect
-witness.
-
-### 2. Capability-progress witness
-
-The harness instantiates the unique challenge through the public production path
-at the phase fixed by the pre-bound challenge contract. Success is a validated,
-exactly-once receipt for that semantic challenge key which is causally downstream
-of, or carries a checked binding to, the intended-effect witness. A merely
-post-trigger receipt that raced ahead of the recovery effect does not pass.
-
-For wrapper, child, relaunch, and resume scenarios the challenge is a no-model
-stub turn which must land a bus response with its dispatched operation nonce and
-advance the exact inbound. This is stronger than `HEALTHY`: it proves the queue,
-wrapper, real child-spawn path, adapter, reply transport, and commit path all
-worked together.
-
-For a capability an incumbent can exercise while the failed recovery authority
-remains broken, an ordinary turn is not discriminating. The scenario must add a
-capability-specific challenge. The #156 case therefore has two stages:
-
-1. require the real re-walk to replace the invalid tree; then
-2. in the isolated fleet, keep the wrapper present and create a deterministic
-   live/stuck owned descendant for which scoped tree teardown is the sole
-   admitted actuator. The pre-action planner observation must deny the old
-   invalid digest and admit the repaired digest. The checked action receipt must
-   bind to and consume that repaired tree digest and wrapper generation before
-   the queued stub turn completes.
-
-The fresh tree is the effect witness. The second-stage turn proves the repaired
-authority is usable. Complete absence is forbidden in this fixture because the
-#150 absence path could relaunch without exercising the repaired tree. The
-external verifier must reject any alternate actuator route. Either the tree or
-turn fact alone would recreate the false green this gate exists to prevent.
-
-### 3. Preservation witness
-
-“Work already done” means work that crossed an existing durable semantic commit
-boundary. It does not mean uncommitted model prose or a half-written external
-side effect.
-
-`RecoveryPreservationRegistryV1` is a closed capability-to-projection registry.
-For the capabilities in this note its authoritative families are:
-
-- validated terminal bus messages, keyed by immutable message identity plus
-  opener/request binding, terminal kind/status, and payload digest;
-- pending inbound, owed-action, resolution, and dead-letter dispositions;
-- agent cursor and thread-seen watermarks;
-- wrapper session-continuity records when the scenario claims resume; and
-- recovery/action reservations and accepted control intents.
-
-Each registry entry fixes a comparator id/version and its required fields. A
-new or unreadable record family, an unknown comparator version, or a family
-which cannot be projected returns `UNKNOWN` and fails the gate. A scenario may
-select the registered capability projection; it may not omit a family or invent
-a weaker comparator. Active publication-fence entries are pinned, so the first
-implementation does not depend on the current store's unread cold-compaction
-layout. A future live-plus-cold validated reader may replace pinning only through
-a versioned registry change.
-
-For every destructive or retry action, let `Cprotected` be the reservation's
-validated manifest: the entries at its atomic publication cut plus every later
-terminal commitment added while the reservation is active. Let `Cpost` be the
-registered projection after recovery. The preservation requirement is:
-
-```text
-Cprotected is a semantic subset of Cpost
-AND every pre-existing pending inbound is still pending or has one terminal result
-AND the recovery challenge has one terminal result
-AND no semantic effect key is applied more than once
-```
-
-Semantic subset compares immutable receipt identity, terminal kind/status, and
-payload/outcome digest. It is not byte-for-byte store equality: compaction and
-index rebuilding may change layout without deleting work. Cursors and
-thread-seen watermarks may advance but may not regress or skip a pending inbound.
-
-The exactly-once effect key is derived by the external registry from
-`(episode_id, subject generation, actuator kind, target/challenge semantic key)`.
-It is not an implementation-minted launch or action id. Two equivalent launches
-with different fresh ids are two applications of the same semantic key and fail,
-even if only one wrapper survives in the final snapshot. The verifier checks
-cardinality across every externally captured actuator input and OS effect, not
-only final state.
-
-If no trustworthy preservation fence can be read, recovery must fail visibly;
-it must not manufacture a clean baseline or claim `RECOVERED`.
-
-Preservation is unconditional. `BLOCKED` and `FAILED` do not authorize loss or
-duplicate effects merely because they are non-success terminals. A negative
-fixture passes only when its expected refusal is visible **and** its preservation
-and no-forbidden-effect checks hold.
-
-## Mechanical gate
-
-### Test substrate
-
-Extend task #34's deterministic stub-agent canary, but do not treat its current
-wrapper-only test as sufficient. The existing branch at `3772e05` establishes
-the useful core:
-
-- a dependency-free stub emits real Claude adapter event shapes;
-- `run.make_drive` uses its default real subprocess spawner;
-- the stub invokes the real AgentTalk reply CLI against the same store; and
-- the test asserts that an operation-nonce-bearing response really landed,
-  rather than trusting model text.
-
-The recovery gate wraps that core in an outer process harness:
-
-1. Create an isolated project with the production `init`/configuration writers.
-2. Start the generated supervisor, real wrapper, and stub CLI as separate
-   processes from the checkout under test.
-3. Complete a baseline stub turn and capture the semantic preservation fence.
-4. Inject the scenario fault by acting on real process state or by
-   corrupting/removing a record the production writer first created. The harness
-   must not synthesize a replacement “good” record or call the planner with a
-   hand-built state dictionary.
-5. Establish the typed failed baseline and pre-bind the challenge.
-6. Let production polling, persistence, planning, and execution perform recovery.
-7. Derive the terminal verdict from raw process observations, validated store
-   records, status projection, and the challenge/preservation comparators.
-8. Capture a final survivor snapshot and prove there is one owner, one
-   completion, and no lost prior commitment.
-
-The harness must set `AGENTTALK_ROOT` to the isolated root, bind the launched
-package to the candidate checkout, strip provider credentials, enforce network
-isolation where the runner supports it, and prove zero model cost. The stub is a
-deterministic child, not a mock recovery record.
-
-### Bounds and clocks
-
-Each scenario declares a maximum number of recovery polls/actions derived from
-the policy it tests and a hard wall-clock guard for harness failure. Poll count
-is the primary deterministic bound; the wall clock prevents a wedged child from
-hanging CI. Timeouts, missing evidence, malformed evidence, and skipped required
-platforms are failures, never passes.
-
-Long production thresholds are replaced only through supported configuration
-or an explicit test fault seam. For example, the watchdog scenario uses low
-test thresholds with the existing explicit low-threshold opt-in and a real hung
-child; it does not sleep for 1,800 seconds and does not mock the kill result.
+Evidence is invalid if a required digest or trace is missing, if the registry
+cannot be rehashed, or if the evidence says `PASS` while the registry is empty.
 
 ### CI placement and cost
 
-| Tier | Runs | Purpose | Cost |
-|---|---|---|---|
-| Contract | every PR | outcome algebra, monotonic budgets, overdue derivation, preservation comparator, manifest validation | cheap, pure Python |
-| Canonical native smoke | every PR | one real Windows supervisor + wrapper + stub recovery and preservation challenge; required artifact, never a green skip | moderate, no model spend; outer cost not yet measured |
-| Touched scenario | additive when a recovery/store/wrapper/supervisor capability is selected | one or more additional real-subprocess allowlist fixtures | moderate, no model spend |
-| Release matrix | release candidate | the full allowlist on every platform named by each scenario | highest; still deterministic and no model spend |
-| Runtime projection | continuously | surface active, blocked, failed, and overdue episodes | observability only; never proof of `RECOVERED` |
+The first enabled #112 scenario belongs on Windows CI because its historical
+failure shape is Windows-specific. It uses the no-model stub and local
+subprocesses only. The negative parent plus candidate run is expected to cost
+seconds to low minutes; admission requires measured bounds before it becomes a
+required PR check. Platform-specific later rows run only where their exact
+adapters exist.
 
-A focused run of the existing #34 wrapper/stub core executed six scenarios in
-20.79 seconds with no model spend or network dependency. That is evidence for
-the inner challenge cost, not for the proposed outer supervisor harness. The
-first live supervisor smoke and the full matrix must be measured before their
-CI budgets are frozen; an estimate is not gate evidence.
+No paid model, network service, browser, or operator is required.
 
-Touched-path selection is only an additive optimization. It cannot suppress the
-canonical native smoke: shared helpers, packaging, launch environment, and
-generated-script changes are capable of breaking recovery without matching a
-perfect path classifier.
+## QA strategy and close evidence
 
-A required Windows generated-supervisor fixture that skips on a POSIX runner is
-not cross-platform evidence. The release matrix must execute it on Windows.
-When a POSIX implementation is claimed, its applicable rows must execute there;
-`not implemented` is an honest release HOLD, not a green skip.
+The highest risks are a false-green attribution, a duplicate hidden by a fresh
+ID or episode, an omitted durable family, and a test process that never
+terminates. Required checks are:
 
-### Gate artifact
+### Registry and digest tests
 
-The external harness emits one immutable artifact per scenario, bound to the
-candidate SHA and OS:
+- empty registry returns `UNAVAILABLE`;
+- one fully valid enabled row is required for possible `PASS`;
+- every enabled row's preservation-family set is nonempty and exactly matches
+  its closed scenario case;
+- duplicate or NFC-colliding keys, unknown scenario IDs, missing fields, floats,
+  registry drift, and oracle-module drift fail closed;
+- registry/sidecar disagreement is detected by clean-checkout rehash; prose-to-
+  registry semantic parity remains an explicit documentation-review check; and
+- every enabled ID has an exhaustive verifier dispatch case.
 
-```text
-RecoveryGateEvidenceV1 {
-  candidate_sha, scenario_id, issue_ids
-  environment {
-    os, os_version, architecture
-    python_runtime, executor_adapter_id, executor_adapter_version
-    duration_ms
-  }
-  isolated_root_id, episode_id, fault_fingerprint
-  baseline_generation, trigger_evidence
-  challenge_contract, challenge_raw_input_manifest_ref
-  pre_action_process_snapshot_ref, post_action_process_snapshot_ref
-  actuator_input_manifest_ref, os_effect_manifest_ref
-  diagnostic_event_ref?       # never recovery authority
-  challenge_id, challenge_receipt, operation_nonce, cursor_result
-  publication_cut, action_sequence
-  preservation_before_manifest_ref, preservation_before_digest, before_count
-  protected_commitment_manifest_ref
-  preservation_after_manifest_ref, preservation_after_digest, after_count
-  preservation_comparator_id, preservation_comparator_version
-  semantic_effect_keys, exactly_once_keys
-  attempts_used, deadline, observed_terminal
-  stub_executable_sha256, stub_argv
-  provider_credentials_present = false
-  network_policy { mode, evidence_ref? }
-  model_spend_evidence
-  verifier_id, verifier_version, verdict, failure_reasons
-}
-```
+### Attribution mutation tests
 
-Manifest digests bind replayable entry lists; two opaque before/after digests are
-not a subset proof. Existing best-effort supervisor event files are diagnostic
-only. The actuator inputs and OS effects must be captured by the external
-harness, and the verifier recomputes effect, challenge, subset, and cardinality
-predicates from the referenced manifests. A SUT-authored status projection may
-prove that `BLOCKED`/`FAILED` is operator-visible; it cannot contribute to a
-`RECOVERED` verdict.
+- valid nonce from the wrong PID, creation FILETIME, executable, checkout,
+  parent, generation, root, or actuator path fails;
+- a helper or healthy incumbent cannot answer for the recovered generation;
+- copied SUT receipts and copied repaired digests fail;
+- an inherited generation token from another process fails peer-identity
+  comparison; and
+- a recovered-process trace joined to an incumbent-written terminal fails;
+- a terminal whose raw bytes, publication sequence, or writer receipt differs
+  at any join point fails;
+- a cursor mutation written by the wrong generation or lacking a matching
+  cursor-broker receipt fails;
+- an unbrokered native effect, unexplained target exit, caller-selected effect
+  kind, or cardinality outside the closed effect family fails;
+- historical-parent bytes labelled as candidate, a mutable SUT bundle, or an
+  alternate imported AgentTalk module fails; and
+- historical-parent/candidate fixture-input drift, broken-state drift, or
+  projected-baseline inequality fails before recovery is released;
+- a brokered native effect plus any unmatched target exit fails; and
+- missing exact identity adapter is `UNAVAILABLE`.
 
-Zero paid spend is derived from the pinned stub digest/argv, absence of provider
-credentials in the child environment, and the stub's captured result. Network
-is reported as the actually enforced CI policy (`DENIED`, `ISOLATED`, or
-`UNENFORCED`), with evidence where the runner supplies it; the artifact may not
-claim `network_used=false` from a self-authored boolean. `UNENFORCED` is
-acceptable only if the pinned stub and launched production path have no provider
-credential and no model executable; the scenario still has zero model spend.
+### Multiplicity mutation tests
 
-The release gate fails closed when an allowlist row has no matching executed
-artifact for its required platform, the artifact is stale at the candidate SHA,
-any manifest cannot be replayed, or any required witness is absent.
+- duplicate terminal under a fresh message ID fails;
+- duplicate of work already terminal at the baseline cut fails;
+- identical effects split across two episode IDs fail;
+- create-then-delete terminal/effect evidence remains visible in the external
+  journal and fails; and
+- two legitimate different actuator kinds use separate declared keys.
 
-## Retroactive allowlist
+### Preservation and #156 tests
 
-The allowlist is a gate manifest, not a narrative list. Every row names its
-scenario, required challenge, expected terminal, platforms, and issue. Platform
-requirements are validated against `RecoveryCapabilityMatrixV1`, the
-release-supported component/OS/runtime matrix; a scenario author may add a
-platform but may not narrow that authoritative set. Marking a bug fixed does not
-remove the row; it changes the expected result to an executed pass. A recovery
-change must either select all affected rows or add a new row.
+- raw-message deletion, mutation, signature/filename/session mismatch, and
+  publication-chain break fail;
+- cursor regression, malformed-as-empty cursor, or advance without disposition
+  fails;
+- excluded durable families are demonstrated not to be part of the claim;
+- a new protected family cannot enter without a registry-version change; and
+- a #156 prior row without FILETIME can only be confirmed absent or rejected,
+  never re-admitted.
 
-The verdicts below answer whether the gate defined in this note—not a generic
-unit test—would have failed on the historical defect.
+### Integration and failure injection
 
-| Bug | Scenario and discriminating challenge | Challenge phase | Expected terminal | Current required execution | Would this gate have failed? |
-|---|---|---|---|---|---|
-| #156 — invalid owned tree is never re-walked while its wrapper stays healthy | Start from a production-written valid tree, make it invalid, retain a healthy incumbent, require an externally recomputed fresh set-cover walk, then create a live/stuck descendant whose checked teardown must consume the repaired tree digest before one queued stub turn completes. | `AFTER_EFFECT`; deferred key derivation pre-bound, concrete key/interruption later | `MUST_RECOVER` | Windows generated supervisor + source-layout stub; expands with the supervisor support matrix | **Yes, with this two-stage fixture.** A plain next-turn check would **not** catch it because the incumbent can keep doing turns. |
-| #158 — a successor supervisor cannot use a persisted owned-tree record to adopt a surviving wrapper | Start supervisor A and a wrapper, persist the real tree, hard-stop A only, start B on the same root, then inject a challenge whose checked action binds B's adopted tree before the next stub turn can complete. | `BEFORE_ACTION` | `MUST_RECOVER` | Windows generated supervisor + real process restart + source-layout stub | **Yes, with the restart/adoption fixture.** An in-process reload or ordinary turn from the survivor would false-pass. |
-| #116 — a twice-confirmed-absent wrapper waits for heartbeat staleness instead of relaunching | Prove complete process absence, queue a unique stub turn, and require replacement plus completion within the absence policy's poll budget rather than the much longer heartbeat threshold. | `BEFORE_ACTION` | `MUST_RECOVER` | Windows generated supervisor + source-layout stub | **Yes.** The old path misses the bounded terminal and progress witnesses even if it eventually relaunches much later. |
-| #129 — a refused restart request remains latched and retries every poll | Submit the existing restart intent into a deterministic permanent safe-refusal condition; require one visible `BLOCKED` record with the exact blocker, retirement of the marker, and no later action. | accepted intent exists `BEFORE_ACTION` | `EXPECT_VISIBLE_BLOCK` | Windows generated supervisor; protected/refusal path | **Yes, on terminality/visibility.** This fixture does not claim the agent returned to work; it proves a refusal cannot remain a permanent intermediate retry. |
-| #112 — the per-turn watchdog's kill wedges the wrapper it protects | Bind a pending inbound, run a real stub child with a hung descendant which inherits the output writer, let the real watchdog kill under short supported thresholds, and require one terminal result followed by a fresh stub turn. | `BEFORE_FAULT` | `MUST_RECOVER` | Windows source-layout wrapped-watchdog path for the observed inherited-writer defect | **Yes, with the inherited-writer fixture.** A generic hung child whose pipe closes normally would not reproduce the shipped defect. |
-| #150 — invalid-tree HOLD pre-empts relaunch after the wrapper is confirmed absent | Corrupt a production-emitted tree, prove the entire agent tree absent, queue a turn, and let the real supervisor poll. | `BEFORE_ACTION` | `MUST_RECOVER` | Windows generated supervisor + source-layout stub | **Yes.** The old self-sealing HOLD produces neither a replacement nor the challenge receipt and times out. |
-| #73 — a terminal bus response lands, then the failed turn is parked and redriven | Make the stub publish the exact response and then fail. The active publication reservation must protect that late response; require guarded cursor/thread commit and complete the next distinct challenge exactly once without re-driving the old inbound. | inbound `BEFORE_FAULT`; response may land during recovery | `MUST_RECOVER` | Windows, Linux, and macOS source-layout wrapper/stub | **Yes.** The old path fails preservation or redrives the exact inbound; new progress alone could hide the duplicate. |
+- build both roles from the same digest-bound fixture, prove projected baseline
+  equivalence and the broken precondition in both, then run the real historical
+  parent negative control and candidate positive path;
+- run real subprocess lineage, CLI/store boundary, and named actuator path;
+- kill or wedge the SUT, attribution adapter, verifier, and reconciler at each
+  phase; the CI parent must return `FAIL` or `UNAVAILABLE` within its hard bound;
+  and
+- preserve full raw artifacts for an adversarial reviewer.
 
-Two adjacent controls explain why the witnesses are conjunctive:
+Performance benchmarking, model-quality evaluation, UI/browser testing, and
+network security scanning are not required for this local no-model gate.
+Security review of the harness capability and peer-identity binding is required
+because forgery would create a false green.
 
-- #72 would fail the stub-turn challenge when the wrapper reports healthy but
-  its CLI child is dead. Health is therefore not the oracle.
-- task #34's missing-resume scenario is the positive template: a later exact
-  reply, cursor advance, no dead letter, and a reminted session together prove
-  recovery more strongly than a self-heal status field.
+Release close requires: exact commands, platform, candidate and historical
+commits, registry and module digests, measured bounds, pass/fail mutation
+matrix, raw evidence artifact paths, and independent review of attribution,
+failure injection, contract drift, integration behavior, and release readiness.
 
-## Scenario registry requirements
+## Named dependencies and implementation order
 
-Each manifest row must declare:
+The design is specified; the gate is not available. Implementation should
+proceed in this order:
 
-- `scenario_id` and bug/task ids;
-- failed capability and typed trigger;
-- production setup and permitted fault injection;
-- closed effect/challenge predicate ids and versions, raw input manifests, and
-  why the failed baseline cannot satisfy them;
-- challenge semantic key and permitted instantiation phase;
-- checked action-input binding, including consumed tree/state digest where the
-  capability depends on persisted authority;
-- registered preservation projection/comparator and externally derived semantic
-  exactly-once key;
-- expected terminal (`MUST_RECOVER` or `EXPECT_VISIBLE_BLOCK`);
-- poll/action and explicit hard-wall bounds;
-- capability-matrix-derived OS/runtime and executor-adapter requirements; and
-- owning test module.
+1. canonical registry parser, exhaustive dispatch, digest binder, and explicit
+   `UNAVAILABLE` result;
+2. `ImmutableSutBundleV1`, `DeterministicRecoveryFixtureV1`, and the projected-
+   baseline comparator, plus `ExternalProcessExecutionTraceV1` for Windows exact
+   identity and actual loaded source/package bytes;
+3. `WatchdogActuatorBrokerV1`, `ExternalAttributedPublicationBrokerV1`,
+   `ExternalAttributedCursorBrokerV1`, and
+   `WindowsIsolatedStoreChangeJournalV1`, under
+   `ExternalNativeEffectFenceV1`;
+4. real inherited-writer #112 negative/positive fixture using the stub agent;
+5. global terminal/effect index and the two preservation-family verifiers;
+6. historical-parent, candidate, and mutation evidence; then
+7. a reviewed registry change that moves #112 from blocked to enabled.
 
-The registry validator rejects an unknown trigger, witness, comparator, or
-terminal; a missing required platform; duplicate scenario id; unbounded retry;
-or a row which can pass from a SUT-authored `recovered=true` field.
+Other named residuals are:
+
+- `RUNTIME_RECOVERY_TERMINALITY_UNENFORCED` — independently owned durable
+  reconciler unavailable;
+- exact identity adapters for every non-Windows platform claimed by a future
+  row;
+- #156 null-FILETIME reconciliation repair and external authority trace;
+- attributed launch/adoption paths for #116, #150, and any established #158
+  incident; and
+- concurrent publication fencing/journaling for #73.
 
 ## Deliberately out of scope
 
-- **First launch, install, and configuration bootstrap.** There is no prior
-  usable generation or preservation baseline; these need a bootstrap gate.
-- **Provider availability, model output quality, and semantic correctness.**
-  AgentTalk does not own provider recovery, and a paid/nondeterministic model is
-  the wrong release oracle. The stub gates the orchestration path at zero spend.
-- **Intentional pause, kill switch, release/end, or stood-down policy.** Those
-  remove authority by design and must not be “recovered” against operator intent.
-- **Host power loss or absence of any scheduler/observer.** Software cannot make
-  progress while nothing executes. Once an evaluator runs, an overdue persisted
-  episode must fail visibly; silence still cannot pass.
-- **Irrecoverable corruption with no trustworthy commit fence.** The only safe
-  result is a named visible blocker. Recovery may not invent history.
-- **Uncommitted model reasoning, partial tool output, and external side effects
-  without an idempotency receipt.** They have not crossed a durable AgentTalk
-  commit boundary. Preserving or compensating them is a separate contract.
-- **Crash prevention and root-cause elimination.** This gate asks whether the
-  declared recovery path works after the injected failure, not whether the
-  original failure can happen.
-- **Performance tuning beyond the declared recovery budget.** Missing the
-  scenario's bound fails; choosing product latency targets is separate policy.
-- **Manual disaster-recovery procedures.** A manual procedure may remain useful
-  operationally, but it cannot satisfy a `MUST_RECOVER` fixture or this release
-  theme.
+- **Universal runtime recovery.** The current process topology has no durable,
+  independent reconciler owner.
+- **Runtime blocker visibility.** Important, but version 1 does not claim it can
+  survive reconciler death.
+- **All incidents and all recovery paths.** Only enabled registry rows count.
+- **All durable state.** Only `HOT_BUS_MESSAGE_V1` and `AGENT_CURSOR_V1` count.
+- **Concurrent store preservation.** Version 1 uses harness-owned quiescent cuts;
+  #73 needs a stronger journal/fence.
+- **Business/model correctness.** The stub proves capability execution, not the
+  semantic quality of a paid model answer.
+- **Platforms without an exact registered adapter.** They are unavailable, not
+  approximated.
+- **Manual repair.** No operator action can make a scenario pass.
+- **Availability of blocked candidates.** A design name is not an implemented
+  oracle.
+
+These exclusions keep the first gate falsifiable. They are not claims that the
+excluded behavior is safe.
 
 ## Rejected alternatives
 
-### Warning absence
+- warning disappearance;
+- health/readiness alone;
+- any later completed turn without generation/path attribution;
+- operation nonce as process identity;
+- production `complete`, digest, receipt, or cursor summaries as their own
+  verifier;
+- per-episode exactly-once keys;
+- final-state-only multiplicity;
+- a preservation registry described as closed without raw discovery;
+- hand-built records or mocked process boundaries for admission;
+- timeout absence without a positive broken-state oracle; and
+- unconditional runtime terminality without an independent reconciler owner.
 
-A dead supervisor emits no warning. This is proof of neither terminality nor
-progress and cannot distinguish recovery from disappearance.
+Each can pass while the repaired capability remains broken or completed work is
+duplicated or destroyed.
 
-### Health or readiness
+## Open questions
 
-Health is a sampled classification. It can observe the wrong process or only the
-wrapper, as #72 demonstrated. It remains useful evidence, never the success
-oracle.
+No open question changes the current `UNAVAILABLE` result. Before #112 can be
+enabled, reviewers must settle:
 
-### Any later completed turn
+1. the exact Windows peer-identity mechanism for the attribution channel;
+2. how an immutable SUT bundle proves the AgentTalk module bytes actually
+   available to the historical-parent and candidate processes;
+3. how the production publication boundary atomically joins exact writer
+   identity to terminal bytes and publication sequence;
+4. how the native watchdog boundary exposes an externally verifiable closed
+   actuator-path ID without substituting a test controller;
+5. the exact restricted-token/job/handle policy that makes
+   `ExternalNativeEffectFenceV1` exhaustive without changing the watchdog's
+   production control flow;
+6. the exact notification-to-broker reconciliation rules and buffer sizing for
+   `WindowsIsolatedStoreChangeJournalV1`;
+7. measured poll and wall bounds for the real inherited-writer fixture; and
+8. the immutable historical parent commit used by the negative control.
 
-This is strong for wrapper/child recovery but false-passes #156 and #158: an
-unaffected incumbent can complete work while the authority needed for the next
-recovery is still unusable. The turn must be a challenge for the failed
-capability.
-
-### Recovery function success or runtime assertion alone
-
-An action-return field can prove only that the action path believes it ran. A
-runtime assertion inside the component that wedges cannot report its own death.
-Both are inputs to the external gate, not verdicts.
-
-## Review and close evidence
-
-This design requires these independent review lenses before implementation:
-
-1. **Failure injection:** crash at every boundary between baseline persistence,
-   action, effect observation, challenge commit, and terminal write; prove a
-   restart cannot reset the budget or duplicate the effect.
-2. **Contract drift:** ensure store, status, doctor, dashboard, harness artifact,
-   and scenario registry use the same outcome and blocker algebra.
-3. **Release readiness:** prove every allowlist row executed at the exact
-   candidate SHA on every applicable platform; referenced or skipped rows HOLD.
-4. **False-green audit:** try to pass each scenario with a dead supervisor, a
-   healthy wrong wrapper, a duplicate wrapper, a replayed receipt, a hand-built
-   good record, a regressed cursor, and a missing platform leg.
-
-Minimum close evidence is the candidate-bound `RecoveryGateEvidenceV1` bundle,
-the executed allowlist projection, per-platform logs, zero-spend and declared
-network-policy proof, and the reviewer dispositions above. Unit tests or a prose
-assertion that the invariant holds are not close evidence.
-
-## Evidence and dependencies
-
-- `docs/ROADMAP.md` names v0.83.0 “recovery actually recovers” and puts this
-  umbrella before its implementation slices.
-- `docs/TASKS.md` records #73, #81, #112, #116, and #129; the #156 and #158
-  scenario descriptions are supplied by the design-round brief and must become
-  registry rows when their implementation branches exist.
-- `docs/logbook/2026-08-02.md` records the #150 fleet-wide invalid-tree HOLD and
-  the canary which remained absent for six polls instead of relaunching.
-- `CHANGELOG.md` records the #156 residual measured on the maintainer fleet:
-  nine agents retained 32-hour-old invalid trees while eight remained healthy
-  and working. This is the counterexample to a generic turn-completion oracle.
-- `docs/logbook/2026-07-30.md` records #112's watchdog kill leaving the wrapper
-  frozen with no live CLI child.
-- `docs/DESIGN-73-wrapper-landed-work-reconciliation.md` defines the exact
-  durable-response boundary used by the preservation witness.
-- `docs/TEST-COVERAGE-REPORT.md` records that most restart/relaunch tests are
-  in-process simulations and that real supervisor/process crash coverage is a
-  primary gap.
-- Task #34 branch commit `3772e05` supplies the deterministic real-child stub
-  and wrapper-path canary to extend. The outer supervisor/restart harness in this
-  note is a dependency, not something that commit already provides.
-- #158 is evidenced here by the design-round incident description, not by a
-  locally established internal cause. Its real-restart scenario catches the
-  externally described adoption failure; implementation review must still bind
-  the eventual cause and fix to that scenario.
-
-## Open implementation questions
-
-These do not change the invariant but must close before code lands:
-
-1. Will the publication writer maintain the normative protected-commitment
-   manifest directly, or will a new versioned validated historical reader back
-   it? The initial implementation must pin entries unless that reader lands.
-2. Which process hosts the independent overdue reconciler on supervisor startup
-   and poll, and how is its compare-and-swap shared across supported platforms?
-3. The #156 design supplies the fresh-walk/set-cover effect witness. Which
-   isolated second-stage interruption should exercise that repaired authority
-   while keeping the wrapper present and every alternate relaunch path denied?
-4. Which supported short-threshold/fault seams keep the real-process watchdog
-   and restart fixtures deterministic without weakening production defaults?
-5. What is the first measured wall budget for the canonical native smoke and
-   each release scenario? No estimate becomes a passing threshold.
+Until those are answered in executable artifacts, the registry remains empty
+and the release gate remains unavailable.

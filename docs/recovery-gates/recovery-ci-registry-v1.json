@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "registry_id": "RecoveryCiScenarioRegistryV1",
+  "canonicalization": "agenttalk-nfc-sorted-json-v1",
+  "availability_derivation": "enabled-entry-nonvacuity-v1",
+  "non_vacuity": {
+    "minimum_enabled_entries": 1,
+    "empty_result": "UNAVAILABLE"
+  },
+  "enabled_entry_required_fields": [
+    "id",
+    "platforms",
+    "failed_baseline_oracle",
+    "effect_oracle",
+    "effect_contract_family_id",
+    "effect_contract_family_sha256",
+    "challenge_oracle",
+    "oracle_module_digests",
+    "protected_opener_selector_id",
+    "protected_opener_selector_sha256",
+    "terminal_contract_family_id",
+    "terminal_contract_family_sha256",
+    "terminal_resolver_id",
+    "terminal_resolver_sha256",
+    "protected_work_resolver_id",
+    "protected_work_resolver_sha256",
+    "execution_attribution_adapter_id",
+    "execution_attribution_adapter_sha256",
+    "actuator_adapter_id",
+    "actuator_adapter_sha256",
+    "native_effect_fence_id",
+    "native_effect_fence_sha256",
+    "publication_attribution_adapter_id",
+    "publication_attribution_adapter_sha256",
+    "cursor_attribution_adapter_id",
+    "cursor_attribution_adapter_sha256",
+    "raw_event_journal_adapter_id",
+    "raw_event_journal_adapter_sha256",
+    "preservation_verifier_bundle_id",
+    "preservation_verifier_bundle_sha256",
+    "sut_bundle_builder_id",
+    "sut_bundle_builder_sha256",
+    "fixture_builder_id",
+    "fixture_builder_sha256",
+    "fixture_input_sha256",
+    "baseline_equivalence_comparator_id",
+    "baseline_equivalence_comparator_sha256",
+    "registry_participant_resolver_id",
+    "registry_participant_resolver_sha256",
+    "registry_participants",
+    "terminal_key",
+    "effect_key",
+    "preservation_families",
+    "poll_bound",
+    "wall_bound",
+    "historical_parent"
+  ],
+  "enabled_entry_constraints": {
+    "preservation_families": {
+      "minimum_items": 1,
+      "binding": "scenario-dispatch-exact-set-v1"
+    },
+    "effect_contract_family": {
+      "binding": "closed-kind-target-cardinality-v1"
+    },
+    "baseline_pair": {
+      "binding": "fixture-input-and-projected-baseline-equivalence-v1"
+    }
+  },
+  "enabled_entries": [],
+  "preservation_algebra": {
+    "schema_version": 1,
+    "registry_id": "RecoveryPreservationFamilyV1",
+    "dispatch": "exhaustive-v1",
+    "case_binding": "full-record-equality-v1",
+    "family_required_fields": [
+      "id",
+      "discovery",
+      "validator",
+      "comparator"
+    ],
+    "closed_family_ids": [
+      "HOT_BUS_MESSAGE_V1",
+      "AGENT_CURSOR_V1"
+    ],
+    "closed_validator_ids": [
+      "strict-delivery-message-and-publication-chain-v1",
+      "strict-empty-or-generated-message-id-v1"
+    ],
+    "closed_comparator_ids": [
+      "baseline-byte-identical-and-global-terminal-multiplicity-v1",
+      "monotonic-addressed-input-disposition-v1"
+    ],
+    "families": [
+      {
+        "id": "HOT_BUS_MESSAGE_V1",
+        "discovery": [
+          "messages/*.json"
+        ],
+        "integrity_paths": [
+          "state/message-publication-order.json",
+          "state/message-publication-order.anchor.json"
+        ],
+        "session_binding": "config.session_id",
+        "validator": "strict-delivery-message-and-publication-chain-v1",
+        "comparator": "baseline-byte-identical-and-global-terminal-multiplicity-v1"
+      },
+      {
+        "id": "AGENT_CURSOR_V1",
+        "discovery": [
+          "state/{registry_participant}.cursor"
+        ],
+        "validator": "strict-empty-or-generated-message-id-v1",
+        "comparator": "monotonic-addressed-input-disposition-v1"
+      }
+    ],
+    "out_of_scope_families": [
+      "COLD_COMPACTED_MESSAGE_V1",
+      "DEAD_LETTER_V1",
+      "DEAD_LETTER_ATTEMPT_V1",
+      "THREAD_STATE_V1",
+      "AWAITING_RECORD_V1",
+      "WRAPPER_SESSION_V1",
+      "OPERATION_MARKER_V1",
+      "OWED_ACTION_LEDGER_V1",
+      "SUPERVISOR_OWNERSHIP_RECORD_V1"
+    ],
+    "out_of_scope_paths": [
+      "archived/compacted/*.json",
+      "dead-letter/**/*.json",
+      "state/dead-letter-attempts/*.json",
+      "state/*.threadstate.json"
+    ]
+  },
+  "blocked_candidates": [
+    {
+      "id": "WATCHDOG_HELD_PIPE_RECOVERY_V1",
+      "issue_ids": [
+        112
+      ],
+      "platforms": [
+        "windows"
+      ],
+      "status": "BLOCKED",
+      "blocked_on": [
+        "ExternalProcessExecutionTraceV1",
+        "WatchdogActuatorBrokerV1",
+        "ExternalNativeEffectFenceV1",
+        "ExternalAttributedPublicationBrokerV1",
+        "ExternalAttributedCursorBrokerV1",
+        "ExternalRawEventJournalV1",
+        "ImmutableSutBundleV1",
+        "DeterministicRecoveryFixtureV1",
+        "real-subprocess-held-pipe-fixture",
+        "measured-poll-and-wall-bounds",
+        "historical-parent-gate-run"
+      ],
+      "proposed_oracles": {
+        "failed_baseline": "WATCHDOG_HELD_PIPE_NEGATIVE_CONTROL_V1",
+        "effect": "WATCHDOG_UNWIND_AND_RETRY_V1",
+        "effect_contract_family_id": "WATCHDOG_STOP_EFFECT_FAMILY_V1",
+        "challenge": "ATTRIBUTED_TRACKED_REPLY_V1",
+        "protected_opener_selector_id": "EXACT_TRACKED_INBOUND_OPENER_V1",
+        "terminal_contract_family_id": "TRACKED_REPLY_TERMINAL_FAMILY_V1",
+        "protected_work_resolver_id": "OPENER_DERIVED_PROTECTED_WORK_V1",
+        "terminal_key": "TerminalAssignmentKeyV1",
+        "effect_key": "RecoveryEffectKeyV1"
+      },
+      "preservation_families": [
+        "HOT_BUS_MESSAGE_V1",
+        "AGENT_CURSOR_V1"
+      ]
+    }
+  ]
+}
