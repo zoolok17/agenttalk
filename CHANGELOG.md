@@ -63,6 +63,18 @@ clean and it made no difference.
 - A first-time-seen snapshot row whose own PID field is malformed cannot be attributed from
   snapshot-only evidence, and is recorded as an accepted residual rather than guessed at.
 - Ephemeral launches still run no Preflight.
+- **An owned process tree that goes `invalid` stays invalid for as long as its wrapper keeps
+  running.** A healthy wrapper never triggers a fresh walk, so the HOLD outlives its cause: a
+  transient whole-host snapshot glitch that clears on the very next poll still leaves a permanent
+  HOLD. This rule predates this release and is not changed by it — but **upgrading makes it
+  visible**, because an invalid record already on disk survives every supervisor restart and code
+  upgrade untouched, and a record written before `rejected_count` existed reads as UNKNOWN rather
+  than zero and so can never earn re-derivation either. Measured on the maintainers' own fleet
+  during the release round: nine agents held on records frozen 32 hours earlier, eight of them
+  healthy and working the whole time. Clearing it is per-agent and fully attended — stop the
+  wrapper, `supervise --reset-process-tree-ownership`, then request a restart; the reset refuses
+  while any recorded identity is still live, by design. Self-healing while the wrapper stays
+  healthy is a design change for its own round, not a fix withheld from this one.
 
 ## [0.80.0] - 2026-07-31
 
