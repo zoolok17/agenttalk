@@ -45,7 +45,7 @@ acquire/reconcile/release adapters also do not belong to 87-A, but task #120
 does not implement them. This document assigns that missing mechanism to an
 explicit **closure successor**: a separately reviewed extension to #120 or a
 successor task whose final task ID is assigned outside this design. 87-A
-defines the closed typed contracts and adapter joins both dependencies must
+defines the complete typed contracts and adapter joins both dependencies must
 satisfy.
 
 This is a normative seam, not hand-waving:
@@ -97,7 +97,8 @@ type, or adapter with its comparator, such as **exact-FILETIME target**.
 no identity authority. **Matching** applies a named predicate or relates a typed
 result, receipt, or transition to its required operands. **Byte-identical**
 applies to canonical serialized bytes and byte-for-byte preservation; **closed**
-applies to a complete displayed algebra. “Exactly one” and “exactly once” remain
+applies to a complete displayed algebra, permitted-field set, or object schema.
+“Exactly one” and “exactly once” remain
 ordinary cardinality or multiplicity phrases. In particular,
 `ExecutionGateCaptureV1.guarded_start` is generic `ProcStartGuardV1`-shaped
 audit evidence, not `OwnedExactStartGuardV1` and not a PID-reuse comparator. A
@@ -112,7 +113,7 @@ that already-produced value from a named source.
 successor (#120 input delivered at `587e7c1`):** An owned wrapper whose CLI child is
 positively absent in two independent complete observations may be torn down
 only after the same-turn nonrenewable `ChildEstablishmentGuardV1` is
-`CLOSED`. Once closed, such a wrapper has no brain and no progressing CLI turn
+`CLOSED`. Once that guard is `CLOSED`, such a wrapper has no brain and no progressing CLI turn
 to interrupt. This is positive evidence of nonexistence after the
 child-establishment window, not an inference from silence, heartbeat
 staleness, or two fast pre-handoff captures.
@@ -1061,8 +1062,9 @@ non-childless `PRE_BARRIER_RELEASE`, synthesize a no-effect result, or clear and
 re-enter through a later `RESERVE`. Exact-FILETIME retry safety answers *which
 process a separately authorized repeat could affect*; it does not supply the
 authority to repeat. The hold exists in both cases: `issuer_extinction` is
-`PROVED_GONE` only from a fresh independent OS result whose queried PID is
-source-equal to the checkpoint issuer PID and whose result is absent; otherwise
+`PROVED_GONE` only from a fresh independent OS result whose queried PID matches
+the checkpoint issuer PID under literal PID value equality and whose result is
+absent; otherwise
 it is `LIVE_OR_UNPROVEN`. Any process present
 at that PID remains unproven even when its generic token/start differs. Reuse
 classification is `CAPABILITY_UNAVAILABLE(ExactIssuerIdentityAdapterV1)` and
@@ -1696,10 +1698,10 @@ checked managed wrapper generation
 checked managed launch nonce == parsed observed-root launch nonce
 ```
 
-`StartRepresentationMatchV1(a, anchor)` first tests for byte-identical values;
+`StartRepresentationMatchV1(a, anchor)` first tests for literal token equality;
 otherwise, ISO tokens may represent the anchor's same instant within the shipped
 one-millisecond Windows representation tolerance; non-ISO tokens still require
-a byte-identical match. Every representation is checked independently against the one
+a literal token match. Every representation is checked independently against the one
 named observed-root anchor—no chained or transitive inference is permitted. It
 joins the checked/runtime/CIM representations but grants no destructive
 authority. `wrapper_start_token` retains that anchor. On Windows, the retained
@@ -1838,14 +1840,16 @@ transition. `UNKNOWN(CAPABILITY_UNAVAILABLE)` during reconciliation likewise
 describes cleanup uncertainty, not permission to reclassify the issued attempt
 as an ordinary failure.
 Repeated acquisition returns the matching closure or a closed refusal. A
-reconciliation result always requires its acquisition ID to be source-equal to the
-persisted attempt ID. While `TREE_CLOSURE_ACQUIRING` has no persisted closure
+reconciliation result always requires its acquisition ID to match the
+persisted attempt ID under literal UUID value equality. While
+`TREE_CLOSURE_ACQUIRING` has no persisted closure
 ID, the first well-formed matching `HELD` or `RELEASED` may bind its returned
 non-null closure ID in the same checked transition; on reload that binding is
 release-only and never authorizes termination. `NEVER_ACQUIRED` is valid only
 in that null-ID acquiring state. Once a closure ID has been bound, every
-`HELD` or `RELEASED` result and release request must be source-equal to the
-persisted pair. Missing, null, changed, or conflicting IDs normalize to
+`HELD` or `RELEASED` result and release request must match the persisted pair
+under componentwise literal UUID value equality. Missing, null, changed, or
+conflicting IDs normalize to
 `UNKNOWN`, preserve the reservation and any debt/current attempt byte-identically, and forbid
 kill and launch. `NEVER_ACQUIRED` is terminal for that acquisition ID: the
 same checked transaction appends its bound attempt ID/revision, binding,
@@ -2079,10 +2083,11 @@ The module basis digest is SHA-256 over
 A qualifying sample with no compatible prior sample becomes count one. An
 `OPEN` guard is nonqualifying, maps the complete zero-child observation to
 `UNKNOWN(CHILD_ESTABLISHMENT_OPEN)`, and resets both this overlay and the
-banked child-death counter. Its capture cannot seed the closed window. From
+banked child-death counter. Its capture cannot seed the `CLOSED` window. From
 count one, a distinct capture advances to count two only when its ordinary
 sequence is adjacent and the complete basis, runtime basis, active-child
-config, complete closed establishment guard, owner, and coverage match.
+config, complete `ChildEstablishmentGuardV1.CLOSED` value, owner, and coverage
+match.
 From count two, another distinct compatible capture adjacent to the stored
 last capture keeps count two and slides the window: prior `last_capture_id`
 becomes `first_capture_id`, the current capture becomes `last_capture_id`, and
@@ -2218,7 +2223,7 @@ records the checked successor revision containing those observations; and sets
 `source_condition_fingerprint` source-equal to the core
 `RecoveryConditionFingerprintV1` for that committed observation.
 Its owned confirmation basis, runtime child-death basis, active-child config
-digest, and complete closed child-establishment guard are non-null and both
+digest, and complete `ChildEstablishmentGuardV1.CLOSED` value are non-null and both
 debt fields are null.
 
 With outstanding debt and no current attempt, `DEBT_COMPLETION` exists if and
@@ -2290,7 +2295,8 @@ tuple.
 
 `ChildlessClosureEvidenceV1` is the 87-A join over the closure-successor result
 and current checked state; the successor does not decide authority. It is valid only when the
-closure acquisition ID is source-equal to the persisted attempt ID; its mode,
+closure acquisition ID matches the persisted attempt ID under literal UUID
+value equality; its mode,
 owner/coverage/targets/digest/debt fields are source-equal to both the reservation
 and `OwnedTreeClosureV1.HELD`; its closure-provider version is source-equal to the
 persisted continuation owner's version; authority/basis IDs are source-equal to
@@ -2298,7 +2304,7 @@ the reservation's IDs; and every target digest matches a fresh
 `OwnedTargetDigestV1` recomputation.
 
 For `INITIAL`, all debt fields are null and all three childless/runtime/config
-basis digests plus the closed establishment guard are non-null. The joined
+basis digests plus the `ChildEstablishmentGuardV1.CLOSED` value are non-null. The joined
 evidence additionally requires:
 
 ```text
@@ -2567,8 +2573,9 @@ crash reconciliation remain idempotently keyed by the attempt ID. 87-A must then
 `ChildlessClosureEvidenceV1`; the closure object alone never supplies
 authority. A well-formed current equality mismatch is a closure veto and
 follows matching typed release. A well-formed envelope plus malformed closure-successor
-output is `POLICY_HELD`; if its closure pair is source-equal to the corresponding
-checked continuation fields, only permit-bound
+output is `POLICY_HELD`; if its closure pair matches the corresponding checked
+continuation fields under componentwise literal UUID value equality, only
+permit-bound
 non-destructive reconciliation/release may proceed. Structurally invalid
 checked state instead selects `RETAIN_INVALID_FENCE` before witness/permit
 construction and makes no mutation or call. Neither case kills or launches.
@@ -3123,7 +3130,8 @@ never cross the 87-B export boundary.
 
 ## Closed state transitions
 
-The safety property is established by a closed construction pipeline, not by
+The safety property is established by the complete displayed construction
+pipeline, not by
 enumerating every state that might enter it:
 
 | Construction boundary | Only conforming operation |
@@ -3304,7 +3312,7 @@ Normal execution is:
 | Spawn and identity commit | Each `PRE_BARRIER`, `SPAWN_IN_FLIGHT`, and `AMBIGUOUS_LAUNCH` envelope carries a binding source-equal to its predecessor. A state-mutation permit first installs `SPAWN_RESERVATION/SPAWN/ARMED`; only a distinct fresh post-CAS call permit invokes spawn, and only its receipt plus a fresh receipt-derived mutation permit whose call-issuance binding is source-equal to that receipt commits identity/ambiguity. The sole receipt-free conversion is the closed crash-only `SPAWN_RESULT_COMMIT` scope over the persisted issuer subject and positive issuer-death proof. |
 | New guarded owner commits | Permitted only with quarantine `NONE`, debt `NONE`, and no childless effect envelope requiring cleanup. A quarantined state cannot commit a replacement owner automatically in V1. |
 
-Crash/reload is equally closed. Deserialization yields only the inert envelope;
+Crash/reload admits no other route. Deserialization yields only the inert envelope;
 the full-poll precedence above handles state loss, observation, typed
 capture-sequence exhaustion, quarantine, and malformed state without
 constructing an effect object. A valid envelope can
@@ -3537,7 +3545,7 @@ transaction; no executor branch may save a cached whole state.
     wrapper/turn to non-active and replay `ACTIVE`; the persisted keyed guard
     and anchors must remain byte-identical, while a same-turn changed key or
     missing retained guard stays `UNKNOWN`. Independently change every
-    closed-guard field between reservation and action; each change vetoes before
+    `CLOSED`-guard field between reservation and action; each change vetoes before
     debt or `Stop-Tree`.
 15. Remove and mismatch independently the checked managed nonce, parsed
     observed-root nonce, and fixed parser schema; each must refuse. Prove the
@@ -3682,8 +3690,9 @@ transaction; no executor branch may save a cached whole state.
     Derive the hold whenever source-bound custody cannot be validated. With the issuer
     still live or death observation unavailable, require
     `issuer_extinction=LIVE_OR_UNPROVEN`, render the same remedy, and reject the
-    attended commit. Only a fresh independent OS result whose queried PID is
-    source-equal to the checkpoint issuer PID and whose result is absent refreshes
+    attended commit. Only a fresh independent OS result whose queried PID
+    matches the checkpoint issuer PID under literal PID value equality and whose
+    result is absent refreshes
     it to `PROVED_GONE(result=GONE)`. Hold that PID
     present with the same generic start token and again with a different generic
     start token; both cases must remain `LIVE_OR_UNPROVEN`, render
@@ -3713,7 +3722,8 @@ transaction; no executor branch may save a cached whole state.
     `ACKNOWLEDGE_FRESH_OBSERVATION_REQUIRED` in displayed order; omit or alter
     any one and require zero mutation.
 
-    Race two byte-identical attended requests and require one checked disposition. Compare
+    Race two attended requests with byte-identical canonical serialization and
+    require one checked disposition. Compare
     the successor: top-level `IDLE`, same-poll terminal written, selection-derived
     confirmations reset, issuer checkpoint removed, and matching
     `ConfiguredPriorEffectUnknownFenceV1` installed; managed identity,
@@ -3968,7 +3978,8 @@ transaction; no executor branch may save a cached whole state.
     owner nor a non-childless dispatch-use owner cell is reachable; only the
     immutable custody/use proof is present. Prove the opaque submission,
     admission, invocation, and receipt-custody handles are the only private
-    associations between their byte-identical immutable values and that owner, and that each holder transition
+    associations between their corresponding immutable values and that owner,
+    and that each holder transition
     changes the separate cell exactly once. A caller
     mutex, external call-ID registry, or unstated dispatcher lock must fail the
     construction-direction control.

@@ -38,12 +38,12 @@ exist.
 
 Every asserted property in this document has one of these labels:
 
-- **ENFORCED** means this document defines a closed type, constructor, equation,
+- **ENFORCED** means this document defines a type, constructor, equation,
   invariant, or mandatory conformance test that mechanically decides the
   property. It means “implementable and test-gated,” not “currently shipped.”
 - **STATED** means a verified current fact, scope boundary, dependency, ordering
   decision, or accepted residual. 87-A supplies no mechanism that enforces it.
-- **NORMATIVE-SPECIFICATION COMPLETE** means a panel has accepted a closed,
+- **NORMATIVE-SPECIFICATION COMPLETE** means a panel has accepted a complete,
   implementable contract and its mandatory evidence. It does not assert that
   executable enforcement exists.
 - **IMPLEMENTATION BLOCKED** means at least one named prerequisite required for
@@ -65,7 +65,8 @@ ordinary cardinality/multiplicity (`exactly one` / `exactly once`).
 equality grants no process-identity comparator. **Byte-identical** means equal
 canonical serialized bytes or byte-for-byte preservation. **Matching** names
 an ordinary predicate without granting identity authority, and **closed** means
-that the displayed algebra has no other variants. No other use of the exact
+that a complete displayed algebra, permitted-field set, or object schema has no
+other members. No other use of the exact
 stem is admitted in these four documents. A recomputed, derived, calculated,
 or execution-produced value is never source-equal to the operand or expected
 result; it must match under the displayed predicate. A later field may be
@@ -85,7 +86,7 @@ not erase mandatory escalation.
 | --- | --- | --- |
 | 87-A, this core plus its normative module | Runtime, active-child, presence, targetability, heartbeat-freshness, and manual-marker classifiers; classifier continuity state; authority equations; origin selection; physical-absence and owned-childless proofs; retry exhaustion; semantic condition record/fingerprint; and final-barrier invariants. | Incident persistence/delivery and rollout. |
 | 87-B, future | Incident, promise, projection, and delivery contract. It consumes `RecoveryConditionV1` and action/result resolution inputs from 87-A. | Classifier authority and migration. |
-| 87-C, future | Activation, compatibility, migration, rollback, and flag-day procedure after 87-A and 87-B are closed. | Classifier and incident semantics. |
+| 87-C, future | Activation, compatibility, migration, rollback, and flag-day procedure after 87-A and 87-B are complete. | Classifier and incident semantics. |
 
 **STATED dependencies and ordering:**
 
@@ -306,7 +307,7 @@ The
 register separately accounts for every finding in the panel over
 `f42570d..44b3787`; it is likewise audit evidence, not a conformance file.
 
-## Closed inputs that remain closed
+## Previously adjudicated inputs
 
 **ENFORCED by independent constructors and the dominant-projection matrix:**
 `RuntimeObservation` is derived without heartbeat or
@@ -315,14 +316,14 @@ process evidence, defined below. `WrapperPresenceResult` is derived from one
 process observation without runtime health or heartbeat. Shared raw snapshot
 rows may feed both private projections, but neither projection may read the
 other's result. Runtime dominant, presence, and freshness are crossed only
-after all three exist. This preserves the closed F1 independence result while
+after all three exist. This preserves the accepted F1 independence result while
 making the active-child evidence flow explicit.
 
 **ENFORCED by an action-scoped, non-persisted conditional value:**
 `CONDITIONAL_POST_TEARDOWN` resolves synchronously from one guarded teardown
 result and one fresh shared-observer capture. It is never stored between polls.
 A failure resolves to `NONE`; no pending value can wait forever. This preserves
-the closed F4 result.
+the accepted F4 result.
 
 **STATED source correction:** `brain_ancestry_ambiguous` occurs only after the
 wrapper PID/start identity and launcher attribution have succeeded and
@@ -565,7 +566,7 @@ Guard `NOT_APPLICABLE` means that no strict active establishment key has yet
 been accepted in the current runtime-wrapper/high-water-turn binding. It is
 not written merely because a later record for that same binding is non-active.
 
-When embedded in a canonical hash payload, the closed variant serializes as the
+When embedded in a canonical hash payload, the `CLOSED` variant serializes as the
 following `CanonicalJsonV1` object:
 
 ```text
@@ -1087,7 +1088,7 @@ below apply otherwise.
   `RELEASE_PENDING` closure.
 - `SPAWN_RESERVATION` is source-equal to the childless reservation and is required
   for `SPAWN/ARMED` while execution is `SPAWN_IN_FLIGHT`. A typed spawn receipt
-  or the closed positive-dead-issuer transition clears/replaces it before
+  or the typed positive-dead-issuer transition clears/replaces it before
   `AMBIGUOUS_LAUNCH`; that phase requires continuation `NONE`.
 
 `PRE_BARRIER` requires continuation `NONE`. Childless `IDLE` requires `NONE`
@@ -1109,11 +1110,16 @@ for this revision. `TEARDOWN_IN_FLIGHT` requires envelope debt with
 
 The converses are also enforced inside the envelope. Debt current-attempt
 fields are non-null if and only if execution is `TEARDOWN_IN_FLIGHT` or
-non-veto `TREE_CLOSURE_RELEASING`, and their pair is source-equal to execution. A
+non-veto `TREE_CLOSURE_RELEASING`, and their
+`(current_attempt_id, current_attempt_revision)` pair is source-equal to
+`(execution.childless_attempt_id, execution.childless_attempt_revision)`. A
 cycle `last_outcome=ISSUED` exists if and only if execution is an automatic
 named childless phase in `{TREE_CLOSURE_ACQUIRING, TREE_CLOSURE_HELD,
-TREE_CLOSURE_RELEASING, TEARDOWN_IN_FLIGHT}`; its owner and last attempt pair
-source-equal execution. An existing `EXHAUSTED` cycle has exactly three issued
+TREE_CLOSURE_RELEASING, TEARDOWN_IN_FLIGHT}`; its owner is source-equal to the
+reservation owner and its `(last_attempt_id, last_attempt_revision)` pair is
+source-equal to
+`(execution.childless_attempt_id, execution.childless_attempt_revision)`. An
+existing `EXHAUSTED` cycle has exactly three issued
 attempts and a typed failure outcome. An `ACTIVE` cycle with a typed failure
 has only one or two issued attempts; `ACTIVE/ISSUED` may have one, two, or
 three. Beginning the next automatic attempt permits only `NONE -> attempt 1`
@@ -1144,11 +1150,13 @@ attempt, when the evicted tombstone is `TERMINAL` and owns no continuation.
 There is no background or maintenance eviction; otherwise the set is full and
 named recovery holds.
 
-Every normal or reload result first requires the returned acquisition ID to be
-source-equal to the persisted attempt ID. In `TREE_CLOSURE_ACQUIRING`, the first
+Every normal or reload result first requires the returned acquisition ID to
+match the persisted attempt ID under literal UUID value equality. In
+`TREE_CLOSURE_ACQUIRING`, the first
 well-formed `HELD`/`RELEASED` may bind its non-null closure ID in the same
 checked transition; reload binding is release-only. After that binding, every
-`HELD`/`RELEASED` must be source-equal to the persisted pair. Null, mismatch,
+`HELD`/`RELEASED` acquisition/closure pair must match the persisted pair under
+componentwise literal UUID value equality. Null, mismatch,
 conflict, or unreadable reconciliation is `UNKNOWN`, keeps the phase,
 reservation, debt, cycle, and current-attempt fields byte-identical, and holds every action.
 
@@ -2087,7 +2095,7 @@ The guard becomes `CLOSED(ADAPTER_PROGRESS)` on a validated current-turn
 `close_evidence_epoch_ms`; its three anchor fields are null when their original
 values are no longer recoverable. It becomes
 `CLOSED(NONRENEWABLE_GRACE_EXPIRED)` only when both shipped no-handoff
-protections have closed:
+protections have elapsed:
 
 ```text
 decision_now_epoch_ms > active_age_grace_through_epoch_ms
@@ -2099,13 +2107,13 @@ and (
 
 The active-record grace is therefore inclusive through the 30-second boundary,
 while the generation launch fence is exclusive at its stored deadline, matching
-the shipped predicates. The closed variant retains both opening anchors byte-identically and
+the shipped predicates. The `CLOSED` variant retains both opening anchors byte-identically and
 sets `close_evidence_epoch_ms` to the earliest integer millisecond satisfying
 that conjunction:
 `max(active_age_grace_through_epoch_ms + 1,
 generation_launch_grace_until_epoch_ms or 0)`, using checked addition. A first
 observation that already has current-turn adapter progress constructs the
-`ADAPTER_PROGRESS` closed variant directly. A key may replace the persisted
+`CLOSED(ADAPTER_PROGRESS)` variant directly. A key may replace the persisted
 guard only after runtime continuity has accepted a different wrapper
 generation or a strictly higher turn, or after the common guarded-launch
 commit has installed a different managed generation; those transitions first
@@ -2125,8 +2133,9 @@ longer generation launch fence applies, two complete absences after 30 seconds
 but before that fence also remain open. The first capture at or after the
 exclusive launch-fence deadline is the first `ABSENT` sample only when the
 inclusive active-age grace has also ended. No pre-close capture carries into a
-closed confirmation. The module confirmation basis, reservation, and
-action-time guard fields are source-equal to the complete closed guard object; a key,
+`CLOSED` confirmation. The module confirmation basis, reservation, and
+action-time guard fields are source-equal to the complete
+`ChildEstablishmentGuardV1.CLOSED` object; a key,
 result, either anchor, or close-evidence change vetoes the named action.
 
 Child-death confirmation increments only on qualifying consecutive
@@ -4631,7 +4640,7 @@ without all of this executed evidence:
     at active age 30 seconds and after 30 seconds but before a longer
     generation launch fence; all remain open. Prove the exclusive launch-fence
     deadline is the first eligible count-one capture after the inclusive
-    active-age grace ends, all closed-guard fields participate in
+    active-age grace ends, all `CLOSED`-guard fields participate in
     reservation/action equality, and no observation can renew or shorten
     either anchor. Phase-flip the same wrapper/turn from `ACTIVE` to non-active
     and replay `ACTIVE` with equal sequence and a newer `updated_at`; the keyed
@@ -4896,13 +4905,13 @@ without all of this executed evidence:
     the winning witness and require exactly one `READY -> ADAPTING` winner.
     Require that its matching fresh source-bound #120 CLEAR receipt custody alone
     may commit `PRIOR_EFFECT_FENCE_CLEAR`; advance the checked revision after
-    receipt creation and require the closed stale/mismatched result, closed
+    receipt creation and require the terminal stale/mismatched result, terminal
     custody, and intact fence. Race same-custody aliases for every outcome; only
     the CAS winner may read the store or return a state-bearing result, while
     losers return `NOT_READ_BY_LOSER`. Map `BLOCKED`, `AMBIGUOUS`, and `UNAVAILABLE` to
     their separate remedies, close the admitted custody, and require a fresh
     committed capture. Inject a positively pre-CAS no-write failure and require
-    `FAILED_PROVED_NO_COMMIT`, the current fence, and closed custody. Inject
+    `FAILED_PROVED_NO_COMMIT`, the current fence, and terminal custody. Inject
     failure immediately before the state CAS, immediately after a successful
     state CAS but before owner close, and after owner close but before response.
     Any point at which the state CAS may have run must return or reconcile as
@@ -5143,8 +5152,8 @@ without all of this executed evidence:
 | Configured issuer PID reuse classification | CAPABILITY UNAVAILABLE; Q4 IMPLEMENTATION BLOCKED ON `ExactIssuerIdentityAdapterV1` | Only a fresh independent definitive PID-absent OS result may produce `PROVED_GONE`. Any process present at that PID, including suspected reuse from a generic start-token mismatch, remains `LIVE_OR_UNPROVEN`; attended disposal is unavailable and the hold persists. Revision 15 names but does not define `ExactIssuerIdentityAdapterV1`. |
 | Configured PRE_BARRIER owner loss | NORMATIVE HOLD, GONE-ONLY ATTENDED ESCAPE, AND GLOBAL FENCE CLEARANCE SPECIFIED; IMPLEMENTATION BLOCKED ON #115 AND `ExactIssuerIdentityAdapterV1`; AUTOMATIC RETRY OPTIONAL/UNDELIVERED AS `ConfiguredPreBarrierRetrySuccessorV1` | Reload cannot reconstruct transient custody. It derives the complete operator-visible hold in proved or unproven extinction form; only definitive PID absence admits the future checked attended disposition. Disposal attests only `PRIOR_EFFECT_UNKNOWN`, never kills or launches, and persists request/audit/source targets plus an epoch-aware freshness floor. A present PID never admits disposal without the separately reviewed adapter. The singular fence pairs only with `IDLE` and globally blocks every configured/childless action, so it cannot be replaced or bypassed. After kill-switch removal and one-current-supervisor restart, #115's winning ordinary commit alone may publish the post-commit witness; #115's narrow unexported reducer over its sealed merged-#120 operands yields the source-bound barrier custody that alone may clear the fence through a no-effect checked transition. This narrow producer belongs to #115's Q4 delivery; the general adapter remains an overall 87-A dependency. |
 | Configured-agent relaunch crash replay | NORMATIVE RISK SPLIT SPECIFIED; IMPLEMENTATION/ACTIVATION BLOCKED ON #57 | #120 makes the `OwnedExactStartGuardV1`-guarded kill subphase target-safe for an independently authorized retry, not authority to remint that retry and not `Start-Process` idempotence. The optional automatic retry successor remains absent. Task #57's project-level singleton per wrapped agent must close the durable duplicate-wrapper window; 87-A does not respecify it. |
-| Maximum ordinary capture sequence | NORMATIVE ATTENDED PATH SPECIFIED; implementation blocked on #115 | Typed exhaustion attention and one checked persisted-top-level-`IDLE` epoch rollover reset capture-derived evidence while keeping the managed/manual/quarantine fields byte-identical. A non-null configured prior-effect fence preserves every audit/source/effect field byte-identically and rebases only its freshness floor to `(new epoch, 0)`. Non-childless execution and every childless envelope/debt/cycle/continuation/retired attempt block rollover and remain byte-identical; an in-flight ephemeral transient owner instead resolves through the closed stale-epoch receipt result with no new-epoch receipt behavior. No budget or fence is laundered. |
-| Child-establishment grace cannot be sampled away | NORMATIVE CONTRACT SPECIFIED; implementation blocked on #115, #146, the merged-#120 adapter, and the closure successor for effect conformance | Nonrenewable same-turn closed guard in observation, confirmation, reservation, and action equality. |
+| Maximum ordinary capture sequence | NORMATIVE ATTENDED PATH SPECIFIED; implementation blocked on #115 | Typed exhaustion attention and one checked persisted-top-level-`IDLE` epoch rollover reset capture-derived evidence while keeping the managed/manual/quarantine fields byte-identical. A non-null configured prior-effect fence preserves every audit/source/effect field byte-identically and rebases only its freshness floor to `(new epoch, 0)`. Non-childless execution and every childless envelope/debt/cycle/continuation/retired attempt block rollover and remain byte-identical; an in-flight ephemeral transient owner instead resolves through the terminal stale-classifier-epoch receipt result with no new-epoch receipt behavior. No budget or fence is laundered. |
+| Child-establishment grace cannot be sampled away | NORMATIVE CONTRACT SPECIFIED; implementation blocked on #115, #146, the merged-#120 adapter, and the closure successor for effect conformance | Nonrenewable same-turn `ChildEstablishmentGuardV1.CLOSED` value in observation, confirmation, reservation, and action equality. |
 | External childless calls cannot outlive their authority owner | PARTIAL WINDOWS #120 TARGET-LOCAL PRIMITIVE DELIVERED; full normative contract specified; implementation blocked on #115, #146, and the closure successor | For an openable Windows target guarded by `OwnedExactStartGuardV1`, merged #120 binds identity-check and termination to one handle and attempts the bounded same-handle wait. Unique lineage custody, deep seals, closed dispatch, checked continuation owner/stage, stable tombstones, and attempt-bound synchronous adapters remain absent. |
 | POSIX named owned-childless teardown and inherited cleanup | CURRENTLY UNAVAILABLE | #120 accepts Linux `linux:<boot_id>:<start_ticks>` observation tokens but declares no macOS mapping, and the merged supervisor owned-tree body skips the Linux-token target because it has no FILETIME. No POSIX childless dispatcher witness exists, so neither fresh authority nor a deserialized `PRE_BARRIER`, external-effect phase, debt-only state, spawn ambiguity, or retired tombstone can construct the permit and typed object required to act. The Windows FILETIME guard is unchanged. |
 | Partial owned-childless teardown cannot be laundered into launch | NORMATIVE CONTRACT SPECIFIED; implementation blocked on #115, #146, the merged-#120 adapter, and the closure successor | Origin-neutral durable teardown debt, closed dispatch, and debt-bound completion authority. |
