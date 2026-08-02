@@ -8,6 +8,7 @@ the cross-process lock order in :mod:`agenttalk.supervisor_lifecycle`.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -486,8 +487,22 @@ def _run_probe(path: str, *, timeout: float) -> subprocess.CompletedProcess[str]
         try:
             _, close_job = _attach_kill_on_close_job(proc)
         except OSError as exc:
-            proc.kill()
-            proc.communicate()
+            # kill() can itself raise (PermissionError on Windows,
+            # ProcessLookupError if the child already exited) - unguarded,
+            # that secondary error would replace this OSError and skip the
+            # PowerShellHostError below entirely. But suppressing it is not
+            # itself free: if kill() failed, proc is still running, and the
+            # unbounded communicate() that follows would then wait forever
+            # on a live process - strictly worse than the crash it
+            # replaced. Preserve the containment error as the raised cause,
+            # but bound the cleanup and fall back to a reap-only wait().
+            with contextlib.suppress(OSError):
+                proc.kill()
+            try:
+                proc.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=25.0)
             raise PowerShellHostError(
                 f"probe process containment failed: {exc}"
             ) from exc
@@ -499,10 +514,44 @@ def _run_probe(path: str, *, timeout: float) -> subprocess.CompletedProcess[str]
             try:
                 stdout, stderr = proc.communicate(timeout=2.0)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
+                # kill() can itself raise - guarded so it can never pre-empt
+                # the "probe timed out" PowerShellHostError raised below.
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                # A descendant holding the captured pipe handles open can
+                # keep this blocked even though proc itself is already
+                # dead - bound it and fall back to wait(), which does not
+                # touch the pipes at all, so the reap still completes.
+                try:
+                    stdout, stderr = proc.communicate(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=25.0)
             raise PowerShellHostError(f"probe timed out after {timeout:g}s") from None
         return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+    except BaseException:
+        if proc.poll() is None:
+            # kill() can itself raise - unguarded, that secondary error
+            # would replace the owner BaseException being handled here and
+            # skip the reap fallback below entirely.
+            with contextlib.suppress(OSError):
+                proc.kill()
+            # Close the containment job before retrying: on Windows this
+            # kills any descendant holding the captured stdout/stderr pipe
+            # handles open via KILL_ON_JOB_CLOSE, so communicate() below has
+            # a chance to actually drain. On POSIX close_job is a no-op -
+            # there is no equivalent containment - so wait() (which does
+            # not touch the pipes) is what guarantees the top-level process
+            # gets reaped there regardless of what a surviving descendant
+            # holds open.
+            close_job()
+            close_job = _noop
+            try:
+                proc.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=25.0)
+        raise
     finally:
         close_job()
 

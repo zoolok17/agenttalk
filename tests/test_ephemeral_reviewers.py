@@ -175,6 +175,88 @@ def test_config_validation_fails_closed_for_prompt_unauthorized_and_stale(tmp_pa
     assert any("stale" in e for e in errors)
 
 
+def test_validate_launch_request_rejects_module_args_from_the_resolver_would_reject(
+    tmp_path: Path,
+) -> None:
+    """Round 17 connector finding, the fifth instance of one rule: the
+    validator must accept exactly what the runtime resolver accepts.
+    launch_spec() (round 13) and the wholesale entry persistence (round
+    14) both make module_args_from survive the launch pipeline faithfully
+    - including when it is wrong, which is exactly what a faithful
+    pipeline does. The missing half was validation at the entry point:
+    a malformed or wrong module_args_from used to sail through
+    validate_launch_request unchecked, launch a Python process that
+    silently gets no nonce injection or bounded logging, and then get
+    PERSISTED that way - leaving the reviewer permanently stuck in
+    process_tree_hold with no teardown authority, because
+    _wrapped_liveness can never confirm the launcher's identity either.
+    Calls supervisor._resolve_module_flag_index - the SAME resolver
+    bootstrap_check delegates to - not a parallel reimplementation."""
+    s = _store(tmp_path)
+
+    wrong_token_profile = {
+        "codex-evidence-reviewer": {
+            "cli": "codex",
+            "role": "reviewer",
+            "groups": ["ephemeral-reviewers"],
+            "launch": {
+                "windows_file": "python.exe",
+                "windows_args": [
+                    "-u", "-Xutf8", "-m", "agenttalk", "--root", "{ROOT}",
+                    "wrap", "--for", "{AGENT}", "--", "codex",
+                ],
+                "module_args_from": 1,
+            },
+        },
+    }
+    marker = _marker()
+    cfg = _cfg(allowed_profiles=wrong_token_profile)
+    errors, profile = eph.validate_launch_request(marker, s.load_config(), cfg)
+    assert profile is not None
+    assert any(
+        "does not resolve against launch.windows_args" in e for e in errors
+    ), errors
+
+    malformed_profile = {
+        "codex-evidence-reviewer": {
+            **wrong_token_profile["codex-evidence-reviewer"],
+            "launch": {
+                **wrong_token_profile["codex-evidence-reviewer"]["launch"],
+                "module_args_from": "1x",
+            },
+        },
+    }
+    errors2, _ = eph.validate_launch_request(
+        marker, s.load_config(), _cfg(allowed_profiles=malformed_profile),
+    )
+    assert any("must be an integer" in e for e in errors2), errors2
+
+    # The companion positive: a genuinely valid declared prefix, and the
+    # plain undeclared form, must both stay clean - this must not turn
+    # every correctly configured profile into a rejection.
+    valid_profile = {
+        "codex-evidence-reviewer": {
+            **wrong_token_profile["codex-evidence-reviewer"],
+            "launch": {
+                **wrong_token_profile["codex-evidence-reviewer"]["launch"],
+                "windows_args": [
+                    "-Xutf8", "-m", "agenttalk", "--root", "{ROOT}",
+                    "wrap", "--for", "{AGENT}", "--", "codex",
+                ],
+            },
+        },
+    }
+    errors3, profile3 = eph.validate_launch_request(
+        marker, s.load_config(), _cfg(allowed_profiles=valid_profile),
+    )
+    assert profile3 is not None
+    assert not any("module_args_from" in e for e in errors3), errors3
+
+    errors4, profile4 = eph.validate_launch_request(marker, s.load_config(), _cfg())
+    assert profile4 is not None
+    assert not any("module_args_from" in e for e in errors4), errors4
+
+
 def test_plan_denies_when_disabled_or_capacity_exceeded() -> None:
     disabled = _cfg(enabled=False)
     plan = sup.plan_actions(_report(_marker()), {}, disabled, now_epoch=NOW, snapshot=[])

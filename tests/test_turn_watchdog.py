@@ -13,6 +13,7 @@ wrapper process and proves both recovery and the old no-wake failure direction.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import multiprocessing
 import os
@@ -738,6 +739,222 @@ def test_proc_stream_watchdog_enabled_consumer_close_is_bounded() -> None:
     assert not closer.is_alive()
     assert close_errors == []
     assert stream.returncode is not None
+
+
+def test_proc_stream_no_watchdog_aborted_consumption_terminates_hung_child() -> None:
+    """Finding A (PR 98 connector re-review, head ee177af): without an
+    enabled turn watchdog - the default for a continuous Claude wrapper -
+    _ProcStream's cleanup gated its "consumer aborted early" detection (and
+    the child-terminate that follows) entirely behind watchdog presence, so
+    an aborted iteration fell straight through to an unbounded wait() with
+    the child never told to stop. A termination signal's SystemExit unwinds
+    through this same generator cleanup (a GeneratorExit closing it early is
+    the same code path), so that gap meant a signal telling the wrapper to
+    exit could instead leave it hanging on a still-running child - the
+    opposite of the pre-#117 default disposition. The sibling
+    watchdog-enabled test above proves close() is bounded WITH a watchdog;
+    this proves it is bounded WITHOUT one too."""
+    stream = run._ProcStream(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "import time\nprint('output', flush=True)\ntime.sleep(60)",
+        ],
+        None,
+    )
+    iterator = iter(stream)
+    assert next(iterator) == "output\n"
+    close_done = threading.Event()
+    close_errors: list[BaseException] = []
+
+    def close_owner() -> None:
+        try:
+            iterator.close()
+        except BaseException as exc:  # noqa: BLE001 - report cleanup failures on test thread
+            close_errors.append(exc)
+        finally:
+            close_done.set()
+
+    closer = threading.Thread(target=close_owner, daemon=True)
+    closer.start()
+    try:
+        assert close_done.wait(10.0), "no-watchdog aborted consumer cleanup wedged"
+    finally:
+        if stream._proc.poll() is None:
+            stream._proc.kill()
+            stream._proc.wait(timeout=5.0)
+        closer.join(5.0)
+
+    assert not closer.is_alive()
+    assert close_errors == []
+    assert stream.returncode is not None
+
+
+def test_proc_stream_no_watchdog_aborted_consumption_bounds_wait_after_terminate() -> None:
+    """I5 (PR 98 cold review): the sibling test above proves terminate() now
+    gets CALLED without a watchdog - but terminate() is a REQUEST (SIGTERM
+    on POSIX), not a guarantee. A child that ignores or SIG_IGNs it (the
+    connector reproduced exactly this) would leave the unified no-watchdog
+    branch's plain, unbounded wait() blocked forever: the exact wedge #117
+    exists to fix, just moved from "no terminate() call" to "terminate()
+    with no bound on what follows it." The watchdog-interrupted branch
+    already had a timeout(10)+kill()+timeout(5) fallback for this; the
+    no-watchdog branch must have the SAME one, not depend on a watchdog
+    being configured at all.
+
+    SIG_IGN itself is POSIX-only and would not reproduce on every dev
+    machine, so the "ignored terminate" is simulated instead: the first
+    wait() call always times out (as if the child never noticed
+    terminate()), and the real child is genuinely killed and reaped on the
+    second, real wait() - proving the OVERALL close() is bounded rather
+    than hanging on the ignored first attempt."""
+    stream = run._ProcStream(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "while True:\n print('output', flush=True)",
+        ],
+        None,
+    )
+    iterator = iter(stream)
+    assert next(iterator) == "output\n"
+    real_wait = stream._proc.wait
+    calls = {"n": 0}
+
+    def wait_ignoring_first_attempt(timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise subprocess.TimeoutExpired("child", timeout or 0.0)
+        return real_wait(timeout=timeout)
+
+    stream._proc.wait = wait_ignoring_first_attempt
+
+    close_done = threading.Event()
+    close_errors: list[BaseException] = []
+
+    def close_owner() -> None:
+        try:
+            iterator.close()
+        except BaseException as exc:  # noqa: BLE001 - report cleanup failures on test thread
+            close_errors.append(exc)
+        finally:
+            close_done.set()
+
+    closer = threading.Thread(target=close_owner, daemon=True)
+    closer.start()
+    try:
+        assert close_done.wait(15.0), (
+            "no-watchdog aborted cleanup wedged when the first wait after "
+            "terminate() did not confirm the exit"
+        )
+    finally:
+        stream._proc.wait = real_wait
+        if stream._proc.poll() is None:
+            stream._proc.kill()
+            stream._proc.wait(timeout=5.0)
+        closer.join(5.0)
+
+    assert not closer.is_alive()
+    assert close_errors == []
+    assert stream.returncode is not None
+
+
+def test_proc_stream_constructor_cleanup_reports_confirmed_exit() -> None:
+    """New area (PR 98 cold review): _cleanup_after_constructor_error runs
+    when __init__ itself fails partway (after the child has already been
+    spawned) - it terminates and reaps the child, but never told on_exit
+    about it, unlike __iter__'s own finally block which does. A child that
+    WAS confirmed dead here left no child_exited record at all, and the
+    cleanup's wait()/kill() result was never even captured into
+    self.returncode in the first place."""
+    exits: list[tuple[int, str | None, int | None]] = []
+
+    def boom(pid: int, start: str | None) -> None:
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run._ProcStream(
+            [sys.executable, "-u", "-c", "import time; time.sleep(5)"],
+            None,
+            on_spawn=boom,
+            on_exit=lambda pid, start, rc: exits.append((pid, start, rc)),
+        )
+
+    assert len(exits) == 1, "on_exit did not fire from constructor cleanup"
+    assert exits[0][2] is not None, "child_exited fired with an unconfirmed return code"
+
+
+def test_proc_stream_aborted_consumption_never_reports_unconfirmed_exit() -> None:
+    """Finding 2 (PR 98 connector re-review, head 2297ce10): when consumption is
+    aborted and the child never confirms its exit (wait keeps timing out, poll
+    keeps reporting alive), the double-exception fallback used to leave
+    ``self.returncode`` at None and still fire the ``child_exited`` callback -
+    asserting an exit that was never observed."""
+    from agenttalk import wrapper_logs
+
+    stream = run._ProcStream(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "while True:\n print('output', flush=True)",
+        ],
+        None,
+        watchdog=TurnWatchdogConfig(
+            enabled=True,
+            turn_elapsed_seconds=30.0,
+            poll_seconds=1.0,
+        ),
+        watchdog_snapshot_fn=lambda: None,
+    )
+    log_stream = io.StringIO()
+    lifecycle = wrapper_logs.WrapperLifecycleLog(
+        "worker", stream=log_stream, clock=lambda: 1_800_000_000.0
+    )
+    stream._on_exit = lifecycle.child_exited
+    real_wait = stream._proc.wait
+    real_kill = stream._proc.kill
+
+    def never_confirms_exit(timeout=None):
+        raise subprocess.TimeoutExpired("child", timeout or 0.0)
+
+    iterator = iter(stream)
+    assert next(iterator) == "output\n"
+    stream._proc.wait = never_confirms_exit
+    stream._proc.kill = lambda: None
+    stream._proc.poll = lambda: None
+
+    close_done = threading.Event()
+    close_errors: list[BaseException] = []
+
+    def close_owner() -> None:
+        try:
+            iterator.close()
+        except BaseException as exc:  # noqa: BLE001 - report cleanup failures on test thread
+            close_errors.append(exc)
+        finally:
+            close_done.set()
+
+    closer = threading.Thread(target=close_owner, daemon=True)
+    closer.start()
+    try:
+        assert close_done.wait(5.0), "aborted consumer cleanup wedged"
+    finally:
+        stream._proc.wait = real_wait
+        stream._proc.kill = real_kill
+        real_kill()
+        real_wait(timeout=5.0)
+        closer.join(5.0)
+
+    assert close_errors == []
+    assert stream.returncode is None
+    events = [
+        json.loads(line)["event"]
+        for line in log_stream.getvalue().splitlines()
+    ]
+    assert "child_exited" not in events
 
 
 class _ObservedWatchdogProcStream(run._ProcStream):

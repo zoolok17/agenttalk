@@ -45,6 +45,11 @@ from agenttalk.store import Store, _process_alive, validate_agent_name
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle as lifecycle
 from agenttalk import wrapper_runtime as runtime_obs
+from agenttalk import wrapper_logs as wrapper_log
+
+WRAPPER_LOG_GENERATIONS = wrapper_log.WRAPPER_LOG_GENERATIONS
+WRAPPER_LOG_MAX_BYTES = wrapper_log.WRAPPER_LOG_MAX_BYTES
+WRAPPER_LOG_SEGMENT_COUNT = wrapper_log.WRAPPER_LOG_SEGMENT_COUNT
 
 # ---- action vocabulary (the dry-run ACTION PLAN tokens) --------------------
 RELAUNCH = "relaunch"            # manual restart request - (re)launch now
@@ -3381,7 +3386,99 @@ def _token_stem(token: str) -> str:
     return _image_stem(token)
 
 
-def _agenttalk_argv(command_line: object) -> list[str] | None:
+# PR 98 connector, the seam finding: this grammar is implemented TWICE (here
+# and in PS_TEMPLATE's Test-AgenttalkAllowedInterpreterPrefixToken), and the
+# two implementations must agree - see
+# test_python_and_powershell_prefix_allowlists_agree, which drives both
+# sides through the same shared table. This constant is the single
+# PYTHON-side source of truth the test consumes (not a literal the test
+# redefines); the PowerShell side is the single source of truth for its own
+# language. Each entry's justification lives on the PowerShell function -
+# duplicating the reasoning here would just be a third place to drift.
+_ALLOWED_INTERPRETER_PREFIX_FLAGS = frozenset(
+    {"-u", "-I", "-S", "-B", "-E", "-P", "-b", "-bb"}
+)
+
+
+def _allowed_interpreter_prefix_token(token: str) -> bool:
+    if token in _ALLOWED_INTERPRETER_PREFIX_FLAGS:
+        return True
+    if len(token) > 2 and (token.startswith("-X") or token.startswith("-W")):
+        # -X presite=MODULE - see the PowerShell function's own comment for
+        # the survey against every other -X sub-option this project knows.
+        if token.startswith("-X") and token[2:].startswith("presite"):
+            return False
+        # Round 24 connector finding: -W's value grammar is
+        # action:message:category:module:lineno, and warnings._getcategory
+        # IMPORTS a non-empty, dotted category (module, _, klass =
+        # category.rpartition('.'); __import__(module)) before -m agenttalk
+        # is ever reached - the same before-main, execution-mode-changing
+        # property as -X presite, just reachable through -W's own attached
+        # value instead of a sub-option. An empty category (no 3rd field,
+        # or an empty one) or a category with no dot never reaches that
+        # import branch (empty -> the default Warning class; no dot -> a
+        # plain attribute lookup on the builtins module) - refuse only the
+        # shape that actually imports.
+        if token.startswith("-W"):
+            parts = token[2:].split(":")
+            if len(parts) > 2 and "." in parts[2]:
+                return False
+        return True
+    return False
+
+
+def _module_args_from(cfg_agent: object) -> object:
+    """Extract the declared launch.module_args_from for one agent's config,
+    if any - the single place every attribution/provenance call site pulls
+    it from cfg_agent it already has in scope, so a malformed or absent
+    launch block degrades to None (the default 0-prefix case) rather than
+    raising."""
+    launch = cfg_agent.get("launch") if isinstance(cfg_agent, dict) else None
+    return launch.get("module_args_from") if isinstance(launch, dict) else None
+
+
+def _resolve_module_flag_index(
+    tokens_after_exe: list[str], module_args_from: object,
+) -> int:
+    """Python-side mirror of Resolve-AgenttalkModuleFlagIndex: given the
+    argv tokens AFTER the interpreter executable and a declared
+    module_args_from, return the index that holds '-m' (with 'agenttalk'
+    immediately after) if every prefix token before it is on the
+    allowlist, or -1 otherwise. A malformed module_args_from fails closed
+    (-1) rather than raising, matching the PowerShell side's own
+    fail-soft cast.
+
+    Shared by _agenttalk_argv (parses an OBSERVED command line at
+    attribution time) and bootstrap_check (validates a DECLARED config
+    at load time) so the two callers cannot independently drift from
+    what this returns - PR 98 connector, round 9: the validator only
+    checked module_args_from's type and range, so an in-range value
+    pointing at the WRONG token (e.g. windows_args ['-u', '-Xutf8', '-m',
+    'agenttalk'] with module_args_from=1) reported valid while this same
+    resolver logic, called at runtime, rejected it - nonce injection,
+    bounded logging, and launcher attribution all silently disabled on a
+    config the validator called clean."""
+    offset = 0
+    if module_args_from is not None:
+        try:
+            offset = int(module_args_from)
+        except (TypeError, ValueError):
+            return -1
+        if offset < 0:
+            return -1
+    if offset >= len(tokens_after_exe):
+        return -1
+    for prefix_token in tokens_after_exe[:offset]:
+        if not _allowed_interpreter_prefix_token(prefix_token):
+            return -1
+    if (offset + 1 < len(tokens_after_exe)
+            and tokens_after_exe[offset] == "-m"
+            and tokens_after_exe[offset + 1] == "agenttalk"):
+        return offset
+    return -1
+
+
+def _agenttalk_argv(command_line: object, module_args_from: object = None) -> list[str] | None:
     tokens = _split_command_line(command_line)
     if not tokens:
         return None
@@ -3389,9 +3486,10 @@ def _agenttalk_argv(command_line: object) -> list[str] | None:
     if first in _SHELL_HOSTS:
         return None
     if first in {"python", "python3", "py"}:
-        if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "agenttalk":
-            return tokens[3:]
-        return None
+        rel_index = _resolve_module_flag_index(tokens[1:], module_args_from)
+        if rel_index < 0:
+            return None
+        return tokens[1 + rel_index + 2:]
     if first == "agenttalk":
         return tokens[1:]
     return None
@@ -3414,8 +3512,9 @@ def _has_option_token(tokens: list[str], option: str) -> bool:
     return any(arg == option or arg.startswith(option + "=") for arg in tokens)
 
 
-def _agenttalk_invocation(command_line: object, root_key: str | None) -> dict | None:
-    argv = _agenttalk_argv(command_line)
+def _agenttalk_invocation(command_line: object, root_key: str | None,
+                           module_args_from: object = None) -> dict | None:
+    argv = _agenttalk_argv(command_line, module_args_from)
     if argv is None:
         return None
     root = None
@@ -3449,8 +3548,10 @@ def _agenttalk_invocation(command_line: object, root_key: str | None) -> dict | 
     }
 
 
-def _parse_supervisor_launch_nonce(command_line: object) -> tuple[str | None, str | None]:
-    argv = _agenttalk_argv(command_line)
+def _parse_supervisor_launch_nonce(
+    command_line: object, module_args_from: object = None,
+) -> tuple[str | None, str | None]:
+    argv = _agenttalk_argv(command_line, module_args_from)
     if argv is None:
         return None, "launcher_wrap_parse_failed"
     nonce = None
@@ -3481,8 +3582,10 @@ def _parse_supervisor_launch_nonce(command_line: object) -> tuple[str | None, st
     return nonce, None
 
 
-def parse_supervisor_launch_nonce(command_line: object) -> str | None:
-    nonce, reason = _parse_supervisor_launch_nonce(command_line)
+def parse_supervisor_launch_nonce(
+    command_line: object, module_args_from: object = None,
+) -> str | None:
+    nonce, reason = _parse_supervisor_launch_nonce(command_line, module_args_from)
     return nonce if reason is None else None
 
 
@@ -3500,8 +3603,8 @@ def _agent_option(args: list[str], option: str) -> str | None:
 
 
 def parse_agenttalk_wait_invocation(command_line: object, root_key: str | None,
-                                    agent: str) -> bool:
-    inv = _agenttalk_invocation(command_line, root_key)
+                                    agent: str, module_args_from: object = None) -> bool:
+    inv = _agenttalk_invocation(command_line, root_key, module_args_from)
     if not inv or inv.get("subcommand") != "wait" or not inv.get("root_match"):
         return False
     args = inv.get("args") or []
@@ -3511,8 +3614,8 @@ def parse_agenttalk_wait_invocation(command_line: object, root_key: str | None,
 
 
 def parse_agenttalk_wrap_invocation(command_line: object, root_key: str | None,
-                                    agent: str) -> bool:
-    inv = _agenttalk_invocation(command_line, root_key)
+                                    agent: str, module_args_from: object = None) -> bool:
+    inv = _agenttalk_invocation(command_line, root_key, module_args_from)
     if not inv or inv.get("subcommand") != "wrap" or not inv.get("root_match"):
         return False
     args = inv.get("args") or []
@@ -3525,10 +3628,11 @@ def parse_agenttalk_wrap_invocation(command_line: object, root_key: str | None,
     return "--loop" in before_tail
 
 
-def _row_branch_reason(row: dict, root_key: str | None, agent: str) -> str | None:
+def _row_branch_reason(row: dict, root_key: str | None, agent: str,
+                        module_args_from: object = None) -> str | None:
     if _is_shell_host(row):
         return "shell_boundary"
-    inv = _agenttalk_invocation(row.get("command_line"), root_key)
+    inv = _agenttalk_invocation(row.get("command_line"), root_key, module_args_from)
     if not inv:
         return None
     if inv.get("root") and not inv.get("root_match"):
@@ -3589,12 +3693,13 @@ def _is_confirmed_launcher(
     root_key: str | None,
     agent: str,
     diagnostics: dict[str, int],
+    module_args_from: object = None,
 ) -> tuple[bool, dict | None]:
     pid = st.get("launcher_pid")
     start = st.get("launcher_start")
     if not _pid_alive_guarded(idx, pid, start):
         return False, None
-    branch = _row_branch_reason(row, root_key, agent)
+    branch = _row_branch_reason(row, root_key, agent, module_args_from)
     if branch is not None:
         _bump(diagnostics, "foreign_launcher_suppressed")
         return False, None
@@ -3615,7 +3720,7 @@ def _is_confirmed_launcher(
     if not isinstance(command_line, str) or not command_line.strip():
         _bump(diagnostics, "launcher_nonce_cmdline_unreadable")
         return False, None
-    actual, nonce_reason = _parse_supervisor_launch_nonce(command_line)
+    actual, nonce_reason = _parse_supervisor_launch_nonce(command_line, module_args_from)
     if nonce_reason in {
         "launcher_nonce_malformed",
         "launcher_nonce_duplicate",
@@ -3624,7 +3729,7 @@ def _is_confirmed_launcher(
     }:
         _bump(diagnostics, nonce_reason)
         return False, None
-    if not parse_agenttalk_wrap_invocation(command_line, root_key, agent):
+    if not parse_agenttalk_wrap_invocation(command_line, root_key, agent, module_args_from):
         _bump(diagnostics, "launcher_wrap_parse_failed")
         return False, None
     if nonce_reason == "launcher_nonce_absent":
@@ -3664,6 +3769,9 @@ def _record_target(targets: dict[int, dict], row: dict, reason: str,
 
 def _is_expected_seed_row(row: dict, cfg_agent: dict, agent: str,
                           root_key: str | None) -> bool:
+    # row is an arbitrary ancestor/descendant, not a confirmed launcher - a
+    # declared module_args_from describes THIS agent's configured launcher
+    # only, so it must not be applied here (see _strict_child_edge).
     if parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
         return True
     if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
@@ -3815,6 +3923,9 @@ def _strict_child_edge(parent: dict, child: dict, *,
                        diagnostics: dict[str, int]) -> bool:
     if child.get("parent_pid") != parent.get("pid"):
         return False
+    # child is an arbitrary descendant, never the confirmed launcher itself -
+    # it made no declaration of its own, so it is parsed by its own argv
+    # shape (module_args_from=None), not this agent's declared prefix.
     branch = _row_branch_reason(child, root_key, agent)
     if branch is not None:
         _bump(diagnostics, branch)
@@ -3836,6 +3947,8 @@ def _strict_child_edge(parent: dict, child: dict, *,
 def _root_wait_brain(idx: dict[int, dict], wait_row: dict, cfg_agent: dict,
                      root_key: str | None, agent: str,
                      diagnostics: dict[str, int]) -> dict | None:
+    # Walks arbitrary ancestor rows - none of them is the confirmed
+    # launcher, so no declared module_args_from applies to any of them.
     child = wait_row
     best = None
     seen: set[int] = set()
@@ -3879,6 +3992,7 @@ def _attribution(
     now_epoch: float,
 ) -> dict:
     diagnostics = _diag()
+    module_args_from = _module_args_from(cfg_agent)
     prior_raw = st.get("managed_pids") if isinstance(st, dict) else None
     valid_priors, legacy_priors = _usable_priors(
         prior_raw,
@@ -3934,7 +4048,7 @@ def _attribution(
         _bump(diagnostics, "pid_reuse_suppressed")
     if isinstance(launcher_row, dict):
         confirmed_launcher, launcher_source = _is_confirmed_launcher(
-            idx, launcher_row, st, root_key, agent, diagnostics)
+            idx, launcher_row, st, root_key, agent, diagnostics, module_args_from)
     if confirmed_launcher:
         confirmed_launcher = True
         _record_target(targets_by_pid, launcher_row, "confirmed_launcher",
@@ -3950,6 +4064,8 @@ def _attribution(
             continue
         if isinstance(launcher_pid, int) and pid == launcher_pid:
             continue
+        # row is an arbitrary snapshot entry, not the confirmed launcher -
+        # parse it by its own argv shape, not this agent's declared prefix.
         branch = _row_branch_reason(row, root_key, agent)
         if branch is not None:
             _bump(diagnostics, branch)
@@ -4362,6 +4478,8 @@ def evaluate_launch_barrier(
             # prior launcher still exists, even when its command line is
             # unreadable. This never authorizes killing that process.
             kind = "state_launcher"
+        # row is an arbitrary post-kill survivor, not a confirmed launcher -
+        # parsed by its own argv shape, not this agent's declared prefix.
         elif parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
             kind = "own_wrapper"
         elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
@@ -4474,6 +4592,9 @@ def capture_launch_child_provenance(
         if child_epoch < launcher_epoch:
             _bump(diagnostics, "inverted_start_edge")
             continue
+        # row is a child of the confirmed launcher, but its OWN argv shape
+        # was never declared - the launcher's declared prefix describes the
+        # launcher, not its children, so it does not apply here either.
         branch = _row_branch_reason(row, root_key, agent)
         if branch is not None:
             _bump(diagnostics, branch)
@@ -5175,6 +5296,7 @@ def _wrapped_liveness(
         root_key,
         agent,
         diagnostics,
+        _module_args_from(cfg_agent),
     )
     if not wrapper_attributed:
         return _current_proof_failed(
@@ -5754,6 +5876,105 @@ def bootstrap_check(store: Store, *, now_epoch: float,
             else:
                 _bootstrap_add(checks, "supervisor_agent_launch_args_set", "ok",
                                "launch.windows_args is filled", agent=name)
+
+            # Round 16 connector finding: making the resolver delegation run
+            # unconditionally (round 14) also made it run for launches that
+            # are not Python at all - a manual archetype's claude.exe/
+            # codex.exe direct launch, or an agenttalk.exe entry-point
+            # launch - where windows_args never contains '-m'/'agenttalk'
+            # and the whole question of a module boundary is meaningless.
+            # windows_file's stem, not wrapped=true/false, is what actually
+            # decides whether the runtime resolver's own logic ever runs
+            # for this agent (_agenttalk_argv gates on exactly this set) -
+            # so this check must be gated on the SAME set, not removed
+            # back to "only when module_args_from is present" (that would
+            # reopen round 14's absent-prefix gap for genuinely Python
+            # launches). "pythonw" is deliberately NOT in this set: the
+            # runtime does not recognize it either (see _agenttalk_argv),
+            # so a pythonw-launched wrapped agent already gets no
+            # attribution regardless of module_args_from - a real, separate
+            # gap, not something this validator can paper over by silently
+            # accepting it here.
+            if _token_stem(windows_file) in {"python", "python3", "py"}:
+                module_args_from = launch.get("module_args_from")
+                module_args_from_type_or_range_error = False
+                if module_args_from is not None:
+                    if not isinstance(module_args_from, int) or isinstance(module_args_from, bool):
+                        _bootstrap_add(
+                            checks, "supervisor_agent_launch_module_args_from_invalid", "error",
+                            "launch.module_args_from must be an integer",
+                            agent=name,
+                            facts={"module_args_from": module_args_from},
+                            suggestion="set module_args_from to the index of '-m' in windows_args, "
+                                       "or remove it",
+                        )
+                        module_args_from_type_or_range_error = True
+                    elif isinstance(windows_args, list) and not (
+                        0 <= module_args_from < len(windows_args)
+                    ):
+                        _bootstrap_add(
+                            checks, "supervisor_agent_launch_module_args_from_out_of_range", "error",
+                            "launch.module_args_from is out of range for windows_args",
+                            agent=name,
+                            facts={"module_args_from": module_args_from,
+                                   "windows_args_len": len(windows_args)},
+                            suggestion="point module_args_from at the index of '-m' in windows_args",
+                        )
+                        module_args_from_type_or_range_error = True
+                # In-range is necessary but not sufficient (PR 98 connector,
+                # round 9): the validator must accept exactly what the
+                # runtime resolver accepts, no more - an in-range
+                # module_args_from pointing at the wrong token, or a
+                # declared prefix containing a token outside the supported
+                # interpreter-flag allowlist, launches fine (the Python
+                # invocation still runs) while nonce injection, bounded
+                # logging, and launcher attribution are all silently
+                # disabled. Round 14: that includes module_args_from being
+                # ABSENT while windows_args carries an undeclared prefix
+                # (e.g. ["-u", "-m", "agenttalk", ...]) - the resolver
+                # defaults an absent field to offset 0 exactly like this
+                # call does, so skipping the check whenever the field is
+                # merely unset let that exact shape report clean. Run
+                # unconditionally (any type/range error above already
+                # fully explains the config; no need to also run this).
+                # Delegate to the SAME resolver the runtime uses instead of
+                # reimplementing this judgment a third time.
+                if not module_args_from_type_or_range_error and isinstance(windows_args, list):
+                    if _resolve_module_flag_index(
+                        [str(token) for token in windows_args], module_args_from,
+                    ) < 0:
+                        _bootstrap_add(
+                            checks, "supervisor_agent_launch_module_args_from_wrong_token",
+                            "error",
+                            (
+                                "launch.module_args_from is in range but does not point at "
+                                "'-m' 'agenttalk', or its declared prefix contains a token "
+                                "outside the supported interpreter-flag set"
+                                if module_args_from is not None else
+                                "launch.module_args_from is not set and windows_args does "
+                                "not start with '-m' 'agenttalk' - the runtime resolver "
+                                "defaults an absent declaration to offset 0 and will reject "
+                                "this exact invocation the same way"
+                            ),
+                            agent=name,
+                            facts={"module_args_from": module_args_from,
+                                   "windows_args": windows_args},
+                            suggestion="point module_args_from at the index of '-m' in "
+                                       "windows_args, and declare only supported "
+                                       "interpreter flags before it (see "
+                                       "docs/supervisor-tutorial.md)",
+                        )
+                    else:
+                        _bootstrap_add(
+                            checks, "supervisor_agent_launch_module_args_from_valid", "ok",
+                            (
+                                "launch.module_args_from is a valid index"
+                                if module_args_from is not None else
+                                "windows_args resolves as the plain, undeclared "
+                                "'-m' 'agenttalk' form"
+                            ),
+                            agent=name,
+                        )
 
             if wrapped and isinstance(windows_args, list):
                 if "wrap" not in windows_args:
@@ -6851,6 +7072,12 @@ def _ephemeral_owned_process_view(
             else "codex"
         ),
         "wrapped": True,
+        # Carried WHOLESALE from the persisted entry (round 14, the
+        # persistence half of the rebuild class) rather than re-listing
+        # individual fields here - module_args_from is the immediate case,
+        # but this way a future field of the profile's own launch config
+        # survives this reconstruction too, without another site-by-site fix.
+        "launch": entry.get("launch") if isinstance(entry.get("launch"), dict) else {},
     }
     liveness = _wrapped_liveness(
         snapshot,
@@ -7782,6 +8009,11 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
             if isinstance(profile.get("cli"), str)
             else "codex"
         ),
+        launch=(
+            profile.get("launch")
+            if isinstance(profile.get("launch"), dict)
+            else None
+        ),
     )
     spec = eph.launch_spec(marker, profile, agent)
     if workspace_path:
@@ -8274,7 +8506,7 @@ CONFIG_TEMPLATE = """\
         "windows_args": ["{SESSION_ARGS}"],
         "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
-      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
+      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor launches the real file directly with the quoted argument line, working directory, and returned PID AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
       "_comment_liveness": "For this MANUAL archetype heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck. The hook runs `agenttalk heartbeat --hook` (soft: it can never block a tool call). For a NON-wrapped codex agent with activity_hook=true, the supervisor adds the GLOBAL --dangerously-bypass-hook-trust to the codex launch: the installed agenttalk hook changes codex's hook-trust hash and would otherwise PROMPT to re-trust on every unattended launch and strand the agent. This bypasses hook-trust for the supervisor's OWN hook, for controlled UNATTENDED supervision only (a wrapped codex does not use the activity hook and is unaffected)."
     },
@@ -8578,6 +8810,20 @@ $cfg = Read-SupervisorConfig
 # source checkout (prepend <root>/src to PYTHONPATH) vs a pip install.
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
 $SrcOnPyPath = __SRC_ON_PYPATH__
+$WrapperLogRoot = '__AGENTTALK_WRAPPER_LOG_ROOT__'
+$WrapperLogFallbackRoot = Join-Path (
+  Join-Path ([IO.Path]::GetTempPath()) 'agenttalk-wrapper-logs'
+) '__AGENTTALK_CHECKOUT_ID__'
+$WrapperLogGenerations = __AGENTTALK_WRAPPER_LOG_GENERATIONS__
+$WrapperLogMaxBytes = __AGENTTALK_WRAPPER_LOG_MAX_BYTES__
+$WrapperLogSegments = __AGENTTALK_WRAPPER_LOG_SEGMENTS__
+$WrapperLogEnvKeys = @(
+  'AGENTTALK_WRAPPER_STDOUT_LOG',
+  'AGENTTALK_WRAPPER_STDERR_LOG',
+  'AGENTTALK_WRAPPER_LOG_MAX_BYTES',
+  'AGENTTALK_WRAPPER_LOG_SEGMENTS',
+  'AGENTTALK_WRAPPER_LOG_NONCE'
+)
 
 function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }
 function Assert-ActionsEnabled([string]$what) {
@@ -8938,7 +9184,257 @@ function Stop-Tree($targets) {
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
-function Ensure-AgenttalkWrapRootArg($argv) {
+function Test-AgenttalkAllowedInterpreterPrefixToken([string]$token) {
+  # ALLOWLIST, not a reject list. (I2, 5th leak: --version/-V/-h/-?/--help*
+  # ran NO program at all - CPython prints and exits before ever reaching
+  # -m - which a REJECT list closed over "which tokens change execution
+  # mode" can never catch, because refusing NO-program tokens is a
+  # different property than refusing WRONG-program tokens, and a reject
+  # list accepts anything it does not specifically know to be dangerous.
+  # The property that actually matters is "does CPython reach the
+  # declared module", and the only check that can never leak by omission
+  # is refusing everything not affirmatively known-safe.)
+  #
+  # Each entry justified against what THIS project actually needs in a
+  # declared prefix, not "seems safe in the abstract":
+  #   -u  unbuffered stdout/stderr - serves #117 directly: an unbuffered
+  #       child flushes into BoundedStreamTee promptly instead of sitting
+  #       in CPython's own buffer.
+  #   -I  isolated mode (implies -E -P -S) - hardening; does not change
+  #       WHICH module CPython reaches, only what environment it sees
+  #       once there.
+  #   -S  skip implicit 'import site' - hardening. NOTE: can break
+  #       resolving `agenttalk` itself if it is installed via
+  #       site-packages rather than reachable without site processing -
+  #       a launch-configuration footgun for the operator to own, not a
+  #       security bypass of this check.
+  #   -B  never write .pyc files - no execution-mode or security effect.
+  #   -E  ignore PYTHON* environment variables - hardening. NOTE: can
+  #       break a dev checkout relying on PYTHONPATH (SrcOnPyPath) - same
+  #       kind of launch-configuration caveat as -S, not a check gap.
+  #
+  #   ROUND 24 CORRECTION to the -S/-E footgun classification above: the
+  #   original wording ("CPython still reaches -m agenttalk, or fails
+  #   loudly with ModuleNotFoundError") assumed that failure would be
+  #   OBSERVED somewhere before it mattered. The connector proved a third
+  #   outcome that assumption missed: on a source checkout resolving
+  #   `agenttalk` only via injected PYTHONPATH, an allowed -E/-S/-I broke
+  #   the REAL wrapped launch's import while Preflight - which ran a bare
+  #   `-m agenttalk --version` with NO declared prefix - never exercised
+  #   the failure and reported success anyway, so the supervisor relaunched
+  #   a wrapper that exits before cmd_wrap, SILENTLY, in a loop. That is a
+  #   genuinely different failure mode than "fails loudly", not a smaller
+  #   version of it. The footgun classification holds again now that
+  #   Preflight tests the CONFIGURED invocation (see
+  #   Resolve-AgenttalkLaunchPrefixTokens) - CPython really does either
+  #   reach -m agenttalk or fail loudly, because Preflight's own probe
+  #   fails the SAME way the real launch would, before a relaunch loop
+  #   ever starts. That guarantee is now Preflight's job, not an assumption
+  #   this allowlist gets to make on its own: if Preflight is ever called
+  #   without the declared prefix again (a fidelity regression), -S/-E/-I
+  #   silently fail-open the same way, and this classification is wrong
+  #   again. NOTE this guarantee does not extend to ephemeral reviewer
+  #   launches (Launch-Spec) - that path has no Preflight call at all,
+  #   for any prefix or any other misconfiguration, a broader and
+  #   pre-existing gap this round's fix does not close.
+  #   -P  don't prepend a possibly-unsafe path to sys.path - hardening.
+  #   -X  implementation-specific options, ATTACHED form only (e.g.
+  #       -Xutf8) - CPython's own scanner always continues past -X to the
+  #       next token; it never changes or suppresses execution by itself.
+  #       The bare, separate-token form (-X utf8) is refused: a value
+  #       token dangling after a bare -X is indistinguishable from a
+  #       script-path token without knowing -X consumes a value, which is
+  #       exactly the "which flags consume a value" problem this
+  #       mechanism declines to solve (round 4).
+  #   -b  warn (doubled as -bb, error) on str(bytes)/str(bytearray) and
+  #       bytes-vs-str comparisons - diagnostic only, same shape and same
+  #       no-execution-mode-effect as -B; never consumes a value, so it
+  #       needs no attached/separate distinction.
+  #   -W  warning-filter control, ATTACHED form only (e.g. -Wignore) -
+  #       same "CPython's scanner always continues past it" property as
+  #       -X, and the same bare-form refusal for the same reason (a value
+  #       token dangling after a bare -W is indistinguishable from a
+  #       script-path token). NOTE: -Werror is a genuine footgun - any
+  #       warning the launched code triggers becomes a crash instead of a
+  #       log line - a launch-configuration risk for the operator to own,
+  #       the same category as -S's and -E's own NOTE above, not a
+  #       security bypass of this check. ROUND 24 CONNECTOR FINDING,
+  #       PROVEN not reasoned: -W's value grammar is
+  #       action:message:category:module:lineno, and
+  #       warnings._getcategory IMPORTS a non-empty, DOTTED category
+  #       (module, _, klass = category.rpartition('.');
+  #       __import__(module)) before -m agenttalk is ever reached - the
+  #       same before-main, execution-mode-changing property as -X
+  #       presite, just reachable through -W's own attached value instead
+  #       of a sub-option. Confirmed with `PYTHONPATH=. python3
+  #       -Wignore::evil.W -c "..."`: evil's top-level code runs before
+  #       the -c body does. An empty category (no 3rd field, or an empty
+  #       one) or a category with no dot never reaches that import branch
+  #       (empty -> the default Warning class; no dot -> a plain
+  #       attribute lookup on the builtins module, not an import) - the
+  #       refusal below is scoped to exactly the shape that imports.
+  #
+  # Deliberately excluded despite looking superficially safe:
+  #   -O/-OO strips `assert` statements, and this codebase has already
+  #     been bitten once by code that relied on asserts silently
+  #     vanishing under an optimized launch (814b645) - no reason to
+  #     reopen that class here.
+  #   -i (inspect after running) does not bypass -m, but parks the
+  #     process at an interactive prompt afterward instead of exiting -
+  #     a different failure mode this project has no use for.
+  # Anything else - known CPython flag or novel spelling, safe-looking or
+  # not - is refused. An option CPython adds in a future release fails
+  # closed by default instead of shipping.
+  # -ceq/-cstartswith throughout: PowerShell's default -eq is
+  # case-INSENSITIVE, which would silently equate e.g. -i with -I - two
+  # DIFFERENT CPython flags (-i inspects after running; -I is isolated
+  # mode) - and let the deliberately-excluded lowercase form through the
+  # allowlist by accident.
+  if ($token -ceq '-u' -or $token -ceq '-I' -or $token -ceq '-S' -or
+      $token -ceq '-B' -or $token -ceq '-E' -or $token -ceq '-P' -or
+      $token -ceq '-b' -or $token -ceq '-bb') {
+    return $true
+  }
+  if ($token.Length -gt 2 -and (
+      $token.StartsWith('-X', [StringComparison]::Ordinal) -or
+      $token.StartsWith('-W', [StringComparison]::Ordinal)
+  )) {
+    # -X presite=MODULE (debug builds only) imports an arbitrary module
+    # BEFORE site initialization - before anything else CPython does,
+    # including reaching -m agenttalk. Same before-main,
+    # execution-mode-changing property as -c/-m/a bare script path, just
+    # spelled as a -X sub-option instead of its own flag - the ONE
+    # attached -X form this allowlist must still refuse. Surveyed the rest
+    # of CPython's documented -X options for the same property: importtime,
+    # dev, utf8, pycache_prefix, int_max_str_digits, frozen_modules,
+    # faulthandler, showrefcount, tracemalloc, no_debug_ranges,
+    # warn_default_encoding - every one of them only configures behavior or
+    # enables a BUILT-IN diagnostic; none imports operator-supplied code
+    # ahead of anything else. presite is the only one with this shape.
+    if ($token.StartsWith('-X', [StringComparison]::Ordinal) -and
+        $token.Substring(2) -clike 'presite*') {
+      return $false
+    }
+    if ($token.StartsWith('-W', [StringComparison]::Ordinal)) {
+      # See the -W bullet above: refuse only when a category field (the
+      # 3rd colon-separated component of the value) is present AND
+      # dotted - that is the exact shape warnings._getcategory imports.
+      $categoryField = $token.Substring(2).Split(':')
+      if ($categoryField.Count -gt 2 -and $categoryField[2].Contains('.')) {
+        return $false
+      }
+    }
+    return $true
+  }
+  return $false
+}
+function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom = $null) {
+  # THE ONE place that recognizes a `python -m agenttalk` invocation - nonce
+  # injection, the bounded-logging eligibility check, and the legacy --root
+  # backfill all need this SAME recognition, and three independent copies is
+  # exactly how a valid `-u`/`-X` launch silently lost the logging capability
+  # while nonce injection (the one copy that had been patched) kept working.
+  #
+  # I2, mechanism change (2nd attempt at bounding CPython's grammar leaked
+  # too - `-c'...'` attached-command forms, and `--check-hash-based-pycs
+  # always`'s separate value, were both missed by the inverted scan).
+  # `python --help` is not a specification safe to re-derive from argv
+  # text, in either direction (an allowlist of safe flags, or a denylist
+  # of unsafe ones) - CPython's option grammar is larger than either
+  # attempt bounded, and stays a moving target.
+  #
+  # STOPPED INFERRING. The boundary between an interpreter-option prefix
+  # and the canonical module invocation is now a DECLARED FACT -
+  # agents.<name>.launch.module_args_from in supervisor.json, defaulting
+  # to 0 (the overwhelmingly common "no interpreter prefix" case, so every
+  # existing config needs zero changes). Whoever configures a launch with
+  # `-u`/`-X .../-P/...` already knows, at config-authoring time, exactly
+  # how many tokens their own prefix occupies - the supervisor no longer
+  # has to reverse-engineer it from the tokens themselves. All that
+  # remains here is a cheap, exact, grammar-independent sanity check: does
+  # the DECLARED position actually hold the literal tokens '-m' 'agenttalk'?
+  # That check can never leak by omission, because it never has to
+  # recognize a single interpreter flag - safe or unsafe - to do its job.
+  #
+  # Returns the declared index if it holds '-m agenttalk', or -1 otherwise
+  # (including an out-of-range declaration - fail closed on a
+  # misconfigured index rather than guess). NOTE: the parameter is NOT
+  # named $args - PowerShell's automatic $args variable silently shadows a
+  # same-named formal parameter, and the function then sees an empty list
+  # regardless of what the caller passed.
+  #
+  # (I2, FINAL gap - narrower each of five rounds, closed by inversion
+  # this time.) Declaring WHERE '-m agenttalk' sits proves the POSITION,
+  # not that CPython ever REACHES it. Every REJECT-list attempt at this
+  # (which flags are safe / which consume a value / which change
+  # execution mode) accepted anything it did not specifically know to be
+  # dangerous, so each novel prefix shape shipped once before the next
+  # round caught it. This is now an ALLOW list - anything in the prefix
+  # that Test-AgenttalkAllowedInterpreterPrefixToken does not affirmatively
+  # recognize is refused, and that function (not this comment) is the
+  # checked source of truth for which tokens those are.
+  #
+  # module_args_from is an operator-declared config value, not argv - a
+  # malformed one ("1x") must not throw under $ErrorActionPreference =
+  # 'Stop' and take the whole supervisor poll down over one agent's typo;
+  # fail soft to -1 like every other "not recognized" case. The bootstrap
+  # config validator is the loud, load-time check; this is defense in
+  # depth for whatever reaches here anyway.
+  $index = 0
+  if ($null -ne $moduleArgsFrom) {
+    try {
+      $index = [int]$moduleArgsFrom
+    } catch {
+      return -1
+    }
+  }
+  if ($index -lt 0 -or $index -ge $argTokens.Count) { return -1 }
+  for ($p = 0; $p -lt $index; $p++) {
+    if (-not (Test-AgenttalkAllowedInterpreterPrefixToken ([string]$argTokens[$p]))) {
+      return -1
+    }
+  }
+  # Case-sensitive: CPython's own option parsing is case-sensitive (-m is
+  # not -M; PowerShell's default -eq is not), and the module name argument
+  # is an exact string CPython passes to the import system verbatim.
+  if ($index + 1 -lt $argTokens.Count -and
+      [string]$argTokens[$index] -ceq '-m' -and
+      [string]$argTokens[$index + 1] -ceq 'agenttalk') {
+    return $index
+  }
+  return -1
+}
+function Resolve-AgenttalkLaunchPrefixTokens($agentConfig) {
+  # THE tokens Preflight must smoke-test WITH, so it tests the CONFIGURED
+  # invocation rather than a fixed stand-in for it (round 24 connector
+  # finding on supervisor.py:3400's -E/-I/-S justification). Reuses
+  # Resolve-AgenttalkModuleFlagIndex - the SAME resolution every other
+  # module_args_from consumer performs - rather than re-deriving where the
+  # prefix ends. Returns @() for the overwhelmingly common case (no
+  # declared prefix, or module_args_from absent/0), and $null if the
+  # declaration does not resolve (out of range, or a token in the prefix
+  # this project does not affirmatively allow) - the caller's job is to
+  # treat $null as the CONFIG ERROR it is, not silently fall back to no
+  # prefix, which would just reintroduce the exact fidelity gap this
+  # exists to close.
+  #
+  # The leading commas below are load-bearing, not style: PowerShell
+  # UNROLLS an array onto the pipeline on `return`, so a caller assigning
+  # the result of a bare `return @()` sees $null, and a bare
+  # `return @('-E')` sees the SCALAR string '-E', not a one-element array
+  # - which then makes `& $file @prefixTokens ...` splat the STRING's
+  # individual CHARACTERS as separate argv tokens (confirmed empirically:
+  # `-E` became two tokens, `-` and `E`). The unary comma operator wraps
+  # the array as a single pipeline object so it survives `return` intact,
+  # at every length including zero and one.
+  $windowsArgs = @($agentConfig.launch.windows_args)
+  $moduleArgsFrom = $agentConfig.launch.module_args_from
+  $mIdx = Resolve-AgenttalkModuleFlagIndex $windowsArgs $moduleArgsFrom
+  if ($mIdx -lt 0) { return $null }
+  if ($mIdx -eq 0) { return ,@() }
+  return ,@($windowsArgs[0..($mIdx - 1)])
+}
+function Ensure-AgenttalkWrapRootArg($argv, $moduleArgsFrom = $null) {
   # Older supervisor.json files launched wrappers as:
   #   python.exe -m agenttalk wrap --for NAME --loop ...
   # and relied on AGENTTALK_ROOT in the environment. Win32_Process exposes only
@@ -8948,26 +9444,29 @@ function Ensure-AgenttalkWrapRootArg($argv) {
   $args = @($argv)
   if ($args.Count -eq 0) { return $args }
   $scan = 0
-  if ($args.Count -ge 2 -and [string]$args[0] -eq '-m' -and [string]$args[1] -eq 'agenttalk') {
-    $scan = 2
-  }
+  $flagIndex = Resolve-AgenttalkModuleFlagIndex $args $moduleArgsFrom
+  if ($flagIndex -ge 0) { $scan = $flagIndex + 2 }
   $rootPresent = $false
   $wrapIndex = -1
   $i = $scan
   while ($i -lt $args.Count) {
+    # Case-sensitive throughout: these are the CLI's own global option and
+    # subcommand spellings, and argparse matches them case-sensitively -
+    # PowerShell's default -eq/-like would treat a differently-cased
+    # config token as if it matched, when the real CLI would reject it.
     $arg = [string]$args[$i]
-    if ($arg -eq '--') { break }
-    if ($arg -eq '--root') {
+    if ($arg -ceq '--') { break }
+    if ($arg -ceq '--root') {
       $rootPresent = $true
       $i += 2
       continue
     }
-    if ($arg -like '--root=*') {
+    if ($arg -clike '--root=*') {
       $rootPresent = $true
       $i += 1
       continue
     }
-    if ($arg -eq 'wrap') {
+    if ($arg -ceq 'wrap') {
       $wrapIndex = $i
       break
     }
@@ -9028,12 +9527,19 @@ function Test-WrappedBaseCli($name) {
     return $false
   }
   $base = [string]$args[$sep + 1]
+  # Deliberately case-insensitive: this is a FAIL-CLOSED refusal, not a
+  # capability grant - matching more spellings of an unfilled scaffold
+  # placeholder (REPLACE:/replace:/etc.) only widens what gets refused. A
+  # config that never had this placeholder is unaffected either way.
   if (-not $base -or $base -like 'REPLACE:*') {
     Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped launch CLI tail is not filled in; NOT launching (fail closed)" -f $name)
     return $false
   }
   $cmd = Get-Command $base -ErrorAction SilentlyContinue
   $resolved = if ($cmd) { $cmd.Source } else { $base }
+  # Deliberately case-insensitive: pre-lowercased via ToLowerInvariant, for
+  # the same reason as File-LeafLower/File-StemLower - a file EXTENSION is
+  # Windows filesystem semantics, not an argv/config token the CLI parses.
   $ext = [IO.Path]::GetExtension([string]$resolved).ToLowerInvariant()
   if ($ext -in @('.cmd','.bat','.ps1')) {
     Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped launch CLI tail resolves to shim '{1}', not a native executable; NOT launching (fail closed)" -f $name, $resolved)
@@ -9046,6 +9552,13 @@ function Test-WrappedBaseCli($name) {
   return $true
 }
 function File-LeafLower([string]$path) {
+  # Deliberately case-insensitive (pre-lowercased, then compared against
+  # all-lowercase literals wherever this is used): unlike argv/config
+  # tokens the CLI's own argparse matches case-sensitively, an executable
+  # NAME is resolved through the Windows filesystem/PATH, which is itself
+  # case-insensitive - `Python.EXE` and `python.exe` are the same file to
+  # Windows. Sensitizing this would make the supervisor MISS a real
+  # python.exe/agenttalk.exe launch that Windows itself would run fine.
   try { return ([IO.Path]::GetFileName($path)).ToLowerInvariant() }
   catch { return ([string]$path).ToLowerInvariant() }
 }
@@ -9053,7 +9566,7 @@ function File-StemLower([string]$path) {
   try { return ([IO.Path]::GetFileNameWithoutExtension($path)).ToLowerInvariant() }
   catch { return ([string]$path).ToLowerInvariant() }
 }
-function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
+function Add-SupervisorLaunchNonce($file, $argv, $nonce, $moduleArgsFrom = $null) {
   $args = @($argv)
   $unsupported = [pscustomobject]@{
     argv = $args
@@ -9063,22 +9576,45 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
     missing_reason = 'unsupported_launch_argv'
   }
   if (-not $nonce) { return $unsupported }
+  foreach ($token in $args) {
+    $text = [string]$token
+    # Case-sensitive: this is the CLI's own reserved global option
+    # spelling, which argparse matches case-sensitively. A differently
+    # cased look-alike is not the real option to argparse either, so
+    # treating it as a collision here would refuse an ordinary token.
+    if ($text -ceq '--supervisor-launch-nonce' -or
+        $text -clike '--supervisor-launch-nonce=*') {
+      # This is a supervisor-owned capability. Accepting an operator-supplied
+      # duplicate would let argparse's last-value-wins behavior desynchronize
+      # the CLI nonce from the logging environment and leave a direct redirect
+      # unbounded.
+      $unsupported.missing_reason = 'reserved_launch_nonce_present'
+      return $unsupported
+    }
+  }
   $stem = File-StemLower ([string]$file)
   if ($stem -in @('python','python3','py')) {
-    for ($i = 0; $i -lt ($args.Count - 1); $i++) {
-      if (($args[$i] -eq '-m') -and ($args[$i + 1] -eq 'agenttalk')) {
-        $out = @()
-        for ($j = 0; $j -lt $args.Count; $j++) {
-          $out += $args[$j]
-          if ($j -eq ($i + 1)) { $out += @('--supervisor-launch-nonce', $nonce) }
-        }
-        return [pscustomobject]@{
-          argv = $out
-          injected = $true
-          nonce = $nonce
-          source = 'agenttalk_global_arg'
-          missing_reason = $null
-        }
+    $i = Resolve-AgenttalkModuleFlagIndex $args $moduleArgsFrom
+    if ($i -ge 0) {
+      # A direct assignment inside a plain `if` STATEMENT preserves the
+      # array type; capturing an if/else USED AS AN EXPRESSION does not -
+      # PowerShell enumerates a one-element array flowing through that
+      # pipeline and collapses it back to a bare scalar, which silently
+      # turns the eventual argv into a single glued-together string.
+      $prefix = @()
+      if ($i -gt 0) { $prefix = @($args[0..($i - 1)]) }
+      $out = @($prefix + @(
+        $args[$i], $args[$i + 1], '--supervisor-launch-nonce', $nonce
+      ))
+      if ($args.Count -gt ($i + 2)) {
+        $out = @($out + @($args[($i + 2)..($args.Count - 1)]))
+      }
+      return [pscustomobject]@{
+        argv = $out
+        injected = $true
+        nonce = $nonce
+        source = 'agenttalk_global_arg'
+        missing_reason = $null
       }
     }
     return $unsupported
@@ -9098,11 +9634,93 @@ function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
   }
   return $unsupported
 }
-function Preflight($name, $plan, $file, $codexHome) {
+function Resolve-AgenttalkOwnArgvIndex($file, [object[]]$argTokens, $moduleArgsFrom = $null) {
+  # Shared by both wrap-eligibility checks below (which token is the
+  # subcommand, and whether the tail from there actually dispatches to
+  # cmd_wrap): the index where agenttalk's OWN argv begins - after `-m
+  # agenttalk` for a python-stem launch, or 0 for a direct agenttalk exe.
+  # Returns -1 if this launch's argv never reaches agenttalk's parser at
+  # all (same fail-closed convention as Resolve-AgenttalkModuleFlagIndex).
+  #
+  # NOTE: the parameter is NOT named $args, same reason as
+  # Resolve-AgenttalkModuleFlagIndex's own note - PowerShell's automatic
+  # $args variable silently shadows a same-named formal parameter, and the
+  # function then sees an empty list regardless of what the caller passed.
+  $stem = File-StemLower ([string]$file)
+  if ($stem -in @('python','python3','py')) {
+    $flagIndex = Resolve-AgenttalkModuleFlagIndex $argTokens $moduleArgsFrom
+    if ($flagIndex -lt 0) { return -1 }
+    return $flagIndex + 2
+  }
+  $leaf = File-LeafLower ([string]$file)
+  if ($leaf -notin @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
+    return -1
+  }
+  return 0
+}
+function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFrom = $null) {
+  if (-not $nonceResult.injected) { return $false }
+  $args = @($argv)
+  $index = Resolve-AgenttalkOwnArgvIndex $file $args $moduleArgsFrom
+  if ($index -lt 0) { return $false }
+  # The CLI has two value-taking global options. The first remaining token is
+  # the subcommand; only a literal `wrap` there may receive the cooperative
+  # byte-bound log capability.
+  #
+  # Case-sensitive throughout this scan: argparse matches its own global
+  # options and subcommands case-sensitively, so a configured "WRAP" (or
+  # "--Root") is invalid argv to the real CLI - it would be rejected as an
+  # unrecognized argument, never reach the wrap subcommand, and never
+  # actually redirect anything. Matching it here as though it WERE 'wrap'
+  # granted the logging capability (nonce injection, generation commit) to
+  # a launch that CPython's own argparse would refuse - the same class of
+  # leak as I2's execution-mode prefix, one call site over.
+  while ($index -lt $args.Count) {
+    $token = [string]$args[$index]
+    if ($token -cin @('--root','--supervisor-launch-nonce')) {
+      if (($index + 1) -ge $args.Count) { return $false }
+      $index += 2
+      continue
+    }
+    if ($token -clike '--root=*' -or
+        $token -clike '--supervisor-launch-nonce=*') {
+      $index += 1
+      continue
+    }
+    return $token -ceq 'wrap'
+  }
+  return $false
+}
+function Preflight($name, $plan, $file, $codexHome, [object[]]$prefixTokens = @()) {
   # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
   # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
   # the launch grace in a relaunch loop. Returns $true on success.
+  #
+  # Round 24 connector finding: the wrapped-mode probe below used to run
+  # `-m agenttalk --version` with NO prefix, while the REAL launch runs
+  # $a.launch.windows_args verbatim - including any declared -E/-I/-S/...
+  # tokens before -m. On a source checkout that only resolves `agenttalk`
+  # via injected PYTHONPATH, an allowed -E (ignores PYTHON* env vars) or -I
+  # (implies -E) breaks the REAL launch's import while this probe, never
+  # having used the prefix, succeeds anyway - the third outcome round 15's
+  # -E/-I/-S justification ("CPython still reaches -m OR fails loudly")
+  # missed: it can fail SILENTLY, in a process this exact check was
+  # supposed to catch before it started looping. $prefixTokens (the
+  # caller's resolved windows_args[0:module_args_from], the SAME
+  # resolution Resolve-AgenttalkModuleFlagIndex performs for every other
+  # consumer of module_args_from - not a second, divergent extraction) is
+  # spliced into the wrapped probe below so it tests the CONFIGURED
+  # invocation, not a fixed stand-in for it. The $AgenttalkPython probes
+  # elsewhere in this function are deliberately left alone: they smoke-test
+  # THIS supervisor's own pinned interpreter/environment, which no
+  # per-agent windows_args prefix ever governs.
   try {
+    # Deliberately case-insensitive (here and every other launch_mode
+    # comparison): launch_mode is never operator-authored config text - it
+    # is a fixed string _launch_detail computes and writes itself
+    # ("wrap"/"fresh"/"resume"), an internal protocol value between our
+    # own Python and PowerShell with no external input path, unlike cli/
+    # backend_profile which pass a raw config field through verbatim.
     if ($plan.launch_mode -eq 'wrap') {
       # WRAPPED agent: $file is the PYTHON wrapper exe (it runs `agenttalk wrap
       # --loop`), NOT the CLI. Smoke-test both the configured wrapper python and
@@ -9112,7 +9730,7 @@ function Preflight($name, $plan, $file, $codexHome) {
       if ($codexHome) { $env:CODEX_HOME = $codexHome }
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
       try {
-        & $file -m agenttalk --version | Out-Null
+        & $file @prefixTokens -m agenttalk --version | Out-Null
         $rc = $LASTEXITCODE
         if ($rc -eq 0) {
           & $AgenttalkPython -m agenttalk --version | Out-Null
@@ -9126,7 +9744,12 @@ function Preflight($name, $plan, $file, $codexHome) {
       if (-not (Test-WrappedBaseCli $name)) { return $false }
       return $true
     }
-    if ($plan.cli -eq 'codex') {
+    # Case-sensitive: cli is passed through from config verbatim
+    # (cfg_agent.get("cli", "claude")), and the bootstrap validator's own
+    # Python check (`cli_name not in _BOOTSTRAP_SUPPORTED_CLIS`) is
+    # case-sensitive too - a config value the validator would reject
+    # should not be silently treated as a match here.
+    if ($plan.cli -ceq 'codex') {
       # Plain import hard gate under the Codex launch env: set the seeded CODEX_HOME
       # + PYTHONPATH (src on a checkout, the SAME way Launch() does) and run
       # `AGENTTALK_PY -m agenttalk --version` - exactly how the supervised agent reaches
@@ -9176,10 +9799,953 @@ function Wait-ForNextPoll($config) {
   if (-not $Once) { Start-Sleep -Seconds ([int]$config.poll_seconds) }
 }
 # endregion checked-mutations
+# region wrapper-log-helpers
+function Test-RunningOnWindows {
+  # Ambient markers such as `$env:OS` are optional and are deliberately absent
+  # in hermetic launch environments.
+  return [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+}
+$script:WrapperLogLauncherTypeReady = $false
+function Initialize-WrapperLogLauncherType {
+  if (-not (Test-RunningOnWindows)) { return $false }
+  if ($script:WrapperLogLauncherTypeReady) { return $true }
+  try {
+    if (-not ('Agenttalk.ExactHandleLauncher' -as [type])) {
+      Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Agenttalk {
+  public sealed class ExactHandleLaunchResult {
+    public Process Process { get; private set; }
+    public bool StdoutDegraded { get; private set; }
+    public bool StderrDegraded { get; private set; }
+
+    internal ExactHandleLaunchResult(
+        Process process, bool stdoutDegraded, bool stderrDegraded) {
+      Process = process;
+      StdoutDegraded = stdoutDegraded;
+      StderrDegraded = stderrDegraded;
+    }
+  }
+
+  public static class ExactHandleLauncher {
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint CREATE_ALWAYS = 2;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint STARTF_USESHOWWINDOW = 0x00000001;
+    private const uint STARTF_USESTDHANDLES = 0x00000100;
+    private const uint CREATE_SUSPENDED = 0x00000004;
+    private const uint CREATE_NO_WINDOW = 0x08000000;
+    private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST =
+      new IntPtr(0x00020002);
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SECURITY_ATTRIBUTES {
+      public int nLength;
+      public IntPtr lpSecurityDescriptor;
+      [MarshalAs(UnmanagedType.Bool)]
+      public bool bInheritHandle;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO {
+      public int cb;
+      public string lpReserved;
+      public string lpDesktop;
+      public string lpTitle;
+      public uint dwX;
+      public uint dwY;
+      public uint dwXSize;
+      public uint dwYSize;
+      public uint dwXCountChars;
+      public uint dwYCountChars;
+      public uint dwFillAttribute;
+      public uint dwFlags;
+      public short wShowWindow;
+      public short cbReserved2;
+      public IntPtr lpReserved2;
+      public IntPtr hStdInput;
+      public IntPtr hStdOutput;
+      public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct STARTUPINFOEX {
+      public STARTUPINFO StartupInfo;
+      public IntPtr lpAttributeList;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION {
+      public IntPtr hProcess;
+      public IntPtr hThread;
+      public uint dwProcessId;
+      public uint dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFile(
+      string fileName, uint desiredAccess, uint shareMode,
+      ref SECURITY_ATTRIBUTES securityAttributes, uint creationDisposition,
+      uint flagsAndAttributes, IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool InitializeProcThreadAttributeList(
+      IntPtr attributeList, int attributeCount, int flags, ref IntPtr size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UpdateProcThreadAttribute(
+      IntPtr attributeList, uint flags, IntPtr attribute, IntPtr value,
+      IntPtr size, IntPtr previousValue, IntPtr returnSize);
+
+    [DllImport("kernel32.dll")]
+    private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
+
+    [DllImport(
+      "kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true,
+      EntryPoint = "CreateProcessW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateProcess(
+      string applicationName, StringBuilder commandLine,
+      IntPtr processAttributes, IntPtr threadAttributes,
+      [MarshalAs(UnmanagedType.Bool)] bool inheritHandles,
+      uint creationFlags, IntPtr environment, string currentDirectory,
+      ref STARTUPINFOEX startupInfo,
+      out PROCESS_INFORMATION processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr thread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private static IntPtr OpenInherited(
+        string path, uint desiredAccess, uint creationDisposition) {
+      SECURITY_ATTRIBUTES security = new SECURITY_ATTRIBUTES();
+      security.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+      security.bInheritHandle = true;
+      IntPtr handle = CreateFile(
+        path, desiredAccess,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ref security, creationDisposition, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+      if (handle == INVALID_HANDLE_VALUE) {
+        throw new Win32Exception(
+          Marshal.GetLastWin32Error(), "CreateFile failed for " + path);
+      }
+      return handle;
+    }
+
+    private static IntPtr OpenOutputOrNull(string path, out bool degraded) {
+      try {
+        degraded = false;
+        return OpenInherited(path, GENERIC_WRITE, CREATE_ALWAYS);
+      } catch {
+        degraded = true;
+        return OpenInherited("NUL", GENERIC_WRITE, OPEN_EXISTING);
+      }
+    }
+
+    public static ExactHandleLaunchResult Start(
+        string fileName, string arguments, string workingDirectory,
+        string stdoutPath, string stderrPath, int showWindow) {
+      if (String.Equals(
+          Path.GetFullPath(stdoutPath), Path.GetFullPath(stderrPath),
+          StringComparison.OrdinalIgnoreCase)) {
+        throw new ArgumentException(
+          "stdout and stderr paths must be distinct");
+      }
+      IntPtr stdinHandle = IntPtr.Zero;
+      IntPtr stdoutHandle = IntPtr.Zero;
+      IntPtr stderrHandle = IntPtr.Zero;
+      IntPtr handleArray = IntPtr.Zero;
+      IntPtr attributeList = IntPtr.Zero;
+      PROCESS_INFORMATION processInfo = new PROCESS_INFORMATION();
+      bool processCreated = false;
+      bool stdoutDegraded;
+      bool stderrDegraded;
+
+      try {
+        stdinHandle = OpenInherited("NUL", GENERIC_READ, OPEN_EXISTING);
+        stdoutHandle = OpenOutputOrNull(stdoutPath, out stdoutDegraded);
+        stderrHandle = OpenOutputOrNull(stderrPath, out stderrDegraded);
+        if (stdoutDegraded && stderrDegraded) {
+          // The both-degraded decision must be made HERE, before the child
+          // is created - not left to the caller to notice after the fact.
+          // CreateProcess+ResumeThread below would start the child with the
+          // caller's already-applied wrapper-log capability env vars
+          // (nonce, AGENTTALK_WRAPPER_STDOUT_LOG/STDERR_LOG) inherited
+          // regardless of which handles it actually got, so a child
+          // launched past this point would authenticate against those
+          // vars and have BoundedStreamTee recreate the generation
+          // directory on its own - even though the caller, seeing
+          // Redirected=false, already discarded it. Throwing before
+          // CreateProcess routes through the SAME catch below that an
+          // exact-handle failure already uses, which falls back to an
+          // unredirected launch that strips the capability env vars first.
+          throw new IOException(
+            "both wrapper log targets are unavailable; refusing to launch " +
+            "an authenticated child with neither stream genuinely redirected");
+        }
+
+        handleArray = Marshal.AllocHGlobal(IntPtr.Size * 3);
+        Marshal.WriteIntPtr(handleArray, 0, stdinHandle);
+        Marshal.WriteIntPtr(handleArray, IntPtr.Size, stdoutHandle);
+        Marshal.WriteIntPtr(handleArray, IntPtr.Size * 2, stderrHandle);
+
+        IntPtr attributeBytes = IntPtr.Zero;
+        InitializeProcThreadAttributeList(
+          IntPtr.Zero, 1, 0, ref attributeBytes);
+        attributeList = Marshal.AllocHGlobal(attributeBytes);
+        if (!InitializeProcThreadAttributeList(
+            attributeList, 1, 0, ref attributeBytes)) {
+          throw new Win32Exception(
+            Marshal.GetLastWin32Error(),
+            "InitializeProcThreadAttributeList failed");
+        }
+        if (!UpdateProcThreadAttribute(
+            attributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            handleArray, new IntPtr(IntPtr.Size * 3),
+            IntPtr.Zero, IntPtr.Zero)) {
+          throw new Win32Exception(
+            Marshal.GetLastWin32Error(),
+            "UpdateProcThreadAttribute failed");
+        }
+
+        STARTUPINFOEX startup = new STARTUPINFOEX();
+        startup.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdinHandle;
+        startup.StartupInfo.hStdOutput = stdoutHandle;
+        startup.StartupInfo.hStdError = stderrHandle;
+        startup.lpAttributeList = attributeList;
+        if (showWindow >= 0) {
+          startup.StartupInfo.dwFlags |= STARTF_USESHOWWINDOW;
+          startup.StartupInfo.wShowWindow = (short)showWindow;
+        }
+
+        string command = "\"" + fileName + "\"";
+        if (!String.IsNullOrWhiteSpace(arguments)) {
+          command += " " + arguments;
+        }
+        uint flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
+        if (showWindow == 0) {
+          flags |= CREATE_NO_WINDOW;
+        }
+        StringBuilder commandLine = new StringBuilder(command);
+        if (!CreateProcess(
+            fileName, commandLine, IntPtr.Zero, IntPtr.Zero, true, flags,
+            IntPtr.Zero, workingDirectory, ref startup, out processInfo)) {
+          throw new Win32Exception(
+            Marshal.GetLastWin32Error(), "CreateProcess failed");
+        }
+        processCreated = true;
+
+        Process process = Process.GetProcessById((int)processInfo.dwProcessId);
+        if (ResumeThread(processInfo.hThread) == UInt32.MaxValue) {
+          throw new Win32Exception(
+            Marshal.GetLastWin32Error(), "ResumeThread failed");
+        }
+        return new ExactHandleLaunchResult(
+          process, stdoutDegraded, stderrDegraded);
+      } catch {
+        if (processCreated && processInfo.hProcess != IntPtr.Zero) {
+          TerminateProcess(processInfo.hProcess, 127);
+        }
+        throw;
+      } finally {
+        if (attributeList != IntPtr.Zero) {
+          DeleteProcThreadAttributeList(attributeList);
+          Marshal.FreeHGlobal(attributeList);
+        }
+        if (handleArray != IntPtr.Zero) {
+          Marshal.FreeHGlobal(handleArray);
+        }
+        if (stdinHandle != IntPtr.Zero &&
+            stdinHandle != INVALID_HANDLE_VALUE) {
+          CloseHandle(stdinHandle);
+        }
+        if (stdoutHandle != IntPtr.Zero &&
+            stdoutHandle != INVALID_HANDLE_VALUE) {
+          CloseHandle(stdoutHandle);
+        }
+        if (stderrHandle != IntPtr.Zero &&
+            stderrHandle != INVALID_HANDLE_VALUE) {
+          CloseHandle(stderrHandle);
+        }
+        if (processInfo.hThread != IntPtr.Zero) {
+          CloseHandle(processInfo.hThread);
+        }
+        if (processInfo.hProcess != IntPtr.Zero) {
+          CloseHandle(processInfo.hProcess);
+        }
+      }
+    }
+  }
+}
+'@
+    }
+    $script:WrapperLogLauncherTypeReady = $true
+    return $true
+  } catch {
+    Write-Warning (
+      "supervisor: cannot initialize exact-handle wrapper logger ({0})" -f
+      $_.Exception.Message)
+    return $false
+  }
+}
+function Start-WrapperProcess([hashtable]$startArgs) {
+  # Returns [pscustomobject]@{ Process = <process>; Redirected = <bool> } -
+  # NEVER the bare process object. I1: logging capability (the env vars
+  # and the nonce - a wrapper that never actually got redirected has no
+  # channel to confirm anything through) is granted if and only if the
+  # child's output is ACTUALLY redirected.
+  # This is the ONE place that knows the true outcome; every caller must
+  # use .Redirected rather than inferring it from a PID alone.
+  $redirected = (
+    $startArgs.ContainsKey('RedirectStandardOutput') -and
+    $startArgs.ContainsKey('RedirectStandardError'))
+  if ($redirected -and (Test-RunningOnWindows)) {
+    # PowerShell's redirected Start-Process enables unrestricted handle
+    # inheritance. Use an explicit three-handle allowlist so a long-lived
+    # wrapper cannot retain the supervisor caller's capture pipes or locks.
+    $startCommand = Get-Command Start-Process -ErrorAction Stop
+    # Deliberately case-insensitive: CommandType is a .NET CommandTypes
+    # enum from Get-Command's own reflection over Start-Process, not any
+    # form of caller/config input - there is no alternate spelling for
+    # PowerShell to have produced here.
+    if ($startCommand.CommandType -eq 'Cmdlet' -and
+        (Initialize-WrapperLogLauncherType)) {
+      try {
+        $argumentLine = if ($startArgs.ContainsKey('ArgumentList')) {
+          [string]$startArgs.ArgumentList
+        } else { '' }
+        # Deliberately case-insensitive: $window is config-supplied
+        # (window_style), but it is also handed to Start-Process's own
+        # -WindowStyle parameter on the fallback path below, whose .NET
+        # enum binding is inherently case-insensitive ('hidden' and
+        # 'Hidden' both resolve to ProcessWindowStyle.Hidden). Matching
+        # this switch case-sensitively would make the exact-handle path
+        # disagree with the fallback's own already-case-insensitive
+        # behavior for the identical value, not close a gap.
+        $window = [string]$startArgs.WindowStyle
+        $showWindow = switch ($window) {
+          'Hidden' { 0 }
+          'Minimized' { 2 }
+          'Maximized' { 3 }
+          default { 1 }
+        }
+        $launchResult = [Agenttalk.ExactHandleLauncher]::Start(
+          [string]$startArgs.FilePath,
+          $argumentLine,
+          [string]$startArgs.WorkingDirectory,
+          [string]$startArgs.RedirectStandardOutput,
+          [string]$startArgs.RedirectStandardError,
+          $showWindow)
+        if ($launchResult.StdoutDegraded) {
+          Write-Warning (
+            "supervisor: wrapper stdout log is unavailable; redirected to NUL")
+        }
+        if ($launchResult.StderrDegraded) {
+          Write-Warning (
+            "supervisor: wrapper stderr log is unavailable; redirected to NUL")
+        }
+        # I1, 2nd leak, closed at the source rather than after the fact:
+        # ::Start now throws BEFORE CreateProcess when both sides degrade
+        # (the child must never inherit the authenticated wrapper-log env
+        # vars if it is about to run with neither stream genuinely
+        # redirected), so this line only ever runs with at most one side
+        # degraded. Redirected is still a predicate over the RESULT, not
+        # over whether ::Start threw - true only if at least one advertised
+        # base log is genuinely pointed at by an inherited stream. A
+        # one-side-degraded launch still commits (the other side IS real
+        # evidence); the both-degraded shape can no longer reach here at
+        # all, matching the invariant that already governs the
+        # exact-handle-unavailable fallback path below.
+        return [pscustomobject]@{
+          Process = $launchResult.Process
+          Redirected = -not ($launchResult.StdoutDegraded -and $launchResult.StderrDegraded)
+        }
+      } catch {
+        Write-Warning (
+          ("supervisor: exact-handle wrapper logging failed ({0}); " +
+           "launching without PowerShell redirection") -f
+          $_.Exception.Message)
+      }
+    } else {
+      Write-Warning (
+        "supervisor: exact-handle wrapper logging unavailable; " +
+        "launching without PowerShell redirection")
+    }
+    # Logging is observational. If the safe Windows launcher is unavailable,
+    # preserve recovery by launching without it; never fall back to unrestricted
+    # inherited handles or risk a duplicate child.
+    $null = $startArgs.Remove('RedirectStandardOutput')
+    $null = $startArgs.Remove('RedirectStandardError')
+    # The caller already applied the wrapper-log capability env vars and
+    # nonce to THIS process's environment before calling here (they must be
+    # present ahead of Start-Process for a successfully-redirected launch to
+    # inherit them). Falling back to an unredirected launch must strip them
+    # again right here - a child must never authenticate against
+    # wrapper_logs._authenticated_environment() unless its output is
+    # actually going to the files those env vars name. Left in place, the
+    # child would install a bounded tee over its INHERITED CONSOLE instead
+    # of a redirected file - forwarding is capped at a few hundred KiB, so
+    # the operator's visible window goes silent forever once that budget is
+    # spent, while still looking healthy otherwise.
+    foreach ($key in $WrapperLogEnvKeys) {
+      Remove-Item -Path ("Env:" + $key) -ErrorAction SilentlyContinue
+    }
+    return [pscustomobject]@{
+      Process = (Start-Process @startArgs)
+      Redirected = $false
+    }
+  }
+  return [pscustomobject]@{
+    Process = (Start-Process @startArgs)
+    Redirected = $redirected
+  }
+}
+if (-not ('AgenttalkSupervisorNativePosix' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+public static class AgenttalkSupervisorNativePosix {
+    [DllImport("libc", SetLastError = true)]
+    public static extern int umask(int mask);
+}
+'@
+}
+function Set-AgenttalkRestrictiveUmask {
+  # Round 22 (connector finding, security): chmod-AFTER cannot close the
+  # window between creating a wrapper log path (directory or file) and
+  # tightening it - another local user on a shared POSIX account can open
+  # a handle inside that window and keep it past the later chmod. The only
+  # way to create a path that is NEVER briefly world/group-readable is to
+  # have the KERNEL apply a restrictive mode at creation time, before any
+  # separate chmod call is even reachable - tightening this process's OWN
+  # umask before the create calls does exactly that (umask only NARROWS a
+  # requested mode, so 0700/0600 requests are unaffected by whatever the
+  # ambient umask already was). Returns the previous umask to restore
+  # (an int, possibly 0 - a real, valid prior value, not a sentinel) or
+  # $null on Windows / if the native call itself is unavailable, so the
+  # caller knows there is nothing to restore.
+  if (Test-RunningOnWindows) { return $null }
+  try {
+    # umask REMOVES bits from any requested mode - 0077 strips every
+    # group/other bit, leaving a 0666 file request at 0600 and a 0777
+    # directory request at 0700, regardless of whatever the ambient
+    # umask already was.
+    return [AgenttalkSupervisorNativePosix]::umask(0x3F)  # 0077 octal
+  } catch {
+    return $null
+  }
+}
+function Restore-AgenttalkUmask($previous) {
+  if ($null -eq $previous) { return }
+  if (Test-RunningOnWindows) { return }
+  try { [void][AgenttalkSupervisorNativePosix]::umask($previous) } catch {}
+}
+function Get-SafeWrapperLogAgentDir(
+  [string]$candidate,
+  [string]$name,
+  [bool]$create
+) {
+  try {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+      if (-not $create) { return $null }
+      $null = New-Item -ItemType Directory -Path $candidate -Force -ErrorAction Stop
+    }
+    $rootItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      Write-Warning (
+        "supervisor: refusing wrapper-log root with a reparse point: '{0}'" -f
+        $candidate)
+      return $null
+    }
+
+    $agentDir = Join-Path $candidate $name
+    if (Test-Path -LiteralPath $agentDir) {
+      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop
+      if ((-not $agentItem.PSIsContainer) -or
+          (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Write-Warning (
+          "supervisor: refusing unsafe wrapper-log agent path: '{0}'" -f
+          $agentDir)
+        return $null
+      }
+    } elseif ($create) {
+      $null = New-Item -ItemType Directory -Path $agentDir -ErrorAction Stop
+      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop
+      if (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Write-Warning (
+          "supervisor: refusing unsafe wrapper-log agent path: '{0}'" -f
+          $agentDir)
+        return $null
+      }
+    } else {
+      return $null
+    }
+    return $agentDir
+  } catch {
+    Write-Warning (
+      "supervisor: cannot prepare wrapper log root '{0}' ({1})" -f
+      $candidate, $_.Exception.Message)
+    return $null
+  }
+}
+function Protect-WrapperLogPaths(
+  [string]$rootDir,
+  [string]$agentDir,
+  [string]$generationDir,
+  [string]$stdoutPath,
+  [string]$stderrPath
+) {
+  if (Test-RunningOnWindows) { return $true }
+  try {
+    [IO.File]::WriteAllBytes($stdoutPath, [byte[]]@())
+    [IO.File]::WriteAllBytes($stderrPath, [byte[]]@())
+    $chmod = Get-Command chmod -CommandType Application -ErrorAction Stop
+    foreach ($path in @($rootDir, $agentDir, $generationDir)) {
+      & $chmod.Source '700' $path
+      if ($LASTEXITCODE -ne 0) { throw "chmod 700 failed for '$path'" }
+    }
+    foreach ($path in @($stdoutPath, $stderrPath)) {
+      & $chmod.Source '600' $path
+      if ($LASTEXITCODE -ne 0) { throw "chmod 600 failed for '$path'" }
+    }
+    return $true
+  } catch {
+    Write-Warning (
+      "supervisor: cannot secure sensitive wrapper logs under '{0}' ({1})" -f
+      $generationDir, $_.Exception.Message)
+    return $false
+  }
+}
+function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
+  # The generation NAME is still wall-clock-derived (for human readability),
+  # but pruning must not rely on it as the sole age key - an operator-
+  # corrected clock can make an old launch look permanently newest. A launch
+  # sequence fixes that, but ONLY if it is a global ordering key. Scanning
+  # every configured root's existing generations for their recorded
+  # sequence, every time, makes the next value correct regardless of which
+  # root ends up accepting it - EXCEPT that a root which EXISTS but could
+  # not be scanned (unreadable, disconnected, rejected) might be hiding a
+  # higher true sequence than the reachable roots show. Silently treating
+  # that root as contributing nothing to the max reintroduces the exact
+  # not-a-global-ordering-key defect this function exists to close, just
+  # relocated to the offline-root window: retention would then rank the
+  # unreadable root's stale generations ahead of genuinely newer ones once
+  # it becomes readable again, and PRUNE the newer evidence. So this also
+  # reports whether any CONFIGURED root holding THIS AGENT'S OWN directory
+  # could not be scanned - the caller must treat that launch's ordering as
+  # unreliable and skip pruning entirely THIS cycle rather than act on it,
+  # per the same fail-closed posture as an unresolved/pending generation.
+  # I3: the root existing is NOT the right test - a fallback root the
+  # operator configured but this agent has simply never used (no per-agent
+  # directory there yet) is absent, not unscannable, and there is nothing
+  # to miss; testing the ROOT's existence instead of the AGENT DIR's own
+  # flagged that ordinary, permanent situation as uncertain on every single
+  # launch, turning "refuse this cycle" into "never prune again."
+  $seq = 0L
+  $uncertain = $false
+  foreach ($scanRoot in $roots) {
+    try {
+      $candidateAgentDir = Join-Path $scanRoot $name
+      $agentDirExists = Test-Path -LiteralPath $candidateAgentDir
+      $scanAgentDir = Get-SafeWrapperLogAgentDir $scanRoot $name $false
+      if ($null -eq $scanAgentDir) {
+        if ($agentDirExists) { $uncertain = $true }
+        continue
+      }
+      foreach ($existing in @(
+        Get-ChildItem -LiteralPath $scanAgentDir -Directory -ErrorAction Stop
+      )) {
+        $committed = Test-Path -LiteralPath (Join-Path $existing.FullName '.committed')
+        $seqFile = Join-Path $existing.FullName '.sequence'
+        if (-not (Test-Path -LiteralPath $seqFile)) {
+          # #139-family, round 13: a COMMITTED generation with no
+          # .sequence file is exactly the write-failure gap round 12
+          # fixed - but that fix's sequence_uncertain lives only on the
+          # ONE launch that hit it, never persisted. Without this check
+          # the NEXT launch's scan silently skips this generation, reuses
+          # the sequence number it never recorded, and retention's sort
+          # key ranks it below every sequence-bearing entry even though
+          # it may be the newest generation on disk. A non-committed
+          # (pending/orphaned) generation is not in retention's ranked
+          # set at all (Invoke-WrapperLogRetentionPrune excludes it), so it
+          # does not need to propagate uncertainty here.
+          #
+          # But "no .sequence file" is ALSO the permanent, by-design shape
+          # of a pre-upgrade legacy generation that never wrote one at
+          # all (see the name-fallback sortKey comment in
+          # Invoke-WrapperLogRetentionPrune) - those must keep tolerating
+          # pruning forever, exactly as before, or a fleet with any
+          # legacy history would never prune again. The two are
+          # indistinguishable by absence alone, so a genuine write
+          # failure also drops an explicit .sequence-failed marker (see
+          # New-WrapperLogTargets) - only THAT combination propagates
+          # uncertainty; a bare missing .sequence with no failure marker
+          # is the legacy case and stays exactly as tolerant as before.
+          if ($committed -and (Test-Path -LiteralPath (Join-Path $existing.FullName '.sequence-failed'))) {
+            $uncertain = $true
+          }
+          continue
+        }
+        try {
+          $existingSeq = [int64]([IO.File]::ReadAllText($seqFile).Trim())
+          if ($existingSeq -gt $seq) { $seq = $existingSeq }
+        } catch {
+          # Corrupt/unreadable record does not veto this generation's own
+          # sequence contribution to the max, but for a COMMITTED
+          # generation it is the same uncertainty class as a missing
+          # record - propagate it the same way.
+          if ($committed) { $uncertain = $true }
+        }
+      }
+    } catch {
+      $uncertain = $true
+      Write-Warning (
+        "supervisor: cannot scan wrapper log root '{0}' for launch sequence ({1})" -f
+        $scanRoot, $_.Exception.Message)
+    }
+  }
+  return [pscustomobject]@{ next_sequence = ($seq + 1L); uncertain = $uncertain }
+}
+function New-WrapperLogPendingMarker([string]$attempt) {
+  [IO.File]::WriteAllText(
+    (Join-Path $attempt '.pending'),
+    '',
+    (New-Object Text.UTF8Encoding($false))
+  )
+}
+function Write-WrapperLogSequenceFile([string]$path, [long]$value) {
+  [IO.File]::WriteAllText(
+    $path,
+    [string]$value,
+    (New-Object Text.UTF8Encoding($false))
+  )
+}
+function New-WrapperLogTargets([string]$name, [string]$nonce) {
+  # Agent names are already roster-validated. Re-check here because these paths
+  # are later used by bounded cleanup; never let a config string select a parent.
+  if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$') {
+    Write-Warning "supervisor: unsafe wrapper-log agent name; using a hashed directory"
+  }
+  # Always hash the exact identity. Regex-valid leaves can still alias on
+  # Windows (`worker`/`worker.`) or be reserved devices (`NUL`, `COM1`).
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    $digest = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($name))
+    $name = 'agent-' + (
+      (($digest | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 16)
+    )
+  } finally {
+    $sha.Dispose()
+  }
+  # Case-insensitive by PowerShell's default -match too (an uppercase-hex
+  # nonce would pass a pattern written to require lowercase) - left as-is,
+  # NOT because that is harmless in general, but because $nonce is not in
+  # the caller-or-config-supplied class TODAY: both callers pass
+  # [Guid]::NewGuid().ToString('N') (always lowercase) immediately before
+  # this call, with no config/argv path supplying it. That is a fact about
+  # today's callers, not a structural guarantee - if a future caller ever
+  # accepts this value from config or argv, this comparison needs the same
+  # -ceq/-cmatch treatment as everything else in this file, not inherited
+  # silent trust.
+  if ($nonce -notmatch '^[0-9a-f]{32}$') {
+    $nonce = [Guid]::NewGuid().ToString('N')
+  }
+  $roots = @($WrapperLogRoot, $WrapperLogFallbackRoot) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+    Select-Object -Unique
+  # Computed ONCE, across every configured root, before the create attempts
+  # below - so the recorded sequence reflects true global launch order no
+  # matter which candidate root ends up accepting this generation.
+  $seqResult = Get-NextWrapperLogSequence $roots $name
+  $seq = $seqResult.next_sequence
+
+  # Create the immutable destination before pruning any prior evidence. If the
+  # persistent root cannot accept it, no old persistent evidence is removed
+  # before the fallback gets its chance.
+  $generationDir = $null
+  foreach ($candidate in $roots) {
+    # Round 22 (connector finding, security): every path created below -
+    # $agentDir inside Get-SafeWrapperLogAgentDir, $attempt, and the two
+    # log files inside Protect-WrapperLogPaths - must never exist even
+    # briefly with default, umask-derived permissions; a restrictive
+    # process umask makes the KERNEL apply the tight mode at creation,
+    # closing the window a later chmod cannot.
+    $savedUmask = Set-AgenttalkRestrictiveUmask
+    try {
+      $agentDir = Get-SafeWrapperLogAgentDir $candidate $name $true
+      if ($null -eq $agentDir) { continue }
+      try {
+        $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
+        $attempt = Join-Path $agentDir ("{0}-{1}" -f $stamp, $nonce)
+        $null = New-Item -ItemType Directory -Path $attempt -ErrorAction Stop
+        $stdoutPath = Join-Path $attempt 'stdout.log'
+        $stderrPath = Join-Path $attempt 'stderr.log'
+        $rootFull = [IO.Path]::GetFullPath($candidate)
+        if (-not (Protect-WrapperLogPaths $rootFull $agentDir $attempt $stdoutPath $stderrPath)) {
+          Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
+          continue
+        }
+        New-WrapperLogPendingMarker $attempt
+        $sequenceWriteFailed = $false
+        try {
+          Write-WrapperLogSequenceFile (Join-Path $attempt '.sequence') $seq
+        } catch {
+          # #139-family: Invoke-WrapperLogRetentionPrune's retention sort ranks a
+          # missing-.sequence generation BELOW every sequence-bearing one,
+          # regardless of actual launch order (sortKey '0-name' vs
+          # '1-sequence') - a transient failure HERE must propagate into
+          # sequence_uncertain, the same signal a failed root SCAN already
+          # produces below, or a later prune cycle can evict THIS (possibly
+          # newer) generation while keeping a genuinely older one.
+          $sequenceWriteFailed = $true
+          Write-Warning (
+            "supervisor: cannot record wrapper log launch sequence under '{0}' ({1})" -f
+            $agentDir, $_.Exception.Message)
+          # Round 13: an explicit marker, not just the absence of .sequence -
+          # a bare missing .sequence file is ALSO the permanent, by-design
+          # shape of a pre-upgrade legacy generation that never wrote one at
+          # all, and that case must keep tolerating pruning forever (see the
+          # matching comment in Get-NextWrapperLogSequence). Best-effort:
+          # this marker existing is a nice-to-have signal, not itself a
+          # durability guarantee this generation depends on.
+          try {
+            [IO.File]::WriteAllText(
+              (Join-Path $attempt '.sequence-failed'), '',
+              (New-Object Text.UTF8Encoding($false))
+            )
+          } catch {
+            # Best-effort only - if even this fails, the generation falls
+            # back to the legacy-tolerant "missing .sequence" treatment.
+          }
+        }
+        $generationDir = $attempt
+        break
+      } catch {
+        # A failure here can land AFTER the generation directory was already
+        # created (e.g. the .pending write itself fails) - without cleanup that
+        # directory is left behind with neither a .pending nor a .committed
+        # marker, and retention preserves EVERY markerless directory forever
+        # because it cannot tell an orphan from a genuinely interrupted launch.
+        # Best-effort delete it now, while this attempt is still reachable -
+        # Invoke-WrapperLogRetentionPrune is never even told about a candidate this
+        # loop abandoned, so nothing downstream can ever clean it up otherwise.
+        if ($attempt -and (Test-Path -LiteralPath $attempt)) {
+          Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Warning (
+          ("supervisor: cannot create wrapper log generation under '{0}' ({1}); " +
+           "trying fallback") -f
+          $agentDir, $_.Exception.Message)
+      }
+    } finally {
+      Restore-AgenttalkUmask $savedUmask
+    }
+  }
+  if ($null -eq $generationDir) {
+    Write-Warning "supervisor: wrapper log preparation failed; launching without redirection"
+    return $null
+  }
+
+  Invoke-WrapperLogRetentionPrune $name $roots ($seqResult.uncertain -or $sequenceWriteFailed)
+
+  return [pscustomobject]@{
+    stdout = Join-Path $generationDir 'stdout.log'
+    stderr = Join-Path $generationDir 'stderr.log'
+    generation_dir = $generationDir
+    agent_name = $name
+    sequence_uncertain = ($seqResult.uncertain -or $sequenceWriteFailed)
+  }
+}
+function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]$sequenceUncertain) {
+  # Round 23: this used to run synchronously right after Complete-
+  # WrapperLogTargets marked ONE specific generation committed - now that
+  # the WRAPPER PROCESS marks its own generation committed (see
+  # installed_standard_streams_from_environment), the supervisor has no
+  # single post-launch moment to hang pruning off of. Called instead from
+  # New-WrapperLogTargets, right after a new generation has been
+  # successfully created (preserving the original ordering rationale:
+  # never prune old evidence before proving a new destination actually
+  # accepted a write, so a persistent-root failure that falls back to a
+  # secondary root never loses evidence for nothing).
+  #
+  # Keeps the newest $WrapperLogGenerations ALREADY-COMMITTED generations -
+  # NOT ($WrapperLogGenerations - 1) reserving a slot for the one just
+  # created. That reservation was tried first and was wrong: the new
+  # generation's fate is not yet known here (still .pending; it may never
+  # be confirmed at all - a launch that never reaches cmd_wrap, or one the
+  # caller discards outright), so budgeting for it as if it were certain
+  # evicted real, already-proven evidence for a guess that did not pay
+  # off. Only evicting once the ALREADY-CONFIRMED count genuinely exceeds
+  # quota means a run of launches that all happen to confirm can leave one
+  # MORE than quota on disk for one extra cycle (the next launch's own
+  # prune brings it back down) - a bounded, self-correcting overshoot of
+  # at most one, which is the honest cost of not being able to synchronously
+  # observe the wrapper's own confirmation from here. That is a strictly
+  # better trade than evicting proven evidence on an unconfirmed guess.
+  #
+  # Retention is one per-agent budget across the persistent and fallback
+  # roots. Cleanup is deliberately restricted to exact owned names and
+  # never traverses a reparse point. Deletion failure can exceed the
+  # quota until the filesystem problem is resolved, but it never blocks
+  # the recovery launch.
+  $owned = @()
+  foreach ($candidate in $roots) {
+    $agentDir = Get-SafeWrapperLogAgentDir $candidate $name $false
+    if ($null -eq $agentDir) { continue }
+    try {
+      foreach ($old in @(
+        Get-ChildItem -LiteralPath $agentDir -Directory -ErrorAction Stop |
+          Where-Object {
+            $_.Name -match '^[0-9]{8}T[0-9]{9}Z-[0-9a-f]{32}$'
+          }
+      )) {
+        if (($old.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+          Write-Warning (
+            "supervisor: refusing to prune wrapper-log reparse point '{0}'" -f
+            $old.FullName)
+          continue
+        }
+        $committed = Test-Path -LiteralPath (Join-Path $old.FullName '.committed')
+        if (-not $committed) {
+          # A crash, a launch that never reached cmd_wrap (wrap --help, a
+          # parse-invalid tail), or a filesystem failure can all leave a
+          # pending or markerless directory behind. None of those prove
+          # the wrapper ever authenticated and installed its streams.
+          # Preserve it, but never let it consume a retained slot or evict
+          # proven evidence - #139 tracks bounding this class separately
+          # (a dead-and-never-committed generation should eventually be
+          # pruned too, once its owning process is confirmed gone, not
+          # kept forever; this scheme raises how often that gap is hit).
+          Write-Warning (
+            "supervisor: preserving unresolved wrapper log generation '{0}'" -f
+            $old.FullName)
+          continue
+        }
+        # Prefer the monotonic launch sequence recorded at creation time over
+        # the wall-clock name: a backward clock correction must not make a
+        # stale generation look permanently newest. A missing/corrupt record
+        # (pre-upgrade generations never wrote one) falls back to the name -
+        # it never blocks pruning, it only loses skew-safety for that one
+        # legacy entry.
+        $sortKey = '0-' + $old.Name
+        $seqFile = Join-Path $old.FullName '.sequence'
+        if (Test-Path -LiteralPath $seqFile) {
+          try {
+            $seqValue = [int64]([IO.File]::ReadAllText($seqFile).Trim())
+            $sortKey = '1-' + $seqValue.ToString('D20')
+          } catch {
+            Write-Warning (
+              "supervisor: unreadable wrapper log launch sequence '{0}' ({1})" -f
+              $seqFile, $_.Exception.Message)
+          }
+        }
+        $owned += [pscustomobject]@{ item = $old; sort_key = $sortKey }
+      }
+    } catch {
+      Write-Warning (
+        "supervisor: cannot inspect wrapper log root '{0}' ({1})" -f
+        $agentDir, $_.Exception.Message)
+    }
+  }
+
+  if ($sequenceUncertain) {
+    # I3: refusing to prune under an unreliable ordering must be BOUNDED - a
+    # persistently (not just transiently) unscannable root must not let
+    # generations for this agent accumulate forever. Skip pruning while the
+    # total is still within a generous multiple of the configured quota
+    # (this self-heals normally once every root becomes reachable again on
+    # a later launch); once the total is FAR past quota, prune anyway using
+    # whatever ordering IS available - imperfect, but bounded is better
+    # than leaking disk space indefinitely.
+    $uncertainBound = [Math]::Max($WrapperLogGenerations * 3, $WrapperLogGenerations + 2)
+    if ($owned.Count -le $uncertainBound) {
+      Write-Warning (
+        ("supervisor: wrapper log launch sequence is unreliable for '{0}' " +
+         "(a configured root could not be scanned); skipping prune this cycle") -f
+        $name)
+      return
+    }
+    Write-Warning (
+      ("supervisor: wrapper log launch sequence remains unreliable for '{0}' " +
+       "but the generation count ({1}) exceeds the safety bound ({2}); " +
+       "pruning anyway rather than accumulating indefinitely") -f
+      $name, $owned.Count, $uncertainBound)
+  }
+
+  $keepCount = [Math]::Max(0, [int]$WrapperLogGenerations)
+  $keep = @(
+    $owned |
+      Sort-Object { $_.sort_key } -Descending |
+      Select-Object -First $keepCount |
+      ForEach-Object { [IO.Path]::GetFullPath($_.item.FullName) }
+  )
+  foreach ($record in $owned) {
+    $full = [IO.Path]::GetFullPath($record.item.FullName)
+    # Deliberately case-insensitive - this is a FILESYSTEM PATH identity
+    # check (NTFS is case-insensitive), not an argv/config token the CLI
+    # parses.
+    if ($keep -contains $full) { continue }
+    try {
+      Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+    } catch {
+      Write-Warning (
+        ("supervisor: could not prune wrapper log generation '{0}' ({1}); " +
+         "launching with a new generation") -f
+        $full, $_.Exception.Message)
+    }
+  }
+}
+function Discard-PendingWrapperLogTargets($targets) {
+  if ($null -eq $targets) { return }
+  $generationDir = [string]$targets.generation_dir
+  if (-not (Test-Path -LiteralPath (Join-Path $generationDir '.pending'))) {
+    return
+  }
+  try {
+    $item = Get-Item -LiteralPath $generationDir -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      return
+    }
+    Remove-Item -LiteralPath $generationDir -Recurse -Force -ErrorAction Stop
+  } catch {
+    Write-Warning (
+      "supervisor: could not discard failed wrapper log generation '{0}' ({1})" -f
+      $generationDir, $_.Exception.Message)
+  }
+}
+# endregion wrapper-log-helpers
 function Launch($name, $plan, $codexHome) {
   if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) { return $null }
   $a = $cfg.agents.$name
-  if ($a.backend_profile -eq 'ovh-qwen') {
+  # Case-sensitive, for consistency with the bootstrap validator's own
+  # Python check (`backend_profile != 'ovh-qwen'`, case-sensitive) -
+  # a config value the validator would already reject as invalid should
+  # not silently get the ovh-qwen trust-boundary treatment here either.
+  if ($a.backend_profile -ceq 'ovh-qwen') {
     if ($env:OVH_KEY -or $env:ANTHROPIC_API_KEY) {
       Write-Warning "supervisor: agent '$name': ovh-qwen refuses ambient OVH_KEY/ANTHROPIC_API_KEY; NOT launching"
       return $null
@@ -9190,6 +10756,9 @@ function Launch($name, $plan, $codexHome) {
     }
   }
   $file = $a.launch.windows_file
+  # Deliberately case-insensitive - see Test-WrappedBaseCli's REPLACE:*
+  # check: a fail-closed refusal only gets safer by matching more
+  # spellings of the unfilled scaffold placeholder.
   if (-not $file -or $file -like 'REPLACE:*') {
     Write-Warning "supervisor: agent '$name' has no real launch.windows_file (the agent EXECUTABLE) - fill supervisor.json"; return $null
   }
@@ -9200,21 +10769,46 @@ function Launch($name, $plan, $codexHome) {
   # (NOT string interpolation): each token is exactly one argument and nothing
   # needs quoting. On a FRESH Claude launch a '{SESSION_ID}' token is still
   # present -> mint + substitute a uuid; Codex has none (it doesn't pin).
+  # Case-sensitive: these placeholder tokens are a supervisor convention
+  # documented and typed by the operator exactly as {SESSION_ID}/
+  # {SESSION_ARGS} - session_args is overridable per-agent config, and a
+  # differently-cased typo should surface as a literal, unsubstituted
+  # argv token (visibly wrong) rather than silently matching anyway.
   $sid = $plan.session_id
   $tokens = @($plan.session_args)
-  if ($plan.launch_mode -eq 'fresh' -and ($tokens -contains '{SESSION_ID}')) {
+  if ($plan.launch_mode -eq 'fresh' -and ($tokens -ccontains '{SESSION_ID}')) {
     $sid = [guid]::NewGuid().ToString()
-    $tokens = $tokens | ForEach-Object { if ($_ -eq '{SESSION_ID}') { $sid } else { $_ } }
+    $tokens = $tokens | ForEach-Object { if ($_ -ceq '{SESSION_ID}') { $sid } else { $_ } }
   }
   $argv = @()
   $cwdToken = if ($a.cwd) { [string]$a.cwd } else { '' }
   foreach ($x in @($a.launch.windows_args)) {
-    if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
+    if ($x -ceq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
   }
-  $argv = @(Ensure-AgenttalkWrapRootArg $argv)
+  $moduleArgsFrom = $a.launch.module_args_from
+  $argv = @(Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom)
   $launchNonce = [guid]::NewGuid().ToString('N')
-  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
+  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
   $argv = @($nonceResult.argv)
+  # Round 23: no longer a prediction. The supervisor used to ask a probe
+  # whether this argv would reach cmd_wrap before ever starting the real
+  # process - five rounds of fidelity/blast-radius defects (quoting, cwd,
+  # interpreter, timeout, temp resources) later, that probe is deleted.
+  # Test-AgenttalkWrapInvocation stays: it reads the STATIC configured
+  # argv (is the subcommand literally 'wrap'), not runtime behavior, so it
+  # has no fidelity gap - it is an optimization to skip logging setup for
+  # an obviously-non-wrap launch, not a forecast. Whether THIS launch
+  # actually reaches cmd_wrap is now something the wrapper process itself
+  # reports, by evidence, from inside installed_standard_streams_from_
+  # environment - see New-WrapperLogTargets/Invoke-WrapperLogRetentionPrune.
+  $shouldLog = (
+    [bool]$a.wrapped -and
+    $plan.launch_mode -eq 'wrap' -and
+    (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom)
+  )
+  $logTargets = if ($shouldLog) {
+    New-WrapperLogTargets $name $launchNonce
+  } else { $null }
   # Apply the agent's env, launch the REAL executable directly with -PassThru,
   # then RESTORE the supervisor's own env. The in-sandbox agent reaches the bus
   # via the explicit AGENTTALK_PY pin; AGENTTALK_PYTHON remains supervisor-only
@@ -9223,19 +10817,55 @@ function Launch($name, $plan, $codexHome) {
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
+  # Deliberately case-insensitive - see Start-WrapperProcess's own $window
+  # switch: this value feeds the same -WindowStyle enum parameter, whose
+  # .NET binding is inherently case-insensitive on the fallback path.
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
-  foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  foreach ($reserved in $WrapperLogEnvKeys) {
+    $null = $applied.Remove($reserved)
+    $applied[$reserved] = $null
+  }
+  if ($null -ne $logTargets) {
+    # These are supervisor-owned capabilities, not per-agent configuration.
+    $applied['AGENTTALK_WRAPPER_STDOUT_LOG'] = $logTargets.stdout
+    $applied['AGENTTALK_WRAPPER_STDERR_LOG'] = $logTargets.stderr
+    $applied['AGENTTALK_WRAPPER_LOG_MAX_BYTES'] = [string]$WrapperLogMaxBytes
+    $applied['AGENTTALK_WRAPPER_LOG_SEGMENTS'] = [string]$WrapperLogSegments
+    $applied['AGENTTALK_WRAPPER_LOG_NONCE'] = $launchNonce
+  }
+  foreach ($k in $applied.Keys) {
+    $saved[$k] = [Environment]::GetEnvironmentVariable($k)
+    if ($null -eq $applied[$k]) {
+      Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue
+    } else {
+      Set-Item -Path ("Env:" + $k) -Value $applied[$k]
+    }
+  }
   try {
     $cwd = if ($a.cwd) { $a.cwd } else { $Root }
     # Quote each token per Windows rules and pass ONE command-line string: a bare
     # array element containing a space would otherwise be split into two args at
     # the Start-Process handoff (so a path/arg WITH SPACES survives as one arg).
+    $startArgs = @{
+      FilePath = $file
+      WorkingDirectory = $cwd
+      WindowStyle = $windowStyle
+      PassThru = $true
+    }
+    if ($null -ne $logTargets) {
+      $startArgs['RedirectStandardOutput'] = $logTargets.stdout
+      $startArgs['RedirectStandardError'] = $logTargets.stderr
+    }
     if (@($argv).Count -gt 0) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
-      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
-    } else {
-      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
+      $startArgs['ArgumentList'] = $argline
+    }
+    try {
+      $launch = Start-WrapperProcess $startArgs
+    } catch {
+      Discard-PendingWrapperLogTargets $logTargets
+      throw
     }
   } finally {
     foreach ($k in $saved.Keys) {
@@ -9243,7 +10873,24 @@ function Launch($name, $plan, $codexHome) {
       else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
     }
   }
+  $proc = $launch.Process
   if ($proc -and $proc.Id) {
+    # Round 23: committing is no longer this call's decision. If
+    # Start-Process itself never redirected, there is no channel a
+    # confirmation could ever arrive through, so discarding immediately is
+    # a fact, not a prediction - that case stays. Otherwise, this
+    # generation is left exactly as New-WrapperLogTargets created it
+    # (.pending): the wrapper process itself writes .committed from
+    # inside installed_standard_streams_from_environment once it has
+    # authenticated and installed its own streams - real evidence that it
+    # reached cmd_wrap, not a pre-launch guess that it would. A launch
+    # that starts, authenticates, and then dies before ever reaching that
+    # point - or one that never reaches cmd_wrap at all (wrap --help, a
+    # parse-invalid tail) - leaves a pending generation that is preserved
+    # and unpruned until #139 lands.
+    if ($null -ne $logTargets -and -not $launch.Redirected) {
+      Discard-PendingWrapperLogTargets $logTargets
+    }
     $out = @{ pid = $proc.Id; session_id = $sid; start = (Proc-Start $proc.Id);
               launcher_nonce_injected = [bool]$nonceResult.injected;
               launcher_nonce_source = $nonceResult.source;
@@ -9251,12 +10898,16 @@ function Launch($name, $plan, $codexHome) {
     if ($nonceResult.injected -and $nonceResult.nonce) { $out.launcher_nonce = $nonceResult.nonce }
     return $out
   }
+  Discard-PendingWrapperLogTargets $logTargets
   Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"; return $null
 }
 
 function Launch-Spec($name, $spec, $codexHome) {
   if (-not (Assert-ActionsEnabled ("launch-spec {0}" -f $name))) { return $null }
   $file = $spec.launch.windows_file
+  # Deliberately case-insensitive - see Test-WrappedBaseCli's REPLACE:*
+  # check: a fail-closed refusal only gets safer by matching more
+  # spellings of the unfilled scaffold placeholder.
   if (-not $file -or $file -like 'REPLACE:*') {
     Write-Warning "supervisor: ephemeral '$name' has no real launch.windows_file - fill supervisor.json ephemeral_reviewers.allowed_profiles"; return $null
   }
@@ -9265,24 +10916,67 @@ function Launch-Spec($name, $spec, $codexHome) {
   $specCwdToken = if ($spec.cwd) { [string]$spec.cwd } else { '' }
   $argv = @($spec.launch.windows_args)
   $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
-  $argv = @(Ensure-AgenttalkWrapRootArg $argv)
+  $moduleArgsFrom = $spec.launch.module_args_from
+  $argv = @(Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom)
   $launchNonce = [guid]::NewGuid().ToString('N')
-  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
+  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
   $argv = @($nonceResult.argv)
+  # Round 23: no probe left to predict reachability - see Launch's own
+  # comment for the full reasoning. $shouldLog is now purely the cheap,
+  # non-predictive static check.
+  $shouldLog = (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom)
+  $logTargets = if ($shouldLog) {
+    New-WrapperLogTargets $name $launchNonce
+  } else { $null }
   $saved = @{}
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }
+  # Deliberately case-insensitive - see Start-WrapperProcess's own $window
+  # switch: this value feeds the same -WindowStyle enum parameter, whose
+  # .NET binding is inherently case-insensitive on the fallback path.
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }
-  foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  foreach ($reserved in $WrapperLogEnvKeys) {
+    $null = $applied.Remove($reserved)
+    $applied[$reserved] = $null
+  }
+  if ($null -ne $logTargets) {
+    $applied['AGENTTALK_WRAPPER_STDOUT_LOG'] = $logTargets.stdout
+    $applied['AGENTTALK_WRAPPER_STDERR_LOG'] = $logTargets.stderr
+    $applied['AGENTTALK_WRAPPER_LOG_MAX_BYTES'] = [string]$WrapperLogMaxBytes
+    $applied['AGENTTALK_WRAPPER_LOG_SEGMENTS'] = [string]$WrapperLogSegments
+    $applied['AGENTTALK_WRAPPER_LOG_NONCE'] = $launchNonce
+  }
+  foreach ($k in $applied.Keys) {
+    $saved[$k] = [Environment]::GetEnvironmentVariable($k)
+    if ($null -eq $applied[$k]) {
+      Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue
+    } else {
+      Set-Item -Path ("Env:" + $k) -Value $applied[$k]
+    }
+  }
   try {
-    $cwd = if ($spec.cwd) { $spec.cwd } else { $Root }
+    $specCwd = if ($spec.cwd) { $spec.cwd } else { $Root }
+    $startArgs = @{
+      FilePath = $file
+      WorkingDirectory = $specCwd
+      WindowStyle = $windowStyle
+      PassThru = $true
+    }
+    if ($null -ne $logTargets) {
+      $startArgs['RedirectStandardOutput'] = $logTargets.stdout
+      $startArgs['RedirectStandardError'] = $logTargets.stderr
+    }
     if (@($argv).Count -gt 0) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
-      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
-    } else {
-      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
+      $startArgs['ArgumentList'] = $argline
+    }
+    try {
+      $launch = Start-WrapperProcess $startArgs
+    } catch {
+      Discard-PendingWrapperLogTargets $logTargets
+      throw
     }
   } finally {
     foreach ($k in $saved.Keys) {
@@ -9290,7 +10984,13 @@ function Launch-Spec($name, $spec, $codexHome) {
       else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
     }
   }
+  $proc = $launch.Process
   if ($proc -and $proc.Id) {
+    # Round 23: see Launch's own comment - committing is the wrapper's own
+    # job now, from evidence, not this call's decision.
+    if ($null -ne $logTargets -and -not $launch.Redirected) {
+      Discard-PendingWrapperLogTargets $logTargets
+    }
     $out = @{ pid = $proc.Id; start = (Proc-Start $proc.Id);
               launcher_nonce_injected = [bool]$nonceResult.injected;
               launcher_nonce_source = $nonceResult.source;
@@ -9298,6 +10998,7 @@ function Launch-Spec($name, $spec, $codexHome) {
     if ($nonceResult.injected -and $nonceResult.nonce) { $out.launcher_nonce = $nonceResult.nonce }
     return $out
   }
+  Discard-PendingWrapperLogTargets $logTargets
   Write-Warning "supervisor: ephemeral launch of '$name' returned no PID"; return $null
 }
 
@@ -9351,6 +11052,11 @@ $pollNum = 0
   foreach ($name in $plan.agents.PSObject.Properties.Name) {
     $p = $plan.agents.$name
     if ($DryRun) { Write-Host ("{0}: {1} ({2}) - {3}" -f $name, $p.action, $p.state, $p.reason); continue }
+    # Deliberately case-insensitive throughout this loop, and every other
+    # .action/.state comparison below: these are never operator-authored
+    # config text - they are Python's own decision-engine output, fixed
+    # named constants (e.g. eph.ACTION_NONE) with no external input path,
+    # not a config field passed through verbatim like cli/backend_profile.
     if (($p.action -ne 'none') -and (-not (Assert-ActionsEnabled ("agent {0} {1}" -f $name, $p.action)))) { continue }
     # Console action log: announce each action-taking decision (relaunch /
     # stuck_recover / clear_marker / backoff_wait) with state+reason; a steady
@@ -9424,20 +11130,38 @@ $pollNum = 0
         # merge {defaultMode} into the launch dir's .claude/settings.json. Then a
         # PREFLIGHT smoke-test in the EXACT seeded mode -> FAIL CLOSED (skip the
         # launch, do not burn the grace) on a broken config.
+        # Case-sensitive: cli is config verbatim, matching the bootstrap
+        # validator's own case-sensitive Python check - see Preflight.
         $homeEnv = $null; $seedOk = $true
-        if (($p.cli -eq 'codex') -and $p.codex_home_isolation) {
+        if (($p.cli -ceq 'codex') -and $p.codex_home_isolation) {
           $homeEnv = Seed-CodexHome $name $p.windows_sandbox
           if (-not $homeEnv) { $seedOk = $false }
         }
         $a = $cfg.agents.$name
-        if ($p.cli -eq 'claude') {
+        if ($p.cli -ceq 'claude') {
           $launchDir = if ($a.cwd) { $a.cwd } else { $Root }
           if (-not (Assert-ActionsEnabled ("seed-claude-settings {0}" -f $name))) { continue }
           & $AgenttalkCmd --root $Root supervise --seed-claude-settings --dir $launchDir --mode $p.perm_mode | Out-Null
         }
         $file = $a.launch.windows_file
+        # Round 24: prefix-token resolution only means anything for a
+        # WRAPPED launch - Preflight's only branch that consumes
+        # $prefixTokens is the one testing $file (the wrapper python) with
+        # `-m agenttalk`. A non-wrapped agent's windows_args is not
+        # required to invoke `-m agenttalk` at all (a legacy direct launch
+        # of some other module, or a CLI exe with a `--` tail) - resolving
+        # against a grammar that does not apply is not a config error to
+        # fail closed on, it is just "no prefix to test here".
+        $prefixTokens = @()
+        if ($p.launch_mode -eq 'wrap') {
+          $prefixTokens = Resolve-AgenttalkLaunchPrefixTokens $a
+          if ($null -eq $prefixTokens) {
+            Write-Warning ("supervisor: {0}: CONFIG ERROR - launch.module_args_from does not resolve against launch.windows_args; NOT launching (fail closed)" -f $name)
+            $seedOk = $false
+          }
+        }
         if ($seedOk -and -not (Assert-ActionsEnabled ("preflight {0}" -f $name))) { $seedOk = $false }
-        if ($seedOk -and -not (Preflight $name $p $file $homeEnv)) { $seedOk = $false }
+        if ($seedOk -and -not (Preflight $name $p $file $homeEnv $prefixTokens)) { $seedOk = $false }
         if (-not $seedOk) {
           Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
           Set-AgentState $state $name $p.next_state
@@ -9521,7 +11245,8 @@ $pollNum = 0
         }
         $prep = $prepText | ConvertFrom-Json
         $homeEnv = $null
-        if (($prep.cli -eq 'codex') -and $prep.codex_home_isolation) {
+        # Case-sensitive: same reasoning as Preflight/the poll loop above.
+        if (($prep.cli -ceq 'codex') -and $prep.codex_home_isolation) {
           $homeEnv = Seed-CodexHome $prep.agent $prep.windows_sandbox
           if (-not $homeEnv) {
             if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
@@ -9874,11 +11599,16 @@ def _marker_placeholder_bundle(
     py = python_exe or sys.executable
     checkout_id = hashlib.sha256(str(store.root).encode("utf-8")).hexdigest()
     src_is_checkout = (store.root / "src" / "agenttalk" / "__init__.py").exists()
+    wrapper_log_root = wrapper_log.default_wrapper_log_root(store.root)
     substitutions = {
         "__AGENTTALK_ARTIFACT_MARKER__": _PS_MARKER,
         "__AGENTTALK_CHECKOUT_ID__": checkout_id,
         "__AGENTTALK_PREAMBLE__": psh.generated_preamble().rstrip("\n"),
         "__AGENTTALK_RUNTIME_GUARD__": psh.generated_runtime_guard().rstrip("\n"),
+        "__AGENTTALK_WRAPPER_LOG_ROOT__": str(wrapper_log_root).replace("'", "''"),
+        "__AGENTTALK_WRAPPER_LOG_GENERATIONS__": str(WRAPPER_LOG_GENERATIONS),
+        "__AGENTTALK_WRAPPER_LOG_MAX_BYTES__": str(WRAPPER_LOG_MAX_BYTES),
+        "__AGENTTALK_WRAPPER_LOG_SEGMENTS__": str(WRAPPER_LOG_SEGMENT_COUNT),
     }
 
     def render_ps(template: str) -> bytes:

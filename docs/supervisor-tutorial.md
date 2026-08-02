@@ -144,6 +144,84 @@ fail closed. Do not delete these files casually: doing so while the monitor is
 stopped discards launch/session/backoff continuity even though bus messages and
 cursors remain.
 
+Each supervisor-launched `agenttalk wrap` process also gets distinct stdout and
+stderr logs outside the checkout. Legacy/manual direct CLI launches are not
+redirected because an arbitrary executable cannot enforce the cooperative byte
+bound described below. On Windows wrapper logs live under
+`%LOCALAPPDATA%\agenttalk\wrapper-logs\<project-hash>\agent-<agent-hash>\<generation>\`;
+on POSIX the base is an absolute `$XDG_STATE_HOME` or `~/.local/state`. Relative
+ambient state paths are ignored. The path-derived project hash keeps projects
+separate without relying on adopter repositories to ignore `.agenttalk/`;
+`agenttalk init` does not provision that ignore rule. Treat these files as
+sensitive: they can contain model output, tool output, and tracebacks. The
+agent directory is the first 16 hex characters of SHA-256 over the exact UTF-8
+agent name, prefixed with `agent-`; hashing avoids Windows reserved-name and
+trailing-dot aliases.
+
+Before starting the process, the supervisor creates a new immutable generation
+across both the persistent and temporary fallback roots and prunes older
+generations back toward a quota of four (`WRAPPER_LOG_GENERATIONS`). Once
+`agenttalk wrap` begins command dispatch, Python-level writes through its
+standard streams are bounded to 1 MiB per stream using four fixed segments;
+suffixes `.1` through `.3` retain the newest output after the initial
+redirect segment fills. Interpreter/package bootstrap output written before
+that entry point, and direct native/file-descriptor writes, are not
+intercepted by the cooperative Python stream bound. The switch to a new
+immutable destination happens before the relaunch, so the wrapper that just
+died is never overwritten.
+
+A generation is retained forever, uncounted against the quota, until the
+wrapper process itself confirms it - from inside `agenttalk wrap`, right
+after authenticating and installing both bounded stream tees, which is the
+earliest point that proves this launch actually reached command dispatch.
+The supervisor never commits a generation on the launcher's behalf (a
+process existing, or even returning a PID, is not proof the wrapper reached
+that point), so a wrapper that dies before confirming leaves its generation
+preserved and unpruned rather than evicting real evidence for a launch
+attempt whose outcome was never known. Because pruning runs when a new
+generation is created - before that new generation's own fate is decided -
+a string of launches that all successfully confirm settles at one MORE than
+the quota (five, by default) rather than exactly the quota: pruning trims
+existing CONFIRMED generations down to four before creating the next one,
+which itself becomes a fifth confirmed generation once it succeeds, and
+nothing prunes again until the next launch repeats the same pattern. This
+is a known, currently-accepted bound violation, not a rare edge case -
+proven by running repeated successful launches against the code as shipped
+and counting the generations left on disk - to be revisited alongside the
+broader retention-timing question in a follow-up round. If the persistent
+root is unavailable, the supervisor warns and tries the OS temporary
+directory. If a stale handle or filesystem error prevents cleanup, the
+recovery launch continues with a unique generation and warns; the quota can
+remain exceeded (independent of the off-by-one above) until that filesystem
+problem is resolved. If neither root can accept a new generation, recovery
+launches without redirection.
+
+Which of the three tail segments (`.1`-`.3`) is currently being written to is
+itself recorded in a sibling `<segment-base>.cursor` file, updated every time
+a segment is opened - not inferred from filesystem modification times, which
+are ambiguous on coarse-resolution filesystems and wrong across a backward
+clock adjustment. A missing cursor - true of every generation already on
+disk the moment this recording was added - falls back to segment `.1`, but
+always in append mode, never by truncating it: the worst case on an upgrade
+boundary is old, unrelated content from an earlier rotation followed by the
+new instance's content in one file, never destroyed content. This preserves
+the property the quota+1 paragraph above does not: this ring never trades
+away crash evidence for a tidier bound.
+
+On Windows the generated supervisor gives the child an explicit allowlist of
+only stdin (`NUL`) and the two log handles. This avoids leaking the
+supervisor's caller pipes or state-file locks into a long-lived wrapper. If the
+safe logging launcher cannot initialize, recovery still launches without the
+PowerShell redirect and emits a warning; logging never grants launch authority
+or blocks recovery.
+
+Wrapper stderr also includes compact JSON lines for facts such as
+`turn_started`, `child_spawned`, `child_exited`, `turn_ended`, and wrapper
+termination. They are post-mortem evidence only. They are not heartbeat,
+progress, health, or restart inputs, and they never describe the wrapper as
+healthy or alive. An OOM, hard kill, or power loss cannot write a final event;
+the gap after the last factual line is the evidence in that case.
+
 Heartbeat freshness is also future-bounded. A timestamp farther ahead than the
 configured clock-skew allowance cannot authorize a healthy state; a timestamp
 within the allowance can.
@@ -264,6 +342,34 @@ Key differences for a wrapped agent:
 > live, its resolved deadline plus the 300s margin. The value is never
 > silently coerced; a threshold below a live watchdog's hard floor cannot
 > authorize autonomous stall recovery.
+
+> **An interpreter-option prefix before `-m agenttalk` (wrapped agents
+> only).** If `windows_args` needs a Python interpreter flag ahead of
+> `-m agenttalk` (e.g. `-u` for unbuffered output), declare exactly how
+> many tokens that prefix occupies with `"launch": {"module_args_from": N}`
+> — the supervisor never infers this from the argv text. Each prefix token
+> must be a single dash-prefixed flag; **attached-value forms are
+> accepted, separate-token values are refused**:
+>
+> ```jsonc
+> "launch": {
+>   "windows_args": ["-Xutf8", "-m", "agenttalk", "--root", "{ROOT}", "wrap", "..."],
+>   "module_args_from": 1
+> }
+> ```
+>
+> `-Xutf8` (attached) works; `-X utf8` (separate tokens) does not — the
+> bare value token `utf8` is indistinguishable from a script path and is
+> refused along with it. **Separate-token forms are not supported at
+> all — do not work around this by moving the flag after `-m agenttalk`:
+> `-m mod` ends Python's own option list, so anything placed after it
+> becomes agenttalk's argv, not Python's, and agenttalk's own argument
+> parser will reject it.** Where CPython exposes an environment-variable
+> equivalent (`PYTHONUTF8`, `PYTHONHASHSEED`, `PYTHONDONTWRITEBYTECODE`,
+> etc.), set that in the agent's `env` block instead — it has the same
+> effect without occupying an argv position at all. Omit
+> `module_args_from` entirely for the common case (no interpreter
+> prefix, the default).
 
 ---
 

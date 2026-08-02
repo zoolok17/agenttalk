@@ -494,6 +494,7 @@ class WrapperRuntimeWriter:
         progress_write_interval_seconds: float = (
             MAX_PROGRESS_WRITE_INTERVAL_SECONDS
         ),
+        on_transition: Callable[[str, dict], None] | None = None,
     ) -> None:
         self.path = runtime_path(state_dir, agent)
         if (
@@ -532,6 +533,7 @@ class WrapperRuntimeWriter:
                 f"between 0 and {MAX_PROGRESS_WRITE_INTERVAL_SECONDS:g}"
             )
         self._clock = clock
+        self._on_transition = on_transition
         self._progress_write_interval_seconds = float(
             progress_write_interval_seconds
         )
@@ -578,6 +580,17 @@ class WrapperRuntimeWriter:
         _atomic_write(self.path, record)
         return dict(record)
 
+    def _transition(self, transition: str, record: dict) -> dict:
+        """Report a factual transition only after its durable record exists."""
+        if self._on_transition is not None:
+            try:
+                self._on_transition(transition, dict(record))
+            except Exception as exc:
+                # Diagnostics never acquire lifecycle authority and may not turn a
+                # successful runtime-state write into a failed wrapper transition.
+                _ = exc
+        return record
+
     def idle(self) -> dict:
         with self._lock:
             now = float(self._clock())
@@ -587,7 +600,7 @@ class WrapperRuntimeWriter:
             self._launcher_pid = None
             self._launcher_start = None
             self._launcher_lifetime = None
-            return self._write(now)
+            return self._transition("idle", self._write(now))
 
     def starting(
         self,
@@ -608,7 +621,7 @@ class WrapperRuntimeWriter:
             self._last_progress_write_epoch = None
             self._last_outcome = None
             self._phase = PHASE_STARTING
-            return self._write(now)
+            return self._transition("starting", self._write(now))
 
     def active(
         self,
@@ -630,7 +643,10 @@ class WrapperRuntimeWriter:
             self._launcher_start = start
             self._launcher_lifetime = None
             self._phase = PHASE_ACTIVE
-            return self._write(float(self._clock()))
+            return self._transition(
+                "active",
+                self._write(float(self._clock())),
+            )
 
     def launcher_exited(
         self,
@@ -688,12 +704,17 @@ class WrapperRuntimeWriter:
                 elapsed is not None
                 and 0 <= elapsed < self._progress_write_interval_seconds
             ):
-                return self._record(now)
+                return self._transition("progress", self._record(now))
             record = self._write(now)
             self._last_progress_write_epoch = now
-            return record
+            return self._transition("progress", record)
 
-    def _terminal_locked(self, outcome: str) -> dict:
+    def _terminal_locked(
+        self,
+        outcome: str,
+        *,
+        transition: str = "terminal",
+    ) -> dict:
         if outcome not in OUTCOMES:
             raise RuntimeRecordError("terminal outcome is invalid")
         if self._phase not in {PHASE_STARTING, PHASE_ACTIVE, PHASE_TERMINAL}:
@@ -701,7 +722,7 @@ class WrapperRuntimeWriter:
         now = float(self._clock())
         self._last_outcome = outcome
         self._phase = PHASE_TERMINAL
-        return self._write(now)
+        return self._transition(transition, self._write(now))
 
     def terminal(self, outcome: str) -> dict:
         with self._lock:
@@ -727,4 +748,7 @@ class WrapperRuntimeWriter:
                 self._last_progress_at = None
                 self._last_outcome = None
                 self._phase = PHASE_STARTING
-            return self._terminal_locked(OUTCOME_DEAD_LETTER)
+            return self._terminal_locked(
+                OUTCOME_DEAD_LETTER,
+                transition="dead_letter",
+            )

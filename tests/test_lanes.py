@@ -1217,12 +1217,208 @@ def test_m12_git_write_env_timeout_and_allowlist(monkeypatch: pytest.MonkeyPatch
         def kill(self):
             seen["killed"] = True
 
+        def wait(self, timeout=None):  # noqa: ANN001
+            return -9
+
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: StuckProc())
     with pytest.raises(cli.GitWriteError, match="could not be reaped"):
         cli._git_write(
             tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
                        str(tmp_path / "wt2"), full_sha], timeout=0.01)
     assert seen["killed"] is True
+
+
+def test_m12_git_write_kills_and_reaps_on_base_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # A termination signal (or any other BaseException) firing while
+    # communicate() is blocked previously skipped straight past the
+    # TimeoutExpired-only cleanup above and left the child git process
+    # running, unreaped.
+    seen = {}
+
+    class SignaledProc:
+        def __init__(self) -> None:
+            self.calls = 0
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            seen["killed"] = True
+            self._returncode = -9
+
+        def communicate(self, timeout=None):  # noqa: ANN001
+            self.calls += 1
+            if self.calls == 1:
+                raise SystemExit(143)
+            return "", ""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: SignaledProc())
+    with pytest.raises(SystemExit):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt3"), "a" * 40])
+    assert seen["killed"] is True
+
+
+def test_m12_git_write_falls_back_to_wait_when_retry_communicate_hangs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # PR 98 connector, round 9: a hook or descendant holding the captured
+    # stdout/stderr pipe handles open can keep the retry communicate()
+    # blocked past its own 5s timeout even though the killed process is
+    # already dead. wait() does not touch the pipes at all, so it still
+    # completes once the process is actually gone - fall back to it
+    # instead of silently giving up on the reap.
+    #
+    # This is why test_m12_git_write_kills_and_reaps_on_base_exception
+    # above is not enough on its own, as asked: its fake kill() marks the
+    # process reaped SYNCHRONOUSLY and its retry communicate() never
+    # times out, so that test would still pass unchanged with the
+    # swallowed-second-timeout bug present - it proves kill() was called,
+    # not that reap completes under the failure mode this finding
+    # describes. This test drives the retry communicate() into a second
+    # TimeoutExpired specifically, so it fails on the old code (nothing
+    # calls wait(), the process is left with poll() still None) and
+    # passes on the fix.
+    seen: dict = {}
+
+    class StuckRetryProc:
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            seen["killed"] = True
+
+        def communicate(self, timeout=None):  # noqa: ANN001
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise SystemExit(143)
+            raise subprocess.TimeoutExpired("git", timeout)
+
+        def wait(self, timeout=None):  # noqa: ANN001
+            seen["wait_timeout"] = timeout
+            self._returncode = -9
+            return self._returncode
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: StuckRetryProc())
+    with pytest.raises(SystemExit):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt4"), "a" * 40])
+    assert seen["killed"] is True
+    assert seen.get("wait_timeout") is not None
+
+
+def test_m12_git_write_kill_raising_does_not_replace_the_owner_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # Round 11 connector finding, sibling of the same pattern reported for
+    # wrapper/run.py: kill() can itself raise (PermissionError on Windows,
+    # ProcessLookupError if the child already exited). Unguarded, that
+    # secondary error would replace the SystemExit being cleaned up after
+    # and skip the reap fallback entirely.
+    seen: dict = {}
+
+    class RaisingKillProc:
+        def __init__(self) -> None:
+            self.calls = 0
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            seen["kill_called"] = True
+            raise PermissionError("simulated: process handle already closing")
+
+        def communicate(self, timeout=None):  # noqa: ANN001
+            self.calls += 1
+            if self.calls == 1:
+                raise SystemExit(143)
+            return "", ""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: RaisingKillProc())
+    with pytest.raises(SystemExit):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt5"), "a" * 40])
+    assert seen["kill_called"] is True
+
+
+def test_m12_git_write_kill_raising_does_not_replace_the_timeout_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # Same finding, the routine (non-BaseException) timeout branch: kill()
+    # raising here would replace the intended GitWriteError with a bare
+    # PermissionError, breaking any caller that catches GitWriteError
+    # specifically.
+    seen: dict = {}
+
+    class RaisingKillProc:
+        def kill(self):
+            seen["kill_called"] = True
+            raise PermissionError("simulated: process handle already closing")
+
+        def communicate(self, timeout=None):  # noqa: ANN001
+            raise subprocess.TimeoutExpired("git", timeout)
+
+        def wait(self, timeout=None):  # noqa: ANN001
+            return -9
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: RaisingKillProc())
+    with pytest.raises(cli.GitWriteError, match="could not be reaped"):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt6"), "a" * 40], timeout=0.01)
+    assert seen["kill_called"] is True
+
+
+def test_m12_git_write_routine_timeout_reaps_via_wait_on_second_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # Round 12 connector finding: a THIRD exit from _git_write's timeout
+    # handling, distinct from the BaseException branch fixed in round 9
+    # and the kill()-guard fixed in round 11 - on the ROUTINE timeout
+    # retry, a second TimeoutExpired raised immediately without ever
+    # calling wait(), so a killed git could still go unreaped while this
+    # function returned (by raising), contradicting its own docstring
+    # contract and leaving a lane mutation's lock state uncertain.
+    seen: dict = {}
+
+    class StuckRoutineRetryProc:
+        def __init__(self) -> None:
+            self.communicate_calls = 0
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def kill(self):
+            seen["killed"] = True
+
+        def communicate(self, timeout=None):
+            self.communicate_calls += 1
+            raise subprocess.TimeoutExpired("git", timeout)
+
+        def wait(self, timeout=None):  # noqa: ANN001
+            seen["wait_timeout"] = timeout
+            self._returncode = -9
+            return self._returncode
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: StuckRoutineRetryProc())
+    with pytest.raises(cli.GitWriteError, match="could not be reaped"):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt7"), "a" * 40], timeout=0.01)
+    assert seen["killed"] is True
+    assert seen.get("wait_timeout") is not None
 
 
 def test_s2_failed_add_cleanup_removes_branch_after_lock_release(

@@ -57,6 +57,13 @@ _TELEMETRY_ONLY = {"codex": True, "claude": False}
 _NO_CHILD_WINDOW_ENV = "AGENTTALK_NO_CHILD_WINDOW"
 WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
 INBOUND_REQUEST_ID_ENV = "AGENTTALK_INBOUND_REQUEST_ID"
+_WRAPPER_LOG_ENV_NAMES = {
+    "AGENTTALK_WRAPPER_STDOUT_LOG",
+    "AGENTTALK_WRAPPER_STDERR_LOG",
+    "AGENTTALK_WRAPPER_LOG_MAX_BYTES",
+    "AGENTTALK_WRAPPER_LOG_SEGMENTS",
+    "AGENTTALK_WRAPPER_LOG_NONCE",
+}
 OVH_QWEN_CLAUDE_MAX_OUTPUT = "4096"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 _WATCHDOG_STREAM_POLL_SECONDS = 0.05
@@ -556,7 +563,12 @@ def _child_env(
                 "ovh_key",
             }:
                 env.pop(key, None)
-        for key in (LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV):
+        for key in (
+            LEAD_LOOP_LEASE_ENV,
+            WRAPPER_GENERATION_ENV,
+            INBOUND_REQUEST_ID_ENV,
+            *_WRAPPER_LOG_ENV_NAMES,
+        ):
             env.pop(key, None)
         env.update(injected)
         # Claude Code must not discover the operator's normal ~/.claude profile
@@ -584,12 +596,19 @@ def _child_env(
     elif backend_profile is not None:
         raise ValueError(f"unsupported backend_profile {backend_profile!r}")
     else:
-        # Preserve the historical environment byte-for-byte for every ordinary
-        # backend; the restrictive profile is intentionally opt-in.
+        # Preserve the historical environment for every ordinary backend except
+        # controller-only ownership/diagnostic markers. Wrapper-log paths and the
+        # launch nonce belong to this process; model children must not reopen or
+        # truncate the ring, or learn an operator-local diagnostic path.
         env = {
             k: v
             for k, v in os.environ.items()
-            if k not in {LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV}
+            if k not in {
+                LEAD_LOOP_LEASE_ENV,
+                WRAPPER_GENERATION_ENV,
+                INBOUND_REQUEST_ID_ENV,
+                *_WRAPPER_LOG_ENV_NAMES,
+            }
         }
     env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
@@ -1503,7 +1522,28 @@ def run_wrapper(
             health_writer.turn_start(None)
         lines = _iter_suppressing_benign_pipe_teardown(proc.stdout or [])
         engine.run(_health_events(parse_lines(lines, mapper)), clock)
-    finally:
+    except BaseException:
+        _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
+        if proc.poll() is None:
+            # terminate()/kill() can themselves raise (PermissionError on
+            # Windows, ProcessLookupError if the child already exited) -
+            # unguarded, that secondary error would REPLACE the owner
+            # exception being handled here (a signal-driven KeyboardInterrupt
+            # or SystemExit), skip the bounded wait/kill fallback below, and
+            # under cmd_wrap could relabel an intended signal exit as a
+            # routine mapped-error exit - corrupting the termination facts
+            # this cleanup exists to preserve.
+            with contextlib.suppress(OSError):
+                proc.terminate()
+            try:
+                proc.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5.0)
+        raise
+    else:
         _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
     rc = proc.wait()
     if health_writer is not None:
@@ -1619,6 +1659,7 @@ class _ProcStream:
                  work_heartbeat_status=None,
                  child_env: dict[str, str] | None = None,
                  on_spawn: Callable[[int, str | None], object] | None = None,
+                 on_exit: Callable[[int, str | None, int], None] | None = None,
                  on_launcher_exit: Callable[..., object] | None = None,
                  lease_lost_exceptions: tuple = ()) -> None:
         # argv is the operator-provided launch command; never shell=True.
@@ -1649,6 +1690,7 @@ class _ProcStream:
         self._launcher_exit_observer = None
         self.work_heartbeat_result: dict | None = None
         self._work_hb = None
+        self._on_exit = on_exit
         try:
             # Record the per-turn root start-time right after spawn (~ the OS-reported create
             # time, within spawn jitter) so the watchdog can start-time-guard the kill against
@@ -1707,12 +1749,13 @@ class _ProcStream:
                         lease_lost_exceptions=lease_lost_exceptions,
                         on_status=work_heartbeat_status)
                     self._work_hb.start()
-        except Exception:
+        except BaseException:
             self._cleanup_after_constructor_error()
             raise
 
     def __iter__(self) -> Iterator[str]:
         consumer_aborted = False
+        stream_exhausted = False
         try:
             if self._watchdog is None:
                 yield from _iter_suppressing_benign_pipe_teardown(
@@ -1720,9 +1763,22 @@ class _ProcStream:
                 )
             else:
                 yield from self._iter_until_watchdog_or_eof()
+            # Reached only on natural EOF - a GeneratorExit (an early consumer
+            # break/close, INCLUDING one driven by a termination signal's
+            # SystemExit unwinding through this generator) jumps straight to
+            # finally below without ever setting this.
+            stream_exhausted = True
         finally:
             if self._watchdog is not None:
                 consumer_aborted = self._cancel_watchdog_stream_after_consumer_exit()
+            elif not stream_exhausted:
+                # No watchdog configured (the default for a continuous loop
+                # wrapper) is not license to skip the same abort handling: an
+                # aborted iteration must still terminate a possibly-still-
+                # running child before the wait below, or a termination
+                # signal would leave the wrapper hanging on it instead of
+                # exiting - the opposite of what the signal asked for.
+                consumer_aborted = True
             # Stop the work-heartbeat ticker FIRST - before this stream reads as
             # exhausted to the caller - so drive()'s failed-turn clear_heartbeat
             # (which runs after stream exhaustion) can never be overwritten by a
@@ -1750,21 +1806,30 @@ class _ProcStream:
                 except Exception:  # noqa: BLE001, S110 - preserve the consumer's failure  # nosec B110
                     pass
             try:
-                if self._watchdog_stream_interrupted:
-                    if consumer_aborted:
+                if consumer_aborted:
+                    # I5: bounded, with a kill fallback, regardless of
+                    # watchdog config - terminate() (above) is a REQUEST
+                    # (SIGTERM on POSIX), not a guarantee. A child that
+                    # ignores or SIG_IGNs it would otherwise wedge an
+                    # unbounded wait() here forever: the exact class of
+                    # wrapper-hang #117 exists to fix, just moved from "no
+                    # terminate() call at all" to "terminate() with no
+                    # bound on what follows it." This is the SAME fallback
+                    # the watchdog-interrupted branch already had - it must
+                    # not depend on a watchdog being configured at all.
+                    try:
+                        self.returncode = self._proc.wait(timeout=10.0)
+                    except subprocess.TimeoutExpired:
                         try:
-                            self.returncode = self._proc.wait(timeout=10.0)
-                        except subprocess.TimeoutExpired:
-                            try:
-                                self._proc.kill()
-                                self.returncode = self._proc.wait(timeout=5.0)
-                            except Exception:  # noqa: BLE001 - cleanup must preserve owner failure
-                                self.returncode = self._proc.poll()
-                    else:
-                        # A watchdog wake is an exit confirmation, never merely a signal
-                        # report. Fail closed if that invariant is ever violated.
-                        self.returncode = self._proc.wait()
+                            self._proc.kill()
+                            self.returncode = self._proc.wait(timeout=5.0)
+                        except Exception:  # noqa: BLE001 - cleanup must preserve owner failure
+                            self.returncode = self._proc.poll()
                 else:
+                    # Natural completion (stream exhausted) or a watchdog
+                    # wake: an exit confirmation, never merely a signal
+                    # report - the watchdog's own kill pass has already run.
+                    # Fail closed if that invariant is ever violated.
                     self.returncode = self._proc.wait()
             finally:
                 if self._watchdog is not None and not consumer_aborted:
@@ -1776,6 +1841,21 @@ class _ProcStream:
                     # result or allowing the next turn to start.
                     self._watchdog.join()
                     self.watchdog_result = self._watchdog.result
+            # After returncode is finalized (when the double-exception fallback
+            # above did not leave it None) and any watchdog kill pass has
+            # finished either way - a diagnostic sink must never race the
+            # authoritative watchdog/abort handling above it, and must never
+            # change the child result or strand its cleanup. A None returncode
+            # means the exit was never actually confirmed - reporting it as one
+            # would assert a fact we do not have, so skip the callback instead
+            # of inventing a synthetic exit code. This fact fires unconditionally
+            # here - independent of #120's launcher-exit observer below, so an
+            # absent or Windows-only-missing observer can never suppress it.
+            if self._on_exit is not None and self.returncode is not None:
+                try:
+                    self._on_exit(self.pid, self.pid_start, self.returncode)
+                except Exception as exc:
+                    _ = exc
             if self._launcher_exit_observer is not None:
                 # #112 owns the wait/watchdog ordering above. #120's retained
                 # handle observer is joined only after that flow has confirmed
@@ -1856,11 +1936,17 @@ class _ProcStream:
                 continue
             if chunk == b"":
                 pending += decoder.decode(b"", final=True)
+                # I5 remnant (cold review, round 3): deliver the final
+                # fragment BEFORE declaring the stream done - marking done
+                # and waking anyone checking it while that fragment is
+                # still only sitting in a local variable, not yet handed to
+                # the consumer, asserts a completeness that hasn't actually
+                # happened yet.
+                if pending:
+                    yield pending
                 with self._watchdog_stream_condition:
                     self._watchdog_stream_done = True
                     self._watchdog_stream_condition.notify_all()
-                if pending:
-                    yield pending
                 return
             pending += decoder.decode(chunk)
             while "\n" in pending:
@@ -1901,17 +1987,29 @@ class _ProcStream:
         try:
             if self._proc.poll() is None:
                 self._proc.terminate()
-            self._proc.wait(timeout=10.0)
+            self.returncode = self._proc.wait(timeout=10.0)
             child_reaped = True
         except subprocess.TimeoutExpired:
             try:
                 self._proc.kill()
-                self._proc.wait(timeout=5.0)
+                self.returncode = self._proc.wait(timeout=5.0)
                 child_reaped = True
             except Exception as exc:
                 _ = exc
         except Exception as exc:
             _ = exc
+        # New area (cold review): this cleanup path terminates and reaps the
+        # child but - unlike __iter__'s own finally block - never told
+        # on_exit about it, so a child that WAS confirmed dead here left no
+        # child_exited record at all. Skip, not fabricate, if the double-
+        # exception fallback above never confirmed the reap - the same
+        # invariant _ProcStream.__iter__ already holds elsewhere. Fires
+        # independent of #120's launcher-exit observer below either way.
+        if child_reaped and self._on_exit is not None:
+            try:
+                self._on_exit(self.pid, self.pid_start, self.returncode)
+            except Exception as exc:
+                _ = exc
         if child_reaped and self._launcher_exit_observer is not None:
             try:
                 self._launcher_exit_observer.join(timeout=10.0)
@@ -2106,6 +2204,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                wrapper_generation: str | None = None,
                backend_profile: str | None = None,
                profile_env: dict[str, str] | None = None,
+               lifecycle_log=None,
                lease_lost_exceptions: tuple = ()) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
@@ -2295,6 +2394,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                                on_spawn=(
                                    runtime_writer.active
                                    if runtime_writer is not None
+                                   else None
+                               ),
+                               on_exit=(
+                                   lifecycle_log.child_exited
+                                   if lifecycle_log is not None
                                    else None
                                ),
                                on_launcher_exit=(
@@ -2738,6 +2842,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                        persist: Callable[[object], None] | None = None,
                        runtime_writer=None,
                        work_heartbeat=None,
+                       lifecycle_log=None,
                        lease_lost_exceptions: tuple = (),
                        ) -> Callable[[dict, list], bool]:
     """Build the SYNTHETIC cadence-turn drive for the managed lead-loop controller (WP3).
@@ -2804,6 +2909,11 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                                on_spawn=(
                                    runtime_writer.active
                                    if runtime_writer is not None
+                                   else None
+                               ),
+                               on_exit=(
+                                   lifecycle_log.child_exited
+                                   if lifecycle_log is not None
                                    else None
                                ),
                                on_launcher_exit=(

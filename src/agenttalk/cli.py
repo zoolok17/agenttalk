@@ -15,6 +15,7 @@ import stat
 import subprocess  # nosec B404
 import sys
 import time
+import traceback
 import unicodedata
 import uuid
 import webbrowser
@@ -2057,16 +2058,54 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        proc.kill()
+        # kill() can itself raise (PermissionError on Windows,
+        # ProcessLookupError if the child already exited) - guarded so it
+        # can never pre-empt the GitWriteError raised below.
+        with contextlib.suppress(OSError):
+            proc.kill()
         try:
             out, err = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired as reap:
+            # A third exit from this function's timeout handling that used
+            # to raise immediately without ever calling wait() - a killed
+            # git could still go unreaped while this function returned
+            # (via raising), contradicting the docstring's own kill+REAP
+            # contract and leaving a lane mutation's lock state uncertain.
+            # Same fallback as the BaseException branch below: wait() does
+            # not touch the pipes, so it still completes once the process
+            # is actually gone.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=25)
             raise GitWriteError(
                 "mutating git timed out and could not be reaped; git/config lock may be stranded"
             ) from reap
         raise GitWriteError(
             f"mutating git timed out after {timeout:g}s and was killed: {err or out or e}"
         ) from e
+    except BaseException:
+        if proc.poll() is None:
+            # kill() can itself raise - unguarded, that secondary error
+            # would replace the owner BaseException being handled here and
+            # skip the reap fallback below entirely.
+            with contextlib.suppress(OSError):
+                proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # A hook or descendant holding the captured stdout/stderr
+                # pipe handles open can keep communicate() blocked past
+                # this retry even though the killed process is already
+                # dead - wait() does not touch the pipes at all, so it
+                # still completes once the process is actually gone.
+                # This function's own contract (kill+REAP before
+                # returning, so a lane is never persisted after an
+                # unknown write state) applies on this path too, not
+                # just the routine-timeout branch above; silently
+                # swallowing a second TimeoutExpired here left the reap
+                # unconfirmed.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=25)
+        raise
     return proc.returncode, out or "", err or ""
 
 
@@ -10237,7 +10276,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     runtime_effort: str | None = None,
                     runtime_fingerprint: str | None = None,
                     backend_profile: str | None = None,
-                    profile_env: dict[str, str] | None = None) -> int:
+                    profile_env: dict[str, str] | None = None,
+                    supervisor_launch_nonce: str | None = None,
+                    lifecycle_log: object | None = None) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -10257,11 +10298,21 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     from .wrapper.health import WrapperHealthWriter
     from .wrapper import session as wsession
     from .wrapper_runtime import WrapperRuntimeWriter
+    from .wrapper_logs import WrapperLifecycleLog
 
     # One observational generation spans this wrapper process.  It is safe to
     # expose to the child (unlike the lead-loop lease id): it grants no mailbox
     # authority and only binds body-free --await-reply markers to this loop.
     wrapper_generation = uuid.uuid4().hex
+    if lifecycle_log is None:
+        lifecycle_log = WrapperLifecycleLog.from_environment(
+            agent,
+            expected_nonce=supervisor_launch_nonce,
+        )
+
+    def _wrapper_exit(code: int, reason: str) -> int:
+        lifecycle_log.wrapper_exited(code, reason=reason)
+        return code
 
     # --- managed lead-loop CONTROLLER lease lifecycle (WP2) -------------------
     lease_id: str | None = None
@@ -10272,7 +10323,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             sys.stderr.write(
                 f"agenttalk wrap --lead-loop: {agent!r} is not a configured managed "
                 f"lead-loop identity (run `agenttalk managed-lead-loop set {agent}`)\n")
-            return 2
+            return _wrapper_exit(2, "managed_lead_loop_not_configured")
         timing = lead_loop_runtime.resolve_timing(
             store, agent, supervisor_config=supervisor_config)
         ttl = timing["ttl_seconds"]
@@ -10293,7 +10344,10 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                 f"agenttalk wrap --lead-loop: {agent!r} mailbox is already owned by a live "
                 f"controller (PID {existing.get('owner_pid')}); standing down "
                 f"(supervisor HOLD, no relaunch).\n")
-            return _LEAD_LOOP_BLOCKED_EXIT
+            return _wrapper_exit(
+                _LEAD_LOOP_BLOCKED_EXIT,
+                "managed_lead_loop_acquire_blocked",
+            )
         lease_id = lease["lease_id"]
         store.clear_lead_loop_exit(agent)  # a live controller makes any prior exit state moot
 
@@ -10347,6 +10401,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         store.state_dir,
         agent,
         wrapper_generation,
+        on_transition=lifecycle_log.runtime_transition,
     )
     try:
         drive = wrapper_run.make_drive(
@@ -10360,6 +10415,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             wrapper_generation=wrapper_generation,
             backend_profile=backend_profile,
             profile_env=profile_env,
+            lifecycle_log=lifecycle_log,
             # the lead-loop combined stamp raises _LeadLoopLeaseLost on a lost lease:
             # the ticker treats it as TYPED loss (permanent stop for the turn, status
             # lost_lease, never a bus heartbeat without the lease), while the
@@ -10369,7 +10425,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     except ValueError as e:
         _release()
         sys.stderr.write(f"agenttalk wrap: {e}\n")
-        return 2
+        return _wrapper_exit(2, "drive_configuration_rejected")
     capacity_refresh = None
     if one_shot_request_id is None:
 
@@ -10430,6 +10486,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             persist=lambda st: wsession.save_session(store, agent, st),
             runtime_writer=runtime_writer,
             work_heartbeat=work_heartbeat,
+            lifecycle_log=lifecycle_log,
             lease_lost_exceptions=(_LeadLoopLeaseLost,))
         cadence_health = _cadence_health_notifier(store, agent)
 
@@ -10539,7 +10596,10 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         _release()
         sys.stderr.write(f"agenttalk wrap --lead-loop: {agent!r} lost the mailbox lease "
                          f"(stolen / torn / force-released); exiting for supervisor recovery.\n")
-        return _LEAD_LOOP_LEASE_LOST_EXIT
+        return _wrapper_exit(
+            _LEAD_LOOP_LEASE_LOST_EXIT,
+            "managed_lead_loop_lease_lost",
+        )
     except BaseException:
         # CRASH / interruption: best-effort release (fast handoff; a SIGKILL skips this
         # but the owner pid is then CONFIRMED-dead -> immediately stealable, D-12). NO
@@ -10555,7 +10615,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         why = ("thread closed/superseded" if (sc.get("closed") or sc.get("superseded"))
                else f"no message on request {one_shot_request_id!r} within the one-shot bound")
         sys.stderr.write(f"agenttalk wrap --one-shot: no turn driven ({why}).\n")
-        return 1
+        return _wrapper_exit(1, "one_shot_request_not_driven")
     if lead_loop:
         # A CLEAN return from the unbounded continuous lead-loop == a VALID human
         # release/end (classify_loop_control "stop"): a DELIBERATE stand-down. Release
@@ -10566,11 +10626,204 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         store.write_lead_loop_exit(agent, state=store.LEAD_LOOP_EXIT_STOOD_DOWN,
                                    owner_pid=os.getpid(),
                                    reason="valid human release/end (deliberate stand-down)")
-        return _LEAD_LOOP_STOOD_DOWN_EXIT
-    return 0
+        return _wrapper_exit(
+            _LEAD_LOOP_STOOD_DOWN_EXIT,
+            "managed_lead_loop_stood_down",
+        )
+    return _wrapper_exit(0, "loop_returned")
+
+
+def _resolves_to_cmd_wrap(argv: list[str]) -> bool:
+    """True iff parsing argv through this SAME parser resolves to cmd_wrap
+    without argparse exiting first. A terminal option (bare -h/--help
+    anywhere before the wrap subcommand's own `cmd` REMAINDER capture
+    starts, e.g. `wrap --help`) or a parse-invalid tail (a missing
+    required value, an unrecognized flag) both call sys.exit before
+    cmd_wrap - hence before the wrap subcommand's bounded logging would
+    ever install - so neither should count as reaching it.
+
+    argparse itself prints usage/help or an "error: ..." line for exactly
+    those two cases as part of raising SystemExit - suppressed here so
+    probing an arbitrary candidate argv (untrusted launch config, not a
+    real invocation) never writes anything to this process's own
+    stdout/stderr as a side effect of merely checking it.
+    """
+    parser = build_parser()
+    try:
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            args = parser.parse_args(argv)
+    except SystemExit:
+        return False
+    return getattr(args, "func", None) is cmd_wrap
+
+
+def cmd_internal_check_wrap_dispatch(args: argparse.Namespace) -> int:
+    """Supervisor-only probe, never documented as a stable CLI surface: exit
+    0 iff the given argv would dispatch to cmd_wrap, 1 otherwise. No
+    stdout/stderr output and no side effects - parsing argv does not call
+    args.func, only inspects what it resolves to.
+
+    Exists so the supervisor can ask this parser directly whether a
+    candidate launch argv actually reaches the wrap subcommand, instead of
+    re-deriving argparse's own grammar (nargs=REMAINDER's auto --help
+    recognition, required-value errors, subparser dispatch) in PowerShell -
+    the same class of leak this project has already paid for once at the
+    interpreter layer (module_args_from), and the reason to prefer asking
+    the real parser here rather than repeating that.
+    """
+    tail = list(args.argv or [])
+    if tail and tail[0] == "--":
+        tail = tail[1:]
+    return 0 if _resolves_to_cmd_wrap(tail) else 1
 
 
 def cmd_wrap(args: argparse.Namespace) -> int:
+    """Install supervisor-authenticated logging before wrapper setup begins."""
+    from .wrapper_logs import (
+        WrapperLifecycleLog,
+        capture_termination_signals,
+        installed_standard_streams_from_environment,
+    )
+
+    with installed_standard_streams_from_environment(
+        expected_nonce=getattr(args, "supervisor_launch_nonce", None),
+    ):
+        agent = (
+            getattr(args, "agent", None)
+            or os.environ.get("AGENTTALK_SELF")
+            or "unknown"
+        )
+        lifecycle_log = WrapperLifecycleLog.from_environment(
+            str(agent),
+            expected_nonce=getattr(args, "supervisor_launch_nonce", None),
+        )
+        args._wrapper_lifecycle_log = lifecycle_log
+        try:
+            with capture_termination_signals(lifecycle_log):
+                result = _cmd_wrap_with_logging(args)
+        except BaseException as exc:
+            # A SystemExit reaching here was ALREADY a deliberate exit with
+            # its own diagnostic already written (e.g. _get_store's "not
+            # initialized" message before sys.exit(2)), or a termination
+            # signal already recorded structurally via lifecycle.defer_signal
+            # before capture_termination_signals raised it. Recording it
+            # again via wrapper_exception and printing a synthetic Python
+            # traceback on top is not a crash report, it is noise over an
+            # already-explained, intentional exit - exactly the regression
+            # #117 exists to prevent. Handle it BEFORE the crash-reporting
+            # path below, not after, so it never reaches it.
+            #
+            # But skipping wrapper_exception must not also skip EVERY
+            # lifecycle fact: a signal-driven SystemExit already recorded
+            # wrapper_signal_received (terminal_emitted is already True by
+            # the time it gets here), but a non-signal SystemExit - like
+            # _get_store's - has no deferred signal for anything to have
+            # recorded, so terminal_emitted is still False. Without an
+            # explicit wrapper_exited here, the trail ends with no
+            # termination fact at all, and a cleanly explained
+            # configuration error becomes indistinguishable from an OOM or
+            # a hard kill when reading the JSON lines - a worse defect than
+            # the traceback this branch exists to suppress. Every
+            # termination path must emit exactly one termination fact.
+            if isinstance(exc, SystemExit):
+                if not lifecycle_log.terminal_emitted:
+                    code = exc.code if isinstance(exc.code, int) else (
+                        0 if exc.code is None else 1
+                    )
+                    lifecycle_log.wrapper_exited(code, reason="system_exit")
+                raise
+            # Same shape, one layer up (PR 98 connector, round 9): the
+            # crash-reporting block below must run ONLY for genuinely
+            # unexpected exceptions. KeyboardInterrupt and (ValueError,
+            # FileNotFoundError, OSError) are NOT unexpected - main() (see
+            # its own except clauses) already has a concise, actionable
+            # one-line diagnostic for exactly these, and this block used to
+            # convert them to the SAME SystemExit codes further down, AFTER
+            # unconditionally recording wrapper_exception and printing a
+            # full Python traceback first. That turned a routine OSError
+            # into crash-report noise ahead of the one line anyone actually
+            # wants - the exact regression #117 exists to prevent, just for
+            # a wider set of types than SystemExit alone.
+            #
+            # Enumerated as a set, not patched type by type: anything NOT
+            # in this set falls through to the crash path below BY
+            # CONSTRUCTION, not by omission - a future exception type that
+            # gains a concise diagnostic elsewhere and is not added here
+            # must be a visible test failure, not a silent traceback. See
+            # test_cmd_wrap_routine_exception_types_skip_crash_reporting
+            # (this set) and
+            # test_cmd_wrap_unclassified_exception_still_gets_crash_reporting
+            # (the other half of the property).
+            # Round 17 connector finding: raising SystemExit here for a
+            # class main() itself handles bypasses main()'s own handler for
+            # it - main() never has a chance to run its except clause,
+            # because SystemExit is not a subclass of Exception and simply
+            # propagates through main()'s try/except untouched, all the way
+            # out of main() itself. main() previously RETURNED an int for
+            # exactly these two classes (see the contract table in
+            # test_cmd_wrap_and_main_exception_contract); that RETURN is
+            # the actual contract an embedder or a test runner calling
+            # cli.main([...]) programmatically depends on, not a
+            # SystemExit with a matching code - the two look the same at a
+            # console (the process exits N either way) but are NOT the
+            # same to anything catching Exception around a call to main().
+            # Return the SAME int main() would have, so main()'s contract
+            # holds regardless of whether cmd_wrap's own exception handling
+            # sits in front of it.
+            if isinstance(exc, KeyboardInterrupt):
+                sys.stderr.write("\nagenttalk: interrupted\n")
+                if not lifecycle_log.terminal_emitted:
+                    lifecycle_log.wrapper_exited(130, reason="keyboard_interrupt")
+                return 130
+            if isinstance(exc, (ValueError, FileNotFoundError, OSError)):
+                sys.stderr.write(f"agenttalk: {exc}\n")
+                if not lifecycle_log.terminal_emitted:
+                    lifecycle_log.wrapper_exited(2, reason="mapped_cli_exception")
+                return 2
+            # Genuinely unexpected: record the crash fact and print the
+            # traceback here, while sys.stderr is still the bounded tee
+            # installed above - the "finally" of that context manager
+            # restores the raw stream before this exception reaches
+            # whatever eventually reports it, which would otherwise let
+            # the one diagnostic anyone actually wants bypass the cap and
+            # the tail rotation #117 exists to provide.
+            #
+            # Round 18: propagate the ORIGINAL exception, not a converted
+            # SystemExit(1) - the same argument that made the two branches
+            # above wrong, one row down. Before this PR, an unexpected
+            # exception left main() with its original type; an embedder
+            # or test runner calling cli.main([...]) could catch it,
+            # inspect it, log it, retry. Converting to SystemExit(1) threw
+            # that away twice: it destroys the type information a caller
+            # needs, and substitutes an exception class that terminates
+            # an unhandled process instead of being caught by an ordinary
+            # except Exception. The "one known exit code for any crash"
+            # goal is a CONSOLE concern the console already gets for
+            # free - Python exits 1 on any uncaught exception regardless
+            # - so propagating the original preserves console behavior
+            # exactly while restoring the contract for embedders. main()
+            # never had a special RETURN contract for this class either
+            # (it would have let the original type propagate uncaught),
+            # so this is not a new divergence to justify - it is the
+            # STATUS QUO main() always had, kept intact.
+            if not lifecycle_log.terminal_emitted:
+                lifecycle_log.wrapper_exception(exc)
+                traceback.print_exc(file=sys.stderr)
+            raise
+        finally:
+            del args._wrapper_lifecycle_log
+        if not lifecycle_log.terminal_emitted:
+            lifecycle_log.wrapper_exited(
+                int(result),
+                reason="wrap_command_returned",
+            )
+        return result
+
+
+def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
     """Run an agent CLI under the progress-adapter wrapper (0.30.0).
 
     Default (one-shot ``-- <argv>``): launch the CLI in structured-stream mode,
@@ -10587,6 +10840,9 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     store = _get_store(args)
     roster = store.load_config().get("agents") or []
     agent = _resolve_self(args.agent, roster=roster)
+    lifecycle_log = getattr(args, "_wrapper_lifecycle_log", None)
+    if lifecycle_log is not None:
+        lifecycle_log.agent = agent
     argv = list(args.cmd or [])
     if argv and argv[0] == "--":
         argv = argv[1:]
@@ -10873,28 +11129,53 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                 return _handle_launch_config_blocked(
                     store, agent, args.cli, mode=whb_mode,
                     min_interval=args.min_interval, summary=summary)
-        return _wrap_loop_mode(store, agent, cli=args.cli, base_argv=argv,
-                               sender=sender, min_interval=args.min_interval,
-                               render=not args.no_render,
-                               one_shot_request_id=args.to_request if args.one_shot else None,
-                               k_poison=k_poison, k_escalate=k_escalate,
-                               infra_exhaust_after_seconds=infra_ceiling[
-                                   "infra_exhaust_after_seconds"],
-                               infra_exhaust_min_attempts=infra_ceiling[
-                                   "infra_exhaust_min_attempts"],
-                               noninfra_sub_ceiling=infra_ceiling["noninfra_sub_ceiling"],
-                               lead_loop=lead_loop, supervisor_config=sup_cfg,
-                               turn_watchdog=watchdog_cfg,
-                               work_heartbeat=whb_cfg,
-                               runtime_model=runtime_model,
-                               runtime_effort=runtime_effort,
-                               runtime_fingerprint=runtime_fingerprint,
-                               backend_profile=backend_profile,
-                               profile_env=profile_env)
+        return _wrap_loop_mode(
+            store,
+            agent,
+            cli=args.cli,
+            base_argv=argv,
+            sender=sender,
+            min_interval=args.min_interval,
+            render=not args.no_render,
+            one_shot_request_id=args.to_request if args.one_shot else None,
+            k_poison=k_poison,
+            k_escalate=k_escalate,
+            infra_exhaust_after_seconds=infra_ceiling[
+                "infra_exhaust_after_seconds"
+            ],
+            infra_exhaust_min_attempts=infra_ceiling[
+                "infra_exhaust_min_attempts"
+            ],
+            noninfra_sub_ceiling=infra_ceiling["noninfra_sub_ceiling"],
+            lead_loop=lead_loop,
+            supervisor_config=sup_cfg,
+            turn_watchdog=watchdog_cfg,
+            work_heartbeat=whb_cfg,
+            runtime_model=runtime_model,
+            runtime_effort=runtime_effort,
+            runtime_fingerprint=runtime_fingerprint,
+            backend_profile=backend_profile,
+            profile_env=profile_env,
+            supervisor_launch_nonce=getattr(
+                args,
+                "supervisor_launch_nonce",
+                None,
+            ),
+            lifecycle_log=getattr(
+                args,
+                "_wrapper_lifecycle_log",
+                None,
+            ),
+        )
     try:
         return wrapper_run.run_wrapper(
-            cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,
-            min_interval=args.min_interval, render=not args.no_render,
+            cli=args.cli,
+            agent=agent,
+            argv=argv,
+            store=store,
+            sender=sender,
+            min_interval=args.min_interval,
+            render=not args.no_render,
         )
     except ValueError as e:
         sys.stderr.write(f"agenttalk wrap: {e}\n")
@@ -14018,6 +14299,13 @@ def build_parser() -> argparse.ArgumentParser:
                             "--json \"...\"` (one-shot).")
     pwrap.set_defaults(func=cmd_wrap)
 
+    pcheckwrap = sub.add_parser(
+        "_internal-check-wrap-dispatch",
+        help=argparse.SUPPRESS,
+    )
+    pcheckwrap.add_argument("argv", nargs=argparse.REMAINDER)
+    pcheckwrap.set_defaults(func=cmd_internal_check_wrap_dispatch)
+
     pdl = sub.add_parser(
         "dead-letter",
         help="Inspect + recover dead-lettered (poison) messages: valid messages the "
@@ -14640,22 +14928,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # On Windows the default console code page (cp1252) can't encode many
-    # characters that turn up in agent messages (arrows, em-dashes, etc.).
-    # Force UTF-8 on stdout/stderr so writes don't raise UnicodeEncodeError.
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-            except (ValueError, OSError):
-                pass
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    # Handle --here on init
-    if getattr(args, "cmd", None) == "init" and getattr(args, "here", False) and not args.path:
-        args.path = str(Path.cwd())
+    # Round 24 connector finding: this try used to wrap only args.func(args),
+    # so a KeyboardInterrupt during build_parser()/parse_args() - before this
+    # try ever started - propagated straight past main() (exiting 130 at
+    # Python's own top level, the conventional cancellation status). Once
+    # console_main's broad `except BaseException` was added (round 20), that
+    # same propagating KeyboardInterrupt fell into ITS crash-reporting branch
+    # instead, misreporting a Ctrl-C as an unexpected crash (return 1). Fixed
+    # by widening the try to cover the whole function body - the SAME
+    # KeyboardInterrupt row already in the contract table now covers this
+    # window too, rather than adding a second, special-cased catch in
+    # console_main beside it.
     try:
+        # On Windows the default console code page (cp1252) can't encode
+        # many characters that turn up in agent messages (arrows,
+        # em-dashes, etc.). Force UTF-8 on stdout/stderr so writes don't
+        # raise UnicodeEncodeError.
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                try:
+                    reconfigure(encoding="utf-8", errors="replace")
+                except (ValueError, OSError):
+                    pass
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        # Handle --here on init
+        if getattr(args, "cmd", None) == "init" and getattr(args, "here", False) and not args.path:
+            args.path = str(Path.cwd())
         return args.func(args)
     except KeyboardInterrupt:
         sys.stderr.write("\nagenttalk: interrupted\n")
@@ -14665,5 +14965,37 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
+def console_main(argv: list[str] | None = None) -> int:
+    """Shared body for every REAL top-level script/console invocation of
+    this CLI - agenttalk/__main__.py's `if __name__ == "__main__":` guard
+    (python -m agenttalk), the installed `agenttalk` console script
+    (pyproject.toml's [project.scripts] entry, autogenerated by
+    setuptools/pip as a thin `sys.exit(console_main())` wrapper), and this
+    module's own `if __name__ == "__main__":` guard below.
+
+    An embedder that imports this module and calls main([...]) directly
+    never calls this function at all - main()'s own contract (propagate an
+    unexpected exception's ORIGINAL type, uncaught) is exactly what such a
+    caller gets, unchanged. This function exists ONLY to add one thing a
+    real top-level process needs that an embedder must never be given:
+    when an unexpected exception is genuinely uncaught, print it through
+    the same bounded mechanism a supervised wrapper's own crash traceback
+    already uses, instead of letting Python's default printer write an
+    unbounded second copy to whatever raw stream is current by the time
+    nothing is left to catch it. It installs no hook, replaces no stream,
+    and leaves no state behind - the one call it makes beyond main() itself
+    is a single, self-contained, best-effort write.
+    """
+    try:
+        return main(argv)
+    except SystemExit:
+        raise
+    except BaseException:
+        from .wrapper_logs import print_bounded_uncaught_exception
+
+        print_bounded_uncaught_exception()
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(console_main())
