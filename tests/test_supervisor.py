@@ -15131,6 +15131,54 @@ def test_post_kill_barrier_hold_cannot_present_a_trustworthy_zero() -> None:
     assert promoted["status"] == "absent"
 
 
+def test_reset_remedy_warns_on_legacy_v2_record_missing_rejected_count() -> None:
+    """Task #150 round 5 connector finding 2: the round-3 remedy clause
+    only fired for a KNOWN positive rejected_count - a legacy v2 record
+    (missing the field entirely, deliberately still valid authority per
+    the v2-migration fix) got NO warning at all, telling the operator to
+    verify only the named/omitted identities when the truth is the walk
+    that produced this record never counted rejections in the first
+    place. Unknown must warn like unknown, not silently read as zero -
+    the same "absent must warn like unknown" correction finding 6 made
+    for the round-2 remedy, now needed again for the same field's
+    missing-vs-zero distinction."""
+    limit = sup._OWNED_PROCESS_TREE_LIMIT
+    snapshot = [_wrap_snap()[0]] + [
+        _proc(400 + i, WRAP_LAUNCHER_PID, "node.exe", "node tool.js", _ps_iso(700000 + i))
+        for i in range(limit)
+    ]
+    plan = _owned_tree_plan(snapshot, request_id="rr-150-v2-remedy-first")
+    assert plan["state"] == "PROCESS_TREE_TRUNCATED"
+    truncated_tree = plan["next_state"]["owned_process_tree"]
+    v2_shaped = dict(truncated_tree)
+    del v2_shaped["rejected_count"]
+    assert sup._valid_owned_process_tree(  # noqa: SLF001
+        v2_shaped, agent="worker", root_key=sup._root_key(TEST_ROOT),  # noqa: SLF001
+        wrapper_generation="wrapper-1", launch_nonce=SUPERVISOR_NONCE,
+    ) is not None
+
+    second_state = dict(plan["next_state"])
+    second_state["owned_process_tree"] = v2_shaped
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-150-v2-remedy-second"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                now=NOW + 1,
+            ),
+        ),
+        {"agents": {"worker": second_state}},
+        now=NOW + 1,
+        snapshot=snapshot,
+    )
+    assert second["state"] == "PROCESS_TREE_TRUNCATED"
+    assert "rejected_count" not in second["next_state"]["owned_process_tree"]
+    assert "UNKNOWN, not zero" in second["reason"]
+    assert "--acknowledge-owned-processes-stopped" in second["reason"]
+
+
 def test_owned_process_tree_rejects_walk_when_launcher_missing_exact_filetime() -> None:
     """Task #150 round 3 connector finding 3: a Windows row lacking exact
     start_filetime used to be ADMITTED by add_node while
@@ -15233,6 +15281,64 @@ def test_owned_process_tree_accounts_for_orphaned_intermediates_live_child() -> 
     assert tree["status"] == "invalid"
     assert tree["rejected_count"] >= 1
     assert live_grandchild_pid not in [e["pid"] for e in tree["entries"]]
+
+
+def test_owned_process_tree_rejects_prior_entry_with_malformed_parent_pid() -> None:
+    """Task #150 round 5 connector finding 1: _snap_all_edges correctly
+    cannot build an edge for a row with a malformed parent_pid - but
+    "cannot place" must not collapse to "not ours". A PRIOR entry (an
+    owned intermediate the walk once admitted) whose CURRENT row has a
+    malformed parent_pid contributes no edge either way, and since a
+    discovery ROOT is deliberately never itself checked against `owned`
+    (only its descendants are - a root simply exiting is normal), a
+    childless malformed-parent root would sit at rejected_count 0
+    forever if nothing else names it. This test isolates exactly that
+    shape (no grandchild at all, so the existing discovery-closure
+    reconciliation for a live descendant plays no part) under an
+    untrusted-but-readable prior, where the trusted-rehydration block's
+    own prior_parent_drift check does not run either."""
+    intermediate_pid = 500
+    first_snapshot = [
+        *_wrap_snap(),
+        _proc(intermediate_pid, WRAP_CHILD_PID, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000)),
+    ]
+    first = _owned_tree_plan(first_snapshot, request_id="rr-150-malformed-parent-first")
+    complete_tree = first["next_state"]["owned_process_tree"]
+    assert complete_tree["status"] == "complete"
+    assert intermediate_pid in [e["pid"] for e in complete_tree["entries"]]
+
+    untrusted_state = dict(first["next_state"])
+    untrusted_tree = dict(complete_tree)
+    untrusted_tree["status"] = "invalid"
+    untrusted_tree["reason_code"] = "process_tree_invalid_generation_adoption_pending"
+    untrusted_state["owned_process_tree"] = untrusted_tree
+
+    # Second poll: same pid, same start/filetime (still "same" identity,
+    # not a recycled/different one) - only parent_pid is now malformed,
+    # exactly the shape a transient WMI/CIM hiccup on one row produces.
+    malformed_row = {
+        **_proc(intermediate_pid, WRAP_CHILD_PID, "pwsh.exe", "pwsh tool.ps1", _ps_iso(700000)),
+        "parent_pid": None,
+    }
+    second_snapshot = [*_wrap_snap(), malformed_row]
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-150-malformed-parent-second"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                now=NOW + 1,
+            ),
+        ),
+        {"agents": {"worker": untrusted_state}},
+        now=NOW + 1,
+        snapshot=second_snapshot,
+    )
+    tree = second["next_state"]["owned_process_tree"]
+    assert tree["status"] == "invalid"
+    assert tree["rejected_count"] >= 1
+    assert intermediate_pid not in [e["pid"] for e in tree["entries"]]
 
 
 def test_reset_remedy_names_rejected_candidates_separately_from_omitted() -> None:

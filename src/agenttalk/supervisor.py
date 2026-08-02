@@ -3427,6 +3427,29 @@ def _owned_process_tree(
         _prior_pid = _prior_entry.get("pid") if isinstance(_prior_entry, dict) else None
         if isinstance(_prior_pid, int) and not isinstance(_prior_pid, bool):
             discovery_roots.add(_prior_pid)
+    # Task #150 round 5 connector finding 1: a PRIOR entry's own current
+    # row can have a malformed parent_pid - _snap_all_edges below correctly
+    # cannot place it (no valid edge to build), but "cannot place" must not
+    # collapse to "not ours". The trusted-rehydration block above already
+    # calls mark_rejected("prior_parent_drift") for exactly this shape, but
+    # ONLY when prior_authority is trusted (status == "complete") - an
+    # untrusted-but-readable prior (the same generation-adoption-pending
+    # exemption round 3's finding 5 needed) skips that block entirely, so
+    # a since-corrupted intermediate the prior once recorded would
+    # otherwise sit at rejected_count 0 forever. This check is independent
+    # of that trust gate on purpose - it does NOT retire the rehydration
+    # block's own check (a double-count there is harmless; rejected_count
+    # is a gate, not an exact tally).
+    for _prior_entry in prior_entries:
+        _prior_pid = _prior_entry.get("pid") if isinstance(_prior_entry, dict) else None
+        if not isinstance(_prior_pid, int) or isinstance(_prior_pid, bool):
+            continue
+        _prior_row = idx.get(_prior_pid)
+        if not isinstance(_prior_row, dict):
+            continue
+        _prior_parent_pid = _prior_row.get("parent_pid")
+        if not isinstance(_prior_parent_pid, int) or isinstance(_prior_parent_pid, bool):
+            mark_rejected("prior_entry_parent_pid_malformed")
     # Task #150 round 4 connector finding 1: children.get(...) above is
     # _children_map(idx) - built from the DEDUPED idx, so a pid _snap_index
     # excluded for identity ambiguity (a duplicate or malformed row) has no
@@ -6812,15 +6835,34 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         has_entries = bool(owned_tree.get("entries"))
         rejected_count = owned_tree.get("rejected_count")
         if has_entries:
-            rejected_clause = (
-                f" This record also excluded {rejected_count} candidate(s) "
-                "the walk could not admit (rejected_count) - the reset "
-                "command's own identity list does not include them, so "
-                "confirming those specifically gone is on you, not the "
-                "command."
-                if isinstance(rejected_count, int) and rejected_count > 0
-                else ""
-            )
+            # Round 4 (connector finding 2, the same wrong direction a third
+            # time): a legacy v2 record predates rejected_count entirely -
+            # missing, not zero, is what keeps it out of absence-promotion
+            # (see the v2-migration fix), but that same "unknown" must warn
+            # here too. Warning only for a known positive integer told the
+            # operator a v2 record excluded nothing, when the truth is the
+            # walk that produced it never even counted - absent must warn
+            # like unknown, not like zero.
+            if isinstance(rejected_count, int) and rejected_count > 0:
+                rejected_clause = (
+                    f" This record also excluded {rejected_count} "
+                    "candidate(s) the walk could not admit (rejected_count) "
+                    "- the reset command's own identity list does not "
+                    "include them, so confirming those specifically gone is "
+                    "on you, not the command."
+                )
+            elif rejected_count is None:
+                rejected_clause = (
+                    " This record predates rejected_count (an older "
+                    "schema) so whether the walk that produced it excluded "
+                    "any candidate is UNKNOWN, not zero - the reset "
+                    "command's own identity list cannot cover an excluded "
+                    "candidate either way, so treat this the same as a "
+                    "nonzero count: confirming anything beyond the named "
+                    "entries gone is on you, not the command."
+                )
+            else:
+                rejected_clause = ""
             remedy = (
                 "recovery: if every process this record could name is "
                 "confirmed gone - including any omitted by a truncated "
