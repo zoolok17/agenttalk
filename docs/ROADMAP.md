@@ -233,22 +233,41 @@ walk. The rule predates the release; upgrading makes it *visible*, since an inva
 survives every restart and code upgrade. Clearing it is per-agent and fully attended. See `CHANGELOG.md`
 §0.81.0 "Known limitations" and the self-healing follow-up on the recovery board.
 
-#### v0.82.0 — "a wrapped agent never dies silently" *(runtime)*
+#### v0.82.0 — "the supervisor can see and start the fleet, or says plainly that it cannot" *(runtime)*
+
+**Re-scoped 2026-08-03 on two-host field evidence.** This release was declared as "a wrapped agent never
+dies silently". That is observability polish, and on 2026-08-03 we measured something more basic: after a
+host reboot the supervisor can neither start the fleet nor *see* the fleet an operator starts by hand.
+Nine agents on the maintainers' host and twelve on a second, independent host (different reason code,
+all entry points confirmed on 0.81.0, so not version skew) were recovered only by bypassing the
+supervisor entirely. An agent that never launches cannot die silently. The three deferred items below
+move to v0.83.0.
 
 | Item | What |
 |---|---|
-| Gate execution outside the turn envelope | Running the project's own gate inside a wrapped turn *guarantees* a watchdog kill: the source pytest leg caps at 2700s while the watchdog tolerates a 600s tool descendant inside a 1800s turn. The practice half (targeted tests in-turn, CI as the gate) is already in force; this ships the durable half — an owned, bounded, start-guarded detached runner that outlives the turn and writes SHA-bound evidence. |
-| Same-message livelock visibility | A message whose processing wedges the wrapper is retried forever, and every later instruction — including the one that would fix it — is starved behind it. The runtime record already carries `message_id`; nothing compares it across turns. Surface consecutive same-message turn starts, and park a repeatedly-wedging message rather than starving the queue. |
-| Strict health reaches operator surfaces | The strict child verdict never reached `status`, `doctor` or the console, so a wrapper with a dead child reads green. A verdict must not be presented where an observation belongs. |
-| Provision the `.agenttalk/` ignore rule | `ASSURANCE.md` asserts the state directory is gitignored as a *structural* property, but nothing provisions the rule on `init`. |
+| **Cold start and adoption** *(keystone)* | Two claims, the second worse. (a) `PROCESS_TREE_INVALID` yields `action=warn_only`, which pre-empts the LAUNCH decision — measured across 20+ polls with zero launches, and an explicit `request-restart` was accepted with "the supervisor will relaunch it" and did not. A HOLD is *teardown* authority; it has no bearing on starting a process that does not exist. (b) `generation_adoption_pending` never resolves: four hand-launched wrappers that heartbeat, completed real turns and replied on the bus still read `observed_count=0, launched=false` after 40 minutes. Adoption must be reachable from observing the live process graph, not only from a launch the supervisor performed itself, and any state whose name promises a transition needs a bounded deadline that escalates. Regression test at *fleet* level: cold host, stale invalid records on disk, plus one hand-started wrapper — every agent launches and the running one is adopted. |
+| Strict health reaches operator surfaces | The strict child verdict never reached `status`, `doctor` or the console, so a wrapper with a dead child reads green. A verdict must not be presented where an observation belongs. **Implemented in PR #100** with a shared two-poll freshness allowance across status/doctor/web; ships with this theme rather than anchoring a different one. |
+| Wrapper capture on every launch path | The #117 bounded stdout/stderr capture is wired into the *generated PowerShell launcher*, not the wrapper, so a wrapper started any other way — including the only working recovery for the keystone above — produces no log at all. Confirmed on both hosts, for healthy and failing agents alike. Its log root is also a hashed path (`%LOCALAPPDATA%\agenttalk\wrapper-logs\<project-hash>\agent-<hash>\`) that no document names and no command prints. Move the capture into the wrapper's own startup and expose the resolved root. |
+| Instance-marker honesty | Stale singleton markers are chronic, not incidental: five quarantines on one host since 2026-07-16. Ctrl-C on `agenttalk start` is not a stop and nothing says so; the orphan keeps the lock, the next `start` prints a success line for a pid that never existed, and the resulting process stays alive writing no state, snapshot or events because it never won the claim. Detect a marker whose holder is dead or parentless, name `--repair-instance-marker`, and never print a pid that was not verified to exist. |
 
 #### v0.83.0 — "recovery actually recovers"
 
-Umbrella first, per the release discipline.
+Umbrella first, per the release discipline. Carries the three items deferred from v0.82.0's original scope.
+
+**OVER-SUBSCRIBED — needs a split before it is built.** Six live items against the four-item cap in the
+release discipline. Recorded here rather than silently absorbed, because a release that quietly grows past
+its cap is how v0.80.0 shrank from four items to one mid-round. The recommended split when this comes up:
+keep the umbrella with "terminate an orphaned wrapper" and "absence is not staleness" (all three are the
+same recovery-authority question), and move "gate execution outside the turn envelope", "same-message
+livelock visibility" and the `.agenttalk/` ignore rule into a separate turn-envelope/hygiene release. That
+call belongs to whoever scopes v0.83.0, not to this note.
 
 | Item | What |
 |---|---|
-| Define + gate the recovery-actually-recovers invariant | The umbrella. Recovery currently *attempts* and reports success while nothing recovers. Make the invariant explicit and gated. |
+| Define + gate the recovery-actually-recovers invariant | The umbrella. Recovery currently *attempts* and reports success while nothing recovers. Make the invariant explicit and gated. Its first falsifiable entry is now measured rather than hypothetical: a supervisor that polls twenty times, reports `warn_only`, accepts an explicit restart request, and launches nothing, while its own record says the wrapper is absent. |
+| Gate execution outside the turn envelope | Running the project's own gate inside a wrapped turn *guarantees* a watchdog kill: the source pytest leg caps at 2700s while the watchdog tolerates a 600s tool descendant inside a 1800s turn. The practice half (targeted tests in-turn, CI as the gate) is already in force; this ships the durable half — an owned, bounded, start-guarded detached runner that outlives the turn and writes SHA-bound evidence. |
+| Same-message livelock visibility | A message whose processing wedges the wrapper is retried forever, and every later instruction — including the one that would fix it — is starved behind it. The runtime record already carries `message_id`; nothing compares it across turns. Surface consecutive same-message turn starts, and park a repeatedly-wedging message rather than starving the queue. Deferred from v0.82.0: it cannot bite an agent that never launches. |
+| Provision the `.agenttalk/` ignore rule | `ASSURANCE.md` asserts the state directory is gitignored as a *structural* property, but nothing provisions the rule on `init`. Deferred from v0.82.0. |
 | ~~Owned process tree per agent~~ | **Shipped early in v0.81.0** (#120) — pulled forward because the wedge frequency made it the blocker. Left here for the trail; do not re-plan it. |
 | Terminate an orphaned wrapper; bound the retry | Recovery is defined as "launch a replacement", which the launch barrier correctly refuses while the incumbent survives — so the cycle backs off exponentially and fades into silence. Something must own terminating a *provably childless* wrapper, and the retry cycle needs a hard cap that escalates instead of going quiet. |
 | Absence is not staleness | A twice-confirmed-absent wrapper waits out the per-CLI heartbeat threshold (up to 2400s for Codex) before relaunch. The heartbeat answers "is this agent still working?"; a complete process snapshot answers "does this process exist?" — conflating them is the defect. Independently stageable, and must not wait for the rest of the recovery-authority design. |
