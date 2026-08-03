@@ -197,7 +197,28 @@ _SAFE_WRAPPER_GENERATION_RE = re.compile(
 # record never earned. schema_version is deliberately NOT bumped: the
 # field's own optionality is the migration, so there is nothing for a
 # version bump to gate that isn't already handled without one.
-_OWNED_PROCESS_TREE_OPTIONAL_FIELDS = frozenset({"rejected_count"})
+#
+# The walk_complete inversion (task #150 follow-up): rejected_count == 0
+# (with omitted_count == 0 and at least one entry) was the eligibility bar
+# for re-deriving absence from an invalid prior - but that bar is chasing
+# the ABSENCE of recorded rejections, which is the default state of an
+# integer and therefore free to every new or narrowed code path that never
+# ran a real walk (inherited, defaulted, hardcoded, or a status relabel).
+# walk_complete inverts it: positive evidence a complete walk actually ran,
+# set in exactly one place (the end of _owned_process_tree's own walk) as
+# the SAME conjunction (bool(entries) and omitted_count == 0 and
+# rejected_count == 0) plus not prior_record_invalid - computed once, at
+# the source, while the inputs are freshly known, instead of re-derived by
+# every later reader from fields that can be inherited or defaulted
+# without ever having been jointly checked. rejected_count/omitted_count
+# remain in the schema as diagnostics and the operator-facing count, where
+# accuracy still matters, but they stop being independently load-bearing
+# for the safety decision. Optional for the identical v2-migration reason
+# rejected_count is: a record from before this field existed is still
+# valid, readable authority; a missing walk_complete reads as unknown,
+# already ineligible for re-derivation - the correct meaning, since no
+# walk is known to have run.
+_OWNED_PROCESS_TREE_OPTIONAL_FIELDS = frozenset({"rejected_count", "walk_complete"})
 _OWNED_PROCESS_TREE_FIELDS = frozenset({
     "schema_version",
     "attribution_model",
@@ -210,6 +231,7 @@ _OWNED_PROCESS_TREE_FIELDS = frozenset({
     "recorded_count",
     "omitted_count",
     "rejected_count",
+    "walk_complete",
     "truncated",
     "refreshed_at",
     "wrapper_generation",
@@ -2532,13 +2554,15 @@ def _valid_owned_process_tree(
     if not isinstance(value, dict):
         return None
     value_keys = frozenset(value)
-    # A v2 record (predates rejected_count) is missing exactly one optional
-    # key - still a complete, valid schema for everything it DOES claim; see
+    # A record may predate rejected_count, walk_complete, both, or neither -
+    # three migration boundaries have added an optional key to this schema
+    # independently, and a record's age determines which subset it has, not
+    # which single field is missing. Any set of optional keys present is
+    # schema-valid for everything the record DOES claim; see
     # _OWNED_PROCESS_TREE_OPTIONAL_FIELDS' own comment for why that must not
     # collapse to schema-invalid.
-    if value_keys != _OWNED_PROCESS_TREE_FIELDS and value_keys != (
-        _OWNED_PROCESS_TREE_FIELDS - _OWNED_PROCESS_TREE_OPTIONAL_FIELDS
-    ):
+    mandatory_fields = _OWNED_PROCESS_TREE_FIELDS - _OWNED_PROCESS_TREE_OPTIONAL_FIELDS
+    if not (mandatory_fields <= value_keys <= _OWNED_PROCESS_TREE_FIELDS):
         return None
     status = value.get("status")
     record_generation = value.get("wrapper_generation")
@@ -2620,6 +2644,27 @@ def _valid_owned_process_tree(
         and rejected_count != 0
     ):
         return None
+    # walk_complete is the other OPTIONAL field - absent means unknown,
+    # never True, for the identical v2-migration reason rejected_count is
+    # optional. A "complete" tree ALWAYS has walk_complete True by
+    # construction (see _owned_process_tree: status can only be "complete"
+    # when the same walk that set it also had omitted_count == 0,
+    # rejected_count == 0, and a non-empty entries list - the schema
+    # already requires entries non-empty whenever status != "invalid").
+    # Eligibility grants complete/absent unconditionally regardless of
+    # walk_complete's own value, so it is not load-bearing for either
+    # status here - but a record explicitly claiming complete/absent WITH
+    # walk_complete written as False is internally contradictory the same
+    # way a nonzero rejected_count is, and must not read as authoritative
+    # just because the field itself still parses.
+    if "walk_complete" in value:
+        walk_complete = value.get("walk_complete")
+        if not isinstance(walk_complete, bool):
+            return None
+    else:
+        walk_complete = None
+    if status in {"complete", "absent"} and walk_complete is False:
+        return None
     entries = value.get("entries")
     if (
         not isinstance(entries, list)
@@ -2628,6 +2673,25 @@ def _valid_owned_process_tree(
         or recorded_count > _OWNED_PROCESS_TREE_LIMIT
         or observed_count != recorded_count + omitted_count
         or value.get("truncated") is not (omitted_count > 0)
+    ):
+        return None
+    # Task #150 follow-up connector finding: the checks above only typed
+    # walk_complete and rejected the False-with-complete/absent
+    # contradiction - they never constrained True against the conjunction
+    # that is supposed to have earned it. A persisted record claiming
+    # walk_complete True while omitted_count/rejected_count are nonzero, or
+    # rejected_count is unknown, or entries is empty, is exactly as
+    # internally contradictory as the existing nonzero-rejected_count-on-
+    # complete/absent check above (same shape, same round-3 precedent) -
+    # and reading it as authoritative here would make the inversion WORSE
+    # than the re-derivation it replaced: the old entries_are_complete
+    # re-derivation would have caught this record; a bare type-check on a
+    # single boolean would not. This does not require the flag to be
+    # PRESENT - only present-and-True must match its own preconditions;
+    # absent or False stays eligible-by-nothing (unknown), never rejected
+    # for a conjunction the record never claimed to have earned.
+    if walk_complete is True and not (
+        bool(entries) and omitted_count == 0 and rejected_count == 0
     ):
         return None
     reason_code = value.get("reason_code")
@@ -2975,29 +3039,34 @@ def _unverified_owned_process_tree(
     only counts the size-cap gap between admitted nodes and recorded entries,
     never a candidate branch the walk SAW and explicitly excluded for any
     other reason (an unproven virtual-parent descendant with a live child,
-    say). rejected_count (see _OWNED_PROCESS_TREE_FIELDS) is the field that
-    actually means "nothing the walk considered was left unaccounted for" -
-    both it and omitted_count must be zero, with at least one entry recorded,
-    for an invalid prior to qualify. A TRUNCATED prior's entries are
-    incomplete by definition (omitted_count > 0) and never qualifies:
-    proving the recorded subset gone says nothing about whatever the size cap
-    dropped. A prior with no entries at all (schema-drift/generation-adoption
-    placeholders built by _invalid_owned_process_tree_record, never a real
-    tree walk) has nothing to disprove against and never qualifies either.
-    Any prior identity still present, or an unavailable/poisoned CURRENT
-    snapshot, remains sticky HOLD evidence exactly as before.
+    say). A TRUNCATED prior's entries are incomplete by definition
+    (omitted_count > 0) and never qualifies: proving the recorded subset
+    gone says nothing about whatever the size cap dropped. A prior with no
+    entries at all (schema-drift/generation-adoption placeholders built by
+    _invalid_owned_process_tree_record, never a real tree walk) has nothing
+    to disprove against and never qualifies either. Any prior identity
+    still present, or an unavailable/poisoned CURRENT snapshot, remains
+    sticky HOLD evidence exactly as before.
+
+    The walk_complete inversion (task #150 follow-up): the bar an invalid
+    prior must clear used to be re-derived here as "omitted_count == 0 and
+    rejected_count == 0 with at least one entry" - chasing the ABSENCE of
+    recorded rejections, which is the default state of an integer and
+    therefore free to any producer that inherited, defaulted, or hardcoded
+    the count without ever running a walk. walk_complete is the inversion:
+    positive evidence a complete walk actually produced this record,
+    stamped once by _owned_process_tree itself at the moment its inputs
+    were freshly known, read here rather than re-derived. Missing (a
+    record from before this field existed, or one a non-walking producer
+    relabeled without carrying it forward) reads as unknown - already
+    ineligible, the correct meaning.
     """
     if prior is None:
         return None
     entries = prior.get("entries")
-    entries_are_complete = (
-        isinstance(entries, list)
-        and bool(entries)
-        and prior.get("omitted_count") == 0
-        and prior.get("rejected_count") == 0
-    )
+    walk_complete = prior.get("walk_complete") is True
     eligible_for_rederivation = prior.get("status") in {"complete", "absent"} or (
-        prior.get("status") == "invalid" and entries_are_complete
+        prior.get("status") == "invalid" and walk_complete
     )
     if not eligible_for_rederivation:
         held = copy.deepcopy(prior)
@@ -3063,13 +3132,16 @@ def _unverified_owned_process_tree(
     # PowerShell post-kill barrier, which strips this same field at its own
     # mutation sites for the identical reason. rejected_count == 0 was true
     # of the walk that produced `prior`; it says nothing about THIS poll,
-    # which performed no walk at all. Left uncorrected, a LATER poll's
-    # entries_are_complete check reads that stale zero as proof this
-    # invalid record is complete, re-admitting it for absence-promotion on
-    # an accounting question nobody actually asked this poll. Missing reads
-    # as unknown - already ineligible for re-derivation - which is the
-    # correct meaning: we genuinely do not know.
+    # which performed no walk at all. Kept stripped for the operator-facing
+    # message's own accuracy - it is diagnostics now, not the safety gate,
+    # but a stale zero would still misreport what THIS poll knows.
     held.pop("rejected_count", None)
+    # The walk_complete inversion: `prior` may have carried walk_complete
+    # True from whatever walk actually produced it - copying that forward
+    # onto THIS relabeled record would claim the identical positive fact
+    # this conversion performed no walk to earn. Missing reads as unknown,
+    # already ineligible for re-derivation - the correct meaning here too.
+    held.pop("walk_complete", None)
     return held
 
 
@@ -3747,6 +3819,24 @@ def _owned_process_tree(
     else:
         status = "complete"
         reason_code = None
+    # The walk_complete inversion: positive evidence THIS walk actually ran
+    # to completion, computed once, here, while every input is freshly
+    # known - not re-derived later from fields that can be inherited,
+    # defaulted, or hardcoded without ever having been jointly checked.
+    # The identical conjunction _unverified_owned_process_tree's own
+    # eligibility check used to re-derive as entries_are_complete, plus
+    # not prior_record_invalid: a narrowed rebuild over a malformed prior's
+    # DISCARDED historical entries (prior_by_pid empty, discovery never
+    # seeded from anything but the wrapper) can admit everything IT saw
+    # cleanly and still read complete relative to a smaller graph than the
+    # one that matters - the gap _unverified_owned_process_tree could never
+    # close from outside, since prior_record_invalid is local to this call.
+    walk_complete = (
+        bool(entries)
+        and omitted_count == 0
+        and rejected_count == 0
+        and not prior_record_invalid
+    )
     tree = {
         "schema_version": _OWNED_PROCESS_TREE_SCHEMA,
         "attribution_model": _OWNED_PROCESS_TREE_MODEL,
@@ -3759,6 +3849,7 @@ def _owned_process_tree(
         "recorded_count": len(entries),
         "omitted_count": omitted_count,
         "rejected_count": rejected_count,
+        "walk_complete": walk_complete,
         "truncated": bool(omitted_count),
         "refreshed_at": refreshed_at,
         "wrapper_generation": wrapper_generation,
@@ -11988,6 +12079,11 @@ $pollNum = 0
             # downstream, never zero - the same shape the v2-migration fix
             # already relies on for a field a record simply never had.
             $p.barrier_state.owned_process_tree.PSObject.Properties.Remove('rejected_count')
+            # walk_complete inversion: this mutation is a status relabel by
+            # THIS barrier's own accounting, not a Python walk - it must not
+            # leave a stale walk_complete=true claiming a fresh walk earned
+            # this record when none ran. Same removal, same reason.
+            $p.barrier_state.owned_process_tree.PSObject.Properties.Remove('walk_complete')
           }
           if ($p.barrier_state) { Set-AgentState $state $name $p.barrier_state } else { Set-AgentState $state $name $p.next_state }
           if (-not (Save-StateForPoll $state)) {
@@ -12208,6 +12304,9 @@ $pollNum = 0
             # comment on the relaunch/stuck_recover barrier above - same
             # second-producer shape, same fix.
             $p.next_entry.owned_process_tree.PSObject.Properties.Remove('rejected_count')
+            # walk_complete inversion: same reasoning, sibling field - see
+            # the matching comment on the relaunch/stuck_recover barrier.
+            $p.next_entry.owned_process_tree.PSObject.Properties.Remove('walk_complete')
           }
           $p.next_entry | Add-Member -NotePropertyName process_tree_hold_reason `
             -NotePropertyValue ("process_tree_invalid_post_kill_{0}" -f $why) -Force
