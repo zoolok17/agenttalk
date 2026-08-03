@@ -27,7 +27,7 @@ from agenttalk.ovh_gateway_front import (
     GatewayFront,
     StreamUsage,
 )
-from tests._socket_harness import (
+from _socket_harness import (
     CANCELLATION_JOIN_SECONDS,
     CompletionBudget,
     ServerActivity,
@@ -840,6 +840,68 @@ def test_request_policy_rejects_wrong_model_and_output_limit_before_reserve(tmp_
         assert status == 422
         assert upstream.requests == []
         assert front.ledger.status()["unresolved"] == []
+
+
+def test_inflight_front_exchange_has_no_socket_deadlines(tmp_path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    results: list[tuple[int, bytes]] = []
+    errors: list[BaseException] = []
+
+    with FakeUpstream(entered=entered, release=release) as upstream, RunningFront(
+        tmp_path,
+        upstream,
+    ) as front:
+        def request() -> None:
+            try:
+                results.append(front.request())
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=request, daemon=True)
+        worker.start()
+        try:
+            if not front.completion_budget.wait(entered):
+                raise front.completion_budget.timeout("provider entry")
+
+            client_sockets = [
+                connection
+                for cancellation in front.client_cancellations
+                for connection in cancellation.sockets
+                if connection.fileno() != -1
+            ]
+            internal_sockets = [
+                connection
+                for connection in front._internal_cancellation.sockets
+                if connection.fileno() != -1
+            ]
+            assert client_sockets
+            assert internal_sockets
+            assert all(
+                connection.gettimeout() is None
+                for connection in client_sockets + internal_sockets
+            )
+            assert not completed.is_set()
+        finally:
+            release.set()
+            if not completed.is_set():
+                try:
+                    finished = front.completion_budget.wait(completed)
+                except AssertionError:
+                    finished = False
+                if not finished:
+                    front.cancel_active_requests()
+            worker.join(timeout=CANCELLATION_JOIN_SECONDS)
+            if worker.is_alive():
+                front.cancel_active_requests()
+                worker.join(timeout=CANCELLATION_JOIN_SECONDS)
+            assert not worker.is_alive()
+
+        assert errors == []
+        assert results and results[0][0] == 200
 
 
 def test_single_permit_covers_transport_through_settlement(tmp_path) -> None:

@@ -19,7 +19,7 @@ from agenttalk.ovh_gateway import (
     settlement_cost_micro_eur,
 )
 from agenttalk.ovh_gateway_front import FrontConfig, GatewayFront
-from tests._socket_harness import (
+from _socket_harness import (
     CANCELLATION_JOIN_SECONDS,
     CompletionBudget,
     ServerActivity,
