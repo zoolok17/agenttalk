@@ -765,7 +765,11 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
             now_epoch=now_epoch,
             state=_read_supervisor_state(store),
             supervisor_config=sup_cfg,
-            snapshot=_read_supervisor_snapshot(store),
+            snapshot=sup.read_supervisor_snapshot_if_fresh(
+                store.dir / "supervisor-snapshot.json",
+                now_epoch=now_epoch,
+                stale_after_seconds=sup.resolve_snapshot_stale_after_seconds(sup_cfg),
+            ),
             event_limit=0,
             lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )

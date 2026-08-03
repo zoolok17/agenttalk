@@ -1839,10 +1839,34 @@ def _redacted_observation_plan(plan: dict) -> dict:
 # stopped polling, or one running with actions disabled after an enabled run,
 # leaves a stale file on disk indefinitely. Reading it unconditionally would
 # let a caller present old process facts as a FRESH strict verdict - lying
-# with MORE authority than the raw self-report did. 300s generously covers
-# any normal poll cadence (default 15s) while still catching a truly-stopped
-# daemon quickly.
+# with MORE authority than the raw self-report did. The 300s floor generously
+# covers the default 15s cadence; slower configured cadences need an allowance
+# derived from that cadence or a healthy snapshot becomes stale between polls.
 SNAPSHOT_STALE_AFTER_SECONDS = 300.0
+
+
+def resolve_snapshot_stale_after_seconds(supervisor_config: dict | None) -> float:
+    """Return a freshness window compatible with the configured poll cadence.
+
+    Two complete intervals cover one scheduled sleep plus the following
+    observation/action cycle. The 300s floor preserves the existing default
+    behavior and still rejects snapshots left behind by a stopped supervisor.
+    Malformed cadence values never expand the trust window.
+    """
+    config = supervisor_config if isinstance(supervisor_config, dict) else {}
+    poll = config.get("poll_seconds", _DEFAULTS["poll_seconds"])
+    if not isinstance(poll, (int, float)) or isinstance(poll, bool):
+        return SNAPSHOT_STALE_AFTER_SECONDS
+    try:
+        poll_seconds = float(poll)
+    except (OverflowError, ValueError):
+        return SNAPSHOT_STALE_AFTER_SECONDS
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        return SNAPSHOT_STALE_AFTER_SECONDS
+    allowance = poll_seconds * 2.0
+    if not math.isfinite(allowance):
+        return SNAPSHOT_STALE_AFTER_SECONDS
+    return max(SNAPSHOT_STALE_AFTER_SECONDS, allowance)
 
 
 def read_supervisor_snapshot_if_fresh(
@@ -1851,16 +1875,22 @@ def read_supervisor_snapshot_if_fresh(
 ) -> list[dict] | None:
     """Read ``supervisor-snapshot.json``, but only if its FILE mtime is fresh.
 
-    A stale, absent, or malformed file returns ``None`` — the SAME "capture
-    failed" signal a genuinely missing snapshot already produces, so a
-    downstream wrapped-agent classification fails closed (CLI_CHILD_UNKNOWN)
-    rather than silently trusting old process facts.
+    A stale, implausibly future-dated, absent, or malformed file returns
+    ``None`` — the SAME "capture failed" signal a genuinely missing snapshot
+    already produces, so a downstream wrapped-agent classification fails
+    closed (CLI_CHILD_UNKNOWN) rather than silently trusting old process
+    facts. The shared heartbeat skew allowance covers the small race where
+    callers capture ``now_epoch`` immediately before a concurrent refresh.
     """
     try:
         mtime = path.stat().st_mtime
     except OSError:
         return None
-    if now_epoch - mtime > stale_after_seconds:
+    age = now_epoch - mtime
+    if (
+        age < -health_model.DEFAULT_HEARTBEAT_SKEW_SECONDS
+        or age > stale_after_seconds
+    ):
         return None
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))

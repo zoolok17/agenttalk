@@ -135,6 +135,41 @@ def test_check_wrapper_child_health_surfaces_strict_verdict_over_self_report(
     assert hb_alpha.status == "ok"
 
 
+def test_check_wrapper_child_health_snapshot_freshness_respects_configured_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "poll_seconds": 600,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    snapshot_path = store.dir / "supervisor-snapshot.json"
+    rows = [{"pid": 123}]
+    snapshot_path.write_text(json.dumps(rows), encoding="utf-8")
+    snapshot_epoch = time.time() - 400.0
+    os.utime(snapshot_path, (snapshot_epoch, snapshot_epoch))
+    observed_snapshots: list[object] = []
+
+    def assessment(_store, **kwargs):
+        observed_snapshots.append(kwargs.get("snapshot"))
+        return {"agents": [{
+            "name": "alpha",
+            "health": {"state": "working_turn", "age_seconds": 1.0},
+            "decision": {"state": "HEALTHY_WORKING", "action": "none", "reason": "bound"},
+        }]}
+
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", assessment)
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert observed_snapshots == [rows]
+    assert len(checks) == 1
+    assert checks[0].status == "ok"
+
+
 def test_check_wrapper_child_health_no_false_down_when_healthy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

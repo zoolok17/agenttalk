@@ -1828,7 +1828,10 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
         # A stale snapshot must not be read as a live liveness fact (see
         # read_supervisor_snapshot_if_fresh's docstring).
         snapshot = sup.read_supervisor_snapshot_if_fresh(
-            store.dir / "supervisor-snapshot.json", now_epoch=now_epoch)
+            store.dir / "supervisor-snapshot.json",
+            now_epoch=now_epoch,
+            stale_after_seconds=sup.resolve_snapshot_stale_after_seconds(sup_cfg),
+        )
         obs = sup.build_supervisor_observation(
             store, now_epoch=now_epoch, state=state, supervisor_config=sup_cfg,
             snapshot=snapshot, event_limit=0,

@@ -551,6 +551,78 @@ def test_status_flags_disagreement_between_self_report_and_strict_verdict(
     assert "[DISAGREEMENT]" in line  # direction control: absent before the fix
 
 
+def test_status_rejects_stale_snapshot_before_computing_strict_verdict(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A stale process row must not turn a strict non-green assessment into
+    HEALTHY_WORKING while raw wrapper health is still cheerfully green."""
+    s = Store(store_root)
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    snapshot_path = s.dir / "supervisor-snapshot.json"
+    snapshot_path.write_text(json.dumps([{"pid": 123}]), encoding="utf-8")
+    os.utime(snapshot_path, (1.0, 1.0))
+    observed_snapshots: list[object] = []
+
+    def assessment(_store, **kwargs):
+        snapshot = kwargs.get("snapshot")
+        observed_snapshots.append(snapshot)
+        state = "CLI_CHILD_UNKNOWN" if snapshot is None else "HEALTHY_WORKING"
+        return _fake_decision(state)
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", assessment)
+
+    assert _run(["status", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+
+    assert observed_snapshots == [None]
+    assert alpha["health"]["state"] == "working_turn"
+    assert alpha["supervisor"]["decision"]["state"] == "CLI_CHILD_UNKNOWN"
+    assert alpha["supervisor"]["disagreement"] is True
+
+
+def test_status_snapshot_freshness_respects_configured_poll_interval(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = Store(store_root)
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "poll_seconds": 600,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    snapshot_path = s.dir / "supervisor-snapshot.json"
+    rows = [{"pid": 123}]
+    snapshot_path.write_text(json.dumps(rows), encoding="utf-8")
+    snapshot_epoch = time.time() - 400.0
+    os.utime(snapshot_path, (snapshot_epoch, snapshot_epoch))
+    observed_snapshots: list[object] = []
+
+    def assessment(_store, **kwargs):
+        observed_snapshots.append(kwargs.get("snapshot"))
+        return _fake_decision("HEALTHY_WORKING")
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", assessment)
+
+    assert _run(["status", "--json"], store_root) == 0
+    capsys.readouterr()
+    assert observed_snapshots == [rows]
+
+
 def test_status_no_disagreement_flag_for_a_genuinely_healthy_agent(
     store_root: Path,
     monkeypatch: pytest.MonkeyPatch,

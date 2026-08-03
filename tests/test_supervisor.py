@@ -756,6 +756,64 @@ def test_read_supervisor_snapshot_if_fresh_returns_the_real_rows_when_current(
     assert got == rows
 
 
+def test_read_supervisor_snapshot_if_fresh_bounds_future_mtime(
+    tmp_path: Path,
+) -> None:
+    """Allow the stat-after-clock-read race, but never trust rows timestamped
+    beyond the project's explicit clock-skew allowance."""
+    path = tmp_path / "supervisor-snapshot.json"
+    rows = [{"pid": 123, "start": "t0", "name": "python.exe"}]
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    mtime = path.stat().st_mtime
+
+    assert sup.read_supervisor_snapshot_if_fresh(
+        path,
+        now_epoch=mtime - 1.0,
+    ) == rows
+    assert sup.read_supervisor_snapshot_if_fresh(
+        path,
+        now_epoch=mtime - hm.DEFAULT_HEARTBEAT_SKEW_SECONDS - 1.0,
+    ) is None
+
+
+def test_snapshot_freshness_allowance_covers_a_configured_slow_poll(
+    tmp_path: Path,
+) -> None:
+    """A supported 600s supervisor cadence must not make its own snapshot
+    stale halfway between polls. The default 300s floor still applies to the
+    normal 15s cadence; slower configured cadences get two full intervals."""
+    path = tmp_path / "supervisor-snapshot.json"
+    rows = [{"pid": 123, "start": "t0", "name": "python.exe"}]
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    allowance = sup.resolve_snapshot_stale_after_seconds({"poll_seconds": 600})
+
+    got = sup.read_supervisor_snapshot_if_fresh(
+        path,
+        now_epoch=path.stat().st_mtime + 900,
+        stale_after_seconds=allowance,
+    )
+
+    assert allowance == 1200.0
+    assert got == rows
+    assert sup.read_supervisor_snapshot_if_fresh(
+        path,
+        now_epoch=path.stat().st_mtime + allowance + 1.0,
+        stale_after_seconds=allowance,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "poll_seconds",
+    [None, True, -1, float("inf"), 1e308, 10**400, "600"],
+)
+def test_snapshot_freshness_allowance_rejects_malformed_poll_values(
+    poll_seconds: object,
+) -> None:
+    assert sup.resolve_snapshot_stale_after_seconds({
+        "poll_seconds": poll_seconds,
+    }) == sup.SNAPSHOT_STALE_AFTER_SECONDS
+
+
 def test_read_supervisor_snapshot_if_fresh_rejects_a_stale_file(
     tmp_path: Path,
 ) -> None:

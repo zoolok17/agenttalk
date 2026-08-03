@@ -12,6 +12,7 @@ import hashlib
 import http.client
 import inspect
 import json
+import os
 import re
 import shutil
 import socket
@@ -2865,6 +2866,17 @@ const unavailable = hooks.agentStateInfo({
 assert(unavailable.key === 'supervisor_unavailable', `expected supervisor_unavailable, got ${unavailable.key}`);
 assert(unavailable.color === 'attn', `expected attn, got ${unavailable.color}`);
 
+// Current-master process-tree HOLDs are strict supervisor verdicts too. Raw
+// wrapper health may remain green, but either HOLD must stay visibly non-green.
+for (const holdState of ['PROCESS_TREE_INVALID', 'PROCESS_TREE_TRUNCATED']) {
+  const held = hooks.agentStateInfo({
+    health: { state: 'working_turn' }, wrapped: true,
+    supervisor_decision: { state: holdState, action: 'warn_only', reason: 'HOLDING' },
+  });
+  assert(held.key === 'supervisor_unconfirmed', `${holdState} must be strict, got ${held.key}`);
+  assert(held.color === 'attn', `${holdState} must not render green, got ${held.color}`);
+}
+
 // No supervisor_decision at all (unwrapped / no supervisor configured) is
 // unaffected — plain self-report, no false alarm.
 const plain = hooks.agentStateInfo({ health: { state: 'working_turn' }, wrapped: true });
@@ -4480,6 +4492,75 @@ def test_api_state_supervisor_decision_surfaces_strict_verdict_over_self_report(
         }
         assert alpha["wrapper_child"]["phase"] == "active"
         assert alpha["wrapper_child"]["progress_age_seconds"] >= 599.0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_filters_supervisor_decisions_to_wrapped_agents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _make_store(tmp_path)
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    _write_health(s, "beta", _hm.STATE_WORKING_TURN, cli="claude", mode="manual")
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {
+            "alpha": {"wrapped": True, "auto_restart": True},
+            "beta": {"wrapped": False, "auto_restart": True},
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(web._supervisor, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [
+            {"name": "alpha", "decision": {
+                "state": "PROCESS_TREE_INVALID", "action": "warn_only", "reason": "HOLDING"}},
+            {"name": "beta", "decision": {
+                "state": "CLI_CHILD_UNKNOWN", "action": "none", "reason": "manual agent"}},
+        ],
+    })
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        by_name = {a["name"]: a for a in root["agents"]}
+        assert by_name["alpha"]["supervisor_decision"]["state"] == "PROCESS_TREE_INVALID"
+        assert by_name["alpha"]["health"]["state"] == "working_turn"
+        assert "supervisor_decision" not in by_name["beta"]
+        assert "supervisor_decision_unavailable" not in by_name["beta"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_snapshot_freshness_respects_configured_poll_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _make_store(tmp_path)
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "poll_seconds": 600,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    snapshot_path = s.dir / "supervisor-snapshot.json"
+    rows = [{"pid": 123}]
+    snapshot_path.write_text(json.dumps(rows), encoding="utf-8")
+    snapshot_epoch = time.time() - 400.0
+    os.utime(snapshot_path, (snapshot_epoch, snapshot_epoch))
+    observed_snapshots: list[object] = []
+
+    def assessment(_store, **kwargs):
+        observed_snapshots.append(kwargs.get("snapshot"))
+        return {"agents": [{"name": "alpha", "decision": {
+            "state": "HEALTHY_WORKING", "action": "none", "reason": "bound"}}]}
+
+    monkeypatch.setattr(web._supervisor, "build_supervisor_observation", assessment)
+
+    srv, _t, base = _serve(s)
+    try:
+        _state(base)
+        assert observed_snapshots == [rows]
     finally:
         srv.shutdown()
         srv.server_close()

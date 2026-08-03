@@ -1482,7 +1482,10 @@ def _supervisor_decisions(store: Store, *,
         # A stale snapshot must not be read as a live liveness fact (see
         # read_supervisor_snapshot_if_fresh's docstring).
         snapshot = _supervisor.read_supervisor_snapshot_if_fresh(
-            store.dir / "supervisor-snapshot.json", now_epoch=now_epoch)
+            store.dir / "supervisor-snapshot.json",
+            now_epoch=now_epoch,
+            stale_after_seconds=_supervisor.resolve_snapshot_stale_after_seconds(sup_cfg),
+        )
         obs = _supervisor.build_supervisor_observation(
             store, now_epoch=now_epoch, state=state, supervisor_config=sup_cfg,
             snapshot=snapshot, event_limit=0,
@@ -1494,6 +1497,8 @@ def _supervisor_decisions(store: Store, *,
     decisions: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        if item["name"] not in wrapped_names:
             continue
         decision = item.get("decision")
         if isinstance(decision, dict):
