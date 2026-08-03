@@ -234,8 +234,8 @@ def cancellable_socket(
     connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     with cancellation.track(connection):
         try:
-            connection.connect((host, port))
             connection.settimeout(None)
+            connection.connect((host, port))
             yield connection
         finally:
             abort_socket(connection)
@@ -274,8 +274,8 @@ class TrackedHTTPConnection(http.client.HTTPConnection):
         self._cancellation.register(raw)
         self._tracked_socket = raw
         try:
-            raw.connect((self.host, self.port))
             raw.settimeout(self.timeout)
+            raw.connect((self.host, self.port))
             self.sock = raw
         except BaseException:
             self._cancellation.unregister(raw)
