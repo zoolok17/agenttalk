@@ -1106,6 +1106,19 @@ def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
     assert "[System.IO.File]::Replace" in block
     assert "[System.IO.File]::Move" in block
     assert "function Invoke-StateFileSwapWithRetry" in block
+    file_atomic = block[
+        block.index("function Write-FileAtomic"):
+        block.index("function Write-StateFileAtomic")
+    ]
+    # Temp cleanup must cover creation and writing as well as replacement.
+    # Otherwise a partial-write/disk-full exception strands the unique temp.
+    assert (
+        file_atomic.index("try {")
+        < file_atomic.index("$stream =")
+        < file_atomic.index("Invoke-StateFileSwapWithRetry")
+        < file_atomic.rindex("} finally {")
+        < file_atomic.rindex("if (Test-Path -LiteralPath $tmp)")
+    )
     assert "Test-IsRetryableStateWriteException $_.Exception" in block
     assert "for ($attempt = 1; $attempt -le 8; $attempt++)" in block
     assert "$delayMs = [Math]::Min(250, $delayMs * 2)" in block
@@ -5060,6 +5073,79 @@ def test_generated_proc_snapshot_emits_exact_live_filetime(tmp_path: Path) -> No
     assert "foreach ($liveProc in @(Get-Process" in helpers
 
 
+def test_generated_proc_snapshot_replaces_destination_atomically(tmp_path: Path) -> None:
+    """A concurrent reader must see the complete previous snapshot while the
+    generated writer publishes the complete replacement, never an in-progress
+    truncate/write of the live path."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    snapshot_path = tmp_path / "process-snapshot.json"
+    out = tmp_path / "process-snapshot-atomic-result.json"
+    initial = '[{"pid":777,"name":"previous"}]'
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        f"$snapshotPath = {_pslit(str(snapshot_path))}",
+        f"$resultPath = {_pslit(str(out))}",
+        "$u8 = New-Object System.Text.UTF8Encoding($false)",
+        f"[IO.File]::WriteAllText($snapshotPath, {_pslit(initial)}, $u8)",
+        "$held = [IO.FileStream]::new($snapshotPath, [IO.FileMode]::Open, "
+        "[IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))",
+        "$script:liveStart = (Microsoft.PowerShell.Management\\Get-Process "
+        "-Id $PID -ErrorAction Stop).StartTime",
+        "function Get-CimInstance { [CmdletBinding()] param([string]$ClassName); "
+        "[pscustomobject]@{ ProcessId = [int]$PID; ParentProcessId = 0; "
+        "Name = 'pwsh.exe'; CommandLine = $null; CreationDate = $script:liveStart } }",
+        "function Get-Process { [CmdletBinding()] param([int]$Id); "
+        "[pscustomobject]@{ Id = [int]$PID; StartTime = $script:liveStart } }",
+        "$heldFailure = $null",
+        "try {",
+        "  if (-not (Get-ProcSnapshot $snapshotPath)) { throw 'snapshot unavailable' }",
+        "  $held.Position = 0",
+        "  $oldBytes = New-Object byte[] ([int]$held.Length)",
+        "  [void]$held.Read($oldBytes, 0, $oldBytes.Length)",
+        "  $heldText = $u8.GetString($oldBytes)",
+        "  $currentText = [IO.File]::ReadAllText($snapshotPath, $u8)",
+        "  $current = @($currentText | ConvertFrom-Json)",
+        "  $held.Dispose(); $held = $null",
+        "  $heldFailure = [IO.FileStream]::new($snapshotPath, [IO.FileMode]::Open, "
+        "[IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))",
+        "  function Get-CimInstance { throw 'injected capture failure' }",
+        "  if (Get-ProcSnapshot $snapshotPath) { throw 'capture unexpectedly succeeded' }",
+        "  $heldFailure.Position = 0",
+        "  $failureOldBytes = New-Object byte[] ([int]$heldFailure.Length)",
+        "  [void]$heldFailure.Read($failureOldBytes, 0, $failureOldBytes.Length)",
+        "  $heldFailureText = $u8.GetString($failureOldBytes)",
+        "  $marker = [IO.File]::ReadAllText($snapshotPath, $u8) | ConvertFrom-Json",
+        "  @{ held = $heldText; current_pid = [int]$current[0].pid; "
+        "writer_pid = [int]$PID; held_failure = $heldFailureText; "
+        "prior_current = $currentText; unavailable = [bool]$marker.unavailable } | "
+        "ConvertTo-Json | Set-Content $resultPath -Encoding utf8",
+        "} finally {",
+        "  if ($null -ne $held) { $held.Dispose() }",
+        "  if ($null -ne $heldFailure) { $heldFailure.Dispose() }",
+        "}",
+    ])
+    script = tmp_path / "proc-snapshot-atomic.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert payload["held"] == initial
+    assert payload["current_pid"] == payload["writer_pid"]
+    assert payload["held_failure"] == payload["prior_current"]
+    assert payload["unavailable"] is True
+
+
 def test_stop_tree_rejects_rounded_start_collision_by_exact_filetime(
     tmp_path: Path,
 ) -> None:
@@ -6831,16 +6917,22 @@ def test_manual_restart_marker_clears_only_after_readiness(tmp_path: Path) -> No
 
 
 def _exec_helpers(tmp_path: Path) -> str:
-    """Extract the verbatim exec-helpers (Proc-Start/Get-ProcSnapshot/Stop-Tree/
-    Seed-CodexHome) from a freshly generated supervisor.ps1, so the runtime tests
-    drive the EXACT shipped PowerShell."""
+    """Extract the state + exec helpers from a freshly generated supervisor.ps1.
+
+    The runtime tests drive the EXACT shipped PowerShell. State helpers are
+    included because Get-ProcSnapshot publishes through their atomic file
+    primitive.
+    """
     s = _team(tmp_path)
     (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
     assert _run(["supervise", "--init"], tmp_path) == 0
     text = (s.dir / "supervisor.ps1").read_text(encoding="utf-8-sig")
+    state = text[
+        text.index("# region state-helpers"):text.index("# endregion state-helpers")
+    ]
     block = text[text.index("# region exec-helpers"):text.index("# endregion exec-helpers")]
     assert "function Stop-Tree" in block and "function Seed-CodexHome" in block
-    return "function Assert-ActionsEnabled([string]$what) { return $true }\n" + block
+    return "function Assert-ActionsEnabled([string]$what) { return $true }\n" + state + block
 
 
 # Round 23: Complete-WrapperLogTargets is gone - marking a generation

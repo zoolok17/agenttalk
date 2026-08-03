@@ -531,6 +531,10 @@ def test_status_flags_disagreement_between_self_report_and_strict_verdict(
         updated_at=now_iso, since=now_iso,
         reason_code="progress_event",
     ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
     monkeypatch.setattr(cli.sup, "build_supervisor_observation",
                         lambda *_a, **_k: _fake_decision("CLI_CHILD_UNKNOWN"))
 
@@ -549,6 +553,50 @@ def test_status_flags_disagreement_between_self_report_and_strict_verdict(
     assert "health=working_turn" in line
     assert "supervisor=CLI_CHILD_UNKNOWN/none" in line
     assert "[DISAGREEMENT]" in line  # direction control: absent before the fix
+
+
+def test_status_does_not_flag_wrapped_disagreement_for_unwrapped_agent(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Manual auto-restart agents keep their useful advisory decision, but it
+    is not the wrapped-child strict verdict and must not get that verdict's
+    disagreement label."""
+    s = Store(store_root)
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    old_iso = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    (s.state_dir / "alpha.heartbeat").write_text(old_iso, encoding="utf-8")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="manual",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {
+            "wrapped": False,
+            "auto_restart": True,
+            "activity_hook": False,
+            "cli": "claude",
+        }},
+    }), encoding="utf-8")
+
+    assert _run(["status", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["supervisor"]["decision"]["state"] == "ACTIVE_OR_BUSY"
+    assert alpha["supervisor"]["decision"]["action"] == "suspect_warn"
+    assert "disagreement" not in alpha["supervisor"]
+
+    assert _run(["status"], store_root) == 0
+    line = next(
+        line for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("alpha")
+    )
+    assert "supervisor=ACTIVE_OR_BUSY/suspect_warn" in line
+    assert "[DISAGREEMENT]" not in line
 
 
 def test_status_rejects_stale_snapshot_before_computing_strict_verdict(

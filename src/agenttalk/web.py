@@ -1443,7 +1443,7 @@ class HealthTimelineRing:
 
 
 def _supervisor_decisions(store: Store, *,
-                          now_epoch: float) -> tuple[dict[str, dict], set[str]]:
+                          now_epoch: float) -> tuple[dict[str, dict], dict[str, str]]:
     """The live supervisor decision per wrapped agent (best-effort, read-only).
 
     This is the STRICT verdict (e.g. ``CLI_CHILD_UNKNOWN``) — distinct from the
@@ -1453,30 +1453,31 @@ def _supervisor_decisions(store: Store, *,
     `agenttalk status`; empty (never raises) when no supervisor is configured
     or the read fails, so a root with no supervisor stays unaffected.
 
-    Returns ``(decisions, decision_unavailable)`` — the second set is every
-    agent configured ``wrapped: true`` for which no decision could be computed
-    (e.g. it is not ``auto_restart``, OR the observation itself failed), so
-    the caller can surface that fact explicitly rather than silently falling
-    back to the self-report. "Cannot verify" must never render as "verified
-    good": a state/snapshot/observation failure below still returns every
-    wrapped name in the unavailable set — it does NOT go silent — while a
+    Returns ``(decisions, decision_unavailable)`` — the second mapping gives
+    every agent configured ``wrapped: true`` for which no decision could be
+    computed a stable reason code (disabled auto-restart, missing decision, or
+    failed assessment), so the caller can surface the actual cause rather than
+    silently falling back to the self-report. "Cannot verify" must never render
+    as "verified good": a state/snapshot/observation failure below still
+    returns every wrapped name in the unavailable mapping — it does NOT go
+    silent — while a
     failure to even load supervisor.json (so the wrapped set itself is
     unknowable) returns both empty, matching doctor's own config-load
     fallback."""
     sup_path = store.dir / "supervisor.json"
     if not sup_path.exists():
-        return {}, set()
+        return {}, {}
     try:
         sup_cfg = _supervisor.load_supervisor_config(sup_path)
     except Exception:  # noqa: BLE001 — advisory arm; never fail the root
-        return {}, set()
+        return {}, {}
     sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
     wrapped_names = {
         name for name, cfg_agent in sup_agents.items()
         if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
     }
     if not wrapped_names:
-        return {}, set()
+        return {}, {}
     try:
         state = _supervisor.load_supervisor_state(store.dir / "supervisor-state.json")
         # A stale snapshot must not be read as a live liveness fact (see
@@ -1493,7 +1494,7 @@ def _supervisor_decisions(store: Store, *,
     except Exception:  # noqa: BLE001 — advisory arm; never fail the root, but
         # every wrapped agent becomes explicitly unavailable rather than
         # vanishing (the #105 defect reintroduced through this error path).
-        return {}, wrapped_names
+        return {}, dict.fromkeys(wrapped_names, "assessment_failed")
     decisions: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -1503,7 +1504,15 @@ def _supervisor_decisions(store: Store, *,
         decision = item.get("decision")
         if isinstance(decision, dict):
             decisions[item["name"]] = decision
-    return decisions, wrapped_names - set(decisions)
+    unavailable = {
+        name: (
+            "auto_restart_disabled"
+            if sup_agents[name].get("auto_restart") is not True
+            else "decision_missing"
+        )
+        for name in wrapped_names - set(decisions)
+    }
+    return decisions, unavailable
 
 
 def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
@@ -1515,7 +1524,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                    root_label: str | None = None,
                    managed_loop: set[str] | None = None,
                    supervisor_decisions: dict[str, dict] | None = None,
-                   decision_unavailable: set[str] | None = None) -> list[dict]:
+                   decision_unavailable: dict[str, str] | None = None) -> list[dict]:
     """Per-agent presence rows (data-model §3). Absent-not-null keys.
 
     0.58.0 additive fields (all OMITTED when not determinable): ``cli``,
@@ -1539,10 +1548,10 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     ``wrapper_child`` (additive) carries the raw wrapper-runtime phase and
     ``last_progress_at`` age directly, independent of any verdict.
 
-    ``decision_unavailable``: the set of agents configured ``wrapped: true``
-    for which no decision could be computed (not ``auto_restart``) — surfaced
-    as ``supervisor_decision_unavailable: true`` so this reads as visibly as
-    doctor's equivalent WARN, rather than silently showing only `health`.
+    ``decision_unavailable``: maps agents configured ``wrapped: true`` for
+    which no decision could be computed to a stable reason code. The API keeps
+    the existing boolean and adds the reason so the console can distinguish a
+    disabled verdict from a failed assessment.
     """
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
@@ -1551,7 +1560,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     avatar_prefs = avatar_prefs or {}
     managed_loop = managed_loop or set()
     supervisor_decisions = supervisor_decisions or {}
-    decision_unavailable = decision_unavailable or set()
+    decision_unavailable = decision_unavailable or {}
     now = datetime.now(timezone.utc)
     now_epoch = now.timestamp()
     # 0.19.0 (FR-001): per-agent message counts from the SAME validated `msgs`
@@ -1647,6 +1656,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
             # doctor's equivalent WARN already does, rather than silently
             # showing only the self-report.
             e["supervisor_decision_unavailable"] = True
+            e["supervisor_decision_unavailable_reason"] = decision_unavailable[a]
         # wrapper_child: the raw wrapper-runtime observation (phase +
         # last_progress_at age) — the cheapest "is the counter frozen" signal,
         # independent of any verdict. Absent when no runtime record exists.

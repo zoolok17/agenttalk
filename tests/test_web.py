@@ -2862,9 +2862,41 @@ assert(healthy.color === 'ok', `HEALTHY_WORKING must stay ok, got ${healthy.colo
 const unavailable = hooks.agentStateInfo({
   health: { state: 'working_turn' }, wrapped: true,
   supervisor_decision_unavailable: true,
+  supervisor_decision_unavailable_reason: 'assessment_failed',
 });
 assert(unavailable.key === 'supervisor_unavailable', `expected supervisor_unavailable, got ${unavailable.key}`);
 assert(unavailable.color === 'attn', `expected attn, got ${unavailable.color}`);
+assert(unavailable.desc.includes('assessment failed'), `missing failure reason: ${unavailable.desc}`);
+assert(!unavailable.desc.includes('not configured auto_restart'), `false disabled claim: ${unavailable.desc}`);
+
+// Losing the strict verdict must not soften an already-dangerous wrapper
+// self-report either. The unavailable cause remains visible alongside it.
+const unavailableDanger = hooks.agentStateInfo({
+  health: { state: 'rate_limited_or_outage' }, wrapped: true,
+  supervisor_decision_unavailable: true,
+  supervisor_decision_unavailable_reason: 'assessment_failed',
+});
+assert(unavailableDanger.key === 'rate_limited_or_outage',
+       `unavailable verdict downgraded danger to ${unavailableDanger.key}`);
+assert(unavailableDanger.color === 'danger',
+       `unavailable verdict downgraded danger to ${unavailableDanger.color}`);
+assert(unavailableDanger.desc.includes('assessment failed'),
+       `unavailable cause disappeared: ${unavailableDanger.desc}`);
+
+// A merely advisory strict verdict must not downgrade an already-dangerous
+// wrapper self-report. Preserve the worse visible state while still naming
+// the separate supervisor fact in its description.
+for (const rawState of ['rate_limited_or_outage', 'errored_fatal']) {
+  const rawDanger = hooks.agentStateInfo({
+    health: { state: rawState }, wrapped: true,
+    supervisor_decision: {
+      state: 'PROCESS_TREE_INVALID', action: 'warn_only', reason: 'HOLDING',
+    },
+  });
+  assert(rawDanger.key === rawState, `${rawState} was downgraded to ${rawDanger.key}`);
+  assert(rawDanger.color === 'danger', `${rawState} was downgraded to ${rawDanger.color}`);
+  assert(rawDanger.desc.includes('PROCESS_TREE_INVALID'), `strict fact disappeared: ${rawDanger.desc}`);
+}
 
 // Current-master process-tree HOLDs are strict supervisor verdicts too. Raw
 // wrapper health may remain green, but either HOLD must stay visibly non-green.
@@ -4607,6 +4639,7 @@ def test_api_state_supervisor_decision_unavailable_for_non_auto_restart_wrapped_
         (root,) = _state(base)["roots"]
         alpha = next(a for a in root["agents"] if a["name"] == "alpha")
         assert alpha.get("supervisor_decision_unavailable") is True
+        assert alpha.get("supervisor_decision_unavailable_reason") == "auto_restart_disabled"
         assert "supervisor_decision" not in alpha
     finally:
         srv.shutdown()
@@ -4645,6 +4678,10 @@ def test_api_state_supervisor_decision_unavailable_for_every_wrapped_agent_on_ob
         by_name = {a["name"]: a for a in root["agents"]}
         assert by_name["alpha"].get("supervisor_decision_unavailable") is True
         assert by_name["beta"].get("supervisor_decision_unavailable") is True
+        assert by_name["alpha"].get(
+            "supervisor_decision_unavailable_reason") == "assessment_failed"
+        assert by_name["beta"].get(
+            "supervisor_decision_unavailable_reason") == "assessment_failed"
         assert "supervisor_decision" not in by_name["alpha"]
         assert "supervisor_decision" not in by_name["beta"]
     finally:

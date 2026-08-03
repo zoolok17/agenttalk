@@ -605,7 +605,8 @@ def _gather_status(store: Store) -> dict:
                 # own self-report still reads "fine" while the supervisor's
                 # strict, positively-bound verdict does not.
                 if (
-                    decision.get("state") not in
+                    cfg_agent.get("wrapped") is True
+                    and decision.get("state") not in
                     (sup.HEALTHY_DECISION_STATES | sup.GRACE_DECISION_STATES)
                     and health.get("state") in ("idle_waiting", "working_turn")
                 ):
@@ -1315,12 +1316,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         dec = sv.get("decision") if isinstance(sv.get("decision"), dict) else None
         if dec:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
-            # Never let the two verdicts silently disagree in favour of the
-            # cheerful one: a wrapper that still self-reports "fine" while the
-            # supervisor's strict, positively-bound verdict says otherwise.
-            dec_state = dec.get("state")
-            if (dec_state not in sup.HEALTHY_DECISION_STATES | sup.GRACE_DECISION_STATES
-                    and h_state in ("idle_waiting", "working_turn")):
+            # Use the already-scoped JSON fact rather than re-deriving it here;
+            # only wrapped agents have a strict wrapper-child disagreement.
+            if sv.get("disagreement") is True:
                 seen += " [DISAGREEMENT]"
         elif sv.get("decision_unavailable") is True:
             seen += " supervisor=UNAVAILABLE(not auto_restart)"

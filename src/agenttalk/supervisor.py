@@ -9940,27 +9940,29 @@ function Invoke-StateFileSwapWithRetry([string]$tmp, [string]$path) {
     }
   }
 }
-function Write-StateFileAtomic([string]$path, $state) {
-  if (-not (Test-StateObject $state)) { throw "supervisor state must be a JSON object" }
-  $json = $state | ConvertTo-Json -Depth 8
-  $utf8 = New-Object System.Text.UTF8Encoding($false)
-  $bytes = $utf8.GetBytes($json)
+function Write-FileAtomic([string]$path, [byte[]]$bytes) {
   $tmpName = ".at-{0}-{1}.tmp" -f $PID, ([Guid]::NewGuid().ToString('N'))
   $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($path), $tmpName)
-  $stream = [System.IO.FileStream]::new(
-    $tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
-    [System.IO.FileShare]::None)
   try {
-    $stream.Write($bytes, 0, $bytes.Length)
-    $stream.Flush($true)
-  } finally {
-    $stream.Dispose()
-  }
-  try {
+    $stream = [System.IO.FileStream]::new(
+      $tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
+      [System.IO.FileShare]::None)
+    try {
+      $stream.Write($bytes, 0, $bytes.Length)
+      $stream.Flush($true)
+    } finally {
+      $stream.Dispose()
+    }
     Invoke-StateFileSwapWithRetry $tmp $path
   } finally {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
   }
+}
+function Write-StateFileAtomic([string]$path, $state) {
+  if (-not (Test-StateObject $state)) { throw "supervisor state must be a JSON object" }
+  $json = $state | ConvertTo-Json -Depth 8
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  Write-FileAtomic $path ($utf8.GetBytes($json))
 }
 function Set-AgentState($state, $name, $value) {
   $state.agents | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
@@ -10175,11 +10177,14 @@ function Get-ProcSnapshot($path) {
     # emits a UTF-8 BOM under Windows PowerShell 5.1, which every JSON write in
     # this template must avoid so a strict Python reader never chokes.
     $u8 = New-Object System.Text.UTF8Encoding($false)
-    if ($arr.Count -eq 0) { [System.IO.File]::WriteAllText($path, '[]', $u8) }
-    else { [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $arr -Depth 4), $u8) }
+    $json = if ($arr.Count -eq 0) { '[]' }
+            else { ConvertTo-Json -InputObject $arr -Depth 4 }
+    Write-FileAtomic $path ($u8.GetBytes([string]$json))
     return $true
   } catch {
-    [System.IO.File]::WriteAllText($path, (@{ unavailable = $true } | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    $u8 = New-Object System.Text.UTF8Encoding($false)
+    $json = @{ unavailable = $true } | ConvertTo-Json
+    Write-FileAtomic $path ($u8.GetBytes([string]$json))
     return $false
   }
 }

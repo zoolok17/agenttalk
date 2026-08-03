@@ -478,26 +478,51 @@
       var dstate = decision.state;
       if (!SUP_HEALTHY_STATES[dstate] && !SUP_GRACE_STATES[dstate]) {
         var isDead = !!SUP_UNBOUND_OR_DEAD_STATES[dstate];
+        var verdictSummary = 'Supervisor verdict: ' + (dstate || 'unknown') +
+          (decision.reason ? ' (' + decision.reason + ')' : '');
+        // A non-dead/advisory verdict is attention-level. It must not soften
+        // an already-dangerous wrapper report; keep the worse presentation
+        // while retaining the separate strict fact in its description.
+        if (!isDead && info.color === 'danger') {
+          info.desc += ' · ' + verdictSummary;
+          info.supervisorDecision = decision;
+          return info;
+        }
         return {
           label: isDead ? 'Child unconfirmed' : 'Supervisor: ' + (dstate || 'unknown'),
           key: isDead ? 'supervisor_unbound' : 'supervisor_unconfirmed',
           color: isDead ? 'danger' : 'attn',
           grp: 'attn',
-          desc: 'Supervisor verdict: ' + (dstate || 'unknown') +
-                ' — self-report says "' + info.label + '", but the CLI child ' +
+          desc: verdictSummary + ' — self-report says "' + info.label +
+                '", but the CLI child ' +
                 'could not be confirmed',
           selfReport: info,
         };
       }
     } else if (agent && agent.supervisor_decision_unavailable === true) {
+      var unavailableReason = agent.supervisor_decision_unavailable_reason;
+      var unavailableDesc = unavailableReason === 'auto_restart_disabled'
+        ? 'Wrapped, but the supervisor has no computable verdict for this agent ' +
+          '(not configured auto_restart)'
+        : unavailableReason === 'assessment_failed'
+          ? 'Wrapped, but the supervisor assessment failed, so no verdict is available'
+          : unavailableReason === 'decision_missing'
+            ? 'Wrapped, but the supervisor returned no decision for this agent'
+            : 'Wrapped, but no supervisor verdict is available (reason unknown)';
+      // Unavailability is attention-level evidence, not permission to soften
+      // an already-dangerous self-report. Keep the worse presentation and
+      // append why the independent strict fact could not be computed.
+      if (info.color === 'danger') {
+        info.desc += ' · ' + unavailableDesc;
+        info.supervisorDecisionUnavailableReason = unavailableReason;
+        return info;
+      }
       return {
         label: 'No verdict',
         key: 'supervisor_unavailable',
         color: 'attn',
         grp: 'attn',
-        desc: 'Wrapped, but the supervisor has no computable verdict for this ' +
-              'agent (not configured auto_restart) — self-report only: "' +
-              info.label + '"',
+        desc: unavailableDesc + ' — self-report only: "' + info.label + '"',
         selfReport: info,
       };
     }
