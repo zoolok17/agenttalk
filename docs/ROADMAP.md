@@ -1,9 +1,9 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-30
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-08-03
 **Audience:** maintainers, operators, and agents deciding what to build next.
 **Horizon:** pragmatic next 2-3 quarters + a labeled "later" tier.
-**Current shipped baseline:** v0.79.1; runtime hardening has continued since v0.74.1 (supervisor crash/durability fixes, PowerShell baseline enforcement, publication-order guards). `CHANGELOG.md` remains the release-history source of truth.
+**Current shipped baseline:** v0.81.0; runtime hardening has continued since v0.74.1 (supervisor crash/durability fixes, PowerShell baseline enforcement, publication-order guards). `CHANGELOG.md` remains the release-history source of truth.
 
 **Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus/store/CLI/wrapper) is already cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The **supervisor is the open platform gap** — it currently requires PowerShell Core 7+ and Windows-only `Win32_Process`; a POSIX supervisor path is an unbuilt follow-up (see §6 cross-cutting and §8).
 
@@ -212,13 +212,26 @@ rather than a shrinking one — the same signal that split the recovery-authorit
 the implementers checked was real, so the code was improving; it was simply not converging on a release
 clock. Shipping the one measured-highest-value item beat shipping four half-converged ones.
 
-#### v0.81.0 — "supervisor state has integrity" *(deferred from v0.80.0; all three have implementations in review)*
+#### v0.81.0 — "the supervisor knows what it owns, and says so when it cannot" *(SHIPPED 2026-08-02)*
+
+The theme changed during the round. Two of the three items declared here converged and shipped; the other
+two — kill-switch startup persistence and the supervisor-state lock — were deferred *again* rather than
+shipped half-converged, for the same reason they were deferred out of v0.80.0. Their place is taken by two
+items pulled forward off the recovery board, one of them found in production during the release round.
 
 | Item | What | State |
 |---|---|---|
-| Kill-switch startup persistence | A kill switch present at *startup* currently produces no state, no projection and no operator-visible record: the generated supervisor exits before the instance claim. Adds a switch-present observational mode with a durable record projected through `status`/`status --json` independent of `event_limit`. | implementation in review |
-| Supervisor-state lock + single checked owner | `load_supervisor_state`/`save_supervisor_state` hold no lock across the read-modify-write, so two writers lose an update. Introduces one data-only checked owner, an enforced lock order with state as the terminal leaf, and removes the second (PowerShell) writer entirely rather than trying to synchronise two implementations. | complete, never gated; ports cleanly onto the item above |
-| Wrapper stdout/stderr capture *(runtime)* | Wrappers launch with a hidden window and no output redirection, so a dying wrapper's traceback is destroyed by construction. Adds bounded, rotated per-agent capture plus factual lifecycle-event lines (never self-assessed health). | implementation in review |
+| Wrapper stdout/stderr capture *(runtime)* | Wrappers launch with a hidden window and no output redirection, so a dying wrapper's traceback is destroyed by construction. Adds bounded, rotated per-agent capture plus factual lifecycle-event lines (never self-assessed health). | **shipped** (#117) |
+| Owned process tree per agent, with exact process identity | Ownership traversal stopped at shell hosts, so the tool descendant that actually wedges a wrapper appeared in no durable record. Kill targets now carry the exact creation FILETIME rather than a rounded timestamp, so a recycled PID cannot be terminated in place of the original. Pulled forward from v0.83.0. | **shipped** (#120) |
+| A confirmed-absent wrapper is launchable under a sticky invalid owned tree *(runtime)* | Found in production on the maintainers' own fleet: one transient malformed row in a single whole-host process snapshot invalidated the owned-tree check for every agent in that poll, and since an invalid record was never re-derived, a ~1-second glitch disabled automatic recovery fleet-wide indefinitely. The HOLD pre-empted the LAUNCH path, so the state was self-sealing. Unplanned; found and fixed during the round. | **shipped** (#150) |
+| Kill-switch startup persistence | A kill switch present at *startup* currently produces no state, no projection and no operator-visible record: the generated supervisor exits before the instance claim. Adds a switch-present observational mode with a durable record projected through `status`/`status --json` independent of `event_limit`. | **deferred again** — PR 107, implementation in review |
+| Supervisor-state lock + single checked owner | `load_supervisor_state`/`save_supervisor_state` hold no lock across the read-modify-write, so two writers lose an update. Introduces one data-only checked owner, an enforced lock order with state as the terminal leaf, and removes the second (PowerShell) writer entirely rather than trying to synchronise two implementations. | **deferred again** — complete, never gated; mechanically blocked on the item above |
+
+**Known limitation shipped with this release, not fixed by it:** an owned process tree that goes `invalid`
+stays invalid for as long as its wrapper keeps running, because a healthy wrapper never triggers a fresh
+walk. The rule predates the release; upgrading makes it *visible*, since an invalid record already on disk
+survives every restart and code upgrade. Clearing it is per-agent and fully attended. See `CHANGELOG.md`
+§0.81.0 "Known limitations" and the self-healing follow-up on the recovery board.
 
 #### v0.82.0 — "a wrapped agent never dies silently" *(runtime)*
 
@@ -236,7 +249,7 @@ Umbrella first, per the release discipline.
 | Item | What |
 |---|---|
 | Define + gate the recovery-actually-recovers invariant | The umbrella. Recovery currently *attempts* and reports success while nothing recovers. Make the invariant explicit and gated. |
-| Owned process tree per agent | Ownership traversal stops at shell hosts, so the tool descendant that actually wedges a wrapper appears in no durable record. Evolve the existing per-poll projection into a bounded, role-tagged owned tree, anchored on `(pid, start)` + generation + launch nonce, and feed the existing start-guarded kill primitive. Names and command lines may *label* an owned row, never establish ownership. |
+| ~~Owned process tree per agent~~ | **Shipped early in v0.81.0** (#120) — pulled forward because the wedge frequency made it the blocker. Left here for the trail; do not re-plan it. |
 | Terminate an orphaned wrapper; bound the retry | Recovery is defined as "launch a replacement", which the launch barrier correctly refuses while the incumbent survives — so the cycle backs off exponentially and fades into silence. Something must own terminating a *provably childless* wrapper, and the retry cycle needs a hard cap that escalates instead of going quiet. |
 | Absence is not staleness | A twice-confirmed-absent wrapper waits out the per-CLI heartbeat threshold (up to 2400s for Codex) before relaunch. The heartbeat answers "is this agent still working?"; a complete process snapshot answers "does this process exist?" — conflating them is the defect. Independently stageable, and must not wait for the rest of the recovery-authority design. |
 
