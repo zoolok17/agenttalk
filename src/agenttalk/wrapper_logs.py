@@ -1,10 +1,11 @@
 """Bounded wrapper process logs and factual lifecycle diagnostics.
 
-``agenttalk wrap`` owns its capture on every launch path. A generated supervisor
-may preallocate and redirect a generation before Python starts; otherwise the
-wrapper allocates a generation itself and mirrors the original console while it
-keeps both files bounded. The lifecycle JSONL is diagnostic output only: it is
-never read by the supervisor and carries no health or restart authority.
+``agenttalk wrap`` attempts capture as its first post-dispatch startup action on
+every launch path. A generated supervisor may preallocate and redirect a
+generation before Python starts; otherwise the wrapper allocates a generation
+itself and mirrors the original console while it keeps both files bounded. The
+lifecycle JSONL is diagnostic output only: it is never read by the supervisor
+and carries no health or restart authority.
 
 The bound is Python-level only: it wraps ``sys.stdout``/``sys.stderr`` and
 bounds whatever text is written through those objects.  A write that reaches
@@ -38,7 +39,6 @@ from pathlib import Path
 from typing import TextIO
 
 from agenttalk import _atomic
-from agenttalk.signing import project_id_for_root
 
 
 ENV_STDOUT_PATH = "AGENTTALK_WRAPPER_STDOUT_LOG"
@@ -58,6 +58,14 @@ _LOCATION_SCHEMA_VERSION = 1
 _GENERATION_NAME_RE = re.compile(
     r"[0-9]{8}T[0-9]{9}Z-[0-9a-f]{32}\Z"
 )
+_SEQUENCE_RECORD_RE = re.compile(r"[1-9][0-9]*\Z")
+_SEQUENCE_MAX = (1 << 63) - 1
+_SEQUENCE_UNCERTAINTY_BY_STATE = {
+    "missing-legacy": False,
+    "missing-write-failed": True,
+    "present-valid": False,
+    "present-invalid": True,
+}
 
 _RUNTIME_FIELDS = (
     "phase",
@@ -98,7 +106,10 @@ def _home_state_root(home_env: str | None, *parts: str) -> Path | None:
     unavailable candidate rather than raising."""
     try:
         home = Path(home_env) if home_env else Path.home()
-        return home.expanduser().resolve().joinpath(*parts)
+        # Preserve the operator-supplied ancestry until the candidate guard
+        # has inspected it. Resolving here would erase a symlink/junction and
+        # make the later refusal check inspect only its target.
+        return home.expanduser().absolute().joinpath(*parts)
     except (OSError, RuntimeError):
         return None
 
@@ -118,8 +129,33 @@ def _candidate_state_roots(
     home_root = _home_state_root(home_env, *home_parts)
     if home_root is not None:
         yield home_root
-    yield Path(tempfile.gettempdir()).resolve()
+    yield Path(tempfile.gettempdir()).absolute()
     yield project.parent / ".agenttalk-wrapper-logs"
+
+
+def _diagnostic_project_root(
+    project_root: str | os.PathLike[str],
+) -> Path:
+    """Return a stable absolute project hint without making capture fragile.
+
+    Canonical resolution is preferred and preserves the established project
+    hash. If the operational root later proves unresolvable, logging must still
+    have a destination for that diagnostic, so use the lexical absolute path as
+    a fail-soft identity. Authoritative project validation remains the store's
+    job after the bounded streams are live.
+    """
+    raw = Path(project_root).expanduser()
+    try:
+        return raw.resolve()
+    except (OSError, RuntimeError):
+        return raw.absolute()
+
+
+def _diagnostic_project_id(project: Path) -> str:
+    # project is already canonical when canonicalization is available. This is
+    # byte-for-byte project_id_for_root's documented hash without a second,
+    # fallible resolve between capture allocation and stream installation.
+    return hashlib.sha256(str(project).encode("utf-8")).hexdigest()
 
 
 def default_wrapper_log_root(
@@ -129,11 +165,14 @@ def default_wrapper_log_root(
     environ: Mapping[str, str] | None = None,
 ) -> Path:
     """Return the preferred per-user, per-project log root outside the checkout."""
-    return wrapper_log_root_candidates(
+    roots = wrapper_log_root_candidates(
         project_root,
         platform=platform,
         environ=environ,
-    )[0]
+    )
+    if not roots:
+        raise OSError("no safe wrapper log root is available")
+    return roots[0]
 
 
 def wrapper_log_root_candidates(
@@ -168,21 +207,32 @@ def wrapper_log_root_candidates(
     configured = Path(raw) if raw else None
     if configured is not None and not configured.is_absolute():
         configured = None
-    project = Path(project_root).resolve()
-    project_id = project_id_for_root(project)
+    project = _diagnostic_project_root(project_root)
+    project_id = _diagnostic_project_id(project)
     preferred: Path | None = None
     for candidate in _candidate_state_roots(configured, home_env, home_parts, project):
         try:
-            result = (
-                candidate.expanduser().resolve()
+            raw_result = (
+                candidate.expanduser().absolute()
                 / "agenttalk"
                 / "wrapper-logs"
                 / project_id
-            ).resolve()
+            )
+            if _has_reparse_or_symlink_component(raw_result):
+                continue
+            resolved = raw_result.resolve()
+            # Recheck both identities after canonicalization. The raw check
+            # catches an ancestor swap; the resolved check keeps the existing
+            # refusal for unsafe targets.
+            if (
+                _has_reparse_or_symlink_component(raw_result)
+                or _has_reparse_or_symlink_component(resolved)
+            ):
+                continue
         except (OSError, RuntimeError):
             continue
-        if not result.is_relative_to(project):
-            preferred = result
+        if not resolved.is_relative_to(project):
+            preferred = raw_result
             break
 
     candidate_factories = [
@@ -200,23 +250,25 @@ def wrapper_log_root_candidates(
             candidate = candidate_factory()
             if candidate is None:
                 continue
-            resolved = candidate.expanduser().resolve()
+            raw_candidate = candidate.expanduser().absolute()
+            if _has_reparse_or_symlink_component(raw_candidate):
+                continue
+            resolved = raw_candidate.resolve()
+            if (
+                _has_reparse_or_symlink_component(raw_candidate)
+                or _has_reparse_or_symlink_component(resolved)
+            ):
+                continue
         except (OSError, RuntimeError):
             continue
         if resolved in seen or resolved.is_relative_to(project):
             continue
         seen.add(resolved)
-        roots.append(resolved)
+        # Allocation must retain the ancestry that was validated. Returning
+        # only the canonical target would make a junction disappear before
+        # _prepare_agent_log_dir's pre/post-create race checks can see it.
+        roots.append(raw_candidate)
 
-    # A checkout rooted at the filesystem anchor has no same-volume "outside".
-    # Keep wrapping usable; allocation remains fail-soft if this cannot open.
-    if not roots:
-        roots.append(
-            Path(tempfile.gettempdir())
-            / "agenttalk"
-            / "wrapper-logs"
-            / project_id
-        )
     return tuple(roots)
 
 
@@ -228,25 +280,25 @@ def _wrapper_log_agent_leaf(agent: str) -> str:
 def temporary_wrapper_log_root(
     project_root: str | os.PathLike[str],
 ) -> Path:
-    project = Path(project_root).resolve()
+    project = _diagnostic_project_root(project_root)
     return (
-        Path(tempfile.gettempdir()).resolve()
+        Path(tempfile.gettempdir()).absolute()
         / "agenttalk-wrapper-logs"
-        / project_id_for_root(project)
+        / _diagnostic_project_id(project)
     )
 
 
 def project_parent_wrapper_log_root(
     project_root: str | os.PathLike[str],
 ) -> Path:
-    project = Path(project_root).resolve()
+    project = _diagnostic_project_root(project_root)
     return (
         project.parent
         / ".agenttalk-wrapper-logs"
         / "agenttalk"
         / "wrapper-logs"
-        / project_id_for_root(project)
-    ).resolve()
+        / _diagnostic_project_id(project)
+    )
 
 
 @dataclass(frozen=True)
@@ -351,8 +403,10 @@ def _restrictive_file_opener(path: str, flags: int) -> int:
 def _is_reparse_or_symlink(path: Path) -> bool:
     try:
         info = path.lstat()
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError as exc:
+        raise OSError(f"cannot validate wrapper log path component: {path}") from exc
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     file_attributes = getattr(info, "st_file_attributes", 0)
     return stat.S_ISLNK(info.st_mode) or bool(file_attributes & reparse_flag)
@@ -522,6 +576,56 @@ def _guard_wrapper_log_prune(generation_dir: Path) -> Iterator[bool]:
                 _unlink_active_lock_if_same(path, identity)
 
 
+def powershell_wrapper_log_sequence_policy() -> str:
+    """Render the canonical uncertainty table for the generated launcher."""
+    entries = "; ".join(
+        f"'{state}' = ${str(uncertain).lower()}"
+        for state, uncertain in _SEQUENCE_UNCERTAINTY_BY_STATE.items()
+    )
+    return "@{ " + entries + " }"
+
+
+def _read_wrapper_log_sequence(
+    generation: Path,
+    *,
+    committed: bool,
+) -> tuple[int | None, bool]:
+    """Read one launch sequence under the shared Python/PowerShell policy."""
+    sequence_path = generation / ".sequence"
+    try:
+        sequence_info = sequence_path.lstat()
+    except FileNotFoundError:
+        state = (
+            "missing-write-failed"
+            if (generation / ".sequence-failed").exists()
+            else "missing-legacy"
+        )
+        return None, bool(committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+    except OSError:
+        state = "present-invalid"
+        return None, bool(committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+
+    state = "present-invalid"
+    sequence: int | None = None
+    try:
+        if (
+            not stat.S_ISREG(sequence_info.st_mode)
+            or _is_reparse_or_symlink(sequence_path)
+        ):
+            raise ValueError("sequence record is not a plain file")
+        text = sequence_path.read_text(encoding="utf-8").strip()
+        if not _SEQUENCE_RECORD_RE.fullmatch(text):
+            raise ValueError("sequence record is not a canonical positive integer")
+        parsed = int(text)
+        if parsed > _SEQUENCE_MAX:
+            raise ValueError("sequence record exceeds signed 64-bit range")
+        sequence = parsed
+        state = "present-valid"
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return sequence, bool(committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+
+
 def _owned_committed_generations(
     roots: tuple[Path, ...],
     agent_leaf: str,
@@ -547,24 +651,15 @@ def _owned_committed_generations(
                     or _has_reparse_or_symlink_component(generation)
                 ):
                     continue
-                sequence: int | None = None
-                try:
-                    sequence = int(
-                        (generation / ".sequence").read_text(
-                            encoding="utf-8"
-                        ).strip()
-                    )
-                    if sequence < 1:
-                        sequence = None
-                except (OSError, ValueError):
-                    if (
-                        (generation / ".committed").exists()
-                        and (generation / ".sequence-failed").exists()
-                    ):
-                        uncertain = True
+                committed = (generation / ".committed").exists()
+                sequence, sequence_uncertain = _read_wrapper_log_sequence(
+                    generation,
+                    committed=committed,
+                )
+                uncertain = uncertain or sequence_uncertain
                 if sequence is not None:
                     max_sequence = max(max_sequence, sequence)
-                if not (generation / ".committed").exists():
+                if not committed:
                     continue
                 sort_key = (
                     f"1-{sequence:020d}-{generation.name}"
@@ -602,6 +697,13 @@ def _allocate_wrapper_log_targets(
             agent_dir = _prepare_agent_log_dir(root, agent_leaf)
             generation_dir = agent_dir / f"{stamp}-{secrets.token_hex(16)}"
             generation_dir.mkdir(mode=0o700)
+            if (
+                not generation_dir.is_dir()
+                or _has_reparse_or_symlink_component(generation_dir)
+            ):
+                raise OSError(
+                    f"unsafe wrapper log generation directory: {generation_dir}"
+                )
             stdout_path = generation_dir / "stdout.log"
             stderr_path = generation_dir / "stderr.log"
             _write_restrictive_text(stdout_path, "")
@@ -721,6 +823,25 @@ def _record_wrapper_log_location(
         )
     except (OSError, ValueError):
         pass
+
+
+def record_wrapper_log_location(
+    project_root: Path,
+    agent: str,
+    installation: WrapperLogInstallation,
+) -> None:
+    """Record the accepted destination after authoritative root discovery.
+
+    Capture can begin from a provisional, non-fallible root hint before the
+    wrapper performs project discovery.  Once discovery succeeds, publish the
+    already-accepted generation under the authoritative project's state
+    directory without making diagnostics a new failure mode.
+    """
+    try:
+        diagnostic_project = _diagnostic_project_root(project_root)
+    except (OSError, RuntimeError):
+        return
+    _record_wrapper_log_location(diagnostic_project, agent, installation)
 
 
 def read_wrapper_log_location(state_dir: Path, agent: str) -> dict[str, object]:
@@ -1207,9 +1328,15 @@ def installed_standard_streams_from_environment(
     env = os.environ if environ is None else environ
     authenticated = _authenticated_environment(env, expected_nonce)
     allocated: _AllocatedWrapperLogTargets | None = None
+    diagnostic_project: Path | None = None
     owned_streams = contextlib.ExitStack()
     original_stdout = sys.stdout
     original_stderr = sys.stderr
+    if project_root is not None:
+        try:
+            diagnostic_project = _diagnostic_project_root(project_root)
+        except (OSError, RuntimeError):
+            diagnostic_project = None
     if authenticated:
         stdout_raw = env.get(ENV_STDOUT_PATH)
         stderr_raw = env.get(ENV_STDERR_PATH)
@@ -1222,12 +1349,15 @@ def installed_standard_streams_from_environment(
         stderr_base = original_stderr
         stdout_mirror = None
         stderr_mirror = None
-    elif project_root is not None and agent:
-        allocated = _allocate_wrapper_log_targets(
-            Path(project_root).resolve(),
-            str(agent),
-            env,
-        )
+    elif diagnostic_project is not None and agent:
+        try:
+            allocated = _allocate_wrapper_log_targets(
+                diagnostic_project,
+                str(agent),
+                env,
+            )
+        except (OSError, RuntimeError):
+            allocated = None
         if allocated is None:
             yield WrapperLogInstallation(False)
             return
@@ -1320,9 +1450,9 @@ def installed_standard_streams_from_environment(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    if project_root is not None and agent:
+    if diagnostic_project is not None and agent:
         _record_wrapper_log_location(
-            Path(project_root).resolve(),
+            diagnostic_project,
             str(agent),
             installation,
         )

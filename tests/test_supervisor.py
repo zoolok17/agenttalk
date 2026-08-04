@@ -5903,6 +5903,367 @@ def test_ps_wrapper_log_prune_bound_recovers_from_persistent_uncertainty(
     )
 
 
+_WRAPPER_LOG_SEQUENCE_AGREEMENT_TABLE = (
+    pytest.param("valid", "5", False, False, 5, 4, True, id="valid"),
+    pytest.param(
+        "bare-legacy",
+        None,
+        False,
+        False,
+        4,
+        4,
+        False,
+        id="bare-legacy-absent",
+    ),
+    pytest.param(
+        "missing-after-write-failure",
+        None,
+        True,
+        True,
+        4,
+        5,
+        True,
+        id="missing-with-failure-marker",
+    ),
+    pytest.param(
+        "corrupt-text",
+        "not-a-sequence",
+        False,
+        True,
+        4,
+        5,
+        True,
+        id="corrupt-text",
+    ),
+    pytest.param("empty", "", False, True, 4, 5, True, id="empty"),
+    pytest.param("zero", "0", False, True, 4, 5, True, id="zero"),
+    pytest.param("negative", "-1", False, True, 4, 5, True, id="negative"),
+    pytest.param(
+        "int64-overflow",
+        str(2**63),
+        False,
+        True,
+        4,
+        5,
+        True,
+        id="int64-overflow",
+    ),
+)
+
+
+def _write_wrapper_log_sequence_agreement_fixture(
+    tmp_path: Path,
+    *,
+    sequence_text: str | None,
+    sequence_failed: bool,
+) -> tuple[Path, str, Path]:
+    """Build four ordered records plus one lexically-newest scenario record."""
+    root = tmp_path / "wrapper-logs"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    agent_dir = root / agent_leaf
+    agent_dir.mkdir(parents=True)
+    for sequence in range(1, 5):
+        generation = agent_dir / (
+            f"20260804T00000000{sequence}Z-{sequence:032x}"
+        )
+        generation.mkdir()
+        (generation / ".committed").write_text("", encoding="utf-8")
+        (generation / ".sequence").write_text(
+            str(sequence),
+            encoding="utf-8",
+        )
+    newest = agent_dir / "20260804T000000005Z-00000000000000000000000000000005"
+    newest.mkdir()
+    (newest / ".committed").write_text("", encoding="utf-8")
+    if sequence_text is not None:
+        (newest / ".sequence").write_text(sequence_text, encoding="utf-8")
+    if sequence_failed:
+        (newest / ".sequence-failed").write_text("", encoding="utf-8")
+    return root, agent_leaf, newest
+
+
+@pytest.mark.parametrize(
+    (
+        "_scenario",
+        "sequence_text",
+        "sequence_failed",
+        "expected_uncertain",
+        "expected_max_sequence",
+        "expected_survivor_count",
+        "expected_newest_exists",
+    ),
+    _WRAPPER_LOG_SEQUENCE_AGREEMENT_TABLE,
+)
+def test_python_wrapper_log_sequence_contract_controls_retention(
+    tmp_path: Path,
+    _scenario: str,
+    sequence_text: str | None,
+    sequence_failed: bool,
+    expected_uncertain: bool,
+    expected_max_sequence: int,
+    expected_survivor_count: int,
+    expected_newest_exists: bool,
+) -> None:
+    """Python must preserve present-invalid evidence but prune bare legacy."""
+    root, agent_leaf, newest = _write_wrapper_log_sequence_agreement_fixture(
+        tmp_path,
+        sequence_text=sequence_text,
+        sequence_failed=sequence_failed,
+    )
+
+    owned, max_sequence, uncertain = wlogs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+    assert len(owned) == 5
+    assert max_sequence == expected_max_sequence
+    assert uncertain is expected_uncertain
+
+    wlogs._prune_wrapper_log_generations((root,), agent_leaf)
+
+    assert len(tuple((root / agent_leaf).iterdir())) == expected_survivor_count
+    assert newest.exists() is expected_newest_exists
+
+
+@pytest.mark.parametrize(
+    (
+        "_scenario",
+        "sequence_text",
+        "sequence_failed",
+        "expected_uncertain",
+        "expected_max_sequence",
+        "expected_survivor_count",
+        "expected_newest_exists",
+    ),
+    _WRAPPER_LOG_SEQUENCE_AGREEMENT_TABLE,
+)
+def test_generated_powershell_wrapper_log_sequence_contract_controls_retention(
+    tmp_path: Path,
+    _scenario: str,
+    sequence_text: str | None,
+    sequence_failed: bool,
+    expected_uncertain: bool,
+    expected_max_sequence: int,
+    expected_survivor_count: int,
+    expected_newest_exists: bool,
+) -> None:
+    """The real generated helpers must implement the same persisted contract."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    root, agent_leaf, newest = _write_wrapper_log_sequence_agreement_fixture(
+        tmp_path,
+        sequence_text=sequence_text,
+        sequence_failed=sequence_failed,
+    )
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / "sequence-contract.json"
+    script = tmp_path / "sequence-contract.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            "$WrapperLogGenerations = 4",
+            helpers,
+            f"$roots = @({_pslit(str(root))})",
+            f"$agentLeaf = {_pslit(agent_leaf)}",
+            "$scan = Get-NextWrapperLogSequence $roots $agentLeaf",
+            "Invoke-WrapperLogRetentionPrune $agentLeaf $roots ([bool]$scan.uncertain)",
+            f"$agentDir = Join-Path {_pslit(str(root))} $agentLeaf",
+            "$survivorCount = @(Get-ChildItem -LiteralPath $agentDir -Directory).Count",
+            "@{ uncertain = [bool]$scan.uncertain; "
+            "next_sequence = [string]$scan.next_sequence; "
+            "survivor_count = $survivorCount; "
+            f"newest_exists = (Test-Path -LiteralPath {_pslit(str(newest))}) }} | "
+            "ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "uncertain": expected_uncertain,
+        "next_sequence": str(expected_max_sequence + 1),
+        "survivor_count": expected_survivor_count,
+        "newest_exists": expected_newest_exists,
+    }
+
+
+def test_generated_powershell_prune_propagates_late_sequence_corruption(
+    tmp_path: Path,
+) -> None:
+    """A record changing after the sequence scan must still stop pruning."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    root, agent_leaf, newest = _write_wrapper_log_sequence_agreement_fixture(
+        tmp_path,
+        sequence_text="5",
+        sequence_failed=False,
+    )
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / "late-sequence-corruption.json"
+    script = tmp_path / "late-sequence-corruption.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            "$WrapperLogGenerations = 4",
+            helpers,
+            f"$roots = @({_pslit(str(root))})",
+            f"$agentLeaf = {_pslit(agent_leaf)}",
+            "$scan = Get-NextWrapperLogSequence $roots $agentLeaf",
+            f"Set-Content -LiteralPath {_pslit(str(newest / '.sequence'))} "
+            "-Value 'corrupt-after-scan' -Encoding utf8",
+            "Invoke-WrapperLogRetentionPrune $agentLeaf $roots ([bool]$scan.uncertain)",
+            f"$agentDir = Join-Path {_pslit(str(root))} $agentLeaf",
+            "@{ scan_uncertain = [bool]$scan.uncertain; "
+            "survivor_count = @(Get-ChildItem -LiteralPath $agentDir -Directory).Count; "
+            f"newest_exists = (Test-Path -LiteralPath {_pslit(str(newest))}) }} | "
+            "ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "scan_uncertain": False,
+        "survivor_count": 5,
+        "newest_exists": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "sequence_record_kind",
+    [
+        pytest.param("directory", id="non-file"),
+        pytest.param(
+            "junction",
+            marks=pytest.mark.skipif(
+                os.name != "nt",
+                reason="Windows junction parity case",
+            ),
+            id="windows-reparse-point",
+        ),
+    ],
+)
+def test_python_and_generated_powershell_fail_closed_on_unsafe_sequence_record(
+    tmp_path: Path,
+    sequence_record_kind: str,
+) -> None:
+    """Both launch paths must preserve evidence for a non-plain record."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    root, agent_leaf, newest = _write_wrapper_log_sequence_agreement_fixture(
+        tmp_path,
+        sequence_text=None,
+        sequence_failed=False,
+    )
+    sequence_path = newest / ".sequence"
+    if sequence_record_kind == "directory":
+        sequence_path.mkdir()
+    else:
+        target = tmp_path / "sequence-junction-target"
+        target.mkdir()
+        create_script = tmp_path / "create-sequence-junction.ps1"
+        create_script.write_text(
+            "param([string]$Link, [string]$Target)\n"
+            "New-Item -ItemType Junction -Path $Link -Target $Target | Out-Null\n",
+            encoding="utf-8-sig",
+        )
+        created = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-File",
+                str(create_script),
+                str(sequence_path),
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert created.returncode == 0, f"{created.stdout}{created.stderr}"
+
+    owned, max_sequence, uncertain = wlogs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+    assert len(owned) == 5
+    assert max_sequence == 4
+    assert uncertain is True
+    wlogs._prune_wrapper_log_generations((root,), agent_leaf)
+    assert newest.exists()
+
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / f"unsafe-sequence-{sequence_record_kind}.json"
+    script = tmp_path / f"unsafe-sequence-{sequence_record_kind}.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            "$WrapperLogGenerations = 4",
+            helpers,
+            f"$roots = @({_pslit(str(root))})",
+            f"$agentLeaf = {_pslit(agent_leaf)}",
+            f"$record = Read-WrapperLogSequenceRecord {_pslit(str(newest))} $true",
+            "$scan = Get-NextWrapperLogSequence $roots $agentLeaf",
+            "Invoke-WrapperLogRetentionPrune $agentLeaf $roots ([bool]$scan.uncertain)",
+            f"$agentDir = Join-Path {_pslit(str(root))} $agentLeaf",
+            "@{ state = [string]$record.state; "
+            "uncertain = [bool]$scan.uncertain; "
+            "survivor_count = @(Get-ChildItem -LiteralPath $agentDir -Directory).Count; "
+            f"newest_exists = (Test-Path -LiteralPath {_pslit(str(newest))}) }} | "
+            "ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "state": "present-invalid",
+        "uncertain": True,
+        "survivor_count": 5,
+        "newest_exists": True,
+    }
+
+
 def test_ps_wrapper_log_sequence_write_failure_marks_uncertain_and_defers_prune(
     tmp_path: Path,
 ) -> None:

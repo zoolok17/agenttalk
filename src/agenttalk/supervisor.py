@@ -10755,6 +10755,7 @@ function Wait-ForNextPoll($config) {
 }
 # endregion checked-mutations
 # region wrapper-log-helpers
+$WrapperLogSequenceUncertaintyByState = __AGENTTALK_WRAPPER_LOG_SEQUENCE_POLICY__
 function Test-RunningOnWindows {
   # Ambient markers such as `$env:OS` are optional and are deliberately absent
   # in hermetic launch environments.
@@ -11295,6 +11296,52 @@ function Protect-WrapperLogPaths(
     return $false
   }
 }
+function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
+  $seqFile = Join-Path $generation '.sequence'
+  $sequenceEntry = $null
+  try {
+    $sequenceEntry = Get-Item -LiteralPath $seqFile -Force -ErrorAction Stop
+  } catch [System.Management.Automation.ItemNotFoundException] {
+    $state = if (Test-Path -LiteralPath (Join-Path $generation '.sequence-failed')) {
+      'missing-write-failed'
+    } else {
+      'missing-legacy'
+    }
+    return [pscustomobject]@{
+      sequence = $null
+      uncertain = ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state])
+      state = $state
+    }
+  } catch {
+    $state = 'present-invalid'
+    return [pscustomobject]@{
+      sequence = $null
+      uncertain = ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state])
+      state = $state
+    }
+  }
+  $state = 'present-invalid'
+  $sequence = $null
+  try {
+    if ($sequenceEntry.PSIsContainer -or
+        (($sequenceEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+      throw 'sequence record is not a plain file'
+    }
+    $text = [IO.File]::ReadAllText($seqFile).Trim()
+    [long]$parsed = 0L
+    if (($text -cnotmatch '^[1-9][0-9]*$') -or
+        (-not [long]::TryParse($text, [ref]$parsed))) {
+      throw 'sequence record is not a canonical positive Int64'
+    }
+    $sequence = $parsed
+    $state = 'present-valid'
+  } catch {}
+  return [pscustomobject]@{
+    sequence = $sequence
+    uncertain = ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state])
+    state = $state
+  }
+}
 function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
   # The generation NAME is still wall-clock-derived (for human readability),
   # but pruning must not rely on it as the sole age key - an operator-
@@ -11335,46 +11382,15 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
         Get-ChildItem -LiteralPath $scanAgentDir -Directory -ErrorAction Stop
       )) {
         $committed = Test-Path -LiteralPath (Join-Path $existing.FullName '.committed')
-        $seqFile = Join-Path $existing.FullName '.sequence'
-        if (-not (Test-Path -LiteralPath $seqFile)) {
-          # #139-family, round 13: a COMMITTED generation with no
-          # .sequence file is exactly the write-failure gap round 12
-          # fixed - but that fix's sequence_uncertain lives only on the
-          # ONE launch that hit it, never persisted. Without this check
-          # the NEXT launch's scan silently skips this generation, reuses
-          # the sequence number it never recorded, and retention's sort
-          # key ranks it below every sequence-bearing entry even though
-          # it may be the newest generation on disk. A non-committed
-          # (pending/orphaned) generation is not in retention's ranked
-          # set at all (Invoke-WrapperLogRetentionPrune excludes it), so it
-          # does not need to propagate uncertainty here.
-          #
-          # But "no .sequence file" is ALSO the permanent, by-design shape
-          # of a pre-upgrade legacy generation that never wrote one at
-          # all (see the name-fallback sortKey comment in
-          # Invoke-WrapperLogRetentionPrune) - those must keep tolerating
-          # pruning forever, exactly as before, or a fleet with any
-          # legacy history would never prune again. The two are
-          # indistinguishable by absence alone, so a genuine write
-          # failure also drops an explicit .sequence-failed marker (see
-          # New-WrapperLogTargets) - only THAT combination propagates
-          # uncertainty; a bare missing .sequence with no failure marker
-          # is the legacy case and stays exactly as tolerant as before.
-          if ($committed -and (Test-Path -LiteralPath (Join-Path $existing.FullName '.sequence-failed'))) {
-            $uncertain = $true
-          }
-          continue
+        # One state policy is rendered from wrapper_logs.py and consumed by
+        # both languages: a bare missing record is legacy-compatible, a
+        # write-failed missing record is uncertain, and every present record
+        # must be a canonical positive Int64 or fail closed as uncertain.
+        $record = Read-WrapperLogSequenceRecord $existing.FullName $committed
+        if (($null -ne $record.sequence) -and ([long]$record.sequence -gt $seq)) {
+          $seq = [long]$record.sequence
         }
-        try {
-          $existingSeq = [int64]([IO.File]::ReadAllText($seqFile).Trim())
-          if ($existingSeq -gt $seq) { $seq = $existingSeq }
-        } catch {
-          # Corrupt/unreadable record does not veto this generation's own
-          # sequence contribution to the max, but for a COMMITTED
-          # generation it is the same uncertainty class as a missing
-          # record - propagate it the same way.
-          if ($committed) { $uncertain = $true }
-        }
+        if ([bool]$record.uncertain) { $uncertain = $true }
       }
     } catch {
       $uncertain = $true
@@ -11607,23 +11623,19 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
         # Prefer the monotonic launch sequence recorded at creation time over
         # the wall-clock name: a backward clock correction must not make a
         # stale generation look permanently newest. A missing/corrupt record
-        # (pre-upgrade generations never wrote one) falls back to the name -
-        # it never blocks pruning, it only loses skew-safety for that one
-        # legacy entry.
+        # (pre-upgrade generations never wrote one) falls back to the name.
+        # A genuinely absent legacy record remains prunable; any present but
+        # invalid/unreadable record makes this prune cycle uncertain, including
+        # corruption that occurs after Get-NextWrapperLogSequence scanned it.
         $sortKey = '0-' + $old.Name
-        $seqFile = Join-Path $old.FullName '.sequence'
-        if (Test-Path -LiteralPath $seqFile) {
-          try {
-            $seqValue = [int64]([IO.File]::ReadAllText($seqFile).Trim())
-            # A direct wrapper can race this singleton allocator and observe
-            # the same prior maximum. The nonce-bearing generation name is a
-            # deterministic total-order tie-break, not a claim of chronology.
-            $sortKey = '1-' + $seqValue.ToString('D20') + '-' + $old.Name
-          } catch {
-            Write-Warning (
-              "supervisor: unreadable wrapper log launch sequence '{0}' ({1})" -f
-              $seqFile, $_.Exception.Message)
-          }
+        $record = Read-WrapperLogSequenceRecord $old.FullName $true
+        if ([bool]$record.uncertain) { $sequenceUncertain = $true }
+        if ($null -ne $record.sequence) {
+          $seqValue = [long]$record.sequence
+          # A direct wrapper can race this singleton allocator and observe
+          # the same prior maximum. The nonce-bearing generation name is a
+          # deterministic total-order tie-break, not a claim of chronology.
+          $sortKey = '1-' + $seqValue.ToString('D20') + '-' + $old.Name
         }
         $owned += [pscustomobject]@{ item = $old; sort_key = $sortKey }
       }
@@ -11647,7 +11659,7 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
     if ($owned.Count -le $uncertainBound) {
       Write-Warning (
         ("supervisor: wrapper log launch sequence is unreliable for '{0}' " +
-         "(a configured root could not be scanned); skipping prune this cycle") -f
+         "(a root or record could not be read safely); skipping prune this cycle") -f
         $name)
       return
     }
@@ -12412,6 +12424,10 @@ $pollNum = 0
   }
 }
 """
+PS_TEMPLATE = PS_TEMPLATE.replace(
+    "__AGENTTALK_WRAPPER_LOG_SEQUENCE_POLICY__",
+    wrapper_log.powershell_wrapper_log_sequence_policy(),
+)
 
 def agenttalk_shim(
     python_exe: str,

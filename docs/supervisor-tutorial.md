@@ -182,7 +182,8 @@ Before a supervised process starts, the supervisor tries its preferred root,
 the OS temporary fallback, and the project-parent fallback in order, creating a
 new immutable generation at the first root that accepts it. A direct wrapper
 does the equivalent at command startup and tries each eligible root in order.
-Once `agenttalk wrap` begins command dispatch, Python-level writes through its
+As `agenttalk wrap` enters its dispatched command, before project/store setup,
+it attempts to install the capture; Python-level writes through the installed
 standard streams are bounded to 1 MiB per stream using four fixed segments;
 suffixes `.1` through `.3` retain the newest output after the initial
 redirect segment fills. Interpreter/package bootstrap output written before

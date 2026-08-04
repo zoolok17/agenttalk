@@ -16,9 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depended on generated PowerShell
   targets. `supervise --report --for <agent>` exposes the wrapper-recorded root
   and files, preserving the real fallback choice instead of recomputing the
-  preferred candidate. Direct wrapper-owned bounded capture begins after
-  argument dispatch; supervised OS redirection still begins earlier. Failures
-  before wrap dispatch remain tracked separately in #136.
+  preferred candidate. Direct wrapper-owned bounded capture is attempted as
+  the first action after argument dispatch, before project/store setup;
+  supervised OS redirection still begins earlier. Failures before wrap dispatch
+  remain tracked separately in #136.
 
 ## [0.81.0] - 2026-08-02
 

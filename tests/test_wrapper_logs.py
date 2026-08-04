@@ -89,6 +89,34 @@ def _captured_stderr_logs(tmp_path: Path) -> list[Path]:
     return sorted(tmp_path.rglob("stderr.log"))
 
 
+def _committed_generation_pool(
+    root: Path,
+    *,
+    newest_sequence: str | None,
+) -> tuple[str, list[Path], Path]:
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    generations: list[Path] = []
+    for sequence in range(1, wrapper_logs.WRAPPER_LOG_GENERATIONS + 2):
+        generation = (
+            root
+            / agent_leaf
+            / f"20260804T12000{sequence}000Z-{sequence:032x}"
+        )
+        generation.mkdir(parents=True)
+        if sequence <= wrapper_logs.WRAPPER_LOG_GENERATIONS:
+            (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        elif newest_sequence is not None:
+            (generation / ".sequence").write_text(
+                newest_sequence,
+                encoding="utf-8",
+            )
+        (generation / ".committed").write_bytes(b"")
+        (generation / "stdout.log").write_bytes(b"")
+        (generation / "stderr.log").write_bytes(b"")
+        generations.append(generation)
+    return agent_leaf, generations, generations[-1]
+
+
 def test_direct_wrap_launch_owns_bounded_log_capture(tmp_path: Path) -> None:
     project = tmp_path / "project"
     Store(project).init(["worker"])
@@ -114,6 +142,64 @@ def test_direct_wrap_launch_owns_bounded_log_capture(tmp_path: Path) -> None:
         for path in _log_glob(generation, "stdout.log*")
     )
     assert "Plan: I would compute" in captured_stdout
+
+
+@pytest.mark.parametrize(
+    ("failure_type", "mapped_exit"),
+    [(OSError, 2), (RuntimeError, None)],
+    ids=("mapped-os-error", "unexpected-runtime-error"),
+)
+def test_direct_wrap_captures_implicit_root_discovery_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
+    mapped_exit: int | None,
+) -> None:
+    project = tmp_path / "project"
+    store = Store(project)
+    store.init(["worker"])
+    state = tmp_path / "state"
+    env = _direct_wrap_environment(tmp_path, state)
+    env.pop("AGENTTALK_ROOT", None)
+    monkeypatch.setattr(os, "environ", env)
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+
+    def fail_root_discovery() -> Path:
+        raise failure_type("ROOT-DISCOVERY-SENTINEL")
+
+    monkeypatch.setattr(cli, "find_root", fail_root_discovery)
+
+    argv = [
+        "wrap",
+        "--for",
+        "worker",
+        "--cli",
+        "claude",
+        "--",
+        sys.executable,
+        "-c",
+        "pass",
+    ]
+    if mapped_exit is None:
+        with pytest.raises(failure_type, match="ROOT-DISCOVERY-SENTINEL"):
+            cli.main(argv)
+    else:
+        assert cli.main(argv) == mapped_exit
+
+    [stderr_log] = _captured_stderr_logs(tmp_path)
+    generation = stderr_log.parent
+    assert (generation / ".committed").is_file()
+    captured = "".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in _log_glob(generation, "stderr.log*")
+    )
+    assert "ROOT-DISCOVERY-SENTINEL" in captured
+    location = wrapper_logs.read_wrapper_log_location(store.state_dir, "worker")
+    assert location["status"] == "observed"
+    assert Path(str(location["generation_dir"])) == generation.resolve()
+    assert Path(str(location["stderr"])) == stderr_log.resolve()
 
 
 def test_report_names_the_root_that_accepted_the_wrapper_generation(
@@ -419,6 +505,96 @@ def test_reparse_attribute_check_is_exercised_without_symlink_privilege(
         wrapper_logs._prepare_agent_log_dir(root, "agent-0123456789abcdef")
 
 
+def test_wrapper_log_candidate_rechecks_original_ancestry_after_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    configured_state = tmp_path / "configured-state"
+    home = tmp_path / "home"
+    home.mkdir()
+    real_check = wrapper_logs._is_reparse_or_symlink
+    configured_visits = 0
+
+    def swap_after_first_check(path: Path) -> bool:
+        nonlocal configured_visits
+        if path == configured_state:
+            configured_visits += 1
+            return configured_visits > 1
+        return real_check(path)
+
+    monkeypatch.setattr(
+        wrapper_logs,
+        "_is_reparse_or_symlink",
+        swap_after_first_check,
+    )
+
+    roots = wrapper_logs.wrapper_log_root_candidates(
+        checkout,
+        platform="posix",
+        environ={
+            "XDG_STATE_HOME": str(configured_state),
+            "HOME": str(home),
+        },
+    )
+
+    assert configured_visits >= 2
+    assert roots[0].is_relative_to(home.resolve())
+
+
+def test_corrupt_committed_sequence_marks_retention_uncertain(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "logs"
+    agent_leaf, _generations, _newest = _committed_generation_pool(
+        root,
+        newest_sequence="not-a-sequence",
+    )
+
+    _owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+
+    assert uncertain is True
+
+
+def test_prune_preserves_newest_generation_when_its_sequence_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "logs"
+    agent_leaf, generations, newest = _committed_generation_pool(
+        root,
+        newest_sequence="not-a-sequence",
+    )
+
+    wrapper_logs._prune_wrapper_log_generations((root,), agent_leaf)
+
+    assert newest.is_dir()
+    assert len([generation for generation in generations if generation.is_dir()]) == 5
+
+
+def test_bare_legacy_generation_without_sequence_remains_prunable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "logs"
+    agent_leaf, generations, newest = _committed_generation_pool(
+        root,
+        newest_sequence=None,
+    )
+    _owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+
+    wrapper_logs._prune_wrapper_log_generations((root,), agent_leaf)
+
+    assert uncertain is False
+    assert not newest.exists()
+    assert len([generation for generation in generations if generation.is_dir()]) == 4
+
+
 def test_prune_preserves_live_generation_and_reclaims_stale_active_lock(
     tmp_path: Path,
 ) -> None:
@@ -626,6 +802,75 @@ def test_direct_allocator_refuses_a_symlinked_root_ancestor(
     assert targets is not None
     assert targets.root != preferred.resolve()
     assert not any(redirected.rglob("stdout.log"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction guard")
+def test_direct_allocator_refuses_a_configured_state_junction(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    linked_state = tmp_path / "linked-state"
+    home = tmp_path / "home"
+    home.mkdir()
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    assert powershell is not None, "Windows PowerShell is required for junction coverage"
+    junction_script = tmp_path / "create-junction.ps1"
+    junction_script.write_text(
+        "param([string]$Link, [string]$Target)\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "New-Item -ItemType Junction -Path $Link -Target $Target | Out-Null\n",
+        encoding="utf-8-sig",
+    )
+    creation = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(junction_script),
+            str(linked_state),
+            str(redirected),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert creation.returncode == 0, creation.stderr
+    assert linked_state.is_dir()
+    assert (
+        linked_state.lstat().st_file_attributes
+        & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+    env = {
+        "LOCALAPPDATA": str(linked_state),
+        "USERPROFILE": str(home),
+        "TEMP": str(temp),
+        "TMP": str(temp),
+    }
+    try:
+        targets = wrapper_logs._allocate_wrapper_log_targets(
+            checkout,
+            "worker",
+            env,
+        )
+
+        assert targets is not None
+        assert targets.root.is_relative_to(home.resolve())
+        assert targets.stdout_path.is_file()
+        assert targets.stderr_path.is_file()
+        assert not any(redirected.rglob("stdout.log"))
+        assert not any(redirected.rglob("stderr.log"))
+    finally:
+        if linked_state.exists():
+            linked_state.rmdir()
 
 
 def test_restrictive_file_opener_bakes_0o600_into_os_open(

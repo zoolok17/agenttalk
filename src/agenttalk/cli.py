@@ -10681,11 +10681,12 @@ def cmd_internal_check_wrap_dispatch(args: argparse.Namespace) -> int:
 
 
 def cmd_wrap(args: argparse.Namespace) -> int:
-    """Install wrapper-owned logging before wrapper setup begins."""
+    """Attempt wrapper-owned logging before fallible wrapper setup begins."""
     from .wrapper_logs import (
         WrapperLifecycleLog,
         capture_termination_signals,
         installed_standard_streams_from_environment,
+        record_wrapper_log_location,
     )
 
     agent = (
@@ -10694,16 +10695,23 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         or "unknown"
     )
     project_root: Path | None = None
+    discover_project_root = False
     # A real argparse Namespace always has the global ``root`` attribute.
     # Some unit-level callers intentionally construct the legacy minimal
     # Namespace; do not make those embedders allocate process-global logs.
     if hasattr(args, "root"):
         raw_root = getattr(args, "root", None) or os.environ.get("AGENTTALK_ROOT")
         if raw_root:
-            project_root = Path(raw_root).resolve()
+            # This is only a diagnostic allocation hint. Do not perform the
+            # authoritative, fallible root resolution before bounded streams
+            # exist; _get_store does that inside the capture below.
+            project_root = Path(raw_root)
         else:
-            with contextlib.suppress(OSError, FileNotFoundError):
-                project_root = find_root()
+            # Allocate a provisional per-CWD destination without touching the
+            # filesystem. Authoritative ancestor discovery runs only after the
+            # bounded streams are installed, below.
+            project_root = Path(".")
+            discover_project_root = True
 
     with installed_standard_streams_from_environment(
         expected_nonce=getattr(args, "supervisor_launch_nonce", None),
@@ -10717,6 +10725,14 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         args._wrapper_lifecycle_log = lifecycle_log
         try:
             with capture_termination_signals(lifecycle_log):
+                if discover_project_root:
+                    discovered_root = find_root()
+                    args.root = str(discovered_root)
+                    record_wrapper_log_location(
+                        discovered_root,
+                        str(agent),
+                        log_installation,
+                    )
                 result = _cmd_wrap_with_logging(args)
         except BaseException as exc:
             # A SystemExit reaching here was ALREADY a deliberate exit with
