@@ -372,6 +372,30 @@ def test_unavailable_requires_two_matching_supervisor_polls(tmp_path: Path) -> N
     assert len(_snapshot(store, config)["items"]) == 1
 
 
+def test_coordination_snapshot_never_advances_supervisor_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, config = _team(tmp_path)
+    calls = []
+    real_observe = supervisor.observe_actions
+
+    def observe(*args, **kwargs):
+        calls.append(True)
+        return real_observe(*args, **kwargs)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("read-only snapshot called the transition planner")
+
+    monkeypatch.setattr(stalls.supervisor, "observe_actions", observe)
+    monkeypatch.setattr(stalls.supervisor, "plan_actions", forbidden)
+
+    snapshot = _snapshot(store, config)
+
+    assert snapshot["diagnostics"] == []
+    assert calls == [True]
+
+
 def test_terminal_responder_is_a_reassign_advisory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -390,7 +414,7 @@ def test_terminal_responder_is_a_reassign_advisory(
     supervisor.record_coordination_availability_observation(
         store, report, plan, config, now_epoch=NOW + 1,
     )
-    monkeypatch.setattr(stalls.supervisor, "plan_actions", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(stalls.supervisor, "observe_actions", lambda *_args, **_kwargs: plan)
 
     item = _snapshot(store, config)["items"][0]
     assert item["evidence"][0]["state"] == supervisor.AVAILABILITY_TERMINAL

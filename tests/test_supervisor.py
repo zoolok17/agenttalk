@@ -8729,6 +8729,193 @@ def test_wrapped_active_absent_brain_requires_two_same_generation_polls() -> Non
     assert second["next_state"]["consecutive_fails"] == 3
 
 
+@pytest.mark.parametrize(
+    ("condition", "counter_key", "provisional_state", "confirmed_state"),
+    [
+        ("missing", "runtime_dead_polls", "CLI_CHILD_MISSING", "CLI_CHILD_DEAD"),
+        ("stalled", "runtime_stall_polls", "CLI_CHILD_STALL_SUSPECT", "CLI_CHILD_STALLED"),
+    ],
+)
+def test_read_only_observation_does_not_manufacture_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    condition: str,
+    counter_key: str,
+    provisional_state: str,
+    confirmed_state: str,
+) -> None:
+    """A surface read is not the supervisor's second confirming poll."""
+    store = _team(tmp_path)
+    progress_age = 2500.0 if condition == "stalled" else 60.0
+    runtime_args = {}
+    if condition == "stalled":
+        runtime_args = {
+            "launcher_creation_filetime": _ps_filetime(600000),
+            "launcher_exit_filetime": _ps_filetime(750000),
+        }
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=progress_age,
+            progress_age=progress_age,
+            progress_sequence=2,
+            **runtime_args,
+        ),
+    )
+    report["roster"] = ["worker"]
+    initial_state = {"agents": {"worker": _wrap_ready(
+        backoff_next_epoch=NOW + 100,
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - progress_age,
+    )}}
+    snapshot = (
+        _wrap_snap()[:1]
+        if condition == "missing"
+        else _codex_forked_brain_snap()
+    )
+
+    first = sup.plan_actions(
+        report,
+        initial_state,
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert first["state"] == provisional_state
+    assert first["next_state"][counter_key] == 1
+    provisional_state_data = {"agents": {"worker": first["next_state"]}}
+
+    # Direction control: only the transition planner is allowed to earn poll two.
+    transition = sup.plan_actions(
+        report,
+        provisional_state_data,
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert transition["state"] == confirmed_state
+    assert transition["next_state"][counter_key] == 2
+
+    projected = sup.observe_actions(
+        report,
+        provisional_state_data,
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert projected["state"] == provisional_state
+    assert projected["next_state"][counter_key] == 1
+    assert sup.project_coordination_availability(
+        "worker",
+        report["agents"]["worker"],
+        projected,
+        _WRAP_CONFIG["agents"]["worker"],
+    )["state"] == sup.AVAILABILITY_UNKNOWN
+    assert sup.project_coordination_availability(
+        "worker",
+        report["agents"]["worker"],
+        transition,
+        _WRAP_CONFIG["agents"]["worker"],
+    )["state"] == sup.AVAILABILITY_UNAVAILABLE
+
+    monkeypatch.setattr(sup, "build_report", lambda *args, **kwargs: report)
+    before = json.dumps(provisional_state_data, sort_keys=True)
+    observation = sup.build_supervisor_observation(
+        store,
+        now_epoch=NOW,
+        state=provisional_state_data,
+        supervisor_config=_WRAP_CONFIG,
+        snapshot=snapshot,
+        event_limit=0,
+    )
+
+    worker = next(item for item in observation["agents"] if item["name"] == "worker")
+    assert worker["decision"]["state"] == provisional_state
+    assert json.dumps(provisional_state_data, sort_keys=True) == before
+
+    confirmed = sup.observe_actions(
+        report,
+        {"agents": {"worker": transition["next_state"]}},
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert confirmed["state"] == confirmed_state
+    assert confirmed["next_state"][counter_key] == 2
+
+
+def test_status_surface_keeps_one_missing_child_poll_unconfirmed(tmp_path: Path) -> None:
+    store = _team(tmp_path)
+    config = {
+        **_WRAP_CONFIG,
+        "root": str(tmp_path),
+        "agents": {"worker": dict(_WRAP_CONFIG["agents"]["worker"])},
+    }
+    (store.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
+    (store.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
+    writer = wrt.WrapperRuntimeWriter(
+        store.state_dir,
+        "worker",
+        "wrapper-1",
+        wrapper_pid=WRAP_LAUNCHER_PID,
+        wrapper_start=WRAP_START,
+        clock=lambda: NOW,
+    )
+    writer.starting(message_id="msg-runtime", turn_id="turn-1")
+    writer.active(WRAP_CHILD_PID, WRAP_CHILD_START)
+    writer.progress()
+
+    snapshot = _wrap_snap(root=str(tmp_path))[:1]
+    initial_state = {"agents": {"worker": _wrap_ready(
+        backoff_next_epoch=NOW + 100,
+        runtime_turn_generation=1,
+        runtime_progress_sequence=1,
+        runtime_progress_seen_epoch=NOW,
+    )}}
+    report = sup.build_report(
+        store,
+        now_epoch=NOW,
+        state=initial_state,
+        supervisor_config=config,
+    )
+    first = sup.plan_actions(
+        report,
+        initial_state,
+        config,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert first["state"] == "CLI_CHILD_MISSING"
+    assert first["next_state"]["runtime_dead_polls"] == 1
+
+    state = {"agents": {"worker": first["next_state"]}}
+    direction = sup.plan_actions(
+        report,
+        state,
+        config,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert direction["state"] == "CLI_CHILD_DEAD"
+
+    (store.dir / "supervisor-state.json").write_text(
+        json.dumps(state),
+        encoding="utf-8",
+    )
+    (store.dir / "supervisor-snapshot.json").write_text(
+        json.dumps(snapshot),
+        encoding="utf-8",
+    )
+
+    rows, warnings = cli._status_supervisor_summaries(store, NOW, config)
+
+    assert warnings == []
+    assert rows["worker"]["decision"]["action"] == sup.NONE
+    assert rows["worker"]["decision"]["state"] == "CLI_CHILD_MISSING"
+
+
 @pytest.mark.parametrize("phase", ["starting", "active", "terminal"])
 def test_wrapped_dead_wrapper_recovers_from_every_non_idle_runtime_phase(
     phase: str,

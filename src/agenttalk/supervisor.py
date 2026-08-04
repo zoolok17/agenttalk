@@ -1811,7 +1811,7 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
                                  event_limit: int = 20,
                                  lead_liveness_stale_after_seconds: float =
                                  LEAD_LIVENESS_STALE_AFTER_SECONDS) -> dict:
-    """Read-only operator view: report + exact planner output + bounded ring tail."""
+    """Read-only operator view with a non-advancing decision projection."""
     config = supervisor_config if isinstance(supervisor_config, dict) else {}
     stuck = config.get("stuck_after_seconds")
     stuck = float(stuck) if isinstance(stuck, (int, float)) else None
@@ -1823,7 +1823,7 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
         state=state,
         supervisor_config=config,
     )
-    plan = plan_actions(report, state, config, now_epoch=now_epoch, snapshot=snapshot)
+    plan = observe_actions(report, state, config, now_epoch=now_epoch, snapshot=snapshot)
     events, event_warnings = read_supervisor_events(store, limit=event_limit)
     agents = []
     rpt_agents = report.get("agents") if isinstance(report.get("agents"), dict) else {}
@@ -6884,8 +6884,21 @@ def _health_brief(view: dict | None) -> dict:
     }
 
 
+def _confirmation_polls(
+    prior_polls: int,
+    *,
+    same_evidence: bool,
+    advance_confirmations: bool,
+) -> int:
+    """Project or advance a durable multi-poll confirmation counter."""
+    if not advance_confirmations:
+        return prior_polls if same_evidence else 0
+    return prior_polls + 1 if same_evidence else 1
+
+
 def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
-              liveness: dict, *, now_epoch: float) -> dict:
+              liveness: dict, *, now_epoch: float,
+              advance_confirmations: bool = True) -> dict:
     """Decide ONE agent's action + next state. PURE - no I/O, no clock.
 
     Manual agents retain heartbeat authority. Wrapped agents require a strict
@@ -7684,7 +7697,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                     and prior_dead_polls >= 0
                     else 0
                 )
-                dead_polls = (prior_dead_polls + 1) if same_runtime_turn else 1
+                dead_polls = _confirmation_polls(
+                    prior_dead_polls,
+                    same_evidence=same_runtime_turn,
+                    advance_confirmations=advance_confirmations,
+                )
                 nxt["runtime_dead_polls"] = dead_polls
                 if dead_polls < _CLI_CHILD_CONFIRM_POLLS:
                     return _result(
@@ -7746,7 +7763,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                     and not isinstance(prior_sequence, bool)
                     and progress_sequence == prior_sequence
                 )
-                stall_polls = (prior_stall_polls + 1) if same_sequence else 1
+                stall_polls = _confirmation_polls(
+                    prior_stall_polls,
+                    same_evidence=same_sequence,
+                    advance_confirmations=advance_confirmations,
+                )
                 nxt["runtime_stall_polls"] = stall_polls
                 if stall_polls < _CLI_CHILD_CONFIRM_POLLS:
                     return _result(
@@ -8312,18 +8333,15 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
     return out
 
 
-def plan_actions(report: dict, state: dict, config: dict,
-                 *, now_epoch: float, snapshot: list[dict] | None = None) -> dict:
-    """The SHARED decision table. Returns ``{"now_epoch", "agents": {name: plan}}``
-    where each plan has ``action``/``state`` plus ``kill_first``/``kill_orphans``/
-    ``kill_targets``/``discover_brain``/``resume_mode``/``next_state`` for the
-    executor. Only agents present in BOTH the config and the report are planned
-    (config drives what is supervised; the report supplies bus facts).
-
-    ``snapshot`` is the executor's process snapshot (list of rows) interpreted
-    per agent by :func:`_liveness`. Manual agents use it for best-effort restart
-    targets. Wrapped agents use it to re-prove ownership and project a bounded,
-    strict process tree into ``next_state`` for the next poll."""
+def _plan_actions(
+    report: dict,
+    state: dict,
+    config: dict,
+    *,
+    now_epoch: float,
+    snapshot: list[dict] | None,
+    advance_confirmations: bool,
+) -> dict:
     cfg_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     rpt_agents = report.get("agents") or {}
     state_agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
@@ -8341,8 +8359,16 @@ def plan_actions(report: dict, state: dict, config: dict,
         liveness = _liveness(snapshot, st, cfg_agent, name, now_epoch,
                              root_key=root_key, request_id=None,
                              runtime_view=rpt.get("wrapper_runtime"))
-        out[name] = _plan_one(name, rpt, st, config, cfg_agent, liveness,
-                              now_epoch=now_epoch)
+        out[name] = _plan_one(
+            name,
+            rpt,
+            st,
+            config,
+            cfg_agent,
+            liveness,
+            now_epoch=now_epoch,
+            advance_confirmations=advance_confirmations,
+        )
     return {
         "now_epoch": now_epoch,
         "agents": out,
@@ -8352,6 +8378,50 @@ def plan_actions(report: dict, state: dict, config: dict,
             report, state, config, now_epoch=now_epoch, snapshot=snapshot,
             root_key=root_key),
     }
+
+
+def plan_actions(report: dict, state: dict, config: dict,
+                 *, now_epoch: float, snapshot: list[dict] | None = None) -> dict:
+    """The SHARED executable decision table.
+
+    Returns ``{"now_epoch", "agents": {name: plan}}`` where each plan has
+    ``action``/``state`` plus ``kill_first``/``kill_orphans``/``kill_targets``/
+    ``discover_brain``/``resume_mode``/``next_state`` for the executor. Only
+    agents present in BOTH the config and the report are planned (config drives
+    what is supervised; the report supplies bus facts).
+
+    ``snapshot`` is the executor's process snapshot (list of rows) interpreted
+    per agent by :func:`_liveness`. Manual agents use it for best-effort restart
+    targets. Wrapped agents use it to re-prove ownership and project a bounded,
+    strict process tree into ``next_state`` for the next poll. This executable
+    path may advance the durable two-poll child confirmation counters.
+    """
+    return _plan_actions(
+        report,
+        state,
+        config,
+        now_epoch=now_epoch,
+        snapshot=snapshot,
+        advance_confirmations=True,
+    )
+
+
+def observe_actions(report: dict, state: dict, config: dict,
+                    *, now_epoch: float, snapshot: list[dict] | None = None) -> dict:
+    """Return the planner's read-only projection without earning another poll.
+
+    Operator surfaces may consume confirmation already persisted by the
+    executable planner, but merely reading a snapshot cannot manufacture the
+    second poll required to call a child dead or stalled.
+    """
+    return _plan_actions(
+        report,
+        state,
+        config,
+        now_epoch=now_epoch,
+        snapshot=snapshot,
+        advance_confirmations=False,
+    )
 
 
 def process_tree_ownership_reset_evidence(

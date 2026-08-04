@@ -431,7 +431,7 @@ def build_snapshot(
             state=state,
             supervisor_config=config,
         )
-        plan = supervisor.plan_actions(
+        plan = supervisor.observe_actions(
             report,
             state,
             config,

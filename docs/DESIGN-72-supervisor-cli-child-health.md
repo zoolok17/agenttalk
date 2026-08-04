@@ -362,6 +362,14 @@ branch.
 
 ### 5. Death, wedge, and restart policy
 
+Only an executable supervisor poll may advance either two-poll confirmation
+counter. Read-only operator views use the same decision table but may only
+consume confirmation already persisted by an executable poll; reading the same
+process snapshot again is not a second poll. This observation/transition
+boundary keeps status, diagnostics, and coordination projections from
+manufacturing the evidence required for `CLI_CHILD_DEAD` or
+`CLI_CHILD_STALLED`.
+
 Child death and child stall are different failures:
 
 - **Dead:** the active-turn brain is absent from a trustworthy snapshot.
