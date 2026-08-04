@@ -449,12 +449,122 @@
     var age = Number(agent && agent.last_seen_age_seconds);
     return Number.isFinite(age) && age >= 0 && age <= UNWRAPPED_LIVE_STALE_AFTER_SECONDS;
   }
-  function agentStateInfo(agent) {
-    var raw = ((agent && agent.health) || {}).state;
-    var info = stateInfo(raw);
-    if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
-      return { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true, desc: 'Alive and checking in, but not running under the supervisor' };
+  var OPERATOR_URGENCY_RANK = nullMap({ fine: 0, unknown: 1, attention: 2, danger: 3 });
+  function observationUrgency(info) {
+    if (info.color === 'danger') return 'danger';
+    if (info.key === 'unknown') return 'unknown';
+    if (info.grp === 'attn') return 'attention';
+    return 'fine';
+  }
+  function legacyHealthComposition(agent, raw, info) {
+    // API/asset skew fallback: old API payloads do not carry the shared Python
+    // classification. Keep each independent strict fact visibly non-green,
+    // but never invent child-loss semantics from an unclassified token.
+    var observation = {
+      source: 'wrapper_health', state: raw || 'unknown', urgency: observationUrgency(info),
+    };
+    var supervisor = null;
+    var decision = agent && agent.supervisor_decision;
+    if (decision && typeof decision === 'object') {
+      supervisor = {
+        source: 'supervisor_decision', kind: 'unclassified', state: decision.state,
+        action: decision.action, reason: decision.reason, urgency: 'attention',
+        classification_reason: 'composition_missing',
+      };
+    } else if (agent && agent.supervisor_decision_unavailable === true) {
+      supervisor = {
+        source: 'supervisor_decision', kind: 'unavailable',
+        reason: agent.supervisor_decision_unavailable_reason || 'decision_missing',
+        urgency: 'attention',
+      };
     }
+    if (!supervisor) return null;
+    var supervisorWins = OPERATOR_URGENCY_RANK[supervisor.urgency] >
+      OPERATOR_URGENCY_RANK[observation.urgency];
+    return {
+      observation: observation,
+      supervisor: supervisor,
+      urgency: supervisorWins ? supervisor.urgency : observation.urgency,
+      primary_source: supervisorWins ? 'supervisor' : 'observation',
+      disagreement: supervisor.urgency !== observation.urgency,
+    };
+  }
+  function supervisorFactSummary(fact) {
+    if (fact.kind === 'unclassified') {
+      return 'Supervisor decision (urgency classification unavailable): ' +
+        (fact.state || 'unknown') +
+        (fact.action ? '/' + fact.action : '') +
+        (fact.reason ? ' (' + fact.reason + ')' : '');
+    }
+    if (fact.kind === 'unavailable') {
+      if (fact.reason === 'auto_restart_disabled') {
+        return 'Supervisor verdict unavailable: auto-restart is disabled';
+      }
+      if (fact.reason === 'assessment_failed') {
+        return 'Supervisor verdict unavailable: assessment failed';
+      }
+      if (fact.reason === 'decision_missing') {
+        return 'Supervisor verdict unavailable: assessment returned no decision';
+      }
+      return 'Supervisor verdict unavailable: ' + (fact.reason || 'reason unknown');
+    }
+    return 'Supervisor verdict: ' + (fact.state || 'unknown') +
+      (fact.action ? '/' + fact.action : '') +
+      (fact.reason ? ' (' + fact.reason + ')' : '');
+  }
+  function supervisorPresentation(fact, observation, observationInfo) {
+    var label = 'Supervisor: ' + (fact.state || 'unknown');
+    var key = fact.urgency === 'danger' ? 'supervisor_alert' : 'supervisor_advisory';
+    if (fact.kind === 'unavailable') {
+      label = 'No verdict';
+      key = 'supervisor_unavailable';
+    } else if (fact.kind === 'unclassified') {
+      label = 'Verdict unclassified';
+    } else if (fact.kind === 'lost_binding') {
+      label = 'Child binding lost';
+      key = 'supervisor_lost_binding';
+    } else if (fact.kind === 'live_stalled') {
+      label = 'Child stalled';
+    } else if (fact.kind === 'failed') {
+      label = 'Turn failed';
+    } else if (fact.kind === 'readiness_exhausted') {
+      label = 'Readiness retries exhausted';
+    }
+    return {
+      label: label,
+      key: key,
+      color: fact.urgency === 'danger' ? 'danger' : 'attn',
+      grp: 'attn',
+      desc: supervisorFactSummary(fact) + ' · Wrapper observation: ' +
+        (observation.state || 'unknown') + ' (' + observationInfo.desc + ')',
+      healthComposition: { observation: observation, supervisor: fact },
+    };
+  }
+  function agentStateInfo(agent) {
+    var health = (agent && agent.health) || {};
+    var raw = health.state;
+    var info = stateInfo(raw);
+    var composition = agent && agent.health_composition;
+    if (!composition || typeof composition !== 'object' ||
+        !composition.observation || !composition.supervisor) {
+      composition = legacyHealthComposition(agent, raw, info);
+    }
+    if (info.key === 'unknown' && freshHeartbeat(agent) && agent) {
+      if (!composition && agent.wrapped !== true &&
+          health.reason_code !== 'health_timing_policy_unavailable') {
+        info = { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true, desc: 'Alive and checking in, but not running under the supervisor' };
+      } else {
+        var healthReason = health.reason_code ? ' (' + health.reason_code + ')' : '';
+        info = { label: 'Unknown', key: 'unknown', color: 'gray', grp: 'unknown', desc: 'Wrapper health is unknown' + healthReason + ' despite a recent heartbeat' };
+      }
+    }
+    if (!composition) return info;
+    var supervisor = composition.supervisor;
+    if (composition.primary_source === 'supervisor') {
+      return supervisorPresentation(supervisor, composition.observation, info);
+    }
+    info.desc += ' · ' + supervisorFactSummary(supervisor);
+    info.healthComposition = composition;
     return info;
   }
   function stateInfoFrom(value) {

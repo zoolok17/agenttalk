@@ -740,6 +740,108 @@ def test_python_supervisor_state_recovers_only_from_validated_backup(tmp_path: P
         sup.load_supervisor_state(path)
 
 
+def test_read_supervisor_snapshot_if_fresh_returns_the_real_rows_when_current(
+    tmp_path: Path,
+) -> None:
+    """The GOOD state is present: a fresh snapshot file's ACTUAL rows come
+    back, not merely "something not-None" — count the thing that should be
+    there, per the review bar."""
+    path = tmp_path / "supervisor-snapshot.json"
+    rows = [{"pid": 123, "start": "t0", "name": "python.exe"}]
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    now = path.stat().st_mtime + 1.0
+
+    got = sup.read_supervisor_snapshot_if_fresh(path, now_epoch=now)
+
+    assert got == rows
+
+
+def test_read_supervisor_snapshot_if_fresh_bounds_future_mtime(
+    tmp_path: Path,
+) -> None:
+    """Allow the stat-after-clock-read race, but never trust rows timestamped
+    beyond the project's explicit clock-skew allowance."""
+    path = tmp_path / "supervisor-snapshot.json"
+    rows = [{"pid": 123, "start": "t0", "name": "python.exe"}]
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    mtime = path.stat().st_mtime
+
+    assert sup.read_supervisor_snapshot_if_fresh(
+        path,
+        now_epoch=mtime - 1.0,
+    ) == rows
+    assert sup.read_supervisor_snapshot_if_fresh(
+        path,
+        now_epoch=mtime - hm.DEFAULT_HEARTBEAT_SKEW_SECONDS - 1.0,
+    ) is None
+
+
+def test_snapshot_freshness_allowance_covers_a_configured_slow_poll(
+    tmp_path: Path,
+) -> None:
+    """A supported 600s supervisor cadence must not make its own snapshot
+    stale halfway between polls. The default 300s floor still applies to the
+    normal 15s cadence; slower configured cadences get two full intervals."""
+    path = tmp_path / "supervisor-snapshot.json"
+    rows = [{"pid": 123, "start": "t0", "name": "python.exe"}]
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    allowance = sup.resolve_snapshot_stale_after_seconds({"poll_seconds": 600})
+
+    got = sup.read_supervisor_snapshot_if_fresh(
+        path,
+        now_epoch=path.stat().st_mtime + 900,
+        stale_after_seconds=allowance,
+    )
+
+    assert allowance == 1200.0
+    assert got == rows
+    assert sup.read_supervisor_snapshot_if_fresh(
+        path,
+        now_epoch=path.stat().st_mtime + allowance + 1.0,
+        stale_after_seconds=allowance,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "poll_seconds",
+    [None, True, -1, float("inf"), 1e308, 10**400, "600"],
+)
+def test_snapshot_freshness_allowance_rejects_malformed_poll_values(
+    poll_seconds: object,
+) -> None:
+    assert sup.resolve_snapshot_stale_after_seconds({
+        "poll_seconds": poll_seconds,
+    }) == sup.SNAPSHOT_STALE_AFTER_SECONDS
+
+
+def test_read_supervisor_snapshot_if_fresh_rejects_a_stale_file(
+    tmp_path: Path,
+) -> None:
+    """Positive process binding requires a CURRENT snapshot: a supervisor that
+    stopped refreshing observations (or runs with actions disabled after an
+    enabled run) leaves a stale file on disk. It must be treated as if the
+    capture had failed (None) — the SAME degrade-safe signal a genuinely
+    missing snapshot produces — not read as a live liveness fact."""
+    path = tmp_path / "supervisor-snapshot.json"
+    path.write_text(json.dumps([{"pid": 1, "start": "t0", "name": "x"}]), encoding="utf-8")
+    stale_now = path.stat().st_mtime + sup.SNAPSHOT_STALE_AFTER_SECONDS + 1.0
+
+    assert sup.read_supervisor_snapshot_if_fresh(path, now_epoch=stale_now) is None
+
+
+def test_read_supervisor_snapshot_if_fresh_absent_and_malformed(tmp_path: Path) -> None:
+    missing = tmp_path / "does-not-exist.json"
+    assert sup.read_supervisor_snapshot_if_fresh(missing, now_epoch=time.time()) is None
+
+    malformed = tmp_path / "supervisor-snapshot.json"
+    malformed.write_text("not valid json {{{", encoding="utf-8")
+    assert sup.read_supervisor_snapshot_if_fresh(malformed, now_epoch=time.time()) is None
+
+    not_a_list = tmp_path / "supervisor-snapshot2.json"
+    not_a_list.write_text(json.dumps({"agents": {}}), encoding="utf-8")
+    assert sup.read_supervisor_snapshot_if_fresh(not_a_list, now_epoch=time.time()) is None
+
+
 def test_python_supervisor_state_interrupted_replace_preserves_primary(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -1004,6 +1106,19 @@ def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
     assert "[System.IO.File]::Replace" in block
     assert "[System.IO.File]::Move" in block
     assert "function Invoke-StateFileSwapWithRetry" in block
+    file_atomic = block[
+        block.index("function Write-FileAtomic"):
+        block.index("function Write-StateFileAtomic")
+    ]
+    # Temp cleanup must cover creation and writing as well as replacement.
+    # Otherwise a partial-write/disk-full exception strands the unique temp.
+    assert (
+        file_atomic.index("try {")
+        < file_atomic.index("$stream =")
+        < file_atomic.index("Invoke-StateFileSwapWithRetry")
+        < file_atomic.rindex("} finally {")
+        < file_atomic.rindex("if (Test-Path -LiteralPath $tmp)")
+    )
     assert "Test-IsRetryableStateWriteException $_.Exception" in block
     assert "for ($attempt = 1; $attempt -le 8; $attempt++)" in block
     assert "$delayMs = [Math]::Min(250, $delayMs * 2)" in block
@@ -4958,6 +5073,79 @@ def test_generated_proc_snapshot_emits_exact_live_filetime(tmp_path: Path) -> No
     assert "foreach ($liveProc in @(Get-Process" in helpers
 
 
+def test_generated_proc_snapshot_replaces_destination_atomically(tmp_path: Path) -> None:
+    """A concurrent reader must see the complete previous snapshot while the
+    generated writer publishes the complete replacement, never an in-progress
+    truncate/write of the live path."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    snapshot_path = tmp_path / "process-snapshot.json"
+    out = tmp_path / "process-snapshot-atomic-result.json"
+    initial = '[{"pid":777,"name":"previous"}]'
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        f"$snapshotPath = {_pslit(str(snapshot_path))}",
+        f"$resultPath = {_pslit(str(out))}",
+        "$u8 = New-Object System.Text.UTF8Encoding($false)",
+        f"[IO.File]::WriteAllText($snapshotPath, {_pslit(initial)}, $u8)",
+        "$held = [IO.FileStream]::new($snapshotPath, [IO.FileMode]::Open, "
+        "[IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))",
+        "$script:liveStart = (Microsoft.PowerShell.Management\\Get-Process "
+        "-Id $PID -ErrorAction Stop).StartTime",
+        "function Get-CimInstance { [CmdletBinding()] param([string]$ClassName); "
+        "[pscustomobject]@{ ProcessId = [int]$PID; ParentProcessId = 0; "
+        "Name = 'pwsh.exe'; CommandLine = $null; CreationDate = $script:liveStart } }",
+        "function Get-Process { [CmdletBinding()] param([int]$Id); "
+        "[pscustomobject]@{ Id = [int]$PID; StartTime = $script:liveStart } }",
+        "$heldFailure = $null",
+        "try {",
+        "  if (-not (Get-ProcSnapshot $snapshotPath)) { throw 'snapshot unavailable' }",
+        "  $held.Position = 0",
+        "  $oldBytes = New-Object byte[] ([int]$held.Length)",
+        "  [void]$held.Read($oldBytes, 0, $oldBytes.Length)",
+        "  $heldText = $u8.GetString($oldBytes)",
+        "  $currentText = [IO.File]::ReadAllText($snapshotPath, $u8)",
+        "  $current = @($currentText | ConvertFrom-Json)",
+        "  $held.Dispose(); $held = $null",
+        "  $heldFailure = [IO.FileStream]::new($snapshotPath, [IO.FileMode]::Open, "
+        "[IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))",
+        "  function Get-CimInstance { throw 'injected capture failure' }",
+        "  if (Get-ProcSnapshot $snapshotPath) { throw 'capture unexpectedly succeeded' }",
+        "  $heldFailure.Position = 0",
+        "  $failureOldBytes = New-Object byte[] ([int]$heldFailure.Length)",
+        "  [void]$heldFailure.Read($failureOldBytes, 0, $failureOldBytes.Length)",
+        "  $heldFailureText = $u8.GetString($failureOldBytes)",
+        "  $marker = [IO.File]::ReadAllText($snapshotPath, $u8) | ConvertFrom-Json",
+        "  @{ held = $heldText; current_pid = [int]$current[0].pid; "
+        "writer_pid = [int]$PID; held_failure = $heldFailureText; "
+        "prior_current = $currentText; unavailable = [bool]$marker.unavailable } | "
+        "ConvertTo-Json | Set-Content $resultPath -Encoding utf8",
+        "} finally {",
+        "  if ($null -ne $held) { $held.Dispose() }",
+        "  if ($null -ne $heldFailure) { $heldFailure.Dispose() }",
+        "}",
+    ])
+    script = tmp_path / "proc-snapshot-atomic.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert payload["held"] == initial
+    assert payload["current_pid"] == payload["writer_pid"]
+    assert payload["held_failure"] == payload["prior_current"]
+    assert payload["unavailable"] is True
+
+
 def test_stop_tree_rejects_rounded_start_collision_by_exact_filetime(
     tmp_path: Path,
 ) -> None:
@@ -6729,16 +6917,22 @@ def test_manual_restart_marker_clears_only_after_readiness(tmp_path: Path) -> No
 
 
 def _exec_helpers(tmp_path: Path) -> str:
-    """Extract the verbatim exec-helpers (Proc-Start/Get-ProcSnapshot/Stop-Tree/
-    Seed-CodexHome) from a freshly generated supervisor.ps1, so the runtime tests
-    drive the EXACT shipped PowerShell."""
+    """Extract the state + exec helpers from a freshly generated supervisor.ps1.
+
+    The runtime tests drive the EXACT shipped PowerShell. State helpers are
+    included because Get-ProcSnapshot publishes through their atomic file
+    primitive.
+    """
     s = _team(tmp_path)
     (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
     assert _run(["supervise", "--init"], tmp_path) == 0
     text = (s.dir / "supervisor.ps1").read_text(encoding="utf-8-sig")
+    state = text[
+        text.index("# region state-helpers"):text.index("# endregion state-helpers")
+    ]
     block = text[text.index("# region exec-helpers"):text.index("# endregion exec-helpers")]
     assert "function Stop-Tree" in block and "function Seed-CodexHome" in block
-    return "function Assert-ActionsEnabled([string]$what) { return $true }\n" + block
+    return "function Assert-ActionsEnabled([string]$what) { return $true }\n" + state + block
 
 
 # Round 23: Complete-WrapperLogTargets is gone - marking a generation

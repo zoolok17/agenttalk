@@ -12,6 +12,7 @@ import hashlib
 import http.client
 import inspect
 import json
+import os
 import re
 import shutil
 import socket
@@ -21,12 +22,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
 
-from agenttalk import avatars, intents, knowledge as kn, lesson_context as lc
+from agenttalk import avatars, health as health_model, intents, knowledge as kn
+from agenttalk import lesson_context as lc, operator_health
 from agenttalk import onboarding as ob
 from agenttalk import signing, web
 from agenttalk.store import Store
@@ -2739,6 +2742,17 @@ check({ last_seen_age_seconds: 5 },
   { key: 'unwrapped_live', label: 'Active', color: 'teal', grp: 'work', heartbeatOnly: true });
 check({ health: { state: 'unknown' }, last_seen_age_seconds: 5, wrapped: false },
   { key: 'unwrapped_live', label: 'Active', color: 'teal', grp: 'work', heartbeatOnly: true });
+const unavailablePolicy = hooks.agentStateInfo({
+  health: { state: 'unknown', reason_code: 'health_timing_policy_unavailable' },
+  last_seen_age_seconds: 5,
+});
+assert(unavailablePolicy.key === 'unknown' && unavailablePolicy.color === 'gray',
+       `unavailable policy was repainted ${unavailablePolicy.key}/${unavailablePolicy.color}`);
+assert(unavailablePolicy.noHb !== true,
+       'fresh heartbeat was falsely described as absent');
+assert(unavailablePolicy.desc.includes('health_timing_policy_unavailable') &&
+       unavailablePolicy.desc.includes('recent heartbeat'),
+       `unavailable policy reason disappeared: ${unavailablePolicy.desc}`);
 check({ health: { state: 'unknown' }, last_seen_age_seconds: 121 },
   { key: 'unknown', label: 'Unknown', color: 'gray', grp: 'unknown' });
 check({ health: { state: 'unknown' } },
@@ -2752,6 +2766,377 @@ check({ health: { state: 'idle_waiting' }, last_seen_age_seconds: 5, wrapped: tr
 assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative heartbeat fails');
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_agent_state_info_reflects_supervisor_decision(tmp_path: Path) -> None:
+    """Drive the real browser-side compositor projection, not just `/api/state`.
+
+    The cases cover both directions of #105: strict evidence escalates a fine
+    observation, but healthy/grace evidence cannot erase a worse observation.
+    They also keep advisory, live-stalled, failed-turn, unconfirmed, unavailable,
+    and confirmed lost-binding wording distinct.
+    """
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the console render-control test")
+
+    now_epoch = 1_700_000_000.0
+    decision = {
+        "state": "HEALTHY_WORKING",
+        "action": "none",
+        "reason": "bound child is healthy",
+    }
+    payload_rows = []
+    for name, health_age, ttl_seconds, heartbeat_skew_seconds, reason_code in (
+        ("ttl", 400.0, 300.0, 1000.0, "health_stale_ttl"),
+        ("skew", 20.0, 600.0, 0.0, "health_older_than_heartbeat"),
+    ):
+        store = Store(tmp_path / name)
+        store.init(["alpha"])
+        updated_at = datetime.fromtimestamp(
+            now_epoch - health_age, timezone.utc,
+        ).isoformat().replace("+00:00", "Z")
+        store.write_health("alpha", health_model.build_snapshot(
+            agent="alpha",
+            cli="claude",
+            mode="wrapper-loop",
+            state=health_model.STATE_DEGRADED_OUTPUT,
+            updated_at=updated_at,
+            since=updated_at,
+            reason_code="degraded_output_detected",
+        ))
+        (store.state_dir / "alpha.heartbeat").write_text(
+            datetime.fromtimestamp(now_epoch, timezone.utc).isoformat().replace(
+                "+00:00", "Z"),
+            encoding="utf-8",
+        )
+        (store.dir / "supervisor.json").write_text(json.dumps({
+            "schema_version": 2,
+            "health": {
+                "ttl_seconds": ttl_seconds,
+                "heartbeat_skew_seconds": heartbeat_skew_seconds,
+            },
+            "agents": {
+                "alpha": {"wrapped": True, "auto_restart": True},
+            },
+        }), encoding="utf-8")
+        policy = operator_health.load_health_timing_policy(store)
+        row = web._agent_entries(
+            store,
+            store.load_config(),
+            [],
+            None,
+            supervisor_decisions={"alpha": decision},
+            health_policy=policy,
+            now_epoch=now_epoch,
+        )[0]
+        assert row["health"]["reason_code"] == reason_code
+        assert row["wrapped"] is True
+        assert row["health_composition"]["primary_source"] == "observation"
+        payload_rows.append(row)
+    composition_without_wrapped = dict(payload_rows[0])
+    composition_without_wrapped.pop("wrapped")
+    composition_without_wrapped.pop("restartable")
+    payload_rows.append(composition_without_wrapped)
+    invalid_store = Store(tmp_path / "invalid-policy")
+    invalid_store.init(["alpha"])
+    (invalid_store.state_dir / "alpha.heartbeat").write_text(
+        datetime.fromtimestamp(now_epoch, timezone.utc).isoformat().replace(
+            "+00:00", "Z"),
+        encoding="utf-8",
+    )
+    (invalid_store.dir / "supervisor.json").write_text(
+        "{not valid json", encoding="utf-8")
+    invalid_policy = operator_health.load_health_timing_policy(invalid_store)
+    invalid_row = web._agent_entries(
+        invalid_store,
+        invalid_store.load_config(),
+        [],
+        None,
+        health_policy=invalid_policy,
+        now_epoch=now_epoch,
+    )[0]
+    assert invalid_row["health"]["reason_code"] == (
+        "health_timing_policy_unavailable"
+    )
+    assert "health_composition" not in invalid_row
+    payload_rows.append(invalid_row)
+    payload_path = tmp_path / "configured-unknown-rows.json"
+    payload_path.write_text(json.dumps(payload_rows), encoding="utf-8")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    agentStateInfo: agentStateInfo\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented2.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-agent-state-supervisor.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+ctx.__agenttalkConsoleTestHooks = {};
+vm.createContext(ctx);
+vm.runInContext(source, ctx, { filename: 'console.instrumented2.js' });
+const hooks = ctx.__agenttalkConsoleTestHooks;
+const configuredUnknownRows = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+
+function composedAgent(raw, observationUrgency, decision, kind, supervisorUrgency,
+                       primarySource) {
+  const observation = {
+    source: 'wrapper_health', state: raw, urgency: observationUrgency,
+  };
+  const supervisor = {
+    source: 'supervisor_decision', kind: kind,
+    state: decision.state, action: decision.action, reason: decision.reason,
+    urgency: supervisorUrgency,
+  };
+  return {
+    health: { state: raw }, wrapped: true, supervisor_decision: decision,
+    health_composition: {
+      observation: observation, supervisor: supervisor,
+      urgency: primarySource === 'supervisor' ? supervisorUrgency : observationUrgency,
+      primary_source: primarySource,
+      disagreement: observationUrgency !== supervisorUrgency,
+    },
+  };
+}
+function unavailableAgent(raw, observationUrgency, primarySource) {
+  const observation = {
+    source: 'wrapper_health', state: raw, urgency: observationUrgency,
+  };
+  const supervisor = {
+    source: 'supervisor_decision', kind: 'unavailable',
+    reason: 'assessment_failed', urgency: 'attention',
+  };
+  return {
+    health: { state: raw }, wrapped: true,
+    supervisor_decision_unavailable: true,
+    supervisor_decision_unavailable_reason: 'assessment_failed',
+    health_composition: {
+      observation: observation, supervisor: supervisor,
+      urgency: primarySource === 'supervisor' ? 'attention' : observationUrgency,
+      primary_source: primarySource,
+      disagreement: observationUrgency !== 'attention',
+    },
+  };
+}
+
+// An unconfirmed child is danger evidence, but it is not confirmed child loss.
+const unconfirmed = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'CLI_CHILD_UNKNOWN', action: 'none', reason: 'binding unknown' },
+  'unconfirmed', 'danger', 'supervisor'));
+assert(unconfirmed.key === 'supervisor_alert',
+       `expected supervisor_alert, got ${unconfirmed.key}`);
+assert(unconfirmed.color === 'danger', `expected danger, got ${unconfirmed.color}`);
+assert(!unconfirmed.label.toLowerCase().includes('lost'),
+       `unconfirmed verdict claimed confirmed loss: ${unconfirmed.label}`);
+
+// CLI_CHILD_MISSING is a provisional first-poll observation, so it is attention.
+const missing = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'CLI_CHILD_MISSING', action: 'none', reason: 'first poll' },
+  'advisory', 'attention', 'supervisor'));
+assert(missing.key === 'supervisor_advisory',
+       `expected supervisor_advisory, got ${missing.key}`);
+assert(missing.color === 'attn', `CLI_CHILD_MISSING must render attention: ${missing.color}`);
+
+// B2 no-false-DOWN control: BOTH grace states render as the self-report says
+// (no override), not attn/danger.
+for (const graceState of ['CLI_CHILD_STARTING', 'LAUNCHING']) {
+  const grace = hooks.agentStateInfo({
+    ...composedAgent(
+      'idle_waiting', 'fine',
+      { state: graceState, action: 'none', reason: 'launch grace' },
+      'grace', 'fine', 'observation'),
+  });
+  assert(grace.key === 'idle_waiting', `${graceState} must not override self-report, got ${grace.key}`);
+  assert(grace.color !== 'danger' && grace.color !== 'attn', `${graceState} false-DOWN: ${grace.color}`);
+  assert(grace.desc.includes(graceState), `${graceState} fact disappeared: ${grace.desc}`);
+}
+
+// Positive control: HEALTHY_WORKING never overrides either.
+const healthy = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'HEALTHY_WORKING', action: 'none', reason: 'ok' },
+  'healthy', 'fine', 'observation'));
+assert(healthy.key === 'working_turn', `HEALTHY_WORKING false-DOWN: ${healthy.key}`);
+assert(healthy.color === 'ok', `HEALTHY_WORKING must stay ok, got ${healthy.color}`);
+assert(healthy.desc.includes('HEALTHY_WORKING'), `healthy fact disappeared: ${healthy.desc}`);
+
+// These are real API rows produced under configured TTL/heartbeat-skew
+// boundaries and an invalid timing policy. One preserves its real composition
+// while deliberately omitting `wrapped` to direction-control API/asset skew.
+// A fresh heartbeat must not repaint any normalized unknown observation teal.
+for (const row of configuredUnknownRows) {
+  const configuredUnknown = hooks.agentStateInfo(row);
+  assert(configuredUnknown.key === 'unknown',
+         `configured unknown was repainted ${configuredUnknown.key}`);
+  assert(configuredUnknown.color === 'gray',
+         `configured unknown was repainted ${configuredUnknown.color}`);
+  assert(configuredUnknown.noHb !== true,
+         'configured unknown falsely claimed no heartbeat');
+  assert(configuredUnknown.desc.includes(row.health.reason_code) &&
+         configuredUnknown.desc.includes('recent heartbeat'),
+         `configured unknown wording lost producer facts: ${configuredUnknown.desc}`);
+}
+
+// B3: supervisor_decision_unavailable (wrapped, not auto_restart) renders
+// visibly rather than silently falling back to plain self-report.
+const unavailable = hooks.agentStateInfo(unavailableAgent('working_turn', 'fine', 'supervisor'));
+assert(unavailable.key === 'supervisor_unavailable', `expected supervisor_unavailable, got ${unavailable.key}`);
+assert(unavailable.color === 'attn', `expected attn, got ${unavailable.color}`);
+assert(unavailable.desc.includes('assessment failed'), `missing failure reason: ${unavailable.desc}`);
+assert(!unavailable.desc.includes('not configured auto_restart'), `false disabled claim: ${unavailable.desc}`);
+
+// Losing the strict verdict must not soften an already-dangerous wrapper
+// self-report either. The unavailable cause remains visible alongside it.
+const unavailableDanger = hooks.agentStateInfo(
+  unavailableAgent('rate_limited_or_outage', 'danger', 'observation'));
+assert(unavailableDanger.key === 'rate_limited_or_outage',
+       `unavailable verdict downgraded danger to ${unavailableDanger.key}`);
+assert(unavailableDanger.color === 'danger',
+       `unavailable verdict downgraded danger to ${unavailableDanger.color}`);
+assert(unavailableDanger.desc.includes('assessment failed'),
+       `unavailable cause disappeared: ${unavailableDanger.desc}`);
+
+// A merely advisory strict verdict must not downgrade an already-dangerous
+// wrapper self-report. Preserve the worse visible state while still naming
+// the separate supervisor fact in its description.
+for (const rawState of ['rate_limited_or_outage', 'errored_fatal']) {
+  const rawDanger = hooks.agentStateInfo({
+    ...composedAgent(
+      rawState, 'danger',
+      { state: 'PROCESS_TREE_INVALID', action: 'warn_only', reason: 'HOLDING' },
+      'advisory', 'attention', 'observation'),
+  });
+  assert(rawDanger.key === rawState, `${rawState} was downgraded to ${rawDanger.key}`);
+  assert(rawDanger.color === 'danger', `${rawState} was downgraded to ${rawDanger.color}`);
+  assert(rawDanger.desc.includes('PROCESS_TREE_INVALID'), `strict fact disappeared: ${rawDanger.desc}`);
+}
+
+// Current-master process-tree HOLDs are strict supervisor verdicts too. Raw
+// wrapper health may remain green, but either HOLD must stay visibly non-green.
+for (const holdState of ['PROCESS_TREE_INVALID', 'PROCESS_TREE_TRUNCATED']) {
+  const held = hooks.agentStateInfo({
+    ...composedAgent(
+      'working_turn', 'fine',
+      { state: holdState, action: 'warn_only', reason: 'HOLDING' },
+      'advisory', 'attention', 'supervisor'),
+  });
+  assert(held.key === 'supervisor_advisory', `${holdState} must be strict, got ${held.key}`);
+  assert(held.color === 'attn', `${holdState} must not render green, got ${held.color}`);
+}
+
+// Administrative recovery policy is not liveness evidence.  It may raise
+// attention, but it must never be narrated as a missing/dead child.
+const cooldown = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'RESTART_COOLDOWN', action: 'backoff_wait', reason: 'cooldown active' },
+  'advisory', 'attention', 'supervisor'));
+assert(cooldown.color === 'attn', `cooldown must render attention, got ${cooldown.color}`);
+assert(!cooldown.label.toLowerCase().includes('child'),
+       `cooldown invented child loss in label: ${cooldown.label}`);
+assert(!cooldown.desc.toLowerCase().includes('could not be confirmed'),
+       `cooldown invented child loss in description: ${cooldown.desc}`);
+
+// A stalled child is explicitly live; preserve that producer meaning instead
+// of routing it through a generic dead/unbound bucket.
+const stalled = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'CLI_CHILD_STALLED', action: 'stuck_recover', reason: 'live child stalled' },
+  'live_stalled', 'danger', 'supervisor'));
+assert(stalled.color === 'danger', `stalled child must render danger, got ${stalled.color}`);
+assert(stalled.desc.toLowerCase().includes('stalled'),
+       `stalled-child meaning disappeared: ${stalled.desc}`);
+assert(!stalled.desc.toLowerCase().includes('could not be confirmed'),
+       `live stalled child was described as lost: ${stalled.desc}`);
+
+// Failed turns and confirmed lost bindings retain different producer meanings.
+const failed = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'TURN_FAILED', action: 'none', reason: 'turn outcome failed' },
+  'failed', 'danger', 'supervisor'));
+assert(failed.label === 'Turn failed', `failed-turn meaning disappeared: ${failed.label}`);
+assert(!failed.label.toLowerCase().includes('child'),
+       `failed turn was described as child loss: ${failed.label}`);
+
+// Readiness exhaustion means launches never produced a first heartbeat; no
+// turn necessarily ran, so it must not inherit failed-turn wording.
+for (const readinessAction of ['readiness_gave_up', 'none']) {
+  const readiness = hooks.agentStateInfo(composedAgent(
+    'working_turn', 'fine',
+    { state: 'READINESS_GAVE_UP', action: readinessAction, reason: 'never ready' },
+    'readiness_exhausted', 'danger', 'supervisor'));
+  assert(readiness.label === 'Readiness retries exhausted',
+         `readiness meaning disappeared: ${readiness.label}`);
+  assert(!readiness.label.toLowerCase().includes('turn failed'),
+         `readiness was relabelled as a failed turn: ${readiness.label}`);
+  assert(readiness.desc.includes('READINESS_GAVE_UP'),
+         `readiness producer state disappeared: ${readiness.desc}`);
+}
+
+const lost = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'CLI_CHILD_DEAD', action: 'relaunch', reason: 'binding lost' },
+  'lost_binding', 'danger', 'supervisor'));
+assert(lost.key === 'supervisor_lost_binding', `lost binding key: ${lost.key}`);
+assert(lost.label === 'Child binding lost', `lost binding wording: ${lost.label}`);
+
+// Asset/API version skew remains fail-safe without duplicating Python's state
+// vocabulary. It preserves the raw decision, explicitly says its urgency is
+// unclassified, and never pretends healthy/dead/advisory semantics are known.
+for (const legacyDecision of [
+  { state: 'HEALTHY_WORKING', action: 'none', reason: 'bound' },
+  { state: 'LAUNCHING', action: 'none', reason: 'launch grace' },
+  { state: 'CLI_CHILD_DEAD', action: 'relaunch', reason: 'producer says dead' },
+  { state: 'RESTART_COOLDOWN', action: 'backoff_wait', reason: 'cooldown' },
+]) {
+  const legacy = hooks.agentStateInfo({
+    health: { state: 'working_turn' }, wrapped: true,
+    supervisor_decision: legacyDecision,
+  });
+  assert(legacy.color === 'attn', `legacy strict fact disappeared: ${legacy.color}`);
+  assert(legacy.label === 'Verdict unclassified',
+         `legacy state was falsely classified: ${legacy.label}`);
+  assert(legacy.desc.includes('urgency classification unavailable'),
+         `missing classification gap: ${legacy.desc}`);
+  assert(legacy.desc.includes(legacyDecision.state),
+         `raw decision disappeared: ${legacy.desc}`);
+  assert(!legacy.desc.toLowerCase().includes('binding lost'),
+         `legacy fallback invented lost-binding semantics: ${legacy.desc}`);
+}
+
+// No supervisor_decision at all (unwrapped / no supervisor configured) is
+// unaffected — plain self-report, no false alarm.
+const plain = hooks.agentStateInfo({ health: { state: 'working_turn' }, wrapped: true });
+assert(plain.key === 'working_turn', `plain self-report must be unaffected, got ${plain.key}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented), str(payload_path)], check=True,
                    capture_output=True, text=True)
 
 
@@ -4307,9 +4692,236 @@ def test_api_state_new_agent_fields_absent_when_no_data(tmp_path: Path) -> None:
         (root,) = _state(base)["roots"]
         for agent in root["agents"]:
             for absent in ("capacity", "cli", "wrapped", "restartable",
-                           "owned_domains", "task", "health_timeline"):
+                           "owned_domains", "task", "health_timeline",
+                           "supervisor_decision", "health_composition",
+                           "wrapper_child"):
                 assert absent not in agent, absent
         _assert_no_body_keys(_state(base))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_supervisor_decision_surfaces_strict_verdict_over_self_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper's own self-report can keep saying "working" long after its
+    CLI child has died. The web console must show BOTH the self-report
+    (``health``) and the supervisor's strict, positively-bound decision
+    (``supervisor_decision``) side by side, plus the raw wrapper-runtime
+    progress age (``wrapper_child``) — never collapsed into one adjective."""
+    from agenttalk import wrapper_runtime as wrt
+
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    now = time.time()
+    writer = wrt.WrapperRuntimeWriter(
+        s.state_dir, "alpha", "test-wrapper-1", wrapper_pid=300,
+        wrapper_start="2020-01-01T00:00:00.000000Z", clock=lambda: now - 600,
+    )
+    writer.starting(message_id="m1", turn_id="t1")
+    writer.active(301, "2020-01-01T00:00:00.000000Z")
+    writer.progress()
+    monkeypatch.setattr(web._supervisor, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "decision": {"state": "CLI_CHILD_UNKNOWN", "action": "none",
+                        "reason": "wrapper runtime could not be bound"},
+        }],
+    })
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert alpha["health"]["state"] == "working_turn"  # self-report: looks fine
+        assert alpha["supervisor_decision"] == {
+            "state": "CLI_CHILD_UNKNOWN", "action": "none",
+            "reason": "wrapper runtime could not be bound",
+        }
+        assert alpha["health_composition"]["urgency"] == "danger"
+        assert alpha["health_composition"]["primary_source"] == "supervisor"
+        assert alpha["health_composition"]["observation"]["state"] == "working_turn"
+        assert alpha["health_composition"]["supervisor"]["kind"] == "unconfirmed"
+        assert alpha["wrapper_child"]["phase"] == "active"
+        assert alpha["wrapper_child"]["progress_age_seconds"] >= 599.0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_filters_supervisor_decisions_to_wrapped_agents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _make_store(tmp_path)
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    _write_health(s, "beta", _hm.STATE_WORKING_TURN, cli="claude", mode="manual")
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {
+            "alpha": {"wrapped": True, "auto_restart": True},
+            "beta": {"wrapped": False, "auto_restart": True},
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(web._supervisor, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [
+            {"name": "alpha", "decision": {
+                "state": "PROCESS_TREE_INVALID", "action": "warn_only", "reason": "HOLDING"}},
+            {"name": "beta", "decision": {
+                "state": "CLI_CHILD_UNKNOWN", "action": "none", "reason": "manual agent"}},
+        ],
+    })
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        by_name = {a["name"]: a for a in root["agents"]}
+        assert by_name["alpha"]["supervisor_decision"]["state"] == "PROCESS_TREE_INVALID"
+        assert by_name["alpha"]["health"]["state"] == "working_turn"
+        assert "supervisor_decision" not in by_name["beta"]
+        assert "supervisor_decision_unavailable" not in by_name["beta"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_snapshot_freshness_respects_configured_poll_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _make_store(tmp_path)
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "poll_seconds": 600,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    snapshot_path = s.dir / "supervisor-snapshot.json"
+    rows = [{"pid": 123}]
+    snapshot_path.write_text(json.dumps(rows), encoding="utf-8")
+    snapshot_epoch = time.time() - 400.0
+    os.utime(snapshot_path, (snapshot_epoch, snapshot_epoch))
+    observed_snapshots: list[object] = []
+
+    def assessment(_store, **kwargs):
+        observed_snapshots.append(kwargs.get("snapshot"))
+        return {"agents": [{"name": "alpha", "decision": {
+            "state": "HEALTHY_WORKING", "action": "none", "reason": "bound"}}]}
+
+    monkeypatch.setattr(web._supervisor, "build_supervisor_observation", assessment)
+
+    srv, _t, base = _serve(s)
+    try:
+        _state(base)
+        assert observed_snapshots == [rows]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_supervisor_decision_absent_when_not_computable(
+    tmp_path: Path,
+) -> None:
+    """No false-DOWN, and no fabricated verdict: an agent with no supervisor
+    configured gets no ``supervisor_decision`` key at all (absent-not-null),
+    not a manufactured "unknown" or "healthy"."""
+    s = _make_store(tmp_path)
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert "supervisor_decision" not in alpha
+        assert "wrapper_child" not in alpha
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_supervisor_decision_unavailable_for_non_auto_restart_wrapped_agent(
+    tmp_path: Path,
+) -> None:
+    """A wrapped agent that is not `auto_restart` has no computable strict
+    decision — real (unpatched) build_supervisor_observation behavior. The
+    web console must say so visibly (`supervisor_decision_unavailable: true`),
+    not silently show only `health` with no other signal at all — the
+    "dishonest on the two human surfaces" gap the reviewer found on web+status."""
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": False}},
+    }), encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert alpha.get("supervisor_decision_unavailable") is True
+        assert alpha.get("supervisor_decision_unavailable_reason") == "auto_restart_disabled"
+        assert alpha["health_composition"]["urgency"] == "attention"
+        assert alpha["health_composition"]["supervisor"] == {
+            "source": "supervisor_decision",
+            "kind": "unavailable",
+            "reason": "auto_restart_disabled",
+            "urgency": "attention",
+        }
+        assert "supervisor_decision" not in alpha
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_supervisor_decision_unavailable_for_every_wrapped_agent_on_observation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """"Cannot verify" must never render as "verified good": when the
+    observation itself fails (corrupt state / unreadable snapshot), EVERY
+    configured-wrapped agent must still show `supervisor_decision_unavailable`
+    — count the thing that should be there (both alpha AND beta), not merely
+    confirm the absence of a false-green marker. Reproduces the
+    "#105 defect reintroduced through the error path" finding."""
+    s = _make_store(tmp_path)
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    _write_health(s, "beta", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {
+            "alpha": {"wrapped": True, "auto_restart": True},
+            "beta": {"wrapped": True, "auto_restart": True},
+        },
+    }), encoding="utf-8")
+
+    def boom(*_a, **_k):
+        raise ValueError("injected supervisor-state corruption")
+
+    monkeypatch.setattr(web._supervisor, "build_supervisor_observation", boom)
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        by_name = {a["name"]: a for a in root["agents"]}
+        assert by_name["alpha"].get("supervisor_decision_unavailable") is True
+        assert by_name["beta"].get("supervisor_decision_unavailable") is True
+        assert by_name["alpha"].get(
+            "supervisor_decision_unavailable_reason") == "assessment_failed"
+        assert by_name["beta"].get(
+            "supervisor_decision_unavailable_reason") == "assessment_failed"
+        assert by_name["alpha"]["health_composition"]["supervisor"][
+            "reason"] == "assessment_failed"
+        assert by_name["beta"]["health_composition"]["supervisor"][
+            "reason"] == "assessment_failed"
+        assert "supervisor_decision" not in by_name["alpha"]
+        assert "supervisor_decision" not in by_name["beta"]
     finally:
         srv.shutdown()
         srv.server_close()

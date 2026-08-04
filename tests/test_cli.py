@@ -493,6 +493,19 @@ def test_status_supervisor_assessment_fail_safe(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture,
 ) -> None:
+    s = Store(store_root)
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+
     def boom(*_args, **_kwargs):
         raise ValueError("bad supervisor report")
 
@@ -503,6 +516,328 @@ def test_status_supervisor_assessment_fail_safe(
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert "supervisor_assessment_unavailable:ValueError" in payload["warnings"]
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["supervisor"] == {
+        "decision_unavailable": True,
+        "decision_unavailable_reason": "assessment_failed",
+        "disagreement": True,
+    }
+    assert alpha["health_composition"]["urgency"] == "attention"
+    assert alpha["health_composition"]["supervisor"]["reason"] == "assessment_failed"
+
+
+def _fake_decision(state: str, *, action: str = "none",
+                   reason: str = "test") -> dict:
+    return {"agents": [{"name": "alpha",
+                        "decision": {"state": state, "action": action,
+                                     "reason": reason}}]}
+
+
+def test_status_flags_disagreement_between_self_report_and_strict_verdict(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A wrapper's self-report can keep saying "fine" after its CLI child has
+    died; the supervisor's strict decision.state is the one #105 exists to
+    surface. `status` must show BOTH facts, and flag when they disagree,
+    rather than silently resolving in favour of the cheerful self-report."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation",
+                        lambda *_a, **_k: _fake_decision("CLI_CHILD_UNKNOWN"))
+
+    rc = _run(["status", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["health"]["state"] == "working_turn"  # self-report: looks fine
+    assert alpha["supervisor"]["decision"]["state"] == "CLI_CHILD_UNKNOWN"
+    assert alpha["supervisor"]["disagreement"] is True
+
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("alpha"))
+    assert "health=working_turn" in line
+    assert "supervisor=CLI_CHILD_UNKNOWN/none" in line
+    assert "[DISAGREEMENT]" in line  # direction control: absent before the fix
+
+
+def test_status_does_not_flag_wrapped_disagreement_for_unwrapped_agent(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Manual auto-restart agents keep their useful advisory decision, but it
+    is not the wrapped-child strict verdict and must not get that verdict's
+    disagreement label."""
+    s = Store(store_root)
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    old_iso = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    (s.state_dir / "alpha.heartbeat").write_text(old_iso, encoding="utf-8")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="manual",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {
+            "wrapped": False,
+            "auto_restart": True,
+            "activity_hook": False,
+            "cli": "claude",
+        }},
+    }), encoding="utf-8")
+
+    assert _run(["status", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["supervisor"]["decision"]["state"] == "ACTIVE_OR_BUSY"
+    assert alpha["supervisor"]["decision"]["action"] == "suspect_warn"
+    assert "disagreement" not in alpha["supervisor"]
+
+    assert _run(["status"], store_root) == 0
+    line = next(
+        line for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("alpha")
+    )
+    assert "supervisor=ACTIVE_OR_BUSY/suspect_warn" in line
+    assert "[DISAGREEMENT]" not in line
+
+
+def test_status_rejects_stale_snapshot_before_computing_strict_verdict(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A stale process row must not turn a strict non-green assessment into
+    HEALTHY_WORKING while raw wrapper health is still cheerfully green."""
+    s = Store(store_root)
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    snapshot_path = s.dir / "supervisor-snapshot.json"
+    snapshot_path.write_text(json.dumps([{"pid": 123}]), encoding="utf-8")
+    os.utime(snapshot_path, (1.0, 1.0))
+    observed_snapshots: list[object] = []
+
+    def assessment(_store, **kwargs):
+        snapshot = kwargs.get("snapshot")
+        observed_snapshots.append(snapshot)
+        state = "CLI_CHILD_UNKNOWN" if snapshot is None else "HEALTHY_WORKING"
+        return _fake_decision(state)
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", assessment)
+
+    assert _run(["status", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+
+    assert observed_snapshots == [None]
+    assert alpha["health"]["state"] == "working_turn"
+    assert alpha["supervisor"]["decision"]["state"] == "CLI_CHILD_UNKNOWN"
+    assert alpha["supervisor"]["disagreement"] is True
+
+
+def test_status_snapshot_freshness_respects_configured_poll_interval(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = Store(store_root)
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "poll_seconds": 600,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    snapshot_path = s.dir / "supervisor-snapshot.json"
+    rows = [{"pid": 123}]
+    snapshot_path.write_text(json.dumps(rows), encoding="utf-8")
+    snapshot_epoch = time.time() - 400.0
+    os.utime(snapshot_path, (snapshot_epoch, snapshot_epoch))
+    observed_snapshots: list[object] = []
+
+    def assessment(_store, **kwargs):
+        observed_snapshots.append(kwargs.get("snapshot"))
+        return _fake_decision("HEALTHY_WORKING")
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", assessment)
+
+    assert _run(["status", "--json"], store_root) == 0
+    capsys.readouterr()
+    assert observed_snapshots == [rows]
+
+
+def test_status_no_disagreement_flag_for_a_genuinely_healthy_agent(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """No false-DOWN: a wrapped agent the supervisor confirms HEALTHY_WORKING
+    must not be flagged, even though its state differs from HEALTHY_IDLE."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation",
+                        lambda *_a, **_k: _fake_decision("HEALTHY_WORKING"))
+
+    rc = _run(["status", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert "disagreement" not in alpha["supervisor"]
+
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("alpha"))
+    assert "[DISAGREEMENT]" not in line
+
+
+def test_status_healthy_decision_does_not_mask_degraded_observation(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_DEGRADED_OUTPUT, updated_at=now_iso, since=now_iso,
+        reason_code="degraded_output_detected",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation",
+                        lambda *_a, **_k: _fake_decision("HEALTHY_WORKING"))
+
+    assert _run(["status", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+
+    assert alpha["health"]["state"] == "degraded_output"
+    assert alpha["health_composition"]["urgency"] == "danger"
+    assert alpha["health_composition"]["primary_source"] == "observation"
+    assert alpha["supervisor"]["disagreement"] is True
+
+    assert _run(["status"], store_root) == 0
+    line = next(
+        line for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("alpha")
+    )
+    assert "health=degraded_output" in line
+    assert "supervisor=HEALTHY_WORKING/none" in line
+    assert "[DISAGREEMENT]" in line
+
+
+@pytest.mark.parametrize("grace_state", ["CLI_CHILD_STARTING", "LAUNCHING"])
+def test_status_no_disagreement_flag_for_grace_states(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    grace_state: str,
+) -> None:
+    """No false-DOWN, both grace states: a freshly launched agent still inside
+    its bounded handoff grace must not be flagged — reproduces the reviewer's
+    LAUNCHING regression (`supervisor=LAUNCHING/none [DISAGREEMENT]`)."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_IDLE_WAITING,
+        updated_at=now_iso, since=now_iso,
+        reason_code="idle_waiting",
+    ))
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation",
+                        lambda *_a, **_k: _fake_decision(grace_state))
+
+    rc = _run(["status", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert "disagreement" not in alpha["supervisor"]
+
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("alpha"))
+    assert "[DISAGREEMENT]" not in line, line
+
+
+def test_status_flags_decision_unavailable_for_non_auto_restart_wrapped_agent(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A wrapped agent that is not `auto_restart` has no computable strict
+    decision — real (unpatched) build_supervisor_observation behavior. status
+    must say so visibly (both JSON and text), not silently show only the
+    self-report with no supervisor field at all."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": False}},
+    }), encoding="utf-8")
+
+    rc = _run(["status", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["supervisor"]["decision_unavailable"] is True
+    assert alpha["supervisor"][
+        "decision_unavailable_reason"] == "auto_restart_disabled"
+    assert alpha["health_composition"]["supervisor"][
+        "reason"] == "auto_restart_disabled"
+
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("alpha"))
+    assert "supervisor=UNAVAILABLE(auto_restart_disabled)" in line, line
 
 
 def test_supervisor_cli_read_fail_safe(

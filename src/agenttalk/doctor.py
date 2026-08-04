@@ -23,10 +23,12 @@ from pathlib import Path
 from agenttalk import __version__
 from agenttalk import codex_config as cxc
 from agenttalk import install_skills as iskl
+from agenttalk import operator_health
 from agenttalk import signing as _signing
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle
+from agenttalk import wrapper_runtime as runtime_obs
 from agenttalk.store import (
     STORE_SCHEMA_CAPABILITIES,
     Store,
@@ -156,6 +158,7 @@ def run(project_root: Path | None = None) -> Report:
         report.checks.append(_check_codex_config(root))
         report.checks.append(_check_hmac(store, root))
         report.checks.extend(_check_heartbeats(store))
+        report.checks.extend(_check_wrapper_child_health(store))
         waiters = _check_active_waiters(store)
         if waiters is not None:  # additive: absent unless a live waiter exists
             report.checks.append(waiters)
@@ -1779,6 +1782,156 @@ def _check_heartbeats(store: Store) -> list[Check]:
                 status="ok",
                 details=f"last seen {int(age)}s ago",
             ))
+    return out
+
+
+def _check_wrapper_child_health(store: Store) -> list[Check]:
+    """One check per wrapped agent — does the SUPERVISOR's strict verdict agree
+    with the wrapper's own self-report, and is progress actually moving?
+
+    The wrapper's self-reported ``health`` (idle_waiting/working_turn/...) is
+    advisory and can go on saying "working" after its CLI child has died. The
+    supervisor's live decision (CLI_CHILD_UNKNOWN/CLI_CHILD_DEAD/...) is the
+    strict, positively-bound verdict, but until now it reached no operator
+    surface `doctor` covers. This check surfaces BOTH observations side by
+    side — never collapsing them into one adjective — plus the raw
+    ``last_progress_at`` age from the wrapper-runtime record, which is the
+    cheapest signal for "the counter is frozen" independent of any verdict.
+
+    Absent entirely when no agent is configured ``wrapped`` in
+    supervisor.json (nothing to check).
+    """
+    sup_path = store.dir / "supervisor.json"
+    if not sup_path.exists():
+        return []
+    health_policy = operator_health.load_health_timing_policy(store)
+    if health_policy.unavailable_reason is not None:
+        return [Check(
+            name="wrapper_child_health.supervisor_config",
+            status="warn",
+            details=(
+                "supervisor health timing policy is unavailable; "
+                "wrapper observations cannot be freshness-checked"
+            ),
+            fix="repair .agenttalk/supervisor.json",
+        )]
+    assessment_problem: str | None = None
+    sup_cfg = health_policy.config
+    sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
+    wrapped_names = [
+        name for name, cfg_agent in sup_agents.items()
+        if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
+    ]
+    if not wrapped_names:
+        return []
+
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    try:
+        # Corrupt/invalid primary+backup state (load_supervisor_state) must
+        # degrade the SAME way a bad observation does — a diagnostic tool
+        # that dies on bad state is worst-useless exactly when state is bad.
+        state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+        # A stale snapshot must not be read as a live liveness fact (see
+        # read_supervisor_snapshot_if_fresh's docstring).
+        snapshot = sup.read_supervisor_snapshot_if_fresh(
+            store.dir / "supervisor-snapshot.json",
+            now_epoch=now_epoch,
+            stale_after_seconds=sup.resolve_snapshot_stale_after_seconds(sup_cfg),
+        )
+        obs = sup.build_supervisor_observation(
+            store, now_epoch=now_epoch, state=state, supervisor_config=sup_cfg,
+            snapshot=snapshot, event_limit=0,
+        )
+        obs_by_name = {
+            a["name"]: a for a in obs.get("agents", []) if isinstance(a, dict)
+        }
+    except Exception as exc:  # noqa: BLE001 - doctor stays fail-safe
+        # Unavailable evidence composes with EACH wrapped agent's observation.
+        # A global warning would lose a persisted degraded/error report.
+        obs_by_name = {}
+        assessment_problem = (
+            "could not compute the supervisor's decision: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    out: list[Check] = []
+    for name in wrapped_names:
+        item = obs_by_name.get(name) or {}
+        cfg_agent = sup_agents.get(name) if isinstance(sup_agents.get(name), dict) else {}
+        health = item.get("health") if isinstance(item.get("health"), dict) else {}
+        if not health:
+            health = operator_health.read_health_observation(
+                store,
+                name,
+                now_epoch=now_epoch,
+                health_policy=health_policy,
+            ).health
+        self_state = health.get("state", "unknown")
+        self_age = health.get("age_seconds")
+        self_age_str = f"{self_age:.0f}s" if isinstance(self_age, (int, float)) else "n/a"
+
+        runtime = runtime_obs.read_runtime(store.state_dir, name, now_epoch=now_epoch)
+        progress_bit = ""
+        if runtime.get("status") == runtime_obs.STATUS_VALID:
+            record = runtime.get("record") or {}
+            progress_age = runtime.get("progress_age_seconds")
+            progress_age_str = (
+                f"{progress_age:.0f}s" if isinstance(progress_age, (int, float))
+                else "never"
+            )
+            progress_bit = (
+                f"; wrapper-runtime phase={record.get('phase')} "
+                f"last_progress_age={progress_age_str}"
+            )
+
+        decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
+        unavailable_reason: str | None = None
+        if decision is None:
+            if assessment_problem is not None:
+                unavailable_reason = "assessment_failed"
+            elif cfg_agent.get("auto_restart") is not True:
+                unavailable_reason = "auto_restart_disabled"
+            else:
+                unavailable_reason = "decision_missing"
+        composition = operator_health.compose_health_evidence(
+            self_state,
+            decision=decision,
+            unavailable_reason=unavailable_reason,
+        )
+        status = operator_health.doctor_status(composition)
+        self_fact = (
+            f"self-reported health={self_state} (age={self_age_str}){progress_bit}"
+        )
+        d_reason = ""
+        if decision is not None:
+            d_state = decision.get("state")
+            d_action = decision.get("action")
+            d_reason = decision.get("reason") or ""
+            supervisor_fact = f"supervisor={d_state}/{d_action} ({d_reason})"
+        else:
+            supervisor_fact = f"supervisor=UNAVAILABLE({unavailable_reason})"
+            if assessment_problem is not None:
+                supervisor_fact += f" ({assessment_problem})"
+            else:
+                supervisor_fact += " (no supervisor decision is available for this agent)"
+        facts = (
+            (self_fact, supervisor_fact)
+            if composition["primary_source"] == "observation"
+            else (supervisor_fact, self_fact)
+        )
+        mismatch = (
+            " [DISAGREEMENT: wrapper observation and supervisor evidence have "
+            "different urgency]"
+            if composition["disagreement"]
+            else ""
+        )
+        out.append(Check(
+            name=f"wrapper_child_health.{name}",
+            status=status,
+            details=f"{facts[0]}; {facts[1]}{mismatch}",
+            fix=(d_reason if status != "ok" and
+                 composition["primary_source"] == "supervisor" else ""),
+        ))
     return out
 
 

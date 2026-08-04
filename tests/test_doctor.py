@@ -4,13 +4,28 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, doctor, install_skills as iskl, ovh_gateway_service, signing
+from agenttalk import (
+    cli,
+    doctor,
+    health as hm,
+    install_skills as iskl,
+    ovh_gateway_service,
+    signing,
+    wrapper_runtime as wrt,
+)
 from agenttalk.store import Store
 from agenttalk.wrapper.obligations import POLICY_ENV
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
 
 
 def test_doctor_on_uninitialized_project_reports_error(tmp_path: Path) -> None:
@@ -39,6 +54,362 @@ def test_doctor_on_initialized_project_includes_all_check_categories(
     assert "codex_config" in names
     assert "heartbeat.alpha" in names
     assert "heartbeat.beta" in names
+
+
+def test_check_wrapper_child_health_absent_without_supervisor_json(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    assert doctor._check_wrapper_child_health(store) == []
+
+
+def test_check_wrapper_child_health_absent_without_wrapped_agents(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2, "agents": {"alpha": {"auto_restart": True}},
+    }), encoding="utf-8")
+    assert doctor._check_wrapper_child_health(store) == []
+
+
+def test_check_wrapper_child_health_surfaces_strict_verdict_over_self_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper's own self-report can keep reading "working" long after its
+    CLI child has died. The supervisor's decision.state is the strict,
+    positively-bound verdict; this check must show BOTH, plus the raw
+    last_progress_at age, rather than collapsing them into one adjective."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    # A real wrapper-runtime record whose progress_sequence has been frozen
+    # for 10 minutes — the cheapest "is the counter frozen" signal, read
+    # independently of any computed verdict.
+    now = time.time()
+    writer = wrt.WrapperRuntimeWriter(
+        store.state_dir, "alpha", "test-wrapper-1", wrapper_pid=300,
+        wrapper_start="2020-01-01T00:00:00.000000Z", clock=lambda: now - 600,
+    )
+    writer.starting(message_id="m1", turn_id="t1")
+    writer.active(301, "2020-01-01T00:00:00.000000Z")
+    writer.progress()
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "working_turn", "age_seconds": 1.0},
+            "decision": {"state": "CLI_CHILD_UNKNOWN", "action": "none",
+                        "reason": "wrapper runtime could not be bound"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    check = checks[0]
+    assert check.name == "wrapper_child_health.alpha"
+    assert check.status == "error"
+    assert "CLI_CHILD_UNKNOWN" in check.details
+    assert "working_turn" in check.details
+    assert "last_progress_age=600s" in check.details
+    assert "DISAGREEMENT" in check.details
+
+    # Direction control: the PRE-EXISTING heartbeat-only check stays green for
+    # this exact scenario — this is the "dead agent reads GREEN" bug; without
+    # the new check, doctor's report has nothing that would have caught it.
+    heartbeat_checks = doctor._check_heartbeats(store)
+    hb_alpha = next(c for c in heartbeat_checks if c.name == "heartbeat.alpha")
+    assert hb_alpha.status == "ok"
+
+
+def test_check_wrapper_child_health_snapshot_freshness_respects_configured_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "poll_seconds": 600,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    snapshot_path = store.dir / "supervisor-snapshot.json"
+    rows = [{"pid": 123}]
+    snapshot_path.write_text(json.dumps(rows), encoding="utf-8")
+    snapshot_epoch = time.time() - 400.0
+    os.utime(snapshot_path, (snapshot_epoch, snapshot_epoch))
+    observed_snapshots: list[object] = []
+
+    def assessment(_store, **kwargs):
+        observed_snapshots.append(kwargs.get("snapshot"))
+        return {"agents": [{
+            "name": "alpha",
+            "health": {"state": "working_turn", "age_seconds": 1.0},
+            "decision": {"state": "HEALTHY_WORKING", "action": "none", "reason": "bound"},
+        }]}
+
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", assessment)
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert observed_snapshots == [rows]
+    assert len(checks) == 1
+    assert checks[0].status == "ok"
+
+
+def test_check_wrapper_child_health_no_false_down_when_healthy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No false-DOWN: a wrapped agent the supervisor confirms as
+    HEALTHY_WORKING must read `ok`, with no spurious disagreement flag."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "working_turn", "age_seconds": 1.0},
+            "decision": {"state": "HEALTHY_WORKING", "action": "none", "reason": "ok"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "ok"
+    assert "DISAGREEMENT" not in checks[0].details
+
+
+def test_check_wrapper_child_health_healthy_decision_preserves_degraded_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful turn cannot overwrite the wrapper's persisted degraded
+    output observation.  The two facts disagree, and the maximum urgency wins."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_DEGRADED_OUTPUT, updated_at=now_iso, since=now_iso,
+        reason_code="degraded_output_detected",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "degraded_output", "age_seconds": 1.0},
+            "decision": {
+                "state": "HEALTHY_WORKING", "action": "none", "reason": "turn succeeded",
+            },
+        }],
+    })
+
+    (check,) = doctor._check_wrapper_child_health(store)
+
+    assert check.status == "error"
+    assert check.details.startswith("self-reported health=degraded_output")
+    assert "degraded_output" in check.details
+    assert "HEALTHY_WORKING" in check.details
+    assert "DISAGREEMENT" in check.details
+
+
+@pytest.mark.parametrize("grace_state", ["CLI_CHILD_STARTING", "LAUNCHING"])
+def test_check_wrapper_child_health_no_false_down_for_grace_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    grace_state: str,
+) -> None:
+    """No false-DOWN, both grace states: a freshly launched agent still inside
+    its bounded handoff grace (CLI_CHILD_STARTING, the wrapped-CLI-spawn
+    state, or the broader LAUNCHING state the planner also returns "in launch
+    grace") must read `ok`, not `warn`/`[DISAGREEMENT]` — reproduces the
+    reviewer's LAUNCHING regression."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_IDLE_WAITING, updated_at=now_iso, since=now_iso,
+        reason_code="idle_waiting",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "idle_waiting", "age_seconds": 1.0},
+            "decision": {"state": grace_state, "action": "none",
+                        "reason": "in launch grace"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "ok", checks[0].details
+    assert "DISAGREEMENT" not in checks[0].details
+
+
+def test_check_wrapper_child_health_no_false_error_for_provisional_cli_child_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI_CHILD_MISSING is the PROVISIONAL first-poll state of the
+    supervisor's two-poll anti-false-positive confirmation policy (the child
+    is absent on this poll, but no recovery action is queued yet, pending a
+    second same-turn poll). It must read `warn`, not `error` — `error` would
+    bypass that confirmation policy from the operator-surface side, exactly
+    the reviewer's correction of my own earlier over-inclusion."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "working_turn", "age_seconds": 1.0},
+            "decision": {"state": "CLI_CHILD_MISSING", "action": "none",
+                        "reason": "active CLI brain absent on first confirming poll"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "warn", checks[0].details
+    assert "CLI_CHILD_MISSING" in checks[0].details
+
+
+@pytest.mark.parametrize(
+    ("decision_state", "action"),
+    [("RESTART_COOLDOWN", "backoff_wait"), ("ACTIVE_OR_BUSY", "suspect_warn")],
+)
+def test_check_wrapper_child_health_action_alone_does_not_escalate_to_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision_state: str,
+    action: str,
+) -> None:
+    """`action` is a recovery-INTENT signal, not a severity signal: a normal
+    RESTART_COOLDOWN/backoff_wait or ACTIVE_OR_BUSY/suspect_warn must read
+    `warn`, not `error` — the live fleet repro the reviewer cited (a diagnostic
+    that cries wolf on a state the supervisor is handling exactly as designed).
+    """
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_heartbeat("alpha")
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_IDLE_WAITING, updated_at=now_iso, since=now_iso,
+        reason_code="idle_waiting",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "idle_waiting", "age_seconds": 1.0},
+            "decision": {"state": decision_state, "action": action, "reason": "x"},
+        }],
+    })
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "warn", checks[0].details
+
+
+def test_check_wrapper_child_health_fail_safe_on_corrupt_supervisor_state(
+    tmp_path: Path,
+) -> None:
+    """A diagnostic tool that dies on bad state is worst-useless exactly when
+    state is bad: a corrupt supervisor-state.json must degrade to a WARN
+    check, not abort doctor entirely (SupervisorPersistenceError)."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    (store.dir / "supervisor-state.json").write_text("not valid json {{{", encoding="utf-8")
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "warn"
+    assert "could not compute the supervisor's decision" in checks[0].details
+
+    # Full doctor.run() must also survive it end-to-end (the actual failure
+    # mode reported: an unguarded load_supervisor_state() call ABORTED the
+    # whole report with SupervisorPersistenceError instead of degrading).
+    report = doctor.run(tmp_path)
+    names = {c.name for c in report.checks}
+    assert "store.initialized" in names
+    assert "heartbeat.alpha" in names
+
+
+def test_check_wrapper_child_health_reports_absent_decision_honestly(
+    tmp_path: Path,
+) -> None:
+    """A wrapped agent that is not `auto_restart` has no computable strict
+    decision — real (unpatched) `build_supervisor_observation` behavior. The
+    check must say so plainly rather than silently reading only self-report."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    store.write_heartbeat("alpha")
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": False}},
+    }), encoding="utf-8")
+
+    checks = doctor._check_wrapper_child_health(store)
+
+    assert len(checks) == 1
+    assert checks[0].status == "warn"
+    assert "no supervisor decision is available" in checks[0].details
 
 
 def test_doctor_warns_when_supervisor_deadman_config_is_ignored(tmp_path: Path) -> None:

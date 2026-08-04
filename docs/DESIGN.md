@@ -327,6 +327,41 @@ two parallel ownership concepts.
   errored, unknown) that degrades safely and never authorizes a kill by itself;
   `deadman.py` is an independent mail-age SLO alarm over owed work, derived
   from the thread projector and not from supervisor state.
+- **Operator-surface health composition contract (#105).** **Audience:**
+  contributors changing `status`, `doctor`, `/api/state`, or Team Console
+  health rendering. **Goal:** present wrapper observations and strict
+  supervisor decisions together without inventing, erasing, or relabelling
+  either source. Observation and decision remain immutable, source-labelled
+  facts. Classify each independently; combined urgency is monotone (the
+  maximum), never a downgrade, on the ordered lattice `fine < unknown <
+  attention < danger`. Wrapper idle/working observations are `fine`; an unknown
+  or unreadable observation is `unknown`; suspected-stuck, poison-message, and
+  exited observations are `attention`; rate-limit/outage, degraded-output, and
+  ambiguous/fatal-error observations are `danger`. Supervisor healthy and grace
+  decisions are `fine`; administrative, cooldown, and provisional decisions
+  are `attention`; live-stalled/no-progress, failed-turn, launch-readiness
+  exhaustion, unconfirmed/stuck-or-dead, and positively lost-binding decisions
+  are distinct `danger` facts; unavailable evidence is `attention` and never
+  healthy.
+
+  On an equal-urgency tie the observation supplies primary wording, and every
+  presentation appends the other fact with its source. Healthy and grace
+  decisions never erase a concerning or unknown observation; a supervisor
+  `action` describes recovery intent, not severity; child-loss wording is used
+  only when the producer state actually establishes lost binding.
+  Administrative decisions, cooldown, a live stalled/no-progress child, a
+  failed turn, and exhausted launch readiness retain those meanings rather
+  than entering one dead/not-dead bucket. Before composition, every operator
+  surface normalizes wrapper health through one configured path: one sample
+  time and heartbeat read feed the same per-agent/global TTL and heartbeat-skew
+  policy into the health reader. A missing supervisor configuration selects
+  documented defaults; an existing but unreadable configuration makes that
+  timing policy explicitly unavailable, so surfaces report `unknown` rather
+  than silently guessing with defaults. Projection and rendering compose facts
+  only; they do not change supervisor decisions or owned-tree predicates.
+  Cross-product expectations derive from these clauses, independently of
+  implementation; downgrade and dropped-unavailable mutations must make named
+  cells fail.
 - **Why:** real hangs and resume-wake churn happened in the field. A wrapper
   can keep heartbeating after its CLI child dies or wedges, so heartbeat alone
   cannot authorize wrapped health. Strict turn lifecycle plus real child/progress
@@ -928,6 +963,15 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   That design treats direct and console ancestry as insufficient, binds the
   live host to the canonical `-File supervisor.ps1` launch plus generated-shim
   shape and artifact generation, and preserves the same-user trust ceiling.
+- **D-30 Operator health surfaces compose independent evidence monotonically
+  (2026-08-04).** *Why:* wrapper observations and supervisor decisions can
+  disagree; decision-only and last-writer-wins rendering produced both
+  false-green and false-death claims. *Decision:* `status`, `doctor`, the web
+  projection, and Team Console follow the §4.6 composition contract. *Rejected:*
+  decision-overwrites-observation, action-as-severity, and a generic
+  dead/not-dead bucket. This governs presentation only; it does not change
+  supervisor decisions or owned-tree predicates. *Proof:* invariant-derived
+  cross-product tables plus downgrade and unavailable-case mutation controls.
 
 ## 6. How we work (process)
 

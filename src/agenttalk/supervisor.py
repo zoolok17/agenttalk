@@ -63,6 +63,35 @@ SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"  # legacy token; no longer emitted
 READINESS_FAILED = "readiness_failed"  # legacy token; folded into stale heartbeat recovery
 READINESS_GAVE_UP = "readiness_gave_up"  # never-ready past the retry cap - STOP relaunching, await operator
 NONE = "none"                    # healthy, nothing to do
+
+# ---- decision.state operator-surface classification ------------------------
+# `status`/`doctor`/the web console all need the same answer to "is this
+# decision.state safely green?" - a single source of truth so the three
+# surfaces can never silently drift apart on what counts as healthy.
+HEALTHY_DECISION_STATES = frozenset({"HEALTHY_IDLE", "HEALTHY_WORKING"})
+# A fresh CLI spawn inside its bounded handoff grace renders healthy too -
+# it is expected, not a fault - but kept separate so a caller that only wants
+# the two POSITIVELY CONFIRMED states can use HEALTHY_DECISION_STATES alone.
+# LAUNCHING is the broader "still in grace, readiness unresolved" state (see
+# the "1) LAUNCHING" branch below); CLI_CHILD_STARTING is its narrower wrapped-
+# CLI-spawn sibling. Both are expected, bounded, and not a fault.
+GRACE_DECISION_STATES = frozenset({"CLI_CHILD_STARTING", "LAUNCHING"})
+# The child-cannot-be-positively-bound / confirmed-dead family: the strict
+# verdict this exists to surface. Everything else non-green (cooldowns,
+# refusals, rate-limited suspect warnings) is a real but lower-urgency
+# observation, not silence.
+# NOTE: CLI_CHILD_MISSING is deliberately EXCLUDED — it is the provisional
+# first-poll state of the two-poll anti-false-positive confirmation policy
+# (see `_CLI_CHILD_CONFIRM_POLLS`): the child is absent on this poll, but the
+# planner withholds any recovery action and waits for a second same-turn poll
+# before declaring CLI_CHILD_DEAD. Treating the provisional poll as already
+# confirmed-dead would bypass that policy from the operator-surface side.
+UNBOUND_OR_DEAD_DECISION_STATES = frozenset({
+    "CLI_CHILD_UNKNOWN", "CLI_CHILD_DEAD", "CLI_CHILD_STALLED",
+    "CLI_CHILD_NO_PROGRESS", "STUCK_OR_DEAD",
+    "WRAPPER_MISSING", "TURN_FAILED", "READINESS_GAVE_UP",
+})
+
 EPHEMERAL_LAUNCH = eph.ACTION_LAUNCH
 EPHEMERAL_DENY = eph.ACTION_DENY
 EPHEMERAL_COMPLETE = eph.ACTION_COMPLETE
@@ -1802,6 +1831,72 @@ def _redacted_observation_plan(plan: dict) -> dict:
             if isinstance(agent_plan, dict)
         }
     }
+
+
+# Positive process binding requires a CURRENT snapshot. The generated PS
+# supervisor only refreshes supervisor-snapshot.json while actions are
+# enabled (`if (Actions-Enabled) { Get-ProcSnapshot ... }`), so a daemon that
+# stopped polling, or one running with actions disabled after an enabled run,
+# leaves a stale file on disk indefinitely. Reading it unconditionally would
+# let a caller present old process facts as a FRESH strict verdict - lying
+# with MORE authority than the raw self-report did. The 300s floor generously
+# covers the default 15s cadence; slower configured cadences need an allowance
+# derived from that cadence or a healthy snapshot becomes stale between polls.
+SNAPSHOT_STALE_AFTER_SECONDS = 300.0
+
+
+def resolve_snapshot_stale_after_seconds(supervisor_config: dict | None) -> float:
+    """Return a freshness window compatible with the configured poll cadence.
+
+    Two complete intervals cover one scheduled sleep plus the following
+    observation/action cycle. The 300s floor preserves the existing default
+    behavior and still rejects snapshots left behind by a stopped supervisor.
+    Malformed cadence values never expand the trust window.
+    """
+    config = supervisor_config if isinstance(supervisor_config, dict) else {}
+    poll = config.get("poll_seconds", _DEFAULTS["poll_seconds"])
+    if not isinstance(poll, (int, float)) or isinstance(poll, bool):
+        return SNAPSHOT_STALE_AFTER_SECONDS
+    try:
+        poll_seconds = float(poll)
+    except (OverflowError, ValueError):
+        return SNAPSHOT_STALE_AFTER_SECONDS
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        return SNAPSHOT_STALE_AFTER_SECONDS
+    allowance = poll_seconds * 2.0
+    if not math.isfinite(allowance):
+        return SNAPSHOT_STALE_AFTER_SECONDS
+    return max(SNAPSHOT_STALE_AFTER_SECONDS, allowance)
+
+
+def read_supervisor_snapshot_if_fresh(
+    path: Path, *, now_epoch: float,
+    stale_after_seconds: float = SNAPSHOT_STALE_AFTER_SECONDS,
+) -> list[dict] | None:
+    """Read ``supervisor-snapshot.json``, but only if its FILE mtime is fresh.
+
+    A stale, implausibly future-dated, absent, or malformed file returns
+    ``None`` — the SAME "capture failed" signal a genuinely missing snapshot
+    already produces, so a downstream wrapped-agent classification fails
+    closed (CLI_CHILD_UNKNOWN) rather than silently trusting old process
+    facts. The shared heartbeat skew allowance covers the small race where
+    callers capture ``now_epoch`` immediately before a concurrent refresh.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    age = now_epoch - mtime
+    if (
+        age < -health_model.DEFAULT_HEARTBEAT_SKEW_SECONDS
+        or age > stale_after_seconds
+    ):
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None
+    return raw if isinstance(raw, list) else None
 
 
 def build_supervisor_observation(store: Store, *, now_epoch: float,
@@ -9845,27 +9940,29 @@ function Invoke-StateFileSwapWithRetry([string]$tmp, [string]$path) {
     }
   }
 }
-function Write-StateFileAtomic([string]$path, $state) {
-  if (-not (Test-StateObject $state)) { throw "supervisor state must be a JSON object" }
-  $json = $state | ConvertTo-Json -Depth 8
-  $utf8 = New-Object System.Text.UTF8Encoding($false)
-  $bytes = $utf8.GetBytes($json)
+function Write-FileAtomic([string]$path, [byte[]]$bytes) {
   $tmpName = ".at-{0}-{1}.tmp" -f $PID, ([Guid]::NewGuid().ToString('N'))
   $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($path), $tmpName)
-  $stream = [System.IO.FileStream]::new(
-    $tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
-    [System.IO.FileShare]::None)
   try {
-    $stream.Write($bytes, 0, $bytes.Length)
-    $stream.Flush($true)
-  } finally {
-    $stream.Dispose()
-  }
-  try {
+    $stream = [System.IO.FileStream]::new(
+      $tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
+      [System.IO.FileShare]::None)
+    try {
+      $stream.Write($bytes, 0, $bytes.Length)
+      $stream.Flush($true)
+    } finally {
+      $stream.Dispose()
+    }
     Invoke-StateFileSwapWithRetry $tmp $path
   } finally {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
   }
+}
+function Write-StateFileAtomic([string]$path, $state) {
+  if (-not (Test-StateObject $state)) { throw "supervisor state must be a JSON object" }
+  $json = $state | ConvertTo-Json -Depth 8
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  Write-FileAtomic $path ($utf8.GetBytes($json))
 }
 function Set-AgentState($state, $name, $value) {
   $state.agents | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
@@ -10080,11 +10177,14 @@ function Get-ProcSnapshot($path) {
     # emits a UTF-8 BOM under Windows PowerShell 5.1, which every JSON write in
     # this template must avoid so a strict Python reader never chokes.
     $u8 = New-Object System.Text.UTF8Encoding($false)
-    if ($arr.Count -eq 0) { [System.IO.File]::WriteAllText($path, '[]', $u8) }
-    else { [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $arr -Depth 4), $u8) }
+    $json = if ($arr.Count -eq 0) { '[]' }
+            else { ConvertTo-Json -InputObject $arr -Depth 4 }
+    Write-FileAtomic $path ($u8.GetBytes([string]$json))
     return $true
   } catch {
-    [System.IO.File]::WriteAllText($path, (@{ unavailable = $true } | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    $u8 = New-Object System.Text.UTF8Encoding($false)
+    $json = @{ unavailable = $true } | ConvertTo-Json
+    Write-FileAtomic $path ($u8.GetBytes([string]$json))
     return $false
   }
 }

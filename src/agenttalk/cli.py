@@ -56,6 +56,7 @@ from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
 from agenttalk import lead_loop_runtime
 from agenttalk import onboarding as ob
+from agenttalk import operator_health
 from agenttalk import signing as _signing
 from agenttalk import threads as th
 from agenttalk import supervisor as sup
@@ -537,16 +538,27 @@ def _gather_status(store: Store) -> dict:
     # Resolve the lead-loop heartbeat window from supervisor.json (if present) so the
     # status view uses the SAME threshold as the steal path - never the 120s default
     # for a wrapped agent (WP1 contract; avoids armed/heartbeat_stale skew).
-    sup_cfg = _load_supervisor_config(store)
-    from agenttalk import supervisor as _sup
+    health_policy = operator_health.load_health_timing_policy(store)
+    sup_cfg = health_policy.config
     sup_agents = (
         sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
     )
-    supervisor_rows, supervisor_warnings = _status_supervisor_summaries(
-        store, now.timestamp(), sup_cfg)
+    if health_policy.unavailable_reason is None:
+        supervisor_rows, supervisor_warnings = _status_supervisor_summaries(
+            store, now.timestamp(), sup_cfg)
+    else:
+        supervisor_rows = {}
+        supervisor_warnings = [health_policy.unavailable_reason]
     agents = []
     for a in cfg.get("agents", []):
-        hb = store.read_heartbeat(a)
+        cfg_agent = sup_agents.get(a) if isinstance(sup_agents.get(a), dict) else {}
+        normalized_health = operator_health.read_health_observation(
+            store,
+            a,
+            now_epoch=now.timestamp(),
+            health_policy=health_policy,
+        )
+        hb = normalized_health.heartbeat
         if hb is None:
             heartbeat_iso: str | None = None
             last_seen_s: float | None = None
@@ -573,15 +585,7 @@ def _gather_status(store: Store) -> dict:
                 isinstance(dl, (int, float))
                 and time.time() > dl + STALE_THRESHOLD_SECONDS
             )
-        cfg_agent = sup_agents.get(a) if isinstance(sup_agents.get(a), dict) else {}
-        health_timing = _sup.resolve_health_timing(sup_cfg or {}, cfg_agent)
-        health = store.read_health(
-            a,
-            now_epoch=now.timestamp(),
-            heartbeat=hb,
-            ttl_seconds=health_timing["ttl_seconds"],
-            heartbeat_skew_seconds=health_timing["heartbeat_skew_seconds"],
-        )
+        health = normalized_health.health
         row = {
             "name": a,
             "role": roles.get(a),
@@ -600,6 +604,28 @@ def _gather_status(store: Store) -> dict:
             decision = sup_row.get("decision")
             if isinstance(decision, dict):
                 row["supervisor"] = {"decision": decision}
+                if cfg_agent.get("wrapped") is True:
+                    composition = operator_health.compose_health_evidence(
+                        health.get("state"), decision=decision)
+                    row["health_composition"] = composition
+                    if composition["disagreement"]:
+                        row["supervisor"]["disagreement"] = True
+            elif sup_row.get("decision_unavailable") is True:
+                # A wrapped agent this supervisor cannot compute a strict
+                # decision for — say why rather than silently showing only the
+                # self-report or assuming every unavailable verdict is disabled.
+                reason = sup_row.get("decision_unavailable_reason")
+                reason = reason if isinstance(reason, str) else "decision_missing"
+                row["supervisor"] = {
+                    "decision_unavailable": True,
+                    "decision_unavailable_reason": reason,
+                }
+                if cfg_agent.get("wrapped") is True:
+                    composition = operator_health.compose_health_evidence(
+                        health.get("state"), unavailable_reason=reason)
+                    row["health_composition"] = composition
+                    if composition["disagreement"]:
+                        row["supervisor"]["disagreement"] = True
             if isinstance(sup_row.get("lead_liveness"), dict):
                 row["lead_liveness"] = sup_row["lead_liveness"]
             effective = sup_row.get("health_effective_state")
@@ -744,37 +770,67 @@ def _read_supervisor_snapshot(store: Store, path_value: str | None = None) -> li
 
 def _status_supervisor_summaries(store: Store, now_epoch: float,
                                  sup_cfg: dict) -> tuple[dict[str, dict], list[str]]:
+    sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
+    wrapped_names = {
+        name for name, cfg_agent in sup_agents.items()
+        if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
+    }
     try:
         obs = sup.build_supervisor_observation(
             store,
             now_epoch=now_epoch,
             state=_read_supervisor_state(store),
             supervisor_config=sup_cfg,
-            snapshot=_read_supervisor_snapshot(store),
+            snapshot=sup.read_supervisor_snapshot_if_fresh(
+                store.dir / "supervisor-snapshot.json",
+                now_epoch=now_epoch,
+                stale_after_seconds=sup.resolve_snapshot_stale_after_seconds(sup_cfg),
+            ),
             event_limit=0,
             lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )
     except Exception as exc:
-        return {}, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
+        rows = {
+            name: {
+                "decision_unavailable": True,
+                "decision_unavailable_reason": "assessment_failed",
+            }
+            for name in wrapped_names
+        }
+        return rows, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
     rows: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             continue
+        name = item["name"]
         decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
         health = item.get("health") if isinstance(item.get("health"), dict) else {}
         lead_liveness = item.get("lead_liveness") if isinstance(item.get("lead_liveness"), dict) else None
         effective = health.get("effective_state")
         raw_state = health.get("state")
-        if decision is None and lead_liveness is None and effective == raw_state:
+        # A WRAPPED agent with no computable decision (e.g. not configured
+        # auto_restart) must say so visibly rather than silently falling back
+        # to the self-report — the same honesty doctor already has.
+        wrapped_without_decision = decision is None and name in wrapped_names
+        if (decision is None and lead_liveness is None and effective == raw_state
+                and not wrapped_without_decision):
             continue
         row: dict[str, object] = {}
         if decision is not None:
             row["decision"] = decision
+        elif wrapped_without_decision:
+            row["decision_unavailable"] = True
+            cfg_agent = sup_agents.get(name)
+            row["decision_unavailable_reason"] = (
+                "auto_restart_disabled"
+                if isinstance(cfg_agent, dict) and cfg_agent.get("auto_restart") is not True
+                else "decision_missing"
+            )
         if isinstance(effective, str) and effective != raw_state:
             row["health_effective_state"] = effective
         if lead_liveness is not None:
             row["lead_liveness"] = lead_liveness
-        rows[item["name"]] = row
+        rows[name] = row
     warnings = []
     ring = obs.get("event_ring") if isinstance(obs.get("event_ring"), dict) else {}
     for warning in ring.get("warnings") or []:
@@ -1283,6 +1339,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         dec = sv.get("decision") if isinstance(sv.get("decision"), dict) else None
         if dec:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
+            # Use the already-scoped JSON fact rather than re-deriving it here;
+            # only wrapped agents have a strict wrapper-child disagreement.
+            if sv.get("disagreement") is True:
+                seen += " [DISAGREEMENT]"
+        elif sv.get("decision_unavailable") is True:
+            reason = sv.get("decision_unavailable_reason") or "decision_missing"
+            seen += f" supervisor=UNAVAILABLE({reason})"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
