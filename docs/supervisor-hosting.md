@@ -83,6 +83,28 @@ IgnoreNew`, restart-on-failure, and no execution time limit. Status prints
 `LastRunTime`, `LastTaskResult`, the command path, arguments, working directory,
 and `supervisor.ps1` path.
 
+## Stopping the supervisor
+
+Use the boundary that launched it:
+
+- Foreground `supervisor.ps1`: Ctrl-C that PowerShell terminal.
+- Scheduled Task: from the project root, run
+  `& $pwshPath -NoLogo -NoProfile -NonInteractive -File
+  .\.agenttalk\supervisor-task.ps1 -Action stop` (include the installed
+  `-TaskName` when customized), then wait until the task is not Running and its
+  supervisor process has exited.
+- `agenttalk start`: Ctrl-C stops only the Team Console. Create
+  the kill switch with the absolute command printed by `start`, then run its
+  root-pinned `agenttalk --root '<project-root>' supervise --stop-instance
+  --acknowledge-stop-supervisor`. This explicit command checks the marker's
+  exact Windows creation FILETIME on the same process handle it terminates;
+  ambiguity or PID reuse is a refusal.
+
+The exact hidden-process stop leaves its marker for explicit audit. Run the
+root-pinned repair command printed by `start`: `agenttalk --root
+'<project-root>' supervise --repair-instance-marker --quarantine
+--acknowledge-no-live-supervisor`.
+
 ## Kill Switch
 
 Create `.agenttalk\supervisor.kill` to disable mutating supervisor automation.
@@ -90,11 +112,11 @@ The file contents are ignored; empty, non-empty, or corrupt all mean disabled.
 
 While the kill switch exists, read-only commands such as `supervise --report`,
 `supervise --plan`, `deadman`, `status`, `threads`, `sync`, and `wait` remain
-usable. The supervisor refuses kills, relaunches, seeding, launch-request
-claim/archive, marker clearing, bus notify, and supervisor-state reconciliation
-writes. The sole operator-write exception is the attended process-tree
-ownership reset below; it requires the kill switch as a safety precondition.
-Remove the file to re-enable automation.
+usable. Automatic supervisor work refuses kills, relaunches, seeding,
+launch-request claim/archive, marker clearing, bus notify, and supervisor-state
+reconciliation writes. The explicit exact-identity `--stop-instance` command
+and the attended process-tree ownership reset below require the kill switch as
+a safety precondition. Remove the file to re-enable automation.
 
 ### Recover an owned-process-tree HOLD
 

@@ -543,13 +543,10 @@ The supported upgrade sequence is:
 1. Stop the Scheduled Task or foreground supervisor and wait for the selected
    host process to exit.
 2. Inspect the old instance marker strictly. If absent, continue. If invalid,
-   run the existing explicit
+   or structurally valid with an owner positively proven gone, run the explicit
    `--repair-instance-marker --quarantine --acknowledge-no-live-supervisor`
-   path only after confirming no owner is live. If structurally valid with a
-   dead owner, do **not** use that repair command (it correctly refuses valid
-   bytes); the lifecycle-locked refresh in step 4 confirms the owner is gone
-   and quarantines the stale marker automatically. A valid live or unqueryable
-   owner remains a stop/wait blocker.
+   path only after confirming no owner is live. A valid live or unqueryable
+   owner remains a stop/wait blocker and the repair refuses it.
 3. Remove `supervisor.kill` if present. Script refresh is a supervisor mutation
    and is deliberately refused while that raw switch exists.
 4. Run `agenttalk supervise --refresh-scripts` so the script and shim share the

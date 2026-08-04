@@ -522,6 +522,41 @@ task and old supervisor process to exit, uninstall, select the new host, run
 `agenttalk supervise --refresh-scripts`, then install and start. Task action
 paths are compared as data and are never executed to discover or probe a host.
 
+`agenttalk start` uses a different hosting boundary: it opens the Team Console
+and launches a hidden supervisor, but reports `supervisor started pid=...` only
+after that exact process has claimed the singleton marker. Ctrl-C stops the
+Team Console only; it is **not** a supervisor stop. To stop the hidden process,
+use the absolute kill-switch command and root-pinned exact-identity stop printed
+by `start`. Their shape is:
+
+```powershell
+New-Item -ItemType File -Force -LiteralPath '<project-root>\.agenttalk\supervisor.kill'
+agenttalk --root '<project-root>' supervise --stop-instance `
+  --acknowledge-stop-supervisor
+```
+
+The command verifies the marker's exact Windows creation FILETIME and
+terminates through that same process handle; it never trusts PID alone. The
+kill switch disables automatic supervisor mutations but does not itself
+terminate the supervisor.
+The exact stop deliberately leaves the marker for explicit audit. Run:
+
+```powershell
+agenttalk --root '<project-root>' supervise --repair-instance-marker --quarantine `
+  --acknowledge-no-live-supervisor
+```
+
+For a foreground `supervisor.ps1`, Ctrl-C its own PowerShell terminal. For a
+Scheduled Task, run the generated helper from the project root through the
+selected host, then wait until both the task and process have stopped:
+
+```powershell
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor-task.ps1 -Action stop
+```
+
+Include the installed `-TaskName` when it was customized.
+
 After an agenttalk upgrade, stop and wait for the claimed supervisor to exit,
 then refresh the four generated files:
 
@@ -532,7 +567,8 @@ agenttalk supervise --refresh-scripts
 Refresh preserves an existing `supervisor.json` byte-for-byte and leaves
 runtime state unchanged. The four replacements are individually atomic, not
 group-atomic; stale/mixed sets are detected and a rerun converges. An invalid
-singleton marker is recovered only with the explicit
+marker, or a structurally valid marker whose owner is positively proven gone,
+is recovered only with the explicit
 `supervise --repair-instance-marker --quarantine
 --acknowledge-no-live-supervisor` acknowledgement.
 

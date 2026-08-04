@@ -15,8 +15,9 @@ full `docs/supervisor-tutorial.md`, the `agenttalk.lead` skill, and the
 > **Commands.** Examples use the installed `agenttalk` CLI. If `.agenttalk/`
 > is not under your current directory, pass `--root <path>` **before** the
 > subcommand: `agenttalk --root C:\proj status` (global options precede the
-> subcommand). On Windows, always stop processes with PowerShell
-> `Stop-Process` — never `taskkill`.
+> subcommand). Never stop the hidden singleton supervisor by numeric PID;
+> use the marker-bound exact-identity command in Section 2e. Avoid `taskkill`,
+> which cannot enforce that identity boundary.
 
 ---
 
@@ -91,9 +92,32 @@ are OK. `start --pwsh <abs>` also selects a host inline before starting.
 ```
 agenttalk start
 ```
-This claims the singleton supervisor, launches the wrapped workers, and opens
-the dashboard. `--no-supervisor` runs the dashboard only; `--no-browser`
-skips opening a browser.
+This launches the supervisor, waits until that exact process has claimed the
+singleton marker, and only then prints `supervisor started pid=...` and opens
+the dashboard. A dead marker is a refusal, not an implicit repair; follow the
+printed root-pinned `supervise --repair-instance-marker` remedy. A live
+parentless holder must first be stopped through the printed marker-bound
+exact-identity command, then repaired.
+`--no-supervisor` runs the dashboard only; `--no-browser` skips opening a
+browser.
+
+Ctrl-C on `agenttalk start` stops the Team Console only. It does **not** stop
+the hidden supervisor. To stop that launch safely, use all three commands that
+`start` prints: they arm the resolved root's absolute `supervisor.kill`, run a
+root-pinned exact-identity stop, and then run the root-pinned attended repair.
+The stop binds the marker's exact creation time to the same process handle it
+terminates; it never acts on PID alone. For a Scheduled Task, run the generated helper
+from the project root through the selected host, then wait for the task and
+process to stop:
+
+```powershell
+$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor-task.ps1 -Action stop
+```
+
+Include the installed `-TaskName` when it was customized. For a foreground
+`supervisor.ps1`, Ctrl-C that PowerShell terminal instead.
 
 ---
 
@@ -111,8 +135,10 @@ skips opening a browser.
   ```
   The supervisor restarts it cleanly on the next cycle. Prefer this over
   killing the process.
-- **Stop the team:** stop the supervisor process (PowerShell `Stop-Process`,
-  never `taskkill`); workers stop when their owner is gone. See
+- **Stop the supervisor:** use the stop boundary that launched it. For
+  `agenttalk start`, use the absolute/root-pinned kill, stop, and repair
+  commands printed by `start`; never terminate that hidden process by PID alone. Existing workers continue,
+  but they are no longer monitored or automatically restarted. See
   `docs/supervisor-tutorial.md` §10 for safe teardown and known limits.
 - **A worker keeps dying:** check `agenttalk dead-letter list` — a poison
   message is quarantined after repeated failures rather than looping forever.

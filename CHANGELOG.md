@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`agenttalk start` now reports a supervisor only after its singleton claim is
+  verified.** Startup refuses invalid, confirmed-dead, parentless, live, and
+  unqueryable instance-marker states without silently clearing them; failures
+  exit non-zero and never print an unverified PID. The attended repair command
+  now also quarantines structurally valid markers whose owner is positively
+  proven gone, while ambiguity remains held.
+- **The Team Console's Ctrl-C boundary is explicit.** Ctrl-C stops the console,
+  not the hidden supervisor launched by `agenttalk start`; startup output and
+  operator documentation now give the corresponding stop procedure. The new
+  `supervise --stop-instance --acknowledge-stop-supervisor` boundary requires
+  the kill switch and verifies the marker's exact Windows creation FILETIME on
+  the same process handle it terminates, so PID reuse cannot redirect the stop.
+
 ## [0.81.0] - 2026-08-02
 
 Theme: **the supervisor knows what it owns, and says so when it cannot.** 0.80.0 deferred three

@@ -118,6 +118,41 @@ def test_real_core_accepts_direct_powershell_to_python_claim_chain(tmp_path: Pat
 
 
 @pytest.mark.source_layout
+def test_real_generated_supervisor_claim_contention_exits_three_and_loud(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("PowerShell Core is not installed")
+    store = _store(tmp_path, pwsh)
+    holder = store.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    assert holder is not None
+
+    result = subprocess.run(  # noqa: S603  # nosec B603
+        [
+            pwsh,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(store.dir / "supervisor.ps1"),
+            "-Once",
+            "-Quiet",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=tmp_path,
+        env=_environment(),
+    )
+
+    assert result.returncode == 3
+    assert "another live supervisor instance owns this root" in result.stderr
+    assert store.read_supervisor_instance() == holder
+    assert not (store.dir / "supervisor-state.json").exists()
+
+
+@pytest.mark.source_layout
 def test_real_core_override_claim_uses_baked_fallback_for_validation(
     tmp_path: Path,
 ) -> None:

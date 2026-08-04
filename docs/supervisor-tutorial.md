@@ -630,11 +630,30 @@ on one agent before trusting it with the whole team.
 
 ### Backing out — returning to attended/interactive
 
-To stop supervising, **stop running `supervisor.ps1`** (Ctrl-C its
-terminal). That is the only required step — the supervisor is just an
-external monitor, so once it's gone nothing auto-restarts anything. Your
-agents and bus are unaffected. Relaunch any agent you want to drive by
-hand with `/agenttalk.listen` as before.
+To stop supervising, stop the supervisor through the boundary that launched
+it:
+
+- Foreground `supervisor.ps1`: Ctrl-C that PowerShell terminal.
+- Scheduled Task: from the project root, run
+  `& $pwshPath -NoLogo -NoProfile -NonInteractive -File
+  .\.agenttalk\supervisor-task.ps1 -Action stop` (include the installed
+  `-TaskName` when customized), then wait until the task is not Running and its
+  supervisor process has exited.
+- `agenttalk start`: Ctrl-C stops the Team Console **only**. Create
+  the kill switch with the absolute command printed by `start`, then run its
+  root-pinned `agenttalk --root '<project-root>' supervise --stop-instance
+  --acknowledge-stop-supervisor`. That command verifies exact process creation
+  time and terminates through the same handle; it never acts on PID alone. The
+  kill switch disables automatic supervisor mutations; it does not terminate
+  the process.
+
+The exact hidden-process stop leaves its singleton marker for explicit audit;
+after the process is confirmed gone, run the root-pinned command printed by
+`start`: `agenttalk --root '<project-root>' supervise
+--repair-instance-marker --quarantine --acknowledge-no-live-supervisor`. The repair fails closed when the holder is
+live or cannot be established. Once the supervisor is gone nothing
+auto-restarts anything; your agents and bus are unaffected. Relaunch any agent
+you want to drive by hand with `/agenttalk.listen` as before.
 
 Optional cleanup — none of it required, all of it inert when the monitor
 isn't running:
@@ -752,7 +771,8 @@ without ever rebuilding state.
 | `agenttalk supervise --init [--force]` | Scaffold config plus four generated artifacts. `--force` refreshes generated files and preserves existing config/state. |
 | `agenttalk supervise --select-pwsh [--pwsh ABSOLUTE_PATH]` | Probe and record the PowerShell Core 7+ host. An explicit candidate never falls through. |
 | `agenttalk supervise --refresh-scripts [--pwsh ABSOLUTE_PATH]` | Regenerate/validate all four artifacts under the lifecycle lock; preserve config/runtime state. |
-| `agenttalk supervise --repair-instance-marker --quarantine --acknowledge-no-live-supervisor` | Explicitly quarantine an invalid singleton marker after the operator confirms no supervisor is live. |
+| `agenttalk supervise --stop-instance --acknowledge-stop-supervisor` | With `supervisor.kill` present, verify and stop the exact Windows process identity recorded by the singleton marker. PID-only or ambiguous identity is refused. |
+| `agenttalk supervise --repair-instance-marker --quarantine --acknowledge-no-live-supervisor` | Explicitly quarantine an invalid marker, or a valid marker whose owner is positively proven gone, after the operator confirms no supervisor is live. Live or unqueryable holders are refused. |
 | `agenttalk supervise --reset-process-tree-ownership --from L --for A --hold-source-hash HASH --verified-launch-nonce NONCE --acknowledge-no-live-supervisor --acknowledge-owned-processes-stopped --reason TEXT` | Record an attended owned-tree boundary. Requires liaison/sole-lead authority, the kill switch, no live instance marker, the current Attention hash and nonce, and every recorded PID/start proven gone or recycled. Never kills or launches. |
 | `agenttalk supervise --report` | Read-only per-agent liveness JSON (fresh/stale + threshold). |
 | `agenttalk supervise --plan` | The action plan (decision table) the monitor executes. |

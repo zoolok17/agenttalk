@@ -9395,6 +9395,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     selected_host = None
     if would_start_supervisor:
         try:
+            supervisor_lifecycle.assert_supervisor_start_precondition(store)
             if args.pwsh:
                 supervisor_lifecycle.select_powershell_host(
                     store, explicit_path=args.pwsh,
@@ -9422,6 +9423,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     actual_port = srv.server_address[1]
     url = _web._format_url(args.host, actual_port)
     proc = None
+    verified_pid = None
+    spawn_identity = None
     if would_start_supervisor:
         try:
             with supervisor_lifecycle.selected_host_for_spawn(store) as launch_host:
@@ -9432,16 +9435,68 @@ def cmd_start(args: argparse.Namespace) -> int:
                     stdout=subprocess.DEVNULL,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
+            spawn_identity = supervisor_lifecycle.observe_spawned_supervisor(proc)
         except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as e:
+            if proc is not None:
+                try:
+                    supervisor_lifecycle.stop_unverified_supervisor(
+                        store, proc, identity=None,
+                    )
+                except supervisor_lifecycle.SupervisorLifecycleError as stop_error:
+                    sys.stderr.write(
+                        "agenttalk start: unverified supervisor could not be "
+                        f"contained ({stop_error})\n"
+                    )
             srv.server_close()
             sys.stderr.write(f"agenttalk start: supervisor.ps1 launch failed ({e})\n")
             return 3
+        try:
+            claim = supervisor_lifecycle.wait_for_supervisor_claim(
+                store, proc, identity=spawn_identity,
+            )
+            verified_pid = int(claim["pid"])
+        except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as e:
+            try:
+                late_claim = supervisor_lifecycle.stop_unverified_supervisor(
+                    store, proc, identity=spawn_identity,
+                )
+            except supervisor_lifecycle.SupervisorLifecycleError as stop_error:
+                srv.server_close()
+                sys.stderr.write(
+                    f"agenttalk start: supervisor claim did not succeed ({e}); "
+                    "the unverified child could not be contained "
+                    f"({stop_error})\n"
+                )
+                return 3
+            if late_claim is not None:
+                verified_pid = int(late_claim["pid"])
+            else:
+                srv.server_close()
+                sys.stderr.write(
+                    f"agenttalk start: supervisor claim did not succeed ({e})\n"
+                )
+                return 3
     if not args.no_browser:
         webbrowser.open(url)
     sys.stderr.write(f"agenttalk: serving team console at {url}\n")
-    if proc is not None:
-        sys.stderr.write(f"           supervisor started pid={proc.pid}\n")
-    sys.stderr.write("           (Ctrl-C to stop)\n")
+    if verified_pid is not None:
+        sys.stderr.write(
+            f"           supervisor started pid={verified_pid} "
+            "(instance claim verified)\n"
+        )
+        sys.stderr.write(
+            "           Ctrl-C stops the Team Console only; the supervisor continues.\n"
+        )
+        sys.stderr.write(
+            "           To stop it, arm the kill switch with "
+            f"`{supervisor_lifecycle.create_kill_switch_command(store)}`, run the "
+            "marker-bound exact-identity stop "
+            f"`{supervisor_lifecycle.stop_instance_command(store)}`, then quarantine "
+            "the stopped instance marker with "
+            f"`{supervisor_lifecycle.instance_marker_repair_command(store)}`.\n"
+        )
+    else:
+        sys.stderr.write("           (Ctrl-C to stop the Team Console)\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -11836,11 +11891,29 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             )
             return 2
         try:
-            path = supervisor_lifecycle.repair_invalid_instance_marker(store)
+            path = supervisor_lifecycle.repair_instance_marker(store)
         except (OSError, ValueError) as e:
             sys.stderr.write(f"agenttalk supervise --repair-instance-marker: {e}\n")
             return 3
         print("no instance marker present" if path is None else f"quarantined: {path}")
+        return 0
+    if args.stop_instance:
+        if not args.acknowledge_stop_supervisor:
+            sys.stderr.write(
+                "agenttalk supervise --stop-instance requires "
+                "--acknowledge-stop-supervisor\n"
+            )
+            return 2
+        try:
+            record = supervisor_lifecycle.stop_supervisor_instance(store)
+        except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --stop-instance: {e}\n")
+            return 3
+        print(
+            f"stopped exact supervisor pid={record['pid']}; its marker remains; "
+            "now run "
+            f"`{supervisor_lifecycle.instance_marker_repair_command(store)}`"
+        )
         return 0
     if args.validate_current_pwsh:
         try:
@@ -14395,7 +14468,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Select and probe PowerShell Core 7+ for this project.")
     gsup.add_argument("--repair-instance-marker", dest="repair_instance_marker",
                       action="store_true",
-                      help="Explicitly recover an invalid singleton marker.")
+                      help="Explicitly recover an invalid or confirmed-dead singleton marker.")
+    gsup.add_argument("--stop-instance", dest="stop_instance", action="store_true",
+                      help="Stop the exact Windows process named by the singleton marker.")
     gsup.add_argument("--report", action="store_true",
                       help="Emit the read-only per-agent liveness snapshot (JSON).")
     gsup.add_argument("--bootstrap-check", dest="bootstrap_check", action="store_true",
@@ -14489,11 +14564,17 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument("--task-working-directory", dest="task_working_directory",
                       help=argparse.SUPPRESS)
     psup.add_argument("--quarantine", action="store_true",
-                      help="(--repair-instance-marker) move the invalid marker aside.")
+                      help="(--repair-instance-marker) move the recoverable marker aside.")
     psup.add_argument("--acknowledge-no-live-supervisor",
                       dest="acknowledge_no_live_supervisor", action="store_true",
                       help="Acknowledge no supervisor is live for an attended "
                            "instance-marker repair or process-tree reset.")
+    psup.add_argument(
+        "--acknowledge-stop-supervisor",
+        dest="acknowledge_stop_supervisor",
+        action="store_true",
+        help="(--stop-instance) acknowledge the exact marker-owned supervisor stop.",
+    )
     psup.add_argument(
         "--acknowledge-owned-processes-stopped",
         dest="acknowledge_owned_processes_stopped",
