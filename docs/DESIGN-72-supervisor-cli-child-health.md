@@ -370,6 +370,14 @@ boundary keeps status, diagnostics, and coordination projections from
 manufacturing the evidence required for `CLI_CHILD_DEAD` or
 `CLI_CHILD_STALLED`.
 
+The boundary is executable, not conventional. Plain `supervise --plan` and the
+generated host's `-DryRun` route call `observe_actions`. The live generated host
+alone calls the hidden `--executable-poll` route with its current supervisor
+instance token and process identity. `observe_actions` positively projects source
+facts and cannot return kill targets, state/marker transitions, launch arguments,
+or archive authority; adding a new executor field therefore cannot expose it to
+an operator surface by default.
+
 Child death and child stall are different failures:
 
 - **Dead:** the active-turn brain is absent from a trustworthy snapshot.

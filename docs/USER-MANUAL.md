@@ -503,6 +503,10 @@ agenttalk supervise --plan
 agenttalk supervise --bootstrap-check
 ```
 
+`--plan` is a read-only, non-advancing preview. It cannot earn a second child
+confirmation poll or carry kill targets; only the live generated supervisor
+host can request the internal executable form.
+
 Use `--bootstrap-check` before treating a roster as a live team. It emits JSON
 and verifies the operator-facing liaison, supervisor-managed agent entries,
 wrapped Claude/Codex launch invariants, explicit wrapped `--root`, filled launch

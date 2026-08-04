@@ -118,8 +118,9 @@ existing `supervisor.json` byte-for-byte and does not touch runtime state.
 - **`supervisor.json`** — the config you fill in: cadence knobs plus a
   per-agent block describing how to launch each agent.
 - **`supervisor.ps1`** — the generated PowerShell monitor. You run this;
-  you do not edit it. It polls `supervise --plan` and executes the plan
-  (launch / relaunch-with-resume / scoped kill / warn).
+  you do not edit it. Its live loop uses an internal, instance-bound executable
+  poll (launch / relaunch-with-resume / scoped kill / warn). `-DryRun` uses the
+  non-advancing `supervise --plan` observation instead.
 - **`bin/agenttalk.cmd`** — a tiny shim the monitor calls so its own bus
   commands resolve to the right Python/agenttalk regardless of your PATH.
   You don't invoke it directly.
@@ -448,12 +449,13 @@ In another terminal:
 
 ```powershell
 agenttalk supervise --report   # read-only liveness JSON: per-agent fresh/stale, threshold
-agenttalk supervise --plan     # the action plan the script will execute
+agenttalk supervise --plan     # non-advancing decision preview, with no kill authority
 agenttalk dashboard            # browser view: heartbeat age, who's composing, open threads
 ```
 
-`--report` and `--plan` are pure read-only derivations — safe to run any
-time, they change nothing.
+`--report` and `--plan` are pure read-only derivations — safe to run any time.
+They neither change state nor earn a confirming poll. Only the running,
+instance-owning generated host can request the executable form.
 
 ### Use the Scheduled Task host
 
@@ -755,7 +757,7 @@ without ever rebuilding state.
 | `agenttalk supervise --repair-instance-marker --quarantine --acknowledge-no-live-supervisor` | Explicitly quarantine an invalid singleton marker after the operator confirms no supervisor is live. |
 | `agenttalk supervise --reset-process-tree-ownership --from L --for A --hold-source-hash HASH --verified-launch-nonce NONCE --acknowledge-no-live-supervisor --acknowledge-owned-processes-stopped --reason TEXT` | Record an attended owned-tree boundary. Requires liaison/sole-lead authority, the kill switch, no live instance marker, the current Attention hash and nonce, and every recorded PID/start proven gone or recycled. Never kills or launches. |
 | `agenttalk supervise --report` | Read-only per-agent liveness JSON (fresh/stale + threshold). |
-| `agenttalk supervise --plan` | The action plan (decision table) the monitor executes. |
+| `agenttalk supervise --plan` | Read-only, non-advancing decision preview; contains no kill authority. |
 | `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` hooks into the **project** `.claude/settings.json`. Codex modes write only the heartbeat hook to `.codex/hooks.json`. Never global, never clobbers unrelated settings. |
 | `agenttalk supervise --install-activity-hook --interactive-for <lead>` | Merge the three Claude hooks with a fallback identity for the current operator-facing human liaison; `AGENTTALK_SELF` still takes precedence. Refuses Codex hook modes. |
 | `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] -- <real exe> <base args>` | Run an agent through the progress wrapper: visibility + working-turn heartbeat + degraded detection. `--loop` = long-running supervised wrapper, one turn per inbound message. |

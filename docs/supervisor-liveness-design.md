@@ -271,7 +271,8 @@ legacy single-PID path for a forking CLI):**
 
 The snapshot is **volatile and never persisted as durable state** (codex Q4):
 the `.ps1` writes it to a SEPARATE `supervisor-snapshot.json` and passes
-`--snapshot-file` to `supervise --plan`. It is an INPUT to the planner only; if
+`--snapshot-file` to its internal executable poll (`supervise --plan` remains
+the manual, non-advancing preview). It is an INPUT to the planner only; if
 an inline form is ever used for speed it MUST be stripped from `next_state` and
 never written back into `supervisor-state.json` (it can contain command lines).
 
@@ -484,7 +485,8 @@ New action/detail fields on the plan result: `kill_orphans` (bool),
 ## `.ps1` executor changes (thin)
 
 1. `Get-ProcSnapshot` — capture the snapshot, write it to a SEPARATE
-   `supervisor-snapshot.json` and pass `--snapshot-file` to `supervise --plan`
+   `supervisor-snapshot.json` and pass `--snapshot-file` to the instance-bound
+   executable poll
    (codex Q4: volatile, may contain command lines, must not become durable
    state). On total failure, write an explicit empty/`unavailable` marker so
    Python can choose `SNAPSHOT_UNAVAILABLE` rather than mistaking it for "no
@@ -497,7 +499,7 @@ New action/detail fields on the plan result: `kill_orphans` (bool),
    `CODEX_HOME` (junctions for `skills`/`plugins`/`rules`, symlink-or-ACL-copy for
    `auth.json`/`config.toml`, never sharing `sessions/`); advisory `codex doctor`
    (ignore websocket/reachability failures). Run before a Codex launch (§Resume).
-5. The do-loop still: refresh snapshot -> `supervise --plan` -> switch on
+5. The do-loop still: refresh snapshot -> instance-bound executable poll -> switch on
    action. `relaunch`/`stuck_recover` now consult `kill_targets`/`kill_orphans`,
    seed the home, launch FRESH or `resume --last` per `resume_mode`, and call
    `supervise --record-launch` with the discovered `brain_pid` (+

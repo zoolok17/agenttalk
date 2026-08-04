@@ -11734,8 +11734,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
 
 def cmd_supervise(args: argparse.Namespace) -> int:
     """Supervisor support (thin): --init scaffolds config+scripts; --report
-    emits the read-only liveness JSON; --plan emits the action plan (the shared
-    decision table); --clear-restart clears a restart marker by request_id."""
+    emits the read-only liveness JSON; --plan emits a non-advancing decision
+    projection; the generated host alone uses --executable-poll for the shared
+    executable table; --clear-restart clears a restart marker by request_id."""
     store = _get_store(args)
     supervisor_mutations = (
         "archive_launch_request",
@@ -12607,7 +12608,28 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         )
         print(json.dumps(payload, indent=2))
         return 2 if payload.get("verdict") == "error" else 0
-    if args.plan:
+    if args.plan or args.executable_poll:
+        if args.record_events and not args.executable_poll:
+            sys.stderr.write(
+                "agenttalk supervise --plan: --record-events is reserved for "
+                "the executable supervisor poll\n"
+            )
+            return 2
+        if args.executable_poll:
+            instance = store.read_supervisor_instance()
+            if (
+                not args.instance_token
+                or not isinstance(instance, dict)
+                or instance.get("token") != args.instance_token
+                or args.pid is None
+                or instance.get("pid") != args.pid
+                or instance.get("pid_start") != args.pid_start
+            ):
+                sys.stderr.write(
+                    "agenttalk supervise --executable-poll: current supervisor "
+                    "instance token/process identity did not match\n"
+                )
+                return 3
         if args.report_file:
             report = json.loads(Path(args.report_file).read_text(encoding="utf-8-sig"))
         else:
@@ -12620,8 +12642,9 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         snapshot = None
         if args.snapshot_file and Path(args.snapshot_file).exists():
             snapshot = _read_snapshot_file(args.snapshot_file)
-        plan = sup.plan_actions(report, _read_state(), config,
-                                now_epoch=now, snapshot=snapshot)
+        planner = sup.plan_actions if args.executable_poll else sup.observe_actions
+        plan = planner(report, _read_state(), config,
+                       now_epoch=now, snapshot=snapshot)
         print(json.dumps(plan, indent=2))
         if getattr(args, "record_events", False):
             with contextlib.suppress(Exception):
@@ -14383,7 +14406,7 @@ def build_parser() -> argparse.ArgumentParser:
     psup = sub.add_parser(
         "supervise",
         help="External-supervisor support (thin): scaffold the config+scripts, "
-             "emit the read-only liveness report, compute the safe action plan, "
+             "emit read-only liveness and non-advancing decision projections, "
              "or clear a restart marker. The generated script owns the loop.",
     )
     gsup = psup.add_mutually_exclusive_group(required=True)
@@ -14403,7 +14426,9 @@ def build_parser() -> argparse.ArgumentParser:
                            "roster, operator-facing lead, supervisor config, wrapped "
                            "Claude/Codex launch invariants, and fresh heartbeats.")
     gsup.add_argument("--plan", action="store_true",
-                      help="Emit the action plan (the shared decision table) as JSON.")
+                      help="Emit a read-only, non-advancing decision projection as JSON.")
+    gsup.add_argument("--executable-poll", dest="executable_poll",
+                      action="store_true", help=argparse.SUPPRESS)
     gsup.add_argument(
         "--reset-process-tree-ownership",
         dest="reset_process_tree_ownership",
@@ -14539,7 +14564,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(--archive-launch-request) JSON review-result "
                            "completion evidence from the supervisor plan.")
     psup.add_argument("--snapshot-file", dest="snapshot_file", default=None,
-                      help="(--plan) the executor's process snapshot JSON (list of "
+                      help="(decision poll) the process snapshot JSON (list of "
                            "{pid,parent_pid,name,command_line,start_time,"
                            "start_filetime}). Missing "
                            "or unreadable => UNAVAILABLE (brain-required CLI fails closed).")
@@ -14577,13 +14602,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="(--init) refresh generated scripts/shim; preserve config and runtime state.",
     )
     psup.add_argument("--now", type=float, default=None,
-                      help="Override 'now' (epoch seconds) for report/plan — test hook.")
+                      help="Override 'now' (epoch seconds) for report/decision poll — "
+                           "test hook.")
     psup.add_argument("--report-file", dest="report_file",
-                      help="(--plan) read the report from this JSON file instead of live.")
+                      help="(decision poll) read the report from this JSON file instead "
+                           "of live.")
     psup.add_argument("--state-file", dest="state_file",
-                      help="(--plan) the supervisor's local state JSON (pids/backoff).")
+                      help="(decision poll) the supervisor's local state JSON "
+                           "(pids/backoff).")
     psup.add_argument("--record-events", dest="record_events", action="store_true",
-                      help="(--plan, script use) append bounded redacted decision events.")
+                      help="(generated supervisor use) append bounded redacted "
+                           "decision events.")
     psup.add_argument(
         "--for",
         dest="agent",
