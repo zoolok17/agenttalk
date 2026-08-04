@@ -2288,129 +2288,6 @@ def _exact_start_order_key_values(
     return None
 
 
-def _exact_identity_confirmed_absent(
-    idx: dict[int, dict],
-    excluded_pids: object,
-    pid: object,
-    start: object,
-    start_filetime: object = None,
-) -> bool:
-    """#163 launch half: PROVEN absence of one exact pid+start(+filetime)
-    identity, never PID-only and never inferred from evidence we could not
-    read. Fails closed to False (present) on anything this cannot classify
-    with confidence: an excluded/ambiguous row at that pid, a claimed or
-    observed side with no exact identity to compare, or a row that IS the
-    same identity. Only an unambiguous absence (pid not present at all) or an
-    unambiguous mismatch (a different exact identity now at that pid) reads
-    True. This is an absence claim only - callers may use True to withhold an
-    action, never to act on whatever they found.
-    """
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    if pid in excluded_pids:
-        return False
-    row = idx.get(pid)
-    if row is None:
-        return True
-    claimed_key = _exact_start_order_key_values(start, start_filetime)
-    if claimed_key is None:
-        return False
-    row_key = _exact_start_order_key_values(_start_of(row), row.get("start_filetime"))
-    if row_key is None:
-        return False
-    return row_key != claimed_key
-
-
-def _named_identities_confirmed_absent(
-    snapshot: list[dict] | None,
-    identities: object,
-) -> bool:
-    """#163 launch half: PROVEN absence for a whole set of this agent's own
-    claimed identities - wrapper, CLI launcher, legacy managed-pid rows,
-    whatever the caller names - fail-closed to False (present) exactly like
-    ``_unverified_owned_process_may_exist`` (same conservative shape: no
-    snapshot means we could not look, a whole-snapshot integrity error means
-    we cannot trust what we saw, a direct child of any named root is
-    sufficient ambiguity to withhold). The one deliberate difference: each
-    root identity is compared EXACTLY (pid + exact start, FILETIME when the
-    platform has one) via ``_exact_identity_confirmed_absent``, never by a
-    rounded or string-formatted timestamp - a recycled PID whose rounded
-    creation time coincides with a dead identity's must not read as "still
-    alive" (or, in the other direction, as "confirmed absent" on ambiguous
-    evidence). A True here may only ever be used to withhold an action.
-    """
-    identities = [
-        (pid, start, start_filetime)
-        for pid, start, start_filetime in identities
-        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-    ]
-    if not identities:
-        # No claim to check is not proof there is nothing to find - that is
-        # the exact "absent field read as zero" trap. A caller with nothing
-        # to name should not reach this function claiming absence; treat it
-        # as unable to prove absence, never as absence itself.
-        return False
-    if snapshot is None:
-        return False
-    if _snapshot_pid_integrity_error(snapshot) is not None:
-        return False
-    idx, excluded_pids = _snap_index_and_excluded(snapshot)
-    roots: set[int] = set()
-    for pid, start, start_filetime in identities:
-        if not _exact_identity_confirmed_absent(
-            idx, excluded_pids, pid, start, start_filetime
-        ):
-            return False
-        roots.add(pid)
-    # A launcher may already have exited and left a reparenting race. A
-    # direct child of any named root PID is sufficient ambiguity to withhold,
-    # never to act - the same rule _unverified_owned_process_may_exist already
-    # applies for the identical reason, just inverted here (we need proof of
-    # absence, it needs proof of possible presence).
-    for row in snapshot:
-        if not isinstance(row, dict):
-            continue
-        pid = row.get("parent_pid")
-        child_pid = row.get("pid")
-        if (
-            pid in roots
-            and isinstance(child_pid, int)
-            and not isinstance(child_pid, bool)
-            and child_pid > 0
-        ):
-            return False
-    return True
-
-
-def _no_live_identity_for_launch(
-    *,
-    owned_tree: dict | None,
-    brain_alive: bool,
-    managed_pids: object,
-    snapshot: list[dict] | None,
-    identities: object,
-) -> bool:
-    """#163 launch half: the absence conjunction, one predicate for every
-    call site (``_wrapped_liveness``'s generation-mismatch and
-    legacy-managed-pids branches, ``_plan_one``, ``evaluate_launch_barrier``).
-    True only when EVERY claim of this agent's own live identity is proven
-    absent: the persisted record names no live identity, no brain, no
-    managed descendant (both already independently proven by the caller),
-    and ``_named_identities_confirmed_absent`` proves the rest (wrapper,
-    CLI launcher, legacy managed-pid rows - whatever the caller names) gone
-    from the current snapshot. A True here may only ever be used to WITHHOLD
-    an action that would otherwise HOLD; it grants no authority to act on
-    anything it found - that stays exactly as blocked as before.
-    """
-    if bool((owned_tree or {}).get("entries")):
-        return False
-    if brain_alive:
-        return False
-    if managed_pids:
-        return False
-    return _named_identities_confirmed_absent(snapshot, identities)
-
-
 def _exact_start_order_key(
     row: dict | None,
 ) -> tuple[str, int | float] | None:
@@ -3496,34 +3373,6 @@ def _owned_process_tree(
         else:
             live_prior: set[int] = set()
             for entry in prior_entries:
-                # #156 finding 4 - CONDITIONAL, no live caller today. If this
-                # entry ever reaches here, _recorded_process_identity_state and
-                # _filetime_identity_matches both fall back to the rounded ISO
-                # start token once expected_filetime is None, and a DIFFERENT
-                # process that later reused this pid/parent_pid with a start
-                # that merely rounds to the same ISO second would pass that
-                # fallback as "same". This loop only runs when prior_authority
-                # is not None, i.e. the persisted prior's own status was
-                # "complete" - and a filetime-less ISO entry can never survive
-                # into a validated "complete" record: the producer gate
-                # (add_node's mark_rejected("exact_start_filetime_unavailable",
-                # ...) forces status="invalid" the same round) and the schema
-                # gate (_valid_owned_process_tree rejects any complete/absent
-                # record containing such an entry, ~line 2746) each
-                # independently block it. This exclusion is dead code against
-                # both gates as they stand; it only becomes load-bearing if a
-                # future change widens prior_authority to admit invalid
-                # priors, or relaxes either gate. It still falls through to
-                # the existing non-live bridge reconstruction below if some
-                # live descendant needs it as a structural ancestor.
-                entry_start_key = _start_order_key(entry["start"])
-                if (
-                    entry.get("start_filetime") is None
-                    and entry_start_key is not None
-                    and entry_start_key[0] == "iso"
-                ):
-                    mark_rejected("prior_exact_filetime_unavailable", entry["pid"])
-                    continue
                 row = idx.get(entry["pid"])
                 identity_state = _recorded_process_identity_state(
                     row,
@@ -5915,13 +5764,6 @@ def _wrapped_liveness(
         "wrapper_state": "unknown",
         "child_state": "unknown",
         "child_reason": "runtime_missing",
-        # #163 launch half: default False everywhere. Only the two branches
-        # that explicitly compute it (the generation-mismatch return below,
-        # and _current_proof_failed's shared convergence point) may set it
-        # True, and only after proving every claimed identity absent. A True
-        # here means only "the HOLD that would otherwise apply may be
-        # withheld" - it never grants authority to act on anything found.
-        "no_live_identity_for_launch": False,
     }
     verified_wrapper_generation: str | None = None
 
@@ -6008,84 +5850,6 @@ def _wrapped_liveness(
             frontier = next_frontier
         return False
 
-    def _self_identities() -> list[tuple[object, object, object]]:
-        """Every identity THIS agent's own evidence currently claims as its
-        own: the legacy pre-v2 candidates (wrapper/brain/managed rows,
-        already deduplicated by ``_legacy_process_migration_evidence``), and
-        - once a runtime record has been read - its wrapper pid+start and,
-        when a CLI launcher is expected (phase active), the launcher's
-        pid+start with its exact creation FILETIME when the retained handle
-        provides one. No pid here is checked for aliveness; that is
-        ``_named_identities_confirmed_absent``'s job.
-        """
-        identities: list[tuple[object, object, object]] = []
-        legacy = base.get("legacy_process_evidence")
-        if isinstance(legacy, dict):
-            for entry in legacy.get("entries") or []:
-                if isinstance(entry, dict):
-                    identities.append((entry.get("pid"), entry.get("start"), None))
-        record = base.get("runtime_record")
-        if isinstance(record, dict):
-            identities.append(
-                (record.get("wrapper_pid"), record.get("wrapper_start"), None)
-            )
-            if record.get("phase") == runtime_obs.PHASE_ACTIVE:
-                launcher_lifetime = record.get("cli_launcher_lifetime")
-                creation_filetime = (
-                    launcher_lifetime.get("creation_filetime")
-                    if (
-                        isinstance(launcher_lifetime, dict)
-                        and launcher_lifetime.get("source")
-                        == runtime_obs.LAUNCHER_LIFETIME_SOURCE
-                    )
-                    else None
-                )
-                identities.append((
-                    record.get("cli_launcher_pid"),
-                    record.get("cli_launcher_start"),
-                    creation_filetime,
-                ))
-        return identities
-
-    def _no_live_identity_here() -> bool:
-        """#163 launch half: this poll's own answer to the shared absence
-        predicate, using whatever identities THIS agent's own evidence
-        currently names. Safe to call from any hold branch below - it can
-        only ever justify WITHHOLDING the HOLD it is asked about, never
-        granting authority over anything it finds.
-
-        Legacy pre-v2 evidence never recorded a bounded parent graph (that
-        is exactly why it is being migrated away from), so an unrelated-
-        looking row elsewhere in the snapshot can never be ruled OUT as an
-        untracked descendant the way a walked tree's own strict edges would
-        let it be. When any legacy entry is in play, require the entire
-        snapshot to be empty, not merely the named identities absent - the
-        same conservative bar the legacy migration boundary already applies
-        everywhere else it appears.
-        """
-        if prior_record_invalid:
-            # A schema-drifted persisted record is corruption of the current
-            # authority, not proof of anything - it might have named an
-            # identity this evidence has no way to reconstruct. Only a
-            # record we understand (a legacy migration placeholder, or a
-            # freshly-observed generation mismatch) is eligible to have its
-            # absence proven at all.
-            return False
-        legacy = base.get("legacy_process_evidence")
-        if (
-            isinstance(legacy, dict)
-            and legacy.get("entries")
-            and snapshot
-        ):
-            return False
-        return _no_live_identity_for_launch(
-            owned_tree=base.get("owned_process_tree"),
-            brain_alive=bool(base.get("brain_alive")),
-            managed_pids=base.get("managed_pids") or [],
-            snapshot=snapshot,
-            identities=_self_identities(),
-        )
-
     def _current_proof_failed(
         child_reason: str,
         *,
@@ -6150,7 +5914,6 @@ def _wrapped_liveness(
             base["child_reason"] = tree.get("reason_code") or child_reason
         else:
             base["child_reason"] = child_reason
-        base["no_live_identity_for_launch"] = _no_live_identity_here()
         return base
 
     view = runtime_view if isinstance(runtime_view, dict) else {}
@@ -6248,14 +6011,6 @@ def _wrapped_liveness(
             "process_tree_invalid_generation_adoption_pending"
         )
         base["child_reason"] = "wrapper_generation_mismatch"
-        # #163 launch half: this is the flagship no-op-under-adoption case -
-        # a fresh, valid runtime record naming a generation this state has
-        # never seen, so there is no prior tree entry to fall back on at
-        # all. The identity-agreement gate above and the entryless HOLD
-        # above are UNCHANGED for every other consequence; this only ever
-        # answers "is anything this evidence claims actually alive", never
-        # "may I act on it".
-        base["no_live_identity_for_launch"] = _no_live_identity_here()
         return base
     if snapshot is None:
         return _current_proof_failed(
@@ -7670,25 +7425,12 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 f"({owned_tree.get('reason_code')}); HOLDING automatic teardown "
                 f"because a partial kill could strand descendants; {remedy}"
             )
-        # #163 launch half: this HOLD's own stated reason is "a partial kill
-        # could strand descendants" - which requires a descendant, i.e. a
-        # live identity. liveness["no_live_identity_for_launch"] is proven
-        # ONLY when the persisted record, the brain, every managed
-        # descendant, and every other identity this agent's own evidence
-        # names are independently confirmed absent from THIS poll's snapshot
-        # (see _no_live_identity_for_launch / _named_identities_confirmed_
-        # absent) - restores the ability to START only; it does not restore
-        # visibility into, or authority over, anything that IS still there.
-        # Teardown/kill authority is untouched by this: it never grants a
-        # kill target, and attributed_targets stays sourced from the same
-        # owned-tree walk regardless.
-        if not liveness.get("no_live_identity_for_launch"):
-            return _result(
-                WARN_ONLY,
-                state=tree_state,
-                notify=notify,
-                reason=tree_reason,
-            )
+        return _result(
+            WARN_ONLY,
+            state=tree_state,
+            notify=notify,
+            reason=tree_reason,
+        )
 
     # Task #150 round 12 connector finding: excluded_live_descendant_
     # unaccounted (see _attribution's BFS loop) was computed and then never
@@ -7832,7 +7574,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 "managed wrapper is absent from an available process snapshot"
             )
             nxt["healthy_since"] = None
-        elif wrapper_state != "alive" and not liveness.get("no_live_identity_for_launch"):
+        elif wrapper_state != "alive":
             return _result(
                 NONE,
                 state="CLI_CHILD_UNKNOWN",
@@ -7841,29 +7583,6 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                     f"({liveness.get('child_reason')}); run `{remediation}`"
                 ),
             )
-        elif wrapper_state != "alive":
-            # #163 launch half: an unresolved (never bound) identity, proven
-            # to name nothing actually alive, is exactly as recoverable as a
-            # confirmed-dead one - same STUCK_OR_DEAD treatment the wrapper_dead
-            # branch above already grants, never more. This restores the
-            # ability to reach a recovery decision; it grants no additional
-            # authority over anything the identity-agreement gate above still
-            # refuses to bind.
-            if not hb_stale:
-                return _result(
-                    NONE,
-                    state="WRAPPER_MISSING",
-                    reason=(
-                        "no live identity is provably bound to this wrapper "
-                        "generation, but its heartbeat is still inside the "
-                        "stale threshold"
-                    ),
-                )
-            child_recovery_state = "STUCK_OR_DEAD"
-            child_recovery_reason = (
-                "no live identity is provably bound to this wrapper generation"
-            )
-            nxt["healthy_since"] = None
 
         updated_age = liveness.get("runtime_updated_age_seconds")
         updated_age_valid = bool(
