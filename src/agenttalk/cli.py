@@ -10681,24 +10681,38 @@ def cmd_internal_check_wrap_dispatch(args: argparse.Namespace) -> int:
 
 
 def cmd_wrap(args: argparse.Namespace) -> int:
-    """Install supervisor-authenticated logging before wrapper setup begins."""
+    """Install wrapper-owned logging before wrapper setup begins."""
     from .wrapper_logs import (
         WrapperLifecycleLog,
         capture_termination_signals,
         installed_standard_streams_from_environment,
     )
 
+    agent = (
+        getattr(args, "agent", None)
+        or os.environ.get("AGENTTALK_SELF")
+        or "unknown"
+    )
+    project_root: Path | None = None
+    # A real argparse Namespace always has the global ``root`` attribute.
+    # Some unit-level callers intentionally construct the legacy minimal
+    # Namespace; do not make those embedders allocate process-global logs.
+    if hasattr(args, "root"):
+        raw_root = getattr(args, "root", None) or os.environ.get("AGENTTALK_ROOT")
+        if raw_root:
+            project_root = Path(raw_root).resolve()
+        else:
+            with contextlib.suppress(OSError, FileNotFoundError):
+                project_root = find_root()
+
     with installed_standard_streams_from_environment(
         expected_nonce=getattr(args, "supervisor_launch_nonce", None),
-    ):
-        agent = (
-            getattr(args, "agent", None)
-            or os.environ.get("AGENTTALK_SELF")
-            or "unknown"
-        )
-        lifecycle_log = WrapperLifecycleLog.from_environment(
+        project_root=project_root,
+        agent=str(agent),
+    ) as log_installation:
+        lifecycle_log = WrapperLifecycleLog(
             str(agent),
-            expected_nonce=getattr(args, "supervisor_launch_nonce", None),
+            enabled=log_installation.enabled,
         )
         args._wrapper_lifecycle_log = lifecycle_log
         try:
@@ -12595,10 +12609,36 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     stuck = float(stuck) if isinstance(stuck, (int, float)) else None
 
     if args.report:
-        print(json.dumps(sup.build_report(store, now_epoch=now,
-                                          stuck_after_seconds=stuck,
-                                          state=_read_state() or None,
-                                          supervisor_config=config), indent=2))
+        report = sup.build_report(
+            store,
+            now_epoch=now,
+            stuck_after_seconds=stuck,
+            state=_read_state() or None,
+            supervisor_config=config,
+        )
+        if args.agent:
+            try:
+                agent = validate_agent_name(args.agent)
+            except ValueError as exc:
+                sys.stderr.write(f"agenttalk supervise --report: {exc}\n")
+                return 2
+            selected = report.get("agents", {}).get(agent)
+            if selected is None:
+                sys.stderr.write(
+                    f"agenttalk supervise --report: unknown agent {agent!r}\n"
+                )
+                return 2
+            report["selected_agent"] = agent
+            # This is intentionally report-only. build_report() also feeds
+            # every supervisor --plan poll; resolving and probing an external
+            # diagnostic root must never enter that liveness/launch loop.
+            from .wrapper_logs import read_wrapper_log_location
+
+            selected["wrapper_log"] = read_wrapper_log_location(
+                store.state_dir,
+                agent,
+            )
+        print(json.dumps(report, indent=2))
         return 0
     if args.bootstrap_check:
         payload = sup.bootstrap_check(
@@ -14396,8 +14436,14 @@ def build_parser() -> argparse.ArgumentParser:
     gsup.add_argument("--repair-instance-marker", dest="repair_instance_marker",
                       action="store_true",
                       help="Explicitly recover an invalid singleton marker.")
-    gsup.add_argument("--report", action="store_true",
-                      help="Emit the read-only per-agent liveness snapshot (JSON).")
+    gsup.add_argument(
+        "--report",
+        action="store_true",
+        help=(
+            "Emit read-only per-agent liveness (JSON); with --for, add the "
+            "named agent's last wrapper-recorded log location."
+        ),
+    )
     gsup.add_argument("--bootstrap-check", dest="bootstrap_check", action="store_true",
                       help="Emit a read-only team bootstrap readiness check (JSON): "
                            "roster, operator-facing lead, supervisor config, wrapped "
@@ -14587,7 +14633,7 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument(
         "--for",
         dest="agent",
-        help="Agent name for --clear-restart or configured "
+        help="Agent name for --report, --clear-restart, or configured "
              "--reset-process-tree-ownership.",
     )
     psup.add_argument(

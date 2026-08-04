@@ -5,7 +5,9 @@ import io
 import json
 import os
 import signal
+import shutil
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,6 +15,7 @@ import pytest
 
 from agenttalk import cli, wrapper_logs
 from agenttalk import wrapper_runtime as runtime
+from agenttalk.store import Store
 
 
 NOW = 1_800_000_000.0
@@ -25,6 +28,218 @@ def _log_glob(root: Path, pattern: str) -> list[Path]:
     the numbered tail segments, but it holds a bare index, not log
     content, and is not a segment any of these tests mean to count."""
     return sorted(p for p in root.glob(pattern) if not p.name.endswith(".cursor"))
+
+
+def _direct_wrap_environment(tmp_path: Path, blocked_state: Path) -> dict[str, str]:
+    home = tmp_path / "home"
+    temp = tmp_path / "temp"
+    home.mkdir()
+    temp.mkdir()
+    env = os.environ.copy()
+    for name in (
+        wrapper_logs.ENV_STDOUT_PATH,
+        wrapper_logs.ENV_STDERR_PATH,
+        wrapper_logs.ENV_MAX_BYTES,
+        wrapper_logs.ENV_SEGMENT_COUNT,
+        wrapper_logs.ENV_LAUNCH_NONCE,
+    ):
+        env.pop(name, None)
+    env.update(
+        {
+            "LOCALAPPDATA": str(blocked_state),
+            "XDG_STATE_HOME": str(blocked_state),
+            "USERPROFILE": str(home),
+            "HOME": str(home),
+            "TEMP": str(temp),
+            "TMP": str(temp),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        }
+    )
+    return env
+
+
+def _run_direct_wrapper(project: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    env = {**env, "AGENTTALK_STUB_SCENARIO": "compute_no_reply"}
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agenttalk",
+            "--root",
+            str(project),
+            "wrap",
+            "--for",
+            "worker",
+            "--cli",
+            "claude",
+            "--",
+            sys.executable,
+            str(Path(__file__).resolve().parent / "support" / "stub_cli.py"),
+        ],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+
+def _captured_stderr_logs(tmp_path: Path) -> list[Path]:
+    return sorted(tmp_path.rglob("stderr.log"))
+
+
+def test_direct_wrap_launch_owns_bounded_log_capture(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    Store(project).init(["worker"])
+    blocked_state = tmp_path / "blocked-state"
+    blocked_state.write_text("not a directory", encoding="utf-8")
+    env = _direct_wrap_environment(tmp_path, blocked_state)
+
+    result = _run_direct_wrapper(project, env)
+
+    assert result.returncode == 0, result.stderr
+    assert "Plan: I would compute" in result.stdout
+    logs = _captured_stderr_logs(tmp_path)
+    assert len(logs) == 1
+    generation = logs[0].parent
+    assert (generation / ".committed").exists()
+    captured = "".join(
+        path.read_text(encoding="utf-8")
+        for path in _log_glob(generation, "stderr.log*")
+    )
+    assert '"event":"wrapper_exited"' in captured.replace(" ", "")
+    captured_stdout = "".join(
+        path.read_text(encoding="utf-8")
+        for path in _log_glob(generation, "stdout.log*")
+    )
+    assert "Plan: I would compute" in captured_stdout
+
+
+def test_report_names_the_root_that_accepted_the_wrapper_generation(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    Store(project).init(["worker"])
+    blocked_state = tmp_path / "blocked-state"
+    blocked_state.write_text("not a directory", encoding="utf-8")
+    env = _direct_wrap_environment(tmp_path, blocked_state)
+    preferred = wrapper_logs.default_wrapper_log_root(
+        project,
+        platform=os.name,
+        environ=env,
+    )
+
+    result = _run_direct_wrapper(project, env)
+    assert result.returncode == 0, result.stderr
+    [stderr_log] = _captured_stderr_logs(tmp_path)
+    actual_generation = stderr_log.parent.resolve()
+    actual_root = actual_generation.parent.parent
+    assert actual_root != preferred.resolve()
+
+    # Make the preferred location viable before asking. A report that recomputes
+    # candidates instead of reading the wrapper's recorded fact now lies.
+    blocked_state.unlink()
+    blocked_state.mkdir()
+    report_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agenttalk",
+            "--root",
+            str(project),
+            "supervise",
+            "--report",
+            "--for",
+            "worker",
+        ],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert report_result.returncode == 0, report_result.stderr
+    report = json.loads(report_result.stdout)
+    assert report["selected_agent"] == "worker"
+    location = report["agents"]["worker"]["wrapper_log"]
+    assert location["status"] == "observed"
+    assert Path(location["root"]) == actual_root
+    assert Path(location["generation_dir"]) == actual_generation
+    assert Path(location["stderr"]) == stderr_log.resolve()
+
+
+def test_wrapper_log_location_uses_hashed_windows_safe_agent_files(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    store = Store(project)
+    store.init(["worker"])
+    observed: dict[str, Path] = {}
+
+    for agent in ("worker", "worker.", "NUL"):
+        root = tmp_path / f"logs-{len(observed)}"
+        generation = (
+            root
+            / wrapper_logs._wrapper_log_agent_leaf(agent)
+            / f"20260804T120000000Z-{len(observed):032x}"
+        )
+        generation.mkdir(parents=True)
+        stdout = generation / "stdout.log"
+        stderr = generation / "stderr.log"
+        stdout.write_text("out", encoding="utf-8")
+        stderr.write_text("err", encoding="utf-8")
+        wrapper_logs._record_wrapper_log_location(
+            project,
+            agent,
+            wrapper_logs.WrapperLogInstallation(
+                True,
+                confirmed=True,
+                root=root,
+                generation_dir=generation,
+                stdout_path=stdout,
+                stderr_path=stderr,
+            ),
+        )
+        path = wrapper_logs._wrapper_log_location_path(store.state_dir, agent)
+        observed[agent] = path
+        assert path.name == f"{wrapper_logs._wrapper_log_agent_leaf(agent)}.json"
+        assert wrapper_logs.read_wrapper_log_location(store.state_dir, agent)[
+            "generation_dir"
+        ] == str(generation.resolve())
+
+    assert len(set(observed.values())) == 3
+    assert not any(path.name in {"worker.json", "worker..json", "NUL.json"} for path in observed.values())
+
+
+def test_supervise_plan_never_probes_wrapper_log_filesystem(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    Store(tmp_path).init(["worker"])
+    assert cli.main(["--root", str(tmp_path), "supervise", "--init"]) == 0
+    capsys.readouterr()
+
+    def _fail_probe(*_args, **_kwargs):
+        raise AssertionError("supervisor plan probed wrapper log diagnostics")
+
+    monkeypatch.setattr(wrapper_logs, "read_wrapper_log_location", _fail_probe)
+    rc = cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "supervise",
+            "--plan",
+            "--now",
+            str(NOW),
+        ]
+    )
+
+    assert rc == 0
+    assert "agents" in json.loads(capsys.readouterr().out)
 
 
 def test_default_wrapper_log_root_is_project_scoped_and_outside_checkout(
@@ -144,6 +359,275 @@ def test_default_wrapper_log_root_falls_back_to_tempdir_when_home_is_unresolvabl
     assert checkout.resolve() not in resolved.resolve().parents
 
 
+def test_wrapper_log_candidates_do_not_consult_later_home_after_valid_configured_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    local = tmp_path / "local-state"
+
+    def _unexpected_home(*_args, **_kwargs):
+        raise AssertionError("later HOME candidate was consulted")
+
+    monkeypatch.setattr(wrapper_logs, "_home_state_root", _unexpected_home)
+    roots = wrapper_logs.wrapper_log_root_candidates(
+        checkout,
+        platform="posix",
+        environ={"XDG_STATE_HOME": str(local)},
+    )
+
+    assert roots[0].parent == local / "agenttalk" / "wrapper-logs"
+
+
+def test_wrapper_log_candidates_keep_preferred_when_later_fallback_resolution_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    local = tmp_path / "local-state"
+
+    def _broken_temp(_project):
+        raise OSError("injected later fallback failure")
+
+    monkeypatch.setattr(wrapper_logs, "temporary_wrapper_log_root", _broken_temp)
+    roots = wrapper_logs.wrapper_log_root_candidates(
+        checkout,
+        platform="posix",
+        environ={"XDG_STATE_HOME": str(local)},
+    )
+
+    assert roots[0].parent == local / "agenttalk" / "wrapper-logs"
+
+
+def test_reparse_attribute_check_is_exercised_without_symlink_privilege(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state" / "agenttalk" / "wrapper-logs" / "project"
+    blocked_ancestor = tmp_path / "state"
+    real_check = wrapper_logs._is_reparse_or_symlink
+
+    monkeypatch.setattr(
+        wrapper_logs,
+        "_is_reparse_or_symlink",
+        lambda path: path == blocked_ancestor or real_check(path),
+    )
+
+    with pytest.raises(OSError, match="unsafe wrapper log root ancestry"):
+        wrapper_logs._prepare_agent_log_dir(root, "agent-0123456789abcdef")
+
+
+def test_prune_preserves_live_generation_and_reclaims_stale_active_lock(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "logs"
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    generations: list[Path] = []
+    for sequence in range(1, wrapper_logs.WRAPPER_LOG_GENERATIONS + 2):
+        generation = (
+            root
+            / agent_leaf
+            / f"20260804T12000{sequence}000Z-{sequence:032x}"
+        )
+        generation.mkdir(parents=True)
+        # Simultaneous direct launches can legitimately observe the same prior
+        # maximum. The nonce-bearing generation name must total-order the tie.
+        (generation / ".sequence").write_text("1", encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        (generation / "stdout.log").write_bytes(b"")
+        (generation / "stderr.log").write_bytes(b"")
+        generations.append(generation)
+
+    owned, _max_sequence, _uncertain = wrapper_logs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+    assert len({sort_key for sort_key, _generation in owned}) == len(generations)
+
+    active = generations[0]
+    script = (
+        "import os,sys\n"
+        "from pathlib import Path\n"
+        "from agenttalk import wrapper_logs\n"
+        "lock=wrapper_logs._acquire_active_generation_lock(Path(sys.argv[1]))\n"
+        "assert lock is not None\n"
+        "print('ready', flush=True)\n"
+        "sys.stdin.readline()\n"
+        "os._exit(0)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(active)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ready"
+
+        wrapper_logs._prune_wrapper_log_generations((root,), agent_leaf)
+        assert active.is_dir()
+        assert len([path for path in generations if path.is_dir()]) == 5
+
+        assert process.stdin is not None
+        process.stdin.write("exit\n")
+        process.stdin.flush()
+        assert process.wait(timeout=5) == 0
+
+        wrapper_logs._prune_wrapper_log_generations((root,), agent_leaf)
+        assert not active.exists()
+        assert not wrapper_logs._active_generation_lock_path(active).exists()
+        assert len([path for path in generations if path.is_dir()]) == 4
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_second_active_lock_attempt_cannot_unlink_live_holders_marker(
+    tmp_path: Path,
+) -> None:
+    generation = (
+        tmp_path
+        / wrapper_logs._wrapper_log_agent_leaf("worker")
+        / "20260804T120000000Z-0123456789abcdef0123456789abcdef"
+    )
+    generation.mkdir(parents=True)
+    first = wrapper_logs._acquire_active_generation_lock(generation)
+    assert first is not None
+    try:
+        assert wrapper_logs._acquire_active_generation_lock(generation) is None
+        assert first.path.is_file()
+        with wrapper_logs._guard_wrapper_log_prune(generation) as prunable:
+            # On POSIX record locks are process-scoped, so the same-process
+            # probe can acquire. The pathname invariant is the direction
+            # control here; cross-process exclusion is proved above.
+            if os.name == "nt":
+                assert prunable is False
+    finally:
+        wrapper_logs._release_active_generation_lock(first)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="generated supervisor is Windows-only")
+def test_python_and_powershell_share_active_generation_byte_lock(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("PowerShell Core is unavailable")
+    generation = (
+        tmp_path
+        / wrapper_logs._wrapper_log_agent_leaf("worker")
+        / "20260804T120000000Z-0123456789abcdef0123456789abcdef"
+    )
+    generation.mkdir(parents=True)
+    marker = wrapper_logs._active_generation_lock_path(generation)
+    script = tmp_path / "active-lock.ps1"
+    script.write_text(
+        """param([string]$Path, [string]$Mode)
+$share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+$fileMode = if ($Mode -eq 'hold') { [IO.FileMode]::CreateNew } else { [IO.FileMode]::Open }
+$stream = New-Object IO.FileStream($Path, $fileMode, [IO.FileAccess]::ReadWrite, $share)
+try {
+  if ($stream.Length -lt 1) { $stream.SetLength(1) }
+  try {
+    $stream.Lock(0, 1)
+    [Console]::Out.WriteLine('acquired')
+    [Console]::Out.Flush()
+    if ($Mode -eq 'hold') { $null = [Console]::In.ReadLine() }
+    $stream.Unlock(0, 1)
+  } catch {
+    [Console]::Out.WriteLine('busy')
+    [Console]::Out.Flush()
+  }
+} finally {
+  $stream.Dispose()
+}
+""",
+        encoding="utf-8",
+    )
+
+    python_lock = wrapper_logs._acquire_active_generation_lock(generation)
+    assert python_lock is not None
+    try:
+        probe = subprocess.run(
+            [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script), str(marker), "probe"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert probe.returncode == 0, probe.stderr
+        assert probe.stdout.strip() == "busy"
+    finally:
+        wrapper_logs._release_active_generation_lock(python_lock)
+
+    holder = subprocess.Popen(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script), str(marker), "hold"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "acquired"
+        with wrapper_logs._guard_wrapper_log_prune(generation) as prunable:
+            assert prunable is False
+        assert holder.stdin is not None
+        holder.stdin.write("exit\n")
+        holder.stdin.flush()
+        assert holder.wait(timeout=10) == 0
+        with wrapper_logs._guard_wrapper_log_prune(generation) as prunable:
+            assert prunable is True
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
+        marker.unlink(missing_ok=True)
+
+
+def test_direct_allocator_refuses_a_symlinked_root_ancestor(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    linked_state = tmp_path / "linked-state"
+    try:
+        linked_state.symlink_to(redirected, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        "LOCALAPPDATA": str(linked_state),
+        "XDG_STATE_HOME": str(linked_state),
+        "USERPROFILE": str(home),
+        "HOME": str(home),
+    }
+    preferred = wrapper_logs.default_wrapper_log_root(
+        checkout,
+        platform=os.name,
+        environ=env,
+    )
+
+    targets = wrapper_logs._allocate_wrapper_log_targets(
+        checkout,
+        "worker",
+        env,
+    )
+
+    assert targets is not None
+    assert targets.root != preferred.resolve()
+    assert not any(redirected.rglob("stdout.log"))
+
+
 def test_restrictive_file_opener_bakes_0o600_into_os_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -197,6 +681,31 @@ def test_bounded_stream_tee_keeps_each_file_and_generation_within_cap(
     assert "TERMINAL-SENTINEL" in "".join(
         path.read_text(encoding="utf-8") for path in files
     )
+
+
+def test_bounded_stream_tee_direct_mode_keeps_the_console_unbounded(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "stdout.log"
+    file_stream = base.open("a", encoding="utf-8", buffering=1)
+    console = io.StringIO()
+    tee = wrapper_logs.BoundedStreamTee(
+        file_stream,
+        base,
+        max_bytes=4096,
+        segment_count=4,
+        mirror=console,
+    )
+    output = "console-output-" * 1000
+
+    tee.write(output)
+    tee.close()
+    file_stream.close()
+
+    assert console.getvalue() == output
+    files = _log_glob(tmp_path, "stdout.log*")
+    assert all(path.stat().st_size <= 1024 for path in files)
+    assert sum(path.stat().st_size for path in files) <= 4096
 
 
 def test_bounded_stream_tee_newline_heavy_stream_stays_within_cap_on_disk(
@@ -936,6 +1445,84 @@ def test_stream_environment_confirms_the_generation_from_inside_the_wrapper(
         assert not (generation / ".pending").exists()
 
     assert (generation / ".committed").exists()
+
+
+def test_authenticated_supervisor_targets_record_their_actual_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    store = Store(project)
+    store.init(["worker"])
+    root = tmp_path / "preallocated-root"
+    generation = (
+        root
+        / wrapper_logs._wrapper_log_agent_leaf("worker")
+        / "20260804T120000000Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    generation.mkdir(parents=True)
+    (generation / ".pending").write_bytes(b"")
+    stdout_path = generation / "stdout.log"
+    stderr_path = generation / "stderr.log"
+    stdout_path.write_bytes(b"")
+    stderr_path.write_bytes(b"")
+    nonce = "a" * 32
+    monkeypatch.setenv(wrapper_logs.ENV_STDOUT_PATH, str(stdout_path))
+    monkeypatch.setenv(wrapper_logs.ENV_STDERR_PATH, str(stderr_path))
+    monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    monkeypatch.setattr("sys.stderr", io.StringIO())
+
+    with wrapper_logs.installed_standard_streams_from_environment(
+        expected_nonce=nonce,
+        project_root=project,
+        agent="worker",
+    ):
+        sys.stderr.write("supervised target accepted\n")
+
+    location = wrapper_logs.read_wrapper_log_location(store.state_dir, "worker")
+    assert location["status"] == "observed"
+    assert Path(str(location["root"])) == root.resolve()
+    assert Path(str(location["generation_dir"])) == generation.resolve()
+
+
+def test_invalid_location_path_resolution_cannot_crash_report_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path / "project")
+    store.init(["worker"])
+    location_path = wrapper_logs._wrapper_log_location_path(
+        store.state_dir,
+        "worker",
+    )
+    location_path.parent.mkdir(parents=True)
+    location_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "agent": "worker",
+                "root": str(tmp_path / "resolution-loop"),
+                "generation_dir": str(tmp_path / "generation"),
+                "stdout": str(tmp_path / "stdout.log"),
+                "stderr": str(tmp_path / "stderr.log"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    real_resolve = Path.resolve
+
+    def fail_one_path(path: Path, *args, **kwargs) -> Path:
+        if path.name == "resolution-loop":
+            raise RuntimeError("symlink loop")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_one_path)
+
+    location = wrapper_logs.read_wrapper_log_location(store.state_dir, "worker")
+
+    assert location["status"] == "invalid"
+    assert location["root"] is None
 
 
 def test_stream_environment_without_a_matching_nonce_never_touches_markers(

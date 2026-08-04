@@ -29,6 +29,7 @@ from agenttalk import (
     ephemeral as eph,
     health as hm,
     supervisor as sup,
+    wrapper_logs as wlogs,
     wrapper_runtime as wrt,
 )
 from agenttalk.store import Store, _process_alive
@@ -6330,6 +6331,73 @@ def test_ps_failed_launch_generations_never_evict_prior_evidence(
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
     payload = json.loads(out.read_text(encoding="utf-8-sig"))
     assert payload == {"count": 1, "evidence": "dead-wrapper-evidence"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="generated supervisor is Windows-only")
+def test_ps_retention_preserves_generation_locked_by_direct_python_wrapper(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region wrapper-log-helpers"):
+        sup.PS_TEMPLATE.index("# endregion wrapper-log-helpers")
+    ]
+    root = tmp_path / "primary"
+    fallback = tmp_path / "fallback"
+    parent_fallback = tmp_path / "parent-fallback"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    generations: list[Path] = []
+    for sequence in range(1, sup.WRAPPER_LOG_GENERATIONS + 2):
+        generation = (
+            root
+            / agent_leaf
+            / f"20260804T12000{sequence}000Z-{sequence:032x}"
+        )
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+
+    active = generations[0]
+    active_lock = wlogs._acquire_active_generation_lock(active)
+    assert active_lock is not None
+    out = tmp_path / "active-retention.json"
+    script = tmp_path / "active-retention.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogRoot = {_pslit(str(root))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+            f"$WrapperLogParentFallbackRoot = {_pslit(str(parent_fallback))}",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            "Invoke-WrapperLogRetentionPrune 'worker' "
+            "@($WrapperLogRoot, $WrapperLogFallbackRoot, "
+            "$WrapperLogParentFallbackRoot) $false",
+            f"@{{ active_exists = (Test-Path -LiteralPath {_pslit(str(active))}); "
+            f"count = @(Get-ChildItem -LiteralPath {_pslit(str(root / agent_leaf))} "
+            "-Directory).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(out))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    try:
+        result = subprocess.run(
+            [shell, "-NoProfile", "-File", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        wlogs._release_active_generation_lock(active_lock)
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    assert json.loads(out.read_text(encoding="utf-8-sig")) == {
+        "active_exists": True,
+        "count": sup.WRAPPER_LOG_GENERATIONS + 1,
+    }
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows locked-file retention")

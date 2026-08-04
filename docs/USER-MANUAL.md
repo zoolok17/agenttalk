@@ -499,9 +499,17 @@ Read what the supervisor sees:
 
 ```powershell
 agenttalk supervise --report
+agenttalk supervise --report --for <agent>  # last wrapper-recorded log root/files
 agenttalk supervise --plan
 agenttalk supervise --bootstrap-check
 ```
+
+The selected agent's `wrapper_log` field is the last successfully recorded
+capture. It names the generation that actually opened, including a fallback
+selected after the preferred state root failed; it is never recomputed from
+the current environment. `observed` means those recorded files still exist,
+not that their `wrapper_pid` is currently live or that no later launch failed
+to allocate capture. Correlate `wrapper_pid` and `observed_at` with the incident.
 
 Use `--bootstrap-check` before treating a roster as a live team. It emits JSON
 and verifies the operator-facing liaison, supervisor-managed agent entries,
@@ -1113,9 +1121,14 @@ Common cases:
   Use `agenttalk dead-letter purge --resolved --from <liaison>` to archive old
   resolved payloads out of the live sink; archived rows are no longer requeueable
   by the live `dead-letter requeue` command unless restored.
-- Wrapper crash. Check `supervise --report`, `supervise --plan`, wrapper
-  health files, and the dead-letter sink. The wrapper owns the heartbeat for
-  wrapped agents.
+- Wrapper crash. Run `agenttalk supervise --report --for <agent>` and inspect
+  `agents.<agent>.wrapper_log`: an `observed` record names the last recorded
+  `root`, `generation_dir`, `stdout`, and `stderr` that still exist, including
+  direct launches and fallback roots. It is not liveness authority; compare
+  `wrapper_pid` and `observed_at` with the incident. `stale`, `absent`, and
+  `invalid` are explicit; the report never guesses the preferred candidate. Also check
+  `supervise --plan`, wrapper health files, and the dead-letter sink. The wrapper
+  owns the heartbeat for wrapped agents.
 - Dashboard unavailable. Use `agenttalk dashboard --port 0` to avoid port
   conflicts. `dashboard` is loopback-only and has no `--host` flag.
 - Permissions or path issues. Use `agenttalk whoami --for <agent>`,

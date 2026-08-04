@@ -9767,9 +9767,8 @@ $cfg = Read-SupervisorConfig
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
 $SrcOnPyPath = __SRC_ON_PYPATH__
 $WrapperLogRoot = '__AGENTTALK_WRAPPER_LOG_ROOT__'
-$WrapperLogFallbackRoot = Join-Path (
-  Join-Path ([IO.Path]::GetTempPath()) 'agenttalk-wrapper-logs'
-) '__AGENTTALK_CHECKOUT_ID__'
+$WrapperLogFallbackRoot = '__AGENTTALK_WRAPPER_LOG_FALLBACK_ROOT__'
+$WrapperLogParentFallbackRoot = '__AGENTTALK_WRAPPER_LOG_PARENT_FALLBACK_ROOT__'
 $WrapperLogGenerations = __AGENTTALK_WRAPPER_LOG_GENERATIONS__
 $WrapperLogMaxBytes = __AGENTTALK_WRAPPER_LOG_MAX_BYTES__
 $WrapperLogSegments = __AGENTTALK_WRAPPER_LOG_SEGMENTS__
@@ -11430,7 +11429,11 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
   if ($nonce -notmatch '^[0-9a-f]{32}$') {
     $nonce = [Guid]::NewGuid().ToString('N')
   }
-  $roots = @($WrapperLogRoot, $WrapperLogFallbackRoot) |
+  $roots = @(
+    $WrapperLogRoot,
+    $WrapperLogFallbackRoot,
+    $WrapperLogParentFallbackRoot
+  ) |
     Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
     Select-Object -Unique
   # Computed ONCE, across every configured root, before the create attempts
@@ -11612,7 +11615,10 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
         if (Test-Path -LiteralPath $seqFile) {
           try {
             $seqValue = [int64]([IO.File]::ReadAllText($seqFile).Trim())
-            $sortKey = '1-' + $seqValue.ToString('D20')
+            # A direct wrapper can race this singleton allocator and observe
+            # the same prior maximum. The nonce-bearing generation name is a
+            # deterministic total-order tie-break, not a claim of chronology.
+            $sortKey = '1-' + $seqValue.ToString('D20') + '-' + $old.Name
           } catch {
             Write-Warning (
               "supervisor: unreadable wrapper log launch sequence '{0}' ({1})" -f
@@ -11665,6 +11671,42 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
     # check (NTFS is case-insensitive), not an argv/config token the CLI
     # parses.
     if ($keep -contains $full) { continue }
+    $activePath = Join-Path (
+      [IO.Path]::GetDirectoryName($full)
+    ) ('.' + [IO.Path]::GetFileName($full) + '.active')
+    $activeStream = $null
+    $prunable = $true
+    if (Test-Path -LiteralPath $activePath) {
+      try {
+        $activeItem = Get-Item -LiteralPath $activePath -Force -ErrorAction Stop
+        if (
+          $activeItem.PSIsContainer -or
+          (($activeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        ) {
+          $prunable = $false
+        } else {
+          $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+          $activeStream = New-Object IO.FileStream(
+            $activePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, $share)
+          if ($activeStream.Length -lt 1) { $activeStream.SetLength(1) }
+          try {
+            $activeStream.Lock(0, 1)
+          } catch {
+            $prunable = $false
+          }
+        }
+      } catch {
+        # An unreadable/unsafe marker may still be owned by a live wrapper.
+        # Diagnostic cleanup fails closed and never delays the launch.
+        $prunable = $false
+      }
+    }
+    if (-not $prunable) {
+      if ($null -ne $activeStream) { $activeStream.Dispose() }
+      Write-Warning (
+        "supervisor: preserving active wrapper log generation '{0}'" -f $full)
+      continue
+    }
     try {
       Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
     } catch {
@@ -11672,6 +11714,14 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
         ("supervisor: could not prune wrapper log generation '{0}' ({1}); " +
          "launching with a new generation") -f
         $full, $_.Exception.Message)
+    } finally {
+      if ($null -ne $activeStream) {
+        try { $activeStream.Unlock(0, 1) } catch {}
+        $activeStream.Dispose()
+      }
+      if (-not (Test-Path -LiteralPath $full)) {
+        Remove-Item -LiteralPath $activePath -Force -ErrorAction SilentlyContinue
+      }
     }
   }
 }
@@ -12576,12 +12626,22 @@ def _marker_placeholder_bundle(
     checkout_id = hashlib.sha256(str(store.root).encode("utf-8")).hexdigest()
     src_is_checkout = (store.root / "src" / "agenttalk" / "__init__.py").exists()
     wrapper_log_root = wrapper_log.default_wrapper_log_root(store.root)
+    wrapper_log_fallback_root = wrapper_log.temporary_wrapper_log_root(store.root)
+    wrapper_log_parent_fallback_root = wrapper_log.project_parent_wrapper_log_root(
+        store.root
+    )
     substitutions = {
         "__AGENTTALK_ARTIFACT_MARKER__": _PS_MARKER,
         "__AGENTTALK_CHECKOUT_ID__": checkout_id,
         "__AGENTTALK_PREAMBLE__": psh.generated_preamble().rstrip("\n"),
         "__AGENTTALK_RUNTIME_GUARD__": psh.generated_runtime_guard().rstrip("\n"),
         "__AGENTTALK_WRAPPER_LOG_ROOT__": str(wrapper_log_root).replace("'", "''"),
+        "__AGENTTALK_WRAPPER_LOG_FALLBACK_ROOT__": str(
+            wrapper_log_fallback_root
+        ).replace("'", "''"),
+        "__AGENTTALK_WRAPPER_LOG_PARENT_FALLBACK_ROOT__": str(
+            wrapper_log_parent_fallback_root
+        ).replace("'", "''"),
         "__AGENTTALK_WRAPPER_LOG_GENERATIONS__": str(WRAPPER_LOG_GENERATIONS),
         "__AGENTTALK_WRAPPER_LOG_MAX_BYTES__": str(WRAPPER_LOG_MAX_BYTES),
         "__AGENTTALK_WRAPPER_LOG_SEGMENTS__": str(WRAPPER_LOG_SEGMENT_COUNT),

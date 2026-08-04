@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every `agenttalk wrap` launch path now attempts bounded wrapper logging,
+  and operators can discover the last successfully recorded capture** (#164).
+  Direct/configured-argv launches now self-allocate when an eligible root is
+  writable, using the same bounded stdout/stderr capture that previously
+  depended on generated PowerShell
+  targets. `supervise --report --for <agent>` exposes the wrapper-recorded root
+  and files, preserving the real fallback choice instead of recomputing the
+  preferred candidate. Direct wrapper-owned bounded capture begins after
+  argument dispatch; supervised OS redirection still begins earlier. Failures
+  before wrap dispatch remain tracked separately in #136.
+
 ## [0.81.0] - 2026-08-02
 
 Theme: **the supervisor knows what it owns, and says so when it cannot.** 0.80.0 deferred three

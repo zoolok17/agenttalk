@@ -1,10 +1,10 @@
 """Bounded wrapper process logs and factual lifecycle diagnostics.
 
-The generated supervisor redirects each wrapper launch to a unique generation
-directory.  Once ``agenttalk wrap`` is running, this module keeps the redirected
-bootstrap stream bounded and mirrors the newest output through a fixed segment
-ring.  The lifecycle JSONL is diagnostic output only: it is never read by the
-supervisor and carries no health or restart authority.
+``agenttalk wrap`` owns its capture on every launch path. A generated supervisor
+may preallocate and redirect a generation before Python starts; otherwise the
+wrapper allocates a generation itself and mirrors the original console while it
+keeps both files bounded. The lifecycle JSONL is diagnostic output only: it is
+never read by the supervisor and carries no health or restart authority.
 
 The bound is Python-level only: it wraps ``sys.stdout``/``sys.stderr`` and
 bounds whatever text is written through those objects.  A write that reaches
@@ -18,20 +18,26 @@ tracked but not yet closed.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
+import re
+import secrets
 import signal
+import shutil
 import stat
 import sys
 import tempfile
 import threading
 import traceback
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
+from agenttalk import _atomic
 from agenttalk.signing import project_id_for_root
 
 
@@ -48,6 +54,10 @@ _MIN_MAX_BYTES = 4 * 1024
 _MAX_MAX_BYTES = 64 * 1024 * 1024
 _MIN_SEGMENTS = 2
 _MAX_SEGMENTS = 32
+_LOCATION_SCHEMA_VERSION = 1
+_GENERATION_NAME_RE = re.compile(
+    r"[0-9]{8}T[0-9]{9}Z-[0-9a-f]{32}\Z"
+)
 
 _RUNTIME_FIELDS = (
     "phase",
@@ -88,9 +98,9 @@ def _home_state_root(home_env: str | None, *parts: str) -> Path | None:
     unavailable candidate rather than raising."""
     try:
         home = Path(home_env) if home_env else Path.home()
-    except RuntimeError:
+        return home.expanduser().resolve().joinpath(*parts)
+    except (OSError, RuntimeError):
         return None
-    return home.expanduser().resolve().joinpath(*parts)
 
 
 def _candidate_state_roots(
@@ -118,7 +128,28 @@ def default_wrapper_log_root(
     platform: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> Path:
-    """Return a persistent per-user, per-project log root outside the checkout."""
+    """Return the preferred per-user, per-project log root outside the checkout."""
+    return wrapper_log_root_candidates(
+        project_root,
+        platform=platform,
+        environ=environ,
+    )[0]
+
+
+def wrapper_log_root_candidates(
+    project_root: str | os.PathLike[str],
+    *,
+    platform: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[Path, ...]:
+    """Return eligible roots in launcher-compatible failover order.
+
+    The first item preserves :func:`default_wrapper_log_root`'s lazy preferred
+    selection. The second is the exact temporary fallback baked into generated
+    PowerShell launchers, and the final candidate is independent of user state.
+    Resolving any later candidate is fail-soft and can never invalidate an
+    already-viable preferred root.
+    """
     env = os.environ if environ is None else environ
     target = os.name if platform is None else platform
     if target == "nt":
@@ -130,21 +161,120 @@ def default_wrapper_log_root(
     # A relative state-directory value is interpreted against the process cwd.
     # The supervisor must not let ambient cwd move diagnostic logs back into the
     # checkout, so only absolute platform state roots are eligible.
-    configured = Path(raw).expanduser() if raw else None
+    # Only absolute platform roots are eligible, so no user expansion is
+    # needed here. Deferring all filesystem resolution to the independently
+    # guarded candidate loop also prevents a malformed ambient value from
+    # aborting direct wrapper startup.
+    configured = Path(raw) if raw else None
+    if configured is not None and not configured.is_absolute():
+        configured = None
     project = Path(project_root).resolve()
     project_id = project_id_for_root(project)
-    seen: set[Path] = set()
+    preferred: Path | None = None
     for candidate in _candidate_state_roots(configured, home_env, home_parts, project):
-        if candidate in seen:
+        try:
+            result = (
+                candidate.expanduser().resolve()
+                / "agenttalk"
+                / "wrapper-logs"
+                / project_id
+            ).resolve()
+        except (OSError, RuntimeError):
             continue
-        seen.add(candidate)
-        result = candidate / "agenttalk" / "wrapper-logs" / project_id
-        if not result.resolve().is_relative_to(project):
-            return result
+        if not result.is_relative_to(project):
+            preferred = result
+            break
+
+    candidate_factories = [
+        lambda: preferred,
+        # Keep this byte-for-byte compatible with $WrapperLogFallbackRoot in
+        # the generated launcher so direct and supervised retention scan the
+        # same temporary pool.
+        lambda: temporary_wrapper_log_root(project),
+        lambda: project_parent_wrapper_log_root(project),
+    ]
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for candidate_factory in candidate_factories:
+        try:
+            candidate = candidate_factory()
+            if candidate is None:
+                continue
+            resolved = candidate.expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved in seen or resolved.is_relative_to(project):
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+
     # A checkout rooted at the filesystem anchor has no same-volume "outside".
-    # Keep supervision usable; the generated script still has its independent
-    # temporary fallback and logging remains fail-soft.
-    return Path(tempfile.gettempdir()).resolve() / "agenttalk" / "wrapper-logs" / project_id
+    # Keep wrapping usable; allocation remains fail-soft if this cannot open.
+    if not roots:
+        roots.append(
+            Path(tempfile.gettempdir())
+            / "agenttalk"
+            / "wrapper-logs"
+            / project_id
+        )
+    return tuple(roots)
+
+
+def _wrapper_log_agent_leaf(agent: str) -> str:
+    digest = hashlib.sha256(agent.encode("utf-8")).hexdigest()
+    return f"agent-{digest[:16]}"
+
+
+def temporary_wrapper_log_root(
+    project_root: str | os.PathLike[str],
+) -> Path:
+    project = Path(project_root).resolve()
+    return (
+        Path(tempfile.gettempdir()).resolve()
+        / "agenttalk-wrapper-logs"
+        / project_id_for_root(project)
+    )
+
+
+def project_parent_wrapper_log_root(
+    project_root: str | os.PathLike[str],
+) -> Path:
+    project = Path(project_root).resolve()
+    return (
+        project.parent
+        / ".agenttalk-wrapper-logs"
+        / "agenttalk"
+        / "wrapper-logs"
+        / project_id_for_root(project)
+    ).resolve()
+
+
+@dataclass(frozen=True)
+class WrapperLogInstallation:
+    enabled: bool
+    confirmed: bool = False
+    root: Path | None = None
+    generation_dir: Path | None = None
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class _AllocatedWrapperLogTargets:
+    root: Path
+    generation_dir: Path
+    stdout_path: Path
+    stderr_path: Path
+    roots: tuple[Path, ...]
+    agent_leaf: str
+    sequence_uncertain: bool
+
+
+@dataclass(frozen=True)
+class _ActiveGenerationLock:
+    path: Path
+    fd: int
+    identity: os.stat_result
 
 
 def _bounded_int(
@@ -218,6 +348,451 @@ def _restrictive_file_opener(path: str, flags: int) -> int:
     return os.open(path, flags, 0o600)
 
 
+def _is_reparse_or_symlink(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(info, "st_file_attributes", 0)
+    return stat.S_ISLNK(info.st_mode) or bool(file_attributes & reparse_flag)
+
+
+def _has_reparse_or_symlink_component(path: Path) -> bool:
+    current = path.absolute()
+    while True:
+        if _is_reparse_or_symlink(current):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _prepare_agent_log_dir(root: Path, agent_leaf: str) -> Path:
+    if _has_reparse_or_symlink_component(root):
+        raise OSError(f"unsafe wrapper log root ancestry: {root}")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not root.is_dir() or _has_reparse_or_symlink_component(root):
+        raise OSError(f"unsafe wrapper log root: {root}")
+    agent_dir = root / agent_leaf
+    agent_dir.mkdir(mode=0o700, exist_ok=True)
+    if not agent_dir.is_dir() or _has_reparse_or_symlink_component(agent_dir):
+        raise OSError(f"unsafe wrapper log agent directory: {agent_dir}")
+    if os.name != "nt":
+        os.chmod(root, stat.S_IRWXU)
+        os.chmod(agent_dir, stat.S_IRWXU)
+    return agent_dir
+
+
+def _active_generation_lock_path(generation_dir: Path) -> Path:
+    """Return a lock path outside the generation so it can guard deletion."""
+    return generation_dir.parent / f".{generation_dir.name}.active"
+
+
+def _validate_open_lock_path(path: Path, fd: int) -> None:
+    opened = os.fstat(fd)
+    current = os.lstat(path)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or not stat.S_ISREG(current.st_mode)
+        or current.st_nlink != 1
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        or _is_reparse_or_symlink(path)
+    ):
+        raise OSError(f"unsafe wrapper log active lock: {path}")
+
+
+def _try_lock_active_fd(fd: int) -> bool:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.fstat(fd).st_size < 1:
+        os.write(fd, b"\0")
+        os.fsync(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            # FileStream.Lock uses a byte-range record lock on Unix. lockf,
+            # rather than flock, keeps the Python and generated-PowerShell
+            # pruners on the same cross-language primitive.
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock_active_fd(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.lockf(fd, fcntl.LOCK_UN, 1)
+
+
+def _acquire_active_generation_lock(
+    generation_dir: Path,
+) -> _ActiveGenerationLock | None:
+    path = _active_generation_lock_path(generation_dir)
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
+    created = False
+    created_identity: os.stat_result | None = None
+    try:
+        fd = os.open(str(path), flags, 0o600)
+        created = True
+        created_identity = os.fstat(fd)
+        _validate_open_lock_path(path, fd)
+        if not _try_lock_active_fd(fd):
+            raise OSError(f"could not acquire wrapper log active lock: {path}")
+        return _ActiveGenerationLock(
+            path=path,
+            fd=fd,
+            identity=created_identity,
+        )
+    except OSError:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if created and created_identity is not None:
+            with contextlib.suppress(OSError):
+                _unlink_active_lock_if_same(path, created_identity)
+        return None
+
+
+def _unlink_active_lock_if_same(path: Path, identity: os.stat_result) -> None:
+    # Reuse the store's pathname-generation-safe removal. Closing a lock before
+    # unlinking is required on Windows, but a replacement must never be removed
+    # in the close/unlink race on either platform.
+    from agenttalk.store import _unlink_if_same_file
+
+    _unlink_if_same_file(path, identity)
+
+
+def _release_active_generation_lock(lock: _ActiveGenerationLock) -> None:
+    try:
+        _unlock_active_fd(lock.fd)
+    finally:
+        os.close(lock.fd)
+    with contextlib.suppress(OSError):
+        _unlink_active_lock_if_same(lock.path, lock.identity)
+
+
+@contextlib.contextmanager
+def _guard_wrapper_log_prune(generation_dir: Path) -> Iterator[bool]:
+    """Hold an inactive generation's byte lock through its deletion attempt."""
+    path = _active_generation_lock_path(generation_dir)
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except FileNotFoundError:
+        yield True
+        return
+    except OSError:
+        yield False
+        return
+    acquired = False
+    identity: os.stat_result | None = None
+    try:
+        _validate_open_lock_path(path, fd)
+        identity = os.fstat(fd)
+        acquired = _try_lock_active_fd(fd)
+    except OSError:
+        acquired = False
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                _unlock_active_fd(fd)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        if acquired and identity is not None and not generation_dir.exists():
+            with contextlib.suppress(OSError):
+                _unlink_active_lock_if_same(path, identity)
+
+
+def _owned_committed_generations(
+    roots: tuple[Path, ...],
+    agent_leaf: str,
+) -> tuple[list[tuple[str, Path]], int, bool]:
+    owned: list[tuple[str, Path]] = []
+    max_sequence = 0
+    uncertain = False
+    for root in roots:
+        agent_dir = root / agent_leaf
+        try:
+            if not agent_dir.exists():
+                continue
+            if (
+                not agent_dir.is_dir()
+                or _has_reparse_or_symlink_component(agent_dir)
+            ):
+                uncertain = True
+                continue
+            for generation in agent_dir.iterdir():
+                if (
+                    not _GENERATION_NAME_RE.fullmatch(generation.name)
+                    or not generation.is_dir()
+                    or _has_reparse_or_symlink_component(generation)
+                ):
+                    continue
+                sequence: int | None = None
+                try:
+                    sequence = int(
+                        (generation / ".sequence").read_text(
+                            encoding="utf-8"
+                        ).strip()
+                    )
+                    if sequence < 1:
+                        sequence = None
+                except (OSError, ValueError):
+                    if (
+                        (generation / ".committed").exists()
+                        and (generation / ".sequence-failed").exists()
+                    ):
+                        uncertain = True
+                if sequence is not None:
+                    max_sequence = max(max_sequence, sequence)
+                if not (generation / ".committed").exists():
+                    continue
+                sort_key = (
+                    f"1-{sequence:020d}-{generation.name}"
+                    if sequence is not None
+                    else f"0-{generation.name}"
+                )
+                owned.append((sort_key, generation))
+        except OSError:
+            uncertain = True
+    return owned, max_sequence, uncertain
+
+
+def _write_restrictive_text(path: Path, text: str) -> None:
+    opener = _restrictive_file_opener if os.name != "nt" else None
+    with open(str(path), "x", encoding="utf-8", opener=opener) as stream:
+        stream.write(text)
+
+
+def _allocate_wrapper_log_targets(
+    project_root: Path,
+    agent: str,
+    environ: Mapping[str, str],
+) -> _AllocatedWrapperLogTargets | None:
+    roots = wrapper_log_root_candidates(project_root, environ=environ)
+    agent_leaf = _wrapper_log_agent_leaf(agent)
+    _owned, max_sequence, uncertain = _owned_committed_generations(
+        roots,
+        agent_leaf,
+    )
+    sequence = max_sequence + 1
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")[:-3] + "Z"
+    for root in roots:
+        generation_dir: Path | None = None
+        try:
+            agent_dir = _prepare_agent_log_dir(root, agent_leaf)
+            generation_dir = agent_dir / f"{stamp}-{secrets.token_hex(16)}"
+            generation_dir.mkdir(mode=0o700)
+            stdout_path = generation_dir / "stdout.log"
+            stderr_path = generation_dir / "stderr.log"
+            _write_restrictive_text(stdout_path, "")
+            _write_restrictive_text(stderr_path, "")
+            _write_restrictive_text(generation_dir / ".pending", "")
+            try:
+                _write_restrictive_text(
+                    generation_dir / ".sequence",
+                    str(sequence),
+                )
+            except OSError:
+                uncertain = True
+                with contextlib.suppress(OSError):
+                    _write_restrictive_text(
+                        generation_dir / ".sequence-failed",
+                        "",
+                    )
+            if uncertain:
+                with contextlib.suppress(OSError):
+                    _write_restrictive_text(
+                        generation_dir / ".sequence-uncertain",
+                        "",
+                    )
+            _harden_posix_log_paths(stdout_path, stderr_path)
+            # Match the generated launcher's evidence-first ordering: this
+            # pending generation proves a destination accepted creation, so it
+            # is safe to trim only *prior* committed evidence now. It is not
+            # itself eligible until the wrapper holds its lifetime lock and
+            # confirms after both tees are live.
+            _prune_wrapper_log_generations(
+                roots,
+                agent_leaf,
+                sequence_uncertain=uncertain,
+            )
+            return _AllocatedWrapperLogTargets(
+                root=root.resolve(),
+                generation_dir=generation_dir.resolve(),
+                stdout_path=stdout_path.resolve(),
+                stderr_path=stderr_path.resolve(),
+                roots=roots,
+                agent_leaf=agent_leaf,
+                sequence_uncertain=uncertain,
+            )
+        except OSError:
+            if (
+                generation_dir is not None
+                and not _has_reparse_or_symlink_component(generation_dir)
+            ):
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(generation_dir)
+    return None
+
+
+def _prune_wrapper_log_generations(
+    roots: tuple[Path, ...],
+    agent_leaf: str,
+    *,
+    sequence_uncertain: bool = False,
+) -> None:
+    owned, _max_sequence, uncertain = _owned_committed_generations(
+        roots,
+        agent_leaf,
+    )
+    safety_bound = max(
+        WRAPPER_LOG_GENERATIONS * 3,
+        WRAPPER_LOG_GENERATIONS + 2,
+    )
+    uncertain = uncertain or sequence_uncertain
+    if uncertain and len(owned) <= safety_bound:
+        return
+    for _sort_key, generation in sorted(owned)[:-WRAPPER_LOG_GENERATIONS]:
+        if _has_reparse_or_symlink_component(generation):
+            continue
+        with _guard_wrapper_log_prune(generation) as prunable:
+            if not prunable:
+                continue
+            with contextlib.suppress(OSError):
+                shutil.rmtree(generation)
+
+
+def _wrapper_log_location_path(state_dir: Path, agent: str) -> Path:
+    from agenttalk.store import validate_agent_name
+
+    safe_agent = validate_agent_name(agent)
+    return (
+        state_dir
+        / "wrapper-log-locations"
+        / f"{_wrapper_log_agent_leaf(safe_agent)}.json"
+    )
+
+
+def _record_wrapper_log_location(
+    project_root: Path,
+    agent: str,
+    installation: WrapperLogInstallation,
+) -> None:
+    if not installation.confirmed or installation.generation_dir is None:
+        return
+    store_dir = project_root / ".agenttalk"
+    if not (store_dir / "config.json").is_file():
+        return
+    try:
+        path = _wrapper_log_location_path(store_dir / "state", agent)
+        payload = {
+            "schema_version": _LOCATION_SCHEMA_VERSION,
+            "agent": agent,
+            "root": str(installation.root),
+            "generation_dir": str(installation.generation_dir),
+            "stdout": str(installation.stdout_path),
+            "stderr": str(installation.stderr_path),
+            "wrapper_pid": os.getpid(),
+            "observed_at": _utc_iso(datetime.now(timezone.utc).timestamp()),
+        }
+        _atomic.write_text(
+            path,
+            json.dumps(payload, indent=2, sort_keys=True),
+        )
+    except (OSError, ValueError):
+        pass
+
+
+def read_wrapper_log_location(state_dir: Path, agent: str) -> dict[str, object]:
+    """Read the last wrapper-recorded location without recomputing candidates."""
+    absent = {
+        "status": "absent",
+        "root": None,
+        "generation_dir": None,
+        "stdout": None,
+        "stderr": None,
+    }
+    try:
+        path = _wrapper_log_location_path(state_dir, agent)
+    except ValueError:
+        return {**absent, "status": "invalid", "error": "unsafe_agent"}
+    if not path.exists():
+        return absent
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("location is not an object")
+        if payload.get("schema_version") != _LOCATION_SCHEMA_VERSION:
+            raise ValueError("unsupported schema")
+        if payload.get("agent") != agent:
+            raise ValueError("agent mismatch")
+        paths = {
+            name: Path(str(payload[name])).resolve()
+            for name in ("root", "generation_dir", "stdout", "stderr")
+            if isinstance(payload.get(name), str) and payload[name]
+        }
+        if set(paths) != {"root", "generation_dir", "stdout", "stderr"}:
+            raise ValueError("missing path")
+        generation = paths["generation_dir"]
+        if generation.parent.name != _wrapper_log_agent_leaf(agent):
+            raise ValueError("agent directory mismatch")
+        if generation.parent.parent != paths["root"]:
+            raise ValueError("root mismatch")
+        if paths["stdout"] != generation / "stdout.log":
+            raise ValueError("stdout mismatch")
+        if paths["stderr"] != generation / "stderr.log":
+            raise ValueError("stderr mismatch")
+        status = (
+            "observed"
+            if generation.is_dir()
+            and paths["stdout"].is_file()
+            and paths["stderr"].is_file()
+            else "stale"
+        )
+        return {
+            "status": status,
+            "root": str(paths["root"]),
+            "generation_dir": str(generation),
+            "stdout": str(paths["stdout"]),
+            "stderr": str(paths["stderr"]),
+            "wrapper_pid": payload.get("wrapper_pid"),
+            "observed_at": payload.get("observed_at"),
+        }
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        return {
+            **absent,
+            "status": "invalid",
+            "error": type(exc).__name__,
+        }
+
+
 class BoundedStreamTee:
     """Text stream that bounds the inherited redirect and keeps a newest-output ring.
 
@@ -242,12 +817,14 @@ class BoundedStreamTee:
         max_bytes: int = WRAPPER_LOG_MAX_BYTES,
         segment_count: int = WRAPPER_LOG_SEGMENT_COUNT,
         resume: bool = False,
+        mirror: TextIO | None = None,
     ) -> None:
         if max_bytes < _MIN_MAX_BYTES or max_bytes > _MAX_MAX_BYTES:
             raise ValueError("max_bytes is outside the supported bound")
         if segment_count < _MIN_SEGMENTS or segment_count > _MAX_SEGMENTS:
             raise ValueError("segment_count is outside the supported bound")
         self._original = original
+        self._mirror = mirror
         self.base_path = Path(base_path)
         self.max_bytes = int(max_bytes)
         self.segment_count = int(segment_count)
@@ -373,21 +950,26 @@ class BoundedStreamTee:
 
     @property
     def encoding(self) -> str:
-        return getattr(self._original, "encoding", None) or "utf-8"
+        source = self._mirror if self._mirror is not None else self._original
+        return getattr(source, "encoding", None) or "utf-8"
 
     @property
     def errors(self) -> str:
-        return getattr(self._original, "errors", None) or "replace"
+        source = self._mirror if self._mirror is not None else self._original
+        return getattr(source, "errors", None) or "replace"
 
     @property
     def closed(self) -> bool:
         return self._closed
 
     def isatty(self) -> bool:
-        return False
+        if self._mirror is None:
+            return False
+        return bool(self._mirror.isatty())
 
     def fileno(self) -> int:
-        return self._original.fileno()
+        source = self._mirror if self._mirror is not None else self._original
+        return source.fileno()
 
     def writable(self) -> bool:
         return not self._closed
@@ -561,6 +1143,9 @@ class BoundedStreamTee:
                             self._tail.close()
                     self._tail = None
             self._write_original(text, bounded=True)
+            if self._mirror is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._mirror.write(text)
         return len(text)
 
     def writelines(self, lines) -> None:
@@ -571,6 +1156,9 @@ class BoundedStreamTee:
         with self._lock:
             with contextlib.suppress(OSError, ValueError):
                 self._original.flush()
+            if self._mirror is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._mirror.flush()
             if self._tail is not None:
                 with contextlib.suppress(OSError, ValueError):
                     self._tail.flush()
@@ -597,6 +1185,7 @@ class BoundedStreamTee:
 # a normal exit is inert rather than something that could leak behavior into
 # unrelated later code.
 _LAST_STDERR_LOG_CONFIG: tuple[str, int, int] | None = None
+_LAST_ACTIVE_GENERATION_LOCK: _ActiveGenerationLock | None = None
 
 
 @contextlib.contextmanager
@@ -604,19 +1193,81 @@ def installed_standard_streams_from_environment(
     environ: Mapping[str, str] | None = None,
     *,
     expected_nonce: str | None = None,
-) -> Iterator[None]:
-    """Install bounded stdout/stderr mirrors only for supervisor-marked wrappers."""
-    global _LAST_STDERR_LOG_CONFIG
+    project_root: str | os.PathLike[str] | None = None,
+    agent: str | None = None,
+) -> Iterator[WrapperLogInstallation]:
+    """Install wrapper-owned bounded capture, reusing authenticated targets.
+
+    A generated supervisor can supply already-open redirect targets through its
+    nonce-authenticated environment. Every other ``wrap`` launch allocates its
+    own generation and mirrors the original console while writing the bounded
+    files. Allocation and the location record are fail-soft diagnostics.
+    """
+    global _LAST_ACTIVE_GENERATION_LOCK, _LAST_STDERR_LOG_CONFIG
     env = os.environ if environ is None else environ
-    if not _authenticated_environment(env, expected_nonce):
-        yield
+    authenticated = _authenticated_environment(env, expected_nonce)
+    allocated: _AllocatedWrapperLogTargets | None = None
+    owned_streams = contextlib.ExitStack()
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    if authenticated:
+        stdout_raw = env.get(ENV_STDOUT_PATH)
+        stderr_raw = env.get(ENV_STDERR_PATH)
+        if not stdout_raw or not stderr_raw:
+            yield WrapperLogInstallation(False)
+            return
+        stdout_path = Path(stdout_raw).resolve()
+        stderr_path = Path(stderr_raw).resolve()
+        stdout_base = original_stdout
+        stderr_base = original_stderr
+        stdout_mirror = None
+        stderr_mirror = None
+    elif project_root is not None and agent:
+        allocated = _allocate_wrapper_log_targets(
+            Path(project_root).resolve(),
+            str(agent),
+            env,
+        )
+        if allocated is None:
+            yield WrapperLogInstallation(False)
+            return
+        stdout_path = allocated.stdout_path
+        stderr_path = allocated.stderr_path
+        opener = _restrictive_file_opener if os.name != "nt" else None
+        try:
+            stdout_base = owned_streams.enter_context(
+                open(
+                    str(stdout_path),
+                    "a",
+                    encoding="utf-8",
+                    errors="replace",
+                    buffering=1,
+                    opener=opener,
+                )
+            )
+            stderr_base = owned_streams.enter_context(
+                open(
+                    str(stderr_path),
+                    "a",
+                    encoding="utf-8",
+                    errors="replace",
+                    buffering=1,
+                    opener=opener,
+                )
+            )
+        except OSError:
+            owned_streams.close()
+            with contextlib.suppress(OSError):
+                shutil.rmtree(allocated.generation_dir)
+            yield WrapperLogInstallation(False)
+            return
+        stdout_mirror = original_stdout
+        stderr_mirror = original_stderr
+    else:
+        yield WrapperLogInstallation(False)
         return
-    stdout_path = env.get(ENV_STDOUT_PATH)
-    stderr_path = env.get(ENV_STDERR_PATH)
-    if not stdout_path or not stderr_path:
-        yield
-        return
-    _harden_posix_log_paths(Path(stdout_path), Path(stderr_path))
+
+    _harden_posix_log_paths(stdout_path, stderr_path)
     max_bytes = _bounded_int(
         env.get(ENV_MAX_BYTES),
         default=WRAPPER_LOG_MAX_BYTES,
@@ -629,23 +1280,23 @@ def installed_standard_streams_from_environment(
         minimum=_MIN_SEGMENTS,
         maximum=_MAX_SEGMENTS,
     )
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
     stdout = BoundedStreamTee(
-        original_stdout,
+        stdout_base,
         stdout_path,
         max_bytes=max_bytes,
         segment_count=segment_count,
+        mirror=stdout_mirror,
     )
     stderr = BoundedStreamTee(
-        original_stderr,
+        stderr_base,
         stderr_path,
         max_bytes=max_bytes,
         segment_count=segment_count,
+        mirror=stderr_mirror,
     )
     sys.stdout = stdout
     sys.stderr = stderr
-    _LAST_STDERR_LOG_CONFIG = (stderr_path, max_bytes, segment_count)
+    _LAST_STDERR_LOG_CONFIG = (str(stderr_path), max_bytes, segment_count)
     # Round 23: this is the ONE moment that proves - by evidence, not by a
     # pre-launch guess - that this launch actually reaches cmd_wrap and
     # installs its streams: authentication has already succeeded and both
@@ -654,17 +1305,59 @@ def installed_standard_streams_from_environment(
     # supervisor's commit decision is now the wrapper's own report instead
     # of a prediction about argv grammar, quoting, cwd, interpreter, or
     # timing it can never fully replicate.
-    _confirm_wrapper_log_generation(Path(stderr_path).parent)
+    generation_dir = stderr_path.parent
+    active_lock = _acquire_active_generation_lock(generation_dir)
+    confirmed = bool(
+        active_lock is not None
+        and _confirm_wrapper_log_generation(generation_dir)
+    )
+    root = generation_dir.parent.parent
+    installation = WrapperLogInstallation(
+        True,
+        confirmed=confirmed,
+        root=root,
+        generation_dir=generation_dir,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
+    if project_root is not None and agent:
+        _record_wrapper_log_location(
+            Path(project_root).resolve(),
+            str(agent),
+            installation,
+        )
+    escaped = False
     try:
-        yield
+        yield installation
+    except BaseException:
+        escaped = True
+        raise
     finally:
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         stdout.close()
         stderr.close()
+        owned_streams.close()
+        if active_lock is not None:
+            if escaped:
+                # The real __main__ boundary appends one final bounded traceback
+                # after this context unwinds. Keep deletion blocked until that
+                # append completes; a caught exception merely leaves an OS-held
+                # diagnostic lock until process exit, which is fail-safe.
+                _LAST_ACTIVE_GENERATION_LOCK = active_lock
+            else:
+                with contextlib.suppress(OSError):
+                    _release_active_generation_lock(active_lock)
+                if allocated is not None and confirmed:
+                    with contextlib.suppress(OSError):
+                        _prune_wrapper_log_generations(
+                            allocated.roots,
+                            allocated.agent_leaf,
+                            sequence_uncertain=allocated.sequence_uncertain,
+                        )
 
 
-def _confirm_wrapper_log_generation(generation_dir: Path) -> None:
+def _confirm_wrapper_log_generation(generation_dir: Path) -> bool:
     """Mark a wrapper log generation committed from INSIDE the wrapper
     process itself, mirroring supervisor.py's own .pending/.committed
     marker pair (New-WrapperLogPendingMarker / the marker half of what was
@@ -675,8 +1368,9 @@ def _confirm_wrapper_log_generation(generation_dir: Path) -> None:
     try:
         (generation_dir / ".committed").write_bytes(b"")
         (generation_dir / ".pending").unlink(missing_ok=True)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def print_bounded_uncaught_exception() -> None:
@@ -698,28 +1392,35 @@ def print_bounded_uncaught_exception() -> None:
     tail-ring mechanism instead; a manual run with no wrapper log installed
     prints normally, unchanged.
     """
+    global _LAST_ACTIVE_GENERATION_LOCK
     config = _LAST_STDERR_LOG_CONFIG
-    if config is None:
-        traceback.print_exc(file=sys.stderr)
-        return
-    stderr_path, max_bytes, segment_count = config
     try:
-        tee = BoundedStreamTee(
-            io.StringIO(),
-            stderr_path,
-            max_bytes=max_bytes,
-            segment_count=segment_count,
-            resume=True,
-        )
-        try:
-            traceback.print_exc(file=tee)
-        finally:
-            tee.close()
-    except Exception:
-        # Best-effort: a failure bounding this redundant second copy must
-        # not swallow the crash itself.
-        with contextlib.suppress(Exception):
+        if config is None:
             traceback.print_exc(file=sys.stderr)
+            return
+        stderr_path, max_bytes, segment_count = config
+        try:
+            tee = BoundedStreamTee(
+                io.StringIO(),
+                stderr_path,
+                max_bytes=max_bytes,
+                segment_count=segment_count,
+                resume=True,
+            )
+            try:
+                traceback.print_exc(file=tee)
+            finally:
+                tee.close()
+        except Exception:
+            # Best-effort: a failure bounding this redundant second copy must
+            # not swallow the crash itself.
+            with contextlib.suppress(Exception):
+                traceback.print_exc(file=sys.stderr)
+    finally:
+        if _LAST_ACTIVE_GENERATION_LOCK is not None:
+            with contextlib.suppress(OSError):
+                _release_active_generation_lock(_LAST_ACTIVE_GENERATION_LOCK)
+            _LAST_ACTIVE_GENERATION_LOCK = None
 
 
 def _utc_iso(epoch: float) -> str:
