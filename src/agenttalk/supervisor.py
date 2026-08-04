@@ -2382,33 +2382,98 @@ def _named_identities_confirmed_absent(
     return True
 
 
+def _claimed_self_identities(
+    legacy_process_evidence: object,
+    runtime_record: object,
+) -> tuple[list[tuple[object, object, object]], list[tuple[object, object, object]]]:
+    """Every identity this agent's own evidence currently claims as its
+    own, split into ``(legacy_identities, other_identities)``. Legacy
+    pre-v2 candidates (wrapper/brain/managed rows, already deduplicated by
+    ``_legacy_process_migration_evidence``) come first, since they carry no
+    bounded parent graph and callers must apply a stricter bar to them; the
+    runtime record's wrapper pid+start and, when a CLI launcher is expected
+    (phase active), the launcher's pid+start with its exact creation
+    FILETIME when the retained handle provides one, come second. No pid
+    here is checked for aliveness - that is
+    ``_named_identities_confirmed_absent``'s job.
+    """
+    legacy_identities: list[tuple[object, object, object]] = []
+    if isinstance(legacy_process_evidence, dict):
+        for entry in legacy_process_evidence.get("entries") or []:
+            if isinstance(entry, dict):
+                legacy_identities.append((entry.get("pid"), entry.get("start"), None))
+    other_identities: list[tuple[object, object, object]] = []
+    if isinstance(runtime_record, dict):
+        other_identities.append((
+            runtime_record.get("wrapper_pid"),
+            runtime_record.get("wrapper_start"),
+            None,
+        ))
+        if runtime_record.get("phase") == runtime_obs.PHASE_ACTIVE:
+            launcher_lifetime = runtime_record.get("cli_launcher_lifetime")
+            creation_filetime = (
+                launcher_lifetime.get("creation_filetime")
+                if (
+                    isinstance(launcher_lifetime, dict)
+                    and launcher_lifetime.get("source")
+                    == runtime_obs.LAUNCHER_LIFETIME_SOURCE
+                )
+                else None
+            )
+            other_identities.append((
+                runtime_record.get("cli_launcher_pid"),
+                runtime_record.get("cli_launcher_start"),
+                creation_filetime,
+            ))
+    return legacy_identities, other_identities
+
+
 def _no_live_identity_for_launch(
     *,
+    prior_record_invalid: bool,
     owned_tree: dict | None,
     brain_alive: bool,
     managed_pids: object,
     snapshot: list[dict] | None,
-    identities: object,
+    legacy_identities: object,
+    other_identities: object,
 ) -> bool:
-    """#163 launch half: the absence conjunction, one predicate for every
+    """#163 launch half: the absence conjunction, ONE predicate for every
     call site (``_wrapped_liveness``'s generation-mismatch and
-    legacy-managed-pids branches, ``_plan_one``, ``evaluate_launch_barrier``).
-    True only when EVERY claim of this agent's own live identity is proven
-    absent: the persisted record names no live identity, no brain, no
-    managed descendant (both already independently proven by the caller),
-    and ``_named_identities_confirmed_absent`` proves the rest (wrapper,
-    CLI launcher, legacy managed-pid rows - whatever the caller names) gone
-    from the current snapshot. A True here may only ever be used to WITHHOLD
-    an action that would otherwise HOLD; it grants no authority to act on
-    anything it found - that stays exactly as blocked as before.
+    legacy-managed-pids branches, ``_plan_one``, ``evaluate_launch_barrier``'s
+    alternative path). True only when EVERY claim of this agent's own live
+    identity is proven absent:
+
+    - a schema-drifted/corrupted prior record is excluded entirely -
+      corruption of the current authority is not proof of anything;
+    - the persisted record names no live identity, no brain, no managed
+      descendant (all already independently proven by the caller);
+    - legacy pre-v2 identities carry no bounded parent graph (that is
+      exactly why they are being migrated away from), so when any are
+      present the ENTIRE current snapshot must be empty - an unrelated-
+      looking row elsewhere can never be ruled OUT as an untracked
+      descendant the way a walked tree's own strict edges would let it be;
+    - every other named identity (wrapper, CLI launcher, whatever the
+      caller names) is proven gone from the current snapshot via
+      ``_named_identities_confirmed_absent``.
+
+    A True here may only ever be used to WITHHOLD an action that would
+    otherwise HOLD/block; it grants no authority to act on anything it
+    found - that stays exactly as blocked as before.
     """
+    if prior_record_invalid:
+        return False
     if bool((owned_tree or {}).get("entries")):
         return False
     if brain_alive:
         return False
     if managed_pids:
         return False
-    return _named_identities_confirmed_absent(snapshot, identities)
+    if legacy_identities and snapshot:
+        return False
+    return _named_identities_confirmed_absent(
+        snapshot, [*legacy_identities, *other_identities]
+    )
 
 
 def _exact_start_order_key(
@@ -5119,6 +5184,7 @@ def evaluate_launch_barrier(
     *,
     root_key: str | None = None,
     request_id: str | None = None,
+    runtime_view: dict | None = None,
 ) -> dict:
     """Post-kill one-live-wrapper barrier for the generated executor.
 
@@ -5192,14 +5258,68 @@ def evaluate_launch_barrier(
             ),
         )
         if tree is None or tree.get("status") not in {"complete", "absent"}:
-            return {
-                "allow_launch": False,
-                "blocked": True,
-                "reason": "owned_process_tree_unavailable",
-                "snapshot_available": True,
-                "survivor_count": 0,
-                "survivors": [],
-            }
+            # #163 launch half: PRIMARY PATH failed - the tree does not
+            # validate against the generation this state believes, or does
+            # not validate at all. Generation match is an IDENTITY-AGREEMENT
+            # proxy for liveness, and in the not-yet-adopted state that
+            # proxy is simply wrong - loosening it would degrade this
+            # barrier's strictness for every other case, so it stays exactly
+            # as it is. ALTERNATIVE PATH: independent of any generation
+            # match, re-validate the SAME raw record with the generation
+            # constraint dropped (schema/nonce still enforced - a
+            # corrupted or otherwise-invalid record still fails this and
+            # stays blocked), then PROVE from the current snapshot, via the
+            # identical shared predicate the planner side already uses,
+            # that no identity this agent's own evidence claims is alive.
+            # Nothing here is relaxed: this is a second, independent,
+            # sufficient way to reach the same safety property ("nothing a
+            # partial kill could strand"), not a weaker door into it - and
+            # on success it substitutes an entries-empty tree for the rest
+            # of this function's own survivor scan below, so the
+            # state_launcher/own_wrapper/own_wait checks still run exactly
+            # as they do for a genuinely complete/absent tree.
+            alt_tree = _valid_owned_process_tree(
+                raw_tree,
+                agent=agent,
+                root_key=root_key,
+                wrapper_generation=None,
+                launch_nonce=(
+                    st.get("launcher_nonce")
+                    if _valid_launch_nonce(st.get("launcher_nonce"))
+                    else None
+                ),
+            )
+            prior_record_invalid = alt_tree is None
+            runtime_record = (
+                runtime_view.get("record")
+                if (
+                    isinstance(runtime_view, dict)
+                    and runtime_view.get("status") == runtime_obs.STATUS_VALID
+                )
+                else None
+            )
+            legacy_identities, other_identities = _claimed_self_identities(
+                st.get("legacy_process_evidence"), runtime_record
+            )
+            if _no_live_identity_for_launch(
+                prior_record_invalid=prior_record_invalid,
+                owned_tree=alt_tree,
+                brain_alive=False,
+                managed_pids=[],
+                snapshot=snapshot,
+                legacy_identities=legacy_identities,
+                other_identities=other_identities,
+            ):
+                tree = alt_tree
+            else:
+                return {
+                    "allow_launch": False,
+                    "blocked": True,
+                    "reason": "owned_process_tree_unavailable",
+                    "snapshot_available": True,
+                    "survivor_count": 0,
+                    "survivors": [],
+                }
     elif request_id is not None:
         return {
             "allow_launch": False,
@@ -6008,82 +6128,25 @@ def _wrapped_liveness(
             frontier = next_frontier
         return False
 
-    def _self_identities() -> list[tuple[object, object, object]]:
-        """Every identity THIS agent's own evidence currently claims as its
-        own: the legacy pre-v2 candidates (wrapper/brain/managed rows,
-        already deduplicated by ``_legacy_process_migration_evidence``), and
-        - once a runtime record has been read - its wrapper pid+start and,
-        when a CLI launcher is expected (phase active), the launcher's
-        pid+start with its exact creation FILETIME when the retained handle
-        provides one. No pid here is checked for aliveness; that is
-        ``_named_identities_confirmed_absent``'s job.
-        """
-        identities: list[tuple[object, object, object]] = []
-        legacy = base.get("legacy_process_evidence")
-        if isinstance(legacy, dict):
-            for entry in legacy.get("entries") or []:
-                if isinstance(entry, dict):
-                    identities.append((entry.get("pid"), entry.get("start"), None))
-        record = base.get("runtime_record")
-        if isinstance(record, dict):
-            identities.append(
-                (record.get("wrapper_pid"), record.get("wrapper_start"), None)
-            )
-            if record.get("phase") == runtime_obs.PHASE_ACTIVE:
-                launcher_lifetime = record.get("cli_launcher_lifetime")
-                creation_filetime = (
-                    launcher_lifetime.get("creation_filetime")
-                    if (
-                        isinstance(launcher_lifetime, dict)
-                        and launcher_lifetime.get("source")
-                        == runtime_obs.LAUNCHER_LIFETIME_SOURCE
-                    )
-                    else None
-                )
-                identities.append((
-                    record.get("cli_launcher_pid"),
-                    record.get("cli_launcher_start"),
-                    creation_filetime,
-                ))
-        return identities
-
     def _no_live_identity_here() -> bool:
         """#163 launch half: this poll's own answer to the shared absence
-        predicate, using whatever identities THIS agent's own evidence
-        currently names. Safe to call from any hold branch below - it can
-        only ever justify WITHHOLDING the HOLD it is asked about, never
-        granting authority over anything it finds.
-
-        Legacy pre-v2 evidence never recorded a bounded parent graph (that
-        is exactly why it is being migrated away from), so an unrelated-
-        looking row elsewhere in the snapshot can never be ruled OUT as an
-        untracked descendant the way a walked tree's own strict edges would
-        let it be. When any legacy entry is in play, require the entire
-        snapshot to be empty, not merely the named identities absent - the
-        same conservative bar the legacy migration boundary already applies
-        everywhere else it appears.
+        predicate (``_no_live_identity_for_launch``), using whatever
+        identities THIS agent's own evidence currently names
+        (``_claimed_self_identities``). Safe to call from any hold branch
+        below - it can only ever justify WITHHOLDING the HOLD it is asked
+        about, never granting authority over anything it finds.
         """
-        if prior_record_invalid:
-            # A schema-drifted persisted record is corruption of the current
-            # authority, not proof of anything - it might have named an
-            # identity this evidence has no way to reconstruct. Only a
-            # record we understand (a legacy migration placeholder, or a
-            # freshly-observed generation mismatch) is eligible to have its
-            # absence proven at all.
-            return False
-        legacy = base.get("legacy_process_evidence")
-        if (
-            isinstance(legacy, dict)
-            and legacy.get("entries")
-            and snapshot
-        ):
-            return False
+        legacy_identities, other_identities = _claimed_self_identities(
+            base.get("legacy_process_evidence"), base.get("runtime_record")
+        )
         return _no_live_identity_for_launch(
+            prior_record_invalid=prior_record_invalid,
             owned_tree=base.get("owned_process_tree"),
             brain_alive=bool(base.get("brain_alive")),
             managed_pids=base.get("managed_pids") or [],
             snapshot=snapshot,
-            identities=_self_identities(),
+            legacy_identities=legacy_identities,
+            other_identities=other_identities,
         )
 
     def _current_proof_failed(
