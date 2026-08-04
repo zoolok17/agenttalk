@@ -5932,6 +5932,15 @@ def _wrapped_liveness(
     diagnostics = _diag()
     prior_tree = None
     raw_prior = None
+    # #163 hotfix: only ever reassigned inside `if isinstance(root_key, str):`
+    # below, same as prior_tree/raw_prior above it - but _no_live_identity_here
+    # (called unconditionally, from _current_proof_failed, regardless of
+    # root_key) reads it too. A non-string root_key (the ephemeral-reviewer
+    # caller passes one) skipped that block entirely and left this name
+    # unbound - a crash, not a scoping decision. False here means exactly
+    # what raw_prior=None already means for that case: no prior record to
+    # call invalid.
+    prior_record_invalid = False
     legacy_evidence = _legacy_process_migration_evidence(st)
     prior_generation = st.get("runtime_wrapper_generation")
     has_revoked_runtime = "revoked_wrapper_runtime" in st
