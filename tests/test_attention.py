@@ -7,12 +7,16 @@ deterministic ranking, dedupe keys, and the append-only/skip-invalid disposition
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from agenttalk import attention as att
 from agenttalk.store import Store
+
+
+_NO_RESET_ADMITTED = {"evaluated": True, "admissions": {}}
 
 
 # ----------------------------------------------------------- typed meta validation
@@ -84,6 +88,13 @@ def test_source_hash_reflects_content_not_just_identity() -> None:
     h2 = att.source_hash({"agent": "beta", "reason": "access denied"})
     assert h1 != h2                                # different content -> different hash
     assert h1 == att.source_hash({"reason": "python not found", "agent": "beta"})  # order-stable
+
+
+def test_source_hash_is_total_for_escaped_lone_surrogate() -> None:
+    malformed = {"reason": "escaped-\ud800-surrogate"}
+
+    assert att.source_hash(malformed) == att.source_hash(malformed)
+    assert att.source_hash(malformed) != att.source_hash({"reason": "escaped-surrogate"})
 
 
 def test_dedupe_key_distinguishes_decisions() -> None:
@@ -461,8 +472,8 @@ def _process_tree_state(
 @pytest.mark.parametrize(
     ("status", "reason_code", "observed_count", "expected_detail"),
     [
-        ("truncated", "process_tree_truncated", 65, "observed 65 identities over cap 64"),
-        ("invalid", "duplicate_pid", 3, "invalid (duplicate_pid)"),
+        ("truncated", "process_tree_truncated", 65, "observed 65 identities over the safe cap 64"),
+        ("invalid", "duplicate_pid", 3, "complete current ownership"),
     ],
 )
 def test_process_tree_hold_projects_blocking_operator_action(
@@ -476,7 +487,8 @@ def test_process_tree_hold_projects_blocking_operator_action(
             status=status,
             reason_code=reason_code,
             observed_count=observed_count,
-        )
+        ),
+        reset_admissions=_NO_RESET_ADMITTED,
     )[0]
 
     assert item["item_id"] == "process_tree_hold:worker"
@@ -486,18 +498,9 @@ def test_process_tree_hold_projects_blocking_operator_action(
     assert item["human_can_unblock_now"] is True
     assert item["priority"] == item["risk_severity"] == item["confidence"] == "high"
     assert expected_detail in item["why_it_matters"]
-    assert "pid/start identity" in item["recommendation"]
-    assert "live wrapper launch nonce" in item["recommendation"]
-    assert item["operator_command"].startswith(
-        "agenttalk supervise --reset-process-tree-ownership"
-    )
-    assert f"--hold-source-hash {item['source_hash']}" in item["operator_command"]
-    assert "--verified-launch-nonce LIVE_NONCE" in (
-        item["operator_command"]
-    )
-    assert "--from LIAISON" in item["operator_command"]
-    assert "--acknowledge-owned-processes-stopped" in item["operator_command"]
-    assert "stored expected nonce is" in item["recommendation"]
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+    assert "operator_command" not in item
+    assert item["configured_launch_unavailable"]
     assert item["source_refs"] == [{
         "kind": "supervisor_state",
         "agent": "worker",
@@ -548,6 +551,33 @@ def test_process_tree_hold_hash_binds_exact_tree_and_legacy_evidence() -> None:
     assert att.process_tree_hold_items(state)[0]["source_hash"] != changed_tree
 
 
+def test_process_tree_hold_never_emits_malformed_persisted_unicode() -> None:
+    state = _process_tree_state(
+        status="truncated",
+        reason_code="process_tree_truncated",
+    )
+    tree = state["agents"]["worker"]["owned_process_tree"]
+    tree["reason_code"] = "malformed-\ud800-reason"
+    tree["observed_count"] = "malformed-\ud800-count"
+    state["agents"]["worker"]["restart_request_state"] = (
+        "applied_pending_readiness"
+    )
+    state["agents"]["worker"]["pending_restart_request_id"] = "rr-\ud800"
+
+    item = att.process_tree_hold_items(
+        state,
+        restart_requests={"worker": {"request_id": "rr-\ud800"}},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert item["source_refs"][0]["reason_code"] == (
+        "process_tree_hold_reason_invalid"
+    )
+    assert "complete current ownership" in item["why_it_matters"]
+    assert "restart_request" not in item
+    json.dumps(item, ensure_ascii=False).encode("utf-8")
+
+
 def test_process_tree_hold_omits_reset_command_without_exact_nonce_authority() -> None:
     state = _process_tree_state(
         status="invalid",
@@ -555,10 +585,13 @@ def test_process_tree_hold_omits_reset_command_without_exact_nonce_authority() -
         observed_count=1,
     )
     state["agents"]["worker"]["owned_process_tree"]["launch_nonce"] = None
-    item = att.process_tree_hold_items(state)[0]
+    item = att.process_tree_hold_items(
+        state,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
 
     assert "operator_command" not in item
-    assert "does not contain enough mutually agreeing" in item["recommendation"]
+    assert "no scripted remedy applies in this state" in item["recommendation"]
 
 
 def test_process_tree_hold_omits_reset_command_for_invalid_agent_key() -> None:
@@ -570,13 +603,388 @@ def test_process_tree_hold_omits_reset_command_for_invalid_agent_key() -> None:
     invalid_agent = "worker; Write-Output PWNED"
     state["agents"][invalid_agent] = row
 
-    item = att.process_tree_hold_items(state)[0]
+    item = att.process_tree_hold_items(
+        state,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
 
     assert item["item_id"] == f"process_tree_hold:{invalid_agent}"
     assert item["state"] == "active"
     assert item["advisory"] is False
     assert "operator_command" not in item
-    assert "does not contain enough mutually agreeing" in item["recommendation"]
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "operator_fact"),
+    [
+        (
+            "process_tree_invalid_generation_adoption_pending",
+            "current wrapper generation has adopted this agent's process tree",
+        ),
+        (
+            "process_tree_invalid_legacy_managed_pids",
+            "complete current ownership from legacy PID records",
+        ),
+        (
+            "process_tree_invalid_exact_start_filetime_unavailable",
+            "exact process lifetime identities",
+        ),
+        (
+            "process_tree_invalid_post_kill_owned_descendant_edge_survived",
+            "every owned descendant ended after the attempted teardown",
+        ),
+        (
+            "process_tree_invalid_wrapper_state_mismatch",
+            "reported wrapper identity agrees with the supervisor's recorded launcher",
+        ),
+    ],
+)
+def test_process_tree_refusal_is_operator_visible_with_working_manual_launch(
+    reason_code: str,
+    operator_fact: str,
+) -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code=reason_code,
+        observed_count=1,
+    )
+    state["agents"]["worker"].update({
+        "restart_request_state": "applied_pending_readiness",
+        "pending_restart_request_id": "rr-blocked",
+    })
+    root = r"D:\work\fleet"
+    config = {
+        "agents": {
+            "worker": {
+                "cwd": r"D:\work\fleet\worker space",
+                "launch": {
+                    "windows_file": r"C:\Python\python.exe",
+                    "windows_args": [
+                        "-m", "agenttalk", "--root", "{ROOT}", "wrap",
+                        "--for", "worker", "--loop", "--", r"C:\Codex\codex.exe",
+                    ],
+                },
+            },
+        },
+    }
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config=config,
+        root=root,
+        restart_requests={"worker": {"request_id": "rr-blocked"}},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert operator_fact in item["why_it_matters"]
+    assert reason_code not in item["title"]
+    assert reason_code not in item["why_it_matters"]
+    assert reason_code not in item["recommendation"]
+    assert item["source_refs"][0]["reason_code"] == reason_code
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+    assert "operator_command" not in item
+    assert item["configured_launch"] == {
+        "source": "supervisor.json",
+        "mode": "detached",
+        "argv": [
+            r"C:\Python\python.exe",
+            "-m", "agenttalk", "--root", root, "wrap", "--for", "worker",
+            "--loop", "--", r"C:\Codex\codex.exe",
+        ],
+        "cwd": r"D:\work\fleet\worker space",
+        "environment": {
+            "AGENTTALK_ROOT": root,
+            "AGENTTALK_PY": r"C:\Python\python.exe",
+            "supervisor_json_env_keys": [],
+        },
+        "environment_note": (
+            "Reproduce the listed values and any configured per-agent values; "
+            "a null AGENTTALK_PY must be recovered from the supervisor artifact, "
+            "and the supervisor may also supply an isolated CODEX_HOME and wrapper-log paths."
+        ),
+    }
+    assert item["restart_request"] == {
+        "request_id": "rr-blocked",
+        "state": "blocked_by_process_tree_hold",
+        "pending_progress": False,
+    }
+
+
+def test_process_tree_hold_hash_resurfaces_for_new_restart_and_launch() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+    initial = att.process_tree_hold_items(
+        state,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+    deferred = _disp(
+        initial["item_id"],
+        initial["source"],
+        att.ACTION_DEFER,
+        initial["source_hash"],
+    )
+
+    with_restart = att.process_tree_hold_items(
+        state,
+        restart_requests={"worker": {"request_id": "rr-new"}},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+    assert with_restart["source_hash"] != initial["source_hash"]
+    assert att.build_queue(
+        [with_restart],
+        [deferred],
+        now_iso=_now(),
+    )["items"][0]["state"] == "active"
+
+    config = {
+        "agents": {
+            "worker": {
+                "launch": {
+                    "windows_file": "python.exe",
+                    "windows_args": [
+                        "-m", "agenttalk", "wrap", "--for", "worker", "--loop",
+                    ],
+                },
+            },
+        },
+    }
+    with_launch = att.process_tree_hold_items(
+        state,
+        supervisor_config=config,
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+    assert with_launch["source_hash"] != initial["source_hash"]
+    assert with_launch["configured_launch"]["argv"][3:6] == [
+        "--root", r"D:\fleet", "wrap",
+    ]
+
+
+def test_completed_restart_is_not_relabelled_blocked_by_later_hold() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+    state["agents"]["worker"].update({
+        "restart_request_state": "readiness_seen",
+        "pending_restart_request_id": "rr-complete",
+    })
+
+    without_marker = att.process_tree_hold_items(
+        state,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+    stale_same_marker = att.process_tree_hold_items(
+        state,
+        restart_requests={"worker": {"request_id": "rr-complete"}},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+    fresh_marker = att.process_tree_hold_items(
+        state,
+        restart_requests={"worker": {"request_id": "rr-new"}},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "restart_request" not in without_marker
+    assert "restart_request" not in stale_same_marker
+    assert fresh_marker["restart_request"]["request_id"] == "rr-new"
+
+
+def test_configured_launch_rejects_quoted_command_line_over_windows_bound() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+    quote_heavy = '"' * 4096
+    config = {
+        "agents": {
+            "worker": {
+                "launch": {
+                    "windows_file": "python.exe",
+                    "windows_args": [quote_heavy] * 5,
+                },
+            },
+        },
+    }
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config=config,
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "command-line bound" in item["configured_launch_unavailable"]
+
+
+def test_configured_launch_bounds_windows_utf16_units_including_nul() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+    config = {
+        "agents": {
+            "worker": {
+                "launch": {
+                    "windows_file": "python.exe",
+                    "windows_args": ["😀" * 4096] * 4,
+                },
+            },
+        },
+    }
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config=config,
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "command-line bound" in item["configured_launch_unavailable"]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "agents": {
+                "worker": {
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": ["\ud800"],
+                    },
+                },
+            },
+        },
+        {
+            "agents": {
+                "worker": {
+                    "env": {"\ud800": "value"},
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": ["-m", "agenttalk"],
+                    },
+                },
+            },
+        },
+    ],
+)
+def test_configured_launch_rejects_unencodable_surrogates(config: dict) -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config=config,
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "configured launch" in item["configured_launch_unavailable"]
+    assert item["source_hash"]
+
+
+def test_configured_non_python_launch_does_not_invent_agenttalk_python_pin() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+    config = {
+        "agents": {
+            "worker": {
+                "launch": {
+                    "windows_file": r"C:\Codex\codex.exe",
+                    "windows_args": ["--safe-static-flag"],
+                },
+            },
+        },
+    }
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config=config,
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert item["configured_launch"]["environment"]["AGENTTALK_PY"] is None
+    assert "null AGENTTALK_PY" in item["configured_launch"]["environment_note"]
+
+
+def test_admitted_reset_is_emitted_as_exact_argv_bound_to_item_hash() -> None:
+    state = _process_tree_state(
+        status="truncated",
+        reason_code="process_tree_truncated",
+    )
+    admissions = {
+        "evaluated": True,
+        "admissions": {
+            "worker": {
+                "mode": "configured_reset",
+                "agent": "worker",
+                "actor": "lead",
+                "verified_launch_nonce": "12345678-1234-4234-8234-123456789abc",
+                "reason": "all recorded process identities independently verified stopped",
+            },
+        },
+    }
+
+    item = att.process_tree_hold_items(
+        state,
+        reset_admissions=admissions,
+    )[0]
+
+    assert "no scripted remedy applies" not in item["recommendation"]
+    argv = item["operator_argv"]
+    assert argv[:5] == [
+        "agenttalk", "supervise", "--reset-process-tree-ownership", "--for", "worker",
+    ]
+    assert argv[argv.index("--hold-source-hash") + 1] == item["source_hash"]
+    assert argv[argv.index("--from") + 1] == "lead"
+
+    changed_actor = {
+        "evaluated": True,
+        "admissions": {
+            "worker": {
+                **admissions["admissions"]["worker"],
+                "actor": "ops",
+            },
+        },
+    }
+    rebound = att.process_tree_hold_items(
+        state,
+        reset_admissions=changed_actor,
+    )[0]
+    assert rebound["source_hash"] != item["source_hash"]
+    assert rebound["operator_argv"][rebound["operator_argv"].index("--from") + 1] == (
+        "ops"
+    )
+
+
+def test_restart_marker_reads_are_limited_to_valid_configured_holds() -> None:
+    held = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )["agents"]["worker"]
+    state = {
+        "agents": {
+            "held": held,
+            "complete": {
+                "owned_process_tree": {"status": "complete"},
+            },
+            r"..\outside": held,
+        },
+    }
+
+    assert att.configured_process_tree_hold_agents(state) == ["held"]
 
 
 def test_process_tree_hold_projection_ignores_a_complete_record() -> None:
@@ -605,11 +1013,14 @@ def test_ephemeral_process_tree_hold_without_tree_is_operator_visible() -> None:
         },
     }
 
-    item = att.process_tree_hold_items(state)[0]
+    item = att.process_tree_hold_items(
+        state,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
 
     assert item["item_id"] == "process_tree_hold:ephemeral:lr-missing-agent"
     assert item["affected"] == ["lr-missing-agent"]
-    assert "ephemeral_agent_identity_missing" in item["why_it_matters"]
+    assert "complete current ownership" in item["why_it_matters"]
     assert item["source_refs"] == [{
         "kind": "supervisor_ephemeral_state",
         "agent": "lr-missing-agent",
@@ -635,7 +1046,9 @@ def test_ephemeral_process_tree_hold_without_tree_is_operator_visible() -> None:
         },
     }
     malformed_item = att.process_tree_hold_items(malformed_reason)[0]
-    assert "process_tree_hold_reason_invalid" in malformed_item["why_it_matters"]
+    assert malformed_item["source_refs"][0]["reason_code"] == (
+        "process_tree_hold_reason_invalid"
+    )
 
 
 def test_ephemeral_process_tree_cap_hold_is_operator_visible() -> None:
@@ -649,12 +1062,15 @@ def test_ephemeral_process_tree_cap_hold_is_operator_visible() -> None:
     row["owned_process_tree"]["agent"] = "adversary-lr-cap"
     state["ephemeral_reviewers"] = {"active": {"lr-cap": row}}
 
-    item = att.process_tree_hold_items(state)[0]
+    item = att.process_tree_hold_items(
+        state,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
 
     assert item["item_id"] == "process_tree_hold:ephemeral:lr-cap"
     assert item["affected"] == ["adversary-lr-cap"]
-    assert "observed 65 identities over cap 64" in item["why_it_matters"]
-    assert "`agenttalk attention`" in item["recommendation"]
+    assert "observed 65 identities over the safe cap 64" in item["why_it_matters"]
+    assert "no scripted remedy applies in this state" in item["recommendation"]
     assert item["source_refs"] == [{
         "kind": "supervisor_ephemeral_state",
         "agent": "adversary-lr-cap",

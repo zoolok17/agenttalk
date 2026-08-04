@@ -75,6 +75,19 @@ def is_full_sha(value: object) -> bool:
     return isinstance(value, str) and bool(_FULL_SHA_RE.match(value))
 
 
+def is_safe_reason(value: object, *, max_length: int = 500) -> bool:
+    """Return whether persisted operator prose is bounded and UTF-8 encodable."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= max_length
+        and not any(
+            ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
+            for char in value
+        )
+    )
+
+
 def make_held_terminal(
     terminal_state: object,
     reason: object,
@@ -83,12 +96,7 @@ def make_held_terminal(
     """Return bounded terminal facts safe to persist in supervisor state."""
     if terminal_state not in TERMINAL_STATES:
         raise EphemeralError("held terminal state is invalid")
-    if (
-        not isinstance(reason, str)
-        or not reason
-        or len(reason) > 500
-        or any(ord(char) < 32 for char in reason)
-    ):
+    if not is_safe_reason(reason):
         raise EphemeralError(
             "held terminal reason must be a non-empty single line of at most "
             "500 characters"

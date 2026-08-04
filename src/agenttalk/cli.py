@@ -1354,6 +1354,11 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         flags = []
         if rr.get("pending"):
             flags.append(f"restart_by={rr.get('requested_by') or '?'}")
+        elif rr.get("blocked"):
+            flags.append(
+                "restart_blocked=process_tree_hold"
+                f" requested_by={rr.get('requested_by') or '?'}"
+            )
         hold = item.get("config_blocked_hold")
         if isinstance(hold, dict) and hold.get("present"):
             flags.append("config_blocked")
@@ -6241,7 +6246,32 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
     # supervisor-owned process-tree HOLDs are global: they must remain visible
     # even when no liaison/sole lead can be resolved.
     try:
-        items += A.process_tree_hold_items(_read_supervisor_state(store))
+        supervisor_state = _read_supervisor_state(store)
+        try:
+            supervisor_config = _load_supervisor_config(store)
+        except Exception:  # noqa: BLE001 - the HOLD must survive bad config
+            supervisor_config = None
+        restart_requests: dict[str, dict] = {}
+        for name in A.configured_process_tree_hold_agents(supervisor_state):
+            try:
+                marker = store.read_restart_request(name)
+            except Exception:  # noqa: BLE001 - optional context, not the signal
+                marker = None
+            if isinstance(marker, dict):
+                restart_requests[name] = marker
+        reset_admissions = sup.evaluate_process_tree_reset_admissions(
+            store,
+            supervisor_state,
+            actor=for_agent,
+            identity_gone=_owner_identity_gone,
+        )
+        items += A.process_tree_hold_items(
+            supervisor_state,
+            supervisor_config=supervisor_config,
+            root=store.root,
+            restart_requests=restart_requests,
+            reset_admissions=reset_admissions,
+        )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
     # dead-letter (ALL; build_queue hides resolved via the resolve_dead_letter disposition)
@@ -6472,6 +6502,29 @@ def _print_attention(rows: list[dict], summary: dict, for_agent: str | None,
         print(line)
         if it.get("recommendation"):
             print(f"           rec: {it['recommendation']}")
+        operator_argv = it.get("operator_argv")
+        if (
+            isinstance(operator_argv, list)
+            and all(isinstance(token, str) for token in operator_argv)
+        ):
+            print(
+                "           currently admitted remedy argv: "
+                + json.dumps(operator_argv, ensure_ascii=False)
+            )
+        launch = it.get("configured_launch")
+        if isinstance(launch, dict) and isinstance(launch.get("argv"), list):
+            print(
+                "           configured detached launch argv: "
+                + json.dumps(launch["argv"], ensure_ascii=False)
+            )
+            print(f"           configured launch cwd: {launch.get('cwd') or '(none)'}")
+            if isinstance(launch.get("environment"), dict):
+                print(
+                    "           configured launch environment: "
+                    + json.dumps(launch["environment"], ensure_ascii=False)
+                )
+            if launch.get("environment_note"):
+                print(f"           configured launch note: {launch['environment_note']}")
         for w in it.get("warnings", []):
             print(f"           ! {w}")
         print(f"           id: {it['item_id']}")
@@ -9828,8 +9881,30 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
     }
     store.write_restart_request(agent, marker)
     extra = " (force-protected)" if args.force_protected else ""
-    print(f"request-restart: queued restart of {agent!r} [{rid}]{extra} — the "
-          f"supervisor will relaunch it.")
+    blocked = False
+    try:
+        supervisor_state = _read_supervisor_state(store)
+        row = (supervisor_state.get("agents") or {}).get(agent)
+        tree = row.get("owned_process_tree") if isinstance(row, dict) else None
+        blocked = bool(
+            isinstance(tree, dict)
+            and tree.get("status") in {"invalid", "truncated"}
+        )
+    except Exception:  # noqa: BLE001 - acknowledgement must not promise progress
+        blocked = False
+    if blocked:
+        print(
+            f"request-restart: recorded request for {agent!r} [{rid}]{extra}, "
+            "but automatic recovery is currently refused by a process-tree "
+            "HOLD. This request is blocked, not pending progress; see "
+            "`agenttalk attention`."
+        )
+    else:
+        print(
+            f"request-restart: queued request for {agent!r} [{rid}]{extra} "
+            "for supervisor assessment; recording the request does not establish "
+            "that relaunch is currently admissible."
+        )
     return 0
 
 
@@ -12104,11 +12179,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             )
             return 2
         attended_reason = args.reason.strip()
-        if (
-            not attended_reason
-            or len(attended_reason) > 500
-            or any(ord(char) < 32 for char in attended_reason)
-        ):
+        if not eph.is_safe_reason(attended_reason):
             sys.stderr.write(
                 "agenttalk supervise --reset-process-tree-ownership: "
                 "--reason must be a non-empty single line of at most "
@@ -12161,8 +12232,33 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                     state = sup.load_supervisor_state(state_path)
                     from agenttalk import attention as A
 
+                    try:
+                        supervisor_config = _load_supervisor_config(store)
+                    except Exception:  # noqa: BLE001 - match attention fail-closed view
+                        supervisor_config = None
+                    restart_requests: dict[str, dict] = {}
+                    if configured_reset:
+                        try:
+                            restart_marker = store.read_restart_request(args.agent)
+                        except Exception:  # noqa: BLE001 - optional projection context
+                            restart_marker = None
+                        if isinstance(restart_marker, dict):
+                            restart_requests[args.agent] = restart_marker
+                    reset_admissions = sup.evaluate_process_tree_reset_admissions(
+                        store,
+                        state,
+                        actor=actor,
+                        now_epoch=now,
+                        identity_gone=_owner_identity_gone,
+                    )
                     current_items = []
-                    for item in A.process_tree_hold_items(state):
+                    for item in A.process_tree_hold_items(
+                        state,
+                        supervisor_config=supervisor_config,
+                        root=store.root,
+                        restart_requests=restart_requests,
+                        reset_admissions=reset_admissions,
+                    ):
                         refs = item.get("source_refs")
                         if not (
                             isinstance(refs, list)
@@ -12279,10 +12375,11 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                             # to equal the original acknowledger: a durable
                             # retry must survive legitimate liaison turnover,
                             # while the journal keeps the original audit fact.
+                            # The current item hash already binds the current
+                            # actor; only immutable staged arguments must still
+                            # equal the journal.
                             if (
-                                pending["hold_source_hash"]
-                                != args.hold_source_hash
-                                or pending["reason"] != attended_reason
+                                pending["reason"] != attended_reason
                                 or pending["verified_launch_nonce"]
                                 != args.verified_launch_nonce
                             ):

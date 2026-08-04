@@ -30,6 +30,7 @@ import math
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -41,7 +42,12 @@ from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk import ephemeral as eph
 from agenttalk import health as health_model
 from agenttalk import lanes as lane_mod
-from agenttalk.store import Store, _process_alive, validate_agent_name
+from agenttalk.store import (
+    Store,
+    _owner_identity_gone,
+    _process_alive,
+    validate_agent_name,
+)
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle as lifecycle
 from agenttalk import wrapper_runtime as runtime_obs
@@ -123,6 +129,34 @@ _COORDINATION_MAX_DIAGNOSTICS = 20
 _COORDINATION_AVAILABILITY_FIELDS = frozenset({
     "schema_version", "updated_at_epoch", "agents",
 })
+
+_PROCESS_TREE_OPERATOR_GAPS = (
+    (
+        "generation_adoption_pending",
+        "Agenttalk could not establish that the current wrapper generation "
+        "has adopted this agent's process tree.",
+    ),
+    (
+        "legacy_managed_pids",
+        "Agenttalk could not establish complete current ownership from legacy "
+        "PID records, which do not carry the current generation's parent graph.",
+    ),
+    (
+        "exact_start_filetime_unavailable",
+        "Agenttalk could not establish exact process lifetime identities, so "
+        "it cannot exclude PID reuse.",
+    ),
+    (
+        "post_kill_owned_descendant_edge_survived",
+        "Agenttalk could not establish that every owned descendant ended after "
+        "the attempted teardown.",
+    ),
+    (
+        "wrapper_state_mismatch",
+        "Agenttalk could not establish that the reported wrapper identity agrees "
+        "with the supervisor's recorded launcher.",
+    ),
+)
 _COORDINATION_AVAILABILITY_ROW_FIELDS = frozenset({
     "state",
     "subtype",
@@ -321,13 +355,17 @@ def _read_supervisor_state_copy(path: Path, *, source: str) -> tuple[dict | None
 
 def _supervisor_json_text(value: dict, *, source: str) -> str:
     try:
-        return json.dumps(
+        text = json.dumps(
             value,
             ensure_ascii=False,
             sort_keys=True,
             indent=2,
             allow_nan=False,
         ) + "\n"
+        # Match the atomic writer's UTF-8 stream contract here, before a temp
+        # file exists and before any caller can treat the state as persistable.
+        text.encode("utf-8")
+        return text
     except (TypeError, ValueError) as exc:
         raise SupervisorPersistenceError(
             f"{source} is not JSON serializable: {type(exc).__name__}"
@@ -1668,6 +1706,46 @@ def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
     rr = rpt.get("restart_request") if isinstance(rpt.get("restart_request"), dict) else None
     hold = rpt.get("config_blocked_hold") if isinstance(
         rpt.get("config_blocked_hold"), dict) else None
+    next_state = (
+        plan.get("next_state")
+        if isinstance(plan, dict) and isinstance(plan.get("next_state"), dict)
+        else {}
+    )
+    persisted_restart_state = next_state.get("restart_request_state")
+    persisted_request_id = next_state.get("pending_restart_request_id")
+    request_id = rr.get("request_id") if rr else persisted_request_id
+    restart_present = bool(
+        rr is not None
+        or (
+            isinstance(persisted_request_id, str)
+            and persisted_restart_state in {
+                "applied_pending_readiness",
+                "readiness_seen",
+            }
+        )
+    )
+    restart_completed = bool(
+        restart_present
+        and (
+            persisted_restart_state == "readiness_seen"
+            or (isinstance(plan, dict) and plan.get("action") == CLEAR_MARKER)
+        )
+    )
+    restart_blocked = bool(
+        restart_present
+        and not restart_completed
+        and isinstance(decision, dict)
+        and decision.get("state") in {"PROCESS_TREE_INVALID", "PROCESS_TREE_TRUNCATED"}
+    )
+    restart_state = (
+        "readiness_seen"
+        if restart_completed
+        else "blocked_by_process_tree_hold"
+        if restart_blocked
+        else "pending"
+        if restart_present
+        else "absent"
+    )
     return {
         "name": name,
         "role": rpt.get("role"),
@@ -1684,9 +1762,16 @@ def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
             "deadline_epoch": rpt.get("waiting_deadline_epoch"),
         },
         "restart_request": {
-            "pending": rr is not None,
-            "request_id": rr.get("request_id") if rr else None,
-            "requested_by": rr.get("requested_by") if rr else None,
+            "present": restart_present,
+            "pending": restart_present and not restart_blocked and not restart_completed,
+            "blocked": restart_blocked,
+            "state": restart_state,
+            "request_id": request_id if isinstance(request_id, str) else None,
+            "requested_by": (
+                rr.get("requested_by")
+                if rr
+                else next_state.get("restart_requested_by")
+            ),
         },
         "config_blocked_hold": {
             "present": hold is not None,
@@ -4045,6 +4130,193 @@ def _resolve_module_flag_index(
             and tokens_after_exe[offset + 1] == "agenttalk"):
         return offset
     return -1
+
+
+def process_tree_operator_gap(
+    *,
+    status: object,
+    reason_code: object,
+    observed: object = None,
+    limit: object = None,
+) -> str:
+    """Describe missing ownership evidence without exposing an internal predicate."""
+    if status == "truncated":
+        return (
+            "Agenttalk could not establish a complete owned process tree: "
+            f"the poll observed {observed} identities over the safe cap {limit}."
+        )
+    if isinstance(reason_code, str):
+        for suffix, explanation in _PROCESS_TREE_OPERATOR_GAPS:
+            if reason_code.endswith(suffix):
+                return explanation
+    return (
+        "Agenttalk could not establish complete current ownership of this "
+        "agent's process tree."
+    )
+
+
+def _ensure_agenttalk_wrap_root_arg(
+    argv: list[str],
+    module_args_from: object,
+    root: str,
+) -> list[str]:
+    """Python mirror of generated ``Ensure-AgenttalkWrapRootArg``.
+
+    A legacy configured wrapper may rely on ``AGENTTALK_ROOT`` and omit the
+    parser-visible ``--root``.  A detached recovery must advertise the same
+    normalized argv the generated executor uses, not the stale literal array.
+    """
+    args = list(argv)
+    if not args:
+        return args
+    flag_index = _resolve_module_flag_index(args, module_args_from)
+    scan = flag_index + 2 if flag_index >= 0 else 0
+    root_present = False
+    wrap_index = -1
+    index = scan
+    while index < len(args):
+        argument = args[index]
+        if argument == "--":
+            break
+        if argument == "--root":
+            root_present = True
+            index += 2
+            continue
+        if argument.startswith("--root="):
+            root_present = True
+            index += 1
+            continue
+        if argument == "wrap":
+            wrap_index = index
+            break
+        index += 1
+    if root_present or wrap_index < 0:
+        return args
+    return [*args[:wrap_index], "--root", root, *args[wrap_index:]]
+
+
+def configured_detached_launch(
+    supervisor_config: dict | None,
+    agent: str,
+    *,
+    root: str | Path | None,
+) -> tuple[dict | None, str]:
+    """Return one bounded, normalized configured launch argv for display.
+
+    This is recovery information, never launch authority.  Dynamic session
+    splices cannot be reconstructed truthfully from static configuration and
+    therefore fail closed.  The returned environment metadata calls out the
+    supervisor-owned context that an attended detached launch must reproduce.
+    """
+    max_args = 256
+    max_token = 4096
+    max_command_line = 32767
+
+    def clean(value: object) -> str | None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > max_token
+            or any(
+                ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
+                for char in value
+            )
+        ):
+            return None
+        return value
+
+    if not isinstance(supervisor_config, dict):
+        return None, "supervisor.json was unavailable"
+    agents = supervisor_config.get("agents")
+    row = agents.get(agent) if isinstance(agents, dict) else None
+    if not isinstance(row, dict):
+        return None, "the agent has no supervisor.json launch entry"
+    launch = row.get("launch")
+    if not isinstance(launch, dict):
+        return None, "the agent's supervisor.json launch entry is invalid"
+    executable = clean(launch.get("windows_file"))
+    if executable is None or "REPLACE:" in executable.upper():
+        return None, "the configured launch executable is not runnable"
+    raw_args = launch.get("windows_args")
+    if not isinstance(raw_args, list) or len(raw_args) > max_args:
+        return None, "the configured launch argument list is invalid"
+    root_text = clean(str(root)) if root is not None else None
+    if root is not None and root_text is None:
+        return None, "the configured launch root is unavailable"
+    raw_cwd = row.get("cwd")
+    if raw_cwd is None:
+        cwd = root_text
+        cwd_token = ""
+    else:
+        cwd = clean(raw_cwd)
+        cwd_token = cwd or ""
+    if cwd is None:
+        return None, "the configured launch working directory is unavailable"
+    args: list[str] = []
+    for value in raw_args:
+        argument = clean(value)
+        if argument is None or "REPLACE:" in argument.upper():
+            return None, "the configured launch argument list is not runnable"
+        if argument == "{SESSION_ARGS}" or any(
+            marker in argument
+            for marker in ("{SESSION_ID}", "{REQUEST_ID}", "{AGENT}")
+        ):
+            return None, "the configured argv still requires runtime-only arguments"
+        if "{ROOT}" in argument:
+            if root_text is None:
+                return None, "the configured argv needs a root that is unavailable"
+            argument = argument.replace("{ROOT}", root_text)
+        args.append(argument.replace("<cwd>", cwd_token))
+    if root_text is not None:
+        args = _ensure_agenttalk_wrap_root_arg(
+            args,
+            launch.get("module_args_from"),
+            root_text,
+        )
+    rendered = subprocess.list2cmdline([executable, *args])
+    rendered_utf16_units = len(rendered.encode("utf-16-le")) // 2 + 1
+    if rendered_utf16_units > max_command_line:
+        return None, "the configured launch exceeds the runnable command-line bound"
+    config_env = row.get("env")
+    if config_env is not None and not isinstance(config_env, dict):
+        return None, "the configured launch environment is invalid"
+    env_keys: list[str] = []
+    if isinstance(config_env, dict):
+        for key in config_env:
+            cleaned_key = clean(key)
+            if cleaned_key is None:
+                return None, "the configured launch environment is invalid"
+            env_keys.append(cleaned_key)
+        env_keys.sort()
+    agenttalk_python = None
+    if root_text is not None:
+        try:
+            agenttalk_python = _baked_python_pin(
+                (Path(root_text) / ".agenttalk" / "bin" / "agenttalk.cmd").read_bytes()
+            )
+        except (ArtifactValidationError, OSError):
+            agenttalk_python = None
+    if agenttalk_python is None and _token_stem(executable) in {"python", "python3", "py"}:
+        agenttalk_python = executable
+    environment = {
+        "AGENTTALK_ROOT": root_text,
+        "AGENTTALK_PY": agenttalk_python,
+        "supervisor_json_env_keys": env_keys,
+    }
+    if root_text is not None and (Path(root_text) / "src" / "agenttalk").is_dir():
+        environment["PYTHONPATH_prepend"] = str(Path(root_text) / "src")
+    return {
+        "source": "supervisor.json",
+        "mode": "detached",
+        "argv": [executable, *args],
+        "cwd": cwd,
+        "environment": environment,
+        "environment_note": (
+            "Reproduce the listed values and any configured per-agent values; "
+            "a null AGENTTALK_PY must be recovered from the supervisor artifact, "
+            "and the supervisor may also supply an isolated CODEX_HOME and wrapper-log paths."
+        ),
+    }, ""
 
 
 def _agenttalk_argv(command_line: object, module_args_from: object = None) -> list[str] | None:
@@ -7256,175 +7528,29 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         notify = now_epoch - last_warn >= suspect_interval
         if notify:
             nxt["last_warn_epoch"] = now_epoch
-        # Task #150: name the remedy. A held state that does not tell the
-        # operator how to leave it is a defect on its own - especially since
-        # the obvious guess (kill the wrapper, expecting the supervisor to
-        # see it absent and relaunch) makes this WORSE, not better: a
-        # wrapper this is still holding for is exempt from this HOLD the
-        # moment it is independently confirmed absent (see
-        # _unverified_owned_process_tree); a wrapper that is still present,
-        # or whose absence this record cannot yet prove on its own, needs
-        # the attended reset.
-        #
-        # Round 2 (connector findings 2 and 3): the FIRST version of this
-        # remedy named --reset-process-tree-ownership unconditionally and
-        # was wrong twice over. (a) --acknowledge-owned-processes-stopped's
-        # own contract already covers "any identities omitted by a
-        # truncated record" - the message must not narrow that to only the
-        # NAMED ones. (b) --reset-process-tree-ownership requires the tree
-        # evidence to carry a real wrapper_generation/launch_nonce that
-        # agrees with a CURRENT, valid runtime record - true for a tree
-        # _owned_process_tree itself walked (non-empty entries), but an
-        # entryless placeholder (_invalid_owned_process_tree_record - schema
-        # drift, a revoked runtime, legacy migration evidence) usually has
-        # no such nonce to agree with, so the command fails for precisely
-        # the case that names it. Naming a remedy that cannot work is worse
-        # than naming none, so the entryless case gets an honest "no
-        # verified one-line fix" message instead of a command that would
-        # frustrate the operator a second time.
-        #
-        # Round 3 (connector finding 6, the same wrong direction again): a
-        # REJECTED candidate is precisely what this record's own entries
-        # never named either, same as a truncated record's omitted ones -
-        # but the reset command's own identity list is built from entries
-        # alone, so it has no way to know about a rejected candidate at
-        # all. The flag's own text only mentions omitted identities; a
-        # nonzero rejected_count needs the same warning stated explicitly,
-        # not folded silently into "every process this record could name".
-        # Round 9 (connector finding, the third instance of the same wrong
-        # direction): the first two rounds each closed the ONE precondition
-        # that had actually bitten - an entryless placeholder's missing
-        # nonce (round 2), a rejected candidate the command's identity list
-        # can't see (round 3) - by patching that specific case, which is
-        # why there was a third: a configured-agent reset ALSO requires
-        # (cli.py, --reset-process-tree-ownership) the CURRENT wrapper
-        # runtime record to read STATUS_VALID, entirely independent of the
-        # tree's own entries/rejected_count. A tree can hold non-empty
-        # entries while the runtime record is exactly what made it invalid
-        # in the first place (process_tree_invalid_runtime_absent/invalid/
-        # record_missing/record_invalid) - the remedy named the command for
-        # precisely that case. One predicate now gates naming the command
-        # at all: this poll's own liveness read of the SAME runtime record
-        # the command re-reads at reset time. It can still go stale between
-        # this poll and when the operator acts - unavoidable from where the
-        # message is produced - but it is never wrong about what THIS poll
-        # already knows, which is what "must never guess" means here.
-        #
-        # Round 10 (connector finding, a fourth instance of the same wrong
-        # direction, this time in the predicate's own precision rather than
-        # a missing precondition): STATUS_VALID only proves the runtime
-        # record parses - a wrapper runtime record can be STATUS_VALID while
-        # its OWN wrapper_pid/wrapper_start disagrees with this state's
-        # stored launcher_pid/launcher_start, which is exactly what sends
-        # _wrapped_liveness down wrapper_state_mismatch
-        # (process_tree_invalid_wrapper_state_mismatch) with a nonempty
-        # inherited tree. process_tree_ownership_reset_evidence rejects that
-        # case on wrapper identity agreement, a DIFFERENT conjunct than
-        # runtime_status - so "one predicate" needed to mean the actual
-        # admission predicate, not one signal that happens to correlate with
-        # it. _wrapper_identity_matches_state is now the single function
-        # both process_tree_ownership_reset_evidence and this check call -
-        # not a second hand-written comparison that could drift from the
-        # first the way runtime_status alone already did once.
-        runtime_record = liveness.get("runtime_record")
-        runtime_currently_valid = (
-            liveness.get("runtime_status") == runtime_obs.STATUS_VALID
-            and isinstance(runtime_record, dict)
-            and _wrapper_identity_matches_state(runtime_record, st)
+        # This live planner can truthfully establish refusal, but it cannot
+        # advertise the attended reset: that command requires the supervisor
+        # singleton to be absent.  The attention projection re-evaluates the
+        # command's complete admission predicate after the supervisor stops.
+        tree_state = (
+            "PROCESS_TREE_TRUNCATED"
+            if tree_status == "truncated"
+            else "PROCESS_TREE_INVALID"
         )
-        has_entries = bool(owned_tree.get("entries"))
-        rejected_count = owned_tree.get("rejected_count")
-        if has_entries and runtime_currently_valid:
-            # Round 4 (connector finding 2, the same wrong direction a third
-            # time): a legacy v2 record predates rejected_count entirely -
-            # missing, not zero, is what keeps it out of absence-promotion
-            # (see the v2-migration fix), but that same "unknown" must warn
-            # here too. Warning only for a known positive integer told the
-            # operator a v2 record excluded nothing, when the truth is the
-            # walk that produced it never even counted - absent must warn
-            # like unknown, not like zero.
-            if isinstance(rejected_count, int) and rejected_count > 0:
-                rejected_clause = (
-                    f" This record also excluded {rejected_count} "
-                    "candidate(s) the walk could not admit (rejected_count) "
-                    "- the reset command's own identity list does not "
-                    "include them, so confirming those specifically gone is "
-                    "on you, not the command."
-                )
-            elif rejected_count is None:
-                rejected_clause = (
-                    " This record predates rejected_count (an older "
-                    "schema) so whether the walk that produced it excluded "
-                    "any candidate is UNKNOWN, not zero - the reset "
-                    "command's own identity list cannot cover an excluded "
-                    "candidate either way, so treat this the same as a "
-                    "nonzero count: confirming anything beyond the named "
-                    "entries gone is on you, not the command."
-                )
-            else:
-                rejected_clause = ""
-            remedy = (
-                "recovery: if every process this record could name is "
-                "confirmed gone - including any omitted by a truncated "
-                "record, which is exactly what --acknowledge-owned-"
-                "processes-stopped attests to -"
-                f"{rejected_clause} run `agenttalk supervise "
-                "--reset-process-tree-ownership` (see --help for the "
-                "required --acknowledge-* flags); do NOT kill the wrapper "
-                "expecting an automatic relaunch - that is only safe once "
-                "this record already reflects the wrapper as absent"
-            )
-        elif has_entries and liveness.get("runtime_status") != runtime_obs.STATUS_VALID:
-            remedy = (
-                "recovery: this record has named identities, but the "
-                "current wrapper runtime record is not valid "
-                f"({liveness.get('runtime_status')}) and --reset-process-"
-                "tree-ownership requires exactly that record to read valid "
-                "before it will act - it will refuse; this needs operator "
-                "investigation of "
-                f"{owned_tree.get('reason_code')} (a valid runtime record "
-                "recovering on its own is what would let a scripted reset "
-                "apply here, not a --acknowledge-* flag)"
-            )
-        elif has_entries:
-            # Round 10: runtime_status is valid but wrapper_identity_matches_state
-            # is not - the record parses, yet its own wrapper pid/start
-            # disagrees with what this state has stored, which is a
-            # separate refusal reason the command checks independently.
-            remedy = (
-                "recovery: this record has named identities and the "
-                "current wrapper runtime record reads valid, but its own "
-                "wrapper identity (pid/start) does not agree with this "
-                "state's stored launcher identity, and --reset-process-"
-                "tree-ownership refuses on exactly that disagreement - it "
-                "will refuse; this needs operator investigation of "
-                f"{owned_tree.get('reason_code')} (the two identities need "
-                "to agree again - on their own, or via an attended reset - "
-                "before a scripted reset can apply here)"
-            )
-        else:
-            remedy = (
-                "recovery: this record has no observed process identities "
-                "to reset against, so --reset-process-tree-ownership will "
-                "refuse it; a new wrapper generation replaces this record "
-                "automatically once adopted - if it does not clear on its "
-                "own, this needs operator investigation of "
-                f"{owned_tree.get('reason_code')}, not a scripted remedy"
-            )
-        if tree_status == "truncated":
-            tree_state = "PROCESS_TREE_TRUNCATED"
-            tree_reason = (
-                f"owned process tree observed {observed} identities over cap "
-                f"{limit}; HOLDING automatic teardown because a partial kill "
-                f"could strand descendants; {remedy}"
-            )
-        else:
-            tree_state = "PROCESS_TREE_INVALID"
-            tree_reason = (
-                "owned process tree failed strict parent/start validation "
-                f"({owned_tree.get('reason_code')}); HOLDING automatic teardown "
-                f"because a partial kill could strand descendants; {remedy}"
-            )
+        gap = process_tree_operator_gap(
+            status=tree_status,
+            reason_code=owned_tree.get("reason_code"),
+            observed=observed,
+            limit=limit,
+        )
+        tree_reason = (
+            f"{gap} Automatic teardown and relaunch are refused because a "
+            "partial action could strand descendants or start a duplicate "
+            "agent. no scripted remedy applies while this supervisor "
+            "instance remains live; run `agenttalk attention` for the "
+            "configured detached launch argv and any remedy admitted after "
+            "the supervisor is stopped."
+        )
         return _result(
             WARN_ONLY,
             state=tree_state,
@@ -8567,6 +8693,267 @@ def process_tree_ownership_reset_evidence(
     }
 
 
+def evaluate_process_tree_reset_admissions(
+    store: Store,
+    state: dict,
+    *,
+    actor: str | None,
+    now_epoch: float | None = None,
+    identity_gone: Callable[[object, object, object], bool] = _owner_identity_gone,
+) -> dict:
+    """Read-only admission check for remedies shown by operator surfaces.
+
+    The returned mapping is keyed exactly like process-tree attention items:
+    configured agents use their agent name and ephemeral requests use
+    ``ephemeral:<request-id>``.  Nothing here mutates authority or state.  The
+    command handler rechecks every predicate under its lifecycle/config locks;
+    this snapshot only decides whether a command may be *shown now*.
+    """
+    admissions: dict[str, dict] = {}
+    def context_is_admitted() -> bool | None:
+        try:
+            marker_status, _marker, _detail = (
+                store.read_supervisor_instance_strict()
+            )
+            kill_switch = store.supervisor_kill_switch()
+            liaison = store.operator_facing()
+            authorized_actor = liaison if liaison is not None else store.sole_lead()
+        except (OSError, TypeError, ValueError):
+            return None
+        return bool(
+            marker_status == "absent"
+            and kill_switch is True
+            and actor is not None
+            and actor == authorized_actor
+        )
+
+    context_admitted = context_is_admitted()
+    if context_admitted is None:
+        return {"evaluated": False, "admissions": admissions}
+    if not context_admitted:
+        return {"evaluated": True, "admissions": admissions}
+    try:
+        validated_state = _validate_supervisor_state(
+            state,
+            source="supervisor state remedy admission",
+        )
+        _supervisor_json_text(
+            validated_state,
+            source="supervisor state remedy admission",
+        )
+    except SupervisorPersistenceError:
+        # Every advertised remedy mutates and durably rewrites this object.
+        # If the exact writer contract cannot persist it, no command applies.
+        return {"evaluated": True, "admissions": admissions}
+
+    def archive_destination_admitted(
+        request_id: str,
+        pending: dict | None,
+    ) -> bool:
+        active_path = store.launch_requests_dir / f"{request_id}.json"
+        archive_path = store.launch_requests_archive_dir / f"{request_id}.json"
+        try:
+            marker = store.read_launch_request(request_id)
+            if marker is None and active_path.exists():
+                return False
+            if archive_path.exists():
+                if pending is None:
+                    return False
+                existing = json.loads(
+                    archive_path.read_text(encoding="utf-8-sig")
+                )
+                expected_payload = pending["archive_payload"]
+                if existing != expected_payload:
+                    return False
+                return marker is None or marker == expected_payload["original"]
+            if pending is not None:
+                return marker == pending["archive_payload"]["original"]
+            return True
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+
+    agents = state.get("agents") if isinstance(state, dict) else None
+    try:
+        _validated_process_tree_reset_audit(state)
+        configured_audit_valid = True
+    except (TypeError, ValueError):
+        configured_audit_valid = False
+    if isinstance(agents, dict) and configured_audit_valid:
+        for raw_agent, entry in sorted(agents.items()):
+            if not isinstance(entry, dict):
+                continue
+            tree = entry.get("owned_process_tree")
+            if not (
+                isinstance(tree, dict)
+                and tree.get("status") in {"invalid", "truncated"}
+            ):
+                continue
+            try:
+                agent = validate_agent_name(raw_agent)
+                runtime_view = runtime_obs.read_runtime(
+                    store.state_dir,
+                    agent,
+                    now_epoch=now_epoch,
+                )
+                if runtime_view.get("status") != runtime_obs.STATUS_VALID:
+                    continue
+                nonce = tree.get("launch_nonce")
+                if not isinstance(nonce, str):
+                    continue
+                evidence = process_tree_ownership_reset_evidence(
+                    state,
+                    agent,
+                    expected_root=store.root,
+                    verified_launch_nonce=nonce,
+                    runtime_record=runtime_view["record"],
+                    now_epoch=now_epoch,
+                )
+                if any(
+                    not identity_gone(
+                        row["pid"],
+                        row["start"],
+                        row.get("start_filetime"),
+                    )
+                    for row in evidence["identities"]
+                ):
+                    continue
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                runtime_obs.RuntimeRecordError,
+            ):
+                continue
+            admissions[agent] = {
+                "mode": "configured_reset",
+                "agent": agent,
+                "actor": actor,
+                "verified_launch_nonce": nonce,
+                "reason": "all recorded process identities independently verified stopped",
+            }
+
+    eph_root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    active = eph_root.get("active") if isinstance(eph_root, dict) else None
+    try:
+        config_agents = store.load_config().get("agents")
+        active_agents = set(config_agents) if isinstance(config_agents, list) else set()
+        retired_agents = set(store.retired_agents())
+        ephemeral_identity_context_valid = True
+    except (OSError, TypeError, ValueError):
+        active_agents = set()
+        retired_agents = set()
+        ephemeral_identity_context_valid = False
+    if isinstance(active, dict) and ephemeral_identity_context_valid:
+        for request_id, entry in sorted(active.items()):
+            if not isinstance(entry, dict) or not eph.is_safe_id(request_id):
+                continue
+            try:
+                agent = validate_agent_name(entry.get("agent"))
+            except (TypeError, ValueError):
+                continue
+            if agent not in active_agents and agent not in retired_agents:
+                continue
+            tree = entry.get("owned_process_tree")
+            has_hold = (
+                isinstance(tree, dict)
+                and tree.get("status") in {"invalid", "truncated"}
+            ) or (
+                "process_tree_hold_reason" in entry
+                and isinstance(entry.get("process_tree_hold_reason"), str)
+            )
+            held_terminal = eph.validate_held_terminal(entry.get("held_terminal"))
+            try:
+                pending = attended_ephemeral_archive_pending(state, request_id)
+            except (TypeError, ValueError):
+                # One corrupt archive journal must not erase configured HOLD
+                # cards, and this request's command would reject the same state.
+                continue
+            if (
+                pending is not None
+                and entry.get("request_id") == request_id
+                and entry.get("agent") == agent
+                and held_terminal is not None
+                and archive_destination_admitted(request_id, pending)
+            ):
+                admissions[f"ephemeral:{request_id}"] = {
+                    "mode": "ephemeral_archive",
+                    "request_id": request_id,
+                    "actor": actor,
+                    "reason": pending["reason"],
+                }
+                continue
+            pending_root = (
+                eph_root.get("attended_archive_pending")
+                if isinstance(eph_root, dict)
+                else None
+            )
+            if isinstance(pending_root, dict) and len(pending_root) >= 64:
+                continue
+            try:
+                launch_marker = store.read_launch_request(request_id)
+            except (OSError, TypeError, ValueError):
+                launch_marker = None
+            marker_errors = eph.validate_marker(launch_marker)
+            if not (
+                has_hold
+                and held_terminal is not None
+                and entry.get("request_id") == request_id
+                and entry.get("agent") == agent
+                and not marker_errors
+                and isinstance(launch_marker, dict)
+                and launch_marker.get("request_id") == request_id
+                and launch_marker.get("agent") == agent
+                and launch_marker.get("state") in eph.ACTIVE_STATES
+                and archive_destination_admitted(request_id, None)
+            ):
+                continue
+            try:
+                prospective = copy.deepcopy(state)
+                stage_attended_ephemeral_archive(
+                    prospective,
+                    request_id,
+                    agent=agent,
+                    launch_marker=launch_marker,
+                    held_terminal=held_terminal,
+                    hold_source_hash="0" * 64,
+                    acknowledged_by=actor,
+                    verification_mode="operator_attested",
+                    verified_launch_nonce=None,
+                    verified_identity_count=0,
+                    reason=(
+                        "operator verified the terminal request can be archived"
+                    ),
+                    now_epoch=(
+                        float(now_epoch)
+                        if isinstance(now_epoch, (int, float))
+                        and not isinstance(now_epoch, bool)
+                        and math.isfinite(float(now_epoch))
+                        else time.time()
+                    ),
+                )
+                _supervisor_json_text(
+                    prospective,
+                    source="prospective attended ephemeral archive",
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            admissions[f"ephemeral:{request_id}"] = {
+                "mode": "ephemeral_archive",
+                "request_id": request_id,
+                "actor": actor,
+                "reason": "operator verified the terminal request can be archived",
+            }
+    # Identity probes and marker reads can outlive the context snapshot above.
+    # Recheck every shared command precondition before advertising an argv.
+    context_admitted = context_is_admitted()
+    if context_admitted is None:
+        return {"evaluated": False, "admissions": {}}
+    if not context_admitted:
+        return {"evaluated": True, "admissions": {}}
+    return {"evaluated": True, "admissions": admissions}
+
+
 def _validated_process_tree_reset_audit(state: dict) -> list[dict]:
     audit = state.get("process_tree_resets")
     if audit is None:
@@ -8635,11 +9022,7 @@ def reset_process_tree_ownership_after_attended_teardown(
     ):
         raise ValueError("hold source hash must be 64 lowercase hexadecimal characters")
     cleaned_reason = reason.strip() if isinstance(reason, str) else ""
-    if (
-        not cleaned_reason
-        or len(cleaned_reason) > 500
-        or any(ord(char) < 32 for char in cleaned_reason)
-    ):
+    if not eph.is_safe_reason(cleaned_reason):
         raise ValueError("reason must be a non-empty single line of at most 500 characters")
     if recorded_identities_gone is not True:
         raise ValueError("every recorded pid/start identity must be gone or recycled")
@@ -9116,12 +9499,7 @@ def _validate_attended_ephemeral_archive_pending(
     ):
         raise ValueError("attended ephemeral archive timestamp is invalid")
     reason = value.get("reason")
-    if (
-        not isinstance(reason, str)
-        or not reason
-        or len(reason) > 500
-        or any(ord(char) < 32 for char in reason)
-    ):
+    if not eph.is_safe_reason(reason):
         raise ValueError("attended ephemeral archive reason is invalid")
     terminal = eph.validate_held_terminal(value.get("terminal"))
     if terminal is None:

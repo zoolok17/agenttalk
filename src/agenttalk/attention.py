@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -52,7 +51,6 @@ _CAP_OPTION = 300
 _MAX_OPTIONS = 10
 _CAP_AFFECTED = 200
 _MAX_AFFECTED = 20
-_RESET_LAUNCH_NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 
 # --- sources ---
 SOURCE_NEEDS_OPERATOR = "needs_operator"
@@ -281,7 +279,10 @@ def source_hash(payload: Any) -> str:
     hold's reason, a needs_operator decision, a gate's blocking set, etc. When this changes,
     a prior disposition is stale and the item resurfaces (gate condition 1)."""
     norm = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+    # Persisted state may contain an escaped lone surrogate.  Source projectors
+    # validate fields before exposing them, but hashing malformed evidence must
+    # still isolate the bad record instead of erasing the whole attention source.
+    return hashlib.sha256(norm.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
 def _notice_log_path(store) -> Path:
@@ -688,15 +689,82 @@ def config_blocked_items(holds: list[dict]) -> list[dict]:
     return out
 
 
-def process_tree_hold_items(state: dict) -> list[dict]:
+def _blocked_restart_request(row: dict, marker: dict | None) -> dict | None:
+    request_id = marker.get("request_id") if isinstance(marker, dict) else None
+    if (
+        isinstance(request_id, str)
+        and request_id
+        and row.get("restart_request_state") == "readiness_seen"
+        and row.get("pending_restart_request_id") == request_id
+    ):
+        return None
+    if (
+        (not isinstance(request_id, str) or not request_id)
+        and row.get("restart_request_state") == "applied_pending_readiness"
+    ):
+        request_id = row.get("pending_restart_request_id")
+    if not eph.is_safe_reason(request_id, max_length=256):
+        return None
+    return {
+        "request_id": request_id,
+        "state": "blocked_by_process_tree_hold",
+        "pending_progress": False,
+    }
+
+
+def configured_process_tree_hold_agents(state: dict) -> list[str]:
+    """Return only validated configured agents with a current strict HOLD."""
+    agents = state.get("agents") if isinstance(state, dict) else None
+    if not isinstance(agents, dict):
+        return []
+    held: list[str] = []
+    for raw_agent, row in agents.items():
+        if not isinstance(row, dict):
+            continue
+        tree = row.get("owned_process_tree")
+        if not (
+            isinstance(tree, dict)
+            and tree.get("status") in {"invalid", "truncated"}
+        ):
+            continue
+        try:
+            held.append(validate_agent_name(raw_agent))
+        except (TypeError, ValueError):
+            continue
+    return sorted(held)
+
+
+def process_tree_hold_items(
+    state: dict,
+    *,
+    supervisor_config: dict | None = None,
+    root: str | Path | None = None,
+    restart_requests: dict[str, dict] | None = None,
+    reset_admissions: dict | None = None,
+) -> list[dict]:
     """Project strict supervisor process-tree HOLDs into global human attention.
 
     A truncated/invalid tree deliberately authorizes no automated teardown.
     This durable projection prevents that fail-closed decision from becoming
-    silent immunity for a runaway process tree. Sticky HOLD records clear only
-    through an operator-attended ownership reset/new wrapper generation.
+    silent immunity for a runaway process tree.  ``reset_admissions`` is the
+    read-only result of the reset command's own current preconditions; when it
+    is absent this projector names no scripted command and makes no claim that
+    none exists.  The configured detached argv remains recovery information,
+    never launch authority.
     """
+    from agenttalk import supervisor as supervisor_mod
+
     agents = state.get("agents") if isinstance(state, dict) else None
+    admissions = (
+        reset_admissions.get("admissions")
+        if isinstance(reset_admissions, dict)
+        and isinstance(reset_admissions.get("admissions"), dict)
+        else {}
+    )
+    admissions_evaluated = bool(
+        isinstance(reset_admissions, dict)
+        and reset_admissions.get("evaluated") is True
+    )
     out: list[dict] = []
 
     def append_hold(
@@ -719,51 +787,147 @@ def process_tree_hold_items(state: dict) -> list[dict]:
             # tree can be constructed. The durable HOLD reason must still
             # become operator-visible rather than granting silent immunity.
             status = "invalid"
-            if (
-                not isinstance(hold_reason, str)
-                or not hold_reason
-                or len(hold_reason) > 256
-                or any(ord(char) < 32 for char in hold_reason)
-            ):
+            if not eph.is_safe_reason(hold_reason, max_length=256):
                 hold_reason = "process_tree_hold_reason_invalid"
         if status not in {"truncated", "invalid"}:
             return
         observed = tree_record.get("observed_count")
         limit = tree_record.get("limit")
         reason_code = tree_record.get("reason_code") or hold_reason
-        if status == "truncated":
-            summary = (
-                f"{agent} owned process tree observed {observed} identities "
-                f"over cap {limit}; automatic teardown is HOLD because a "
-                "partial kill could strand descendants."
+        if not eph.is_safe_reason(reason_code, max_length=256):
+            reason_code = "process_tree_hold_reason_invalid"
+        display_observed = (
+            observed
+            if isinstance(observed, int)
+            and not isinstance(observed, bool)
+            and 0 <= observed <= 1_000_000
+            else None
+        )
+        display_limit = (
+            limit
+            if isinstance(limit, int)
+            and not isinstance(limit, bool)
+            and 0 <= limit <= 1_000_000
+            else None
+        )
+        gap_status = (
+            status
+            if status != "truncated"
+            or (display_observed is not None and display_limit is not None)
+            else "invalid"
+        )
+        gap = supervisor_mod.process_tree_operator_gap(
+            status=gap_status,
+            reason_code=reason_code,
+            observed=display_observed,
+            limit=display_limit,
+        )
+        summary = (
+            f"{gap} Automatic teardown and relaunch are refused because a "
+            "partial action could strand descendants or start a duplicate agent."
+        )
+        launch, launch_problem = supervisor_mod.configured_detached_launch(
+            supervisor_config,
+            agent,
+            root=root,
+        )
+        marker = (
+            restart_requests.get(agent)
+            if isinstance(restart_requests, dict)
+            and isinstance(restart_requests.get(agent), dict)
+            else None
+        )
+        blocked_restart = _blocked_restart_request(row, marker)
+        remedy = admissions.get(identity)
+        remedy_mode = None
+        remedy_identity = None
+        if isinstance(remedy, dict):
+            mode = remedy.get("mode")
+            actor = remedy.get("actor")
+            reason = remedy.get("reason")
+            try:
+                valid_actor = validate_agent_name(actor)
+            except (TypeError, ValueError):
+                valid_actor = None
+            valid_reason = eph.is_safe_reason(reason)
+            if (
+                mode == "configured_reset"
+                and remedy.get("agent") == agent
+                and valid_actor is not None
+                and valid_reason
+                and isinstance(remedy.get("verified_launch_nonce"), str)
+                and bool(remedy["verified_launch_nonce"])
+            ):
+                remedy_mode = mode
+                remedy_identity = {
+                    "mode": mode,
+                    "agent": agent,
+                    "actor": valid_actor,
+                    "verified_launch_nonce": remedy["verified_launch_nonce"],
+                    "reason": reason,
+                }
+            elif (
+                mode == "ephemeral_archive"
+                and request_id is not None
+                and remedy.get("request_id") == request_id
+                and eph.is_safe_id(request_id)
+                and valid_actor is not None
+                and valid_reason
+            ):
+                remedy_mode = mode
+                remedy_identity = {
+                    "mode": mode,
+                    "request_id": request_id,
+                    "actor": valid_actor,
+                    "reason": reason,
+                }
+        if remedy_mode is not None:
+            recommendation = (
+                "The attended scripted remedy argv below is currently admitted; "
+                "the command rechecks every precondition before it changes state."
+            )
+        elif admissions_evaluated:
+            recommendation = "no scripted remedy applies in this state."
+        else:
+            recommendation = (
+                "Scripted remedy admission was not evaluated by this state-only "
+                "projection; no scripted command is shown."
+            )
+        if blocked_restart is not None:
+            recommendation += (
+                " A restart request is blocked by this refusal and is not "
+                "pending progress."
+            )
+        if launch is not None:
+            recommendation += (
+                " After independently verifying the prior agent processes are "
+                "stopped, reproduce the listed launch environment and run the "
+                "configured argv below as a detached process."
             )
         else:
-            summary = (
-                f"{agent} owned process tree is invalid ({reason_code}); "
-                "automatic teardown is HOLD because a partial kill could "
-                "strand descendants."
+            recommendation += (
+                " The configured detached launch could not be established from "
+                f"supervisor.json: {launch_problem}."
             )
-        recommendation = (
-            "Inspect and reduce the owned tree, or perform an operator-attended "
-            "teardown only after verifying every pid/start identity and the "
-            "live wrapper launch nonce. Record the resolution by starting a new "
-            "wrapper generation; an ordinary smaller poll does not clear this "
-            "sticky HOLD. This item is visible in `agenttalk attention` and the "
-            "supervisor dashboard."
-        )
         it = _mk_item(
             SOURCE_PROCESS_TREE_HOLD,
             item_id(SOURCE_PROCESS_TREE_HOLD, identity),
-            title=f"supervisor process-tree HOLD: {agent}",
+            title=f"automatic recovery refused: {agent}",
             ident_content={
                 "agent": agent,
                 "request_id": request_id,
                 "status": status,
                 "reason_code": reason_code,
-                "observed_count": observed,
-                "limit": limit,
+                "observed_count": display_observed,
+                "limit": display_limit,
                 "wrapper_generation": tree_record.get("wrapper_generation"),
                 "launch_nonce": tree_record.get("launch_nonce"),
+                "configured_launch": launch,
+                "configured_launch_unavailable": (
+                    launch_problem if launch is None else None
+                ),
+                "blocked_restart": blocked_restart,
+                "scripted_remedy": remedy_identity,
                 "evidence_hash": source_hash({
                     "owned_process_tree": tree_record,
                     "legacy_process_evidence": row.get(
@@ -789,8 +953,8 @@ def process_tree_hold_items(state: dict) -> list[dict]:
                 "why_it_matters": summary,
                 "recommendation": recommendation,
                 "risk_if_ignored": (
-                    "The agent remains intentionally unkillable by automation "
-                    "until complete ownership evidence is restored."
+                    "Automatic recovery remains blocked, and later work can be "
+                    "starved behind a restart request that cannot progress."
                 ),
                 "priority": "high",
                 "risk_severity": "high",
@@ -808,122 +972,63 @@ def process_tree_hold_items(state: dict) -> list[dict]:
                 "reason_code": reason_code,
             }],
         )
-        nonce = tree_record.get("launch_nonce")
-        generation = tree_record.get("wrapper_generation")
-        launcher_pid = row.get("launcher_pid")
-        launcher_start = row.get("launcher_start")
-        tree_entries = tree_record.get("entries")
-        legacy = row.get("legacy_process_evidence")
-        legacy_entries = (
-            legacy.get("entries")
-            if isinstance(legacy, dict)
-            else None
-        )
-        reset_wrapper_recorded = any(
-            isinstance(entry, dict)
-            and entry.get("pid") == launcher_pid
-            and entry.get("start") == launcher_start
-            and entry.get("role") == "wrapper"
-            for entry in (
-                tree_entries
-                if isinstance(tree_entries, list)
-                else []
-            )
-        ) or any(
-            isinstance(entry, dict)
-            and entry.get("pid") == launcher_pid
-            and entry.get("start") == launcher_start
-            and entry.get("source") == "wrapper"
-            for entry in (
-                legacy_entries
-                if isinstance(legacy_entries, list)
-                else []
-            )
-        )
-        try:
-            reset_agent = validate_agent_name(agent)
-        except (TypeError, ValueError):
-            reset_agent = None
-        held_terminal = (
-            eph.validate_held_terminal(row.get("held_terminal"))
-            if request_id is not None
-            else None
-        )
-        ephemeral_archive_available = (
-            request_id is not None
-            and reset_agent is not None
-            and eph.is_safe_id(request_id)
-            and held_terminal is not None
-            and row.get("request_id") == request_id
-            and row.get("agent") == reset_agent
-        )
-        reset_evidence_available = (
-            request_id is None
-            and reset_agent is not None
-            and isinstance(nonce, str)
-            and _RESET_LAUNCH_NONCE_RE.fullmatch(nonce) is not None
-            and row.get("launcher_nonce") == nonce
-            and isinstance(generation, str)
-            and bool(generation)
-            and row.get("runtime_wrapper_generation") == generation
-            and isinstance(launcher_pid, int)
-            and not isinstance(launcher_pid, bool)
-            and launcher_pid > 0
-            and isinstance(launcher_start, str)
-            and bool(launcher_start)
-            and reset_wrapper_recorded
-        )
-        if ephemeral_archive_available:
-            reset_command = (
-                "agenttalk supervise --reset-process-tree-ownership "
-                f"--request-id {request_id} "
-                f"--hold-source-hash {it['source_hash']} --from LIAISON "
-                "--acknowledge-no-live-supervisor "
-                "--acknowledge-owned-processes-stopped "
-                '--reason "attended terminal request archive"'
-            )
-            it["operator_command"] = reset_command
-            it["attended_disposition_mode"] = "operator_attested"
-            it["recommendation"] = (
-                "Stop the supervisor, preserve supervisor.kill, and verify "
-                "under operator control that the request's processes are "
-                "stopped. This request-bound disposition deliberately relies "
-                "on the two explicit acknowledgements even when persisted "
-                "pid/start, runtime, generation, or nonce evidence is "
-                "incomplete. Replace LIAISON in "
-                f"`{reset_command}`. The command retires the temporary "
-                "identity and clears capacity; it never kills or launches."
-            )
-        elif reset_evidence_available:
-            reset_command = (
-                "agenttalk supervise --reset-process-tree-ownership "
-                f"--for {reset_agent} --hold-source-hash {it['source_hash']} "
-                "--verified-launch-nonce LIVE_NONCE --from LIAISON "
-                "--acknowledge-no-live-supervisor "
-                "--acknowledge-owned-processes-stopped "
-                '--reason "attended teardown verified"'
-            )
-            it["operator_command"] = reset_command
-            it["attended_disposition_mode"] = "strict_identity"
-            it["recommendation"] = (
-                "Stop the supervisor and verify every pid/start identity plus "
-                "the live wrapper launch nonce (the stored expected nonce is "
-                f"`{nonce}`). Replace LIVE_NONCE and LIAISON in "
-                f"`{reset_command}` while supervisor.kill remains present. "
-                "Then refresh/validate the artifacts and request a restart to "
-                "create a new wrapper generation; the reset itself never "
-                "kills or launches."
-            )
+        if launch is not None:
+            it["configured_launch"] = launch
         else:
-            it["recommendation"] = (
-                "Stop the supervisor and preserve supervisor.kill. This HOLD "
-                "does not contain enough mutually agreeing pid/start, wrapper "
-                "generation, and launch-nonce evidence for the attended reset "
-                "or terminal request archive command, so repair the damaged "
-                "record manually under operator control; do not kill by name "
-                "or command-line pattern. Re-read the resulting item in "
-                "`agenttalk attention` before acting."
-            )
+            it["configured_launch_unavailable"] = launch_problem
+        if blocked_restart is not None:
+            it["restart_request"] = blocked_restart
+        if remedy_mode == "configured_reset":
+            it["operator_argv"] = [
+                "agenttalk",
+                "supervise",
+                "--reset-process-tree-ownership",
+                "--for",
+                remedy["agent"],
+                "--hold-source-hash",
+                it["source_hash"],
+                "--verified-launch-nonce",
+                remedy["verified_launch_nonce"],
+                "--acknowledge-no-live-supervisor",
+                "--acknowledge-owned-processes-stopped",
+                "--reason",
+                remedy["reason"],
+                "--from",
+                remedy["actor"],
+            ]
+        elif remedy_mode == "ephemeral_archive":
+            it["operator_argv"] = [
+                "agenttalk",
+                "supervise",
+                "--reset-process-tree-ownership",
+                "--request-id",
+                remedy["request_id"],
+                "--hold-source-hash",
+                it["source_hash"],
+                "--acknowledge-no-live-supervisor",
+                "--acknowledge-owned-processes-stopped",
+                "--reason",
+                remedy["reason"],
+                "--from",
+                remedy["actor"],
+            ]
+        if request_id is not None:
+            try:
+                archive_agent = validate_agent_name(agent)
+            except (TypeError, ValueError):
+                archive_agent = None
+            held_terminal = eph.validate_held_terminal(row.get("held_terminal"))
+            if (
+                archive_agent is not None
+                and eph.is_safe_id(request_id)
+                and held_terminal is not None
+                and row.get("request_id") == request_id
+                and row.get("agent") == archive_agent
+            ):
+                # This is an archive verification MODE, not remedy admission.
+                # The CLI still independently proves the supervisor is stopped,
+                # the kill switch remains, and the caller is authorized.
+                it["attended_disposition_mode"] = "operator_attested"
         it["dedupe_key"] = dedupe_key(
             SOURCE_PROCESS_TREE_HOLD,
             identity=identity,
@@ -941,16 +1046,26 @@ def process_tree_hold_items(state: dict) -> list[dict]:
     )
     active = eph_root.get("active") if isinstance(eph_root, dict) else None
     if isinstance(active, dict):
-        for request_id, row in sorted(active.items()):
-            if not isinstance(request_id, str) or not isinstance(row, dict):
+        for raw_request_id, row in sorted(active.items(), key=lambda pair: str(pair[0])):
+            if not isinstance(raw_request_id, str) or not isinstance(row, dict):
                 continue
+            request_id = raw_request_id
+            if not eph.is_safe_id(request_id):
+                request_id = (
+                    "invalid-"
+                    + hashlib.sha256(
+                        request_id.encode("utf-8", errors="surrogatepass")
+                    ).hexdigest()[:12]
+                )
             fallback_agent = request_id
             try:
                 fallback_agent = validate_agent_name(fallback_agent)
             except (TypeError, ValueError):
                 fallback_agent = (
                     "ephemeral-"
-                    + hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:12]
+                    + hashlib.sha256(
+                        request_id.encode("utf-8", errors="surrogatepass")
+                    ).hexdigest()[:12]
                 )
             try:
                 agent = validate_agent_name(row.get("agent"))

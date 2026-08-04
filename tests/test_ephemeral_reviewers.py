@@ -972,11 +972,9 @@ def test_ephemeral_cap_exceeded_holds_archive_and_escalates_attention() -> None:
     assert [item["item_id"] for item in items] == [
         "process_tree_hold:ephemeral:lr-cap"
     ]
-    assert "observed 65 identities over cap 64" in items[0]["why_it_matters"]
-    assert "--request-id lr-cap" in items[0]["operator_command"]
-    assert f"--hold-source-hash {items[0]['source_hash']}" in (
-        items[0]["operator_command"]
-    )
+    assert "observed 65 identities over the safe cap 64" in items[0]["why_it_matters"]
+    assert "operator_command" not in items[0]
+    assert "no scripted remedy applies in this state" in items[0]["recommendation"]
     changed = json.loads(json.dumps(attention_state))
     changed["ephemeral_reviewers"]["active"]["lr-cap"]["held_terminal"][
         "reason"
@@ -1092,33 +1090,46 @@ def _write_attended_ephemeral_hold_fixture(
     return request_id, agent, item["source_hash"]
 
 
+def _current_ephemeral_reset_item(
+    store: Store,
+    state: dict,
+    request_id: str,
+    *,
+    actor: str = "lead",
+) -> dict:
+    admissions = sup.evaluate_process_tree_reset_admissions(
+        store,
+        state,
+        actor=actor,
+        now_epoch=NOW,
+    )
+    return next(
+        item
+        for item in att.process_tree_hold_items(
+            state,
+            supervisor_config=cli._load_supervisor_config(store),  # noqa: SLF001
+            root=store.root,
+            reset_admissions=admissions,
+        )
+        if item["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+
+
 def test_cli_attended_ephemeral_tree_hold_archives_exact_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _store(tmp_path)
-    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    request_id, agent, _source_hash = _write_attended_ephemeral_hold_fixture(store)
     (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
     monkeypatch.setattr(cli, "_owner_identity_gone", lambda _pid, _start: True)
+    monkeypatch.setattr(cli.time, "time", lambda: NOW)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    item = _current_ephemeral_reset_item(store, state, request_id)
+    source_hash = item["source_hash"]
 
-    rc = cli.main([
-        "--root",
-        str(tmp_path),
-        "supervise",
-        "--reset-process-tree-ownership",
-        "--request-id",
-        request_id,
-        "--hold-source-hash",
-        source_hash,
-        "--acknowledge-no-live-supervisor",
-        "--acknowledge-owned-processes-stopped",
-        "--reason",
-        "all recorded request identities verified stopped",
-        "--from",
-        "lead",
-        "--now",
-        str(NOW),
-    ])
+    assert item["operator_argv"][3:5] == ["--request-id", request_id]
+    rc = cli.main(["--root", str(tmp_path), *item["operator_argv"][1:]])
 
     assert rc == 0
     persisted = sup.load_supervisor_state(store.dir / "supervisor-state.json")
@@ -1140,7 +1151,7 @@ def test_cli_attended_ephemeral_tree_hold_archives_exact_request(
         "verified_launch_nonce": None,
         "verified_identity_count": 0,
         "acknowledged_at": "1970-01-01T00:16:40Z",
-        "reason": "all recorded request identities verified stopped",
+        "reason": "operator verified the terminal request can be archived",
     }
     assert agent not in store.load_config()["agents"]
     assert agent in store.retired_agents()
@@ -1149,6 +1160,7 @@ def test_cli_attended_ephemeral_tree_hold_archives_exact_request(
 
 def test_cli_attended_ephemeral_hold_archives_without_strict_tree_evidence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _store(tmp_path)
     request_id, agent, _source_hash = _write_attended_ephemeral_hold_fixture(store)
@@ -1156,30 +1168,14 @@ def test_cli_attended_ephemeral_hold_archives_without_strict_tree_evidence(
     state_path = store.dir / "supervisor-state.json"
     state = sup.load_supervisor_state(state_path)
     wrt.runtime_path(store.state_dir, agent).unlink()
-    item = att.process_tree_hold_items(state)[0]
+    monkeypatch.setattr(cli.time, "time", lambda: NOW)
+    item = _current_ephemeral_reset_item(store, state, request_id)
 
-    assert item["attended_disposition_mode"] == "operator_attested"
-    assert "--request-id lr-attended" in item["operator_command"]
-    assert "--verified-launch-nonce" not in item["operator_command"]
+    assert "operator_command" not in item
+    assert "no scripted remedy applies in this state" not in item["recommendation"]
+    assert item["operator_argv"][3:5] == ["--request-id", request_id]
 
-    rc = cli.main([
-        "--root",
-        str(tmp_path),
-        "supervise",
-        "--reset-process-tree-ownership",
-        "--request-id",
-        request_id,
-        "--hold-source-hash",
-        item["source_hash"],
-        "--acknowledge-no-live-supervisor",
-        "--acknowledge-owned-processes-stopped",
-        "--reason",
-        "operator verified the terminal request can be archived",
-        "--from",
-        "lead",
-        "--now",
-        str(NOW),
-    ])
+    rc = cli.main(["--root", str(tmp_path), *item["operator_argv"][1:]])
 
     assert rc == 0
     persisted = sup.load_supervisor_state(state_path)
@@ -1196,31 +1192,113 @@ def test_cli_attended_ephemeral_hold_archives_without_strict_tree_evidence(
     assert agent in store.retired_agents()
 
 
+@pytest.mark.parametrize(
+    "inadmissible_context",
+    ["journal_cap", "identity_missing", "archive_conflict"],
+)
+def test_ephemeral_archive_command_hidden_when_finish_precondition_fails(
+    tmp_path: Path,
+    inadmissible_context: str,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, _source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    if inadmissible_context == "journal_cap":
+        state["ephemeral_reviewers"]["attended_archive_pending"] = {
+            f"lr-other-{index}": {}
+            for index in range(64)
+        }
+    elif inadmissible_context == "identity_missing":
+        store.remove_agent(agent)
+    else:
+        store.launch_requests_archive_dir.mkdir(parents=True, exist_ok=True)
+        (store.launch_requests_archive_dir / f"{request_id}.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+
+
+def test_corrupt_archive_journal_reason_cannot_erase_refusal_attention(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    marker = store.read_launch_request(request_id)
+    assert marker is not None
+    sup.stage_attended_ephemeral_archive(
+        state,
+        request_id,
+        agent=agent,
+        launch_marker=marker,
+        held_terminal=entry["held_terminal"],
+        hold_source_hash=source_hash,
+        acknowledged_by="lead",
+        verification_mode="operator_attested",
+        verified_launch_nonce=None,
+        verified_identity_count=0,
+        reason="operator verified the terminal request can be archived",
+        now_epoch=NOW,
+    )
+    state["ephemeral_reviewers"]["attended_archive_pending"][request_id][
+        "reason"
+    ] = "malformed-\ud800-reason"
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+
+
+@pytest.mark.parametrize(
+    "marker_poison",
+    ["escaped-\ud800-surrogate", float("nan")],
+    ids=["unpaired-surrogate", "non-finite-number"],
+)
+def test_unpersistable_launch_marker_hides_ephemeral_archive_remedy(
+    tmp_path: Path,
+    marker_poison: object,
+) -> None:
+    store = _store(tmp_path)
+    request_id, _agent, _source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    marker = store.read_launch_request(request_id)
+    assert marker is not None
+    marker["unrelated_persistence_poison"] = marker_poison
+    (store.launch_requests_dir / f"{request_id}.json").write_text(
+        json.dumps(marker, ensure_ascii=True),
+        encoding="utf-8",
+    )
+    assert eph.validate_marker(store.read_launch_request(request_id)) == []
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+
+
 def test_cli_attended_ephemeral_archive_recovers_after_final_state_save_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _store(tmp_path)
-    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    request_id, agent, _source_hash = _write_attended_ephemeral_hold_fixture(store)
     (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
     monkeypatch.setattr(cli, "_owner_identity_gone", lambda _pid, _start: True)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    item = _current_ephemeral_reset_item(store, state, request_id)
     args = [
-        "--root",
-        str(tmp_path),
-        "supervise",
-        "--reset-process-tree-ownership",
-        "--request-id",
-        request_id,
-        "--hold-source-hash",
-        source_hash,
-        "--acknowledge-no-live-supervisor",
-        "--acknowledge-owned-processes-stopped",
-        "--reason",
-        "all recorded request identities verified stopped",
-        "--from",
-        "lead",
-        "--now",
-        str(NOW),
+        "--root", str(tmp_path), *item["operator_argv"][1:],
+        "--now", str(NOW),
     ]
     real_save = sup.save_supervisor_state
     save_calls = 0
@@ -1262,25 +1340,13 @@ def test_cli_attended_ephemeral_archive_recovery_allows_liaison_turnover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _store(tmp_path)
-    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    request_id, agent, _source_hash = _write_attended_ephemeral_hold_fixture(store)
     (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    item = _current_ephemeral_reset_item(store, state, request_id)
     args = [
-        "--root",
-        str(tmp_path),
-        "supervise",
-        "--reset-process-tree-ownership",
-        "--request-id",
-        request_id,
-        "--hold-source-hash",
-        source_hash,
-        "--acknowledge-no-live-supervisor",
-        "--acknowledge-owned-processes-stopped",
-        "--reason",
-        "operator verified the terminal request can be archived",
-        "--from",
-        "lead",
-        "--now",
-        str(NOW),
+        "--root", str(tmp_path), *item["operator_argv"][1:],
+        "--now", str(NOW),
     ]
     real_save = sup.save_supervisor_state
     save_calls = 0
@@ -1300,9 +1366,18 @@ def test_cli_attended_ephemeral_archive_recovery_allows_liaison_turnover(
     monkeypatch.setattr(sup, "save_supervisor_state", real_save)
     store.add_agent("newlead")
     store.set_operator_facing("newlead")
-    retry_args = list(args)
-    retry_args[retry_args.index("--from") + 1] = "newlead"
-    retry_args[-1] = str(NOW + 1)
+    staged = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    retry_item = _current_ephemeral_reset_item(
+        store,
+        staged,
+        request_id,
+        actor="newlead",
+    )
+    assert retry_item["source_hash"] != item["source_hash"]
+    retry_args = [
+        "--root", str(tmp_path), *retry_item["operator_argv"][1:],
+        "--now", str(NOW + 1),
+    ]
 
     assert cli.main(retry_args) == 0
     recovered = sup.load_supervisor_state(store.dir / "supervisor-state.json")

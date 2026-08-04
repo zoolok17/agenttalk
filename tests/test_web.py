@@ -3097,7 +3097,13 @@ const payloads = {
         severity: 'high',
         title: 'supervisor process-tree HOLD: codex-test',
         detail: 'Automatic teardown is HOLD because the tree is truncated.',
-        recommendation: 'Inspect and reduce the owned tree before recovery.',
+        recommendation: 'no scripted remedy applies in this state.',
+        configured_launch: {
+          source: 'supervisor.json',
+          mode: 'detached',
+          argv: ['C:\\Python\\python.exe', '-m', 'agenttalk', 'wrap', '--for', 'codex-test'],
+          cwd: 'D:\\work\\demo-root',
+        },
         agent: 'codex-test',
         ts: iso,
         age_seconds: 5,
@@ -3273,7 +3279,10 @@ const cases = [
       'Operator decision needed',
       'Can I publish v0.72.1 now?',
       'stuck-agent',
-      'Inspect and reduce the owned tree before recovery.',
+      'no scripted remedy applies in this state.',
+      'Configured detached launch',
+      'C:\\\\Python\\\\python.exe',
+      'D:\\work\\demo-root',
     ],
   },
   { view: 'lead-chat', expected: ['Lead chat', 'Direct channel', 'route received'] },
@@ -5067,6 +5076,24 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
     s = _make_store(tmp_path)
     assert s.operator_facing() is None
     assert s.sole_lead() is None
+    launch_args = [
+        "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "alpha",
+        "--loop", "--", r"C:\Program Files\Codex\codex.exe",
+    ]
+    (s.dir / "supervisor.json").write_text(
+        json.dumps({
+            "agents": {
+                "alpha": {
+                    "cwd": str(tmp_path / "alpha cwd"),
+                    "launch": {
+                        "windows_file": r"C:\Python\python.exe",
+                        "windows_args": launch_args,
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
     entries = [
         {
             "pid": 100 + index,
@@ -5104,7 +5131,18 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
                         "launch_nonce": "12345678-1234-4234-8234-123456789abc",
                         "entries": entries,
                     }
-                }
+                },
+                "beta": {
+                    "owned_process_tree": {
+                        "status": "invalid",
+                        "reason_code": (
+                            "process_tree_invalid_wrapper_state_mismatch"
+                        ),
+                        "observed_count": 1,
+                        "limit": 64,
+                        "entries": [],
+                    },
+                },
             }
         },
     )
@@ -5131,6 +5169,11 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         item for item in payload["items"]
         if item["id"] == "process_tree_hold:alpha"
     )
+    assert {
+        item["id"]
+        for item in payload["items"]
+        if item["source_label"] == "SUPERVISOR HOLD"
+    } == {"process_tree_hold:alpha", "process_tree_hold:beta"}
     assert wire == {
         "id": internal["item_id"],
         "source": "supervisor",
@@ -5140,18 +5183,34 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         "agent": "alpha",
         "detail": internal["why_it_matters"],
         "recommendation": web._envelope_str(internal["recommendation"]),
-        "operator_command": internal["operator_command"],
+        "configured_launch": internal["configured_launch"],
         "age_seconds": 0.0,
         "human_can_unblock_now": True,
     }
-    assert wire["operator_command"].endswith(
-        '--reason "attended teardown verified"'
-    )
-    assert "LIVE_NONCE" in wire["operator_command"]
-    console_source = (
-        Path(web.__file__).with_name("web_static") / "console.js"
-    ).read_text(encoding="utf-8")
-    assert "item.operator_command" in console_source
+    assert wire["configured_launch"] == {
+        "source": "supervisor.json",
+        "mode": "detached",
+        "argv": [
+            r"C:\Python\python.exe",
+            *[
+                str(tmp_path) if token == "{ROOT}" else token
+                for token in launch_args
+            ],
+            ],
+            "cwd": str(tmp_path / "alpha cwd"),
+            "environment": {
+                "AGENTTALK_ROOT": str(tmp_path),
+                "AGENTTALK_PY": r"C:\Python\python.exe",
+                "supervisor_json_env_keys": [],
+            },
+            "environment_note": (
+                "Reproduce the listed values and any configured per-agent values; "
+                "a null AGENTTALK_PY must be recovered from the supervisor artifact, "
+                "and the supervisor may also supply an isolated CODEX_HOME and wrapper-log paths."
+            ),
+        }
+    assert "no scripted remedy applies in this state" in wire["recommendation"]
+    assert "operator_command" not in wire
 
 
 def test_api_attention_hides_resolved_dead_letter_and_keeps_unresolved(

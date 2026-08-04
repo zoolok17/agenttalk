@@ -1876,6 +1876,32 @@
     if (item.recommendation && !(actionSession.enabled && item.answerable)) {
       body.appendChild(el('div', 'tc-attn-detail', item.recommendation));
     }
+    if (item.configured_launch && Array.isArray(item.configured_launch.argv)) {
+      body.appendChild(el('div', 'tc-attn-detail', 'Configured detached launch'));
+      var launchArgv = el(
+        'code', 'tc-attn-detail', JSON.stringify(item.configured_launch.argv));
+      launchArgv.setAttribute('aria-label', 'Configured detached launch argv');
+      body.appendChild(launchArgv);
+      if (item.configured_launch.cwd) {
+        body.appendChild(el(
+          'div', 'tc-attn-detail', 'Working directory: ' + item.configured_launch.cwd));
+      }
+      if (item.configured_launch.environment) {
+        body.appendChild(el(
+          'code', 'tc-attn-detail',
+          'Launch environment: ' + JSON.stringify(item.configured_launch.environment)));
+      }
+      if (item.configured_launch.environment_note) {
+        body.appendChild(el(
+          'div', 'tc-attn-detail', item.configured_launch.environment_note));
+      }
+    }
+    if (Array.isArray(item.operator_argv)) {
+      var remedyArgv = el(
+        'code', 'tc-attn-detail', JSON.stringify(item.operator_argv));
+      remedyArgv.setAttribute('aria-label', 'Currently admitted remedy argv');
+      body.appendChild(remedyArgv);
+    }
     if (item.operator_command) {
       var command = el('code', 'tc-attn-detail', item.operator_command);
       command.setAttribute('aria-label', 'Operator command');

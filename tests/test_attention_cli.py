@@ -3,10 +3,12 @@ meta.attention (strict CLI validation, exit 2 on malformed, no Store.send reject
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
 from agenttalk import cli
+from agenttalk import supervisor as supervisor_mod
 from agenttalk.store import Store
 
 
@@ -591,3 +593,179 @@ def test_wrapper_config_blocked_notice_coalesced_when_hold_exists(tmp_path: Path
     items = cli._collect_attention_items(s, for_agent="claude", roster=["beta", "claude"])
     assert not [i for i in items if i["source"] == A.SOURCE_NEEDS_OPERATOR]   # twin coalesced
     assert [i for i in items if i["source"] == A.SOURCE_CONFIG_BLOCKED]       # canonical hold row
+
+
+def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    s = _team(tmp_path)
+    launch_args = [
+        "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "beta",
+        "--loop", "--", r"C:\Program Files\Codex\codex.exe",
+    ]
+    (s.dir / "supervisor.json").write_text(
+        json.dumps({
+            "agents": {
+                "beta": {
+                    "cwd": str(tmp_path / "worker cwd"),
+                    "launch": {
+                        "windows_file": r"C:\Python\python.exe",
+                        "windows_args": launch_args,
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    supervisor_mod.save_supervisor_state(
+        s.dir / "supervisor-state.json",
+        {
+            "agents": {
+                "beta": {
+                    "restart_request_state": "applied_pending_readiness",
+                    "pending_restart_request_id": "rr-held",
+                    "owned_process_tree": {
+                        "status": "invalid",
+                        "reason_code": "process_tree_invalid_legacy_managed_pids",
+                        "observed_count": 1,
+                        "limit": 64,
+                        "entries": [],
+                    },
+                },
+                "claude": {
+                    "owned_process_tree": {
+                        "status": "invalid",
+                        "reason_code": (
+                            "process_tree_invalid_wrapper_state_mismatch"
+                        ),
+                        "observed_count": 1,
+                        "limit": 64,
+                        "entries": [],
+                    },
+                },
+            },
+        },
+    )
+    s.write_restart_request("beta", {
+        "agent": "beta",
+        "request_id": "rr-held",
+        "requested_by": "claude",
+    })
+
+    assert cli.main([*_root(tmp_path), "attention", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {
+        row["item_id"]
+        for row in payload["items"]
+        if row["source"] == "process_tree_hold"
+    } == {"process_tree_hold:beta", "process_tree_hold:claude"}
+    item = next(
+        row for row in payload["items"]
+        if row["item_id"] == "process_tree_hold:beta"
+    )
+
+    assert "complete current ownership from legacy PID records" in item["why_it_matters"]
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+    assert item["restart_request"]["pending_progress"] is False
+    assert item["configured_launch"]["argv"] == [
+        r"C:\Python\python.exe",
+        *[
+            str(tmp_path) if token == "{ROOT}" else token
+            for token in launch_args
+        ],
+    ]
+    assert item["configured_launch"]["mode"] == "detached"
+    assert "operator_command" not in item
+
+    assert cli.main([*_root(tmp_path), "attention"]) == 0
+    plain = capsys.readouterr().out
+    assert "automatic recovery refused: beta" in plain
+    assert "automatic recovery refused: claude" in plain
+    assert "no scripted remedy applies in this state" in plain
+    assert "configured detached launch argv" in plain
+    assert r"C:\\Program Files\\Codex\\codex.exe" in plain
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "operator_fact"),
+    [
+        (
+            "process_tree_invalid_generation_adoption_pending",
+            "current wrapper generation has adopted this agent's process tree",
+        ),
+        (
+            "process_tree_invalid_legacy_managed_pids",
+            "complete current ownership from legacy PID records",
+        ),
+        (
+            "process_tree_invalid_exact_start_filetime_unavailable",
+            "exact process lifetime identities",
+        ),
+        (
+            "process_tree_invalid_post_kill_owned_descendant_edge_survived",
+            "every owned descendant ended after the attempted teardown",
+        ),
+        (
+            "process_tree_invalid_wrapper_state_mismatch",
+            "reported wrapper identity agrees with the supervisor's recorded launcher",
+        ),
+    ],
+)
+def test_attention_collector_fail_closed_for_each_field_refusal_reason(
+    tmp_path: Path,
+    reason_code: str,
+    operator_fact: str,
+) -> None:
+    s = _team(tmp_path)
+    launcher_start = f"linux:{'a' * 32}:1"
+    nonce = "12345678-1234-4234-8234-123456789abc"
+    supervisor_mod.save_supervisor_state(
+        s.dir / "supervisor-state.json",
+        {
+            "agents": {
+                "beta": {
+                    "launcher_pid": 100,
+                    "launcher_start": launcher_start,
+                    "launcher_nonce": nonce,
+                    "runtime_wrapper_generation": "wrapper-1",
+                    "owned_process_tree": {
+                        "schema_version": 2,
+                        "attribution_model": "owned_process_tree_v2",
+                        "agent": "beta",
+                        "root_key": "root-1",
+                        "status": "invalid",
+                        "reason_code": reason_code,
+                        "limit": 64,
+                        "observed_count": 1,
+                        "recorded_count": 1,
+                        "omitted_count": 0,
+                        "truncated": False,
+                        "refreshed_at": "2026-06-01T00:00:00Z",
+                        "wrapper_generation": "wrapper-1",
+                        "launch_nonce": nonce,
+                        "entries": [{
+                            "pid": 100,
+                            "start": launcher_start,
+                            "start_filetime": None,
+                            "role": "wrapper",
+                            "parent_pid": 1,
+                            "discovered_at": "2026-06-01T00:00:00Z",
+                        }],
+                    },
+                },
+            },
+        },
+    )
+
+    items = cli._collect_attention_items(  # noqa: SLF001
+        s,
+        for_agent="claude",
+        roster=["beta", "claude"],
+    )
+    hold = next(item for item in items if item["source"] == "process_tree_hold")
+
+    assert operator_fact in hold["why_it_matters"]
+    assert "no scripted remedy applies in this state" in hold["recommendation"]
+    assert "operator_argv" not in hold
+    assert "operator_command" not in hold

@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk import (
+    attention as att,
     checkpoint,
     cli,
     ephemeral as eph,
@@ -536,6 +537,52 @@ def test_request_restart_writes_marker(tmp_path: Path) -> None:
     assert m["authority_result"] == "authorized"
     assert m["force_protected_authorized_by"] == "lead"
     assert m["reason"] == "outage" and m["request_id"].startswith("rr-")
+
+
+def test_request_restart_during_process_tree_hold_does_not_promise_relaunch(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _team(tmp_path)
+    s.set_role("lead", "lead")
+    _write_attended_process_tree_reset_fixture(s)
+
+    assert _run([
+        "request-restart", "--for", "worker", "--from", "lead", "--reason", "recover",
+    ], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    assert "will relaunch" not in output
+    assert "blocked, not pending progress" in output
+    items = cli._collect_attention_items(  # noqa: SLF001
+        s,
+        for_agent="lead",
+        roster=["lead", "worker"],
+    )
+    hold = next(item for item in items if item["source"] == "process_tree_hold")
+    assert hold["restart_request"]["pending_progress"] is False
+    assert hold["restart_request"]["request_id"].startswith("rr-")
+
+
+@pytest.mark.parametrize("corrupt_supervisor_state", [False, True])
+def test_request_restart_without_known_hold_never_promises_relaunch(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    corrupt_supervisor_state: bool,
+) -> None:
+    s = _team(tmp_path)
+    s.set_role("lead", "lead")
+    if corrupt_supervisor_state:
+        (s.dir / "supervisor-state.json").write_text("{broken", encoding="utf-8")
+
+    assert _run([
+        "request-restart", "--for", "worker", "--from", "lead",
+        "--reason", "recover",
+    ], tmp_path) == 0
+
+    output = capsys.readouterr().out
+    assert "will relaunch" not in output
+    assert "does not establish that relaunch is currently admissible" in output
 
 
 def test_request_restart_missing_requested_by_is_denied(tmp_path: Path) -> None:
@@ -1270,6 +1317,65 @@ def test_supervisor_cli_json_decision_matches_plan_actions(tmp_path: Path, capsy
     assert worker["decision"]["state"] == expected["state"]
     assert worker["decision"]["reason"] == expected["reason"]
     assert expected["action"] == sup.STUCK_RECOVER
+
+
+@pytest.mark.parametrize("decision_state", ["PROCESS_TREE_INVALID", "PROCESS_TREE_TRUNCATED"])
+def test_restart_request_blocked_by_process_tree_refusal_is_not_pending_progress(
+    decision_state: str,
+) -> None:
+    report = _report(
+        heartbeat_stale=True,
+        restart_request=_auth_marker("rr-held"),
+    )["agents"]["worker"]
+    assessment = sup.supervisor_agent_assessment(
+        "worker",
+        report,
+        {
+            "action": sup.WARN_ONLY,
+            "state": decision_state,
+            "reason": "operator-visible process ownership refusal",
+        },
+    )
+
+    assert assessment["restart_request"] == {
+        "present": True,
+        "pending": False,
+        "blocked": True,
+        "state": "blocked_by_process_tree_hold",
+        "request_id": "rr-held",
+        "requested_by": "lead",
+    }
+
+
+def test_completed_restart_marker_is_not_reported_as_pending_progress() -> None:
+    report = _report(
+        heartbeat_stale=False,
+        restart_request=_auth_marker("rr-complete"),
+    )["agents"]["worker"]
+    assessment = sup.supervisor_agent_assessment(
+        "worker",
+        report,
+        {
+            "action": sup.CLEAR_MARKER,
+            "state": "HEALTHY_IDLE",
+            "reason": "restart reached readiness",
+            "clear_marker": "rr-complete",
+            "next_state": {
+                "restart_request_state": "readiness_seen",
+                "pending_restart_request_id": "rr-complete",
+                "restart_requested_by": "lead",
+            },
+        },
+    )
+
+    assert assessment["restart_request"] == {
+        "present": True,
+        "pending": False,
+        "blocked": False,
+        "state": "readiness_seen",
+        "request_id": "rr-complete",
+        "requested_by": "lead",
+    }
 
 
 def test_supervisor_cli_json_redacts_embedded_report_config_blocked(
@@ -10003,11 +10109,9 @@ def test_reset_remedy_does_not_name_command_when_runtime_currently_invalid() -> 
     assert tree["status"] == "invalid"
     assert tree["entries"]  # has_entries branch, not the entryless one
     assert tree["reason_code"] == "process_tree_invalid_runtime_absent"
-    # The command may still be NAMED for context (same as the established
-    # entryless-placeholder wording), but must never be RECOMMENDED to run
-    # when this poll already knows it would refuse.
-    assert "run `agenttalk supervise --reset-process-tree-ownership`" not in plan["reason"]
-    assert "runtime record is not valid" in plan["reason"]
+    assert "--reset-process-tree-ownership" not in plan["reason"]
+    assert "no scripted remedy applies" in plan["reason"]
+    assert "complete current ownership" in plan["reason"]
 
 
 def test_reset_remedy_does_not_name_command_when_wrapper_identity_mismatches_state() -> None:
@@ -10045,8 +10149,10 @@ def test_reset_remedy_does_not_name_command_when_wrapper_identity_mismatches_sta
     assert tree["status"] == "invalid"
     assert tree["entries"]  # has_entries branch, not the entryless one
     assert tree["reason_code"] == "process_tree_invalid_wrapper_state_mismatch"
-    assert "run `agenttalk supervise --reset-process-tree-ownership`" not in plan["reason"]
-    assert "does not agree with this state's stored launcher identity" in plan["reason"]
+    assert "--reset-process-tree-ownership" not in plan["reason"]
+    assert "reported wrapper identity agrees with the supervisor's recorded launcher" in (
+        plan["reason"]
+    )
 
 
 def test_wrapped_torn_runtime_read_is_unknown_without_partial_fields(
@@ -12338,6 +12444,34 @@ def _write_attended_process_tree_reset_fixture(store: Store) -> tuple[dict, str]
     return state, hold["source_hash"]
 
 
+def _current_configured_reset_item(
+    store: Store,
+    state: dict,
+    *,
+    identity_gone,
+) -> dict:
+    restart_marker = store.read_restart_request("worker")
+    restart_requests = (
+        {"worker": restart_marker}
+        if isinstance(restart_marker, dict)
+        else {}
+    )
+    admissions = sup.evaluate_process_tree_reset_admissions(
+        store,
+        state,
+        actor="lead",
+        now_epoch=NOW,
+        identity_gone=identity_gone,
+    )
+    return att.process_tree_hold_items(
+        state,
+        supervisor_config=cli._load_supervisor_config(store),  # noqa: SLF001
+        root=store.root,
+        restart_requests=restart_requests,
+        reset_admissions=admissions,
+    )[0]
+
+
 def _attended_process_tree_reset_args(source_hash: str) -> list[str]:
     return [
         "supervise",
@@ -12388,6 +12522,163 @@ def test_process_tree_reset_evidence_preserves_exact_filetime(
     ]
 
 
+def test_live_supervisor_hides_reset_remedy_and_rejects_previously_admitted_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    def identity_gone(_pid, _start, _start_filetime=None) -> bool:
+        return True
+    monkeypatch.setattr(cli, "_owner_identity_gone", identity_gone)
+    monkeypatch.setattr(cli.time, "time", lambda: NOW)
+
+    admitted = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=identity_gone,
+    )
+    assert admitted["operator_argv"]
+
+    store.supervisor_instance_path().write_text(
+        json.dumps({
+            "root": str(store.root),
+            "pid": 999999,
+            "pid_start": "linux:0123456789abcdef0123456789abcdef:1",
+            "token": "b" * 32,
+            "started_at": _iso(NOW),
+        }),
+        encoding="utf-8",
+    )
+    refused = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=identity_gone,
+    )
+
+    assert "operator_argv" not in refused
+    assert "no scripted remedy applies in this state" in refused["recommendation"]
+    assert _run(admitted["operator_argv"][1:], tmp_path) == 3
+
+
+def test_malformed_reset_audit_hides_command_that_handler_would_refuse(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state["process_tree_resets"] = [{"malformed": True}]
+
+    item = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=lambda _pid, _start, _start_filetime=None: True,
+    )
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+
+
+@pytest.mark.parametrize(
+    "persistence_poison",
+    ["escaped-\ud800-surrogate", float("nan")],
+    ids=["unpaired-surrogate", "non-finite-number"],
+)
+def test_unpersistable_supervisor_state_hides_every_mutating_remedy(
+    tmp_path: Path,
+    persistence_poison: object,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state["unrelated_persistence_poison"] = persistence_poison
+
+    item = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=lambda _pid, _start, _start_filetime=None: True,
+    )
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+
+
+def test_reset_admission_rechecks_kill_switch_after_identity_probe(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    kill_switch = store.dir / "supervisor.kill"
+    kill_switch.write_text("stop", encoding="utf-8")
+
+    def remove_kill_switch(_pid, _start, _start_filetime=None) -> bool:
+        if kill_switch.exists():
+            kill_switch.unlink()
+        return True
+
+    item = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=remove_kill_switch,
+    )
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+
+
+def test_malformed_ephemeral_journal_does_not_erase_configured_refusal_card(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    state["ephemeral_reviewers"] = {
+        "active": {
+            "lr-bad-journal": {
+                "request_id": "lr-bad-journal",
+                "agent": "reviewer",
+                "owned_process_tree": {"status": "invalid"},
+                "held_terminal": {
+                    "terminal_state": eph.STATE_TIMED_OUT,
+                    "reason": "ephemeral reviewer timed out without a result",
+                    "completion": {
+                        "status": eph.COMPLETION_NONE,
+                        "terminal": False,
+                        "hold": True,
+                    },
+                },
+            },
+        },
+        "attended_archive_pending": [],
+    }
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+
+    items = cli._collect_attention_items(  # noqa: SLF001
+        store,
+        for_agent="lead",
+        roster=["lead", "worker"],
+    )
+
+    assert any(
+        item.get("item_id") == "process_tree_hold:worker"
+        for item in items
+    )
+    assert not any(
+        item.get("item_id") == "source_error:process_tree_hold"
+        for item in items
+    )
+
+
 def test_attended_process_tree_reset_is_audited_and_rearms_new_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -12408,13 +12699,24 @@ def test_attended_process_tree_reset_is_audited_and_rearms_new_generation(
         return True
 
     monkeypatch.setattr(cli, "_owner_identity_gone", identity_gone)
+    monkeypatch.setattr(cli.time, "time", lambda: NOW)
+    item = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=identity_gone,
+    )
+    source_hash = item["source_hash"]
 
-    assert _run(_attended_process_tree_reset_args(source_hash), tmp_path) == 0
+    assert item["operator_argv"][3:5] == ["--for", "worker"]
+    assert _run(item["operator_argv"][1:], tmp_path) == 0
 
-    assert probed_identities == [
+    expected_identities = [
         (row["pid"], row["start"], row.get("start_filetime"))
         for row in state["agents"]["worker"]["owned_process_tree"]["entries"]
     ]
+    # Projection proves admission, the command rebuilds that projection under
+    # the lifecycle lock, and the mutation path independently rechecks it.
+    assert probed_identities == expected_identities * 3
 
     persisted = sup.load_supervisor_state(
         store.dir / "supervisor-state.json"
@@ -12471,7 +12773,7 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
     store = _team(tmp_path)
     store.set_role("lead", "lead")
     store.set_operator_facing("lead")
-    _state, source_hash = _write_attended_process_tree_reset_fixture(store)
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
     kill_switch = store.dir / "supervisor.kill"
     kill_switch.write_text("stop", encoding="utf-8")
     monkeypatch.setattr(
@@ -12479,8 +12781,14 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
         "_owner_identity_gone",
         lambda _pid, _start, _start_filetime=None: True,
     )
+    monkeypatch.setattr(cli.time, "time", lambda: NOW)
+    item = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=lambda _pid, _start, _start_filetime=None: True,
+    )
 
-    assert _run(_attended_process_tree_reset_args(source_hash), tmp_path) == 0
+    assert _run(item["operator_argv"][1:], tmp_path) == 0
     reset_state = sup.load_supervisor_state(
         store.dir / "supervisor-state.json"
     )
@@ -15146,10 +15454,9 @@ def test_plan_actions_confirmed_absent_wrapper_recovers_despite_unrelated_snapsh
     assert poll1["next_state"]["owned_process_tree"]["reason_code"] == (
         "process_tree_invalid_snapshot_invalid_process_row"
     )
-    # Task #150 priority 4: the HOLD message must name the remedy, not just
-    # announce that it is holding.
-    assert "--reset-process-tree-ownership" in poll1["reason"]
-    assert "do NOT kill the wrapper" in poll1["reason"]
+    assert "--reset-process-tree-ownership" not in poll1["reason"]
+    assert "no scripted remedy applies" in poll1["reason"]
+    assert "`agenttalk attention`" in poll1["reason"]
 
     state_after_poll1 = {
         "agents": {
@@ -15347,22 +15654,14 @@ def test_process_tree_hold_message_names_no_remedy_for_entryless_placeholder() -
         "process_tree_invalid_prior_record_invalid"
     )
     assert not plan["next_state"]["owned_process_tree"]["entries"]
-    # It may NAME the command to explain why it will not help, but must
-    # never tell the operator to run it - that is the exact "worse than
-    # naming none" failure mode finding 3 identified.
-    assert "run `agenttalk supervise --reset-process-tree-ownership`" not in plan["reason"]
-    assert "will refuse it" in plan["reason"]
-    assert "not a scripted remedy" in plan["reason"]
-    assert "process_tree_invalid_prior_record_invalid" in plan["reason"]
+    assert "--reset-process-tree-ownership" not in plan["reason"]
+    assert "no scripted remedy applies" in plan["reason"]
+    assert "process_tree_invalid_prior_record_invalid" not in plan["reason"]
+    assert "could not establish complete current ownership" in plan["reason"]
 
 
-def test_process_tree_truncated_remedy_covers_omitted_identities_too() -> None:
-    """Task #150 connector finding 2: the truncated-tree remedy must not
-    read as "confirm only the NAMED processes are gone" -
-    --acknowledge-owned-processes-stopped's own contract explicitly covers
-    "any identities omitted by a truncated record", and the message must
-    say so rather than narrowing the precondition to what the record
-    happens to name."""
+def test_process_tree_truncated_refusal_names_the_missing_evidence_not_a_reset() -> None:
+    """A live supervisor cannot truthfully advertise its stopped-only reset."""
     limit = sup._OWNED_PROCESS_TREE_LIMIT  # noqa: SLF001
     snapshot = [_wrap_snap()[0]] + [
         _proc(400 + i, WRAP_LAUNCHER_PID, "node.exe", "node tool.js", _ps_iso(700000 + i))
@@ -15371,8 +15670,9 @@ def test_process_tree_truncated_remedy_covers_omitted_identities_too() -> None:
     plan = _owned_tree_plan(snapshot, request_id="rr-150-truncated-remedy")
     assert plan["state"] == "PROCESS_TREE_TRUNCATED"
     assert plan["next_state"]["owned_process_tree"]["omitted_count"] > 0
-    assert "omitted by a truncated record" in plan["reason"]
-    assert "--acknowledge-owned-processes-stopped" in plan["reason"]
+    assert "observed 65 identities over the safe cap 64" in plan["reason"]
+    assert "--reset-process-tree-ownership" not in plan["reason"]
+    assert "no scripted remedy applies" in plan["reason"]
 
 
 def test_v2_record_missing_rejected_count_stays_valid_but_ineligible() -> None:
@@ -16197,14 +16497,7 @@ def test_owned_process_tree_rejects_prior_entry_excluded_by_snap_index() -> None
     assert intermediate_pid not in [e["pid"] for e in tree["entries"]]
 
 
-def test_reset_remedy_names_rejected_candidates_separately_from_omitted() -> None:
-    """Task #150 round 3 connector finding 6, the same wrong direction as
-    round 2's own finding 2: a rejected candidate is precisely what this
-    record's entries never named at all, same as a truncated record's
-    omitted ones - but the reset command's own identity list is built
-    from entries alone, so it cannot know about a rejected candidate
-    either. The message must say so explicitly rather than folding it
-    silently into "every process this record could name"."""
+def test_rejected_candidate_refusal_does_not_expose_internal_reset_advice() -> None:
     launcher_no_filetime = {
         **_proc(WRAP_CHILD_PID, WRAP_LAUNCHER_PID, "codex.exe", "codex exec --json", WRAP_CHILD_START),
         "start_filetime": None,
@@ -16213,9 +16506,9 @@ def test_reset_remedy_names_rejected_candidates_separately_from_omitted() -> Non
     plan = _owned_tree_plan(snapshot, request_id="rr-150-reset-remedy-rejected")
     assert plan["state"] == "PROCESS_TREE_INVALID"
     assert plan["next_state"]["owned_process_tree"]["rejected_count"] >= 1
-    assert "rejected_count" in plan["reason"]
-    assert "does not include them" in plan["reason"]
-    assert "--reset-process-tree-ownership" in plan["reason"]
+    assert "rejected_count" not in plan["reason"]
+    assert "--reset-process-tree-ownership" not in plan["reason"]
+    assert "exact process lifetime identities" in plan["reason"]
 
 
 def test_launch_barrier_same_agent_wait_survivor_blocks_replacement() -> None:
