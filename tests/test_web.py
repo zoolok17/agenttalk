@@ -2757,17 +2757,12 @@ assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative 
 
 
 def test_console_agent_state_info_reflects_supervisor_decision(tmp_path: Path) -> None:
-    """A REAL render control: drives the actual browser-side `agentStateInfo()`
-    (not `/api/state`) for the exact scenario #105 exists to fix — a wrapper
-    whose self-report still says "working" while the supervisor's decision
-    says the CLI child could not be confirmed. Without the console.js fix,
-    `agentStateInfo` classified this purely from `health.state` and returned
-    `color: 'ok'` — a browser-visible false-GREEN. This asserts it does not.
+    """Drive the real browser-side compositor projection, not just `/api/state`.
 
-    Also a no-false-DOWN control for BOTH grace states (`CLI_CHILD_STARTING`
-    and `LAUNCHING`) and the two green states, and the `supervisor_decision_
-    unavailable` case (a wrapped, non-auto_restart agent) renders visibly
-    rather than silently as plain self-report.
+    The cases cover both directions of #105: strict evidence escalates a fine
+    observation, but healthy/grace evidence cannot erase a worse observation.
+    They also keep advisory, live-stalled, failed-turn, unconfirmed, unavailable,
+    and confirmed lost-binding wording distinct.
     """
     if shutil.which("node") is None:
         pytest.skip("node is required for the console render-control test")
@@ -2811,59 +2806,93 @@ function assert(cond, msg) {
   if (!cond) throw new Error(msg);
 }
 
-// B1 direction control: the dead-child case, self-report still "working".
-// Before the console.js fix this returned color:'ok' (the browser-visible bug).
-const dead = hooks.agentStateInfo({
-  health: { state: 'working_turn' }, wrapped: true,
-  supervisor_decision: { state: 'CLI_CHILD_UNKNOWN', action: 'none', reason: 'x' },
-});
-assert(dead.color !== 'ok', `dead-child must not render ok, got ${dead.color}`);
-assert(dead.key === 'supervisor_unbound', `expected supervisor_unbound, got ${dead.key}`);
-assert(dead.color === 'danger', `expected danger, got ${dead.color}`);
+function composedAgent(raw, observationUrgency, decision, kind, supervisorUrgency,
+                       primarySource) {
+  const observation = {
+    source: 'wrapper_health', state: raw, urgency: observationUrgency,
+  };
+  const supervisor = {
+    source: 'supervisor_decision', kind: kind,
+    state: decision.state, action: decision.action, reason: decision.reason,
+    urgency: supervisorUrgency,
+  };
+  return {
+    health: { state: raw }, wrapped: true, supervisor_decision: decision,
+    health_composition: {
+      observation: observation, supervisor: supervisor,
+      urgency: primarySource === 'supervisor' ? supervisorUrgency : observationUrgency,
+      primary_source: primarySource,
+      disagreement: observationUrgency !== supervisorUrgency,
+    },
+  };
+}
+function unavailableAgent(raw, observationUrgency, primarySource) {
+  const observation = {
+    source: 'wrapper_health', state: raw, urgency: observationUrgency,
+  };
+  const supervisor = {
+    source: 'supervisor_decision', kind: 'unavailable',
+    reason: 'assessment_failed', urgency: 'attention',
+  };
+  return {
+    health: { state: raw }, wrapped: true,
+    supervisor_decision_unavailable: true,
+    supervisor_decision_unavailable_reason: 'assessment_failed',
+    health_composition: {
+      observation: observation, supervisor: supervisor,
+      urgency: primarySource === 'supervisor' ? 'attention' : observationUrgency,
+      primary_source: primarySource,
+      disagreement: observationUrgency !== 'attention',
+    },
+  };
+}
 
-// Same for a confirmed-dead sibling state (not just CLI_CHILD_UNKNOWN).
-const stuck = hooks.agentStateInfo({
-  health: { state: 'idle_waiting' }, wrapped: true,
-  supervisor_decision: { state: 'STUCK_OR_DEAD', action: 'stuck_recover', reason: 'x' },
-});
-assert(stuck.color === 'danger', `STUCK_OR_DEAD must render danger, got ${stuck.color}`);
+// An unconfirmed child is danger evidence, but it is not confirmed child loss.
+const unconfirmed = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'CLI_CHILD_UNKNOWN', action: 'none', reason: 'binding unknown' },
+  'unconfirmed', 'danger', 'supervisor'));
+assert(unconfirmed.key === 'supervisor_alert',
+       `expected supervisor_alert, got ${unconfirmed.key}`);
+assert(unconfirmed.color === 'danger', `expected danger, got ${unconfirmed.color}`);
+assert(!unconfirmed.label.toLowerCase().includes('lost'),
+       `unconfirmed verdict claimed confirmed loss: ${unconfirmed.label}`);
 
-// CLI_CHILD_MISSING is the PROVISIONAL first-poll state of the supervisor's
-// two-poll confirmation policy, not confirmed-dead - must render attn
-// (supervisor_unconfirmed), never danger (mirrors the doctor.py fix).
-const missing = hooks.agentStateInfo({
-  health: { state: 'working_turn' }, wrapped: true,
-  supervisor_decision: { state: 'CLI_CHILD_MISSING', action: 'none', reason: 'x' },
-});
-assert(missing.key === 'supervisor_unconfirmed', `expected supervisor_unconfirmed, got ${missing.key}`);
-assert(missing.color === 'attn', `CLI_CHILD_MISSING must render attn not danger, got ${missing.color}`);
+// CLI_CHILD_MISSING is a provisional first-poll observation, so it is attention.
+const missing = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'CLI_CHILD_MISSING', action: 'none', reason: 'first poll' },
+  'advisory', 'attention', 'supervisor'));
+assert(missing.key === 'supervisor_advisory',
+       `expected supervisor_advisory, got ${missing.key}`);
+assert(missing.color === 'attn', `CLI_CHILD_MISSING must render attention: ${missing.color}`);
 
 // B2 no-false-DOWN control: BOTH grace states render as the self-report says
 // (no override), not attn/danger.
 for (const graceState of ['CLI_CHILD_STARTING', 'LAUNCHING']) {
   const grace = hooks.agentStateInfo({
-    health: { state: 'idle_waiting' }, wrapped: true,
-    supervisor_decision: { state: graceState, action: 'none', reason: 'x' },
+    ...composedAgent(
+      'idle_waiting', 'fine',
+      { state: graceState, action: 'none', reason: 'launch grace' },
+      'grace', 'fine', 'observation'),
   });
   assert(grace.key === 'idle_waiting', `${graceState} must not override self-report, got ${grace.key}`);
   assert(grace.color !== 'danger' && grace.color !== 'attn', `${graceState} false-DOWN: ${grace.color}`);
+  assert(grace.desc.includes(graceState), `${graceState} fact disappeared: ${grace.desc}`);
 }
 
 // Positive control: HEALTHY_WORKING never overrides either.
-const healthy = hooks.agentStateInfo({
-  health: { state: 'working_turn' }, wrapped: true,
-  supervisor_decision: { state: 'HEALTHY_WORKING', action: 'none', reason: 'ok' },
-});
+const healthy = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'HEALTHY_WORKING', action: 'none', reason: 'ok' },
+  'healthy', 'fine', 'observation'));
 assert(healthy.key === 'working_turn', `HEALTHY_WORKING false-DOWN: ${healthy.key}`);
 assert(healthy.color === 'ok', `HEALTHY_WORKING must stay ok, got ${healthy.color}`);
+assert(healthy.desc.includes('HEALTHY_WORKING'), `healthy fact disappeared: ${healthy.desc}`);
 
 // B3: supervisor_decision_unavailable (wrapped, not auto_restart) renders
 // visibly rather than silently falling back to plain self-report.
-const unavailable = hooks.agentStateInfo({
-  health: { state: 'working_turn' }, wrapped: true,
-  supervisor_decision_unavailable: true,
-  supervisor_decision_unavailable_reason: 'assessment_failed',
-});
+const unavailable = hooks.agentStateInfo(unavailableAgent('working_turn', 'fine', 'supervisor'));
 assert(unavailable.key === 'supervisor_unavailable', `expected supervisor_unavailable, got ${unavailable.key}`);
 assert(unavailable.color === 'attn', `expected attn, got ${unavailable.color}`);
 assert(unavailable.desc.includes('assessment failed'), `missing failure reason: ${unavailable.desc}`);
@@ -2871,11 +2900,8 @@ assert(!unavailable.desc.includes('not configured auto_restart'), `false disable
 
 // Losing the strict verdict must not soften an already-dangerous wrapper
 // self-report either. The unavailable cause remains visible alongside it.
-const unavailableDanger = hooks.agentStateInfo({
-  health: { state: 'rate_limited_or_outage' }, wrapped: true,
-  supervisor_decision_unavailable: true,
-  supervisor_decision_unavailable_reason: 'assessment_failed',
-});
+const unavailableDanger = hooks.agentStateInfo(
+  unavailableAgent('rate_limited_or_outage', 'danger', 'observation'));
 assert(unavailableDanger.key === 'rate_limited_or_outage',
        `unavailable verdict downgraded danger to ${unavailableDanger.key}`);
 assert(unavailableDanger.color === 'danger',
@@ -2888,10 +2914,10 @@ assert(unavailableDanger.desc.includes('assessment failed'),
 // the separate supervisor fact in its description.
 for (const rawState of ['rate_limited_or_outage', 'errored_fatal']) {
   const rawDanger = hooks.agentStateInfo({
-    health: { state: rawState }, wrapped: true,
-    supervisor_decision: {
-      state: 'PROCESS_TREE_INVALID', action: 'warn_only', reason: 'HOLDING',
-    },
+    ...composedAgent(
+      rawState, 'danger',
+      { state: 'PROCESS_TREE_INVALID', action: 'warn_only', reason: 'HOLDING' },
+      'advisory', 'attention', 'observation'),
   });
   assert(rawDanger.key === rawState, `${rawState} was downgraded to ${rawDanger.key}`);
   assert(rawDanger.color === 'danger', `${rawState} was downgraded to ${rawDanger.color}`);
@@ -2902,11 +2928,77 @@ for (const rawState of ['rate_limited_or_outage', 'errored_fatal']) {
 // wrapper health may remain green, but either HOLD must stay visibly non-green.
 for (const holdState of ['PROCESS_TREE_INVALID', 'PROCESS_TREE_TRUNCATED']) {
   const held = hooks.agentStateInfo({
-    health: { state: 'working_turn' }, wrapped: true,
-    supervisor_decision: { state: holdState, action: 'warn_only', reason: 'HOLDING' },
+    ...composedAgent(
+      'working_turn', 'fine',
+      { state: holdState, action: 'warn_only', reason: 'HOLDING' },
+      'advisory', 'attention', 'supervisor'),
   });
-  assert(held.key === 'supervisor_unconfirmed', `${holdState} must be strict, got ${held.key}`);
+  assert(held.key === 'supervisor_advisory', `${holdState} must be strict, got ${held.key}`);
   assert(held.color === 'attn', `${holdState} must not render green, got ${held.color}`);
+}
+
+// Administrative recovery policy is not liveness evidence.  It may raise
+// attention, but it must never be narrated as a missing/dead child.
+const cooldown = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'RESTART_COOLDOWN', action: 'backoff_wait', reason: 'cooldown active' },
+  'advisory', 'attention', 'supervisor'));
+assert(cooldown.color === 'attn', `cooldown must render attention, got ${cooldown.color}`);
+assert(!cooldown.label.toLowerCase().includes('child'),
+       `cooldown invented child loss in label: ${cooldown.label}`);
+assert(!cooldown.desc.toLowerCase().includes('could not be confirmed'),
+       `cooldown invented child loss in description: ${cooldown.desc}`);
+
+// A stalled child is explicitly live; preserve that producer meaning instead
+// of routing it through a generic dead/unbound bucket.
+const stalled = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'CLI_CHILD_STALLED', action: 'stuck_recover', reason: 'live child stalled' },
+  'live_stalled', 'danger', 'supervisor'));
+assert(stalled.color === 'danger', `stalled child must render danger, got ${stalled.color}`);
+assert(stalled.desc.toLowerCase().includes('stalled'),
+       `stalled-child meaning disappeared: ${stalled.desc}`);
+assert(!stalled.desc.toLowerCase().includes('could not be confirmed'),
+       `live stalled child was described as lost: ${stalled.desc}`);
+
+// Failed turns and confirmed lost bindings retain different producer meanings.
+const failed = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'TURN_FAILED', action: 'none', reason: 'turn outcome failed' },
+  'failed', 'danger', 'supervisor'));
+assert(failed.label === 'Turn failed', `failed-turn meaning disappeared: ${failed.label}`);
+assert(!failed.label.toLowerCase().includes('child'),
+       `failed turn was described as child loss: ${failed.label}`);
+
+const lost = hooks.agentStateInfo(composedAgent(
+  'working_turn', 'fine',
+  { state: 'CLI_CHILD_DEAD', action: 'relaunch', reason: 'binding lost' },
+  'lost_binding', 'danger', 'supervisor'));
+assert(lost.key === 'supervisor_lost_binding', `lost binding key: ${lost.key}`);
+assert(lost.label === 'Child binding lost', `lost binding wording: ${lost.label}`);
+
+// Asset/API version skew remains fail-safe without duplicating Python's state
+// vocabulary. It preserves the raw decision, explicitly says its urgency is
+// unclassified, and never pretends healthy/dead/advisory semantics are known.
+for (const legacyDecision of [
+  { state: 'HEALTHY_WORKING', action: 'none', reason: 'bound' },
+  { state: 'LAUNCHING', action: 'none', reason: 'launch grace' },
+  { state: 'CLI_CHILD_DEAD', action: 'relaunch', reason: 'producer says dead' },
+  { state: 'RESTART_COOLDOWN', action: 'backoff_wait', reason: 'cooldown' },
+]) {
+  const legacy = hooks.agentStateInfo({
+    health: { state: 'working_turn' }, wrapped: true,
+    supervisor_decision: legacyDecision,
+  });
+  assert(legacy.color === 'attn', `legacy strict fact disappeared: ${legacy.color}`);
+  assert(legacy.label === 'Verdict unclassified',
+         `legacy state was falsely classified: ${legacy.label}`);
+  assert(legacy.desc.includes('urgency classification unavailable'),
+         `missing classification gap: ${legacy.desc}`);
+  assert(legacy.desc.includes(legacyDecision.state),
+         `raw decision disappeared: ${legacy.desc}`);
+  assert(!legacy.desc.toLowerCase().includes('binding lost'),
+         `legacy fallback invented lost-binding semantics: ${legacy.desc}`);
 }
 
 // No supervisor_decision at all (unwrapped / no supervisor configured) is
@@ -4471,7 +4563,8 @@ def test_api_state_new_agent_fields_absent_when_no_data(tmp_path: Path) -> None:
         for agent in root["agents"]:
             for absent in ("capacity", "cli", "wrapped", "restartable",
                            "owned_domains", "task", "health_timeline",
-                           "supervisor_decision", "wrapper_child"):
+                           "supervisor_decision", "health_composition",
+                           "wrapper_child"):
                 assert absent not in agent, absent
         _assert_no_body_keys(_state(base))
     finally:
@@ -4522,6 +4615,10 @@ def test_api_state_supervisor_decision_surfaces_strict_verdict_over_self_report(
             "state": "CLI_CHILD_UNKNOWN", "action": "none",
             "reason": "wrapper runtime could not be bound",
         }
+        assert alpha["health_composition"]["urgency"] == "danger"
+        assert alpha["health_composition"]["primary_source"] == "supervisor"
+        assert alpha["health_composition"]["observation"]["state"] == "working_turn"
+        assert alpha["health_composition"]["supervisor"]["kind"] == "unconfirmed"
         assert alpha["wrapper_child"]["phase"] == "active"
         assert alpha["wrapper_child"]["progress_age_seconds"] >= 599.0
     finally:
@@ -4640,6 +4737,13 @@ def test_api_state_supervisor_decision_unavailable_for_non_auto_restart_wrapped_
         alpha = next(a for a in root["agents"] if a["name"] == "alpha")
         assert alpha.get("supervisor_decision_unavailable") is True
         assert alpha.get("supervisor_decision_unavailable_reason") == "auto_restart_disabled"
+        assert alpha["health_composition"]["urgency"] == "attention"
+        assert alpha["health_composition"]["supervisor"] == {
+            "source": "supervisor_decision",
+            "kind": "unavailable",
+            "reason": "auto_restart_disabled",
+            "urgency": "attention",
+        }
         assert "supervisor_decision" not in alpha
     finally:
         srv.shutdown()
@@ -4682,6 +4786,10 @@ def test_api_state_supervisor_decision_unavailable_for_every_wrapped_agent_on_ob
             "supervisor_decision_unavailable_reason") == "assessment_failed"
         assert by_name["beta"].get(
             "supervisor_decision_unavailable_reason") == "assessment_failed"
+        assert by_name["alpha"]["health_composition"]["supervisor"][
+            "reason"] == "assessment_failed"
+        assert by_name["beta"]["health_composition"]["supervisor"][
+            "reason"] == "assessment_failed"
         assert "supervisor_decision" not in by_name["alpha"]
         assert "supervisor_decision" not in by_name["beta"]
     finally:

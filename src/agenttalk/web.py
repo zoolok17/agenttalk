@@ -121,6 +121,7 @@ from agenttalk import health as _health
 from agenttalk import knowledge as _knowledge
 from agenttalk import lesson_context as _lesson_context
 from agenttalk import onboarding as _onboarding
+from agenttalk import operator_health as _operator_health
 from agenttalk import signing as _signing
 from agenttalk import supervisor as _supervisor
 from agenttalk import threads as th
@@ -1552,6 +1553,10 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     which no decision could be computed to a stable reason code. The API keeps
     the existing boolean and adds the reason so the console can distinguish a
     disabled verdict from a failed assessment.
+
+    ``health_composition``: an additive, presentation-only composition of the
+    two source-labelled facts.  Raw ``health`` and ``supervisor_decision`` stay
+    unchanged; the console consumes the shared urgency/provenance contract.
     """
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
@@ -1650,6 +1655,8 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                 "action": decision.get("action"),
                 "reason": decision.get("reason"),
             }
+            e["health_composition"] = _operator_health.compose_health_evidence(
+                health.get("state"), decision=e["supervisor_decision"])
         elif a in decision_unavailable:
             # A wrapped agent this supervisor cannot compute a strict decision
             # for (e.g. not configured auto_restart) — say so visibly, as
@@ -1657,6 +1664,8 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
             # showing only the self-report.
             e["supervisor_decision_unavailable"] = True
             e["supervisor_decision_unavailable_reason"] = decision_unavailable[a]
+            e["health_composition"] = _operator_health.compose_health_evidence(
+                health.get("state"), unavailable_reason=decision_unavailable[a])
         # wrapper_child: the raw wrapper-runtime observation (phase +
         # last_progress_at age) — the cheapest "is the counter frozen" signal,
         # independent of any verdict. Absent when no runtime record exists.

@@ -23,6 +23,7 @@ from pathlib import Path
 from agenttalk import __version__
 from agenttalk import codex_config as cxc
 from agenttalk import install_skills as iskl
+from agenttalk import operator_health
 from agenttalk import signing as _signing
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
@@ -1784,10 +1785,6 @@ def _check_heartbeats(store: Store) -> list[Check]:
     return out
 
 
-_HEALTHY_DECISION_STATES = sup.HEALTHY_DECISION_STATES | sup.GRACE_DECISION_STATES
-_SELF_REPORT_LOOKS_FINE = frozenset({"idle_waiting", "working_turn"})
-
-
 def _check_wrapper_child_health(store: Store) -> list[Check]:
     """One check per wrapped agent — does the SUPERVISOR's strict verdict agree
     with the wrapper's own self-report, and is progress actually moving?
@@ -1807,6 +1804,7 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
     sup_path = store.dir / "supervisor.json"
     if not sup_path.exists():
         return []
+    assessment_problem: str | None = None
     try:
         sup_cfg = sup.load_supervisor_config(sup_path)
     except (ValueError, OSError):
@@ -1840,17 +1838,20 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
             a["name"]: a for a in obs.get("agents", []) if isinstance(a, dict)
         }
     except Exception as exc:  # noqa: BLE001 - doctor stays fail-safe
-        return [Check(
-            name="wrapper_child_health",
-            status="warn",
-            details=f"could not compute the supervisor's decision: "
-                    f"{type(exc).__name__}: {exc}",
-        )]
+        # Unavailable evidence composes with EACH wrapped agent's observation.
+        # A global warning would lose a persisted degraded/error report.
+        obs_by_name = {}
+        assessment_problem = (
+            "could not compute the supervisor's decision: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
     out: list[Check] = []
     for name in wrapped_names:
         item = obs_by_name.get(name) or {}
         health = item.get("health") if isinstance(item.get("health"), dict) else {}
+        if not health:
+            health = store.read_health(name, now_epoch=now_epoch)
         self_state = health.get("state", "unknown")
         self_age = health.get("age_seconds")
         self_age_str = f"{self_age:.0f}s" if isinstance(self_age, (int, float)) else "n/a"
@@ -1870,48 +1871,53 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
             )
 
         decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
+        cfg_agent = sup_agents.get(name) if isinstance(sup_agents.get(name), dict) else {}
+        unavailable_reason: str | None = None
         if decision is None:
-            out.append(Check(
-                name=f"wrapper_child_health.{name}",
-                status="warn",
-                details=(
-                    f"self-reported health={self_state} (age={self_age_str}){progress_bit}; "
-                    "no supervisor decision is available for this agent (it is not "
-                    "configured auto_restart, so the strict CLI-child-bound verdict "
-                    "cannot be computed here — this is the wrapper's own self-report only)"
-                ),
-            ))
-            continue
-
-        d_state = decision.get("state")
-        d_action = decision.get("action")
-        d_reason = decision.get("reason") or ""
-        # `action` is a RECOVERY-INTENT signal, not a severity signal: backoff_wait
-        # (cooldown), suspect_warn (rate-limited, unconfirmed), refuse_protected
-        # (administrative refusal of a manual restart) etc. all pair with states
-        # OUTSIDE the confirmed-dead family and must not be escalated to `error`
-        # just for existing — that made a normal RESTART_COOLDOWN/backoff_wait or
-        # ACTIVE_OR_BUSY/suspect_warn cry wolf. `error` is reserved for the state
-        # itself being in the confirmed unbound/dead family (RELAUNCH/STUCK_RECOVER
-        # already pair with such a state, so this loses no real severity).
-        if d_state in _HEALTHY_DECISION_STATES:
-            status = "ok"
-        elif d_state in sup.UNBOUND_OR_DEAD_DECISION_STATES:
-            status = "error"
+            if assessment_problem is not None:
+                unavailable_reason = "assessment_failed"
+            elif cfg_agent.get("auto_restart") is not True:
+                unavailable_reason = "auto_restart_disabled"
+            else:
+                unavailable_reason = "decision_missing"
+        composition = operator_health.compose_health_evidence(
+            self_state,
+            decision=decision,
+            unavailable_reason=unavailable_reason,
+        )
+        status = operator_health.doctor_status(composition)
+        self_fact = (
+            f"self-reported health={self_state} (age={self_age_str}){progress_bit}"
+        )
+        d_reason = ""
+        if decision is not None:
+            d_state = decision.get("state")
+            d_action = decision.get("action")
+            d_reason = decision.get("reason") or ""
+            supervisor_fact = f"supervisor={d_state}/{d_action} ({d_reason})"
         else:
-            status = "warn"
-        mismatch = ""
-        if status != "ok" and self_state in _SELF_REPORT_LOOKS_FINE:
-            mismatch = " [DISAGREEMENT: self-report looks fine, supervisor verdict does not]"
+            supervisor_fact = f"supervisor=UNAVAILABLE({unavailable_reason})"
+            if assessment_problem is not None:
+                supervisor_fact += f" ({assessment_problem})"
+            else:
+                supervisor_fact += " (no supervisor decision is available for this agent)"
+        facts = (
+            (self_fact, supervisor_fact)
+            if composition["primary_source"] == "observation"
+            else (supervisor_fact, self_fact)
+        )
+        mismatch = (
+            " [DISAGREEMENT: wrapper observation and supervisor evidence have "
+            "different urgency]"
+            if composition["disagreement"]
+            else ""
+        )
         out.append(Check(
             name=f"wrapper_child_health.{name}",
             status=status,
-            details=(
-                f"supervisor={d_state}/{d_action} ({d_reason}); "
-                f"self-reported health={self_state} (age={self_age_str})"
-                f"{progress_bit}{mismatch}"
-            ),
-            fix=d_reason if status != "ok" else "",
+            details=f"{facts[0]}; {facts[1]}{mismatch}",
+            fix=(d_reason if status != "ok" and
+                 composition["primary_source"] == "supervisor" else ""),
         ))
     return out
 

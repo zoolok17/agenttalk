@@ -204,6 +204,43 @@ def test_check_wrapper_child_health_no_false_down_when_healthy(
     assert "DISAGREEMENT" not in checks[0].details
 
 
+def test_check_wrapper_child_health_healthy_decision_preserves_degraded_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful turn cannot overwrite the wrapper's persisted degraded
+    output observation.  The two facts disagree, and the maximum urgency wins."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    now_iso = _now_iso()
+    store.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_DEGRADED_OUTPUT, updated_at=now_iso, since=now_iso,
+        reason_code="degraded_output_detected",
+    ))
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", lambda *_a, **_k: {
+        "agents": [{
+            "name": "alpha",
+            "health": {"state": "degraded_output", "age_seconds": 1.0},
+            "decision": {
+                "state": "HEALTHY_WORKING", "action": "none", "reason": "turn succeeded",
+            },
+        }],
+    })
+
+    (check,) = doctor._check_wrapper_child_health(store)
+
+    assert check.status == "error"
+    assert check.details.startswith("self-reported health=degraded_output")
+    assert "degraded_output" in check.details
+    assert "HEALTHY_WORKING" in check.details
+    assert "DISAGREEMENT" in check.details
+
+
 @pytest.mark.parametrize("grace_state", ["CLI_CHILD_STARTING", "LAUNCHING"])
 def test_check_wrapper_child_health_no_false_down_for_grace_states(
     tmp_path: Path,

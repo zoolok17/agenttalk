@@ -449,83 +449,113 @@
     var age = Number(agent && agent.last_seen_age_seconds);
     return Number.isFinite(age) && age >= 0 && age <= UNWRAPPED_LIVE_STALE_AFTER_SECONDS;
   }
-  // decision.state operator-surface classification (#105) - MUST mirror
-  // supervisor.py's HEALTHY_DECISION_STATES / GRACE_DECISION_STATES /
-  // UNBOUND_OR_DEAD_DECISION_STATES (Python is the source of truth; this is
-  // the browser-side render of the same vocabulary).
-  var SUP_HEALTHY_STATES = nullMap({ HEALTHY_IDLE: 1, HEALTHY_WORKING: 1 });
-  var SUP_GRACE_STATES = nullMap({ CLI_CHILD_STARTING: 1, LAUNCHING: 1 });
-  // CLI_CHILD_MISSING is deliberately excluded - it is the provisional
-  // first-poll state of the supervisor's two-poll confirmation policy, not a
-  // confirmed-dead state (mirrors supervisor.py's own exclusion).
-  var SUP_UNBOUND_OR_DEAD_STATES = nullMap({
-    CLI_CHILD_UNKNOWN: 1, CLI_CHILD_DEAD: 1, CLI_CHILD_STALLED: 1,
-    CLI_CHILD_NO_PROGRESS: 1, STUCK_OR_DEAD: 1,
-    WRAPPER_MISSING: 1, TURN_FAILED: 1, READINESS_GAVE_UP: 1,
-  });
+  var OPERATOR_URGENCY_RANK = nullMap({ fine: 0, unknown: 1, attention: 2, danger: 3 });
+  function observationUrgency(info) {
+    if (info.color === 'danger') return 'danger';
+    if (info.key === 'unknown') return 'unknown';
+    if (info.grp === 'attn') return 'attention';
+    return 'fine';
+  }
+  function legacyHealthComposition(agent, raw, info) {
+    // API/asset skew fallback: old API payloads do not carry the shared Python
+    // classification. Keep each independent strict fact visibly non-green,
+    // but never invent child-loss semantics from an unclassified token.
+    var observation = {
+      source: 'wrapper_health', state: raw || 'unknown', urgency: observationUrgency(info),
+    };
+    var supervisor = null;
+    var decision = agent && agent.supervisor_decision;
+    if (decision && typeof decision === 'object') {
+      supervisor = {
+        source: 'supervisor_decision', kind: 'unclassified', state: decision.state,
+        action: decision.action, reason: decision.reason, urgency: 'attention',
+        classification_reason: 'composition_missing',
+      };
+    } else if (agent && agent.supervisor_decision_unavailable === true) {
+      supervisor = {
+        source: 'supervisor_decision', kind: 'unavailable',
+        reason: agent.supervisor_decision_unavailable_reason || 'decision_missing',
+        urgency: 'attention',
+      };
+    }
+    if (!supervisor) return null;
+    var supervisorWins = OPERATOR_URGENCY_RANK[supervisor.urgency] >
+      OPERATOR_URGENCY_RANK[observation.urgency];
+    return {
+      observation: observation,
+      supervisor: supervisor,
+      urgency: supervisorWins ? supervisor.urgency : observation.urgency,
+      primary_source: supervisorWins ? 'supervisor' : 'observation',
+      disagreement: supervisor.urgency !== observation.urgency,
+    };
+  }
+  function supervisorFactSummary(fact) {
+    if (fact.kind === 'unclassified') {
+      return 'Supervisor decision (urgency classification unavailable): ' +
+        (fact.state || 'unknown') +
+        (fact.action ? '/' + fact.action : '') +
+        (fact.reason ? ' (' + fact.reason + ')' : '');
+    }
+    if (fact.kind === 'unavailable') {
+      if (fact.reason === 'auto_restart_disabled') {
+        return 'Supervisor verdict unavailable: auto-restart is disabled';
+      }
+      if (fact.reason === 'assessment_failed') {
+        return 'Supervisor verdict unavailable: assessment failed';
+      }
+      if (fact.reason === 'decision_missing') {
+        return 'Supervisor verdict unavailable: assessment returned no decision';
+      }
+      return 'Supervisor verdict unavailable: ' + (fact.reason || 'reason unknown');
+    }
+    return 'Supervisor verdict: ' + (fact.state || 'unknown') +
+      (fact.action ? '/' + fact.action : '') +
+      (fact.reason ? ' (' + fact.reason + ')' : '');
+  }
+  function supervisorPresentation(fact, observation, observationInfo) {
+    var label = 'Supervisor: ' + (fact.state || 'unknown');
+    var key = fact.urgency === 'danger' ? 'supervisor_alert' : 'supervisor_advisory';
+    if (fact.kind === 'unavailable') {
+      label = 'No verdict';
+      key = 'supervisor_unavailable';
+    } else if (fact.kind === 'unclassified') {
+      label = 'Verdict unclassified';
+    } else if (fact.kind === 'lost_binding') {
+      label = 'Child binding lost';
+      key = 'supervisor_lost_binding';
+    } else if (fact.kind === 'live_stalled') {
+      label = 'Child stalled';
+    } else if (fact.kind === 'failed') {
+      label = 'Turn failed';
+    }
+    return {
+      label: label,
+      key: key,
+      color: fact.urgency === 'danger' ? 'danger' : 'attn',
+      grp: 'attn',
+      desc: supervisorFactSummary(fact) + ' · Wrapper observation: ' +
+        (observation.state || 'unknown') + ' (' + observationInfo.desc + ')',
+      healthComposition: { observation: observation, supervisor: fact },
+    };
+  }
   function agentStateInfo(agent) {
     var raw = ((agent && agent.health) || {}).state;
     var info = stateInfo(raw);
     if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
       info = { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true, desc: 'Alive and checking in, but not running under the supervisor' };
     }
-    // The supervisor's strict, positively-bound decision is a SEPARATE fact
-    // from the wrapper's self-report above (`info`) - never let a cheerful
-    // self-report hide a confirmed-bad verdict. Grace states (CLI_CHILD_
-    // STARTING / LAUNCHING) and the two HEALTHY_* states never override.
-    var decision = agent && agent.supervisor_decision;
-    if (decision && typeof decision === 'object') {
-      var dstate = decision.state;
-      if (!SUP_HEALTHY_STATES[dstate] && !SUP_GRACE_STATES[dstate]) {
-        var isDead = !!SUP_UNBOUND_OR_DEAD_STATES[dstate];
-        var verdictSummary = 'Supervisor verdict: ' + (dstate || 'unknown') +
-          (decision.reason ? ' (' + decision.reason + ')' : '');
-        // A non-dead/advisory verdict is attention-level. It must not soften
-        // an already-dangerous wrapper report; keep the worse presentation
-        // while retaining the separate strict fact in its description.
-        if (!isDead && info.color === 'danger') {
-          info.desc += ' · ' + verdictSummary;
-          info.supervisorDecision = decision;
-          return info;
-        }
-        return {
-          label: isDead ? 'Child unconfirmed' : 'Supervisor: ' + (dstate || 'unknown'),
-          key: isDead ? 'supervisor_unbound' : 'supervisor_unconfirmed',
-          color: isDead ? 'danger' : 'attn',
-          grp: 'attn',
-          desc: verdictSummary + ' — self-report says "' + info.label +
-                '", but the CLI child ' +
-                'could not be confirmed',
-          selfReport: info,
-        };
-      }
-    } else if (agent && agent.supervisor_decision_unavailable === true) {
-      var unavailableReason = agent.supervisor_decision_unavailable_reason;
-      var unavailableDesc = unavailableReason === 'auto_restart_disabled'
-        ? 'Wrapped, but the supervisor has no computable verdict for this agent ' +
-          '(not configured auto_restart)'
-        : unavailableReason === 'assessment_failed'
-          ? 'Wrapped, but the supervisor assessment failed, so no verdict is available'
-          : unavailableReason === 'decision_missing'
-            ? 'Wrapped, but the supervisor returned no decision for this agent'
-            : 'Wrapped, but no supervisor verdict is available (reason unknown)';
-      // Unavailability is attention-level evidence, not permission to soften
-      // an already-dangerous self-report. Keep the worse presentation and
-      // append why the independent strict fact could not be computed.
-      if (info.color === 'danger') {
-        info.desc += ' · ' + unavailableDesc;
-        info.supervisorDecisionUnavailableReason = unavailableReason;
-        return info;
-      }
-      return {
-        label: 'No verdict',
-        key: 'supervisor_unavailable',
-        color: 'attn',
-        grp: 'attn',
-        desc: unavailableDesc + ' — self-report only: "' + info.label + '"',
-        selfReport: info,
-      };
+    var composition = agent && agent.health_composition;
+    if (!composition || typeof composition !== 'object' ||
+        !composition.observation || !composition.supervisor) {
+      composition = legacyHealthComposition(agent, raw, info);
     }
+    if (!composition) return info;
+    var supervisor = composition.supervisor;
+    if (composition.primary_source === 'supervisor') {
+      return supervisorPresentation(supervisor, composition.observation, info);
+    }
+    info.desc += ' · ' + supervisorFactSummary(supervisor);
+    info.healthComposition = composition;
     return info;
   }
   function stateInfoFrom(value) {

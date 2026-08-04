@@ -56,6 +56,7 @@ from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
 from agenttalk import lead_loop_runtime
 from agenttalk import onboarding as ob
+from agenttalk import operator_health
 from agenttalk import signing as _signing
 from agenttalk import threads as th
 from agenttalk import supervisor as sup
@@ -600,22 +601,28 @@ def _gather_status(store: Store) -> dict:
             decision = sup_row.get("decision")
             if isinstance(decision, dict):
                 row["supervisor"] = {"decision": decision}
-                # Never let the two verdicts silently disagree in favour of the
-                # cheerful one: additive flag, present only when the wrapper's
-                # own self-report still reads "fine" while the supervisor's
-                # strict, positively-bound verdict does not.
-                if (
-                    cfg_agent.get("wrapped") is True
-                    and decision.get("state") not in
-                    (sup.HEALTHY_DECISION_STATES | sup.GRACE_DECISION_STATES)
-                    and health.get("state") in ("idle_waiting", "working_turn")
-                ):
-                    row["supervisor"]["disagreement"] = True
+                if cfg_agent.get("wrapped") is True:
+                    composition = operator_health.compose_health_evidence(
+                        health.get("state"), decision=decision)
+                    row["health_composition"] = composition
+                    if composition["disagreement"]:
+                        row["supervisor"]["disagreement"] = True
             elif sup_row.get("decision_unavailable") is True:
                 # A wrapped agent this supervisor cannot compute a strict
-                # decision for (e.g. not configured auto_restart) — say so
-                # rather than silently showing only the self-report.
-                row["supervisor"] = {"decision_unavailable": True}
+                # decision for — say why rather than silently showing only the
+                # self-report or assuming every unavailable verdict is disabled.
+                reason = sup_row.get("decision_unavailable_reason")
+                reason = reason if isinstance(reason, str) else "decision_missing"
+                row["supervisor"] = {
+                    "decision_unavailable": True,
+                    "decision_unavailable_reason": reason,
+                }
+                if cfg_agent.get("wrapped") is True:
+                    composition = operator_health.compose_health_evidence(
+                        health.get("state"), unavailable_reason=reason)
+                    row["health_composition"] = composition
+                    if composition["disagreement"]:
+                        row["supervisor"]["disagreement"] = True
             if isinstance(sup_row.get("lead_liveness"), dict):
                 row["lead_liveness"] = sup_row["lead_liveness"]
             effective = sup_row.get("health_effective_state")
@@ -760,6 +767,11 @@ def _read_supervisor_snapshot(store: Store, path_value: str | None = None) -> li
 
 def _status_supervisor_summaries(store: Store, now_epoch: float,
                                  sup_cfg: dict) -> tuple[dict[str, dict], list[str]]:
+    sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
+    wrapped_names = {
+        name for name, cfg_agent in sup_agents.items()
+        if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
+    }
     try:
         obs = sup.build_supervisor_observation(
             store,
@@ -775,12 +787,14 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
             lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )
     except Exception as exc:
-        return {}, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
-    sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
-    wrapped_names = {
-        name for name, cfg_agent in sup_agents.items()
-        if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
-    }
+        rows = {
+            name: {
+                "decision_unavailable": True,
+                "decision_unavailable_reason": "assessment_failed",
+            }
+            for name in wrapped_names
+        }
+        return rows, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
     rows: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -803,6 +817,12 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
             row["decision"] = decision
         elif wrapped_without_decision:
             row["decision_unavailable"] = True
+            cfg_agent = sup_agents.get(name)
+            row["decision_unavailable_reason"] = (
+                "auto_restart_disabled"
+                if isinstance(cfg_agent, dict) and cfg_agent.get("auto_restart") is not True
+                else "decision_missing"
+            )
         if isinstance(effective, str) and effective != raw_state:
             row["health_effective_state"] = effective
         if lead_liveness is not None:
@@ -1321,7 +1341,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             if sv.get("disagreement") is True:
                 seen += " [DISAGREEMENT]"
         elif sv.get("decision_unavailable") is True:
-            seen += " supervisor=UNAVAILABLE(not auto_restart)"
+            reason = sv.get("decision_unavailable_reason") or "decision_missing"
+            seen += f" supervisor=UNAVAILABLE({reason})"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")

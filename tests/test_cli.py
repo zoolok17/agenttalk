@@ -493,6 +493,19 @@ def test_status_supervisor_assessment_fail_safe(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture,
 ) -> None:
+    s = Store(store_root)
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN, updated_at=now_iso, since=now_iso,
+        reason_code="progress_event",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+
     def boom(*_args, **_kwargs):
         raise ValueError("bad supervisor report")
 
@@ -503,6 +516,14 @@ def test_status_supervisor_assessment_fail_safe(
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert "supervisor_assessment_unavailable:ValueError" in payload["warnings"]
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["supervisor"] == {
+        "decision_unavailable": True,
+        "decision_unavailable_reason": "assessment_failed",
+        "disagreement": True,
+    }
+    assert alpha["health_composition"]["urgency"] == "attention"
+    assert alpha["health_composition"]["supervisor"]["reason"] == "assessment_failed"
 
 
 def _fake_decision(state: str, *, action: str = "none",
@@ -704,6 +725,45 @@ def test_status_no_disagreement_flag_for_a_genuinely_healthy_agent(
     assert "[DISAGREEMENT]" not in line
 
 
+def test_status_healthy_decision_does_not_mask_degraded_observation(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z")
+    s = Store(store_root)
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="claude", mode="wrapper-loop",
+        state=hm.STATE_DEGRADED_OUTPUT, updated_at=now_iso, since=now_iso,
+        reason_code="degraded_output_detected",
+    ))
+    (s.dir / "supervisor.json").write_text(json.dumps({
+        "schema_version": 2,
+        "agents": {"alpha": {"wrapped": True, "auto_restart": True}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation",
+                        lambda *_a, **_k: _fake_decision("HEALTHY_WORKING"))
+
+    assert _run(["status", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+
+    assert alpha["health"]["state"] == "degraded_output"
+    assert alpha["health_composition"]["urgency"] == "danger"
+    assert alpha["health_composition"]["primary_source"] == "observation"
+    assert alpha["supervisor"]["disagreement"] is True
+
+    assert _run(["status"], store_root) == 0
+    line = next(
+        line for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("alpha")
+    )
+    assert "health=degraded_output" in line
+    assert "supervisor=HEALTHY_WORKING/none" in line
+    assert "[DISAGREEMENT]" in line
+
+
 @pytest.mark.parametrize("grace_state", ["CLI_CHILD_STARTING", "LAUNCHING"])
 def test_status_no_disagreement_flag_for_grace_states(
     store_root: Path,
@@ -768,12 +828,16 @@ def test_status_flags_decision_unavailable_for_non_auto_restart_wrapped_agent(
     payload = json.loads(capsys.readouterr().out)
     alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
     assert alpha["supervisor"]["decision_unavailable"] is True
+    assert alpha["supervisor"][
+        "decision_unavailable_reason"] == "auto_restart_disabled"
+    assert alpha["health_composition"]["supervisor"][
+        "reason"] == "auto_restart_disabled"
 
     rc = _run(["status"], store_root)
     assert rc == 0
     out = capsys.readouterr().out
     line = next(ln for ln in out.splitlines() if ln.strip().startswith("alpha"))
-    assert "supervisor=UNAVAILABLE" in line, line
+    assert "supervisor=UNAVAILABLE(auto_restart_disabled)" in line, line
 
 
 def test_supervisor_cli_read_fail_safe(
