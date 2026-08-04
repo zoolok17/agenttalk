@@ -12509,6 +12509,13 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         state = _read_state()
         config = _load_supervisor_config(store)
         now = args.now if args.now is not None else time.time()
+        # #163 launch half: a fresh read, mirroring how build_report seeds
+        # the planner's own wrapper_runtime - the barrier's alternative
+        # absence path needs the CURRENT runtime record's own wrapper/CLI
+        # launcher identity, not a proxy for it.
+        barrier_runtime_view = runtime_obs.read_runtime(
+            store.state_dir, args.agent, now_epoch=now,
+        )
         result = sup.evaluate_launch_barrier(
             _read_snapshot_file(args.snapshot_file),
             state,
@@ -12516,6 +12523,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             args.agent,
             root_key=sup._root_key(str(store.root.resolve())),
             request_id=args.request_id,
+            runtime_view=barrier_runtime_view,
         )
         if result.get("blocked") and getattr(args, "record_events", False):
             with contextlib.suppress(Exception):

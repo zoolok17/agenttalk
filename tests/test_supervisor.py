@@ -14578,6 +14578,132 @@ def test_launch_barrier_rejects_nullable_authoritative_tree(
     assert result["survivors"] == []
 
 
+def test_launch_barrier_alternative_path_allows_generation_mismatch_with_empty_snapshot() -> None:
+    """#163 launch half: the barrier's ALTERNATIVE PATH, flagship case.
+    PRIMARY validation fails on generation mismatch (identity-agreement is
+    a liveness PROXY, wrong in the not-yet-adopted state, unchanged and
+    still strict) - the barrier instead proves absence directly, via the
+    identical shared predicate (_no_live_identity_for_launch /
+    _claimed_self_identities) the planner side already uses, and permits
+    the spawn only because nothing this evidence claims is alive anywhere
+    in the snapshot."""
+    placeholder = sup._invalid_owned_process_tree_record(
+        agent="worker", root_key=sup._root_key(TEST_ROOT),
+        wrapper_generation="wrapper-2", launch_nonce=None,
+        now_epoch=NOW,
+        reason_code="process_tree_invalid_generation_adoption_pending",
+    )
+    state = {"agents": {"worker": {
+        "owned_process_tree": placeholder,
+        "runtime_wrapper_generation": "wrapper-1",
+    }}}
+    runtime_view = _wrapper_runtime_view(
+        phase="idle", wrapper_generation="wrapper-2",
+        wrapper_pid=500, wrapper_start=_ps_iso(990000),
+    )
+
+    result = sup.evaluate_launch_barrier(
+        [], state, _WRAP_CONFIG, "worker",
+        root_key=sup._root_key(TEST_ROOT), runtime_view=runtime_view,
+    )
+
+    assert result["allow_launch"] is True
+    assert result["blocked"] is False
+    assert result["survivors"] == []
+
+
+def test_launch_barrier_alternative_path_still_blocks_when_identity_alive() -> None:
+    """Direction control for the alternative path: the SAME generation-
+    mismatch shape, but the runtime record's own claimed wrapper pid is
+    present in the snapshot - the alternative path must not succeed (an
+    existing row at that pid is ambiguous without an exact FILETIME to
+    compare, which the wrapper's own identity never carries, so it fails
+    closed to present), and the barrier must still block exactly as it
+    does today. This is the orphan-hazard direction control, one level
+    down from the planner-side one."""
+    wrapper_start = _ps_iso(990000)
+    placeholder = sup._invalid_owned_process_tree_record(
+        agent="worker", root_key=sup._root_key(TEST_ROOT),
+        wrapper_generation="wrapper-2", launch_nonce=None,
+        now_epoch=NOW,
+        reason_code="process_tree_invalid_generation_adoption_pending",
+    )
+    state = {"agents": {"worker": {
+        "owned_process_tree": placeholder,
+        "runtime_wrapper_generation": "wrapper-1",
+    }}}
+    runtime_view = _wrapper_runtime_view(
+        phase="idle", wrapper_generation="wrapper-2",
+        wrapper_pid=500, wrapper_start=wrapper_start,
+    )
+    alive_row = _proc(500, 1, "python.exe", "python worker.py", wrapper_start)
+
+    result = sup.evaluate_launch_barrier(
+        [alive_row], state, _WRAP_CONFIG, "worker",
+        root_key=sup._root_key(TEST_ROOT), runtime_view=runtime_view,
+    )
+
+    assert result["allow_launch"] is False
+    assert result["blocked"] is True
+
+
+def test_launch_barrier_alternative_path_excludes_corrupted_prior() -> None:
+    """A schema-drifted/corrupted persisted record is excluded from the
+    alternative path entirely - corruption of the current authority is not
+    proof of anything, even with an empty snapshot and a fresh valid
+    runtime record naming a different generation."""
+    state = {"agents": {"worker": {
+        "owned_process_tree": {"not": "the expected schema at all"},
+        "runtime_wrapper_generation": "wrapper-1",
+    }}}
+    runtime_view = _wrapper_runtime_view(
+        phase="idle", wrapper_generation="wrapper-2",
+        wrapper_pid=500, wrapper_start=_ps_iso(990000),
+    )
+
+    result = sup.evaluate_launch_barrier(
+        [], state, _WRAP_CONFIG, "worker",
+        root_key=sup._root_key(TEST_ROOT), runtime_view=runtime_view,
+    )
+
+    assert result["allow_launch"] is False
+    assert result["blocked"] is True
+
+
+def test_launch_barrier_alternative_path_legacy_evidence_requires_empty_snapshot() -> None:
+    """Legacy pre-v2 evidence has no bounded parent graph, so the
+    alternative path requires the WHOLE snapshot empty, not merely the
+    named identities absent - an unrelated-looking live row elsewhere still
+    blocks, mirroring the deep-orphan safety already proven on the planner
+    side (test_owned_process_tree_adopted_generation_missing_record_holds_
+    deep_orphan). The barrier must not be a softer door than the planner."""
+    placeholder = sup._invalid_owned_process_tree_record(
+        agent="worker", root_key=sup._root_key(TEST_ROOT),
+        wrapper_generation=None, launch_nonce=None,
+        now_epoch=NOW, reason_code="process_tree_invalid_legacy_managed_pids",
+    )
+    orphan = _proc(404, 403, "node.exe", "node orphaned-tool.js", _ps_iso(950000))
+    state = {"agents": {"worker": {
+        "owned_process_tree": placeholder,
+        "legacy_process_evidence": {
+            "schema_version": 1, "status": "migration_hold", "limit": 64,
+            "observed_count": 1, "recorded_count": 1, "omitted_count": 0,
+            "truncated": False, "malformed_count": 0, "source_hash": "x",
+            "entries": [
+                {"pid": WRAP_LAUNCHER_PID, "start": WRAP_START, "source": "wrapper"},
+            ],
+        },
+    }}}
+
+    result = sup.evaluate_launch_barrier(
+        [orphan], state, _WRAP_CONFIG, "worker",
+        root_key=sup._root_key(TEST_ROOT),
+    )
+
+    assert result["allow_launch"] is False
+    assert result["blocked"] is True
+
+
 @pytest.mark.parametrize("ephemeral", [False, True])
 def test_launch_barrier_blocks_exact_owned_leaf_survivor(
     ephemeral: bool,
