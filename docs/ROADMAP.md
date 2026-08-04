@@ -235,17 +235,41 @@ survives every restart and code upgrade. Clearing it is per-agent and fully atte
 
 #### v0.82.0 — "the supervisor can see and start the fleet, or says plainly that it cannot" *(runtime)*
 
-**Re-scoped 2026-08-03 on two-host field evidence.** This release was declared as "a wrapped agent never
-dies silently". That is observability polish, and on 2026-08-03 we measured something more basic: after a
-host reboot the supervisor can neither start the fleet nor *see* the fleet an operator starts by hand.
-Nine agents on the maintainers' host and twelve on a second, independent host (different reason code,
-all entry points confirmed on 0.81.0, so not version skew) were recovered only by bypassing the
-supervisor entirely. An agent that never launches cannot die silently. The three deferred items below
-move to v0.83.0.
+**Re-scoped twice. Read this before planning anything in it.**
+
+*2026-08-03:* declared theme was "a wrapped agent never dies silently". Replaced, because after a host
+reboot the supervisor could neither start the fleet nor *see* the fleet an operator starts by hand — nine
+agents on the maintainers' host, twelve on a second independent host (different reason code, all entry
+points confirmed on 0.81.0, so not version skew), both recovered only by bypassing the supervisor. An
+agent that never launches cannot die silently.
+
+*2026-08-04:* the cold-start keystone was **removed from this release** after one attempt, one revert and
+two independent refutations. It is not a small fix, and the reason is structural rather than an
+estimating error:
+
+- The attempt proved absence by ENUMERATING the identities an agent's own records name, then checking
+  each against the live process list. `7de07e4` was merged, turned master red on every platform (one
+  deterministic failure in the ephemeral-reviewer path — a caller nobody had mapped), and was reverted
+  in `627d5ee`.
+- An independent cold review then **reproduced a false absence**: a live same-agent process that the
+  predicate cannot see, because a `TERMINAL`-phase record drops the CLI-launcher identity, and because
+  only rows whose *current direct* parent is a named root are excluded — so a process reparented after
+  its parent exited, or a grandchild, is invisible. The code raises the correct HOLD first and the new
+  predicate then suppresses it.
+- **The method is the defect.** You cannot prove nothing is running by ticking off what you know about;
+  the failure mode is what is missing from the list. No length of list fixes it. A complete ownership
+  proof is required, which is the recovery-authority work — see v0.83.0.
+- Separately: **the actual spawn is not testable today.** It happens entirely inside the generated
+  PowerShell executor; the stub-agent canary drives the *wrapper's* CLI-spawn loop and never the
+  supervisor's launch step. So a fix to this path currently has no way to demonstrate that an agent
+  actually starts. Extracting that spawn step to a testable seam is a prerequisite, not a nicety.
+
+What ships here instead is the honest subset: three items that are converging, plus a replacement for the
+keystone that improves availability **without** authorising any launch.
 
 | Item | What |
 |---|---|
-| **Cold start and adoption** *(keystone)* | Two claims, the second worse. (a) `PROCESS_TREE_INVALID` yields `action=warn_only`, which pre-empts the LAUNCH decision — measured across 20+ polls with zero launches, and an explicit `request-restart` was accepted with "the supervisor will relaunch it" and did not. A HOLD is *teardown* authority; it has no bearing on starting a process that does not exist. (b) `generation_adoption_pending` never resolves: four hand-launched wrappers that heartbeat, completed real turns and replied on the bus still read `observed_count=0, launched=false` after 40 minutes. Adoption must be reachable from observing the live process graph, not only from a launch the supervisor performed itself, and any state whose name promises a transition needs a bounded deadline that escalates. Regression test at *fleet* level: cold host, stale invalid records on disk, plus one hand-started wrapper — every agent launches and the running one is adopted. |
+| **Refuse loudly, with a remedy that works** *(keystone replacement)* | The worst property of the cold-start defect is not that automation declines to act — it is that the refusal is silent and the printed remedy does not run. Measured: 20+ polls producing `warn_only` and nothing else; an explicit `request-restart` accepted with "the supervisor will relaunch it" that relaunched nothing; a remedy naming `--reset-process-tree-ownership`, which for one of the nine self-reported that it would refuse, and which requires attesting there is no live supervisor while the supervisor is running. Fix the *communication*, not the authority: when the supervisor will not start an agent, say so once per agent as an operator-visible attention item, state which specific evidence is missing, and print only commands whose preconditions currently hold — or say plainly that no scripted remedy applies. Turns an indefinite silent wait into one actionable step. Authorises nothing new, so it needs no ownership proof. |
 | Strict health reaches operator surfaces | The strict child verdict never reached `status`, `doctor` or the console, so a wrapper with a dead child reads green. A verdict must not be presented where an observation belongs. **Implemented in PR #100** with a shared two-poll freshness allowance across status/doctor/web; ships with this theme rather than anchoring a different one. |
 | Wrapper capture on every launch path | The #117 bounded stdout/stderr capture is wired into the *generated PowerShell launcher*, not the wrapper, so a wrapper started any other way — including the only working recovery for the keystone above — produces no log at all. Confirmed on both hosts, for healthy and failing agents alike. Its log root is also a hashed path (`%LOCALAPPDATA%\agenttalk\wrapper-logs\<project-hash>\agent-<hash>\`) that no document names and no command prints. Move the capture into the wrapper's own startup and expose the resolved root. |
 | Instance-marker honesty | Stale singleton markers are chronic, not incidental: five quarantines on one host since 2026-07-16. Ctrl-C on `agenttalk start` is not a stop and nothing says so; the orphan keeps the lock, the next `start` prints a success line for a pid that never existed, and the resulting process stays alive writing no state, snapshot or events because it never won the claim. Detect a marker whose holder is dead or parentless, name `--repair-instance-marker`, and never print a pid that was not verified to exist. |
@@ -265,6 +289,8 @@ call belongs to whoever scopes v0.83.0, not to this note.
 | Item | What |
 |---|---|
 | Define + gate the recovery-actually-recovers invariant | The umbrella. Recovery currently *attempts* and reports success while nothing recovers. Make the invariant explicit and gated. Its first falsifiable entry is now measured rather than hypothetical: a supervisor that polls twenty times, reports `warn_only`, accepts an explicit restart request, and launches nothing, while its own record says the wrapper is absent. |
+| **Complete ownership proof** *(moved here from v0.82.0 on 2026-08-04)* | The cold-start fix belongs to this release, not an earlier one, because it needs what this release is for. Enumerating known identities cannot establish absence — reproduced: a reparented live process, and a grandchild whose intermediate parent exited, are both invisible to an identity list, and a `TERMINAL`-phase record silently drops the launcher identity. Recovery may only launch when absence rests on a complete ownership account of the current process graph, not on a list of names the records happen to carry. Until then the supervisor must keep refusing — see v0.82.0's loud-refusal item for the interim operator experience. |
+| **A testable spawn seam** *(prerequisite, found 2026-08-04)* | The supervisor's actual process launch lives entirely inside the generated PowerShell executor, and no existing harness reaches it: the stub-agent canary drives the *wrapper's* CLI-spawn loop instead. So no fix to the launch path can currently demonstrate that an agent starts. Extract the spawn step behind a seam that a test can drive and observe (exactly one replacement process, reaching readiness, exact identity, no duplicate, no kill, exact cleanup). Build this BEFORE the ownership proof, because otherwise its acceptance test cannot exist. Two changes in two days were shipped or nearly shipped on tests that could not reach the behaviour they claimed to cover; this closes that channel. |
 | Gate execution outside the turn envelope | Running the project's own gate inside a wrapped turn *guarantees* a watchdog kill: the source pytest leg caps at 2700s while the watchdog tolerates a 600s tool descendant inside a 1800s turn. The practice half (targeted tests in-turn, CI as the gate) is already in force; this ships the durable half — an owned, bounded, start-guarded detached runner that outlives the turn and writes SHA-bound evidence. |
 | Same-message livelock visibility | A message whose processing wedges the wrapper is retried forever, and every later instruction — including the one that would fix it — is starved behind it. The runtime record already carries `message_id`; nothing compares it across turns. Surface consecutive same-message turn starts, and park a repeatedly-wedging message rather than starving the queue. Deferred from v0.82.0: it cannot bite an agent that never launches. |
 | Provision the `.agenttalk/` ignore rule | `ASSURANCE.md` asserts the state directory is gitignored as a *structural* property, but nothing provisions the rule on `init`. Deferred from v0.82.0. |
