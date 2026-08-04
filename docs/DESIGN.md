@@ -339,21 +339,29 @@ two parallel ownership concepts.
   exited observations are `attention`; rate-limit/outage, degraded-output, and
   ambiguous/fatal-error observations are `danger`. Supervisor healthy and grace
   decisions are `fine`; administrative, cooldown, and provisional decisions
-  are `attention`; live-stalled/no-progress, failed-turn/readiness,
-  unconfirmed/stuck-or-dead, and positively lost-binding decisions are
-  `danger`; unavailable evidence is `attention` and never healthy.
+  are `attention`; live-stalled/no-progress, failed-turn, launch-readiness
+  exhaustion, unconfirmed/stuck-or-dead, and positively lost-binding decisions
+  are distinct `danger` facts; unavailable evidence is `attention` and never
+  healthy.
 
   On an equal-urgency tie the observation supplies primary wording, and every
   presentation appends the other fact with its source. Healthy and grace
   decisions never erase a concerning or unknown observation; a supervisor
   `action` describes recovery intent, not severity; child-loss wording is used
   only when the producer state actually establishes lost binding.
-  Administrative decisions, cooldown, a live stalled/no-progress child, and a
-  failed turn retain those meanings rather than entering one dead/not-dead
-  bucket. Projection and rendering compose facts only; they do not change
-  supervisor decisions or owned-tree predicates. Cross-product expectations
-  derive from these clauses, independently of implementation; downgrade and
-  dropped-unavailable mutations must make named cells fail.
+  Administrative decisions, cooldown, a live stalled/no-progress child, a
+  failed turn, and exhausted launch readiness retain those meanings rather
+  than entering one dead/not-dead bucket. Before composition, every operator
+  surface normalizes wrapper health through one configured path: one sample
+  time and heartbeat read feed the same per-agent/global TTL and heartbeat-skew
+  policy into the health reader. A missing supervisor configuration selects
+  documented defaults; an existing but unreadable configuration makes that
+  timing policy explicitly unavailable, so surfaces report `unknown` rather
+  than silently guessing with defaults. Projection and rendering compose facts
+  only; they do not change supervisor decisions or owned-tree predicates.
+  Cross-product expectations derive from these clauses, independently of
+  implementation; downgrade and dropped-unavailable mutations must make named
+  cells fail.
 - **Why:** real hangs and resume-wake churn happened in the field. A wrapper
   can keep heartbeating after its CLI child dies or wedges, so heartbeat alone
   cannot authorize wrapped health. Strict turn lifecycle plus real child/progress

@@ -1804,11 +1804,19 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
     sup_path = store.dir / "supervisor.json"
     if not sup_path.exists():
         return []
+    health_policy = operator_health.load_health_timing_policy(store)
+    if health_policy.unavailable_reason is not None:
+        return [Check(
+            name="wrapper_child_health.supervisor_config",
+            status="warn",
+            details=(
+                "supervisor health timing policy is unavailable; "
+                "wrapper observations cannot be freshness-checked"
+            ),
+            fix="repair .agenttalk/supervisor.json",
+        )]
     assessment_problem: str | None = None
-    try:
-        sup_cfg = sup.load_supervisor_config(sup_path)
-    except (ValueError, OSError):
-        return []
+    sup_cfg = health_policy.config
     sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
     wrapped_names = [
         name for name, cfg_agent in sup_agents.items()
@@ -1849,9 +1857,15 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
     out: list[Check] = []
     for name in wrapped_names:
         item = obs_by_name.get(name) or {}
+        cfg_agent = sup_agents.get(name) if isinstance(sup_agents.get(name), dict) else {}
         health = item.get("health") if isinstance(item.get("health"), dict) else {}
         if not health:
-            health = store.read_health(name, now_epoch=now_epoch)
+            health = operator_health.read_health_observation(
+                store,
+                name,
+                now_epoch=now_epoch,
+                health_policy=health_policy,
+            ).health
         self_state = health.get("state", "unknown")
         self_age = health.get("age_seconds")
         self_age_str = f"{self_age:.0f}s" if isinstance(self_age, (int, float)) else "n/a"
@@ -1871,7 +1885,6 @@ def _check_wrapper_child_health(store: Store) -> list[Check]:
             )
 
         decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
-        cfg_agent = sup_agents.get(name) if isinstance(sup_agents.get(name), dict) else {}
         unavailable_reason: str | None = None
         if decision is None:
             if assessment_problem is not None:

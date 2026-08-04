@@ -527,6 +527,8 @@
       label = 'Child stalled';
     } else if (fact.kind === 'failed') {
       label = 'Turn failed';
+    } else if (fact.kind === 'readiness_exhausted') {
+      label = 'Readiness retries exhausted';
     }
     return {
       label: label,
@@ -539,15 +541,22 @@
     };
   }
   function agentStateInfo(agent) {
-    var raw = ((agent && agent.health) || {}).state;
+    var health = (agent && agent.health) || {};
+    var raw = health.state;
     var info = stateInfo(raw);
-    if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
-      info = { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true, desc: 'Alive and checking in, but not running under the supervisor' };
-    }
     var composition = agent && agent.health_composition;
     if (!composition || typeof composition !== 'object' ||
         !composition.observation || !composition.supervisor) {
       composition = legacyHealthComposition(agent, raw, info);
+    }
+    if (info.key === 'unknown' && freshHeartbeat(agent) && agent) {
+      if (!composition && agent.wrapped !== true &&
+          health.reason_code !== 'health_timing_policy_unavailable') {
+        info = { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true, desc: 'Alive and checking in, but not running under the supervisor' };
+      } else {
+        var healthReason = health.reason_code ? ' (' + health.reason_code + ')' : '';
+        info = { label: 'Unknown', key: 'unknown', color: 'gray', grp: 'unknown', desc: 'Wrapper health is unknown' + healthReason + ' despite a recent heartbeat' };
+      }
     }
     if (!composition) return info;
     var supervisor = composition.supervisor;

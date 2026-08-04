@@ -845,12 +845,17 @@ def status_payload(store: Store) -> dict:
     health = _signing.inspect_key(store.project_id(), store.root)
     now = datetime.now(timezone.utc).timestamp()
     agents = cfg.get("agents", []) or []
+    health_policy = _operator_health.load_health_timing_policy(store)
     agent_health = {}
     for a in agents:
         if not isinstance(a, str):
             continue
-        hb = store.read_heartbeat(a)
-        agent_health[a] = store.read_health(a, now_epoch=now, heartbeat=hb)
+        agent_health[a] = _operator_health.read_health_observation(
+            store,
+            a,
+            now_epoch=now,
+            health_policy=health_policy,
+        ).health
     return {
         "agenttalk_version": __version__,
         "project_root": str(store.root),
@@ -1443,8 +1448,15 @@ class HealthTimelineRing:
             return []
 
 
-def _supervisor_decisions(store: Store, *,
-                          now_epoch: float) -> tuple[dict[str, dict], dict[str, str]]:
+def _supervisor_decisions(
+    store: Store,
+    *,
+    now_epoch: float,
+) -> tuple[
+    dict[str, dict],
+    dict[str, str],
+    _operator_health.HealthTimingPolicy,
+]:
     """The live supervisor decision per wrapped agent (best-effort, read-only).
 
     This is the STRICT verdict (e.g. ``CLI_CHILD_UNKNOWN``) — distinct from the
@@ -1454,7 +1466,8 @@ def _supervisor_decisions(store: Store, *,
     `agenttalk status`; empty (never raises) when no supervisor is configured
     or the read fails, so a root with no supervisor stays unaffected.
 
-    Returns ``(decisions, decision_unavailable)`` — the second mapping gives
+    Returns ``(decisions, decision_unavailable, health_timing_policy)`` — the
+    second mapping gives
     every agent configured ``wrapped: true`` for which no decision could be
     computed a stable reason code (disabled auto-restart, missing decision, or
     failed assessment), so the caller can surface the actual cause rather than
@@ -1463,22 +1476,22 @@ def _supervisor_decisions(store: Store, *,
     returns every wrapped name in the unavailable mapping — it does NOT go
     silent — while a
     failure to even load supervisor.json (so the wrapped set itself is
-    unknowable) returns both empty, matching doctor's own config-load
-    fallback."""
+    unknowable) returns empty decision maps plus an explicitly unavailable
+    health-timing policy; doctor reports the same policy failure as a warning."""
+    health_policy = _operator_health.load_health_timing_policy(store)
     sup_path = store.dir / "supervisor.json"
     if not sup_path.exists():
-        return {}, {}
-    try:
-        sup_cfg = _supervisor.load_supervisor_config(sup_path)
-    except Exception:  # noqa: BLE001 — advisory arm; never fail the root
-        return {}, {}
+        return {}, {}, health_policy
+    if health_policy.unavailable_reason is not None:
+        return {}, {}, health_policy
+    sup_cfg = health_policy.config
     sup_agents = sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
     wrapped_names = {
         name for name, cfg_agent in sup_agents.items()
         if isinstance(cfg_agent, dict) and cfg_agent.get("wrapped") is True
     }
     if not wrapped_names:
-        return {}, {}
+        return {}, {}, health_policy
     try:
         state = _supervisor.load_supervisor_state(store.dir / "supervisor-state.json")
         # A stale snapshot must not be read as a live liveness fact (see
@@ -1495,7 +1508,7 @@ def _supervisor_decisions(store: Store, *,
     except Exception:  # noqa: BLE001 — advisory arm; never fail the root, but
         # every wrapped agent becomes explicitly unavailable rather than
         # vanishing (the #105 defect reintroduced through this error path).
-        return {}, dict.fromkeys(wrapped_names, "assessment_failed")
+        return {}, dict.fromkeys(wrapped_names, "assessment_failed"), health_policy
     decisions: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -1513,7 +1526,7 @@ def _supervisor_decisions(store: Store, *,
         )
         for name in wrapped_names - set(decisions)
     }
-    return decisions, unavailable
+    return decisions, unavailable, health_policy
 
 
 def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
@@ -1525,7 +1538,9 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                    root_label: str | None = None,
                    managed_loop: set[str] | None = None,
                    supervisor_decisions: dict[str, dict] | None = None,
-                   decision_unavailable: dict[str, str] | None = None) -> list[dict]:
+                   decision_unavailable: dict[str, str] | None = None,
+                   health_policy: _operator_health.HealthTimingPolicy | None = None,
+                   now_epoch: float | None = None) -> list[dict]:
     """Per-agent presence rows (data-model §3). Absent-not-null keys.
 
     0.58.0 additive fields (all OMITTED when not determinable): ``cli``,
@@ -1566,7 +1581,12 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     managed_loop = managed_loop or set()
     supervisor_decisions = supervisor_decisions or {}
     decision_unavailable = decision_unavailable or {}
-    now = datetime.now(timezone.utc)
+    health_policy = health_policy or _operator_health.load_health_timing_policy(store)
+    now = (
+        datetime.now(timezone.utc)
+        if now_epoch is None
+        else datetime.fromtimestamp(float(now_epoch), timezone.utc)
+    )
     now_epoch = now.timestamp()
     # 0.19.0 (FR-001): per-agent message counts from the SAME validated `msgs`
     # already passed in — no extra scan. Always-present integers (0 is data).
@@ -1585,13 +1605,19 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
             e["groups"] = in_groups
         if a == liaison:
             e["operator_facing"] = True
-        hb = store.read_heartbeat(a)
+        normalized_health = _operator_health.read_health_observation(
+            store,
+            a,
+            now_epoch=now_epoch,
+            health_policy=health_policy,
+        )
+        hb = normalized_health.heartbeat
         if hb is not None:
             e["last_seen"] = hb.isoformat()
             heartbeat_age = _heartbeat_age_seconds(hb, now_epoch=now_epoch)
             if heartbeat_age is not None:
                 e["last_seen_age_seconds"] = round(heartbeat_age, 3)
-        health = store.read_health(a, now_epoch=now_epoch, heartbeat=hb)
+        health = normalized_health.health
         e["health"] = health
         e["unread"] = _unread_count(msgs, a, store.cursor(a))
         e["sent"] = sent_counts.get(a, 0)
@@ -1633,13 +1659,15 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         cap = _capacity_entry(snap, now=now)
         if cap is not None:
             e["capacity"] = cap
+        decision = supervisor_decisions.get(a)
+        known_wrapped = decision is not None or a in decision_unavailable
         # wrapped/restartable arm on EITHER the health mode OR the managed
-        # lead-loop set (review P2-1): health mode alone omits the field exactly
-        # when a wrapped agent's health goes stale/missing (mode unknown),
-        # losing the restart signal when the agent is down. Keep absent-not-null
-        # only when NEITHER signal is determinable.
+        # lead-loop set OR strict-supervisor evidence (review P2-1): health mode
+        # alone omits the field exactly when a wrapped agent's health normalizes
+        # to unknown, losing the restart signal when the agent is down. Keep
+        # absent-not-null only when no source determines the answer.
         wrapped = _is_wrapped(health)
-        if a in managed_loop:
+        if a in managed_loop or known_wrapped:
             wrapped = True
         if wrapped is not None:
             e["wrapped"] = wrapped
@@ -1648,7 +1676,6 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         # supervisor_decision: the STRICT, positively-bound verdict (e.g.
         # CLI_CHILD_UNKNOWN), shown ALONGSIDE `health` (the wrapper's own
         # self-report) — never merged into it, so the two can visibly disagree.
-        decision = supervisor_decisions.get(a)
         if decision is not None:
             e["supervisor_decision"] = {
                 "state": decision.get("state"),
@@ -1767,8 +1794,9 @@ def _root_state(desc: RootDescriptor,
                     managed_loop.add(a)
         except Exception:  # noqa: BLE001 — advisory arm; never fail the root
             managed_loop = set()
-        supervisor_decisions, decision_unavailable = _supervisor_decisions(
-            store, now_epoch=time.time())
+        now_epoch = time.time()
+        (supervisor_decisions, decision_unavailable,
+         health_policy) = _supervisor_decisions(store, now_epoch=now_epoch)
         out: dict[str, Any] = {
             "label": label,
             "path": path,
@@ -1801,7 +1829,8 @@ def _root_state(desc: RootDescriptor,
             threads_rows=threads_rows, owned_domains=owned_domains,
             avatar_prefs=avatar_prefs, history=history, root_label=label,
             managed_loop=managed_loop, supervisor_decisions=supervisor_decisions,
-            decision_unavailable=decision_unavailable)
+            decision_unavailable=decision_unavailable,
+            health_policy=health_policy, now_epoch=now_epoch)
         out["retired"] = store.retired_agents()
         out["threads"] = threads_rows
         out["broadcasts"] = broadcasts
@@ -2734,7 +2763,10 @@ def build_attention(desc: RootDescriptor,
             try:
                 agents = _agent_entries(store, cfg,
                                         _validated_for_state(store, cfg)[0],
-                                        for_agent)
+                                        for_agent,
+                                        health_policy=(
+                                            _operator_health.load_health_timing_policy(store)),
+                                        now_epoch=now.timestamp())
             except Exception:  # noqa: BLE001 — stuck items are best-effort
                 agents = []
         wire.extend(_derive_stuck_items(agents, now=now))

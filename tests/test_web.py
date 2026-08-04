@@ -22,12 +22,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
 
-from agenttalk import avatars, intents, knowledge as kn, lesson_context as lc
+from agenttalk import avatars, health as health_model, intents, knowledge as kn
+from agenttalk import lesson_context as lc, operator_health
 from agenttalk import onboarding as ob
 from agenttalk import signing, web
 from agenttalk.store import Store
@@ -2740,6 +2742,17 @@ check({ last_seen_age_seconds: 5 },
   { key: 'unwrapped_live', label: 'Active', color: 'teal', grp: 'work', heartbeatOnly: true });
 check({ health: { state: 'unknown' }, last_seen_age_seconds: 5, wrapped: false },
   { key: 'unwrapped_live', label: 'Active', color: 'teal', grp: 'work', heartbeatOnly: true });
+const unavailablePolicy = hooks.agentStateInfo({
+  health: { state: 'unknown', reason_code: 'health_timing_policy_unavailable' },
+  last_seen_age_seconds: 5,
+});
+assert(unavailablePolicy.key === 'unknown' && unavailablePolicy.color === 'gray',
+       `unavailable policy was repainted ${unavailablePolicy.key}/${unavailablePolicy.color}`);
+assert(unavailablePolicy.noHb !== true,
+       'fresh heartbeat was falsely described as absent');
+assert(unavailablePolicy.desc.includes('health_timing_policy_unavailable') &&
+       unavailablePolicy.desc.includes('recent heartbeat'),
+       `unavailable policy reason disappeared: ${unavailablePolicy.desc}`);
 check({ health: { state: 'unknown' }, last_seen_age_seconds: 121 },
   { key: 'unknown', label: 'Unknown', color: 'gray', grp: 'unknown' });
 check({ health: { state: 'unknown' } },
@@ -2766,6 +2779,90 @@ def test_console_agent_state_info_reflects_supervisor_decision(tmp_path: Path) -
     """
     if shutil.which("node") is None:
         pytest.skip("node is required for the console render-control test")
+
+    now_epoch = 1_700_000_000.0
+    decision = {
+        "state": "HEALTHY_WORKING",
+        "action": "none",
+        "reason": "bound child is healthy",
+    }
+    payload_rows = []
+    for name, health_age, ttl_seconds, heartbeat_skew_seconds, reason_code in (
+        ("ttl", 400.0, 300.0, 1000.0, "health_stale_ttl"),
+        ("skew", 20.0, 600.0, 0.0, "health_older_than_heartbeat"),
+    ):
+        store = Store(tmp_path / name)
+        store.init(["alpha"])
+        updated_at = datetime.fromtimestamp(
+            now_epoch - health_age, timezone.utc,
+        ).isoformat().replace("+00:00", "Z")
+        store.write_health("alpha", health_model.build_snapshot(
+            agent="alpha",
+            cli="claude",
+            mode="wrapper-loop",
+            state=health_model.STATE_DEGRADED_OUTPUT,
+            updated_at=updated_at,
+            since=updated_at,
+            reason_code="degraded_output_detected",
+        ))
+        (store.state_dir / "alpha.heartbeat").write_text(
+            datetime.fromtimestamp(now_epoch, timezone.utc).isoformat().replace(
+                "+00:00", "Z"),
+            encoding="utf-8",
+        )
+        (store.dir / "supervisor.json").write_text(json.dumps({
+            "schema_version": 2,
+            "health": {
+                "ttl_seconds": ttl_seconds,
+                "heartbeat_skew_seconds": heartbeat_skew_seconds,
+            },
+            "agents": {
+                "alpha": {"wrapped": True, "auto_restart": True},
+            },
+        }), encoding="utf-8")
+        policy = operator_health.load_health_timing_policy(store)
+        row = web._agent_entries(
+            store,
+            store.load_config(),
+            [],
+            None,
+            supervisor_decisions={"alpha": decision},
+            health_policy=policy,
+            now_epoch=now_epoch,
+        )[0]
+        assert row["health"]["reason_code"] == reason_code
+        assert row["wrapped"] is True
+        assert row["health_composition"]["primary_source"] == "observation"
+        payload_rows.append(row)
+    composition_without_wrapped = dict(payload_rows[0])
+    composition_without_wrapped.pop("wrapped")
+    composition_without_wrapped.pop("restartable")
+    payload_rows.append(composition_without_wrapped)
+    invalid_store = Store(tmp_path / "invalid-policy")
+    invalid_store.init(["alpha"])
+    (invalid_store.state_dir / "alpha.heartbeat").write_text(
+        datetime.fromtimestamp(now_epoch, timezone.utc).isoformat().replace(
+            "+00:00", "Z"),
+        encoding="utf-8",
+    )
+    (invalid_store.dir / "supervisor.json").write_text(
+        "{not valid json", encoding="utf-8")
+    invalid_policy = operator_health.load_health_timing_policy(invalid_store)
+    invalid_row = web._agent_entries(
+        invalid_store,
+        invalid_store.load_config(),
+        [],
+        None,
+        health_policy=invalid_policy,
+        now_epoch=now_epoch,
+    )[0]
+    assert invalid_row["health"]["reason_code"] == (
+        "health_timing_policy_unavailable"
+    )
+    assert "health_composition" not in invalid_row
+    payload_rows.append(invalid_row)
+    payload_path = tmp_path / "configured-unknown-rows.json"
+    payload_path.write_text(json.dumps(payload_rows), encoding="utf-8")
 
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")
@@ -2801,6 +2898,7 @@ ctx.__agenttalkConsoleTestHooks = {};
 vm.createContext(ctx);
 vm.runInContext(source, ctx, { filename: 'console.instrumented2.js' });
 const hooks = ctx.__agenttalkConsoleTestHooks;
+const configuredUnknownRows = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
@@ -2890,6 +2988,23 @@ assert(healthy.key === 'working_turn', `HEALTHY_WORKING false-DOWN: ${healthy.ke
 assert(healthy.color === 'ok', `HEALTHY_WORKING must stay ok, got ${healthy.color}`);
 assert(healthy.desc.includes('HEALTHY_WORKING'), `healthy fact disappeared: ${healthy.desc}`);
 
+// These are real API rows produced under configured TTL/heartbeat-skew
+// boundaries and an invalid timing policy. One preserves its real composition
+// while deliberately omitting `wrapped` to direction-control API/asset skew.
+// A fresh heartbeat must not repaint any normalized unknown observation teal.
+for (const row of configuredUnknownRows) {
+  const configuredUnknown = hooks.agentStateInfo(row);
+  assert(configuredUnknown.key === 'unknown',
+         `configured unknown was repainted ${configuredUnknown.key}`);
+  assert(configuredUnknown.color === 'gray',
+         `configured unknown was repainted ${configuredUnknown.color}`);
+  assert(configuredUnknown.noHb !== true,
+         'configured unknown falsely claimed no heartbeat');
+  assert(configuredUnknown.desc.includes(row.health.reason_code) &&
+         configuredUnknown.desc.includes('recent heartbeat'),
+         `configured unknown wording lost producer facts: ${configuredUnknown.desc}`);
+}
+
 // B3: supervisor_decision_unavailable (wrapped, not auto_restart) renders
 // visibly rather than silently falling back to plain self-report.
 const unavailable = hooks.agentStateInfo(unavailableAgent('working_turn', 'fine', 'supervisor'));
@@ -2970,6 +3085,21 @@ assert(failed.label === 'Turn failed', `failed-turn meaning disappeared: ${faile
 assert(!failed.label.toLowerCase().includes('child'),
        `failed turn was described as child loss: ${failed.label}`);
 
+// Readiness exhaustion means launches never produced a first heartbeat; no
+// turn necessarily ran, so it must not inherit failed-turn wording.
+for (const readinessAction of ['readiness_gave_up', 'none']) {
+  const readiness = hooks.agentStateInfo(composedAgent(
+    'working_turn', 'fine',
+    { state: 'READINESS_GAVE_UP', action: readinessAction, reason: 'never ready' },
+    'readiness_exhausted', 'danger', 'supervisor'));
+  assert(readiness.label === 'Readiness retries exhausted',
+         `readiness meaning disappeared: ${readiness.label}`);
+  assert(!readiness.label.toLowerCase().includes('turn failed'),
+         `readiness was relabelled as a failed turn: ${readiness.label}`);
+  assert(readiness.desc.includes('READINESS_GAVE_UP'),
+         `readiness producer state disappeared: ${readiness.desc}`);
+}
+
 const lost = hooks.agentStateInfo(composedAgent(
   'working_turn', 'fine',
   { state: 'CLI_CHILD_DEAD', action: 'relaunch', reason: 'binding lost' },
@@ -3006,7 +3136,7 @@ for (const legacyDecision of [
 const plain = hooks.agentStateInfo({ health: { state: 'working_turn' }, wrapped: true });
 assert(plain.key === 'working_turn', `plain self-report must be unaffected, got ${plain.key}`);
 """, encoding="utf-8")
-    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+    subprocess.run(["node", str(runner), str(instrumented), str(payload_path)], check=True,
                    capture_output=True, text=True)
 
 

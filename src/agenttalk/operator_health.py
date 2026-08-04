@@ -8,10 +8,15 @@ to choose urgency and primary wording without changing either fact.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from agenttalk import health as health_model
 from agenttalk import supervisor as supervisor_model
+
+if TYPE_CHECKING:
+    from agenttalk.store import Store
 
 
 URGENCY_FINE = "fine"
@@ -56,6 +61,8 @@ _LIVE_STALLED_DECISION_STATES = frozenset({
 })
 _FAILED_DECISION_STATES = frozenset({
     "TURN_FAILED",
+})
+_READINESS_EXHAUSTED_DECISION_STATES = frozenset({
     "READINESS_GAVE_UP",
 })
 _UNCONFIRMED_DANGER_DECISION_STATES = frozenset({
@@ -77,6 +84,81 @@ def classify_observation_state(state: object) -> str:
     return URGENCY_UNKNOWN
 
 
+@dataclass(frozen=True)
+class HealthTimingPolicy:
+    """Loaded supervisor timing policy, or an explicit unavailable result."""
+
+    config: dict[str, Any]
+    unavailable_reason: str | None = None
+    problem: str | None = None
+
+
+@dataclass(frozen=True)
+class NormalizedHealth:
+    """One configured wrapper-health read and its heartbeat input."""
+
+    health: dict[str, Any]
+    heartbeat: datetime | None
+
+
+def load_health_timing_policy(store: Store) -> HealthTimingPolicy:
+    """Load health timing without substituting defaults for invalid config.
+
+    A missing supervisor file legitimately selects documented defaults.  An
+    existing but unreadable file is different: its configured policy is
+    unknowable, so every operator surface must report that fact instead of
+    guessing with defaults.
+    """
+    path = store.dir / "supervisor.json"
+    if not path.exists():
+        return HealthTimingPolicy(config={})
+    try:
+        config = supervisor_model.load_supervisor_config(path)
+    except (OSError, ValueError) as exc:
+        return HealthTimingPolicy(
+            config={},
+            unavailable_reason="health_timing_policy_unavailable",
+            problem=f"{type(exc).__name__}: {exc}",
+        )
+    return HealthTimingPolicy(config=config)
+
+
+def read_health_observation(
+    store: Store,
+    agent: str,
+    *,
+    now_epoch: float,
+    health_policy: HealthTimingPolicy,
+) -> NormalizedHealth:
+    """Read one wrapper observation under the supervisor's timing policy.
+
+    Operator surfaces must not independently choose TTL, heartbeat skew, or
+    whether to compare the heartbeat.  Resolve those inputs here once and
+    return the heartbeat used so callers cannot accidentally reread a
+    different value for display.
+    """
+    heartbeat = store.read_heartbeat(agent)
+    if health_policy.unavailable_reason is not None:
+        return NormalizedHealth(
+            health=health_model.unknown(agent, health_policy.unavailable_reason),
+            heartbeat=heartbeat,
+        )
+    config = health_policy.config
+    agents = config.get("agents")
+    agents = agents if isinstance(agents, dict) else {}
+    candidate = agents.get(agent)
+    agent_config = candidate if isinstance(candidate, dict) else {}
+    timing = supervisor_model.resolve_health_timing(config, agent_config)
+    health = store.read_health(
+        agent,
+        now_epoch=now_epoch,
+        heartbeat=heartbeat,
+        ttl_seconds=timing["ttl_seconds"],
+        heartbeat_skew_seconds=timing["heartbeat_skew_seconds"],
+    )
+    return NormalizedHealth(health=health, heartbeat=heartbeat)
+
+
 def _supervisor_kind_and_urgency(state: object) -> tuple[str, str]:
     if not isinstance(state, str):
         return "advisory", URGENCY_ATTENTION
@@ -90,6 +172,8 @@ def _supervisor_kind_and_urgency(state: object) -> tuple[str, str]:
         return "live_stalled", URGENCY_DANGER
     if state in _FAILED_DECISION_STATES:
         return "failed", URGENCY_DANGER
+    if state in _READINESS_EXHAUSTED_DECISION_STATES:
+        return "readiness_exhausted", URGENCY_DANGER
     if state in _UNCONFIRMED_DANGER_DECISION_STATES:
         return "unconfirmed", URGENCY_DANGER
     return "advisory", URGENCY_ATTENTION

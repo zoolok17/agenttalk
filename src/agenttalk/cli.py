@@ -538,16 +538,27 @@ def _gather_status(store: Store) -> dict:
     # Resolve the lead-loop heartbeat window from supervisor.json (if present) so the
     # status view uses the SAME threshold as the steal path - never the 120s default
     # for a wrapped agent (WP1 contract; avoids armed/heartbeat_stale skew).
-    sup_cfg = _load_supervisor_config(store)
-    from agenttalk import supervisor as _sup
+    health_policy = operator_health.load_health_timing_policy(store)
+    sup_cfg = health_policy.config
     sup_agents = (
         sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
     )
-    supervisor_rows, supervisor_warnings = _status_supervisor_summaries(
-        store, now.timestamp(), sup_cfg)
+    if health_policy.unavailable_reason is None:
+        supervisor_rows, supervisor_warnings = _status_supervisor_summaries(
+            store, now.timestamp(), sup_cfg)
+    else:
+        supervisor_rows = {}
+        supervisor_warnings = [health_policy.unavailable_reason]
     agents = []
     for a in cfg.get("agents", []):
-        hb = store.read_heartbeat(a)
+        cfg_agent = sup_agents.get(a) if isinstance(sup_agents.get(a), dict) else {}
+        normalized_health = operator_health.read_health_observation(
+            store,
+            a,
+            now_epoch=now.timestamp(),
+            health_policy=health_policy,
+        )
+        hb = normalized_health.heartbeat
         if hb is None:
             heartbeat_iso: str | None = None
             last_seen_s: float | None = None
@@ -574,15 +585,7 @@ def _gather_status(store: Store) -> dict:
                 isinstance(dl, (int, float))
                 and time.time() > dl + STALE_THRESHOLD_SECONDS
             )
-        cfg_agent = sup_agents.get(a) if isinstance(sup_agents.get(a), dict) else {}
-        health_timing = _sup.resolve_health_timing(sup_cfg or {}, cfg_agent)
-        health = store.read_health(
-            a,
-            now_epoch=now.timestamp(),
-            heartbeat=hb,
-            ttl_seconds=health_timing["ttl_seconds"],
-            heartbeat_skew_seconds=health_timing["heartbeat_skew_seconds"],
-        )
+        health = normalized_health.health
         row = {
             "name": a,
             "role": roles.get(a),
