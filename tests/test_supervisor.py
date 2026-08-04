@@ -10957,6 +10957,14 @@ def test_valid_owned_process_tree_prefers_exact_child_order() -> None:
 def test_valid_owned_process_tree_requires_filetime_for_windows_authority(
     status: str,
 ) -> None:
+    """#156 finding 4's SCHEMA GATE, pinned directly.
+
+    If this ever stops returning None, a filetime-less ISO entry can reach a
+    validated complete/absent record, and the exclusion at the top of
+    _owned_process_tree's live_prior admission loop (supervisor.py, "#156
+    finding 4") stops being dead code - the loop becomes reachable and this
+    is the test that would need to catch it doing so.
+    """
     tree = _owned_tree_plan(
         _wrap_snap(),
         request_id="rr-valid-authoritative-filetime",
@@ -11028,6 +11036,14 @@ def test_valid_owned_process_tree_keeps_nullable_hold_evidence_strictly_ordered(
 
 
 def test_owned_process_tree_holds_when_windows_filetime_is_unavailable() -> None:
+    """Also #156 finding 4's PRODUCER GATE, pinned directly.
+
+    A walk that admits a filetime-less ISO row must not be able to emit
+    "complete" - if it ever does, the row's missing start_filetime can reach
+    a persisted "complete" record and the exclusion at the top of
+    _owned_process_tree's live_prior admission loop (supervisor.py, "#156
+    finding 4") stops being dead code.
+    """
     snapshot = [
         _wrap_snap()[0],
         _proc(
@@ -11043,6 +11059,7 @@ def test_owned_process_tree_holds_when_windows_filetime_is_unavailable() -> None
 
     plan = _owned_tree_plan(snapshot, request_id="rr-missing-exact-filetime")
 
+    assert plan["next_state"]["owned_process_tree"]["status"] != "complete"
     assert plan["next_state"]["owned_process_tree"]["status"] == "invalid"
     assert plan["next_state"]["owned_process_tree"]["reason_code"] == (
         "process_tree_invalid_exact_start_filetime_unavailable"
@@ -12122,7 +12139,17 @@ def test_owned_process_tree_first_generation_adoption_holds_orphan_child() -> No
     )
 
 
-def test_owned_process_tree_generation_adoption_holds_without_visible_roots() -> None:
+def test_owned_process_tree_generation_adoption_reaches_recovery_without_visible_roots() -> None:
+    """#163 launch half, flagship reboot case. Generation mismatch (a fresh,
+    valid runtime record naming a generation this state has never adopted)
+    with an EMPTY snapshot - nothing alive anywhere - used to HOLD forever
+    (pre-#163: this test asserted WARN_ONLY). No entry, no brain, no managed
+    descendant, and no wrapper/launcher identity this evidence names can be
+    proven absent, so _no_live_identity_for_launch withholds the HOLD and
+    this reaches an actual recovery decision - kill_targets stays empty
+    (nothing to strand, nothing killed), so teardown authority is untouched;
+    only the ability to START is restored, never adoption of an identity
+    found alive (see the orphan_child direction-control test)."""
     report = _report(
         heartbeat_stale=True,
         wrapper_runtime=_wrapper_runtime_view(
@@ -12141,7 +12168,9 @@ def test_owned_process_tree_generation_adoption_holds_without_visible_roots() ->
 
     adoption = _plan_wrap(report, state, snapshot=[])
 
-    assert adoption["action"] == sup.WARN_ONLY
+    assert adoption["action"] == sup.STUCK_RECOVER
+    assert adoption["state"] == "STUCK_OR_DEAD"
+    assert adoption["kill_first"] is False
     assert adoption["kill_targets"] == []
     assert adoption["next_state"]["owned_process_tree"]["reason_code"] == (
         "process_tree_invalid_generation_adoption_pending"
@@ -12575,6 +12604,19 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
 
     # The boundary applies only to the exact retired observation. A new wrapper
     # generation follows the ordinary fail-closed adoption path.
+    #
+    # #163 launch half: pre-#163, the ordinary adoption path could never do
+    # anything but WARN_ONLY here, forever - that is the exact defect #163
+    # fixes. This state has no live identity (empty snapshot) so
+    # _no_live_identity_for_launch withholds the HOLD and reaches the SAME
+    # STUCK_OR_DEAD treatment a confirmed-dead wrapper already gets,
+    # including that path's own PRE-EXISTING backoff throttle: two
+    # consecutive_fails from the earlier truncated-tree history in this
+    # fixture put backoff_next_epoch in the future, so the result is
+    # backoff_wait, not an immediate relaunch - the ordinary fail-closed
+    # adoption path now means "eligible to recover, subject to the same
+    # backoff every other recovery already respects," not "held forever."
+    # kill_targets stays empty either way: teardown authority is untouched.
     fresh_report = json.loads(json.dumps(report))
     fresh_report["agents"]["worker"]["restart_request"] = None
     fresh_report["agents"]["worker"]["wrapper_runtime"] = (
@@ -12592,8 +12634,9 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
         now_epoch=NOW + 2,
         snapshot=[],
     )["agents"]["worker"]
-    assert adoption["action"] == sup.WARN_ONLY
-    assert adoption["state"] == "PROCESS_TREE_INVALID"
+    assert adoption["action"] == sup.BACKOFF_WAIT
+    assert adoption["state"] == "STUCK_OR_DEAD"
+    assert adoption["kill_targets"] == []
     assert adoption["next_state"]["owned_process_tree"]["reason_code"] == (
         "process_tree_invalid_generation_adoption_pending"
     )
