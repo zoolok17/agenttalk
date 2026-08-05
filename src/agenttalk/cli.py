@@ -11735,8 +11735,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
 def cmd_supervise(args: argparse.Namespace) -> int:
     """Supervisor support (thin): --init scaffolds config+scripts; --report
     emits the read-only liveness JSON; --plan emits a non-advancing decision
-    projection; the generated host alone uses --executable-poll for the shared
-    executable table; --clear-restart clears a restart marker by request_id."""
+    projection; an OS-bound child of the live selected PowerShell marker owner
+    uses the hidden executable poll; --clear-restart clears a restart marker by
+    request_id."""
     store = _get_store(args)
     supervisor_mutations = (
         "archive_launch_request",
@@ -12615,21 +12616,6 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 "the executable supervisor poll\n"
             )
             return 2
-        if args.executable_poll:
-            instance = store.read_supervisor_instance()
-            if (
-                not args.instance_token
-                or not isinstance(instance, dict)
-                or instance.get("token") != args.instance_token
-                or args.pid is None
-                or instance.get("pid") != args.pid
-                or instance.get("pid_start") != args.pid_start
-            ):
-                sys.stderr.write(
-                    "agenttalk supervise --executable-poll: current supervisor "
-                    "instance token/process identity did not match\n"
-                )
-                return 3
         if args.report_file:
             report = json.loads(Path(args.report_file).read_text(encoding="utf-8-sig"))
         else:
@@ -12642,9 +12628,33 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         snapshot = None
         if args.snapshot_file and Path(args.snapshot_file).exists():
             snapshot = _read_snapshot_file(args.snapshot_file)
-        planner = sup.plan_actions if args.executable_poll else sup.observe_actions
-        plan = planner(report, _read_state(), config,
-                       now_epoch=now, snapshot=snapshot)
+        if args.executable_poll:
+            try:
+                with supervisor_lifecycle.authorized_executable_poll(
+                    store,
+                    instance_token=args.instance_token,
+                ):
+                    plan = sup.plan_actions(
+                        report,
+                        _read_state(),
+                        config,
+                        now_epoch=now,
+                        snapshot=snapshot,
+                    )
+            except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as e:
+                sys.stderr.write(
+                    "agenttalk supervise --executable-poll: live supervisor host "
+                    f"did not authorize this process ({e})\n"
+                )
+                return 3
+        else:
+            plan = sup.observe_actions(
+                report,
+                _read_state(),
+                config,
+                now_epoch=now,
+                snapshot=snapshot,
+            )
         print(json.dumps(plan, indent=2))
         if getattr(args, "record_events", False):
             with contextlib.suppress(Exception):

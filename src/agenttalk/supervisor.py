@@ -10,7 +10,7 @@ must be deterministic and CI-testable WITHOUT launching a terminal:
 - :func:`plan_actions` - the SHARED executable decision table. Given the report, the
   supervisor's own state (launched-pid liveness + backoff + consumed restart
   ids + last-warn timestamps), and config, it returns one safe ACTION per
-  agent PLUS the next state. The live loop calls it through the instance-bound
+  agent PLUS the next state. The live loop calls it through the OS-bound
   executable-poll route. :func:`observe_actions` applies the same classifier
   without advancing confirmation and projects an authority-free shape for
   manual plans, dry runs, and operator surfaces.
@@ -8407,25 +8407,85 @@ def plan_actions(report: dict, state: dict, config: dict,
     )
 
 
-_OBSERVED_AGENT_FIELDS = ("agent", "action", "state", "reason", "health")
-_OBSERVED_REQUEST_FIELDS = (
-    "request_id", "agent", "action", "state", "terminal_state", "reason",
-)
+_OBSERVED_OMIT = object()
 
 
-def _observed_items(items: object, fields: tuple[str, ...]) -> dict[str, dict]:
-    """Project planner rows into facts that carry no executor authority."""
+def _observed_text(value: object) -> object:
+    return value if isinstance(value, str) else _OBSERVED_OMIT
+
+
+def _observed_optional_text(value: object) -> object:
+    return value if value is None or isinstance(value, str) else _OBSERVED_OMIT
+
+
+def _observed_number(value: object) -> int | float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return value if math.isfinite(float(value)) else None
+    except OverflowError:
+        return None
+
+
+def _observed_health(value: object) -> dict:
+    """Build the closed advisory-health fact; never copy a planner mapping."""
+    view = value if isinstance(value, dict) else {}
+    age = _observed_number(view.get("age_seconds"))
+    raw_warnings = view.get("warnings")
+    warnings = (
+        [warning for warning in raw_warnings if isinstance(warning, str)]
+        if isinstance(raw_warnings, list)
+        else []
+    )
+    return {
+        "state": health_model.label(view),
+        "age_seconds": age,
+        "warnings": warnings,
+        "advisory": True,
+    }
+
+
+_OBSERVED_AGENT_SCHEMA: dict[str, Callable[[object], object]] = {
+    "agent": _observed_text,
+    "action": _observed_text,
+    "state": _observed_text,
+    "reason": _observed_text,
+    "health": _observed_health,
+}
+_OBSERVED_REQUEST_SCHEMA: dict[str, Callable[[object], object]] = {
+    "request_id": _observed_optional_text,
+    "agent": _observed_optional_text,
+    "action": _observed_text,
+    "state": _observed_text,
+    "terminal_state": _observed_text,
+    "reason": _observed_text,
+}
+
+
+def _observed_items(
+    items: object,
+    schema: dict[str, Callable[[object], object]],
+) -> dict[str, dict]:
+    """Project planner rows through a closed, typed leaf schema."""
     if not isinstance(items, dict):
         return {}
-    return {
-        key: {
-            field: copy.deepcopy(item[field])
-            for field in fields
-            if field in item
-        }
-        for key, item in items.items()
-        if isinstance(key, str) and isinstance(item, dict)
-    }
+    observed: dict[str, dict] = {}
+    for key, item in items.items():
+        if not isinstance(key, str) or not isinstance(item, dict):
+            continue
+        row: dict[str, object] = {}
+        for field, project in schema.items():
+            if field not in item:
+                continue
+            value = project(item[field])
+            if value is not _OBSERVED_OMIT:
+                row[field] = value
+        observed[key] = row
+    return observed
+
+
+def _observed_epoch(value: object) -> int | float | None:
+    return _observed_number(value)
 
 
 def observe_actions(report: dict, state: dict, config: dict,
@@ -8447,13 +8507,13 @@ def observe_actions(report: dict, state: dict, config: dict,
         advance_confirmations=False,
     )
     return {
-        "now_epoch": planned.get("now_epoch"),
+        "now_epoch": _observed_epoch(planned.get("now_epoch")),
         "agents": _observed_items(
-            planned.get("agents"), _OBSERVED_AGENT_FIELDS),
+            planned.get("agents"), _OBSERVED_AGENT_SCHEMA),
         "launch_requests": _observed_items(
-            planned.get("launch_requests"), _OBSERVED_REQUEST_FIELDS),
+            planned.get("launch_requests"), _OBSERVED_REQUEST_SCHEMA),
         "ephemeral_reviewers": _observed_items(
-            planned.get("ephemeral_reviewers"), _OBSERVED_REQUEST_FIELDS),
+            planned.get("ephemeral_reviewers"), _OBSERVED_REQUEST_SCHEMA),
     }
 
 
@@ -9595,7 +9655,7 @@ CONFIG_TEMPLATE = """\
 """
 
 # NOTE on the templates below: the DECISION lives in Python. The scripts are
-# THIN executors that supply launched-pid liveness, request an instance-bound
+# THIN executors that supply launched-pid liveness, request an OS-bound
 # executable poll, and do terminal mechanics. Their dry-run route uses the
 # non-advancing `agenttalk supervise --plan` observation instead.
 
@@ -9801,9 +9861,10 @@ PS_TEMPLATE = r"""__AGENTTALK_ARTIFACT_MARKER__
 # agenttalk-checkout-id: __AGENTTALK_CHECKOUT_ID__
 __AGENTTALK_PREAMBLE__
 # agenttalk supervisor (PowerShell) - generated by `agenttalk supervise --init`.
-# The DECISION table is in Python; this script alone requests its hidden,
-# instance-bound executable poll. Manual `supervise --plan` and -DryRun are
-# non-advancing observations and carry no kill authority.
+# The DECISION table is in Python; a Python child whose OS-derived ancestry
+# reaches this exact live selected host requests its hidden executable poll.
+# Manual `supervise --plan` and -DryRun are non-advancing observations and
+# carry no kill authority.
 # Resolve $pwshPath from `agenttalk supervise --select-pwsh`, then use it here.
 #   & $pwshPath -NoLogo -NoProfile -NonInteractive -File .\supervisor.ps1
 #   & $pwshPath -NoLogo -NoProfile -NonInteractive -File .\supervisor.ps1 -Once -DryRun
@@ -12098,8 +12159,9 @@ $pollNum = 0
     continue supervisorPoll
   }
   # 2) ask Python for the executable action plan (it interprets the snapshot).
-  # DryRun uses the read-only --plan projection; only the instance-owning live
-  # host may earn a confirming poll via --executable-poll.
+  # DryRun uses the read-only --plan projection. The executable route derives
+  # this exact live host and the Python caller's ancestry from the OS; the token
+  # correlates the request but does not authenticate the host.
   # MUST be a UTC epoch: heartbeats are stamped in UTC (...Z), and the Python
   # plan compares now-vs-heartbeat for staleness. `Get-Date -UFormat %s` on
   # Windows PowerShell 5.1 returns a LOCAL-time epoch, so on any non-UTC machine
@@ -12113,7 +12175,7 @@ $pollNum = 0
   if (-not $DryRun) {
     $eventArgs = @('--record-events')
     $pollArgs = @('--executable-poll') + $eventArgs + @(
-                  '--instance-token', $InstanceToken) + (Supervisor-IdentityArgs)
+                  '--instance-token', $InstanceToken)
   }
   $plan = (& $AgenttalkCmd --root $Root supervise @pollArgs --state-file $StatePath @snapshotArgs --now $now) | ConvertFrom-Json
   $pollNum++; $healthy = 0; $total = 0

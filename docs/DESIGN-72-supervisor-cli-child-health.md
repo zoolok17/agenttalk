@@ -371,12 +371,17 @@ manufacturing the evidence required for `CLI_CHILD_DEAD` or
 `CLI_CHILD_STALLED`.
 
 The boundary is executable, not conventional. Plain `supervise --plan` and the
-generated host's `-DryRun` route call `observe_actions`. The live generated host
-alone calls the hidden `--executable-poll` route with its current supervisor
-instance token and process identity. `observe_actions` positively projects source
-facts and cannot return kill targets, state/marker transitions, launch arguments,
-or archive authority; adding a new executor field therefore cannot expose it to
-an operator surface by default.
+generated host's `-DryRun` route call `observe_actions`. The hidden
+`--executable-poll` route derives the selected PowerShell host identity and the
+caller's ancestry from the OS while holding the lifecycle locks, and rechecks
+both processes after planning; command-line PID/start values are not authority,
+and the instance token is correlation only. This establishes a live child of the
+current selected host, not the provenance of the PowerShell script itself (the
+wider host-provenance gap remains #131). `observe_actions` projects every source
+fact through a closed typed leaf schema, including the nested health record, and
+cannot return kill targets, state/marker transitions, launch arguments, or archive
+authority. New top-level or nested executor fields are therefore excluded until
+the observation schema explicitly admits them.
 
 Child death and child stall are different failures:
 

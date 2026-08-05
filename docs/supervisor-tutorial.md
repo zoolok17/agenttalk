@@ -118,9 +118,10 @@ existing `supervisor.json` byte-for-byte and does not touch runtime state.
 - **`supervisor.json`** — the config you fill in: cadence knobs plus a
   per-agent block describing how to launch each agent.
 - **`supervisor.ps1`** — the generated PowerShell monitor. You run this;
-  you do not edit it. Its live loop uses an internal, instance-bound executable
-  poll (launch / relaunch-with-resume / scoped kill / warn). `-DryRun` uses the
-  non-advancing `supervise --plan` observation instead.
+  you do not edit it. Its live loop uses an internal executable poll whose caller
+  must be an OS-verified child of the live selected PowerShell host (launch /
+  relaunch-with-resume / scoped kill / warn). `-DryRun` uses the non-advancing
+  `supervise --plan` observation instead.
 - **`bin/agenttalk.cmd`** — a tiny shim the monitor calls so its own bus
   commands resolve to the right Python/agenttalk regardless of your PATH.
   You don't invoke it directly.
@@ -433,12 +434,12 @@ changed file fails that request instead of falling back. The project record and
 native file checks provide same-user consistency, not executable signing or ACL
 attestation; every generated script also keeps its in-process Core/major guard.
 
-The monitor loops every `poll_seconds`: it asks `agenttalk supervise
---plan` for the decision table and executes it — launching agents that
-aren't running, relaunching (resuming each agent's session — see section
-1) agents whose heartbeat went stale past grace, killing only the scoped
-process tree it manages, and
-warning (never killing) for un-instrumented stale agents.
+The monitor loops every `poll_seconds`: it invokes the internal executable poll
+for the decision table and executes it — launching agents that aren't running,
+relaunching (resuming each agent's session — see section 1) agents whose
+heartbeat went stale past grace, killing only the scoped process tree it manages,
+and warning (never killing) for un-instrumented stale agents. The public
+`agenttalk supervise --plan` command is only the read-only preview shown below.
 
 Leave it running. It survives the agents crashing; the agents survive it
 restarting.
@@ -454,8 +455,10 @@ agenttalk dashboard            # browser view: heartbeat age, who's composing, o
 ```
 
 `--report` and `--plan` are pure read-only derivations — safe to run any time.
-They neither change state nor earn a confirming poll. Only the running,
-instance-owning generated host can request the executable form.
+They neither change state nor earn a confirming poll. The executable form accepts
+only a process whose live ancestry and host identity match the current selected
+PowerShell marker; the instance token alone is not authority. This proves the
+caller/host relationship, not the generated script's provenance (see #131).
 
 ### Use the Scheduled Task host
 

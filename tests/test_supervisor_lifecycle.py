@@ -372,6 +372,113 @@ def test_generated_claim_lock_order_is_lifecycle_selection_config(
     ]
 
 
+def test_executable_poll_refuses_unrelated_process_replaying_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token correlates a poll; OS ancestry supplies its authority."""
+    store = _store(tmp_path)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    marker = store.claim_supervisor_instance(
+        pid=host.pid,
+        pid_start=host.creation_token,
+    )
+    assert marker is not None
+    selected = _selected(store)
+    monkeypatch.setattr(lifecycle, "_read_valid_selection_locked", lambda store: selected)
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(
+        lifecycle,
+        "_validate_ancestry",
+        lambda observed: (_ for _ in ()).throw(
+            lifecycle.SupervisorLifecycleError(
+                "current Python process is unrelated to the supervisor host"
+            )
+        ),
+    )
+
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match="unrelated"):
+        with lifecycle.authorized_executable_poll(
+            store,
+            instance_token=marker["token"],
+        ):
+            pytest.fail("an unrelated process must not enter the executable boundary")
+
+
+def test_executable_poll_holds_and_rechecks_live_host_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current = _observation(
+        os.getpid(), parent=host.pid, path=r"C:\Python\python.exe", ticks=200,
+    )
+    marker = store.claim_supervisor_instance(
+        pid=host.pid,
+        pid_start=host.creation_token,
+    )
+    assert marker is not None
+    selected = _selected(store)
+    active_checks: list[int] = []
+    monkeypatch.setattr(lifecycle, "_read_valid_selection_locked", lambda store: selected)
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
+    monkeypatch.setattr(
+        lifecycle,
+        "_require_process_active",
+        lambda observed: active_checks.append(observed.pid),
+    )
+    monkeypatch.setattr(lifecycle, "_revalidate_process_image", lambda host, record: None)
+
+    with lifecycle.authorized_executable_poll(
+        store,
+        instance_token=marker["token"],
+    ):
+        active_checks.append(-1)
+
+    assert active_checks == [current.pid, host.pid, -1, current.pid, host.pid]
+
+
+def test_executable_poll_refuses_owner_exit_before_plan_is_released(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current = _observation(
+        os.getpid(), parent=host.pid, path=r"C:\Python\python.exe", ticks=200,
+    )
+    marker = store.claim_supervisor_instance(
+        pid=host.pid,
+        pid_start=host.creation_token,
+    )
+    assert marker is not None
+    checks = {host.pid: 0, current.pid: 0}
+    monkeypatch.setattr(
+        lifecycle, "_read_valid_selection_locked", lambda store: _selected(store),
+    )
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
+    monkeypatch.setattr(lifecycle, "_revalidate_process_image", lambda host, record: None)
+
+    def require_active(observed: lifecycle.ProcessObservation) -> None:
+        checks[observed.pid] += 1
+        if observed is host and checks[host.pid] == 2:
+            raise lifecycle.SupervisorLifecycleError(
+                "supervisor host exited before executable plan release"
+            )
+
+    monkeypatch.setattr(lifecycle, "_require_process_active", require_active)
+
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match="exited"):
+        with lifecycle.authorized_executable_poll(
+            store,
+            instance_token=marker["token"],
+        ):
+            pass
+
+
 @WINDOWS_ONLY
 def test_lifecycle_barrier_blocks_claim_select_and_refresh_without_mutation(
     tmp_path: Path,

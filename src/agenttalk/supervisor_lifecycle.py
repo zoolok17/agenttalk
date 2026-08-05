@@ -764,6 +764,83 @@ def claim_powershell_supervisor(
                 _close_process_observation(host)
 
 
+@contextlib.contextmanager
+def authorized_executable_poll(
+    store: Store,
+    *,
+    instance_token: object,
+) -> Iterator[dict]:
+    """Hold one executable poll under the exact live PowerShell owner.
+
+    The marker token correlates the request with the current instance; it is not
+    host authentication. Authority comes from OS observations: the marker's
+    owner must still be the selected PowerShell process, and this Python process
+    must be its direct child or its exact ``cmd.exe`` hop. The handles and lock
+    remain held through plan construction and are rechecked before release.
+    """
+    with store._supervisor_lifecycle_lock():
+        status, marker, detail = store._read_supervisor_instance_strict_locked()
+        if status != "valid" or not isinstance(marker, dict):
+            raise SupervisorLifecycleError(
+                "executable poll requires a valid live supervisor instance marker"
+                + (f" ({detail})" if detail else "")
+            )
+        token = marker.get("token")
+        if (
+            not isinstance(instance_token, str)
+            or not isinstance(token, str)
+            or instance_token != token
+        ):
+            raise SupervisorLifecycleError(
+                "executable poll token does not match the current supervisor instance"
+            )
+        pid = marker.get("pid")
+        pid_start = marker.get("pid_start")
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(pid_start, str)
+            or not pid_start
+        ):
+            raise SupervisorLifecycleError(
+                "executable poll owner lacks an exact process identity"
+            )
+        with store._powershell_selection_lock():
+            selected = _read_valid_selection_locked(store)
+            host = _open_process_observation(pid)
+            ancestry: tuple[ProcessObservation, ...] = ()
+            try:
+                if not start_tokens_match(host.creation_token, pid_start):
+                    raise SupervisorLifecycleError(
+                        "executable poll owner pid/start was reused or ambiguous"
+                    )
+                if not _host_matches_selection(host, selected):
+                    raise SupervisorLifecycleError(
+                        "executable poll owner is not the selected PowerShell host"
+                    )
+                try:
+                    ancestry = _validate_ancestry(host)
+                except SupervisorLifecycleError as exc:
+                    raise SupervisorLifecycleError(
+                        "executable poll caller is unrelated to the live supervisor host: "
+                        f"{exc}"
+                    ) from exc
+                for observation in ancestry:
+                    _require_process_active(observation)
+                _require_process_active(host)
+                _revalidate_process_image(host, selected)
+                yield marker
+                for observation in ancestry:
+                    _require_process_active(observation)
+                _require_process_active(host)
+                _revalidate_process_image(host, selected)
+            finally:
+                for observation in ancestry:
+                    _close_process_observation(observation)
+                _close_process_observation(host)
+
+
 def repair_invalid_instance_marker(store: Store) -> Path | None:
     return store.quarantine_invalid_supervisor_instance(
         reason="operator acknowledged no live supervisor"
