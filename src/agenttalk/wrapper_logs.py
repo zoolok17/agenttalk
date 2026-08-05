@@ -158,21 +158,61 @@ def _diagnostic_project_id(project: Path) -> str:
     return hashlib.sha256(str(project).encode("utf-8")).hexdigest()
 
 
+def _wrapper_log_env_inputs(
+    target: str,
+    env: Mapping[str, str],
+) -> tuple[Path | None, str | None, tuple[str, ...]]:
+    if target == "nt":
+        raw = env.get("LOCALAPPDATA")
+        home_env, home_parts = env.get("USERPROFILE"), ("AppData", "Local")
+    else:
+        raw = env.get("XDG_STATE_HOME")
+        home_env, home_parts = env.get("HOME"), (".local", "state")
+    # A relative state-directory value is interpreted against the process cwd.
+    # The supervisor must not let ambient cwd move diagnostic logs back into the
+    # checkout, so only absolute platform state roots are eligible.
+    configured = Path(raw) if raw else None
+    if configured is not None and not configured.is_absolute():
+        configured = None
+    return configured, home_env, home_parts
+
+
 def default_wrapper_log_root(
     project_root: str | os.PathLike[str],
     *,
     platform: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> Path:
-    """Return the preferred per-user, per-project log root outside the checkout."""
-    roots = wrapper_log_root_candidates(
-        project_root,
-        platform=platform,
-        environ=environ,
-    )
-    if not roots:
-        raise OSError("no safe wrapper log root is available")
-    return roots[0]
+    """Return the preferred per-user, per-project log root outside the checkout.
+
+    This is a lazy candidate, not a validated one: it is baked into the
+    generated supervisor launcher and independently recomputed by the
+    allocator's own candidate search. Neither consumer trusts it blindly -
+    both refuse a reparse/symlink ancestor at the point they actually try to
+    use the root, so this function does not perform that (filesystem-probing)
+    refusal itself. Doing so here would make this report indistinguishable
+    from what the allocator actually accepted, hiding a refusal instead of
+    proving one happened.
+    """
+    env = os.environ if environ is None else environ
+    target = os.name if platform is None else platform
+    configured, home_env, home_parts = _wrapper_log_env_inputs(target, env)
+    project = _diagnostic_project_root(project_root)
+    project_id = _diagnostic_project_id(project)
+    for candidate in _candidate_state_roots(configured, home_env, home_parts, project):
+        try:
+            raw_result = (
+                candidate.expanduser().absolute()
+                / "agenttalk"
+                / "wrapper-logs"
+                / project_id
+            )
+            resolved = raw_result.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_relative_to(project):
+            return raw_result
+    raise OSError("no safe wrapper log root is available")
 
 
 def wrapper_log_root_candidates(
@@ -183,30 +223,17 @@ def wrapper_log_root_candidates(
 ) -> tuple[Path, ...]:
     """Return eligible roots in launcher-compatible failover order.
 
-    The first item preserves :func:`default_wrapper_log_root`'s lazy preferred
-    selection. The second is the exact temporary fallback baked into generated
-    PowerShell launchers, and the final candidate is independent of user state.
-    Resolving any later candidate is fail-soft and can never invalidate an
+    The first item is the same lazy preferred candidate
+    :func:`default_wrapper_log_root` would report, filtered for reparse/symlink
+    safety here since this tuple is what the allocator actually attempts. The
+    second is the exact temporary fallback baked into generated PowerShell
+    launchers, and the final candidate is independent of user state. Resolving
+    any later candidate is fail-soft and can never invalidate an
     already-viable preferred root.
     """
     env = os.environ if environ is None else environ
     target = os.name if platform is None else platform
-    if target == "nt":
-        raw = env.get("LOCALAPPDATA")
-        home_env, home_parts = env.get("USERPROFILE"), ("AppData", "Local")
-    else:
-        raw = env.get("XDG_STATE_HOME")
-        home_env, home_parts = env.get("HOME"), (".local", "state")
-    # A relative state-directory value is interpreted against the process cwd.
-    # The supervisor must not let ambient cwd move diagnostic logs back into the
-    # checkout, so only absolute platform state roots are eligible.
-    # Only absolute platform roots are eligible, so no user expansion is
-    # needed here. Deferring all filesystem resolution to the independently
-    # guarded candidate loop also prevents a malformed ambient value from
-    # aborting direct wrapper startup.
-    configured = Path(raw) if raw else None
-    if configured is not None and not configured.is_absolute():
-        configured = None
+    configured, home_env, home_parts = _wrapper_log_env_inputs(target, env)
     project = _diagnostic_project_root(project_root)
     project_id = _diagnostic_project_id(project)
     preferred: Path | None = None

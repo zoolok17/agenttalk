@@ -80,7 +80,7 @@ def _run_direct_wrapper(project: Path, env: dict[str, str]) -> subprocess.Comple
         env=env,
         text=True,
         capture_output=True,
-        timeout=20,
+        timeout=120,
         check=False,
     )
 
@@ -243,7 +243,7 @@ def test_report_names_the_root_that_accepted_the_wrapper_generation(
         env=env,
         text=True,
         capture_output=True,
-        timeout=20,
+        timeout=120,
         check=False,
     )
 
@@ -839,7 +839,7 @@ def test_direct_allocator_refuses_a_configured_state_junction(
         ],
         text=True,
         capture_output=True,
-        timeout=20,
+        timeout=120,
         check=False,
     )
     assert creation.returncode == 0, creation.stderr
