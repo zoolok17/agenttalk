@@ -1801,7 +1801,7 @@ def test_supervise_plan_record_events_uses_ring_not_bus(
     monkeypatch.setattr(
         cli.supervisor_lifecycle,
         "authorized_executable_poll",
-        lambda _store, *, instance_token: contextlib.nullcontext(),
+        lambda _store, *, instance_token: contextlib.nullcontext(lambda: None),
     )
 
     rc = _run([
@@ -1820,6 +1820,156 @@ def test_supervise_plan_record_events_uses_ring_not_bus(
     assert s.all_messages() == []
 
 
+def test_executable_poll_holds_authority_through_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG), encoding="utf-8",
+    )
+    report_file = tmp_path / "report.json"
+    report_file.write_text(json.dumps(_report()), encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    snapshot_file = tmp_path / "snapshot.json"
+    snapshot_file.write_text("[]", encoding="utf-8")
+    instance = store.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    assert instance is not None
+    order: list[str] = []
+    authority_held = {"value": False}
+    real_plan_actions = cli.sup.plan_actions
+    real_dumps = json.dumps
+
+    @contextlib.contextmanager
+    def authority(_store, *, instance_token):
+        assert instance_token == instance["token"]
+        authority_held["value"] = True
+        order.append("authority-enter")
+
+        def recheck() -> None:
+            assert authority_held["value"]
+            order.append("authority-recheck")
+
+        try:
+            yield recheck
+        finally:
+            order.append("authority-exit")
+            authority_held["value"] = False
+
+    def plan_actions(*args, **kwargs):
+        assert authority_held["value"]
+        order.append("plan-built")
+        return real_plan_actions(*args, **kwargs)
+
+    def dumps(payload, *args, **kwargs):
+        assert authority_held["value"]
+        order.append("serialized")
+        return real_dumps(payload, *args, **kwargs)
+
+    def publish(rendered, *, flush=False):
+        assert authority_held["value"]
+        assert isinstance(rendered, str)
+        assert flush is True
+        order.append("stdout-published")
+
+    def record_coordination(*args, **kwargs):
+        assert authority_held["value"]
+        order.append("coordination-event")
+
+    def record_plan(*args, **kwargs):
+        assert authority_held["value"]
+        order.append("plan-events")
+
+    monkeypatch.setattr(cli.supervisor_lifecycle, "authorized_executable_poll", authority)
+    monkeypatch.setattr(cli.sup, "plan_actions", plan_actions)
+    monkeypatch.setattr(cli.json, "dumps", dumps)
+    monkeypatch.setattr(cli, "print", publish, raising=False)
+    monkeypatch.setattr(
+        cli.sup,
+        "record_coordination_availability_observation",
+        record_coordination,
+    )
+    monkeypatch.setattr(cli.sup, "record_supervisor_plan_events", record_plan)
+
+    rc = _run([
+        "supervise", "--executable-poll", "--record-events",
+        "--instance-token", instance["token"],
+        "--report-file", str(report_file),
+        "--state-file", str(state_file),
+        "--snapshot-file", str(snapshot_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    assert order == [
+        "authority-enter",
+        "plan-built",
+        "serialized",
+        "authority-recheck",
+        "stdout-published",
+        "coordination-event",
+        "plan-events",
+        "authority-exit",
+    ]
+
+
+def test_executable_poll_recheck_failure_prevents_all_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG), encoding="utf-8",
+    )
+    report_file = tmp_path / "report.json"
+    report_file.write_text(json.dumps(_report()), encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    snapshot_file = tmp_path / "snapshot.json"
+    snapshot_file.write_text("[]", encoding="utf-8")
+    instance = store.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    assert instance is not None
+
+    @contextlib.contextmanager
+    def authority(_store, *, instance_token):
+        assert instance_token == instance["token"]
+
+        def recheck() -> None:
+            raise cli.supervisor_lifecycle.SupervisorLifecycleError(
+                "supervisor host exited before publication"
+            )
+
+        yield recheck
+
+    def must_not_publish(*args, **kwargs):
+        pytest.fail("authority loss must prevent stdout and event publication")
+
+    monkeypatch.setattr(cli.supervisor_lifecycle, "authorized_executable_poll", authority)
+    monkeypatch.setattr(cli, "print", must_not_publish, raising=False)
+    monkeypatch.setattr(
+        cli.sup,
+        "record_coordination_availability_observation",
+        must_not_publish,
+    )
+    monkeypatch.setattr(cli.sup, "record_supervisor_plan_events", must_not_publish)
+
+    rc = _run([
+        "supervise", "--executable-poll", "--record-events",
+        "--instance-token", instance["token"],
+        "--report-file", str(report_file),
+        "--state-file", str(state_file),
+        "--snapshot-file", str(snapshot_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert captured.out == ""
+    assert "exited before publication" in captured.err
+
+
 def test_supervise_plan_prints_when_record_events_raises(
         tmp_path: Path, monkeypatch, capsys) -> None:
     store = _team(tmp_path)
@@ -1836,7 +1986,7 @@ def test_supervise_plan_prints_when_record_events_raises(
     monkeypatch.setattr(
         cli.supervisor_lifecycle,
         "authorized_executable_poll",
-        lambda _store, *, instance_token: contextlib.nullcontext(),
+        lambda _store, *, instance_token: contextlib.nullcontext(lambda: None),
     )
 
     def boom(*_args, **_kwargs):
@@ -9391,7 +9541,7 @@ def test_supervise_plan_observes_but_executable_poll_advances_confirmation(
     monkeypatch.setattr(
         cli.supervisor_lifecycle,
         "authorized_executable_poll",
-        lambda _store, *, instance_token: contextlib.nullcontext(),
+        lambda _store, *, instance_token: contextlib.nullcontext(lambda: None),
     )
     assert _run([
         "supervise", "--executable-poll",

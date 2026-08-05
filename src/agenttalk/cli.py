@@ -12633,7 +12633,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 with supervisor_lifecycle.authorized_executable_poll(
                     store,
                     instance_token=args.instance_token,
-                ):
+                ) as recheck_before_publication:
                     plan = sup.plan_actions(
                         report,
                         _read_state(),
@@ -12641,12 +12641,31 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                         now_epoch=now,
                         snapshot=snapshot,
                     )
+                    rendered = json.dumps(plan, indent=2)
+                    recheck_before_publication()
+                    print(rendered, flush=True)
+                    if getattr(args, "record_events", False):
+                        with contextlib.suppress(Exception):
+                            sup.record_coordination_availability_observation(
+                                store,
+                                report,
+                                plan,
+                                config,
+                                now_epoch=now,
+                            )
+                        with contextlib.suppress(Exception):
+                            sup.record_supervisor_plan_events(
+                                store,
+                                plan,
+                                now_epoch=now,
+                            )
             except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as e:
                 sys.stderr.write(
                     "agenttalk supervise --executable-poll: live supervisor host "
                     f"did not authorize this process ({e})\n"
                 )
                 return 3
+            return 0
         else:
             plan = sup.observe_actions(
                 report,
@@ -12656,17 +12675,6 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 snapshot=snapshot,
             )
         print(json.dumps(plan, indent=2))
-        if getattr(args, "record_events", False):
-            with contextlib.suppress(Exception):
-                sup.record_coordination_availability_observation(
-                    store,
-                    report,
-                    plan,
-                    config,
-                    now_epoch=now,
-                )
-            with contextlib.suppress(Exception):
-                sup.record_supervisor_plan_events(store, plan, now_epoch=now)
         return 0
     sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, "
                      "--bootstrap-check, --install-activity-hook, --launch-barrier, "

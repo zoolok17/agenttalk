@@ -17,7 +17,7 @@ import tempfile
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterator, Mapping
 
 from agenttalk import powershell_host as psh
@@ -323,10 +323,12 @@ def _filetime_ticks(value: wintypes.FILETIME) -> int:
 
 
 def _ticks_to_token(ticks: int) -> str:
-    epoch_seconds = ticks / 10_000_000.0 - 11644473600
-    return datetime.fromtimestamp(epoch_seconds, timezone.utc).isoformat(
-        timespec="microseconds"
-    ).replace("+00:00", "Z")
+    unix_ticks = ticks - 116_444_736_000_000_000
+    seconds, fraction = divmod(unix_ticks, 10_000_000)
+    stamp = datetime.fromtimestamp(seconds, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    return f"{stamp}.{fraction:07d}Z"
 
 
 def _open_process_observation(pid: int, *, parents: Mapping[int, int] | None = None) -> ProcessObservation:
@@ -360,7 +362,10 @@ def _open_process_observation(pid: int, *, parents: Mapping[int, int] | None = N
         code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
             raise SupervisorLifecycleError(f"process {pid} is not active")
-        identity, image_handle = psh.open_stable_native_file_identity(buf.value)
+        identity, image_handle = _open_stable_process_image_identity(
+            buf.value,
+            int(handle),
+        )
         parent_map = parents if parents is not None else _process_parent_map()
         ticks = _filetime_ticks(creation)
         return ProcessObservation(
@@ -409,28 +414,220 @@ def _require_process_active(observation: ProcessObservation) -> None:
 
 
 def start_tokens_match(observed: str, locator: object) -> bool:
-    if not isinstance(locator, str) or not locator:
-        return False
-    # .NET's round-trip ("o") format uses seven fractional-second digits;
-    # Python 3.10's fromisoformat accepts at most six.  The seventh digit is
-    # below the precision used by datetime, so truncate it before comparing.
-    def parse(value: str) -> datetime:
-        normalized = value.replace("Z", "+00:00")
-        match = re.fullmatch(
-            r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d+)([+-]\d{2}:\d{2})",
-            normalized,
-        )
-        if match:
-            fraction = (match.group(2) + "000000")[:6]
-            normalized = f"{match.group(1)}.{fraction}{match.group(3)}"
-        return datetime.fromisoformat(normalized)
+    left = _start_token_filetime(observed)
+    right = _start_token_filetime(locator)
+    return left is not None and left == right
 
+
+def _start_token_filetime(value: object) -> int | None:
+    """Parse one exact .NET round-trip process-start token to FILETIME ticks."""
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+        r"(?:\.(\d{1,7}))?(Z|[+-]\d{2}:\d{2})",
+        value,
+    )
+    if match is None:
+        return None
+    prefix, fraction, zone = match.groups()
     try:
-        left = parse(observed)
-        right = parse(locator)
-    except ValueError:
-        return observed == locator
-    return abs((left - right).total_seconds()) <= 0.01
+        stamp = datetime.fromisoformat(
+            prefix + ("+00:00" if zone == "Z" else zone)
+        ).astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = stamp - epoch
+    seconds = delta.days * 86_400 + delta.seconds
+    fractional_ticks = int((fraction or "0").ljust(7, "0"))
+    return 116_444_736_000_000_000 + seconds * 10_000_000 + fractional_ticks
+
+
+def _system_cmd_path() -> str:
+    """Return the native system-directory command interpreter."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_system_directory = kernel32.GetSystemDirectoryW
+    get_system_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    get_system_directory.restype = wintypes.UINT
+    capacity = 32768
+    buf = ctypes.create_unicode_buffer(capacity)
+    length = int(get_system_directory(buf, capacity))
+    if length <= 0 or length >= capacity:
+        raise SupervisorLifecycleError("cannot resolve the Windows system directory")
+    return str(Path(buf.value) / "cmd.exe")
+
+
+def _process_machines(process_handle: int) -> tuple[int, int]:
+    """Return the emulated and native PE machines for one live process."""
+    if not process_handle:
+        raise SupervisorLifecycleError("cannot identify process architecture")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        is_wow64_process2 = kernel32.IsWow64Process2
+    except AttributeError:
+        try:
+            is_wow64_process = kernel32.IsWow64Process
+        except AttributeError as exc:
+            raise SupervisorLifecycleError(
+                "cannot resolve the Windows process-architecture API"
+            ) from exc
+        is_wow64_process.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        is_wow64_process.restype = wintypes.BOOL
+        emulated = wintypes.BOOL()
+        if not is_wow64_process(
+            wintypes.HANDLE(process_handle),
+            ctypes.byref(emulated),
+        ):
+            raise SupervisorLifecycleError(
+                "cannot identify process architecture "
+                f"(winerror {ctypes.get_last_error()})"
+            ) from None
+        return (0x014C if emulated.value else 0), 0
+    is_wow64_process2.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.WORD),
+    ]
+    is_wow64_process2.restype = wintypes.BOOL
+    process_machine = wintypes.WORD()
+    native_machine = wintypes.WORD()
+    if not is_wow64_process2(
+        wintypes.HANDLE(process_handle),
+        ctypes.byref(process_machine),
+        ctypes.byref(native_machine),
+    ):
+        raise SupervisorLifecycleError(
+            "cannot identify process architecture "
+            f"(winerror {ctypes.get_last_error()})"
+        )
+    return int(process_machine.value), int(native_machine.value)
+
+
+def _wow64_system_directory(machine: int) -> str:
+    """Return the OS-owned system directory for one emulated PE machine."""
+    library = None
+    function = None
+    for dll_name in (
+        "api-ms-win-core-wow64-l1-1-1.dll",
+        "kernelbase.dll",
+        "kernel32.dll",
+    ):
+        try:
+            candidate = ctypes.WinDLL(dll_name, use_last_error=True)
+            resolved = candidate.GetSystemWow64Directory2W
+        except (AttributeError, OSError):
+            continue
+        library = candidate
+        function = resolved
+        break
+    capacity = 32767
+    if library is not None and function is not None:
+        function.argtypes = [wintypes.LPWSTR, wintypes.UINT, wintypes.WORD]
+        function.restype = wintypes.UINT
+        buf = ctypes.create_unicode_buffer(capacity)
+        length = int(function(buf, capacity, machine))
+        if 0 < length < capacity:
+            return buf.value
+    if machine != 0x014C:
+        raise SupervisorLifecycleError(
+            "cannot resolve the Windows emulated system directory"
+        )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        legacy = kernel32.GetSystemWow64DirectoryW
+    except AttributeError as exc:
+        raise SupervisorLifecycleError(
+            "cannot resolve the Windows emulated-system-directory API"
+        ) from exc
+    legacy.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    legacy.restype = wintypes.UINT
+    buf = ctypes.create_unicode_buffer(capacity)
+    length = int(legacy(buf, capacity))
+    if length <= 0 or length >= capacity:
+        raise SupervisorLifecycleError(
+            "cannot resolve the Windows emulated system directory"
+        )
+    return buf.value
+
+
+def _windows_directory() -> str:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_windows_directory = kernel32.GetWindowsDirectoryW
+    get_windows_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    get_windows_directory.restype = wintypes.UINT
+    capacity = 32767
+    buf = ctypes.create_unicode_buffer(capacity)
+    length = int(get_windows_directory(buf, capacity))
+    if length <= 0 or length >= capacity:
+        raise SupervisorLifecycleError("cannot resolve the Windows directory")
+    return buf.value
+
+
+def _current_process_handle() -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.argtypes = []
+    get_current_process.restype = wintypes.HANDLE
+    return int(get_current_process())
+
+
+def _process_image_path_for_reopen(image_path: str, process_handle: int) -> str:
+    """Map a native System32 image through Sysnative when Python is WOW64."""
+    process_machine, _ = _process_machines(process_handle)
+    current_machine, _ = _process_machines(_current_process_handle())
+    if process_machine or not current_machine:
+        return image_path
+    windows = PureWindowsPath(_windows_directory())
+    system = windows / "System32"
+    image = PureWindowsPath(image_path)
+    system_parts = tuple(part.casefold() for part in system.parts)
+    image_parts = tuple(part.casefold() for part in image.parts)
+    if image_parts[:len(system_parts)] != system_parts:
+        return image_path
+    relative = image.parts[len(system_parts):]
+    if not relative:
+        raise SupervisorLifecycleError("process image path is not a file")
+    return str(windows / "Sysnative" / PureWindowsPath(*relative))
+
+
+def _open_stable_process_image_identity(
+    image_path: str,
+    process_handle: int,
+) -> tuple[psh.NativeFileIdentity, int]:
+    return psh.open_stable_native_file_identity(
+        _process_image_path_for_reopen(image_path, process_handle)
+    )
+
+
+def _system_cmd_path_for_observation(observation: ProcessObservation) -> str:
+    """Resolve the OS-owned ``cmd.exe`` for the observed process architecture."""
+    if not observation.handle:
+        return _system_cmd_path()
+    process_machine, _ = _process_machines(observation.handle)
+    if process_machine:
+        return str(Path(_wow64_system_directory(process_machine)) / "cmd.exe")
+    current_machine, _ = _process_machines(_current_process_handle())
+    if current_machine:
+        return str(Path(_windows_directory()) / "Sysnative" / "cmd.exe")
+    return _system_cmd_path()
+
+
+def _require_observed_image(
+    observation: ProcessObservation,
+    expected_path: str,
+    *,
+    subject: str,
+) -> None:
+    try:
+        expected = psh.native_file_identity(expected_path)
+    except (OSError, ValueError, psh.PowerShellHostError) as exc:
+        raise SupervisorLifecycleError(f"cannot identify {subject}: {exc}") from exc
+    if not psh.same_identity(observation.identity, expected):
+        raise SupervisorLifecycleError(f"{subject} image identity does not match")
 
 
 def _validate_ancestry(host: ProcessObservation) -> tuple[ProcessObservation, ...]:
@@ -450,6 +647,11 @@ def _validate_ancestry(host: ProcessObservation) -> tuple[ProcessObservation, ..
             raise SupervisorLifecycleError(
                 "manual --claim-instance is unsupported without a direct or cmd-hop PowerShell ancestor"
             )
+        _require_observed_image(
+            cmd,
+            _system_cmd_path_for_observation(cmd),
+            subject="command-interpreter ancestor",
+        )
         if not (host.creation_ticks <= cmd.creation_ticks <= current.creation_ticks):
             raise SupervisorLifecycleError("PowerShell/cmd/Python ancestry start times are inconsistent")
         return tuple(opened)
@@ -769,14 +971,16 @@ def authorized_executable_poll(
     store: Store,
     *,
     instance_token: object,
-) -> Iterator[dict]:
+) -> Iterator[Callable[[], None]]:
     """Hold one executable poll under the exact live PowerShell owner.
 
     The marker token correlates the request with the current instance; it is not
     host authentication. Authority comes from OS observations: the marker's
     owner must still be the selected PowerShell process, and this Python process
-    must be its direct child or its exact ``cmd.exe`` hop. The handles and lock
-    remain held through plan construction and are rechecked before release.
+    must be its direct child or its exact OS-owned ``cmd.exe`` hop. The handles
+    and locks remain held through plan serialization and event publication. The
+    yielded callback rechecks every live identity immediately before anything is
+    published.
     """
     with store._supervisor_lifecycle_lock():
         status, marker, detail = store._read_supervisor_instance_strict_locked()
@@ -830,11 +1034,14 @@ def authorized_executable_poll(
                     _require_process_active(observation)
                 _require_process_active(host)
                 _revalidate_process_image(host, selected)
-                yield marker
-                for observation in ancestry:
-                    _require_process_active(observation)
-                _require_process_active(host)
-                _revalidate_process_image(host, selected)
+
+                def recheck_before_publication() -> None:
+                    for observation in ancestry:
+                        _require_process_active(observation)
+                    _require_process_active(host)
+                    _revalidate_process_image(host, selected)
+
+                yield recheck_before_publication
             finally:
                 for observation in ancestry:
                     _close_process_observation(observation)
