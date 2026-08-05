@@ -626,10 +626,22 @@ def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
                     "restart_request_state": "applied_pending_readiness",
                     "pending_restart_request_id": "rr-held",
                     "owned_process_tree": {
+                        "schema_version": 2,
+                        "attribution_model": "owned_process_tree_v2",
+                        "agent": "beta",
+                        "root_key": supervisor_mod._root_key(  # noqa: SLF001
+                            str(tmp_path.resolve())
+                        ),
                         "status": "invalid",
                         "reason_code": "process_tree_invalid_legacy_managed_pids",
                         "observed_count": 1,
+                        "recorded_count": 0,
+                        "omitted_count": 1,
                         "limit": 64,
+                        "truncated": True,
+                        "refreshed_at": "2026-06-01T00:00:00Z",
+                        "wrapper_generation": None,
+                        "launch_nonce": None,
                         "entries": [],
                     },
                 },
@@ -641,6 +653,7 @@ def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
                         ),
                         "observed_count": 1,
                         "limit": 64,
+                        "rejected_count": 2,
                         "entries": [],
                     },
                 },
@@ -664,8 +677,22 @@ def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
         row for row in payload["items"]
         if row["item_id"] == "process_tree_hold:beta"
     )
+    rejected_item = next(
+        row for row in payload["items"]
+        if row["item_id"] == "process_tree_hold:claude"
+    )
 
     assert "complete current ownership from legacy PID records" in item["why_it_matters"]
+    assert "UNKNOWN, not zero" in item["recommendation"]
+    assert "Ownership record carries no rejected-candidate accounting" in (
+        item["recommendation"]
+    )
+    assert "Operator must confirm" in item["recommendation"]
+    assert "excludes 2 candidate identities" in rejected_item["recommendation"]
+    assert "outside the reset command's identity list" in (
+        rejected_item["recommendation"]
+    )
+    assert "Operator must confirm" in rejected_item["recommendation"]
     assert "no scripted remedy applies in this state" in item["recommendation"]
     assert item["restart_request"]["pending_progress"] is False
     assert item["configured_launch"]["argv"] == [
@@ -682,6 +709,8 @@ def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
     plain = capsys.readouterr().out
     assert "automatic recovery refused: beta" in plain
     assert "automatic recovery refused: claude" in plain
+    assert "UNKNOWN, not zero" in plain
+    assert "excludes 2 candidate identities" in plain
     assert "no scripted remedy applies in this state" in plain
     assert "configured detached launch argv" in plain
     assert r"C:\\Program Files\\Codex\\codex.exe" in plain

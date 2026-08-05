@@ -11308,7 +11308,8 @@ def test_owned_process_tree_bound_holds_and_escalates_when_truncated(
     assert attention_item["human_can_unblock_now"] is True
     assert attention_item["risk_severity"] == "high"
     assert "observed 65" in attention_item["why_it_matters"]
-    assert "automatic teardown" in attention_item["why_it_matters"]
+    assert "Automatic teardown" in attention_item["why_it_matters"]
+    assert "omits 1 observed identity" in attention_item["recommendation"]
 
     # A smaller reachable prefix does not prove the omitted identity ended.
     # Keep HOLD until an attended new launch/generation clears the record.
@@ -12633,6 +12634,63 @@ def test_reset_admission_rechecks_kill_switch_after_identity_probe(
 
     assert "operator_argv" not in item
     assert "no scripted remedy applies in this state" in item["recommendation"]
+    assert ".agenttalk/supervisor.kill" in item["recommendation"]
+    assert "absent" in item["recommendation"]
+
+
+def test_missing_kill_switch_names_the_only_operator_satisfiable_precondition(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+
+    item = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=lambda _pid, _start, _start_filetime=None: True,
+    )
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+    assert ".agenttalk/supervisor.kill" in item["recommendation"]
+    assert "absent" in item["recommendation"]
+    assert "while the supervisor remains stopped" in item["recommendation"]
+
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    admitted = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=lambda _pid, _start, _start_filetime=None: True,
+    )
+    assert admitted["operator_argv"]
+    assert ".agenttalk/supervisor.kill" not in admitted["recommendation"]
+
+
+def test_missing_kill_switch_is_not_named_when_recorded_identity_is_live(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    probed: list[int] = []
+
+    def identity_still_live(pid, _start, _start_filetime=None) -> bool:
+        probed.append(pid)
+        return False
+
+    item = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=identity_still_live,
+    )
+
+    assert probed
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+    assert ".agenttalk/supervisor.kill" not in item["recommendation"]
 
 
 def test_malformed_ephemeral_journal_does_not_erase_configured_refusal_card(
@@ -16109,8 +16167,15 @@ def test_reset_remedy_warns_on_legacy_v2_record_missing_rejected_count() -> None
     )
     assert second["state"] == "PROCESS_TREE_TRUNCATED"
     assert "rejected_count" not in second["next_state"]["owned_process_tree"]
-    assert "UNKNOWN, not zero" in second["reason"]
-    assert "--acknowledge-owned-processes-stopped" in second["reason"]
+    item = att.process_tree_hold_items(
+        {"agents": {"worker": second["next_state"]}},
+        reset_admissions={"evaluated": True, "admissions": {}},
+    )[0]
+    assert "UNKNOWN, not zero" in item["recommendation"]
+    assert "Ownership record carries no rejected-candidate accounting" in (
+        item["recommendation"]
+    )
+    assert "Operator must confirm" in item["recommendation"]
 
 
 def test_owned_process_tree_rejects_walk_when_launcher_missing_exact_filetime() -> None:
@@ -16276,8 +16341,13 @@ def test_owned_process_tree_does_not_double_count_same_rejected_candidate() -> N
     assert tree["rejected_count"] == 1
     # The operator-visible outcome the standing test rule asks for: the
     # remedy message must report ONE excluded candidate, not two.
-    assert "excluded 1 candidate(s)" in second["reason"]
-    assert "excluded 2 candidate(s)" not in second["reason"]
+    item = att.process_tree_hold_items(
+        {"agents": {"worker": second["next_state"]}},
+        reset_admissions={"evaluated": True, "admissions": {}},
+    )[0]
+    assert "excludes 1 candidate identity" in item["recommendation"]
+    assert "excludes 2 candidate identities" not in item["recommendation"]
+    assert "Operator must confirm" in item["recommendation"]
 
 
 def test_owned_process_tree_prior_entry_malformed_pid_still_finds_live_child() -> None:

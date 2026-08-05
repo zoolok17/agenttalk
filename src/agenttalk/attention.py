@@ -734,6 +734,94 @@ def configured_process_tree_hold_agents(state: dict) -> list[str]:
     return sorted(held)
 
 
+def _process_tree_identity_warning(tree: dict) -> str | None:
+    """Describe identities the reset command cannot prove from its own list."""
+    omitted = tree.get("omitted_count")
+    omitted_count = (
+        omitted
+        if isinstance(omitted, int)
+        and not isinstance(omitted, bool)
+        and 0 < omitted <= 1_000_000
+        else 0
+    )
+    omitted_over_display_cap = (
+        isinstance(omitted, int)
+        and not isinstance(omitted, bool)
+        and omitted > 1_000_000
+    )
+    rejected = tree.get("rejected_count")
+    rejected_count = (
+        rejected
+        if isinstance(rejected, int)
+        and not isinstance(rejected, bool)
+        and 0 < rejected <= 1_000_000
+        else 0
+    )
+    rejected_over_display_cap = (
+        isinstance(rejected, int)
+        and not isinstance(rejected, bool)
+        and rejected > 1_000_000
+    )
+    omitted_text = (
+        f"omits {omitted_count} observed "
+        f"{'identity' if omitted_count == 1 else 'identities'}"
+        if omitted_count
+        else (
+            "omits >1,000,000 identities"
+            if omitted_over_display_cap
+            else ""
+        )
+    )
+    rejected_text = (
+        f"excludes {rejected_count} candidate "
+        f"{'identity' if rejected_count == 1 else 'identities'}"
+        if rejected_count
+        else (
+            "excludes >1,000,000 candidates"
+            if rejected_over_display_cap
+            else ""
+        )
+    )
+    if omitted_text and rejected_text:
+        warning = (
+            f"Reset evidence {omitted_text} and {rejected_text} outside the "
+            "reset command's identity list. Operator must confirm them gone "
+            "separately."
+        )
+    elif rejected_text:
+        pronoun = "it" if rejected_count == 1 else "them"
+        warning = (
+            f"Reset evidence {rejected_text} outside the reset command's "
+            f"identity list. Operator must confirm {pronoun} gone separately."
+        )
+    elif omitted_text:
+        warning = (
+            f"Reset evidence {omitted_text}. Operator must confirm omitted "
+            "identities gone separately."
+        )
+    else:
+        warning = ""
+    if "rejected_count" not in tree:
+        omitted_clause = f" and {omitted_text}" if omitted_text else ""
+        return (
+            "Ownership record carries no rejected-candidate accounting "
+            f"(UNKNOWN, not zero){omitted_clause}. Operator must confirm "
+            "unlisted identities gone separately."
+        )
+    if (
+        not isinstance(rejected, int)
+        or isinstance(rejected, bool)
+        or rejected < 0
+    ):
+        omitted_clause = f" and {omitted_text}" if omitted_text else ""
+        return (
+            "Ownership record has invalid rejected-candidate accounting "
+            f"(UNKNOWN, not zero){omitted_clause}. Operator must confirm "
+            "unlisted identities gone separately."
+        )
+    return warning or None
+
+
 def process_tree_hold_items(
     state: dict,
     *,
@@ -759,6 +847,13 @@ def process_tree_hold_items(
         reset_admissions.get("admissions")
         if isinstance(reset_admissions, dict)
         and isinstance(reset_admissions.get("admissions"), dict)
+        else {}
+    )
+    blocked_admissions = (
+        reset_admissions.get("blocked_admissions")
+        if isinstance(reset_admissions, dict)
+        and reset_admissions.get("evaluated") is True
+        and isinstance(reset_admissions.get("blocked_admissions"), dict)
         else {}
     )
     admissions_evaluated = bool(
@@ -841,6 +936,7 @@ def process_tree_hold_items(
         remedy = admissions.get(identity)
         remedy_mode = None
         remedy_identity = None
+        remedy_blocker = None
         if isinstance(remedy, dict):
             mode = remedy.get("mode")
             actor = remedy.get("actor")
@@ -881,10 +977,48 @@ def process_tree_hold_items(
                     "actor": valid_actor,
                     "reason": reason,
                 }
+        blocker = blocked_admissions.get(identity)
+        if remedy_mode is None and isinstance(blocker, dict):
+            expected_common = {
+                "mode",
+                "missing_precondition",
+            }
+            if (
+                blocker.get("missing_precondition")
+                == "supervisor_kill_switch_absent"
+                and blocker.get("mode") == "configured_reset"
+                and frozenset(blocker) == expected_common | {"agent"}
+                and blocker.get("agent") == agent
+            ):
+                remedy_blocker = {
+                    "mode": "configured_reset",
+                    "agent": agent,
+                    "missing_precondition": "supervisor_kill_switch_absent",
+                }
+            elif (
+                blocker.get("missing_precondition")
+                == "supervisor_kill_switch_absent"
+                and blocker.get("mode") == "ephemeral_archive"
+                and request_id is not None
+                and frozenset(blocker) == expected_common | {"request_id"}
+                and blocker.get("request_id") == request_id
+                and eph.is_safe_id(request_id)
+            ):
+                remedy_blocker = {
+                    "mode": "ephemeral_archive",
+                    "request_id": request_id,
+                    "missing_precondition": "supervisor_kill_switch_absent",
+                }
         if remedy_mode is not None:
             recommendation = (
                 "The attended scripted remedy argv below is currently admitted; "
                 "the command rechecks every precondition before it changes state."
+            )
+        elif remedy_blocker is not None:
+            recommendation = (
+                "no scripted remedy applies in this state: "
+                ".agenttalk/supervisor.kill is absent. Create it while the "
+                "supervisor remains stopped."
             )
         elif admissions_evaluated:
             recommendation = "no scripted remedy applies in this state."
@@ -893,6 +1027,13 @@ def process_tree_hold_items(
                 "Scripted remedy admission was not evaluated by this state-only "
                 "projection; no scripted command is shown."
             )
+        identity_warning = (
+            _process_tree_identity_warning(tree_record)
+            if isinstance(tree, dict)
+            else None
+        )
+        if identity_warning:
+            recommendation = f"{identity_warning} {recommendation}"
         if blocked_restart is not None:
             recommendation += (
                 " A restart request is blocked by this refusal and is not "
@@ -928,6 +1069,7 @@ def process_tree_hold_items(
                 ),
                 "blocked_restart": blocked_restart,
                 "scripted_remedy": remedy_identity,
+                "scripted_remedy_blocker": remedy_blocker,
                 "evidence_hash": source_hash({
                     "owned_process_tree": tree_record,
                     "legacy_process_evidence": row.get(

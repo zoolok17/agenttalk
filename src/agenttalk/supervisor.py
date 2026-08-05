@@ -8707,10 +8707,13 @@ def evaluate_process_tree_reset_admissions(
     configured agents use their agent name and ephemeral requests use
     ``ephemeral:<request-id>``.  Nothing here mutates authority or state.  The
     command handler rechecks every predicate under its lifecycle/config locks;
-    this snapshot only decides whether a command may be *shown now*.
+    this snapshot only decides whether a command may be *shown now*.  A
+    ``blocked_admissions`` row is deliberately non-executable: it can name the
+    absent kill-switch only after every other remedy precondition passed.
     """
     admissions: dict[str, dict] = {}
-    def context_is_admitted() -> bool | None:
+
+    def context_state() -> str:
         try:
             marker_status, _marker, _detail = (
                 store.read_supervisor_instance_strict()
@@ -8719,18 +8722,21 @@ def evaluate_process_tree_reset_admissions(
             liaison = store.operator_facing()
             authorized_actor = liaison if liaison is not None else store.sole_lead()
         except (OSError, TypeError, ValueError):
-            return None
-        return bool(
-            marker_status == "absent"
-            and kill_switch is True
-            and actor is not None
-            and actor == authorized_actor
-        )
+            return "unavailable"
+        if kill_switch is None:
+            return "unavailable"
+        if (
+            marker_status != "absent"
+            or actor is None
+            or actor != authorized_actor
+        ):
+            return "blocked"
+        return "admitted" if kill_switch is True else "kill_switch_absent"
 
-    context_admitted = context_is_admitted()
-    if context_admitted is None:
+    context = context_state()
+    if context == "unavailable":
         return {"evaluated": False, "admissions": admissions}
-    if not context_admitted:
+    if context == "blocked":
         return {"evaluated": True, "admissions": admissions}
     try:
         validated_state = _validate_supervisor_state(
@@ -8946,11 +8952,31 @@ def evaluate_process_tree_reset_admissions(
             }
     # Identity probes and marker reads can outlive the context snapshot above.
     # Recheck every shared command precondition before advertising an argv.
-    context_admitted = context_is_admitted()
-    if context_admitted is None:
+    context = context_state()
+    if context == "unavailable":
         return {"evaluated": False, "admissions": {}}
-    if not context_admitted:
+    if context == "blocked":
         return {"evaluated": True, "admissions": {}}
+    if context == "kill_switch_absent":
+        blocked_admissions: dict[str, dict] = {}
+        for identity, admission in admissions.items():
+            if admission.get("mode") == "configured_reset":
+                blocked_admissions[identity] = {
+                    "mode": "configured_reset",
+                    "agent": admission["agent"],
+                    "missing_precondition": "supervisor_kill_switch_absent",
+                }
+            elif admission.get("mode") == "ephemeral_archive":
+                blocked_admissions[identity] = {
+                    "mode": "ephemeral_archive",
+                    "request_id": admission["request_id"],
+                    "missing_precondition": "supervisor_kill_switch_absent",
+                }
+        return {
+            "evaluated": True,
+            "admissions": {},
+            "blocked_admissions": blocked_admissions,
+        }
     return {"evaluated": True, "admissions": admissions}
 
 

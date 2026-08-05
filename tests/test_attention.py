@@ -458,6 +458,7 @@ def _process_tree_state(
                     "observed_count": observed_count,
                     "recorded_count": recorded_count,
                     "omitted_count": omitted_count,
+                    "rejected_count": 0,
                     "truncated": omitted_count > 0,
                     "refreshed_at": "2026-06-01T00:00:00Z",
                     "wrapper_generation": "wrapper-1",
@@ -498,6 +499,8 @@ def test_process_tree_hold_projects_blocking_operator_action(
     assert item["human_can_unblock_now"] is True
     assert item["priority"] == item["risk_severity"] == item["confidence"] == "high"
     assert expected_detail in item["why_it_matters"]
+    if status == "truncated":
+        assert "omits 1 observed identity" in item["recommendation"]
     assert "no scripted remedy applies in this state" in item["recommendation"]
     assert "operator_command" not in item
     assert item["configured_launch_unavailable"]
@@ -517,6 +520,40 @@ def test_process_tree_hold_projects_blocking_operator_action(
     surfaced = queue["items"][0]
     assert surfaced["state"] == "active"
     assert "ignored_illegitimate_disposition" in surfaced["warnings"]
+
+
+def test_large_positive_omitted_count_never_collapses_to_zero() -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="truncated",
+            reason_code="process_tree_truncated",
+            observed_count=1_000_065,
+        ),
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "omits >1,000,000 identities" in (
+        item["recommendation"]
+    )
+
+
+def test_large_positive_rejected_count_never_collapses_to_unknown() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+        observed_count=1,
+    )
+    state["agents"]["worker"]["owned_process_tree"]["rejected_count"] = 1_000_001
+
+    item = att.process_tree_hold_items(
+        state,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "excludes >1,000,000 candidates" in (
+        item["recommendation"]
+    )
+    assert "UNKNOWN, not zero" not in item["recommendation"]
 
 
 def test_process_tree_hold_hash_binds_exact_tree_and_legacy_evidence() -> None:
@@ -967,6 +1004,45 @@ def test_admitted_reset_is_emitted_as_exact_argv_bound_to_item_hash() -> None:
     assert rebound["operator_argv"][rebound["operator_argv"].index("--from") + 1] == (
         "ops"
     )
+
+
+def test_only_missing_kill_switch_precondition_is_named_without_a_command() -> None:
+    state = _process_tree_state(
+        status="truncated",
+        reason_code="process_tree_truncated",
+    )
+    admissions = {
+        "evaluated": True,
+        "admissions": {},
+        "blocked_admissions": {
+            "worker": {
+                "mode": "configured_reset",
+                "agent": "worker",
+                "missing_precondition": "supervisor_kill_switch_absent",
+            },
+        },
+    }
+
+    item = att.process_tree_hold_items(
+        state,
+        reset_admissions=admissions,
+    )[0]
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+    assert ".agenttalk/supervisor.kill" in item["recommendation"]
+    assert "absent" in item["recommendation"]
+    assert "while the supervisor remains stopped" in item["recommendation"]
+
+    unevaluated = {
+        **admissions,
+        "evaluated": False,
+    }
+    not_established = att.process_tree_hold_items(
+        state,
+        reset_admissions=unevaluated,
+    )[0]
+    assert ".agenttalk/supervisor.kill" not in not_established["recommendation"]
 
 
 def test_restart_marker_reads_are_limited_to_valid_configured_holds() -> None:

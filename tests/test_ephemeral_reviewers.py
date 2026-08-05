@@ -719,10 +719,7 @@ def test_launched_exit_without_fresh_tree_holds_without_restart_or_archive() -> 
     assert [item["item_id"] for item in attention_items] == [
         "process_tree_hold:ephemeral:lr-dead",
     ]
-    assert (
-        held["next_entry"]["process_tree_hold_reason"]
-        in attention_items[0]["why_it_matters"]
-    )
+    assert "complete current ownership" in attention_items[0]["why_it_matters"]
 
 
 @pytest.mark.parametrize("agent", [None, {}, "", "bad/agent"])
@@ -949,6 +946,8 @@ def test_ephemeral_cap_exceeded_holds_archive_and_escalates_attention() -> None:
     assert held["action"] == eph.ACTION_NONE
     assert held["state"] == "process_tree_hold"
     assert held["archive"] is False
+    assert held["retire"] is False
+    assert held["auto_restart"] is False
     assert held["kill_targets"] == []
     assert held["next_entry"]["owned_process_tree"]["status"] == "truncated"
     assert held["next_entry"]["owned_process_tree"]["observed_count"] == 65
@@ -968,7 +967,10 @@ def test_ephemeral_cap_exceeded_holds_archive_and_escalates_attention() -> None:
     attention_state = {
         "ephemeral_reviewers": {"active": {"lr-cap": held["next_entry"]}}
     }
-    items = att.process_tree_hold_items(attention_state)
+    items = att.process_tree_hold_items(
+        attention_state,
+        reset_admissions={"evaluated": True, "admissions": {}},
+    )
     assert [item["item_id"] for item in items] == [
         "process_tree_hold:ephemeral:lr-cap"
     ]

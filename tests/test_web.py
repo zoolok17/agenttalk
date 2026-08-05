@@ -5069,6 +5069,7 @@ def _attention(base: str) -> dict:
 
 def test_api_attention_surfaces_process_tree_hold_without_liaison(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agenttalk import attention as attention_mod
     from agenttalk import supervisor as supervisor_mod
@@ -5122,9 +5123,10 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
                         "status": "truncated",
                         "reason_code": "process_tree_truncated",
                         "limit": 64,
-                        "observed_count": 65,
+                        "observed_count": 1_000_065,
                         "recorded_count": 64,
-                        "omitted_count": 1,
+                        "omitted_count": 1_000_001,
+                        "rejected_count": 1_000_001,
                         "truncated": True,
                         "refreshed_at": "2026-06-01T00:00:00Z",
                         "wrapper_generation": "wrapper-1",
@@ -5134,16 +5136,43 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
                 },
                 "beta": {
                     "owned_process_tree": {
+                        "schema_version": 2,
+                        "attribution_model": "owned_process_tree_v2",
+                        "agent": "beta",
+                        "root_key": supervisor_mod._root_key(  # noqa: SLF001
+                            str(s.root.resolve())
+                        ),
                         "status": "invalid",
                         "reason_code": (
                             "process_tree_invalid_wrapper_state_mismatch"
                         ),
                         "observed_count": 1,
+                        "recorded_count": 0,
+                        "omitted_count": 1,
                         "limit": 64,
+                        "truncated": True,
+                        "refreshed_at": "2026-06-01T00:00:00Z",
+                        "wrapper_generation": None,
+                        "launch_nonce": None,
                         "entries": [],
                     },
                 },
             }
+        },
+    )
+    monkeypatch.setattr(
+        supervisor_mod,
+        "evaluate_process_tree_reset_admissions",
+        lambda *_args, **_kwargs: {
+            "evaluated": True,
+            "admissions": {},
+            "blocked_admissions": {
+                "alpha": {
+                    "mode": "configured_reset",
+                    "agent": "alpha",
+                    "missing_precondition": "supervisor_kill_switch_absent",
+                },
+            },
         },
     )
 
@@ -5168,6 +5197,10 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
     wire = next(
         item for item in payload["items"]
         if item["id"] == "process_tree_hold:alpha"
+    )
+    missing_accounting_wire = next(
+        item for item in payload["items"]
+        if item["id"] == "process_tree_hold:beta"
     )
     assert {
         item["id"]
@@ -5208,8 +5241,20 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
                 "a null AGENTTALK_PY must be recovered from the supervisor artifact, "
                 "and the supervisor may also supply an isolated CODEX_HOME and wrapper-log paths."
             ),
-        }
+    }
     assert "no scripted remedy applies in this state" in wire["recommendation"]
+    assert "Operator must confirm" in wire["recommendation"]
+    assert "omits >1,000,000 identities" in wire["recommendation"]
+    assert "excludes >1,000,000 candidates" in wire["recommendation"]
+    assert ".agenttalk/supervisor.kill" in wire["recommendation"]
+    assert "Create it while the supervisor remains stopped" in (
+        wire["recommendation"]
+    )
+    assert "UNKNOWN, not zero" in missing_accounting_wire["recommendation"]
+    assert "Ownership record carries no rejected-candidate accounting" in (
+        missing_accounting_wire["recommendation"]
+    )
+    assert "Operator must confirm" in missing_accounting_wire["recommendation"]
     assert "operator_command" not in wire
 
 
