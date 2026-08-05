@@ -7,6 +7,7 @@ fixtures. The generated PS/bash scripts are thin executors (documented-manual).
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -291,6 +292,285 @@ def test_scenario_iii_manual_marker_relaunches_and_waits_for_readiness() -> None
     assert p["bypass_backoff"] is True      # bypasses the future backoff_next
     assert "rr-1" in p["next_state"]["consumed_rids"]
     assert p["next_state"]["restart_request_state"] == "applied_pending_readiness"
+
+
+def test_observe_actions_cannot_express_executor_authority() -> None:
+    marker = _auth_marker("rr-observe")
+    report = _report(restart_request=marker)
+    state = {"agents": {"worker": _ready(backoff_next_epoch=NOW + 9999)}}
+    executable = sup.plan_actions(
+        report,
+        state,
+        _CONFIG,
+        now_epoch=NOW,
+        snapshot=_snap(),
+    )
+    assert executable["agents"]["worker"]["kill_first"] is True
+    assert executable["agents"]["worker"]["kill_targets"]
+
+    observed = sup.observe_actions(
+        report,
+        state,
+        _CONFIG,
+        now_epoch=NOW,
+        snapshot=_snap(),
+    )
+
+    assert set(observed) == {
+        "now_epoch", "agents", "launch_requests", "ephemeral_reviewers",
+    }
+    assert set(observed["agents"]["worker"]) == {
+        "agent", "action", "state", "reason", "health",
+    }
+    for fact in ("agent", "action", "state", "reason", "health"):
+        assert observed["agents"]["worker"][fact] == executable["agents"]["worker"][fact]
+    forbidden = {
+        "kill_first", "kill_orphans", "kill_targets", "clear_marker",
+        "next_state", "barrier_state", "session_args",
+    }
+
+    def _keys(value: object) -> set[str]:
+        if isinstance(value, dict):
+            return set(value) | set().union(*(_keys(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(_keys(item) for item in value))
+        return set()
+
+    assert forbidden.isdisjoint(_keys(observed))
+
+
+def test_observe_actions_allowlists_every_planner_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polluted = {
+        "now_epoch": NOW,
+        "agents": {"worker": {
+            "agent": "worker", "action": sup.STUCK_RECOVER,
+            "state": "STUCK_OR_DEAD", "reason": "confirmed",
+            "health": {
+                "state": "unknown",
+                "age_seconds": 12.5,
+                "warnings": [
+                    "health_missing",
+                    {"kill_targets": [{"pid": 999}]},
+                ],
+                "advisory": True,
+                "kill_targets": [{"pid": 123}],
+                "next_state": {"runtime_dead_polls": 2},
+                "launch": {"argv": ["python", "payload.py"]},
+            },
+            "kill_first": True, "kill_targets": [{"pid": 123}],
+            "future_executor_capability": "must not escape",
+        }},
+        "launch_requests": {"lr-1": {
+            "request_id": "lr-1", "action": "ephemeral_launch",
+            "state": "queued", "reason": "valid",
+            "profile": "executor-only launch detail", "archive": True,
+        }},
+        "ephemeral_reviewers": {"lr-2": {
+            "request_id": "lr-2", "agent": "adversary-lr-2",
+            "action": "ephemeral_complete", "state": "completed",
+            "terminal_state": "completed", "reason": "done",
+            "completion": {"status": "approved", "kill_targets": [{"pid": 999}]},
+            "kill_first": True, "kill_targets": [{"pid": 456}],
+            "retire": True, "archive": True,
+        }},
+    }
+    monkeypatch.setattr(
+        sup,
+        "_plan_actions",
+        lambda *_args, **_kwargs: polluted,
+    )
+
+    observed = sup.observe_actions({}, {}, {}, now_epoch=NOW, snapshot=[])
+
+    assert observed == {
+        "now_epoch": NOW,
+        "agents": {"worker": {
+            "agent": "worker", "action": sup.STUCK_RECOVER,
+            "state": "STUCK_OR_DEAD", "reason": "confirmed",
+            "health": {
+                "state": "unknown",
+                "age_seconds": 12.5,
+                "warnings": ["health_missing"],
+                "advisory": True,
+            },
+        }},
+        "launch_requests": {"lr-1": {
+            "request_id": "lr-1", "action": "ephemeral_launch",
+            "state": "queued", "reason": "valid",
+        }},
+        "ephemeral_reviewers": {"lr-2": {
+            "request_id": "lr-2", "agent": "adversary-lr-2",
+            "action": "ephemeral_complete", "state": "completed",
+            "terminal_state": "completed", "reason": "done",
+        }},
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        (None, {
+            "state": "unknown", "age_seconds": None,
+            "warnings": [], "advisory": True,
+        }),
+        ("state", {
+            "state": "unknown", "age_seconds": 1.0,
+            "warnings": ["health_missing"], "advisory": True,
+        }),
+        ("age_seconds", {
+            "state": "idle_waiting", "age_seconds": None,
+            "warnings": ["health_missing"], "advisory": True,
+        }),
+        ("warnings", {
+            "state": "idle_waiting", "age_seconds": 1.0,
+            "warnings": [], "advisory": True,
+        }),
+        ("advisory", {
+            "state": "idle_waiting", "age_seconds": 1.0,
+            "warnings": ["health_missing"], "advisory": True,
+        }),
+    ],
+)
+def test_observe_actions_closes_every_nested_health_leaf(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str | None,
+    expected: dict,
+) -> None:
+    poison = {
+        "kill_targets": [{"pid": 444}],
+        "next_state": {"runtime_dead_polls": 2},
+        "launch": {"argv": ["python", "payload.py"]},
+    }
+    health: object = {
+        "state": "idle_waiting",
+        "age_seconds": 1.0,
+        "warnings": ["health_missing"],
+        "advisory": True,
+    }
+    if field is None:
+        health = [poison]
+    else:
+        health[field] = poison
+    monkeypatch.setattr(
+        sup,
+        "_plan_actions",
+        lambda *_args, **_kwargs: {
+            "now_epoch": NOW,
+            "agents": {"worker": {"health": health}},
+            "launch_requests": {},
+            "ephemeral_reviewers": {},
+        },
+    )
+
+    observed = sup.observe_actions({}, {}, {}, now_epoch=NOW, snapshot=[])
+
+    assert observed["agents"]["worker"]["health"] == expected
+
+
+@pytest.mark.parametrize(
+    ("section", "row_key", "field"),
+    [
+        *(("agents", "worker", field) for field in (
+            "agent", "action", "state", "reason",
+        )),
+        *(("launch_requests", "lr-1", field) for field in (
+            "request_id", "agent", "action", "state", "terminal_state", "reason",
+        )),
+        *(("ephemeral_reviewers", "lr-2", field) for field in (
+            "request_id", "agent", "action", "state", "terminal_state", "reason",
+        )),
+    ],
+)
+def test_observe_actions_rejects_compound_values_in_scalar_facts(
+    monkeypatch: pytest.MonkeyPatch,
+    section: str,
+    row_key: str,
+    field: str,
+) -> None:
+    """Every observed leaf is typed; an allowlisted name is not enough."""
+    planned = {
+        "now_epoch": NOW,
+        "agents": {"worker": {
+            "agent": "worker",
+            "action": sup.NONE,
+            "state": "HEALTHY_IDLE",
+            "reason": "healthy",
+            "health": {
+                "state": "idle_waiting",
+                "age_seconds": 1.0,
+                "warnings": [],
+                "advisory": True,
+            },
+        }},
+        "launch_requests": {"lr-1": {
+            "request_id": "lr-1",
+            "agent": "adversary-lr-1",
+            "action": "ephemeral_launch",
+            "state": "queued",
+            "terminal_state": "denied",
+            "reason": "valid",
+        }},
+        "ephemeral_reviewers": {"lr-2": {
+            "request_id": "lr-2",
+            "agent": "adversary-lr-2",
+            "action": "none",
+            "state": "launched",
+            "terminal_state": "completed",
+            "reason": "awaiting result",
+        }},
+    }
+    planned[section][row_key][field] = {
+        "kill_targets": [{"pid": 444}],
+        "next_state": {"runtime_dead_polls": 2},
+        "launch": {"argv": ["python", "payload.py"]},
+    }
+    monkeypatch.setattr(sup, "_plan_actions", lambda *_args, **_kwargs: planned)
+
+    observed = sup.observe_actions({}, {}, {}, now_epoch=NOW, snapshot=[])
+
+    assert field not in observed[section][row_key]
+
+
+def test_observe_actions_rejects_compound_now_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sup,
+        "_plan_actions",
+        lambda *_args, **_kwargs: {
+            "now_epoch": {"next_state": {"runtime_dead_polls": 2}},
+            "agents": {},
+            "launch_requests": {},
+            "ephemeral_reviewers": {},
+        },
+    )
+
+    observed = sup.observe_actions({}, {}, {}, now_epoch=NOW, snapshot=[])
+
+    assert observed["now_epoch"] is None
+
+
+def test_observe_actions_rejects_overflowing_numeric_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    huge = 10 ** 400
+    monkeypatch.setattr(
+        sup,
+        "_plan_actions",
+        lambda *_args, **_kwargs: {
+            "now_epoch": huge,
+            "agents": {"worker": {"health": {"age_seconds": huge}}},
+            "launch_requests": {},
+            "ephemeral_reviewers": {},
+        },
+    )
+
+    observed = sup.observe_actions({}, {}, {}, now_epoch=NOW, snapshot=[])
+
+    assert observed["now_epoch"] is None
+    assert observed["agents"]["worker"]["health"]["age_seconds"] is None
 
 
 def test_scenario_iv_protected_stale_heartbeat_is_warn_only() -> None:
@@ -654,8 +934,16 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     # the REAL exe via -FilePath/-ArgumentList (NOT Invoke-Expression), applies
     # + restores env, the dry-run hook, and preserves state on a failed launch.
     ps = (s.dir / "supervisor.ps1").read_text(encoding="utf-8")
-    assert "supervise --plan --state-file" in ps
-    assert "--record-events" in ps
+    assert "$pollArgs = @('--plan')" in ps
+    assert "if (-not $DryRun)" in ps
+    assert "$eventArgs = @('--record-events')" in ps
+    assert "$pollArgs = @('--executable-poll') + $eventArgs" in ps
+    assert "'--instance-token', $InstanceToken" in ps
+    poll_start = ps.index("$pollArgs = @('--executable-poll')")
+    poll_end = ps.index("$plan = (& $AgenttalkCmd", poll_start)
+    assert "Supervisor-IdentityArgs" not in ps[poll_start:poll_end]
+    assert "supervise @pollArgs --state-file" in ps
+    assert "--snapshot-file $barrierPath @eventArgs" in ps
     assert "--json" not in ps                       # blocker regression guard
     assert "Start-WrapperProcess $startArgs" in ps
     assert "ArgumentList" in ps and "PassThru = $true" in ps
@@ -1495,7 +1783,11 @@ def test_supervisor_event_write_lock_timeout_is_fail_safe(tmp_path: Path, monkey
     assert not sup.supervisor_events_path(s).exists()
 
 
-def test_supervise_plan_record_events_uses_ring_not_bus(tmp_path: Path, capsys) -> None:
+def test_supervise_plan_record_events_uses_ring_not_bus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     s = _team(tmp_path)
     (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
     report_file = tmp_path / "rpt.json"
@@ -1504,9 +1796,18 @@ def test_supervise_plan_record_events_uses_ring_not_bus(tmp_path: Path, capsys) 
     state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
     snap_file = tmp_path / "snap.json"
     snap_file.write_text("[]", encoding="utf-8")
+    instance = s.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    assert instance is not None
+    monkeypatch.setattr(
+        cli.supervisor_lifecycle,
+        "authorized_executable_poll",
+        lambda _store, *, instance_token: contextlib.nullcontext(lambda: None),
+    )
 
     rc = _run([
-        "supervise", "--plan", "--record-events", "--report-file", str(report_file),
+        "supervise", "--executable-poll", "--record-events",
+        "--instance-token", instance["token"],
+        "--report-file", str(report_file),
         "--state-file", str(state_file), "--snapshot-file", str(snap_file),
         "--now", str(NOW),
     ], tmp_path)
@@ -1519,9 +1820,159 @@ def test_supervise_plan_record_events_uses_ring_not_bus(tmp_path: Path, capsys) 
     assert s.all_messages() == []
 
 
+def test_executable_poll_holds_authority_through_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG), encoding="utf-8",
+    )
+    report_file = tmp_path / "report.json"
+    report_file.write_text(json.dumps(_report()), encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    snapshot_file = tmp_path / "snapshot.json"
+    snapshot_file.write_text("[]", encoding="utf-8")
+    instance = store.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    assert instance is not None
+    order: list[str] = []
+    authority_held = {"value": False}
+    real_plan_actions = cli.sup.plan_actions
+    real_dumps = json.dumps
+
+    @contextlib.contextmanager
+    def authority(_store, *, instance_token):
+        assert instance_token == instance["token"]
+        authority_held["value"] = True
+        order.append("authority-enter")
+
+        def recheck() -> None:
+            assert authority_held["value"]
+            order.append("authority-recheck")
+
+        try:
+            yield recheck
+        finally:
+            order.append("authority-exit")
+            authority_held["value"] = False
+
+    def plan_actions(*args, **kwargs):
+        assert authority_held["value"]
+        order.append("plan-built")
+        return real_plan_actions(*args, **kwargs)
+
+    def dumps(payload, *args, **kwargs):
+        assert authority_held["value"]
+        order.append("serialized")
+        return real_dumps(payload, *args, **kwargs)
+
+    def publish(rendered, *, flush=False):
+        assert authority_held["value"]
+        assert isinstance(rendered, str)
+        assert flush is True
+        order.append("stdout-published")
+
+    def record_coordination(*args, **kwargs):
+        assert authority_held["value"]
+        order.append("coordination-event")
+
+    def record_plan(*args, **kwargs):
+        assert authority_held["value"]
+        order.append("plan-events")
+
+    monkeypatch.setattr(cli.supervisor_lifecycle, "authorized_executable_poll", authority)
+    monkeypatch.setattr(cli.sup, "plan_actions", plan_actions)
+    monkeypatch.setattr(cli.json, "dumps", dumps)
+    monkeypatch.setattr(cli, "print", publish, raising=False)
+    monkeypatch.setattr(
+        cli.sup,
+        "record_coordination_availability_observation",
+        record_coordination,
+    )
+    monkeypatch.setattr(cli.sup, "record_supervisor_plan_events", record_plan)
+
+    rc = _run([
+        "supervise", "--executable-poll", "--record-events",
+        "--instance-token", instance["token"],
+        "--report-file", str(report_file),
+        "--state-file", str(state_file),
+        "--snapshot-file", str(snapshot_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    assert order == [
+        "authority-enter",
+        "plan-built",
+        "serialized",
+        "authority-recheck",
+        "stdout-published",
+        "coordination-event",
+        "plan-events",
+        "authority-exit",
+    ]
+
+
+def test_executable_poll_recheck_failure_prevents_all_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG), encoding="utf-8",
+    )
+    report_file = tmp_path / "report.json"
+    report_file.write_text(json.dumps(_report()), encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    snapshot_file = tmp_path / "snapshot.json"
+    snapshot_file.write_text("[]", encoding="utf-8")
+    instance = store.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    assert instance is not None
+
+    @contextlib.contextmanager
+    def authority(_store, *, instance_token):
+        assert instance_token == instance["token"]
+
+        def recheck() -> None:
+            raise cli.supervisor_lifecycle.SupervisorLifecycleError(
+                "supervisor host exited before publication"
+            )
+
+        yield recheck
+
+    def must_not_publish(*args, **kwargs):
+        pytest.fail("authority loss must prevent stdout and event publication")
+
+    monkeypatch.setattr(cli.supervisor_lifecycle, "authorized_executable_poll", authority)
+    monkeypatch.setattr(cli, "print", must_not_publish, raising=False)
+    monkeypatch.setattr(
+        cli.sup,
+        "record_coordination_availability_observation",
+        must_not_publish,
+    )
+    monkeypatch.setattr(cli.sup, "record_supervisor_plan_events", must_not_publish)
+
+    rc = _run([
+        "supervise", "--executable-poll", "--record-events",
+        "--instance-token", instance["token"],
+        "--report-file", str(report_file),
+        "--state-file", str(state_file),
+        "--snapshot-file", str(snapshot_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert captured.out == ""
+    assert "exited before publication" in captured.err
+
+
 def test_supervise_plan_prints_when_record_events_raises(
         tmp_path: Path, monkeypatch, capsys) -> None:
-    _team(tmp_path)
+    store = _team(tmp_path)
     (tmp_path / ".agenttalk" / "supervisor.json").write_text(
         json.dumps(_CONFIG), encoding="utf-8")
     report_file = tmp_path / "rpt.json"
@@ -1530,6 +1981,13 @@ def test_supervise_plan_prints_when_record_events_raises(
     state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
     snap_file = tmp_path / "snap.json"
     snap_file.write_text("[]", encoding="utf-8")
+    instance = store.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    assert instance is not None
+    monkeypatch.setattr(
+        cli.supervisor_lifecycle,
+        "authorized_executable_poll",
+        lambda _store, *, instance_token: contextlib.nullcontext(lambda: None),
+    )
 
     def boom(*_args, **_kwargs):
         raise RuntimeError("recording side channel failed")
@@ -1537,7 +1995,9 @@ def test_supervise_plan_prints_when_record_events_raises(
     monkeypatch.setattr(cli.sup, "record_supervisor_plan_events", boom)
 
     rc = _run([
-        "supervise", "--plan", "--record-events", "--report-file", str(report_file),
+        "supervise", "--executable-poll", "--record-events",
+        "--instance-token", instance["token"],
+        "--report-file", str(report_file),
         "--state-file", str(state_file), "--snapshot-file", str(snap_file),
         "--now", str(NOW),
     ], tmp_path)
@@ -4888,6 +5348,167 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     assert "is not recognized" not in combined and "CommandNotFound" not in combined, combined
     # the DryRun plan line for the dead worker actually printed (the bus call ran)
     assert "worker:" in res.stdout, f"no plan emitted; stdout={res.stdout!r} stderr={res.stderr!r}"
+
+
+def test_generated_ps1_dry_run_does_not_confirm_one_missing_child_poll(
+    tmp_path: Path,
+) -> None:
+    """The real generated -DryRun route observes persisted poll one as poll one."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    config = {
+        **_WRAP_CONFIG,
+        "root": str(tmp_path),
+        "agents": {"worker": {
+            **_WRAP_CONFIG["agents"]["worker"],
+            "brain_pattern": "agenttalk-test-cli-never-exists.exe",
+        }},
+    }
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(config), encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+    ps1 = store.dir / "supervisor.ps1"
+    env = _checkout_runtime_env()
+    env["AGENTTALK_SELF"] = "worker"
+    fake_wrapper_dir = tmp_path / "fake-wrapper"
+    fake_wrapper_dir.mkdir()
+    (fake_wrapper_dir / "agenttalk.py").write_text(
+        "import time\ntime.sleep(300)\n",
+        encoding="utf-8",
+    )
+    wrapper_env = dict(env)
+    wrapper_env["PYTHONPATH"] = str(fake_wrapper_dir)
+    wrapper = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "agenttalk",
+            "--supervisor-launch-nonce",
+            SUPERVISOR_NONCE,
+            "--root",
+            str(tmp_path),
+            "wrap",
+            "--for",
+            "worker",
+            "--cli",
+            "codex",
+            "--loop",
+            "--",
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ],
+        cwd=str(fake_wrapper_dir),
+        env=wrapper_env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=(
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        ),
+    )
+    try:
+        assert wrapper.poll() is None
+        deadline = time.monotonic() + 10.0
+        wrapper_start = None
+        while wrapper_start is None and time.monotonic() < deadline:
+            wrapper_start = wrt.process_start_token(wrapper.pid)
+            if wrapper_start is None:
+                time.sleep(0.05)
+        assert wrapper_start is not None
+        start_dt = datetime.fromisoformat(wrapper_start.replace("Z", "+00:00"))
+        snapshot = _wrap_snap(
+            launcher_pid=wrapper.pid,
+            root=str(tmp_path),
+        )[:1]
+        snapshot[0]["start_time"] = wrapper_start
+        snapshot[0]["start_filetime"] = str(
+            int((start_dt.timestamp() + 11_644_473_600) * 10_000_000),
+        )
+
+        now = time.time()
+        writer = wrt.WrapperRuntimeWriter(
+            store.state_dir,
+            "worker",
+            "dryrun-wrapper",
+            wrapper_pid=wrapper.pid,
+            wrapper_start=wrapper_start,
+            clock=lambda: now - 60.0,
+            progress_write_interval_seconds=0,
+        )
+        writer.starting(message_id="msg-dryrun", turn_id="turn-dryrun")
+        writer.active(2_000_000_000, "missing-child-start")
+        writer.progress()
+        (store.state_dir / "worker.heartbeat").write_text(
+            _iso(now), encoding="utf-8",
+        )
+        initial_state = {"agents": {"worker": _wrap_ready(
+            launcher_pid=wrapper.pid,
+            launcher_start=wrapper_start,
+            runtime_wrapper_generation="dryrun-wrapper",
+            runtime_turn_generation=1,
+            runtime_progress_sequence=1,
+            runtime_progress_seen_epoch=now - 60.0,
+            backoff_next_epoch=now + 100.0,
+        )}}
+        report = sup.build_report(
+            store,
+            now_epoch=now,
+            state=initial_state,
+            supervisor_config=config,
+        )
+        first = sup.plan_actions(
+            report,
+            initial_state,
+            config,
+            now_epoch=now,
+            snapshot=snapshot,
+        )["agents"]["worker"]
+        assert first["state"] == "CLI_CHILD_MISSING", first
+        assert first["next_state"]["runtime_dead_polls"] == 1
+        direction = sup.plan_actions(
+            report,
+            {"agents": {"worker": first["next_state"]}},
+            config,
+            now_epoch=now,
+            snapshot=snapshot,
+        )["agents"]["worker"]
+        assert direction["state"] == "CLI_CHILD_DEAD"
+        assert direction["next_state"]["runtime_dead_polls"] == 2
+        persisted_state = dict(first["next_state"])
+        persisted_state.pop("owned_process_tree", None)
+        persisted_state["owned_process_tree_pending"] = True
+        (store.dir / "supervisor-state.json").write_text(
+            json.dumps({"agents": {"worker": persisted_state}}),
+            encoding="utf-8",
+        )
+
+        observed = subprocess.run(
+            [shell, "-NoProfile", "-File", str(ps1), "-Once", "-DryRun"],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert observed.returncode == 0, f"{observed.stdout}{observed.stderr}"
+        assert "worker: none (CLI_CHILD_MISSING)" in observed.stdout
+        assert "CLI_CHILD_DEAD" not in observed.stdout
+        persisted = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+        assert persisted["agents"]["worker"]["runtime_dead_polls"] == 1
+    finally:
+        if wrapper.poll() is None:
+            wrapper.terminate()
+            try:
+                wrapper.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                wrapper.kill()
+                wrapper.wait(timeout=10)
 
 
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:
@@ -8727,6 +9348,457 @@ def test_wrapped_active_absent_brain_requires_two_same_generation_polls() -> Non
     assert second["action"] == sup.STUCK_RECOVER
     assert second["state"] == "CLI_CHILD_DEAD"
     assert second["next_state"]["consecutive_fails"] == 3
+
+
+@pytest.mark.parametrize(
+    ("condition", "counter_key", "provisional_state", "confirmed_state"),
+    [
+        ("missing", "runtime_dead_polls", "CLI_CHILD_MISSING", "CLI_CHILD_DEAD"),
+        ("stalled", "runtime_stall_polls", "CLI_CHILD_STALL_SUSPECT", "CLI_CHILD_STALLED"),
+    ],
+)
+def test_read_only_observation_does_not_manufacture_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    condition: str,
+    counter_key: str,
+    provisional_state: str,
+    confirmed_state: str,
+) -> None:
+    """A surface read is not the supervisor's second confirming poll."""
+    store = _team(tmp_path)
+    progress_age = 2500.0 if condition == "stalled" else 60.0
+    runtime_args = {}
+    if condition == "stalled":
+        runtime_args = {
+            "launcher_creation_filetime": _ps_filetime(600000),
+            "launcher_exit_filetime": _ps_filetime(750000),
+        }
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=progress_age,
+            progress_age=progress_age,
+            progress_sequence=2,
+            **runtime_args,
+        ),
+    )
+    report["roster"] = ["worker"]
+    initial_state = {"agents": {"worker": _wrap_ready(
+        backoff_next_epoch=NOW + 100,
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - progress_age,
+    )}}
+    snapshot = (
+        _wrap_snap()[:1]
+        if condition == "missing"
+        else _codex_forked_brain_snap()
+    )
+
+    first = sup.plan_actions(
+        report,
+        initial_state,
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert first["state"] == provisional_state
+    assert first["next_state"][counter_key] == 1
+    provisional_state_data = {"agents": {"worker": first["next_state"]}}
+
+    # Direction control: only the transition planner is allowed to earn poll two.
+    transition = sup.plan_actions(
+        report,
+        provisional_state_data,
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert transition["state"] == confirmed_state
+    assert transition["next_state"][counter_key] == 2
+
+    projected = sup.observe_actions(
+        report,
+        provisional_state_data,
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert projected["state"] == provisional_state
+    assert "next_state" not in projected
+    assert sup.project_coordination_availability(
+        "worker",
+        report["agents"]["worker"],
+        projected,
+        _WRAP_CONFIG["agents"]["worker"],
+    )["state"] == sup.AVAILABILITY_UNKNOWN
+    assert sup.project_coordination_availability(
+        "worker",
+        report["agents"]["worker"],
+        transition,
+        _WRAP_CONFIG["agents"]["worker"],
+    )["state"] == sup.AVAILABILITY_UNAVAILABLE
+
+    monkeypatch.setattr(sup, "build_report", lambda *args, **kwargs: report)
+    before = json.dumps(provisional_state_data, sort_keys=True)
+    observation = sup.build_supervisor_observation(
+        store,
+        now_epoch=NOW,
+        state=provisional_state_data,
+        supervisor_config=_WRAP_CONFIG,
+        snapshot=snapshot,
+        event_limit=0,
+    )
+
+    worker = next(item for item in observation["agents"] if item["name"] == "worker")
+    assert worker["decision"]["state"] == provisional_state
+    assert json.dumps(provisional_state_data, sort_keys=True) == before
+
+    confirmed = sup.observe_actions(
+        report,
+        {"agents": {"worker": transition["next_state"]}},
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert confirmed["state"] == confirmed_state
+    assert "next_state" not in confirmed
+
+
+def test_supervise_plan_observes_but_executable_poll_advances_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The operator's primary inspection command must not earn poll two."""
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_WRAP_CONFIG), encoding="utf-8",
+    )
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=60.0,
+            progress_age=60.0,
+            progress_sequence=2,
+        ),
+    )
+    snapshot = _wrap_snap()[:1]
+    initial_state = {"agents": {"worker": _wrap_ready(
+        backoff_next_epoch=NOW + 100,
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 60.0,
+    )}}
+    first = sup.plan_actions(
+        report,
+        initial_state,
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert first["state"] == "CLI_CHILD_MISSING"
+    assert first["next_state"]["runtime_dead_polls"] == 1
+
+    report_file = tmp_path / "report.json"
+    report_file.write_text(json.dumps(report), encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"agents": {"worker": first["next_state"]}}),
+        encoding="utf-8",
+    )
+    snapshot_file = tmp_path / "snapshot.json"
+    snapshot_file.write_text(json.dumps(snapshot), encoding="utf-8")
+    before = state_file.read_bytes()
+    common = [
+        "--report-file", str(report_file),
+        "--state-file", str(state_file),
+        "--snapshot-file", str(snapshot_file),
+        "--now", str(NOW),
+    ]
+
+    assert _run(["supervise", "--plan", *common], tmp_path) == 0
+    observed = json.loads(capsys.readouterr().out)
+    assert observed["agents"]["worker"]["state"] == "CLI_CHILD_MISSING"
+    assert "next_state" not in observed["agents"]["worker"]
+    assert state_file.read_bytes() == before
+
+    assert _run([
+        "supervise", "--plan", "--record-events", *common,
+    ], tmp_path) == 2
+    assert "reserved for the executable supervisor poll" in capsys.readouterr().err
+
+    assert _run(["supervise", "--executable-poll", *common], tmp_path) == 3
+    assert "live supervisor host did not authorize this process" in (
+        capsys.readouterr().err
+    )
+
+    instance = store.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    assert instance is not None
+    monkeypatch.setattr(
+        cli.supervisor_lifecycle,
+        "authorized_executable_poll",
+        lambda _store, *, instance_token: contextlib.nullcontext(lambda: None),
+    )
+    assert _run([
+        "supervise", "--executable-poll",
+        "--instance-token", instance["token"],
+        *common,
+    ], tmp_path) == 0
+    executable = json.loads(capsys.readouterr().out)
+    assert executable["agents"]["worker"]["state"] == "CLI_CHILD_DEAD"
+    assert executable["agents"]["worker"]["next_state"]["runtime_dead_polls"] == 2
+    assert state_file.read_bytes() == before
+
+
+def test_executable_poll_replay_from_unrelated_process_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Only the selected live host's real child can earn confirmation poll two."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_WRAP_CONFIG), encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+    report = _report(
+        heartbeat_stale=False,
+        wrapper_runtime=_wrapper_runtime_view(
+            phase="active",
+            updated_age=60.0,
+            progress_age=60.0,
+            progress_sequence=2,
+        ),
+    )
+    snapshot = _wrap_snap()[:1]
+    initial_state = {"agents": {"worker": _wrap_ready(
+        backoff_next_epoch=NOW + 100,
+        runtime_turn_generation=1,
+        runtime_progress_sequence=2,
+        runtime_progress_seen_epoch=NOW - 60.0,
+    )}}
+    first = sup.plan_actions(
+        report,
+        initial_state,
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert first["state"] == "CLI_CHILD_MISSING"
+    assert first["next_state"]["runtime_dead_polls"] == 1
+
+    report_file = tmp_path / "replay-report.json"
+    state_file = tmp_path / "replay-state.json"
+    snapshot_file = tmp_path / "replay-snapshot.json"
+    report_file.write_text(json.dumps(report), encoding="utf-8")
+    state_file.write_text(
+        json.dumps({"agents": {"worker": first["next_state"]}}),
+        encoding="utf-8",
+    )
+    snapshot_file.write_text(json.dumps(snapshot), encoding="utf-8")
+    before = state_file.read_bytes()
+    host_script = tmp_path / "executable-poll-host.ps1"
+    legitimate_file = tmp_path / "legitimate-poll.json"
+    ready_file = tmp_path / "host-ready"
+    host_script.write_text(
+        r"""param(
+  [string]$Root,
+  [string]$ReportPath,
+  [string]$StatePath,
+  [string]$SnapshotPath,
+  [string]$LegitimatePath,
+  [string]$ReadyPath,
+  [string]$NowEpoch
+)
+$AgenttalkCmd = Join-Path $Root '.agenttalk\bin\agenttalk.cmd'
+$start = ([datetimeoffset](Get-Process -Id $PID -ErrorAction Stop).StartTime).ToString('o')
+$claim = $null
+try {
+  $claimArgs = @('--root', $Root, 'supervise', '--claim-instance',
+                 '--pid', "$PID", '--pid-start', $start)
+  $claimText = & $AgenttalkCmd @claimArgs
+  if ($LASTEXITCODE -ne 0) { throw "claim failed: $LASTEXITCODE" }
+  $claim = $claimText | ConvertFrom-Json
+  $pollArgs = @('--root', $Root, 'supervise', '--executable-poll',
+                '--instance-token', $claim.token,
+                '--report-file', $ReportPath, '--state-file', $StatePath,
+                '--snapshot-file', $SnapshotPath, '--now', $NowEpoch)
+  $pollText = & $AgenttalkCmd @pollArgs
+  if ($LASTEXITCODE -ne 0) { throw "legitimate poll failed: $LASTEXITCODE" }
+  $utf8 = [System.Text.UTF8Encoding]::new($false)
+  [System.IO.File]::WriteAllText(
+    $LegitimatePath, ($pollText -join [Environment]::NewLine), $utf8)
+  [System.IO.File]::WriteAllText($ReadyPath, [string]$claim.token, $utf8)
+  Start-Sleep -Seconds 60
+} finally {
+  if ($null -ne $claim) {
+    $releaseArgs = @('--root', $Root, 'supervise', '--release-instance',
+                     '--instance-token', $claim.token,
+                     '--pid', "$PID", '--pid-start', $start)
+    & $AgenttalkCmd @releaseArgs | Out-Null
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    env = _checkout_runtime_env()
+    host = subprocess.Popen(
+        [
+            shell, "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-File", str(host_script),
+            "-Root", str(tmp_path),
+            "-ReportPath", str(report_file),
+            "-StatePath", str(state_file),
+            "-SnapshotPath", str(snapshot_file),
+            "-LegitimatePath", str(legitimate_file),
+            "-ReadyPath", str(ready_file),
+            "-NowEpoch", str(NOW),
+        ],
+        cwd=str(tmp_path),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    code = (
+        "import sys; from agenttalk import cli; "
+        "raise SystemExit(cli.main(sys.argv[1:]))"
+    )
+    try:
+        deadline = time.monotonic() + 20.0
+        while (
+            not ready_file.exists()
+            and host.poll() is None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        if not ready_file.exists():
+            if host.poll() is None:
+                host.terminate()
+            stdout, stderr = host.communicate(timeout=10)
+            pytest.fail(f"selected host did not become ready: {stdout}{stderr}")
+
+        instance = store.read_supervisor_instance()
+        assert isinstance(instance, dict)
+        assert instance["pid"] == host.pid
+        assert host.poll() is None
+        legitimate = json.loads(legitimate_file.read_text(encoding="utf-8"))
+        assert legitimate["agents"]["worker"]["state"] == "CLI_CHILD_DEAD"
+        assert (
+            legitimate["agents"]["worker"]["next_state"]["runtime_dead_polls"]
+            == 2
+        )
+
+        replay = subprocess.run(
+            [
+                sys.executable, "-c", code,
+                "--root", str(tmp_path),
+                "supervise", "--executable-poll",
+                "--instance-token", instance["token"],
+                "--pid", str(instance["pid"]),
+                "--pid-start", instance["pid_start"],
+                "--report-file", str(report_file),
+                "--state-file", str(state_file),
+                "--snapshot-file", str(snapshot_file),
+                "--now", str(NOW),
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        assert replay.returncode == 3, replay.stdout + replay.stderr
+        assert "caller is unrelated to the live supervisor host" in replay.stderr
+        assert "CLI_CHILD_DEAD" not in replay.stdout
+        assert '"runtime_dead_polls": 2' not in replay.stdout
+        assert state_file.read_bytes() == before
+    finally:
+        if host.poll() is None:
+            host.terminate()
+        try:
+            host.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            host.kill()
+            host.wait(timeout=10)
+
+
+def test_status_surface_keeps_one_missing_child_poll_unconfirmed(tmp_path: Path) -> None:
+    store = _team(tmp_path)
+    config = {
+        **_WRAP_CONFIG,
+        "root": str(tmp_path),
+        "agents": {"worker": dict(_WRAP_CONFIG["agents"]["worker"])},
+    }
+    (store.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
+    (store.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
+    writer = wrt.WrapperRuntimeWriter(
+        store.state_dir,
+        "worker",
+        "wrapper-1",
+        wrapper_pid=WRAP_LAUNCHER_PID,
+        wrapper_start=WRAP_START,
+        clock=lambda: NOW,
+    )
+    writer.starting(message_id="msg-runtime", turn_id="turn-1")
+    writer.active(WRAP_CHILD_PID, WRAP_CHILD_START)
+    writer.progress()
+
+    snapshot = _wrap_snap(root=str(tmp_path))[:1]
+    initial_state = {"agents": {"worker": _wrap_ready(
+        backoff_next_epoch=NOW + 100,
+        runtime_turn_generation=1,
+        runtime_progress_sequence=1,
+        runtime_progress_seen_epoch=NOW,
+    )}}
+    report = sup.build_report(
+        store,
+        now_epoch=NOW,
+        state=initial_state,
+        supervisor_config=config,
+    )
+    first = sup.plan_actions(
+        report,
+        initial_state,
+        config,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert first["state"] == "CLI_CHILD_MISSING"
+    assert first["next_state"]["runtime_dead_polls"] == 1
+
+    state = {"agents": {"worker": first["next_state"]}}
+    direction = sup.plan_actions(
+        report,
+        state,
+        config,
+        now_epoch=NOW,
+        snapshot=snapshot,
+    )["agents"]["worker"]
+    assert direction["state"] == "CLI_CHILD_DEAD"
+
+    (store.dir / "supervisor-state.json").write_text(
+        json.dumps(state),
+        encoding="utf-8",
+    )
+    (store.dir / "supervisor-snapshot.json").write_text(
+        json.dumps(snapshot),
+        encoding="utf-8",
+    )
+
+    rows, warnings = cli._status_supervisor_summaries(store, NOW, config)
+
+    assert warnings == []
+    assert rows["worker"]["decision"]["action"] == sup.NONE
+    assert rows["worker"]["decision"]["state"] == "CLI_CHILD_MISSING"
 
 
 @pytest.mark.parametrize("phase", ["starting", "active", "terminal"])

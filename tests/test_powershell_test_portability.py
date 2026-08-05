@@ -21,10 +21,14 @@ EXPECTED_WINDOWS_ONLY = {
     "test_supervisor_lifecycle.py": {
         "test_explicit_selection_repairs_invalid_record_under_writer_locks",
         "test_lifecycle_barrier_blocks_claim_select_and_refresh_without_mutation",
+        "test_process_image_identity_reopens_native_system_image_through_sysnative",
+        "test_system_cmd_resolver_uses_observed_guest_architecture",
+        "test_system_cmd_resolver_uses_sysnative_for_native_ancestor_from_wow64",
         "test_task_install_commit_refuses_concurrent_selection_change",
         "test_task_install_prepare_refuses_different_existing_binding",
         "test_task_uninstall_clears_binding_before_new_name_prepare",
         "test_validate_ancestry_accepts_direct_and_cmd_hop",
+        "test_validate_ancestry_refuses_non_system_cmd_image",
     },
 }
 

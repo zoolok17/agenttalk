@@ -503,6 +503,13 @@ agenttalk supervise --plan
 agenttalk supervise --bootstrap-check
 ```
 
+`--plan` is a read-only, non-advancing preview. It cannot earn a second child
+confirmation poll or carry kill targets. The internal executable form derives
+the current selected PowerShell host and caller ancestry from the OS, verifies
+both remain live while planning, and treats the instance token as correlation
+rather than authority. This proves a live selected-host child, not the provenance
+of the PowerShell script itself (the wider gap remains #131).
+
 Use `--bootstrap-check` before treating a roster as a live team. It emits JSON
 and verifies the operator-facing liaison, supervisor-managed agent entries,
 wrapped Claude/Codex launch invariants, explicit wrapped `--root`, filled launch

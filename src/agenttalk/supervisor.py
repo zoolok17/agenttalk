@@ -7,12 +7,13 @@ must be deterministic and CI-testable WITHOUT launching a terminal:
 
 - :func:`build_report` - the read-only bus-side liveness snapshot
   (``agenttalk supervise --report --json``).
-- :func:`plan_actions` - the SHARED decision table. Given the report, the
+- :func:`plan_actions` - the SHARED executable decision table. Given the report, the
   supervisor's own state (launched-pid liveness + backoff + consumed restart
   ids + last-warn timestamps), and config, it returns one safe ACTION per
-  agent PLUS the next state. The live loop and the ``--dry-run`` harness call
-  the SAME function, so the safety table is unit-tested via fixtures and never
-  depends on real process death.
+  agent PLUS the next state. The live loop calls it through the OS-bound
+  executable-poll route. :func:`observe_actions` applies the same classifier
+  without advancing confirmation and projects an authority-free shape for
+  manual plans, dry runs, and operator surfaces.
 
 Decision principle: heartbeat freshness remains the liveness authority for
 manual agents. Wrapped agents additionally require one strictly validated
@@ -1811,7 +1812,7 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
                                  event_limit: int = 20,
                                  lead_liveness_stale_after_seconds: float =
                                  LEAD_LIVENESS_STALE_AFTER_SECONDS) -> dict:
-    """Read-only operator view: report + exact planner output + bounded ring tail."""
+    """Read-only operator view with a non-advancing decision projection."""
     config = supervisor_config if isinstance(supervisor_config, dict) else {}
     stuck = config.get("stuck_after_seconds")
     stuck = float(stuck) if isinstance(stuck, (int, float)) else None
@@ -1823,7 +1824,7 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
         state=state,
         supervisor_config=config,
     )
-    plan = plan_actions(report, state, config, now_epoch=now_epoch, snapshot=snapshot)
+    plan = observe_actions(report, state, config, now_epoch=now_epoch, snapshot=snapshot)
     events, event_warnings = read_supervisor_events(store, limit=event_limit)
     agents = []
     rpt_agents = report.get("agents") if isinstance(report.get("agents"), dict) else {}
@@ -6884,8 +6885,21 @@ def _health_brief(view: dict | None) -> dict:
     }
 
 
+def _confirmation_polls(
+    prior_polls: int,
+    *,
+    same_evidence: bool,
+    advance_confirmations: bool,
+) -> int:
+    """Project or advance a durable multi-poll confirmation counter."""
+    if not advance_confirmations:
+        return prior_polls if same_evidence else 0
+    return prior_polls + 1 if same_evidence else 1
+
+
 def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
-              liveness: dict, *, now_epoch: float) -> dict:
+              liveness: dict, *, now_epoch: float,
+              advance_confirmations: bool = True) -> dict:
     """Decide ONE agent's action + next state. PURE - no I/O, no clock.
 
     Manual agents retain heartbeat authority. Wrapped agents require a strict
@@ -7684,7 +7698,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                     and prior_dead_polls >= 0
                     else 0
                 )
-                dead_polls = (prior_dead_polls + 1) if same_runtime_turn else 1
+                dead_polls = _confirmation_polls(
+                    prior_dead_polls,
+                    same_evidence=same_runtime_turn,
+                    advance_confirmations=advance_confirmations,
+                )
                 nxt["runtime_dead_polls"] = dead_polls
                 if dead_polls < _CLI_CHILD_CONFIRM_POLLS:
                     return _result(
@@ -7746,7 +7764,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                     and not isinstance(prior_sequence, bool)
                     and progress_sequence == prior_sequence
                 )
-                stall_polls = (prior_stall_polls + 1) if same_sequence else 1
+                stall_polls = _confirmation_polls(
+                    prior_stall_polls,
+                    same_evidence=same_sequence,
+                    advance_confirmations=advance_confirmations,
+                )
                 nxt["runtime_stall_polls"] = stall_polls
                 if stall_polls < _CLI_CHILD_CONFIRM_POLLS:
                     return _result(
@@ -8312,18 +8334,15 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
     return out
 
 
-def plan_actions(report: dict, state: dict, config: dict,
-                 *, now_epoch: float, snapshot: list[dict] | None = None) -> dict:
-    """The SHARED decision table. Returns ``{"now_epoch", "agents": {name: plan}}``
-    where each plan has ``action``/``state`` plus ``kill_first``/``kill_orphans``/
-    ``kill_targets``/``discover_brain``/``resume_mode``/``next_state`` for the
-    executor. Only agents present in BOTH the config and the report are planned
-    (config drives what is supervised; the report supplies bus facts).
-
-    ``snapshot`` is the executor's process snapshot (list of rows) interpreted
-    per agent by :func:`_liveness`. Manual agents use it for best-effort restart
-    targets. Wrapped agents use it to re-prove ownership and project a bounded,
-    strict process tree into ``next_state`` for the next poll."""
+def _plan_actions(
+    report: dict,
+    state: dict,
+    config: dict,
+    *,
+    now_epoch: float,
+    snapshot: list[dict] | None,
+    advance_confirmations: bool,
+) -> dict:
     cfg_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     rpt_agents = report.get("agents") or {}
     state_agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
@@ -8341,8 +8360,16 @@ def plan_actions(report: dict, state: dict, config: dict,
         liveness = _liveness(snapshot, st, cfg_agent, name, now_epoch,
                              root_key=root_key, request_id=None,
                              runtime_view=rpt.get("wrapper_runtime"))
-        out[name] = _plan_one(name, rpt, st, config, cfg_agent, liveness,
-                              now_epoch=now_epoch)
+        out[name] = _plan_one(
+            name,
+            rpt,
+            st,
+            config,
+            cfg_agent,
+            liveness,
+            now_epoch=now_epoch,
+            advance_confirmations=advance_confirmations,
+        )
     return {
         "now_epoch": now_epoch,
         "agents": out,
@@ -8351,6 +8378,142 @@ def plan_actions(report: dict, state: dict, config: dict,
         "ephemeral_reviewers": _plan_ephemeral_active(
             report, state, config, now_epoch=now_epoch, snapshot=snapshot,
             root_key=root_key),
+    }
+
+
+def plan_actions(report: dict, state: dict, config: dict,
+                 *, now_epoch: float, snapshot: list[dict] | None = None) -> dict:
+    """The SHARED executable decision table.
+
+    Returns ``{"now_epoch", "agents": {name: plan}}`` where each plan has
+    ``action``/``state`` plus ``kill_first``/``kill_orphans``/``kill_targets``/
+    ``discover_brain``/``resume_mode``/``next_state`` for the executor. Only
+    agents present in BOTH the config and the report are planned (config drives
+    what is supervised; the report supplies bus facts).
+
+    ``snapshot`` is the executor's process snapshot (list of rows) interpreted
+    per agent by :func:`_liveness`. Manual agents use it for best-effort restart
+    targets. Wrapped agents use it to re-prove ownership and project a bounded,
+    strict process tree into ``next_state`` for the next poll. This executable
+    path may advance the durable two-poll child confirmation counters.
+    """
+    return _plan_actions(
+        report,
+        state,
+        config,
+        now_epoch=now_epoch,
+        snapshot=snapshot,
+        advance_confirmations=True,
+    )
+
+
+_OBSERVED_OMIT = object()
+
+
+def _observed_text(value: object) -> object:
+    return value if isinstance(value, str) else _OBSERVED_OMIT
+
+
+def _observed_optional_text(value: object) -> object:
+    return value if value is None or isinstance(value, str) else _OBSERVED_OMIT
+
+
+def _observed_number(value: object) -> int | float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return value if math.isfinite(float(value)) else None
+    except OverflowError:
+        return None
+
+
+def _observed_health(value: object) -> dict:
+    """Build the closed advisory-health fact; never copy a planner mapping."""
+    view = value if isinstance(value, dict) else {}
+    age = _observed_number(view.get("age_seconds"))
+    raw_warnings = view.get("warnings")
+    warnings = (
+        [warning for warning in raw_warnings if isinstance(warning, str)]
+        if isinstance(raw_warnings, list)
+        else []
+    )
+    return {
+        "state": health_model.label(view),
+        "age_seconds": age,
+        "warnings": warnings,
+        "advisory": True,
+    }
+
+
+_OBSERVED_AGENT_SCHEMA: dict[str, Callable[[object], object]] = {
+    "agent": _observed_text,
+    "action": _observed_text,
+    "state": _observed_text,
+    "reason": _observed_text,
+    "health": _observed_health,
+}
+_OBSERVED_REQUEST_SCHEMA: dict[str, Callable[[object], object]] = {
+    "request_id": _observed_optional_text,
+    "agent": _observed_optional_text,
+    "action": _observed_text,
+    "state": _observed_text,
+    "terminal_state": _observed_text,
+    "reason": _observed_text,
+}
+
+
+def _observed_items(
+    items: object,
+    schema: dict[str, Callable[[object], object]],
+) -> dict[str, dict]:
+    """Project planner rows through a closed, typed leaf schema."""
+    if not isinstance(items, dict):
+        return {}
+    observed: dict[str, dict] = {}
+    for key, item in items.items():
+        if not isinstance(key, str) or not isinstance(item, dict):
+            continue
+        row: dict[str, object] = {}
+        for field, project in schema.items():
+            if field not in item:
+                continue
+            value = project(item[field])
+            if value is not _OBSERVED_OMIT:
+                row[field] = value
+        observed[key] = row
+    return observed
+
+
+def _observed_epoch(value: object) -> int | float | None:
+    return _observed_number(value)
+
+
+def observe_actions(report: dict, state: dict, config: dict,
+                    *, now_epoch: float, snapshot: list[dict] | None = None) -> dict:
+    """Return read-only facts without earning a poll or executor authority.
+
+    Operator surfaces may consume confirmation already persisted by the
+    executable planner, but merely reading a snapshot cannot manufacture the
+    second poll required to call a child dead or stalled.  The positive
+    projection is also a capability boundary: observation rows cannot express
+    kill targets, state mutation, launch arguments, or archive authority.
+    """
+    planned = _plan_actions(
+        report,
+        state,
+        config,
+        now_epoch=now_epoch,
+        snapshot=snapshot,
+        advance_confirmations=False,
+    )
+    return {
+        "now_epoch": _observed_epoch(planned.get("now_epoch")),
+        "agents": _observed_items(
+            planned.get("agents"), _OBSERVED_AGENT_SCHEMA),
+        "launch_requests": _observed_items(
+            planned.get("launch_requests"), _OBSERVED_REQUEST_SCHEMA),
+        "ephemeral_reviewers": _observed_items(
+            planned.get("ephemeral_reviewers"), _OBSERVED_REQUEST_SCHEMA),
     }
 
 
@@ -9491,10 +9654,10 @@ CONFIG_TEMPLATE = """\
 }
 """
 
-# NOTE on the templates below: the DECISION lives in Python
-# (`agenttalk supervise --plan`); the scripts are THIN executors that supply
-# launched-pid liveness, run the plan, and do terminal mechanics. They support
-# `--once --dry-run` to print the action plan without launching anything.
+# NOTE on the templates below: the DECISION lives in Python. The scripts are
+# THIN executors that supply launched-pid liveness, request an OS-bound
+# executable poll, and do terminal mechanics. Their dry-run route uses the
+# non-advancing `agenttalk supervise --plan` observation instead.
 
 ARTIFACT_SCHEMA = 1
 
@@ -9698,8 +9861,10 @@ PS_TEMPLATE = r"""__AGENTTALK_ARTIFACT_MARKER__
 # agenttalk-checkout-id: __AGENTTALK_CHECKOUT_ID__
 __AGENTTALK_PREAMBLE__
 # agenttalk supervisor (PowerShell) - generated by `agenttalk supervise --init`.
-# The DECISION table is in Python (`agenttalk supervise --plan`); this script
-# only tracks launched PIDs, runs the plan, and launches/kills terminals.
+# The DECISION table is in Python; a Python child whose OS-derived ancestry
+# reaches this exact live selected host requests its hidden executable poll.
+# Manual `supervise --plan` and -DryRun are non-advancing observations and
+# carry no kill authority.
 # Resolve $pwshPath from `agenttalk supervise --select-pwsh`, then use it here.
 #   & $pwshPath -NoLogo -NoProfile -NonInteractive -File .\supervisor.ps1
 #   & $pwshPath -NoLogo -NoProfile -NonInteractive -File .\supervisor.ps1 -Once -DryRun
@@ -11993,7 +12158,10 @@ $pollNum = 0
     Wait-ForNextPoll $cfg
     continue supervisorPoll
   }
-  # 2) ask Python for the safe action plan (it interprets the snapshot)
+  # 2) ask Python for the executable action plan (it interprets the snapshot).
+  # DryRun uses the read-only --plan projection. The executable route derives
+  # this exact live host and the Python caller's ancestry from the OS; the token
+  # correlates the request but does not authenticate the host.
   # MUST be a UTC epoch: heartbeats are stamped in UTC (...Z), and the Python
   # plan compares now-vs-heartbeat for staleness. `Get-Date -UFormat %s` on
   # Windows PowerShell 5.1 returns a LOCAL-time epoch, so on any non-UTC machine
@@ -12002,8 +12170,14 @@ $pollNum = 0
   # skew -> constant stuck_recover). DateTimeOffset.UtcNow.ToUnixTimeSeconds() is
   # unambiguous UTC and locale-independent.
   $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-  $eventArgs = @(); if (-not $DryRun) { $eventArgs += @('--record-events') }
-  $plan = (& $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath @snapshotArgs @eventArgs --now $now) | ConvertFrom-Json
+  $eventArgs = @()
+  $pollArgs = @('--plan')
+  if (-not $DryRun) {
+    $eventArgs = @('--record-events')
+    $pollArgs = @('--executable-poll') + $eventArgs + @(
+                  '--instance-token', $InstanceToken)
+  }
+  $plan = (& $AgenttalkCmd --root $Root supervise @pollArgs --state-file $StatePath @snapshotArgs --now $now) | ConvertFrom-Json
   $pollNum++; $healthy = 0; $total = 0
   foreach ($name in $plan.agents.PSObject.Properties.Name) {
     $p = $plan.agents.$name

@@ -118,8 +118,10 @@ existing `supervisor.json` byte-for-byte and does not touch runtime state.
 - **`supervisor.json`** — the config you fill in: cadence knobs plus a
   per-agent block describing how to launch each agent.
 - **`supervisor.ps1`** — the generated PowerShell monitor. You run this;
-  you do not edit it. It polls `supervise --plan` and executes the plan
-  (launch / relaunch-with-resume / scoped kill / warn).
+  you do not edit it. Its live loop uses an internal executable poll whose caller
+  must be an OS-verified child of the live selected PowerShell host (launch /
+  relaunch-with-resume / scoped kill / warn). `-DryRun` uses the non-advancing
+  `supervise --plan` observation instead.
 - **`bin/agenttalk.cmd`** — a tiny shim the monitor calls so its own bus
   commands resolve to the right Python/agenttalk regardless of your PATH.
   You don't invoke it directly.
@@ -432,12 +434,12 @@ changed file fails that request instead of falling back. The project record and
 native file checks provide same-user consistency, not executable signing or ACL
 attestation; every generated script also keeps its in-process Core/major guard.
 
-The monitor loops every `poll_seconds`: it asks `agenttalk supervise
---plan` for the decision table and executes it — launching agents that
-aren't running, relaunching (resuming each agent's session — see section
-1) agents whose heartbeat went stale past grace, killing only the scoped
-process tree it manages, and
-warning (never killing) for un-instrumented stale agents.
+The monitor loops every `poll_seconds`: it invokes the internal executable poll
+for the decision table and executes it — launching agents that aren't running,
+relaunching (resuming each agent's session — see section 1) agents whose
+heartbeat went stale past grace, killing only the scoped process tree it manages,
+and warning (never killing) for un-instrumented stale agents. The public
+`agenttalk supervise --plan` command is only the read-only preview shown below.
 
 Leave it running. It survives the agents crashing; the agents survive it
 restarting.
@@ -448,12 +450,15 @@ In another terminal:
 
 ```powershell
 agenttalk supervise --report   # read-only liveness JSON: per-agent fresh/stale, threshold
-agenttalk supervise --plan     # the action plan the script will execute
+agenttalk supervise --plan     # non-advancing decision preview, with no kill authority
 agenttalk dashboard            # browser view: heartbeat age, who's composing, open threads
 ```
 
-`--report` and `--plan` are pure read-only derivations — safe to run any
-time, they change nothing.
+`--report` and `--plan` are pure read-only derivations — safe to run any time.
+They neither change state nor earn a confirming poll. The executable form accepts
+only a process whose live ancestry and host identity match the current selected
+PowerShell marker; the instance token alone is not authority. This proves the
+caller/host relationship, not the generated script's provenance (see #131).
 
 ### Use the Scheduled Task host
 
@@ -755,7 +760,7 @@ without ever rebuilding state.
 | `agenttalk supervise --repair-instance-marker --quarantine --acknowledge-no-live-supervisor` | Explicitly quarantine an invalid singleton marker after the operator confirms no supervisor is live. |
 | `agenttalk supervise --reset-process-tree-ownership --from L --for A --hold-source-hash HASH --verified-launch-nonce NONCE --acknowledge-no-live-supervisor --acknowledge-owned-processes-stopped --reason TEXT` | Record an attended owned-tree boundary. Requires liaison/sole-lead authority, the kill switch, no live instance marker, the current Attention hash and nonce, and every recorded PID/start proven gone or recycled. Never kills or launches. |
 | `agenttalk supervise --report` | Read-only per-agent liveness JSON (fresh/stale + threshold). |
-| `agenttalk supervise --plan` | The action plan (decision table) the monitor executes. |
+| `agenttalk supervise --plan` | Read-only, non-advancing decision preview; contains no kill authority. |
 | `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` hooks into the **project** `.claude/settings.json`. Codex modes write only the heartbeat hook to `.codex/hooks.json`. Never global, never clobbers unrelated settings. |
 | `agenttalk supervise --install-activity-hook --interactive-for <lead>` | Merge the three Claude hooks with a fallback identity for the current operator-facing human liaison; `AGENTTALK_SELF` still takes precedence. Refuses Codex hook modes. |
 | `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] -- <real exe> <base args>` | Run an agent through the progress wrapper: visibility + working-turn heartbeat + degraded detection. `--loop` = long-running supervised wrapper, one turn per inbound message. |

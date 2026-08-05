@@ -89,8 +89,22 @@ def _observation(
 
 def test_dotnet_seven_digit_creation_locator_matches_kernel_token() -> None:
     assert lifecycle.start_tokens_match(
-        "2026-07-15T13:05:52.062092Z",
+        "2026-07-15T13:05:52.0620917Z",
         "2026-07-15T15:05:52.0620917+02:00",
+    )
+    assert not lifecycle.start_tokens_match(
+        "2026-07-15T13:05:52.0620917Z",
+        "2026-07-15T15:05:52.0620916+02:00",
+    )
+    assert not lifecycle.start_tokens_match(
+        "2026-07-15T13:05:52.0620917Z",
+        "2026-07-15T15:05:52.0620918+02:00",
+    )
+
+
+def test_kernel_filetime_token_preserves_all_seven_fractional_digits() -> None:
+    assert lifecycle._ticks_to_token(134_285_904_001_234_567) == (
+        "2026-07-15T12:00:00.1234567Z"
     )
 
 
@@ -115,7 +129,160 @@ def test_validate_ancestry_accepts_direct_and_cmd_hop(
         "_open_process_observation",
         lambda pid, parents=None: current if pid == current_pid else cmd,
     )
+    monkeypatch.setattr(
+        lifecycle,
+        "_system_cmd_path_for_observation",
+        lambda observation: r"C:\Windows\System32\cmd.exe",
+        raising=False,
+    )
+    monkeypatch.setattr(psh, "native_file_identity", lambda path: cmd.identity)
     assert lifecycle._validate_ancestry(host) == (current, cmd)
+
+
+@WINDOWS_ONLY
+def test_validate_ancestry_refuses_non_system_cmd_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current_pid = os.getpid()
+    current = _observation(
+        current_pid,
+        parent=200,
+        path=r"C:\Python\python.exe",
+        ticks=300,
+    )
+    rogue = _observation(
+        200,
+        parent=100,
+        path=r"D:\attacker-controlled\cmd.exe",
+        ticks=200,
+        identity=_identity(r"D:\attacker-controlled\cmd.exe", "02"),
+    )
+    system_cmd = _identity(r"C:\Windows\System32\cmd.exe", "03")
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_parent_map",
+        lambda: {current_pid: rogue.pid, rogue.pid: host.pid},
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_open_process_observation",
+        lambda pid, parents=None: current if pid == current_pid else rogue,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_system_cmd_path_for_observation",
+        lambda observation: r"C:\Windows\System32\cmd.exe",
+        raising=False,
+    )
+    monkeypatch.setattr(psh, "native_file_identity", lambda path: system_cmd)
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="command-interpreter ancestor image identity",
+    ):
+        lifecycle._validate_ancestry(host)
+
+
+def test_expected_cmd_identity_read_failure_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cmd = _observation(
+        200,
+        parent=100,
+        path=r"C:\Windows\System32\cmd.exe",
+        ticks=200,
+    )
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: (_ for _ in ()).throw(psh.PowerShellHostError("access denied")),
+    )
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="cannot identify command-interpreter ancestor: access denied",
+    ):
+        lifecycle._require_observed_image(
+            cmd,
+            r"C:\Windows\System32\cmd.exe",
+            subject="command-interpreter ancestor",
+        )
+
+
+@WINDOWS_ONLY
+def test_system_cmd_resolver_uses_observed_guest_architecture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cmd = _observation(
+        200,
+        parent=100,
+        path=r"C:\Windows\SysWOW64\cmd.exe",
+        ticks=200,
+    )
+    cmd.handle = 700
+    monkeypatch.setattr(lifecycle, "_process_machines", lambda handle: (0x014C, 0x8664))
+    monkeypatch.setattr(
+        lifecycle,
+        "_wow64_system_directory",
+        lambda machine: r"C:\Windows\SysWOW64" if machine == 0x014C else "",
+    )
+
+    assert lifecycle._system_cmd_path_for_observation(cmd) == (
+        r"C:\Windows\SysWOW64\cmd.exe"
+    )
+
+
+@WINDOWS_ONLY
+def test_system_cmd_resolver_uses_sysnative_for_native_ancestor_from_wow64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cmd = _observation(
+        200,
+        parent=100,
+        path=r"C:\Windows\System32\cmd.exe",
+        ticks=200,
+    )
+    cmd.handle = 700
+    monkeypatch.setattr(lifecycle, "_current_process_handle", lambda: 800)
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_machines",
+        lambda handle: (0, 0x8664) if handle == 700 else (0x014C, 0x8664),
+    )
+    monkeypatch.setattr(lifecycle, "_windows_directory", lambda: r"C:\Windows")
+
+    assert lifecycle._system_cmd_path_for_observation(cmd) == (
+        r"C:\Windows\Sysnative\cmd.exe"
+    )
+
+
+@WINDOWS_ONLY
+def test_process_image_identity_reopens_native_system_image_through_sysnative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_cmd = r"C:\Windows\System32\cmd.exe"
+    native_identity = _identity(native_cmd, "04")
+    opened: list[str] = []
+    monkeypatch.setattr(lifecycle, "_current_process_handle", lambda: 800)
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_machines",
+        lambda handle: (0, 0x8664) if handle == 700 else (0x014C, 0x8664),
+    )
+    monkeypatch.setattr(lifecycle, "_windows_directory", lambda: r"C:\Windows")
+
+    def open_identity(path: str):
+        opened.append(str(path))
+        return native_identity, 900
+
+    monkeypatch.setattr(psh, "open_stable_native_file_identity", open_identity)
+
+    identity, handle = lifecycle._open_stable_process_image_identity(native_cmd, 700)
+
+    assert opened == [r"C:\Windows\Sysnative\cmd.exe"]
+    assert identity is native_identity
+    assert handle == 900
 
 
 def test_validate_ancestry_refuses_unrelated_manual_claim(
@@ -370,6 +537,114 @@ def test_generated_claim_lock_order_is_lifecycle_selection_config(
         "enter:lifecycle", "artifacts", "enter:selection", "enter:config",
         "exit:config", "exit:selection", "exit:lifecycle",
     ]
+
+
+def test_executable_poll_refuses_unrelated_process_replaying_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token correlates a poll; OS ancestry supplies its authority."""
+    store = _store(tmp_path)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    marker = store.claim_supervisor_instance(
+        pid=host.pid,
+        pid_start=host.creation_token,
+    )
+    assert marker is not None
+    selected = _selected(store)
+    monkeypatch.setattr(lifecycle, "_read_valid_selection_locked", lambda store: selected)
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(
+        lifecycle,
+        "_validate_ancestry",
+        lambda observed: (_ for _ in ()).throw(
+            lifecycle.SupervisorLifecycleError(
+                "current Python process is unrelated to the supervisor host"
+            )
+        ),
+    )
+
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match="unrelated"):
+        with lifecycle.authorized_executable_poll(
+            store,
+            instance_token=marker["token"],
+        ):
+            pytest.fail("an unrelated process must not enter the executable boundary")
+
+
+def test_executable_poll_holds_and_rechecks_live_host_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current = _observation(
+        os.getpid(), parent=host.pid, path=r"C:\Python\python.exe", ticks=200,
+    )
+    marker = store.claim_supervisor_instance(
+        pid=host.pid,
+        pid_start=host.creation_token,
+    )
+    assert marker is not None
+    selected = _selected(store)
+    active_checks: list[int] = []
+    monkeypatch.setattr(lifecycle, "_read_valid_selection_locked", lambda store: selected)
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
+    monkeypatch.setattr(
+        lifecycle,
+        "_require_process_active",
+        lambda observed: active_checks.append(observed.pid),
+    )
+    monkeypatch.setattr(lifecycle, "_revalidate_process_image", lambda host, record: None)
+
+    with lifecycle.authorized_executable_poll(
+        store,
+        instance_token=marker["token"],
+    ) as recheck_before_publication:
+        active_checks.append(-1)
+        recheck_before_publication()
+
+    assert active_checks == [current.pid, host.pid, -1, current.pid, host.pid]
+
+
+def test_executable_poll_refuses_owner_exit_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current = _observation(
+        os.getpid(), parent=host.pid, path=r"C:\Python\python.exe", ticks=200,
+    )
+    marker = store.claim_supervisor_instance(
+        pid=host.pid,
+        pid_start=host.creation_token,
+    )
+    assert marker is not None
+    checks = {host.pid: 0, current.pid: 0}
+    monkeypatch.setattr(
+        lifecycle, "_read_valid_selection_locked", lambda store: _selected(store),
+    )
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
+    monkeypatch.setattr(lifecycle, "_revalidate_process_image", lambda host, record: None)
+
+    def require_active(observed: lifecycle.ProcessObservation) -> None:
+        checks[observed.pid] += 1
+        if observed is host and checks[host.pid] == 2:
+            raise lifecycle.SupervisorLifecycleError(
+                "supervisor host exited before executable plan release"
+            )
+
+    monkeypatch.setattr(lifecycle, "_require_process_active", require_active)
+
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match="exited"):
+        with lifecycle.authorized_executable_poll(
+            store,
+            instance_token=marker["token"],
+        ) as recheck_before_publication:
+            recheck_before_publication()
 
 
 @WINDOWS_ONLY

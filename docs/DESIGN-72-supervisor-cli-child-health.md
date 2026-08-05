@@ -362,6 +362,27 @@ branch.
 
 ### 5. Death, wedge, and restart policy
 
+Only an executable supervisor poll may advance either two-poll confirmation
+counter. Read-only operator views use the same decision table but may only
+consume confirmation already persisted by an executable poll; reading the same
+process snapshot again is not a second poll. This observation/transition
+boundary keeps status, diagnostics, and coordination projections from
+manufacturing the evidence required for `CLI_CHILD_DEAD` or
+`CLI_CHILD_STALLED`.
+
+The boundary is executable, not conventional. Plain `supervise --plan` and the
+generated host's `-DryRun` route call `observe_actions`. The hidden
+`--executable-poll` route derives the selected PowerShell host identity and the
+caller's ancestry from the OS while holding the lifecycle locks, and rechecks
+both processes after planning; command-line PID/start values are not authority,
+and the instance token is correlation only. This establishes a live child of the
+current selected host, not the provenance of the PowerShell script itself (the
+wider host-provenance gap remains #131). `observe_actions` projects every source
+fact through a closed typed leaf schema, including the nested health record, and
+cannot return kill targets, state/marker transitions, launch arguments, or archive
+authority. New top-level or nested executor fields are therefore excluded until
+the observation schema explicitly admits them.
+
 Child death and child stall are different failures:
 
 - **Dead:** the active-turn brain is absent from a trustworthy snapshot.
