@@ -30,7 +30,7 @@ import math
 import os
 import re
 import shlex
-import subprocess
+import subprocess  # nosec B404 - list2cmdline formats argv; no process is launched
 import sys
 import tempfile
 import time
@@ -4246,7 +4246,7 @@ def configured_detached_launch(
     raw_cwd = row.get("cwd")
     if raw_cwd is None:
         cwd = root_text
-        cwd_token = ""
+        cwd_token = ""  # nosec B105 - command-template placeholder, not a secret
     else:
         cwd = clean(raw_cwd)
         cwd_token = cwd or ""
