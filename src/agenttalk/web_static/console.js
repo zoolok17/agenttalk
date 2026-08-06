@@ -1895,6 +1895,10 @@
         body.appendChild(el(
           'div', 'tc-attn-detail', item.configured_launch.environment_note));
       }
+    } else if (item.configured_launch_unavailable) {
+      body.appendChild(el(
+        'div', 'tc-attn-detail',
+        'Configured detached launch unavailable: ' + item.configured_launch_unavailable));
     }
     if (Array.isArray(item.operator_argv)) {
       var remedyArgv = el(

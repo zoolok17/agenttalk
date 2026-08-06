@@ -4293,8 +4293,10 @@ def configured_detached_launch(
     if not isinstance(launch, dict):
         return None, "the agent's supervisor.json launch entry is invalid"
     executable = clean(launch.get("windows_file"))
-    if executable is None or "REPLACE:" in executable.upper():
+    if executable is None:
         return None, "the configured launch executable is not runnable"
+    if _configured_launch_has_unresolved_placeholder(executable):
+        return None, "the configured launch executable contains an unresolved placeholder"
     raw_args = launch.get("windows_args")
     if not isinstance(raw_args, list) or len(raw_args) > max_args:
         return None, "the configured launch argument list is invalid"
@@ -4308,23 +4310,24 @@ def configured_detached_launch(
     else:
         cwd = clean(raw_cwd)
         cwd_token = cwd or ""
+        if cwd is not None and _configured_launch_has_unresolved_placeholder(cwd):
+            return None, "the configured launch working directory contains an unresolved placeholder"
     if cwd is None:
         return None, "the configured launch working directory is unavailable"
     args: list[str] = []
     for value in raw_args:
         argument = clean(value)
-        if argument is None or "REPLACE:" in argument.upper():
+        if argument is None:
             return None, "the configured launch argument list is not runnable"
-        if argument == "{SESSION_ARGS}" or any(
-            marker in argument
-            for marker in ("{SESSION_ID}", "{REQUEST_ID}", "{AGENT}")
-        ):
-            return None, "the configured argv still requires runtime-only arguments"
+        placeholder_candidate = argument.replace("{ROOT}", "").replace("<cwd>", "")
+        if _configured_launch_has_unresolved_placeholder(placeholder_candidate):
+            return None, "the configured launch argument list contains an unresolved placeholder"
         if "{ROOT}" in argument:
             if root_text is None:
                 return None, "the configured argv needs a root that is unavailable"
             argument = argument.replace("{ROOT}", root_text)
-        args.append(argument.replace("<cwd>", cwd_token))
+        argument = argument.replace("<cwd>", cwd_token)
+        args.append(argument)
     if root_text is not None:
         args = _ensure_agenttalk_wrap_root_arg(
             args,
@@ -6706,11 +6709,17 @@ def build_report(store: Store, *, now_epoch: float,
 
 _BOOTSTRAP_SUPPORTED_CLIS = {"claude", "codex"}
 _BOOTSTRAP_PLACEHOLDER_TOKENS = (
-    "REPLACE",
+    "REPLACE:",
     "REPLACE_WITH_PROJECT_DIR",
-    "AGENT_NAME",
     "{AGENT}",
     "<CWD>",
+)
+_BOOTSTRAP_AGENT_PLACEHOLDER_RE = re.compile(
+    r"\bAGENT_NAME(?:_WRAPPED)?\b",
+)
+_CONFIGURED_LAUNCH_RUNTIME_PLACEHOLDER_RE = re.compile(
+    r"\{(?:ROOT|SESSION_ARGS|SESSION_ID|REQUEST_ID|AGENT|PERM_MODE)\}|<CWD>",
+    re.IGNORECASE,
 )
 
 
@@ -6730,12 +6739,22 @@ def _bootstrap_add(checks: list[dict], check_id: str, status: str, detail: str,
 def _bootstrap_has_placeholder(value: object) -> bool:
     if isinstance(value, str):
         upper = value.upper()
-        return any(token in upper for token in _BOOTSTRAP_PLACEHOLDER_TOKENS)
+        return (
+            any(token in upper for token in _BOOTSTRAP_PLACEHOLDER_TOKENS)
+            or _BOOTSTRAP_AGENT_PLACEHOLDER_RE.search(upper) is not None
+        )
     if isinstance(value, list):
         return any(_bootstrap_has_placeholder(item) for item in value)
     if isinstance(value, dict):
         return any(_bootstrap_has_placeholder(item) for item in value.values())
     return False
+
+
+def _configured_launch_has_unresolved_placeholder(value: str) -> bool:
+    return (
+        _bootstrap_has_placeholder(value)
+        or _CONFIGURED_LAUNCH_RUNTIME_PLACEHOLDER_RE.search(value) is not None
+    )
 
 
 def _bootstrap_arg_value(args: list, flag: str) -> str | None:

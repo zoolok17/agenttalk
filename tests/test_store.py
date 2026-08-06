@@ -1323,6 +1323,36 @@ def test_process_alive_basic() -> None:
     assert _process_alive("x") is False           # never raises
 
 
+def test_windows_process_probes_reject_pid_outside_dword_before_openprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = False
+
+    def unexpected_open(*_args: object, **_kwargs: object) -> object:
+        nonlocal opened
+        opened = True
+        raise AssertionError("out-of-range pid reached OpenProcess")
+
+    monkeypatch.setattr(store_mod, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(ctypes, "WinDLL", unexpected_open, raising=False)
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(kernel32=SimpleNamespace(OpenProcess=unexpected_open)),
+        raising=False,
+    )
+
+    oversized_pid = 1 << 100
+    assert store_mod._process_alive(oversized_pid) is False
+    assert store_mod._process_liveness(oversized_pid) == store_mod.PROC_UNKNOWN
+    assert store_mod._process_start_token(oversized_pid) is None
+    assert (
+        store_mod._windows_owner_identity_gone_exact(oversized_pid, "1")
+        is False
+    )
+    assert opened is False
+
+
 def test_foreign_wait_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     s = Store(tmp_path)
     s.init(["alpha", "beta"])

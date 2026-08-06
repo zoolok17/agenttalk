@@ -7013,6 +7013,16 @@ LEAD_LOOP_CADENCE_FAIL_BACKOFF_MAX = 1800.0   # backoff ceiling (s)
 LEAD_LOOP_CADENCE_HEALTH_THRESHOLD = 5        # consecutive failed ticks -> escalate
 #                                               controller-HEALTH (NOT message poison)
 
+_WINDOWS_PID_MAX = (1 << 32) - 1
+
+
+def _valid_pid_value(pid: object) -> bool:
+    return isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+
+
+def _valid_windows_pid_value(pid: object) -> bool:
+    return _valid_pid_value(pid) and pid <= _WINDOWS_PID_MAX
+
 
 def _process_alive(pid: int) -> bool:
     """Best-effort, stdlib, fail-quiet liveness check (0.18.0, FR-007).
@@ -7022,9 +7032,11 @@ def _process_alive(pid: int) -> bool:
     duplicate-activation warning errs toward silence rather than a false
     alarm or a crash.
     """
-    if not isinstance(pid, int) or pid <= 0:
+    if not _valid_pid_value(pid):
         return False
     if os.name == "nt":
+        if not _valid_windows_pid_value(pid):
+            return False
         try:
             import ctypes  # stdlib; imported lazily so POSIX never pays for it
             from ctypes import wintypes
@@ -7064,7 +7076,7 @@ def _process_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True  # exists, owned by another user
-    except OSError:
+    except (OSError, OverflowError):
         return False
 
 
@@ -7104,9 +7116,11 @@ def _process_liveness(pid: object) -> str:
     alive => armed, guarded, and not stolen until the lease both expires AND its
     heartbeat goes stale. A non-positive/non-int pid is UNKNOWN (not DEAD): only the
     enumerated OS signals are definitive enough to authorize a steal."""
-    if not isinstance(pid, int) or pid <= 0:
+    if not _valid_pid_value(pid):
         return PROC_UNKNOWN
     if os.name == "nt":
+        if not _valid_windows_pid_value(pid):
+            return PROC_UNKNOWN
         try:
             import ctypes  # stdlib; lazy so POSIX never pays for it
             from ctypes import wintypes
@@ -7146,7 +7160,7 @@ def _process_liveness(pid: object) -> str:
         return PROC_DEAD
     except PermissionError:
         return PROC_ALIVE  # exists, owned by another user
-    except OSError:
+    except (OSError, OverflowError):
         return PROC_UNKNOWN  # uncertain -> never steal
 
 
@@ -7157,9 +7171,11 @@ def _process_start_token(pid: object) -> str | None:
     compare against a previously recorded start. Callers must treat None as
     conservative/possibly-same-process.
     """
-    if not isinstance(pid, int) or pid <= 0:
+    if not _valid_pid_value(pid):
         return None
     if os.name == "nt":
+        if not _valid_windows_pid_value(pid):
+            return None
         try:
             import ctypes  # stdlib; lazy so POSIX never pays for it
             from ctypes import wintypes
@@ -7289,9 +7305,7 @@ def _windows_owner_identity_gone_exact(
 ) -> bool:
     """Compare one live Windows process handle with an exact creation FILETIME."""
     if (
-        not isinstance(pid, int)
-        or isinstance(pid, bool)
-        or pid <= 0
+        not _valid_windows_pid_value(pid)
         or not isinstance(recorded_start_filetime, str)
         or re.fullmatch(r"[1-9][0-9]{0,19}", recorded_start_filetime) is None
     ):

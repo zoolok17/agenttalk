@@ -1178,8 +1178,9 @@ def test_rendered_strict_identity_ephemeral_retry_argv_executes(
     argv = item["operator_argv"]
 
     assert item["attended_disposition_mode"] == "strict_identity"
+    assert argv[:4] == ["agenttalk", "--root", str(tmp_path), "supervise"]
     assert argv[argv.index("--verified-launch-nonce") + 1] == SUPERVISOR_NONCE
-    assert cli.main(["--root", str(tmp_path), *argv[1:], "--now", str(NOW)]) == 0
+    assert cli.main([*argv[1:], "--now", str(NOW)]) == 0
 
 
 def test_staged_ephemeral_terminal_drift_hides_rendered_remedy(
@@ -1297,8 +1298,8 @@ def test_cli_attended_ephemeral_tree_hold_archives_exact_request(
     item = _current_ephemeral_reset_item(store, state, request_id)
     source_hash = item["source_hash"]
 
-    assert item["operator_argv"][3:5] == ["--request-id", request_id]
-    rc = cli.main(["--root", str(tmp_path), *item["operator_argv"][1:]])
+    assert item["operator_argv"][5:7] == ["--request-id", request_id]
+    rc = cli.main(item["operator_argv"][1:])
 
     assert rc == 0
     persisted = sup.load_supervisor_state(store.dir / "supervisor-state.json")
@@ -1342,9 +1343,9 @@ def test_cli_attended_ephemeral_hold_archives_without_strict_tree_evidence(
 
     assert "operator_command" not in item
     assert "no scripted remedy applies in this state" not in item["recommendation"]
-    assert item["operator_argv"][3:5] == ["--request-id", request_id]
+    assert item["operator_argv"][5:7] == ["--request-id", request_id]
 
-    rc = cli.main(["--root", str(tmp_path), *item["operator_argv"][1:]])
+    rc = cli.main(item["operator_argv"][1:])
 
     assert rc == 0
     persisted = sup.load_supervisor_state(state_path)
@@ -1466,7 +1467,7 @@ def test_cli_attended_ephemeral_archive_recovers_after_final_state_save_failure(
     state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
     item = _current_ephemeral_reset_item(store, state, request_id)
     args = [
-        "--root", str(tmp_path), *item["operator_argv"][1:],
+        *item["operator_argv"][1:],
         "--now", str(NOW),
     ]
     real_save = sup.save_supervisor_state
@@ -1514,7 +1515,7 @@ def test_cli_attended_ephemeral_archive_recovery_allows_liaison_turnover(
     state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
     item = _current_ephemeral_reset_item(store, state, request_id)
     args = [
-        "--root", str(tmp_path), *item["operator_argv"][1:],
+        *item["operator_argv"][1:],
         "--now", str(NOW),
     ]
     real_save = sup.save_supervisor_state
@@ -1544,7 +1545,7 @@ def test_cli_attended_ephemeral_archive_recovery_allows_liaison_turnover(
     )
     assert retry_item["source_hash"] != item["source_hash"]
     retry_args = [
-        "--root", str(tmp_path), *retry_item["operator_argv"][1:],
+        *retry_item["operator_argv"][1:],
         "--now", str(NOW + 1),
     ]
 

@@ -2634,6 +2634,12 @@ def build_attention(desc: RootDescriptor,
                             entry["configured_launch"]["environment_note"] = (
                                 _envelope_str(note)
                             )
+                else:
+                    launch_problem = it.get("configured_launch_unavailable")
+                    if isinstance(launch_problem, str):
+                        launch_problem = _envelope_str(launch_problem)
+                        if launch_problem:
+                            entry["configured_launch_unavailable"] = launch_problem
                 restart_request = it.get("restart_request")
                 if isinstance(restart_request, dict):
                     entry["restart_request"] = dict(restart_request)

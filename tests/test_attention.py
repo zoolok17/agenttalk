@@ -933,6 +933,148 @@ def test_configured_launch_rejects_unencodable_surrogates(config: dict) -> None:
     assert item["source_hash"]
 
 
+@pytest.mark.parametrize(
+    ("launch", "cwd"),
+    [
+        ({"windows_file": "AGENT_NAME_WRAPPED.exe", "windows_args": []}, None),
+        ({"windows_file": r"{ROOT}\python.exe", "windows_args": []}, None),
+        ({"windows_file": "{SESSION_ARGS}", "windows_args": []}, None),
+        ({"windows_file": "python.exe", "windows_args": ["AGENT_NAME_WRAPPED"]}, None),
+        ({"windows_file": "python.exe", "windows_args": ["REPLACE_WITH_PROJECT_DIR"]}, None),
+        ({"windows_file": "python.exe", "windows_args": ["<CWD>"]}, None),
+        ({"windows_file": "python.exe", "windows_args": []}, "REPLACE_WITH_PROJECT_DIR"),
+        ({"windows_file": "python.exe", "windows_args": []}, "{ROOT}"),
+        ({"windows_file": "python.exe", "windows_args": []}, "{REQUEST_ID}"),
+    ],
+    ids=[
+        "file",
+        "root-in-file",
+        "runtime-in-file",
+        "agent",
+        "project-dir",
+        "uppercase-cwd",
+        "working-dir",
+        "root-in-working-dir",
+        "runtime-in-working-dir",
+    ],
+)
+def test_configured_launch_rejects_unresolved_scaffold_placeholders(
+    launch: dict,
+    cwd: str | None,
+) -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+    row = {"launch": launch}
+    if cwd is not None:
+        row["cwd"] = cwd
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config={"agents": {"worker": row}},
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "placeholder" in item["configured_launch_unavailable"]
+
+
+def test_configured_launch_resolves_supported_cwd_placeholder() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+    cwd = r"D:\fleet\worker"
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "cwd": cwd,
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": ["--cwd", "<cwd>"],
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert item["configured_launch"]["argv"] == ["python.exe", "--cwd", cwd]
+
+
+def test_configured_launch_does_not_reinterpret_tokens_inside_project_root() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+    root = r"D:\literal-{ROOT}\fleet"
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": ["--root", "{ROOT}"],
+                    },
+                },
+            },
+        },
+        root=root,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert item["configured_launch"]["argv"] == ["python.exe", "--root", root]
+    assert item["configured_launch"]["cwd"] == root
+
+
+@pytest.mark.parametrize(
+    ("executable", "arguments", "cwd"),
+    [
+        (r"C:\Tools\Replacement\python.exe", [], r"D:\fleet"),
+        ("python.exe", ["--label", "replacement"], r"D:\fleet"),
+        ("python.exe", [], r"D:\replacement-cache"),
+    ],
+    ids=["executable", "argument", "working-dir"],
+)
+def test_configured_launch_allows_concrete_replacement_text(
+    executable: str,
+    arguments: list[str],
+    cwd: str,
+) -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "cwd": cwd,
+                    "launch": {
+                        "windows_file": executable,
+                        "windows_args": arguments,
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert item["configured_launch"]["argv"] == [executable, *arguments]
+    assert item["configured_launch"]["cwd"] == cwd
+
+
 def test_configured_non_python_launch_does_not_invent_agenttalk_python_pin() -> None:
     state = _process_tree_state(
         status="invalid",
@@ -978,18 +1120,31 @@ def test_admitted_reset_is_emitted_as_exact_argv_bound_to_item_hash() -> None:
         },
     }
 
+    root = r"D:\fleet target"
     item = att.process_tree_hold_items(
         state,
+        root=root,
         reset_admissions=admissions,
     )[0]
 
     assert "no scripted remedy applies" not in item["recommendation"]
     argv = item["operator_argv"]
-    assert argv[:5] == [
-        "agenttalk", "supervise", "--reset-process-tree-ownership", "--for", "worker",
+    assert argv[:7] == [
+        "agenttalk", "--root", root, "supervise",
+        "--reset-process-tree-ownership", "--for", "worker",
     ]
     assert argv[argv.index("--hold-source-hash") + 1] == item["source_hash"]
     assert argv[argv.index("--from") + 1] == "lead"
+
+    other_root = att.process_tree_hold_items(
+        state,
+        root=r"D:\other fleet",
+        reset_admissions=admissions,
+    )[0]
+    assert other_root["source_hash"] != item["source_hash"]
+    assert other_root["operator_argv"][:4] == [
+        "agenttalk", "--root", r"D:\other fleet", "supervise",
+    ]
 
     changed_actor = {
         "evaluated": True,
@@ -1002,12 +1157,28 @@ def test_admitted_reset_is_emitted_as_exact_argv_bound_to_item_hash() -> None:
     }
     rebound = att.process_tree_hold_items(
         state,
+        root=root,
         reset_admissions=changed_actor,
     )[0]
     assert rebound["source_hash"] != item["source_hash"]
     assert rebound["operator_argv"][rebound["operator_argv"].index("--from") + 1] == (
         "ops"
     )
+
+    unbound = att.process_tree_hold_items(
+        state,
+        reset_admissions=admissions,
+    )[0]
+    assert "operator_argv" not in unbound
+    assert "project root was unavailable" in unbound["recommendation"]
+
+    oversized_root = att.process_tree_hold_items(
+        state,
+        root="x" * 501,
+        reset_admissions=admissions,
+    )[0]
+    assert "operator_argv" not in oversized_root
+    assert "project root was unavailable" in oversized_root["recommendation"]
 
 
 def test_only_missing_kill_switch_precondition_is_named_without_a_command() -> None:

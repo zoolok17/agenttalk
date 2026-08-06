@@ -3066,7 +3066,7 @@ const root = {
 const payloads = {
   lastState: { roots: [root], _fetchedAt: now },
   attentionData: {
-    count: 3,
+    count: 4,
     items: [
       {
         source: 'escalation',
@@ -3107,6 +3107,18 @@ const payloads = {
         agent: 'codex-test',
         ts: iso,
         age_seconds: 5,
+      },
+      {
+        source: 'supervisor',
+        source_label: 'SUPERVISOR HOLD',
+        severity: 'high',
+        title: 'supervisor process-tree HOLD: beta',
+        detail: 'Automatic teardown is HOLD because the tree is invalid.',
+        recommendation: 'no scripted remedy applies in this state.',
+        configured_launch_unavailable: 'the agent has no supervisor.json launch entry',
+        agent: 'beta',
+        ts: iso,
+        age_seconds: 4,
       },
     ],
   },
@@ -3283,6 +3295,7 @@ const cases = [
       'Configured detached launch',
       'C:\\\\Python\\\\python.exe',
       'D:\\work\\demo-root',
+      'Configured detached launch unavailable: the agent has no supervisor.json launch entry',
     ],
   },
   { view: 'lead-chat', expected: ['Lead chat', 'Direct channel', 'route received'] },
@@ -5164,6 +5177,10 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         '{"agent": "alpha"}',
         encoding="utf-8",
     )
+    (s.state_dir / "beta.restart-request").write_text(
+        '{"agent": "beta"}',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         supervisor_mod,
         "evaluate_process_tree_reset_admissions",
@@ -5266,7 +5283,45 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         missing_accounting_wire["recommendation"]
     )
     assert "Operator must confirm" in missing_accounting_wire["recommendation"]
+    assert "configured_launch" not in missing_accounting_wire
+    assert missing_accounting_wire["configured_launch_unavailable"] == (
+        "the agent has no supervisor.json launch entry"
+    )
+    assert missing_accounting_wire["restart_request"] == {
+        "request_id": None,
+        "state": "blocked_by_process_tree_hold",
+        "pending_progress": False,
+        "unavailable": True,
+    }
     assert "operator_command" not in wire
+
+    monkeypatch.setattr(
+        supervisor_mod,
+        "evaluate_process_tree_reset_admissions",
+        lambda *_args, **_kwargs: {
+            "evaluated": True,
+            "admissions": {
+                "alpha": {
+                    "mode": "configured_reset",
+                    "agent": "alpha",
+                    "actor": "lead",
+                    "verified_launch_nonce": (
+                        "12345678-1234-4234-8234-123456789abc"
+                    ),
+                    "reason": "all recorded process identities verified stopped",
+                },
+            },
+        },
+    )
+    admitted_payload = web.build_attention(web.RootDescriptor(s, "root"))
+    admitted_wire = next(
+        item
+        for item in admitted_payload["items"]
+        if item["id"] == "process_tree_hold:alpha"
+    )
+    assert admitted_wire["operator_argv"][:4] == [
+        "agenttalk", "--root", str(tmp_path), "supervise",
+    ]
 
 
 def test_api_attention_hides_resolved_dead_letter_and_keeps_unresolved(

@@ -12803,7 +12803,7 @@ def test_live_supervisor_hides_reset_remedy_and_rejects_previously_admitted_argv
 
     assert "operator_argv" not in refused
     assert "no scripted remedy applies in this state" in refused["recommendation"]
-    assert _run(admitted["operator_argv"][1:], tmp_path) == 3
+    assert cli.main(admitted["operator_argv"][1:]) == 3
 
 
 def test_malformed_reset_audit_hides_command_that_handler_would_refuse(
@@ -12978,6 +12978,72 @@ def test_malformed_ephemeral_journal_does_not_erase_configured_refusal_card(
     )
 
 
+@pytest.mark.parametrize("surface", ["cli", "web"])
+def test_oversized_process_identity_keeps_hold_visible_on_attention_surfaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+) -> None:
+    from agenttalk import store as store_mod
+    from agenttalk import web
+
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    oversized_pid = 1 << 100
+    entry = state["agents"]["worker"]
+    entry["launcher_pid"] = oversized_pid
+    tree = entry["owned_process_tree"]
+    tree["entries"][0]["pid"] = oversized_pid
+    tree["entries"][0]["start_filetime"] = None
+    tree["entries"][1]["parent_pid"] = oversized_pid
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+
+    runtime_path = wrt.runtime_path(store.state_dir, "worker")
+    runtime_record = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime_record["wrapper_pid"] = oversized_pid
+    runtime_path.write_text(json.dumps(runtime_record), encoding="utf-8")
+
+    probed: list[int] = []
+
+    class PosixOverflowOS:
+        name = "posix"
+
+        def kill(self, pid: int, signal_number: int) -> None:
+            probed.append(pid)
+            raise OverflowError("pid does not fit pid_t")
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(os, name)
+
+    monkeypatch.setattr(store_mod, "os", PosixOverflowOS())
+    if surface == "cli":
+        items = cli._collect_attention_items(  # noqa: SLF001
+            store,
+            for_agent="lead",
+            roster=["lead", "worker"],
+        )
+    else:
+        items = web._collect_web_attention_items(  # noqa: SLF001
+            store,
+            ["lead", "worker"],
+            "lead",
+        )
+
+    assert oversized_pid in probed
+    hold_items = [
+        item for item in items
+        if item.get("item_id") == "process_tree_hold:worker"
+    ]
+    assert len(hold_items) == 1
+    assert "operator_argv" not in hold_items[0]
+    assert not any(
+        item.get("item_id") == "source_error:process_tree_hold"
+        for item in items
+    )
+
+
 def test_attended_process_tree_reset_is_audited_and_rearms_new_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -13006,8 +13072,8 @@ def test_attended_process_tree_reset_is_audited_and_rearms_new_generation(
     )
     source_hash = item["source_hash"]
 
-    assert item["operator_argv"][3:5] == ["--for", "worker"]
-    assert _run(item["operator_argv"][1:], tmp_path) == 0
+    assert item["operator_argv"][5:7] == ["--for", "worker"]
+    assert cli.main(item["operator_argv"][1:]) == 0
 
     expected_identities = [
         (row["pid"], row["start"], row.get("start_filetime"))
@@ -13087,7 +13153,7 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
         identity_gone=lambda _pid, _start, _start_filetime=None: True,
     )
 
-    assert _run(item["operator_argv"][1:], tmp_path) == 0
+    assert cli.main(item["operator_argv"][1:]) == 0
     reset_state = sup.load_supervisor_state(
         store.dir / "supervisor-state.json"
     )

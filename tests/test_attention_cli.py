@@ -715,6 +715,27 @@ def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
     assert "configured detached launch argv" in plain
     assert r"C:\\Program Files\\Codex\\codex.exe" in plain
 
+    supervisor_config_path = s.dir / "supervisor.json"
+    supervisor_config = json.loads(
+        supervisor_config_path.read_text(encoding="utf-8")
+    )
+    supervisor_config["agents"]["beta"]["launch"]["windows_args"][-1] = (
+        "AGENT_NAME_WRAPPED"
+    )
+    supervisor_config_path.write_text(
+        json.dumps(supervisor_config),
+        encoding="utf-8",
+    )
+
+    assert cli.main([*_root(tmp_path), "attention", "--json"]) == 0
+    placeholder_payload = json.loads(capsys.readouterr().out)
+    placeholder_item = next(
+        row for row in placeholder_payload["items"]
+        if row["item_id"] == "process_tree_hold:beta"
+    )
+    assert "configured_launch" not in placeholder_item
+    assert "placeholder" in placeholder_item["configured_launch_unavailable"]
+
 
 @pytest.mark.parametrize(
     ("reason_code", "operator_fact"),

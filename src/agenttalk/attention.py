@@ -819,6 +819,18 @@ def process_tree_hold_items(
     """
     from agenttalk import supervisor as supervisor_mod
 
+    operator_root = str(root) if root is not None else None
+    if (
+        not operator_root
+        # Keep emitted argv inside the web attention wire's closed token bound.
+        or len(operator_root) > 500
+        or any(
+            ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
+            for char in operator_root
+        )
+    ):
+        operator_root = None
+
     agents = state.get("agents") if isinstance(state, dict) else None
     admissions = (
         reset_admissions.get("admissions")
@@ -1033,10 +1045,15 @@ def process_tree_hold_items(
                     "request_id": request_id,
                     "missing_precondition": "supervisor_kill_switch_absent",
                 }
-        if remedy_mode is not None:
+        if remedy_mode is not None and operator_root is not None:
             recommendation = (
                 "The attended scripted remedy argv below is currently admitted; "
                 "the command rechecks every precondition before it changes state."
+            )
+        elif remedy_mode is not None:
+            recommendation = (
+                "The attended scripted remedy is currently admitted, but its "
+                "project root was unavailable; no scripted command is shown."
             )
         elif remedy_blocker is not None:
             recommendation = (
@@ -1087,6 +1104,7 @@ def process_tree_hold_items(
                 "limit": display_limit,
                 "wrapper_generation": tree_record.get("wrapper_generation"),
                 "launch_nonce": tree_record.get("launch_nonce"),
+                "project_root": operator_root,
                 "configured_launch": launch,
                 "configured_launch_unavailable": (
                     launch_problem if launch is None else None
@@ -1144,9 +1162,11 @@ def process_tree_hold_items(
             it["configured_launch_unavailable"] = launch_problem
         if blocked_restart is not None:
             it["restart_request"] = blocked_restart
-        if remedy_mode == "configured_reset":
+        if remedy_mode == "configured_reset" and operator_root is not None:
             it["operator_argv"] = [
                 "agenttalk",
+                "--root",
+                operator_root,
                 "supervise",
                 "--reset-process-tree-ownership",
                 "--for",
@@ -1162,9 +1182,11 @@ def process_tree_hold_items(
                 "--from",
                 remedy["actor"],
             ]
-        elif remedy_mode == "ephemeral_archive":
+        elif remedy_mode == "ephemeral_archive" and operator_root is not None:
             operator_argv = [
                 "agenttalk",
+                "--root",
+                operator_root,
                 "supervise",
                 "--reset-process-tree-ownership",
                 "--request-id",
