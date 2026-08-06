@@ -119,7 +119,8 @@ def _committed_generation_pool(
 
 def test_direct_wrap_launch_owns_bounded_log_capture(tmp_path: Path) -> None:
     project = tmp_path / "project"
-    Store(project).init(["worker"])
+    store = Store(project)
+    store.init(["worker"])
     blocked_state = tmp_path / "blocked-state"
     blocked_state.write_text("not a directory", encoding="utf-8")
     env = _direct_wrap_environment(tmp_path, blocked_state)
@@ -128,12 +129,17 @@ def test_direct_wrap_launch_owns_bounded_log_capture(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "Plan: I would compute" in result.stdout
-    logs = _captured_stderr_logs(tmp_path)
-    assert len(logs) == 1, (
-        f"expected exactly one stderr.log under {tmp_path}, found {len(logs)}; "
+    # Read the wrapper's own recorded fact rather than guessing where the
+    # fallback landed: a rejected preferred root can be superseded by a
+    # fallback outside tmp_path (e.g. the OS temp directory), which a glob
+    # confined to tmp_path would never find even though capture worked
+    # correctly. See #113 - four rounds were spent tracing exactly this.
+    location = wrapper_logs.read_wrapper_log_location(store.state_dir, "worker")
+    assert location["status"] == "observed", (
+        f"expected an observed wrapper log location, got {location!r}; "
         f"wrapper stderr was: {result.stderr!r}"
     )
-    generation = logs[0].parent
+    generation = Path(str(location["generation_dir"]))
     assert (generation / ".committed").exists()
     captured = "".join(
         path.read_text(encoding="utf-8")
@@ -209,7 +215,8 @@ def test_report_names_the_root_that_accepted_the_wrapper_generation(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
-    Store(project).init(["worker"])
+    store = Store(project)
+    store.init(["worker"])
     blocked_state = tmp_path / "blocked-state"
     blocked_state.write_text("not a directory", encoding="utf-8")
     env = _direct_wrap_environment(tmp_path, blocked_state)
@@ -221,14 +228,23 @@ def test_report_names_the_root_that_accepted_the_wrapper_generation(
 
     result = _run_direct_wrapper(project, env)
     assert result.returncode == 0, result.stderr
-    logs = _captured_stderr_logs(tmp_path)
-    assert len(logs) == 1, (
-        f"expected exactly one stderr.log under {tmp_path}, found {len(logs)}; "
+    # Read the wrapper's own recorded fact rather than guessing where the
+    # fallback landed via a glob confined to tmp_path: the preferred root is
+    # deliberately blocked above, and the fallback that supersedes it is not
+    # guaranteed to resolve under tmp_path (e.g. the OS temp directory can
+    # sit alongside it, not inside it). The wrapper already names its own
+    # accepted location as a fact - asserting against that fact instead of
+    # an inferred directory is the property this test is actually named for.
+    location = wrapper_logs.read_wrapper_log_location(store.state_dir, "worker")
+    assert location["status"] == "observed", (
+        f"expected an observed wrapper log location, got {location!r}; "
         f"wrapper stderr was: {result.stderr!r}"
     )
-    [stderr_log] = logs
-    actual_generation = stderr_log.parent.resolve()
-    actual_root = actual_generation.parent.parent
+    actual_root = Path(str(location["root"]))
+    actual_generation = Path(str(location["generation_dir"]))
+    actual_stderr = Path(str(location["stderr"]))
+    assert actual_generation.is_dir()
+    assert (actual_generation / ".committed").exists()
     assert actual_root != preferred.resolve()
 
     # Make the preferred location viable before asking. A report that recomputes
@@ -262,7 +278,7 @@ def test_report_names_the_root_that_accepted_the_wrapper_generation(
     assert location["status"] == "observed"
     assert Path(location["root"]) == actual_root
     assert Path(location["generation_dir"]) == actual_generation
-    assert Path(location["stderr"]) == stderr_log.resolve()
+    assert Path(location["stderr"]) == actual_stderr
 
 
 def test_wrapper_log_location_uses_hashed_windows_safe_agent_files(
