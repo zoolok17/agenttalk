@@ -44,6 +44,7 @@ from agenttalk import lanes as lane_mod
 from agenttalk.store import Store, _process_alive, validate_agent_name
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle as lifecycle
+from agenttalk import supervisor_runtime as runtime_control
 from agenttalk import wrapper_runtime as runtime_obs
 from agenttalk import wrapper_logs as wrapper_log
 
@@ -1835,7 +1836,7 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
         agents.append(supervisor_agent_assessment(
             name, rpt, plan_agents.get(name), operator_facing=report.get("operator_facing"),
             lead_liveness_stale_after_seconds=lead_liveness_stale_after_seconds))
-    return {
+    observation = {
         "schema_version": 1,
         "root": str(store.root),
         "now_epoch": float(now_epoch),
@@ -1850,6 +1851,10 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
         "report": _redacted_observation_report(report),
         "plan": _redacted_observation_plan(plan),
     }
+    runtime_status = runtime_control.build_runtime_status(store)
+    if runtime_control.runtime_status_relevant(runtime_status):
+        observation["supervisor_runtime"] = runtime_status
+    return observation
 
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
 # generated PowerShell uses an array-of-literals ArgumentList - single-quoted
@@ -9731,8 +9736,31 @@ function Supervisor-IdentityArgs {
   if ($SupervisorStart) { $argv += @('--pid-start', $SupervisorStart) }
   return $argv
 }
+function Sync-KillSwitchObservation([string]$phase) {
+  $observeArgs = @('--root', $Root, 'supervise', '--observe-kill-switch',
+                   '--observation-phase', $phase) + (Supervisor-IdentityArgs)
+  $observeText = & $AgenttalkCmd @observeArgs
+  if ($LASTEXITCODE -ne 0) {
+    if (-not $Quiet) {
+      Write-Warning "supervisor: could not persist kill-switch observation"
+    }
+    return $null
+  }
+  try { return ($observeText | ConvertFrom-Json) } catch {
+    if (-not $Quiet) {
+      Write-Warning "supervisor: kill-switch observation response was invalid"
+    }
+    return $null
+  }
+}
 $InstanceToken = $null
-if (Test-Path $KillSwitchPath) { exit 3 }
+$startupObservation = Sync-KillSwitchObservation 'startup'
+if ($null -eq $startupObservation) { exit 3 }
+$script:KillSwitchObservationActive = [bool]$startupObservation.active
+if ($script:KillSwitchObservationActive) {
+  # Exit 3 is a blocked failure, not success: Scheduled Task hosting retries it.
+  exit 3
+}
 if ($DryRun) {
   $validateArgs = @('--root', $Root, 'supervise', '--validate-current-pwsh',
                     '--artifact-boundary', 'supervisor') + (Supervisor-IdentityArgs)
@@ -9741,7 +9769,16 @@ if ($DryRun) {
 } else {
   $claimArgs = @('--root', $Root, 'supervise', '--claim-instance') + (Supervisor-IdentityArgs)
   $claimText = & $AgenttalkCmd @claimArgs
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if ($LASTEXITCODE -ne 0) {
+    $claimExit = $LASTEXITCODE
+    # Close the post-observation race: claim refuses a switch that appeared
+    # after startup sync, so publish that level before preserving exit 3.
+    if (Test-Path $KillSwitchPath) {
+      $startupObservation = Sync-KillSwitchObservation 'startup'
+      exit 3
+    }
+    exit $claimExit
+  }
   $InstanceToken = ($claimText | ConvertFrom-Json).token
 }
 
@@ -9781,7 +9818,15 @@ $WrapperLogEnvKeys = @(
   'AGENTTALK_WRAPPER_LOG_NONCE'
 )
 
-function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }
+function Actions-Enabled {
+  $rawActive = Test-Path $KillSwitchPath
+  if ($rawActive -ne $script:KillSwitchObservationActive) {
+    $observation = Sync-KillSwitchObservation 'mid_poll'
+    if ($null -eq $observation) { return $false }
+    $script:KillSwitchObservationActive = [bool]$observation.active
+  }
+  return -not $script:KillSwitchObservationActive
+}
 function Assert-ActionsEnabled([string]$what) {
   if (Actions-Enabled) { return $true }
   if (-not $Quiet) { Write-Host ("supervisor: kill switch active; skipping {0}" -f $what) }

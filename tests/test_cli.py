@@ -505,6 +505,29 @@ def test_status_supervisor_assessment_fail_safe(
     assert "supervisor_assessment_unavailable:ValueError" in payload["warnings"]
 
 
+def test_status_human_preserves_runtime_warning_when_assessment_fails(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    store = Store(store_root)
+    (store.state_dir / "supervisor-runtime-observation.json").write_text(
+        "{broken",
+        encoding="utf-8",
+    )
+
+    def boom(*_args, **_kwargs):
+        raise ValueError("bad supervisor report")
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", boom)
+
+    assert _run(["status"], store_root) == 0
+
+    rendered = capsys.readouterr().out
+    assert "WARN:       supervisor_assessment_unavailable:ValueError" in rendered
+    assert "WARN:       supervisor_runtime_observation_invalid:" in rendered
+
+
 def test_supervisor_cli_read_fail_safe(
     store_root: Path,
     monkeypatch: pytest.MonkeyPatch,

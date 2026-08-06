@@ -13,11 +13,13 @@ import ctypes
 import json
 import os
 import re
+import sys
+import sysconfig
 import tempfile
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterator, Mapping
 
 from agenttalk import powershell_host as psh
@@ -360,7 +362,10 @@ def _open_process_observation(pid: int, *, parents: Mapping[int, int] | None = N
         code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
             raise SupervisorLifecycleError(f"process {pid} is not active")
-        identity, image_handle = psh.open_stable_native_file_identity(buf.value)
+        identity, image_handle = _open_stable_process_image_identity(
+            buf.value,
+            int(handle),
+        )
         parent_map = parents if parents is not None else _process_parent_map()
         ticks = _filetime_ticks(creation)
         return ProcessObservation(
@@ -433,25 +438,348 @@ def start_tokens_match(observed: str, locator: object) -> bool:
     return abs((left - right).total_seconds()) <= 0.01
 
 
+def _system_cmd_path() -> str:
+    """Return the native system-directory command interpreter."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_system_directory = kernel32.GetSystemDirectoryW
+    get_system_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    get_system_directory.restype = wintypes.UINT
+    capacity = 32768
+    buf = ctypes.create_unicode_buffer(capacity)
+    length = int(get_system_directory(buf, capacity))
+    if length <= 0 or length >= capacity:
+        raise SupervisorLifecycleError("cannot resolve the Windows system directory")
+    return str(Path(buf.value) / "cmd.exe")
+
+
+def _process_machines(process_handle: int) -> tuple[int, int]:
+    """Return the emulated and native PE machines for one live process."""
+    if not process_handle:
+        raise SupervisorLifecycleError("cannot identify process architecture")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        is_wow64_process2 = kernel32.IsWow64Process2
+    except AttributeError:
+        try:
+            is_wow64_process = kernel32.IsWow64Process
+        except AttributeError as exc:
+            raise SupervisorLifecycleError(
+                "cannot resolve the Windows process-architecture API"
+            ) from exc
+        is_wow64_process.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        is_wow64_process.restype = wintypes.BOOL
+        emulated = wintypes.BOOL()
+        if not is_wow64_process(
+            wintypes.HANDLE(process_handle),
+            ctypes.byref(emulated),
+        ):
+            raise SupervisorLifecycleError(
+                "cannot identify process architecture "
+                f"(winerror {ctypes.get_last_error()})"
+            ) from None
+        # IsWow64Process predates multi-architecture WOW64.  On those systems
+        # its true case is the x86 guest machine.
+        return (0x014C if emulated.value else 0), 0
+    is_wow64_process2.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.WORD),
+    ]
+    is_wow64_process2.restype = wintypes.BOOL
+    process_machine = wintypes.WORD()
+    native_machine = wintypes.WORD()
+    if not is_wow64_process2(
+        wintypes.HANDLE(process_handle),
+        ctypes.byref(process_machine),
+        ctypes.byref(native_machine),
+    ):
+        raise SupervisorLifecycleError(
+            "cannot identify process architecture "
+            f"(winerror {ctypes.get_last_error()})"
+        )
+    return int(process_machine.value), int(native_machine.value)
+
+
+def _wow64_system_directory(machine: int) -> str:
+    """Return the OS-owned system directory for one emulated PE machine."""
+    library = None
+    function = None
+    for dll_name in (
+        "api-ms-win-core-wow64-l1-1-1.dll",
+        "kernelbase.dll",
+        "kernel32.dll",
+    ):
+        try:
+            candidate = ctypes.WinDLL(dll_name, use_last_error=True)
+            resolved = candidate.GetSystemWow64Directory2W
+        except (AttributeError, OSError):
+            continue
+        library = candidate
+        function = resolved
+        break
+    capacity = 32767
+    if library is not None and function is not None:
+        function.argtypes = [wintypes.LPWSTR, wintypes.UINT, wintypes.WORD]
+        function.restype = wintypes.UINT
+        buf = ctypes.create_unicode_buffer(capacity)
+        length = int(function(buf, capacity, machine))
+        if 0 < length < capacity:
+            return buf.value
+    if machine != 0x014C:
+        raise SupervisorLifecycleError(
+            "cannot resolve the Windows emulated system directory"
+        )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        legacy = kernel32.GetSystemWow64DirectoryW
+    except AttributeError as exc:
+        raise SupervisorLifecycleError(
+            "cannot resolve the Windows emulated-system-directory API"
+        ) from exc
+    legacy.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    legacy.restype = wintypes.UINT
+    buf = ctypes.create_unicode_buffer(capacity)
+    length = int(legacy(buf, capacity))
+    if length <= 0 or length >= capacity:
+        raise SupervisorLifecycleError(
+            "cannot resolve the Windows emulated system directory"
+        )
+    return buf.value
+
+
+def _windows_directory() -> str:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_windows_directory = kernel32.GetWindowsDirectoryW
+    get_windows_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    get_windows_directory.restype = wintypes.UINT
+    capacity = 32767
+    buf = ctypes.create_unicode_buffer(capacity)
+    length = int(get_windows_directory(buf, capacity))
+    if length <= 0 or length >= capacity:
+        raise SupervisorLifecycleError("cannot resolve the Windows directory")
+    return buf.value
+
+
+def _current_process_handle() -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.argtypes = []
+    get_current_process.restype = wintypes.HANDLE
+    return int(get_current_process())
+
+
+def _process_image_path_for_reopen(image_path: str, process_handle: int) -> str:
+    """Map a native System32 image through Sysnative when Python is WOW64."""
+    process_machine, _ = _process_machines(process_handle)
+    current_machine, _ = _process_machines(_current_process_handle())
+    if process_machine or not current_machine:
+        return image_path
+    windows = PureWindowsPath(_windows_directory())
+    system = windows / "System32"
+    image = PureWindowsPath(image_path)
+    system_parts = tuple(part.casefold() for part in system.parts)
+    image_parts = tuple(part.casefold() for part in image.parts)
+    if image_parts[:len(system_parts)] != system_parts:
+        return image_path
+    relative = image.parts[len(system_parts):]
+    if not relative:
+        raise SupervisorLifecycleError("process image path is not a file")
+    return str(windows / "Sysnative" / PureWindowsPath(*relative))
+
+
+def _open_stable_process_image_identity(
+    image_path: str,
+    process_handle: int,
+) -> tuple[psh.NativeFileIdentity, int]:
+    return psh.open_stable_native_file_identity(
+        _process_image_path_for_reopen(image_path, process_handle)
+    )
+
+
+def _system_cmd_path_for_observation(observation: ProcessObservation) -> str:
+    """Resolve ``cmd.exe`` for the observed process architecture.
+
+    Synthetic observations used by pure tests have no live process handle and
+    retain the same-architecture resolver.  Every production observation has a
+    held handle, so WOW64 ancestry is resolved from that process rather than
+    from the Python process performing validation.
+    """
+    if not observation.handle:
+        return _system_cmd_path()
+    process_machine, _ = _process_machines(observation.handle)
+    if process_machine:
+        return str(Path(_wow64_system_directory(process_machine)) / "cmd.exe")
+
+    current_machine, _ = _process_machines(_current_process_handle())
+    if current_machine:
+        # Sysnative is Microsoft's process-relative alias for bypassing WOW64
+        # redirection and opening the native System32 image.
+        return str(Path(_windows_directory()) / "Sysnative" / "cmd.exe")
+    return _system_cmd_path()
+
+
+def _require_observed_image(
+    observation: ProcessObservation,
+    expected_path: str,
+    *,
+    subject: str,
+) -> None:
+    try:
+        expected = psh.native_file_identity(expected_path)
+    except (OSError, ValueError, psh.PowerShellHostError) as exc:
+        raise SupervisorLifecycleError(f"cannot identify {subject}: {exc}") from exc
+    if not psh.same_identity(observation.identity, expected):
+        raise SupervisorLifecycleError(f"{subject} image identity does not match")
+
+
+def _runtime_scripts_path() -> Path:
+    try:
+        scripts = sysconfig.get_path("scripts")
+    except (KeyError, OSError, ValueError) as exc:
+        raise SupervisorLifecycleError(
+            f"cannot resolve the active Python scripts directory: {exc}"
+        ) from exc
+    if not isinstance(scripts, str) or not scripts:
+        raise SupervisorLifecycleError(
+            "cannot resolve the active Python scripts directory"
+        )
+    return Path(scripts)
+
+
+def _classify_intermediate(
+    observation: ProcessObservation,
+    *,
+    current: ProcessObservation,
+) -> str:
+    leaf = PureWindowsPath(observation.path).name.casefold()
+    if leaf == "cmd.exe":
+        _require_observed_image(
+            observation,
+            _system_cmd_path_for_observation(observation),
+            subject="command-interpreter ancestor",
+        )
+        return "cmd"
+    if leaf == "agenttalk.exe":
+        expected = _runtime_scripts_path() / "agenttalk.exe"
+        argv0 = sys.argv[0] if sys.argv else ""
+        expected_argv0 = {
+            psh.normalized_path_key(expected),
+            # distlib's generated console entry point strips its ``.exe``
+            # suffix before importing the target function.
+            psh.normalized_path_key(expected.with_suffix("")),
+        }
+        if (
+            not argv0
+            or psh.normalized_path_key(argv0) not in expected_argv0
+            or psh.normalized_path_key(observation.path)
+            != psh.normalized_path_key(expected)
+        ):
+            raise SupervisorLifecycleError(
+                "console-script ancestor is not the active agenttalk entry point"
+            )
+        _require_observed_image(
+            observation,
+            str(expected),
+            subject="agenttalk console-script ancestor",
+        )
+        return "console"
+    if leaf in {"python.exe", "pythonw.exe"}:
+        base_executable = getattr(sys, "_base_executable", None)
+        executable = sys.executable
+        if (
+            sys.prefix == sys.base_prefix
+            or not isinstance(base_executable, str)
+            or not base_executable
+            or psh.normalized_path_key(executable)
+            == psh.normalized_path_key(base_executable)
+            or psh.normalized_path_key(observation.path)
+            != psh.normalized_path_key(executable)
+            or psh.normalized_path_key(Path(executable).parent)
+            != psh.normalized_path_key(_runtime_scripts_path())
+        ):
+            raise SupervisorLifecycleError(
+                "Python ancestor is not the active virtual-environment launcher"
+            )
+        _require_observed_image(
+            observation,
+            executable,
+            subject="virtual-environment Python launcher",
+        )
+        _require_observed_image(
+            current,
+            base_executable,
+            subject="running base Python",
+        )
+        return "venv"
+    raise SupervisorLifecycleError(
+        "generated supervisor caller has an unidentified launcher ancestor"
+    )
+
+
+_ALLOWED_CALLER_ANCESTRIES = frozenset(
+    {
+        (),
+        ("cmd",),
+        ("console",),
+        ("venv",),
+        ("cmd", "console"),
+        ("cmd", "venv"),
+        ("console", "venv"),
+        ("cmd", "console", "venv"),
+    }
+)
+
+
 def _validate_ancestry(host: ProcessObservation) -> tuple[ProcessObservation, ...]:
     parents = _process_parent_map()
     current = _open_process_observation(os.getpid(), parents=parents)
     opened: list[ProcessObservation] = [current]
     try:
-        if current.parent_pid == host.pid:
-            if host.creation_ticks > current.creation_ticks:
-                raise SupervisorLifecycleError("PowerShell ancestor started after Python")
-            return tuple(opened)
-        if current.parent_pid <= 0:
-            raise SupervisorLifecycleError("manual --claim-instance has no PowerShell ancestor")
-        cmd = _open_process_observation(current.parent_pid, parents=parents)
-        opened.append(cmd)
-        if Path(cmd.path).name.casefold() != "cmd.exe" or cmd.parent_pid != host.pid:
+        cursor = current
+        seen = {host.pid, current.pid}
+        while cursor.parent_pid != host.pid:
+            if cursor.parent_pid <= 0:
+                raise SupervisorLifecycleError(
+                    "generated supervisor caller has no PowerShell ancestor"
+                )
+            if len(opened) > 3:
+                raise SupervisorLifecycleError(
+                    "generated supervisor caller has too many launcher ancestors"
+                )
+            if cursor.parent_pid in seen:
+                raise SupervisorLifecycleError(
+                    "generated supervisor caller ancestry contains a process cycle"
+                )
+            seen.add(cursor.parent_pid)
+            cursor = _open_process_observation(cursor.parent_pid, parents=parents)
+            opened.append(cursor)
+
+        intermediates = tuple(reversed(opened[1:]))
+        roles = tuple(
+            _classify_intermediate(observation, current=current)
+            for observation in intermediates
+        )
+        if roles not in _ALLOWED_CALLER_ANCESTRIES:
             raise SupervisorLifecycleError(
-                "manual --claim-instance is unsupported without a direct or cmd-hop PowerShell ancestor"
+                "generated supervisor caller launcher order is unsupported"
             )
-        if not (host.creation_ticks <= cmd.creation_ticks <= current.creation_ticks):
-            raise SupervisorLifecycleError("PowerShell/cmd/Python ancestry start times are inconsistent")
+        ordered = (host, *intermediates, current)
+        if any(
+            parent.creation_ticks > child.creation_ticks
+            for parent, child in zip(ordered, ordered[1:], strict=False)
+        ):
+            raise SupervisorLifecycleError(
+                "PowerShell supervisor caller ancestry start times are inconsistent"
+            )
+        if "venv" not in roles:
+            _require_observed_image(
+                current,
+                sys.executable,
+                subject="running Python",
+            )
         return tuple(opened)
     except Exception:
         for observation in opened:
@@ -512,6 +840,78 @@ def validate_current_powershell(
             return record
     finally:
         _close_process_observation(host)
+
+
+@contextlib.contextmanager
+def checked_powershell_supervisor_observer(
+    store: Store,
+    *,
+    pid: int,
+    pid_start: object,
+    validate_artifacts: Callable[[], None],
+) -> Iterator[None]:
+    """Authorize one generated-supervisor observation without claiming it.
+
+    The caller must be the active Python process reached from the selected
+    PowerShell host through one bounded, positively identified generated-shim
+    or installed-entry-point chain.  Locks stay held through the caller's
+    field-owned write so selection, process identity, and artifact validation
+    cannot change between authorization and publish.
+    """
+    with store._supervisor_lifecycle_lock():
+        validate_artifacts()
+        with store._powershell_selection_lock():
+            first = _read_valid_selection_locked(store)
+            host = _open_process_observation(pid)
+            ancestry: tuple[ProcessObservation, ...] = ()
+            try:
+                if not start_tokens_match(host.creation_token, pid_start):
+                    raise SupervisorLifecycleError(
+                        "PowerShell pid/start locator was reused or ambiguous"
+                    )
+                if not _host_matches_selection(host, first):
+                    raise SupervisorLifecycleError(
+                        "observing PowerShell process does not match the "
+                        "current host selection"
+                    )
+                ancestry = _validate_ancestry(host)
+                for observation in ancestry:
+                    _require_process_active(observation)
+                _require_process_active(host)
+                second = _read_valid_selection_locked(store)
+                if (
+                    second["selection_revision"] != first["selection_revision"]
+                    or second["selection_fingerprint"]
+                    != first["selection_fingerprint"]
+                    or not _host_matches_selection(host, second)
+                ):
+                    raise SupervisorLifecycleError(
+                        "PowerShell host selection changed during "
+                        "supervisor observation"
+                    )
+                with store._config_lock():
+                    for observation in ancestry:
+                        _require_process_active(observation)
+                    _require_process_active(host)
+                    final = _read_valid_selection_locked(store)
+                    if (
+                        final["selection_revision"]
+                        != second["selection_revision"]
+                        or final["selection_fingerprint"]
+                        != second["selection_fingerprint"]
+                        or not _host_matches_selection(host, final)
+                    ):
+                        raise SupervisorLifecycleError(
+                            "PowerShell host selection changed before "
+                            "supervisor observation write"
+                        )
+                    _revalidate_process_image(host, final)
+                    _require_process_active(host)
+                    yield
+            finally:
+                for observation in ancestry:
+                    _close_process_observation(observation)
+                _close_process_observation(host)
 
 
 def _probe_observed_current_host(host: ProcessObservation) -> psh.ProbeResult:
@@ -754,6 +1154,14 @@ def claim_powershell_supervisor(
                         )
                     _revalidate_process_image(host, final)
                     _require_process_active(host)
+                    # Linearize the emergency brake as late as possible in the
+                    # checked claim, after the outer CLI's fast precheck.
+                    kill_switch = store.supervisor_kill_switch()
+                    if kill_switch is not False:
+                        state = "present" if kill_switch else "unreadable"
+                        raise SupervisorLifecycleError(
+                            f"supervisor.kill is {state}; refusing supervisor claim"
+                        )
                     return store._claim_supervisor_instance_locked(
                         pid=pid,
                         pid_start=pid_start,

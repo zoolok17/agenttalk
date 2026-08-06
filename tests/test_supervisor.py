@@ -8,6 +8,7 @@ fixtures. The generated PS/bash scripts are thin executors (documented-manual).
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import io
 import json
 import os
@@ -17,7 +18,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,7 +32,11 @@ from agenttalk import (
     cli,
     ephemeral as eph,
     health as hm,
+    powershell_host as psh,
+    store as store_module,
     supervisor as sup,
+    supervisor_lifecycle as lifecycle,
+    supervisor_runtime as runtime_control,
     wrapper_runtime as wrt,
 )
 from agenttalk.store import Store, _process_alive
@@ -203,6 +211,862 @@ def test_supervise_claim_instance_refuses_kill_switch_and_release_allows_cleanup
         "--pid-start", "start", "--instance-token", rec["token"],
     ], tmp_path) == 0
     assert s.read_supervisor_instance() is None
+
+
+def _allow_checked_kill_switch_observer(monkeypatch) -> None:
+    @contextlib.contextmanager
+    def allowed(
+        store,
+        *,
+        pid,
+        pid_start,
+        validate_artifacts,
+    ):
+        with store._supervisor_lifecycle_lock():
+            validate_artifacts()
+            with store._config_lock():
+                yield
+
+    monkeypatch.setattr(
+        lifecycle,
+        "checked_powershell_supervisor_observer",
+        allowed,
+    )
+
+
+def test_supervise_observe_kill_switch_records_checked_active_transition(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    monkeypatch.setattr(sup, "validate_artifact_bundle", lambda *args, **kwargs: None)
+
+    rc = _run([
+        "supervise",
+        "--observe-kill-switch",
+        "--observation-phase", "startup",
+        "--pid", "123",
+        "--pid-start", "start",
+        "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["active"] is True
+    assert payload["changed"] is True
+    record = json.loads(
+        (s.state_dir / "supervisor-runtime-observation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    startup = record["kill_switch"]["observations"]["startup"]
+    assert startup == {
+        "exit_code": 3,
+        "observed_at": _iso(NOW),
+        "observed_at_epoch": NOW,
+        "observer_pid": 123,
+        "observer_pid_start": "start",
+    }
+    assert s.read_supervisor_instance() is None
+
+
+def test_kill_switch_observation_is_idempotent_and_reactivates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    kill_switch_path = s.dir / "supervisor.kill"
+    kill_switch_path.write_text("stop", encoding="utf-8")
+
+    def observe(phase: str, now: float) -> dict:
+        return runtime_control.observe_powershell_kill_switch(
+            s,
+            phase=phase,
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=now,
+            validate_artifacts=lambda: None,
+        )
+
+    first = observe("startup", NOW)
+    first_bytes = runtime_control.runtime_observation_path(s).read_bytes()
+    duplicate = observe("startup", NOW + 1)
+    assert duplicate["changed"] is False
+    assert runtime_control.runtime_observation_path(s).read_bytes() == first_bytes
+
+    kill_switch_path.unlink()
+    resolved = observe("mid_poll", NOW + 2)
+    assert resolved["active"] is False
+    assert resolved["changed"] is True
+
+    kill_switch_path.write_text("stop-again", encoding="utf-8")
+    reactivated = observe("mid_poll", NOW + 3)
+    assert reactivated["changed"] is True
+    assert (
+        reactivated["observation"]["kill_switch"]["activation_id"]
+        != first["observation"]["kill_switch"]["activation_id"]
+    )
+    assert set(
+        reactivated["observation"]["kill_switch"]["observations"]
+    ) == {"mid_poll"}
+
+
+def test_kill_switch_observation_does_not_invent_an_active_level(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+
+    result = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+
+    assert result == {"active": False, "changed": False, "observation": None}
+    assert not runtime_control.runtime_observation_path(s).exists()
+
+
+def test_concurrent_kill_switch_observers_publish_one_transition(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    barrier = threading.Barrier(2)
+
+    def observe(observer_pid: int) -> dict:
+        barrier.wait(timeout=10)
+        return runtime_control.observe_powershell_kill_switch(
+            Store(tmp_path),
+            phase="startup",
+            observer_pid=observer_pid,
+            observer_pid_start=f"start-{observer_pid}",
+            now_epoch=NOW,
+            validate_artifacts=lambda: None,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(observe, [123, 456]))
+
+    assert sorted(result["changed"] for result in results) == [False, True]
+    assert len({
+        result["observation"]["kill_switch"]["activation_id"]
+        for result in results
+    }) == 1
+
+
+def test_status_projects_kill_switch_observation_without_event_history(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    result = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    assert not sup.supervisor_events_path(s).exists()
+
+    assert _run(["status", "--json"], tmp_path) == 0
+    structured = json.loads(capsys.readouterr().out)
+    projected = structured["supervisor_runtime"]["kill_switch"]
+    assert projected["active"] is True
+    assert projected["observed"] is True
+    assert (
+        projected["activation_id"]
+        == result["observation"]["kill_switch"]["activation_id"]
+    )
+
+    assert _run(["status"], tmp_path) == 0
+    rendered = capsys.readouterr().out
+    assert "supervisor.kill active" in rendered
+    assert "startup observed" in rendered
+    assert _iso(NOW) in rendered
+
+
+def test_pristine_status_omits_additive_supervisor_runtime_key(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    _team(tmp_path)
+
+    assert _run(["status", "--json"], tmp_path) == 0
+
+    assert "supervisor_runtime" not in json.loads(capsys.readouterr().out)
+
+
+def test_kill_switch_observer_validation_failure_writes_nothing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+
+    @contextlib.contextmanager
+    def denied(*args, **kwargs):
+        raise lifecycle.SupervisorLifecycleError("unrelated PowerShell caller")
+        yield
+
+    monkeypatch.setattr(
+        lifecycle,
+        "checked_powershell_supervisor_observer",
+        denied,
+    )
+
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match="unrelated"):
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=NOW,
+            validate_artifacts=lambda: None,
+        )
+    assert not runtime_control.runtime_observation_path(s).exists()
+
+
+def test_kill_switch_level_is_rechecked_inside_checked_operation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    kill_switch_path = s.dir / "supervisor.kill"
+    assert not kill_switch_path.exists()
+
+    @contextlib.contextmanager
+    def checked(
+        store,
+        *,
+        pid,
+        pid_start,
+        validate_artifacts,
+    ):
+        validate_artifacts()
+        yield
+
+    monkeypatch.setattr(
+        lifecycle,
+        "checked_powershell_supervisor_observer",
+        checked,
+    )
+
+    result = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: kill_switch_path.write_text(
+            "appeared-during-validation",
+            encoding="utf-8",
+        ),
+    )
+
+    assert result["active"] is True
+    assert result["changed"] is True
+    assert runtime_control.runtime_observation_path(s).exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_record",
+    [
+        "{broken",
+        json.dumps({"schema_version": runtime_control.RUNTIME_OBSERVATION_SCHEMA + 1}),
+    ],
+)
+def test_invalid_observation_cannot_hold_supervisor_after_switch_is_absent(
+    tmp_path: Path,
+    monkeypatch,
+    invalid_record: str,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(invalid_record, encoding="utf-8")
+
+    result = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="mid_poll",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+
+    assert result == {"active": False, "changed": False, "observation": None}
+    assert path.read_text(encoding="utf-8") == invalid_record
+    status = runtime_control.build_runtime_status(s)
+    assert status["kill_switch"]["active"] is False
+    assert status["kill_switch"]["warnings"]
+
+
+@pytest.mark.parametrize(
+    "invalid_record",
+    [
+        b"{broken",
+        json.dumps({
+            "schema_version": runtime_control.RUNTIME_OBSERVATION_SCHEMA + 1,
+        }).encode("utf-8"),
+    ],
+    ids=["malformed", "future-schema"],
+)
+def test_invalid_inactive_observation_is_preserved_and_activation_recovers(
+    tmp_path: Path,
+    monkeypatch,
+    invalid_record: bytes,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(invalid_record)
+
+    inactive = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="mid_poll",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    assert inactive == {"active": False, "changed": False, "observation": None}
+    assert path.read_bytes() == invalid_record
+
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    activated = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="mid_poll",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW + 1,
+        validate_artifacts=lambda: None,
+    )
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+    assert warnings == []
+    assert observed == activated["observation"]
+    assert observed is not None
+    assert observed["kill_switch"]["active"] is True
+    preserved = list(path.parent.glob(f"{path.name}.quarantine-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == invalid_record
+
+
+def test_invalid_active_observation_preservation_failure_keeps_original(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_record = b"{broken"
+    path.write_bytes(invalid_record)
+
+    def fail_preservation(source: object, destination: object) -> None:
+        del source, destination
+        raise PermissionError("preservation denied")
+
+    monkeypatch.setattr(runtime_control.os, "replace", fail_preservation)
+
+    with pytest.raises(
+        runtime_control.SupervisorRuntimeObservationError,
+        match="could not be preserved: PermissionError",
+    ):
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=NOW,
+            validate_artifacts=lambda: None,
+        )
+
+    assert path.read_bytes() == invalid_record
+    assert list(path.parent.glob(f"{path.name}.quarantine-*")) == []
+
+
+def test_active_unreadable_observation_stays_fail_closed_without_quarantine(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    preservation_attempted = False
+
+    def unreadable(store: Store) -> dict | None:
+        del store
+        raise runtime_control._RuntimeObservationUnreadableError("sharing violation")
+
+    def preserve(store: Store) -> None:
+        nonlocal preservation_attempted
+        del store
+        preservation_attempted = True
+
+    monkeypatch.setattr(runtime_control, "_read_strict", unreadable)
+    monkeypatch.setattr(runtime_control, "_preserve_invalid_observation", preserve)
+
+    with pytest.raises(
+        runtime_control.SupervisorRuntimeObservationError,
+        match="sharing violation",
+    ):
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=NOW,
+            validate_artifacts=lambda: None,
+        )
+
+    assert preservation_attempted is False
+
+
+def test_invalid_active_observation_write_failure_retries_from_preserved_copy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    _allow_checked_kill_switch_observer(monkeypatch)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_record = b"{broken"
+    path.write_bytes(invalid_record)
+    real_write = runtime_control._atomic_write_text
+
+    def fail_write(destination: Path, text: str) -> None:
+        del destination, text
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runtime_control, "_atomic_write_text", fail_write)
+    with pytest.raises(OSError, match="disk full"):
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=NOW,
+            validate_artifacts=lambda: None,
+        )
+
+    assert not path.exists()
+    preserved = list(path.parent.glob(f"{path.name}.quarantine-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == invalid_record
+
+    monkeypatch.setattr(runtime_control, "_atomic_write_text", real_write)
+    recovered = runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW + 1,
+        validate_artifacts=lambda: None,
+    )
+
+    assert recovered["changed"] is True
+    observed, warnings = runtime_control.read_runtime_observation(s)
+    assert warnings == []
+    assert observed == recovered["observation"]
+    assert preserved[0].read_bytes() == invalid_record
+
+
+def test_status_warns_on_oversized_runtime_epoch(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["kill_switch"]["observations"]["startup"]["observed_at_epoch"] = 10**400
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert _run(["status", "--json"], tmp_path) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    projected = payload["supervisor_runtime"]["kill_switch"]
+    assert projected["observed"] is False
+    assert any(
+        "observed_at_epoch must be a finite epoch" in warning
+        for warning in projected["warnings"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement", "resolved"),
+    [
+        (
+            ("kill_switch", "observations", "startup", "observed_at"),
+            "garbage",
+            False,
+        ),
+        (
+            ("kill_switch", "first_observed_at"),
+            _iso(NOW + 1),
+            False,
+        ),
+        (
+            ("kill_switch", "resolved_at"),
+            _iso(NOW + 2),
+            True,
+        ),
+    ],
+    ids=["unparseable-phase", "mismatched-first", "mismatched-resolution"],
+)
+def test_status_rejects_runtime_timestamp_that_does_not_match_epoch(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    field_path: tuple[str, ...],
+    replacement: str,
+    resolved: bool,
+) -> None:
+    s = _team(tmp_path)
+    kill_switch = s.dir / "supervisor.kill"
+    kill_switch.write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    if resolved:
+        kill_switch.unlink()
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="mid_poll",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=NOW + 1,
+            validate_artifacts=lambda: None,
+        )
+    path = runtime_control.runtime_observation_path(s)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    target = record
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = replacement
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert _run(["status"], tmp_path) == 0
+
+    rendered = capsys.readouterr().out
+    assert "supervisor_runtime_observation_invalid:" in rendered
+    assert "startup observed garbage" not in rendered
+
+
+def test_status_rejects_first_observed_pair_not_backed_by_phase(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["kill_switch"]["first_observed_at"] = _iso(NOW + 1)
+    record["kill_switch"]["first_observed_at_epoch"] = NOW + 1
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert _run(["status"], tmp_path) == 0
+
+    assert "supervisor_runtime_observation_invalid:" in capsys.readouterr().out
+
+
+def test_runtime_reader_rejects_later_phase_as_first_observation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="mid_poll",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW + 1,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    later = record["kill_switch"]["observations"]["startup"]
+    record["kill_switch"]["first_observed_at"] = later["observed_at"]
+    record["kill_switch"]["first_observed_at_epoch"] = later[
+        "observed_at_epoch"
+    ]
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+
+    assert observed is None
+    assert any("activation-source phase" in warning for warning in warnings)
+
+
+def test_runtime_first_observation_uses_phase_order_across_clock_rollback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="mid_poll",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW + 1,
+        validate_artifacts=lambda: None,
+    )
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+
+    assert warnings == []
+    assert observed is not None
+    assert observed["kill_switch"]["first_observed_at_epoch"] == NOW + 1
+
+
+def test_default_observation_clock_is_sampled_after_lifecycle_lock_wait(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    kill_switch = s.dir / "supervisor.kill"
+    _allow_checked_kill_switch_observer(monkeypatch)
+    real_lock = s._supervisor_lifecycle_lock
+    attempted = threading.Event()
+    real_store_time = store_module.time
+
+    class ObservedLockWaitTime:
+        monotonic = staticmethod(real_store_time.monotonic)
+        time = staticmethod(real_store_time.time)
+
+        @staticmethod
+        def sleep(seconds: float) -> None:
+            attempted.set()
+            real_store_time.sleep(seconds)
+
+    class SwitchAwareClock:
+        @staticmethod
+        def time() -> float:
+            return NOW + 1 if kill_switch.exists() else NOW
+
+    monkeypatch.setattr(runtime_control, "time", SwitchAwareClock)
+
+    def observe() -> dict:
+        return runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=None,
+            validate_artifacts=lambda: None,
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with real_lock():
+            monkeypatch.setattr(store_module, "time", ObservedLockWaitTime)
+            future = pool.submit(observe)
+            assert attempted.wait(timeout=10)
+            kill_switch.write_text("appeared-during-lock-wait", encoding="utf-8")
+        result = future.result(timeout=10)
+
+    record = result["observation"]["kill_switch"]
+    assert record["first_observed_at_epoch"] == NOW + 1
+    assert record["observations"]["startup"]["observed_at_epoch"] == NOW + 1
+
+
+def test_kill_switch_observer_rejects_datetime_unrepresentable_epoch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+
+    with pytest.raises(
+        runtime_control.SupervisorRuntimeObservationError,
+        match="representable in UTC",
+    ):
+        runtime_control.observe_powershell_kill_switch(
+            s,
+            phase="startup",
+            observer_pid=123,
+            observer_pid_start="start",
+            now_epoch=1e300,
+            validate_artifacts=lambda: None,
+        )
+
+    assert not runtime_control.runtime_observation_path(s).exists()
+
+
+def test_status_warns_on_runtime_integer_beyond_json_conversion_limit(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    s = _team(tmp_path)
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"epoch":' + ("1" * 5000) + "}", encoding="utf-8")
+
+    assert _run(["status", "--json"], tmp_path) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    warnings = payload["supervisor_runtime"]["kill_switch"]["warnings"]
+    assert any(
+        "runtime observation is malformed: ValueError" in warning
+        for warning in warnings
+    )
+
+
+def test_runtime_reader_warns_when_json_nesting_exceeds_decoder_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    path = runtime_control.runtime_observation_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}", encoding="utf-8")
+
+    def reject_nesting(raw: str, **kwargs) -> object:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(runtime_control.json, "loads", reject_nesting)
+
+    record, warnings = runtime_control.read_runtime_observation(s)
+
+    assert record is None
+    assert any(
+        "runtime observation is malformed: RecursionError" in warning
+        for warning in warnings
+    )
+
+
+def test_runtime_reader_bounds_bytes_from_same_open_after_stale_size_check(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + (" " * (runtime_control.RUNTIME_OBSERVATION_MAX_BYTES + 1)),
+        encoding="utf-8",
+    )
+    real_stat = Path.stat
+
+    class StaleSmallStat:
+        st_size = 1
+
+    def stale_stat(self: Path, *args, **kwargs):
+        if self == path:
+            return StaleSmallStat()
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stale_stat)
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+
+    assert observed is None
+    assert any("exceeds its size cap" in warning for warning in warnings)
+
+
+def test_runtime_reader_rejects_duplicate_json_object_keys(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    _allow_checked_kill_switch_observer(monkeypatch)
+    runtime_control.observe_powershell_kill_switch(
+        s,
+        phase="startup",
+        observer_pid=123,
+        observer_pid_start="start",
+        now_epoch=NOW,
+        validate_artifacts=lambda: None,
+    )
+    path = runtime_control.runtime_observation_path(s)
+    raw = path.read_text(encoding="utf-8")
+    path.write_text(
+        raw.replace('"active": true', '"active": false, "active": true', 1),
+        encoding="utf-8",
+    )
+
+    observed, warnings = runtime_control.read_runtime_observation(s)
+
+    assert observed is None
+    assert any("duplicate JSON object key" in warning for warning in warnings)
+
 
 # ---- snapshot-model fixtures (the 8-state classifier reads a process snapshot) ----
 BRAIN_PID, LAUNCHER_PID, WAIT_PID = 200, 199, 400
@@ -713,6 +1577,9 @@ def test_supervisor_report_surfaces_kill_switch_and_mutations_refuse(
 def test_ps_template_kill_switch_guards_mutating_boundaries() -> None:
     ps = sup.PS_TEMPLATE
     assert "$KillSwitchPath" in ps
+    assert "function Sync-KillSwitchObservation" in ps
+    assert ps.index("'--observe-kill-switch'") < ps.index("'--claim-instance'")
+    assert "Scheduled Task hosting retries it" in ps
     assert "function Actions-Enabled" in ps
     assert "function Assert-ActionsEnabled" in ps
     assert "function Save-State($state)" in ps
@@ -1264,6 +2131,7 @@ def test_supervisor_cli_json_decision_matches_plan_actions(tmp_path: Path, capsy
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
+    assert "supervisor_runtime" not in payload
     expected = payload["plan"]["agents"]["worker"]
     worker = next(a for a in payload["agents"] if a["name"] == "worker")
     assert worker["decision"]["action"] == expected["action"]
@@ -3810,14 +4678,59 @@ def _select_test_powershell(root: Path, shell: str) -> None:
     assert _run(["supervise", "--select-pwsh", "--pwsh", shell], root) == 0
 
 
+def _select_test_powershell_with_slow_probe(root: Path, shell: str) -> None:
+    """Set up the selected-host contract without the production 5s probe budget.
+
+    The shared Windows host can take longer than that under parallel review
+    load.  Host selection is not the boundary under test in #114.
+    """
+    store = Store(root)
+    result = psh.probe_candidate(
+        shell,
+        source="explicit",
+        timeout=30,
+    )
+    record = psh.make_selection_record(result, project_id=store.project_id())
+    lifecycle._atomic_write_selection(lifecycle.selection_path(store), record)
+
+
 def _checkout_runtime_env(base: dict[str, str] | None = None) -> dict[str, str]:
-    """Make generated-shim subprocesses execute the checkout under test."""
+    """Keep generated subprocesses on the same candidate as the test process."""
     env = dict(os.environ if base is None else base)
-    source = str(Path(__file__).resolve().parents[1] / "src")
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = source + (os.pathsep + existing if existing else "")
+    source = (Path(__file__).resolve().parents[1] / "src").resolve()
+    candidate = Path(sup.__file__).resolve()
+    pythonpath_keys = [
+        key for key in env if key.casefold() == "pythonpath"
+    ]
+    existing = next((env[key] for key in pythonpath_keys), None)
+    for key in pythonpath_keys:
+        del env[key]
+    if candidate.is_relative_to(source):
+        env["PYTHONPATH"] = str(source) + (
+            os.pathsep + existing if existing else ""
+        )
     env["AGENTTALK_PYTHON"] = sys.executable
     return env
+
+
+def test_checkout_runtime_env_preserves_imported_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = (Path(__file__).resolve().parents[1] / "src").resolve()
+    monkeypatch.setattr(sup, "__file__", str(source / "agenttalk" / "supervisor.py"))
+    source_env = _checkout_runtime_env({"PythonPath": "existing"})
+    assert source_env["PYTHONPATH"].split(os.pathsep) == [
+        str(source),
+        "existing",
+    ]
+
+    installed = tmp_path / "site-packages" / "agenttalk" / "supervisor.py"
+    monkeypatch.setattr(sup, "__file__", str(installed))
+    wheel_env = _checkout_runtime_env(
+        {"PYTHONPATH": str(source), "PythonPath": "also-source"}
+    )
+    assert not any(key.casefold() == "pythonpath" for key in wheel_env)
 
 
 def _live_supervisor_config(*agents: str) -> dict:
@@ -3907,6 +4820,8 @@ def _replace_text_when_unlocked(path: Path, text: str, *, timeout: float = 5) ->
 def _start_live_generated_supervisor(
     tmp_path: Path,
     shell: str,
+    *,
+    slow_host_probe: bool = False,
 ) -> tuple[Store, subprocess.Popen, object, Path]:
     store = _team(tmp_path)
     store.set_role("lead", "lead")
@@ -3915,7 +4830,10 @@ def _start_live_generated_supervisor(
         encoding="utf-8",
     )
     assert _run(["supervise", "--init"], tmp_path) == 0
-    _select_test_powershell(tmp_path, shell)
+    if slow_host_probe:
+        _select_test_powershell_with_slow_probe(tmp_path, shell)
+    else:
+        _select_test_powershell(tmp_path, shell)
     log_path = tmp_path / "live-supervisor.log"
     log_handle = log_path.open("w", encoding="utf-8")
     proc = subprocess.Popen(
@@ -3927,6 +4845,132 @@ def _start_live_generated_supervisor(
         env=_checkout_runtime_env(),
     )
     return store, proc, log_handle, log_path
+
+
+def _read_kill_switch_observation(store: Store) -> dict | None:
+    path = store.state_dir / "supervisor-runtime-observation.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.source_layout
+@pytest.mark.parametrize("activation_order", ["before_start", "mid_poll"])
+def test_generated_supervisor_kill_switch_observation_reaches_status(
+    tmp_path: Path,
+    capsys,
+    activation_order: str,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        pytest.skip("PowerShell is unavailable")
+    proc: subprocess.Popen | None = None
+    log_handle = None
+    if activation_order == "before_start":
+        store = _team(tmp_path)
+        store.set_role("lead", "lead")
+        (store.dir / "supervisor.json").write_text(
+            json.dumps(_live_supervisor_config("lead")),
+            encoding="utf-8",
+        )
+        assert _run(["supervise", "--init"], tmp_path) == 0
+        _select_test_powershell_with_slow_probe(tmp_path, shell)
+        capsys.readouterr()
+        (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+        result = subprocess.run(
+            [
+                shell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(store.dir / "supervisor.ps1"),
+                "-Once",
+                "-Quiet",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=tmp_path,
+            env=_checkout_runtime_env(),
+        )
+        assert result.returncode == 3, result.stdout + result.stderr
+        assert not store.supervisor_instance_path().exists()
+        assert not (store.dir / "supervisor-state.json").exists()
+        expected_phase = "startup"
+    else:
+        store, proc, log_handle, log_path = _start_live_generated_supervisor(
+            tmp_path,
+            shell,
+            slow_host_probe=True,
+        )
+        capsys.readouterr()
+        _wait_for_live_supervisor(
+            proc,
+            log_path,
+            lambda: store.supervisor_instance_path().exists()
+            and _state_has_agent(store.dir / "supervisor-state.json", "lead"),
+        )
+        (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+        expected_phase = "mid_poll"
+    try:
+        observation_path = store.state_dir / "supervisor-runtime-observation.json"
+        if proc is not None:
+            _wait_for_live_supervisor(
+                proc,
+                log_path,
+                lambda: (
+                    (observation := _read_kill_switch_observation(store)) is not None
+                    and expected_phase
+                    in observation.get("kill_switch", {}).get("observations", {})
+                ),
+            )
+            assert proc.poll() is None
+            assert store.supervisor_instance_path().exists()
+            store.add_agent("held-agent", role="worker")
+            _replace_text_when_unlocked(
+                store.dir / "supervisor.json",
+                json.dumps(_live_supervisor_config("lead", "held-agent")),
+            )
+            _wait_for_live_supervisor(
+                proc,
+                log_path,
+                lambda: _log_contains(
+                    log_path,
+                    "kill switch active; skipping agent held-agent",
+                ),
+            )
+            assert not _state_has_agent(
+                store.dir / "supervisor-state.json",
+                "held-agent",
+            )
+
+        observation = _read_kill_switch_observation(store)
+        assert observation is not None
+        kill_switch = observation["kill_switch"]
+        assert kill_switch["active"] is True
+        phase_observation = kill_switch["observations"][expected_phase]
+        observed_at = phase_observation["observed_at"]
+        assert observation_path.exists()
+
+        assert _run(["status", "--json"], tmp_path) == 0
+        structured = json.loads(capsys.readouterr().out)
+        projected = structured["supervisor_runtime"]["kill_switch"]
+        assert projected["active"] is True
+        assert projected["observed"] is True
+        assert projected["activation_id"] == kill_switch["activation_id"]
+        assert projected["observations"][expected_phase]["observed_at"] == observed_at
+
+        assert _run(["status"], tmp_path) == 0
+        rendered = capsys.readouterr().out
+        assert "supervisor.kill active" in rendered
+        assert expected_phase.replace("_", "-") in rendered
+        assert observed_at in rendered
+    finally:
+        if proc is not None:
+            _stop_live_supervisor(proc)
+        if log_handle is not None:
+            log_handle.close()
 
 
 @pytest.mark.source_layout
@@ -4880,6 +5924,20 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     reduced["PATH"] = os.pathsep.join([
         os.path.join(windir, "System32"), windir,
         os.path.join(windir, "System32", "WindowsPowerShell", "v1.0")])
+    provenance = subprocess.run(
+        [
+            reduced["AGENTTALK_PYTHON"],
+            "-c",
+            "import agenttalk.supervisor as m; print(m.__file__)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=reduced,
+        cwd=str(tmp_path),
+    )
+    assert provenance.returncode == 0, provenance.stderr
+    assert Path(provenance.stdout.strip()).resolve() == Path(sup.__file__).resolve()
     res = subprocess.run(
         [shell, "-NoProfile", "-File", str(ps1), "-Once", "-DryRun"],
         capture_output=True, text=True, timeout=120, env=reduced, cwd=str(tmp_path))
@@ -4888,6 +5946,152 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     assert "is not recognized" not in combined and "CommandNotFound" not in combined, combined
     # the DryRun plan line for the dead worker actually printed (the bus call ran)
     assert "worker:" in res.stdout, f"no plan emitted; stdout={res.stdout!r} stderr={res.stderr!r}"
+
+
+def test_generated_ps1_records_startup_kill_switch_through_wheel_shim(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """The wheel's venv redirector is part of the checked generated-shim path."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG),
+        encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+    capsys.readouterr()
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            shell,
+            "-NoProfile",
+            "-File",
+            str(store.dir / "supervisor.ps1"),
+            "-Once",
+            "-DryRun",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_checkout_runtime_env(),
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert store.read_supervisor_instance() is None
+    observation = json.loads(
+        runtime_control.runtime_observation_path(store).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert observation["kill_switch"]["active"] is True
+    assert "startup" in observation["kill_switch"]["observations"]
+
+    assert _run(["status", "--json"], tmp_path) == 0
+    projected = json.loads(capsys.readouterr().out)["supervisor_runtime"][
+        "kill_switch"
+    ]
+    assert projected["active"] is True
+    assert projected["observed"] is True
+    assert "startup" in projected["observations"]
+
+
+def test_generated_ps1_claims_and_releases_through_wheel_shim(
+    tmp_path: Path,
+) -> None:
+    """The same bounded ancestry authorizes the executor claim path."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    config = {
+        **_CONFIG,
+        "agents": {"lead": {"auto_restart": True, "cli": "claude"}},
+    }
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(config),
+        encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+
+    result = subprocess.run(
+        [
+            shell,
+            "-NoProfile",
+            "-File",
+            str(store.dir / "supervisor.ps1"),
+            "-Once",
+            "-Quiet",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_checkout_runtime_env(),
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert store.read_supervisor_instance() is None
+    assert (store.dir / "supervisor-state.json").exists()
+
+
+def test_checked_observer_accepts_identified_console_script_ancestry(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    console = Path(sysconfig.get_path("scripts")) / "agenttalk.exe"
+    if not console.is_file():
+        pytest.skip("the active Python has no installed agenttalk console script")
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG),
+        encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    harness = tmp_path / "console-observer.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                "$start = ([datetimeoffset](Get-Process -Id $PID).StartTime).ToString('o')",
+                (
+                    f"& {_pslit(str(console))} --root {_pslit(str(tmp_path))} "
+                    "supervise --observe-kill-switch "
+                    "--observation-phase startup --pid $PID --pid-start $start"
+                ),
+                "exit $LASTEXITCODE",
+            ]
+        ),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_checkout_runtime_env(),
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["active"] is True
+    observation = json.loads(
+        runtime_control.runtime_observation_path(store).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "startup" in observation["kill_switch"]["observations"]
 
 
 def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:

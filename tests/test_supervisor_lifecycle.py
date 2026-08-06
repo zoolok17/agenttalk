@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 import sys
+import sysconfig
+from ctypes import wintypes
 from pathlib import Path
 
 import pytest
@@ -87,6 +90,58 @@ def _observation(
     )
 
 
+def _patch_observed_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    host: lifecycle.ProcessObservation,
+    *,
+    intermediate: tuple[tuple[str, psh.NativeFileIdentity, int], ...],
+    current_path: str,
+    current_identity: psh.NativeFileIdentity,
+    current_ticks: int = 500,
+) -> tuple[
+    lifecycle.ProcessObservation,
+    tuple[lifecycle.ProcessObservation, ...],
+]:
+    current_pid = os.getpid()
+    observations: dict[int, lifecycle.ProcessObservation] = {}
+    parent_pid = host.pid
+    ordered: list[lifecycle.ProcessObservation] = []
+    for index, (path, identity, ticks) in enumerate(intermediate):
+        pid = 200 + index
+        item = _observation(
+            pid,
+            parent=parent_pid,
+            path=path,
+            ticks=ticks,
+            identity=identity,
+        )
+        observations[pid] = item
+        ordered.append(item)
+        parent_pid = pid
+    current = _observation(
+        current_pid,
+        parent=parent_pid,
+        path=current_path,
+        ticks=current_ticks,
+        identity=current_identity,
+    )
+    observations[current_pid] = current
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_parent_map",
+        lambda: {
+            pid: observation.parent_pid
+            for pid, observation in observations.items()
+        },
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_open_process_observation",
+        lambda pid, parents=None: observations[pid],
+    )
+    return current, tuple(ordered)
+
+
 def test_dotnet_seven_digit_creation_locator_matches_kernel_token() -> None:
     assert lifecycle.start_tokens_match(
         "2026-07-15T13:05:52.062092Z",
@@ -95,27 +150,757 @@ def test_dotnet_seven_digit_creation_locator_matches_kernel_token() -> None:
 
 
 @WINDOWS_ONLY
-def test_validate_ancestry_accepts_direct_and_cmd_hop(
+@pytest.mark.parametrize(
+    ("name", "intermediate_paths"),
+    [
+        ("direct-pwsh", ()),
+        ("cmd-hop", (r"C:\Windows\System32\cmd.exe",)),
+        ("venv-launcher", (r"C:\venv\Scripts\python.exe",)),
+        (
+            "generated-bin-shim",
+            (
+                r"C:\Windows\System32\cmd.exe",
+                r"C:\venv\Scripts\python.exe",
+            ),
+        ),
+        (
+            "wheel-console-script",
+            (
+                r"C:\venv\Scripts\agenttalk.exe",
+                r"C:\venv\Scripts\python.exe",
+            ),
+        ),
+        (
+            "cmd-wheel-console-script",
+            (
+                r"C:\Windows\System32\cmd.exe",
+                r"C:\venv\Scripts\agenttalk.exe",
+                r"C:\venv\Scripts\python.exe",
+            ),
+        ),
+    ],
+)
+def test_validate_ancestry_accepts_identified_generated_launch_classes(
     monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    intermediate_paths: tuple[str, ...],
 ) -> None:
     host = _observation(100, parent=1, path=PWSH, ticks=100)
     current_pid = os.getpid()
-    direct = _observation(current_pid, parent=100, path=r"C:\Python\python.exe", ticks=300)
-    monkeypatch.setattr(lifecycle, "_process_parent_map", lambda: {current_pid: 100})
-    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid, parents=None: direct)
-    assert lifecycle._validate_ancestry(host) == (direct,)
-
-    cmd = _observation(200, parent=100, path=r"C:\Windows\System32\cmd.exe", ticks=200)
-    current = _observation(current_pid, parent=200, path=r"C:\Python\python.exe", ticks=300)
+    base_python = r"C:\Python\python.exe"
+    identities = {
+        path: _identity(path, f"{index + 1:02x}")
+        for index, path in enumerate(
+            (
+                r"C:\Windows\System32\cmd.exe",
+                r"C:\venv\Scripts\agenttalk.exe",
+                r"C:\venv\Scripts\python.exe",
+                base_python,
+            )
+        )
+    }
+    observations: dict[int, lifecycle.ProcessObservation] = {}
+    parent_pid = host.pid
+    for index, path in enumerate(intermediate_paths):
+        pid = 200 + index
+        observations[pid] = _observation(
+            pid,
+            parent=parent_pid,
+            path=path,
+            ticks=200 + index,
+            identity=identities[path],
+        )
+        parent_pid = pid
+    current = _observation(
+        current_pid,
+        parent=parent_pid,
+        path=base_python,
+        ticks=300,
+        identity=identities[base_python],
+    )
+    observations[current_pid] = current
+    parent_map = {
+        pid: observation.parent_pid
+        for pid, observation in observations.items()
+    }
+    monkeypatch.setattr(lifecycle, "_process_parent_map", lambda: parent_map)
     monkeypatch.setattr(
-        lifecycle, "_process_parent_map", lambda: {current_pid: 200, 200: 100},
+        lifecycle,
+        "_open_process_observation",
+        lambda pid, parents=None: observations[pid],
+    )
+    uses_venv = r"C:\venv\Scripts\python.exe" in intermediate_paths
+    monkeypatch.setattr(
+        sys,
+        "executable",
+        r"C:\venv\Scripts\python.exe" if uses_venv else base_python,
+    )
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\venv" if uses_venv else r"C:\Python")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            (
+                r"C:\venv\Scripts\agenttalk"
+                if r"C:\venv\Scripts\agenttalk.exe" in intermediate_paths
+                else r"C:\venv\Lib\site-packages\agenttalk\__main__.py"
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda name: (
+            (r"C:\venv\Scripts" if uses_venv else r"C:\Python\Scripts")
+            if name == "scripts"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_system_cmd_path",
+        lambda: r"C:\Windows\System32\cmd.exe",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: identities[str(path)],
+    )
+
+    expected = (current,) + tuple(
+        observations[200 + index]
+        for index in reversed(range(len(intermediate_paths)))
+    )
+    assert lifecycle._validate_ancestry(host) == expected, name
+
+
+@WINDOWS_ONLY
+def test_validate_ancestry_accepts_verified_wow64_cmd_for_cross_arch_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _observation(
+        100,
+        parent=1,
+        path=r"C:\Program Files (x86)\PowerShell\7\pwsh.exe",
+        ticks=100,
+    )
+    native_cmd = r"C:\Windows\System32\cmd.exe"
+    wow64_cmd = r"C:\Windows\SysWOW64\cmd.exe"
+    base_python = r"C:\Python\python.exe"
+    identities = {
+        native_cmd: _identity(native_cmd, "70"),
+        wow64_cmd: _identity(wow64_cmd, "71"),
+        base_python: _identity(base_python, "72"),
+    }
+    current, (cmd,) = _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=((wow64_cmd, identities[wow64_cmd], 200),),
+        current_path=base_python,
+        current_identity=identities[base_python],
+    )
+    monkeypatch.setattr(sys, "executable", base_python)
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\Python")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(lifecycle, "_system_cmd_path", lambda: native_cmd)
+    monkeypatch.setattr(
+        lifecycle,
+        "_system_cmd_path_for_observation",
+        lambda observation: wow64_cmd,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: identities[str(path)],
+    )
+
+    assert lifecycle._validate_ancestry(host) == (current, cmd)
+
+
+@WINDOWS_ONLY
+def test_system_cmd_resolver_uses_observed_guest_architecture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cmd = _observation(
+        200,
+        parent=100,
+        path=r"C:\Windows\SysWOW64\cmd.exe",
+        ticks=200,
+    )
+    cmd.handle = 700
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_machines",
+        lambda handle: (0x014C, 0x8664),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_wow64_system_directory",
+        lambda machine: r"C:\Windows\SysWOW64" if machine == 0x014C else "",
+    )
+
+    assert lifecycle._system_cmd_path_for_observation(cmd) == (
+        r"C:\Windows\SysWOW64\cmd.exe"
+    )
+
+
+@WINDOWS_ONLY
+def test_system_cmd_resolver_uses_sysnative_for_native_ancestor_from_wow64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cmd = _observation(
+        200,
+        parent=100,
+        path=r"C:\Windows\System32\cmd.exe",
+        ticks=200,
+    )
+    cmd.handle = 700
+    monkeypatch.setattr(lifecycle, "_current_process_handle", lambda: 800)
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_machines",
+        lambda handle: (0, 0x8664) if handle == 700 else (0x014C, 0x8664),
+    )
+    monkeypatch.setattr(lifecycle, "_windows_directory", lambda: r"C:\Windows")
+
+    assert lifecycle._system_cmd_path_for_observation(cmd) == (
+        r"C:\Windows\Sysnative\cmd.exe"
+    )
+
+
+@WINDOWS_ONLY
+def test_process_image_identity_reopens_native_system_image_through_sysnative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_cmd = r"C:\Windows\System32\cmd.exe"
+    native_identity = _identity(native_cmd, "73")
+    opened: list[str] = []
+    monkeypatch.setattr(lifecycle, "_current_process_handle", lambda: 800)
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_machines",
+        lambda handle: (0, 0x8664) if handle == 700 else (0x014C, 0x8664),
+    )
+    monkeypatch.setattr(lifecycle, "_windows_directory", lambda: r"C:\Windows")
+
+    def open_identity(path: str):
+        opened.append(str(path))
+        return native_identity, 900
+
+    monkeypatch.setattr(psh, "open_stable_native_file_identity", open_identity)
+
+    identity, handle = lifecycle._open_stable_process_image_identity(
+        native_cmd,
+        700,
+    )
+
+    assert opened == [r"C:\Windows\Sysnative\cmd.exe"]
+    assert identity is native_identity
+    assert handle == 900
+
+
+@WINDOWS_ONLY
+def test_process_machine_query_falls_back_to_legacy_wow64_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LegacyIsWow64Process:
+        argtypes = None
+        restype = None
+
+        def __call__(self, handle, emulated) -> int:
+            assert int(handle.value) == 700
+            ctypes.cast(
+                emulated,
+                ctypes.POINTER(wintypes.BOOL),
+            ).contents.value = 1
+            return 1
+
+    class LegacyKernel32:
+        IsWow64Process = LegacyIsWow64Process()
+
+        def __getattr__(self, name: str):
+            raise AttributeError(name)
+
+    monkeypatch.setattr(
+        lifecycle.ctypes,
+        "WinDLL",
+        lambda name, use_last_error=True: LegacyKernel32(),
+    )
+
+    assert lifecycle._process_machines(700) == (0x014C, 0)
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("v2_mode", ["missing", "failure"])
+def test_wow64_directory_query_falls_back_to_legacy_api(
+    monkeypatch: pytest.MonkeyPatch,
+    v2_mode: str,
+) -> None:
+    class FailedDirectory2:
+        argtypes = None
+        restype = None
+
+        def __call__(self, buffer, capacity, machine) -> int:
+            assert machine == 0x014C
+            return 0
+
+    class LegacyDirectory:
+        argtypes = None
+        restype = None
+        called = 0
+
+        def __call__(self, buffer, capacity) -> int:
+            self.called += 1
+            buffer.value = r"C:\Windows\SysWOW64"
+            return len(buffer.value)
+
+    legacy = LegacyDirectory()
+
+    class LegacyKernel32:
+        GetSystemWow64DirectoryW = legacy
+
+        def __getattr__(self, name: str):
+            if name == "GetSystemWow64Directory2W" and v2_mode == "failure":
+                return FailedDirectory2()
+            raise AttributeError(name)
+
+    monkeypatch.setattr(
+        lifecycle.ctypes,
+        "WinDLL",
+        lambda name, use_last_error=True: LegacyKernel32(),
+    )
+
+    assert lifecycle._wow64_system_directory(0x014C) == (
+        r"C:\Windows\SysWOW64"
+    )
+    assert legacy.called == 1
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("with_cmd", [False, True])
+def test_validate_ancestry_accepts_base_install_console_script(
+    monkeypatch: pytest.MonkeyPatch,
+    with_cmd: bool,
+) -> None:
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current_pid = os.getpid()
+    cmd_path = r"C:\Windows\System32\cmd.exe"
+    console_path = r"C:\Python\Scripts\agenttalk.exe"
+    base_python = r"C:\Python\python.exe"
+    cmd = _observation(
+        200,
+        parent=host.pid,
+        path=cmd_path,
+        ticks=200,
+        identity=_identity(cmd_path, "0f"),
+    )
+    console = _observation(
+        201,
+        parent=cmd.pid if with_cmd else host.pid,
+        path=console_path,
+        ticks=210,
+        identity=_identity(console_path, "10"),
+    )
+    current = _observation(
+        current_pid,
+        parent=console.pid,
+        path=base_python,
+        ticks=300,
+        identity=_identity(base_python, "11"),
+    )
+    observations = {current_pid: current, console.pid: console}
+    if with_cmd:
+        observations[cmd.pid] = cmd
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_parent_map",
+        lambda: {pid: item.parent_pid for pid, item in observations.items()},
     )
     monkeypatch.setattr(
         lifecycle,
         "_open_process_observation",
-        lambda pid, parents=None: current if pid == current_pid else cmd,
+        lambda pid, parents=None: observations[pid],
     )
-    assert lifecycle._validate_ancestry(host) == (current, cmd)
+    monkeypatch.setattr(sys, "executable", base_python)
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\Python")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(sys, "argv", [r"C:\Python\Scripts\agenttalk"])
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda name: r"C:\Python\Scripts" if name == "scripts" else None,
+    )
+    monkeypatch.setattr(lifecycle, "_system_cmd_path", lambda: cmd_path)
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: (
+            cmd.identity
+            if str(path) == cmd_path
+            else console.identity
+            if str(path) == console_path
+            else current.identity
+        ),
+    )
+
+    expected = (current, console, cmd) if with_cmd else (current, console)
+    assert lifecycle._validate_ancestry(host) == expected
+
+
+@WINDOWS_ONLY
+def test_validate_ancestry_refuses_venv_launcher_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    launcher_path = r"C:\venv\Scripts\python.exe"
+    base_python = r"C:\Python\python.exe"
+    launcher_identity = _identity(launcher_path, "20")
+    base_identity = _identity(base_python, "21")
+    _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=((launcher_path, launcher_identity, 200),),
+        current_path=base_python,
+        current_identity=base_identity,
+    )
+    monkeypatch.setattr(sys, "executable", launcher_path)
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\venv")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda name: r"C:\venv\Scripts" if name == "scripts" else None,
+    )
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: (
+            _identity(launcher_path, "different")
+            if str(path) == launcher_path
+            else base_identity
+        ),
+    )
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="virtual-environment Python launcher image identity",
+    ):
+        lifecycle._validate_ancestry(host)
+
+
+@WINDOWS_ONLY
+def test_validate_ancestry_refuses_missing_venv_redirector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    launcher_path = r"C:\venv\Scripts\python.exe"
+    base_python = r"C:\Python\python.exe"
+    base_identity = _identity(base_python, "30")
+    _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=(),
+        current_path=base_python,
+        current_identity=base_identity,
+    )
+    monkeypatch.setattr(sys, "executable", launcher_path)
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\venv")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: _identity(str(path), "31"),
+    )
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="running Python image identity",
+    ):
+        lifecycle._validate_ancestry(host)
+
+
+@WINDOWS_ONLY
+def test_validate_ancestry_refuses_unattributed_console_and_python_launchers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    base_python = r"C:\Python\python.exe"
+    base_identity = _identity(base_python, "32")
+    console_path = r"C:\Python\Scripts\agenttalk.exe"
+    _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=((console_path, _identity(console_path, "33"), 200),),
+        current_path=base_python,
+        current_identity=base_identity,
+    )
+    monkeypatch.setattr(sys, "executable", base_python)
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\Python")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(sys, "argv", [r"C:\Tools\not-agenttalk.py"])
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda name: r"C:\Python\Scripts" if name == "scripts" else None,
+    )
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="not the active agenttalk entry point",
+    ):
+        lifecycle._validate_ancestry(host)
+
+    arbitrary_python = r"C:\Tools\python.exe"
+    _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=(
+            (arbitrary_python, _identity(arbitrary_python, "34"), 200),
+        ),
+        current_path=base_python,
+        current_identity=base_identity,
+    )
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="not the active virtual-environment launcher",
+    ):
+        lifecycle._validate_ancestry(host)
+
+
+@WINDOWS_ONLY
+def test_validate_ancestry_refuses_replaced_console_script_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    console_path = r"C:\Python\Scripts\agenttalk.exe"
+    base_python = r"C:\Python\python.exe"
+    console_identity = _identity(console_path, "35")
+    base_identity = _identity(base_python, "36")
+    _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=((console_path, console_identity, 200),),
+        current_path=base_python,
+        current_identity=base_identity,
+    )
+    monkeypatch.setattr(sys, "executable", base_python)
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\Python")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(sys, "argv", [r"C:\Python\Scripts\agenttalk"])
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda name: r"C:\Python\Scripts" if name == "scripts" else None,
+    )
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: (
+            _identity(console_path, "replaced")
+            if str(path) == console_path
+            else base_identity
+        ),
+    )
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="agenttalk console-script ancestor image identity",
+    ):
+        lifecycle._validate_ancestry(host)
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize(
+    ("name", "intermediate_paths", "match"),
+    [
+        (
+            "reordered",
+            (
+                r"C:\venv\Scripts\python.exe",
+                r"C:\Windows\System32\cmd.exe",
+            ),
+            "launcher order",
+        ),
+        (
+            "duplicate",
+            (
+                r"C:\Windows\System32\cmd.exe",
+                r"C:\Windows\System32\cmd.exe",
+            ),
+            "launcher order",
+        ),
+        (
+            "over-depth",
+            (
+                r"C:\Windows\System32\cmd.exe",
+                r"C:\venv\Scripts\agenttalk.exe",
+                r"C:\venv\Scripts\python.exe",
+                r"C:\Windows\System32\cmd.exe",
+            ),
+            "too many",
+        ),
+    ],
+)
+def test_validate_ancestry_refuses_unbounded_or_reordered_launchers(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    intermediate_paths: tuple[str, ...],
+    match: str,
+) -> None:
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    base_python = r"C:\Python\python.exe"
+    identities = {
+        path: _identity(path, f"{index + 40:02x}")
+        for index, path in enumerate(set(intermediate_paths) | {base_python})
+    }
+    _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=tuple(
+            (path, identities[path], 200 + index)
+            for index, path in enumerate(intermediate_paths)
+        ),
+        current_path=base_python,
+        current_identity=identities[base_python],
+    )
+    uses_venv = r"C:\venv\Scripts\python.exe" in intermediate_paths
+    monkeypatch.setattr(
+        sys,
+        "executable",
+        r"C:\venv\Scripts\python.exe" if uses_venv else base_python,
+    )
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\venv" if uses_venv else r"C:\Python")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            (
+                r"C:\venv\Scripts\agenttalk"
+                if r"C:\venv\Scripts\agenttalk.exe" in intermediate_paths
+                else r"C:\agenttalk\__main__.py"
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda name: r"C:\venv\Scripts" if name == "scripts" else None,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_system_cmd_path",
+        lambda: r"C:\Windows\System32\cmd.exe",
+    )
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: identities[str(path)],
+    )
+
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match=match):
+        lifecycle._validate_ancestry(host)
+
+
+@WINDOWS_ONLY
+def test_validate_ancestry_refuses_copied_cmd_and_start_inversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    copied_cmd = r"C:\Tools\cmd.exe"
+    base_python = r"C:\Python\python.exe"
+    copied_identity = _identity(copied_cmd, "50")
+    base_identity = _identity(base_python, "51")
+    _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=((copied_cmd, copied_identity, 90),),
+        current_path=base_python,
+        current_identity=base_identity,
+    )
+    monkeypatch.setattr(sys, "executable", base_python)
+    monkeypatch.setattr(sys, "_base_executable", base_python)
+    monkeypatch.setattr(sys, "prefix", r"C:\Python")
+    monkeypatch.setattr(sys, "base_prefix", r"C:\Python")
+    monkeypatch.setattr(
+        lifecycle,
+        "_system_cmd_path",
+        lambda: r"C:\Windows\System32\cmd.exe",
+    )
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: (
+            _identity(r"C:\Windows\System32\cmd.exe", "52")
+            if str(path) == r"C:\Windows\System32\cmd.exe"
+            else base_identity
+        ),
+    )
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="command-interpreter ancestor image identity",
+    ):
+        lifecycle._validate_ancestry(host)
+
+    system_cmd = _identity(r"C:\Windows\System32\cmd.exe", "52")
+    _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=((r"C:\Windows\System32\cmd.exe", system_cmd, 90),),
+        current_path=base_python,
+        current_identity=base_identity,
+    )
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="start times are inconsistent",
+    ):
+        lifecycle._validate_ancestry(host)
+
+
+@WINDOWS_ONLY
+def test_validate_ancestry_refuses_launcher_identity_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    cmd_path = r"C:\Windows\System32\cmd.exe"
+    base_python = r"C:\Python\python.exe"
+    _patch_observed_chain(
+        monkeypatch,
+        host,
+        intermediate=((cmd_path, _identity(cmd_path, "60"), 200),),
+        current_path=base_python,
+        current_identity=_identity(base_python, "61"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_system_cmd_path",
+        lambda: cmd_path,
+    )
+    monkeypatch.setattr(
+        psh,
+        "native_file_identity",
+        lambda path: (_ for _ in ()).throw(
+            psh.PowerShellHostError("access denied")
+        ),
+    )
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="cannot identify command-interpreter ancestor",
+    ):
+        lifecycle._validate_ancestry(host)
 
 
 def test_validate_ancestry_refuses_unrelated_manual_claim(
@@ -124,16 +909,23 @@ def test_validate_ancestry_refuses_unrelated_manual_claim(
     host = _observation(100, parent=1, path=PWSH, ticks=100)
     current_pid = os.getpid()
     current = _observation(current_pid, parent=200, path=r"C:\Python\python.exe", ticks=300)
-    unrelated = _observation(200, parent=999, path=r"C:\Tools\runner.exe", ticks=200)
+    unrelated = _observation(
+        200,
+        parent=host.pid,
+        path=r"C:\Tools\runner.exe",
+        ticks=200,
+    )
     monkeypatch.setattr(
-        lifecycle, "_process_parent_map", lambda: {current_pid: 200, 200: 999},
+        lifecycle,
+        "_process_parent_map",
+        lambda: {current_pid: 200, 200: host.pid},
     )
     monkeypatch.setattr(
         lifecycle,
         "_open_process_observation",
         lambda pid, parents=None: current if pid == current_pid else unrelated,
     )
-    with pytest.raises(lifecycle.SupervisorLifecycleError, match="unsupported"):
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match="unidentified"):
         lifecycle._validate_ancestry(host)
 
 
@@ -160,6 +952,43 @@ def test_claim_rechecks_selection_before_marker_write(
             pid_start=host.creation_token,
             validate_artifacts=lambda: None,
         )
+    assert not store.supervisor_instance_path().exists()
+
+
+def test_claim_rechecks_kill_switch_before_marker_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    selected = _selected(store)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current = _observation(
+        os.getpid(), parent=100, path=r"C:\Python\python.exe", ticks=200,
+    )
+    kill_switch = store.dir / "supervisor.kill"
+    monkeypatch.setattr(
+        lifecycle, "_read_valid_selection_locked", lambda store: selected,
+    )
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
+    monkeypatch.setattr(lifecycle, "_require_process_active", lambda observed: None)
+    monkeypatch.setattr(psh, "native_file_identity", lambda path: host.identity)
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match=r"supervisor\.kill is present",
+    ):
+        lifecycle.claim_powershell_supervisor(
+            store,
+            pid=host.pid,
+            pid_start=host.creation_token,
+            validate_artifacts=lambda: kill_switch.write_text(
+                "appeared-after-precheck",
+                encoding="utf-8",
+            ),
+        )
+
+    assert kill_switch.exists()
     assert not store.supervisor_instance_path().exists()
 
 
@@ -309,6 +1138,172 @@ def test_claim_refuses_unrelated_pid_without_marker(
             pid_start=host.creation_token,
             validate_artifacts=lambda: None,
         )
+    assert not store.supervisor_instance_path().exists()
+
+
+def test_observer_refuses_unrelated_powershell_pid_without_claiming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    selected = _selected(store)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current_pid = os.getpid()
+    current = _observation(
+        current_pid,
+        parent=200,
+        path=r"C:\Python\python.exe",
+        ticks=300,
+    )
+    unrelated = _observation(
+        200,
+        parent=host.pid,
+        path=r"C:\Tools\runner.exe",
+        ticks=200,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_read_valid_selection_locked",
+        lambda store: selected,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_process_parent_map",
+        lambda: {current_pid: 200, 200: host.pid},
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_open_process_observation",
+        lambda pid, parents=None: (
+            host
+            if pid == host.pid
+            else current
+            if pid == current_pid
+            else unrelated
+        ),
+    )
+
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match="unidentified"):
+        with lifecycle.checked_powershell_supervisor_observer(
+            store,
+            pid=host.pid,
+            pid_start=host.creation_token,
+            validate_artifacts=lambda: None,
+        ):
+            pytest.fail("unrelated caller reached the observation write")
+    assert not store.supervisor_instance_path().exists()
+
+
+def test_observer_refuses_exited_identified_launcher_before_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    selected = _selected(store)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    launcher = _observation(
+        200,
+        parent=host.pid,
+        path=r"C:\venv\Scripts\python.exe",
+        ticks=200,
+    )
+    current = _observation(
+        os.getpid(),
+        parent=launcher.pid,
+        path=r"C:\Python\python.exe",
+        ticks=300,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_read_valid_selection_locked",
+        lambda store: selected,
+    )
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(
+        lifecycle,
+        "_validate_ancestry",
+        lambda observed: (current, launcher),
+    )
+
+    def require_active(observed: lifecycle.ProcessObservation) -> None:
+        if observed is launcher:
+            raise lifecycle.SupervisorLifecycleError(
+                "process 200 exited during validation"
+            )
+
+    monkeypatch.setattr(lifecycle, "_require_process_active", require_active)
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="exited during validation",
+    ):
+        with lifecycle.checked_powershell_supervisor_observer(
+            store,
+            pid=host.pid,
+            pid_start=host.creation_token,
+            validate_artifacts=lambda: None,
+        ):
+            pytest.fail("an exited launcher reached the observation write")
+    assert not store.supervisor_instance_path().exists()
+
+
+def test_observer_holds_lifecycle_selection_config_through_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    events: list[str] = []
+
+    def lock(name: str):
+        @contextlib.contextmanager
+        def held():
+            events.append("enter:" + name)
+            try:
+                yield
+            finally:
+                events.append("exit:" + name)
+
+        return held()
+
+    monkeypatch.setattr(store, "_supervisor_lifecycle_lock", lambda: lock("lifecycle"))
+    monkeypatch.setattr(store, "_powershell_selection_lock", lambda: lock("selection"))
+    monkeypatch.setattr(store, "_config_lock", lambda: lock("config"))
+    selected = _selected(store)
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current = _observation(
+        os.getpid(),
+        parent=100,
+        path=r"C:\Python\python.exe",
+        ticks=200,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_read_valid_selection_locked",
+        lambda store: selected,
+    )
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
+    monkeypatch.setattr(lifecycle, "_require_process_active", lambda observed: None)
+    monkeypatch.setattr(psh, "native_file_identity", lambda path: host.identity)
+
+    with lifecycle.checked_powershell_supervisor_observer(
+        store,
+        pid=host.pid,
+        pid_start=host.creation_token,
+        validate_artifacts=lambda: events.append("artifacts"),
+    ):
+        events.append("write")
+
+    assert events == [
+        "enter:lifecycle",
+        "artifacts",
+        "enter:selection",
+        "enter:config",
+        "write",
+        "exit:config",
+        "exit:selection",
+        "exit:lifecycle",
+    ]
     assert not store.supervisor_instance_path().exists()
 
 
