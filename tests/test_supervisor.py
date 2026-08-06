@@ -1378,6 +1378,68 @@ def test_completed_restart_marker_is_not_reported_as_pending_progress() -> None:
     }
 
 
+def test_current_restart_is_not_completed_by_an_old_request_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    state["agents"]["worker"].update({
+        "restart_request_state": "readiness_seen",
+        "pending_restart_request_id": "rr-old",
+        "restart_requested_by": "lead",
+    })
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+    store.write_restart_request(
+        "worker",
+        {"agent": "worker", **_auth_marker("rr-new")},
+    )
+
+    stale_plan = {
+        "action": sup.WARN_ONLY,
+        "state": "PROCESS_TREE_TRUNCATED",
+        "reason": "operator-visible process ownership refusal",
+        "next_state": state["agents"]["worker"],
+    }
+
+    def fixed_plan(*_args, **_kwargs) -> dict:
+        return {"agents": {"worker": stale_plan}}
+
+    monkeypatch.setattr(sup, "plan_actions", fixed_plan)
+
+    observation = sup.build_supervisor_observation(
+        store,
+        now_epoch=NOW,
+        state=state,
+        supervisor_config=_WRAP_CONFIG,
+        snapshot=_wrap_snap(),
+    )
+    assessment = next(
+        row for row in observation["agents"] if row["name"] == "worker"
+    )
+    marker = store.read_restart_request("worker")
+    attention_item = att.process_tree_hold_items(
+        state,
+        restart_requests={"worker": marker},
+        reset_admissions={"evaluated": True, "admissions": {}},
+    )[0]
+
+    assert assessment["restart_request"] == {
+        "present": True,
+        "pending": False,
+        "blocked": True,
+        "state": "blocked_by_process_tree_hold",
+        "request_id": "rr-new",
+        "requested_by": "lead",
+    }
+    assert attention_item["restart_request"] == {
+        "request_id": "rr-new",
+        "state": "blocked_by_process_tree_hold",
+        "pending_progress": False,
+    }
+
+
 def test_supervisor_cli_json_redacts_embedded_report_config_blocked(
         tmp_path: Path, capsys) -> None:
     s = _team(tmp_path)

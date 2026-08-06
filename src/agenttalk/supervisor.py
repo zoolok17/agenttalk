@@ -1679,6 +1679,73 @@ def _assessment_health(rpt: dict, lead_liveness: dict | None) -> dict:
     }
 
 
+def restart_request_progress(
+    state_row: dict,
+    marker: dict | None,
+    *,
+    decision_state: str | None = None,
+    clear_marker: str | None = None,
+) -> dict:
+    """Classify one restart request without borrowing another request's state."""
+    persisted_state = state_row.get("restart_request_state")
+    persisted_request_id = state_row.get("pending_restart_request_id")
+    current_request_id = (
+        marker.get("request_id") if isinstance(marker, dict) else None
+    )
+    request_id = (
+        current_request_id
+        if isinstance(current_request_id, str) and current_request_id
+        else persisted_request_id
+    )
+    present = bool(
+        isinstance(marker, dict)
+        or (
+            isinstance(persisted_request_id, str)
+            and persisted_state in {
+                "applied_pending_readiness",
+                "readiness_seen",
+            }
+        )
+    )
+    completed = bool(
+        present
+        and isinstance(request_id, str)
+        and (
+            (
+                persisted_state == "readiness_seen"
+                and persisted_request_id == request_id
+            )
+            or (
+                clear_marker == request_id
+                and persisted_request_id in {None, request_id}
+            )
+        )
+    )
+    blocked = bool(
+        present
+        and not completed
+        and decision_state in {
+            "PROCESS_TREE_INVALID",
+            "PROCESS_TREE_TRUNCATED",
+        }
+    )
+    return {
+        "present": present,
+        "pending": present and not blocked and not completed,
+        "blocked": blocked,
+        "state": (
+            "readiness_seen"
+            if completed
+            else "blocked_by_process_tree_hold"
+            if blocked
+            else "pending"
+            if present
+            else "absent"
+        ),
+        "request_id": request_id if isinstance(request_id, str) else None,
+    }
+
+
 def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
                                 operator_facing: str | None = None,
                                 lead_liveness_stale_after_seconds: float =
@@ -1711,40 +1778,17 @@ def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
         if isinstance(plan, dict) and isinstance(plan.get("next_state"), dict)
         else {}
     )
-    persisted_restart_state = next_state.get("restart_request_state")
-    persisted_request_id = next_state.get("pending_restart_request_id")
-    request_id = rr.get("request_id") if rr else persisted_request_id
-    restart_present = bool(
-        rr is not None
-        or (
-            isinstance(persisted_request_id, str)
-            and persisted_restart_state in {
-                "applied_pending_readiness",
-                "readiness_seen",
-            }
-        )
-    )
-    restart_completed = bool(
-        restart_present
-        and (
-            persisted_restart_state == "readiness_seen"
-            or (isinstance(plan, dict) and plan.get("action") == CLEAR_MARKER)
-        )
-    )
-    restart_blocked = bool(
-        restart_present
-        and not restart_completed
-        and isinstance(decision, dict)
-        and decision.get("state") in {"PROCESS_TREE_INVALID", "PROCESS_TREE_TRUNCATED"}
-    )
-    restart_state = (
-        "readiness_seen"
-        if restart_completed
-        else "blocked_by_process_tree_hold"
-        if restart_blocked
-        else "pending"
-        if restart_present
-        else "absent"
+    restart = restart_request_progress(
+        next_state,
+        rr,
+        decision_state=(
+            decision.get("state") if isinstance(decision, dict) else None
+        ),
+        clear_marker=(
+            plan.get("clear_marker")
+            if isinstance(plan, dict) and plan.get("action") == CLEAR_MARKER
+            else None
+        ),
     )
     return {
         "name": name,
@@ -1762,11 +1806,7 @@ def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
             "deadline_epoch": rpt.get("waiting_deadline_epoch"),
         },
         "restart_request": {
-            "present": restart_present,
-            "pending": restart_present and not restart_blocked and not restart_completed,
-            "blocked": restart_blocked,
-            "state": restart_state,
-            "request_id": request_id if isinstance(request_id, str) else None,
+            **restart,
             "requested_by": (
                 rr.get("requested_by")
                 if rr
@@ -8875,19 +8915,25 @@ def evaluate_process_tree_reset_admissions(
                 # One corrupt archive journal must not erase configured HOLD
                 # cards, and this request's command would reject the same state.
                 continue
-            if (
-                pending is not None
-                and entry.get("request_id") == request_id
-                and entry.get("agent") == agent
-                and held_terminal is not None
-                and archive_destination_admitted(request_id, pending)
-            ):
-                admissions[f"ephemeral:{request_id}"] = {
-                    "mode": "ephemeral_archive",
-                    "request_id": request_id,
-                    "actor": actor,
-                    "reason": pending["reason"],
-                }
+            if pending is not None:
+                if (
+                    _active_ephemeral_hold_matches_archive(
+                        entry,
+                        pending,
+                        request_id,
+                    )
+                    and archive_destination_admitted(request_id, pending)
+                ):
+                    admissions[f"ephemeral:{request_id}"] = {
+                        "mode": "ephemeral_archive",
+                        "request_id": request_id,
+                        "actor": actor,
+                        "verification_mode": pending["verification_mode"],
+                        "verified_launch_nonce": pending[
+                            "verified_launch_nonce"
+                        ],
+                        "reason": pending["reason"],
+                    }
                 continue
             pending_root = (
                 eph_root.get("attended_archive_pending")
@@ -8948,6 +8994,8 @@ def evaluate_process_tree_reset_admissions(
                 "mode": "ephemeral_archive",
                 "request_id": request_id,
                 "actor": actor,
+                "verification_mode": "operator_attested",
+                "verified_launch_nonce": None,
                 "reason": "operator verified the terminal request can be archived",
             }
     # Identity probes and marker reads can outlive the context snapshot above.
@@ -9579,6 +9627,21 @@ def _validate_attended_ephemeral_archive_pending(
     return copy.deepcopy(value)
 
 
+def _active_ephemeral_hold_matches_archive(
+    entry: object,
+    record: dict,
+    request_id: str,
+) -> bool:
+    """Return whether the live HOLD is exactly the one a journal stages."""
+    return bool(
+        isinstance(entry, dict)
+        and entry.get("request_id") == request_id
+        and entry.get("agent") == record.get("agent")
+        and eph.validate_held_terminal(entry.get("held_terminal"))
+        == record.get("terminal")
+    )
+
+
 def attended_ephemeral_archive_pending(
     state: dict,
     request_id: str,
@@ -9694,13 +9757,7 @@ def finish_attended_ephemeral_archive(
     root = eph.ensure_state(state)
     active = root["active"]
     entry = active.get(request_id)
-    if (
-        not isinstance(entry, dict)
-        or entry.get("request_id") != request_id
-        or entry.get("agent") != record["agent"]
-        or eph.validate_held_terminal(entry.get("held_terminal"))
-        != record["terminal"]
-    ):
+    if not _active_ephemeral_hold_matches_archive(entry, record, request_id):
         raise ValueError(
             "active ephemeral HOLD changed after its attended archive was staged"
         )

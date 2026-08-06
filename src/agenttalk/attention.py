@@ -689,29 +689,6 @@ def config_blocked_items(holds: list[dict]) -> list[dict]:
     return out
 
 
-def _blocked_restart_request(row: dict, marker: dict | None) -> dict | None:
-    request_id = marker.get("request_id") if isinstance(marker, dict) else None
-    if (
-        isinstance(request_id, str)
-        and request_id
-        and row.get("restart_request_state") == "readiness_seen"
-        and row.get("pending_restart_request_id") == request_id
-    ):
-        return None
-    if (
-        (not isinstance(request_id, str) or not request_id)
-        and row.get("restart_request_state") == "applied_pending_readiness"
-    ):
-        request_id = row.get("pending_restart_request_id")
-    if not eph.is_safe_reason(request_id, max_length=256):
-        return None
-    return {
-        "request_id": request_id,
-        "state": "blocked_by_process_tree_hold",
-        "pending_progress": False,
-    }
-
-
 def configured_process_tree_hold_agents(state: dict) -> list[str]:
     """Return only validated configured agents with a current strict HOLD."""
     agents = state.get("agents") if isinstance(state, dict) else None
@@ -932,7 +909,25 @@ def process_tree_hold_items(
             and isinstance(restart_requests.get(agent), dict)
             else None
         )
-        blocked_restart = _blocked_restart_request(row, marker)
+        restart = supervisor_mod.restart_request_progress(
+            row,
+            marker,
+            decision_state=(
+                "PROCESS_TREE_TRUNCATED"
+                if status == "truncated"
+                else "PROCESS_TREE_INVALID"
+            ),
+        )
+        blocked_restart = (
+            {
+                "request_id": restart["request_id"],
+                "state": restart["state"],
+                "pending_progress": restart["pending"],
+            }
+            if restart["blocked"]
+            and eph.is_safe_reason(restart["request_id"], max_length=256)
+            else None
+        )
         remedy = admissions.get(identity)
         remedy_mode = None
         remedy_identity = None
@@ -969,12 +964,33 @@ def process_tree_hold_items(
                 and eph.is_safe_id(request_id)
                 and valid_actor is not None
                 and valid_reason
+                and remedy.get("verification_mode") in {
+                    "strict_identity",
+                    "operator_attested",
+                }
+                and (
+                    (
+                        remedy.get("verification_mode") == "strict_identity"
+                        and isinstance(
+                            remedy.get("verified_launch_nonce"), str
+                        )
+                        and bool(remedy["verified_launch_nonce"])
+                    )
+                    or (
+                        remedy.get("verification_mode") == "operator_attested"
+                        and remedy.get("verified_launch_nonce") is None
+                    )
+                )
             ):
                 remedy_mode = mode
                 remedy_identity = {
                     "mode": mode,
                     "request_id": request_id,
                     "actor": valid_actor,
+                    "verification_mode": remedy["verification_mode"],
+                    "verified_launch_nonce": remedy[
+                        "verified_launch_nonce"
+                    ],
                     "reason": reason,
                 }
         blocker = blocked_admissions.get(identity)
@@ -1139,7 +1155,7 @@ def process_tree_hold_items(
                 remedy["actor"],
             ]
         elif remedy_mode == "ephemeral_archive":
-            it["operator_argv"] = [
+            operator_argv = [
                 "agenttalk",
                 "supervise",
                 "--reset-process-tree-ownership",
@@ -1147,30 +1163,24 @@ def process_tree_hold_items(
                 remedy["request_id"],
                 "--hold-source-hash",
                 it["source_hash"],
+            ]
+            if remedy["verification_mode"] == "strict_identity":
+                operator_argv.extend([
+                    "--verified-launch-nonce",
+                    remedy["verified_launch_nonce"],
+                ])
+            operator_argv.extend([
                 "--acknowledge-no-live-supervisor",
                 "--acknowledge-owned-processes-stopped",
                 "--reason",
                 remedy["reason"],
                 "--from",
                 remedy["actor"],
-            ]
-        if request_id is not None:
-            try:
-                archive_agent = validate_agent_name(agent)
-            except (TypeError, ValueError):
-                archive_agent = None
-            held_terminal = eph.validate_held_terminal(row.get("held_terminal"))
-            if (
-                archive_agent is not None
-                and eph.is_safe_id(request_id)
-                and held_terminal is not None
-                and row.get("request_id") == request_id
-                and row.get("agent") == archive_agent
-            ):
-                # This is an archive verification MODE, not remedy admission.
-                # The CLI still independently proves the supervisor is stopped,
-                # the kill switch remains, and the caller is authorized.
-                it["attended_disposition_mode"] = "operator_attested"
+            ])
+            it["operator_argv"] = operator_argv
+            # This is archive verification evidence, not remedy authority.
+            # The CLI still independently rechecks every command precondition.
+            it["attended_disposition_mode"] = remedy["verification_mode"]
         it["dedupe_key"] = dedupe_key(
             SOURCE_PROCESS_TREE_HOLD,
             identity=identity,

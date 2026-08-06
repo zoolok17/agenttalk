@@ -827,7 +827,11 @@ def test_completed_restart_is_not_relabelled_blocked_by_later_hold() -> None:
 
     assert "restart_request" not in without_marker
     assert "restart_request" not in stale_same_marker
-    assert fresh_marker["restart_request"]["request_id"] == "rr-new"
+    assert fresh_marker["restart_request"] == {
+        "request_id": "rr-new",
+        "state": "blocked_by_process_tree_hold",
+        "pending_progress": False,
+    }
 
 
 def test_configured_launch_rejects_quoted_command_line_over_windows_bound() -> None:

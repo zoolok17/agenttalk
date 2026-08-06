@@ -1117,6 +1117,133 @@ def _current_ephemeral_reset_item(
     )
 
 
+def _stage_ephemeral_archive_retry(
+    store: Store,
+    state: dict,
+    request_id: str,
+    agent: str,
+    source_hash: str,
+    *,
+    verification_mode: str,
+    verified_launch_nonce: str | None,
+) -> None:
+    marker = store.read_launch_request(request_id)
+    assert marker is not None
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    sup.stage_attended_ephemeral_archive(
+        state,
+        request_id,
+        agent=agent,
+        launch_marker=marker,
+        held_terminal=entry["held_terminal"],
+        hold_source_hash=source_hash,
+        acknowledged_by="lead",
+        verification_mode=verification_mode,
+        verified_launch_nonce=verified_launch_nonce,
+        verified_identity_count=(1 if verification_mode == "strict_identity" else 0),
+        reason="operator verified the terminal request can be archived",
+        now_epoch=NOW,
+    )
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+
+
+def _drift_ephemeral_terminal(state: dict, request_id: str) -> None:
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    original = entry["held_terminal"]
+    entry["held_terminal"] = {
+        "terminal_state": original["terminal_state"],
+        "reason": "a different valid terminal fact replaced the staged one",
+        "completion": dict(original["completion"]),
+    }
+
+
+def test_rendered_strict_identity_ephemeral_retry_argv_executes(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    _stage_ephemeral_archive_retry(
+        store,
+        state,
+        request_id,
+        agent,
+        source_hash,
+        verification_mode="strict_identity",
+        verified_launch_nonce=SUPERVISOR_NONCE,
+    )
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+    argv = item["operator_argv"]
+
+    assert item["attended_disposition_mode"] == "strict_identity"
+    assert argv[argv.index("--verified-launch-nonce") + 1] == SUPERVISOR_NONCE
+    assert cli.main(["--root", str(tmp_path), *argv[1:], "--now", str(NOW)]) == 0
+
+
+def test_staged_ephemeral_terminal_drift_hides_rendered_remedy(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    _stage_ephemeral_archive_retry(
+        store,
+        state,
+        request_id,
+        agent,
+        source_hash,
+        verification_mode="operator_attested",
+        verified_launch_nonce=None,
+    )
+    _drift_ephemeral_terminal(state, request_id)
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+
+
+def test_staged_ephemeral_terminal_drift_does_not_name_kill_switch(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    original_terminal = dict(
+        state["ephemeral_reviewers"]["active"][request_id]["held_terminal"]
+    )
+    _stage_ephemeral_archive_retry(
+        store,
+        state,
+        request_id,
+        agent,
+        source_hash,
+        verification_mode="operator_attested",
+        verified_launch_nonce=None,
+    )
+    _drift_ephemeral_terminal(state, request_id)
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+
+    drifted = _current_ephemeral_reset_item(store, state, request_id)
+
+    assert "operator_argv" not in drifted
+    assert ".agenttalk/supervisor.kill" not in drifted["recommendation"]
+
+    state["ephemeral_reviewers"]["active"][request_id][
+        "held_terminal"
+    ] = original_terminal
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    matching = _current_ephemeral_reset_item(store, state, request_id)
+    assert ".agenttalk/supervisor.kill" in matching["recommendation"]
+
+
 def test_cli_attended_ephemeral_tree_hold_archives_exact_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
