@@ -7583,6 +7583,7 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "'AGENTTALK_WRAPPER_LOG_NONCE')",
         "    stdout_capability = [Environment]::GetEnvironmentVariable("
         "'AGENTTALK_WRAPPER_STDOUT_LOG')",
+        "    argument_line = [string]$startArgs.ArgumentList",
         "  }",
         "  return [pscustomobject]@{ "
         "Process = [pscustomobject]@{ Id = 4242 }; Redirected = "
@@ -7592,7 +7593,7 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         launchers,
         "function Invoke-RegularCase("
         "[string]$label, [string]$file, [object[]]$argv, "
-        "[bool]$wrapped, [string]$mode, $moduleArgsFrom = $null) {",
+        "[object]$wrapped, [string]$mode, $moduleArgsFrom = $null) {",
         "  $script:caseName = $label",
         "  $agent = [pscustomobject]@{",
         "    backend_profile = $null",
@@ -7635,7 +7636,7 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "$env:AGENTTALK_WRAPPER_LOG_NONCE = 'ambient-nonce'",
         "$env:AGENTTALK_WRAPPER_STDOUT_LOG = 'ambient-stdout'",
         "Invoke-RegularCase 'regular_python_wrap' 'python.exe' "
-        "@('-m','agenttalk','wrap') $true 'wrap'",
+        "@('-m','agenttalk','wrap','--for','worker','--','codex.exe') $true 'wrap'",
         # Round 23: these no longer get a special not-logged answer - the
         # supervisor stopped predicting whether argparse would actually
         # reach cmd_wrap (that probe is deleted; see Launch's own comment).
@@ -7647,13 +7648,13 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         # never .committed, and is preserved rather than evicting real
         # evidence (see New-WrapperLogTargets/Invoke-WrapperLogRetentionPrune).
         "Invoke-RegularCase 'regular_wrap_help' 'python.exe' "
-        "@('-m','agenttalk','wrap','--help') $true 'wrap'",
+        "@('-m','agenttalk','wrap','--for','worker','--help','--','codex.exe') $true 'wrap'",
         "Invoke-RegularCase 'regular_wrap_invalid_flag' 'python.exe' "
-        "@('-m','agenttalk','wrap','--nonexistent-flag') $true 'wrap'",
+        "@('-m','agenttalk','wrap','--for','worker','--nonexistent-flag','--','codex.exe') $true 'wrap'",
         "Invoke-RegularCase 'regular_unbuffered_wrap' 'python.exe' "
-        "@('-u','-m','agenttalk','wrap') $true 'wrap' 1",
+        "@('-u','-m','agenttalk','wrap','--for','worker','--','codex.exe') $true 'wrap' 1",
         "Invoke-RegularCase 'regular_xoption_wrap' 'python.exe' "
-        "@('-X','utf8','-m','agenttalk','wrap') $true 'wrap' 2",
+        "@('-X','utf8','-m','agenttalk','wrap','--for','worker') $true 'wrap' 2",
         "Invoke-RegularCase 'regular_no_args' 'python.exe' @() $true 'wrap'",
         "Invoke-RegularCase 'regular_script_prefix' 'python.exe' "
         "@('helper.py','-m','agenttalk','wrap') $true 'wrap'",
@@ -7662,13 +7663,61 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "Invoke-RegularCase 'regular_wait' 'python.exe' "
         "@('-m','agenttalk','wait') $true 'wrap'",
         "Invoke-RegularCase 'regular_not_wrapped' 'python.exe' "
-        "@('-m','agenttalk','wrap') $false 'wrap'",
+        "@('-m','agenttalk','wrap','--for','worker','--','codex.exe') $false 'wrap'",
         "Invoke-RegularCase 'regular_not_wrap_mode' 'python.exe' "
-        "@('-m','agenttalk','wrap') $true 'fresh'",
+        "@('-m','agenttalk','wrap','--for','worker','--','codex.exe') $true 'fresh'",
+        "Invoke-RegularCase 'regular_wrong_agent' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','other','--','codex.exe') $true 'wrap'",
+        "Invoke-RegularCase 'regular_duplicate_agent' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','worker','--for','other','--','codex.exe') $true 'wrap'",
+        "Invoke-RegularCase 'regular_truthy_wrong_agent' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','other','--','codex.exe') 'true' 'wrap'",
+        "Invoke-RegularCase 'regular_non_agenttalk_entry' 'codex.exe' "
+        "@('wrap','--for','worker') $true 'wrap'",
+        "Invoke-RegularCase 'regular_python_without_module' 'python.exe' "
+        "@('wrap','--for','worker') $true 'wrap'",
+        "Invoke-RegularCase 'regular_for_in_remainder' 'python.exe' "
+        "@('-m','agenttalk','wrap','codex.exe','--for','worker') $true 'wrap'",
+        "Invoke-RegularCase 'regular_false_wrap_dispatch' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','other','--','codex.exe') $false 'wrap'",
+        "Invoke-RegularCase 'regular_empty_cli_tail' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','worker','--') $true 'wrap'",
+        "Invoke-RegularCase 'regular_positional_before_tail' 'python.exe' "
+        "@('-m','agenttalk','wrap','codex.exe','--for','worker','--','codex.exe') $true 'wrap'",
+        "Invoke-RegularCase 'regular_option_as_value' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','worker','--model','--loop','--','codex.exe') $true 'wrap'",
+        "Invoke-RegularCase 'regular_empty_option_value' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','worker','--model','','--','codex.exe') $true 'wrap'",
+        "Invoke-RegularCase 'regular_invalid_global_value' 'python.exe' "
+        "@('-m','agenttalk','--root','--','wrap','--for','worker','--','codex.exe') $true 'wrap'",
+        "Invoke-RegularCase 'regular_wrong_root' 'python.exe' "
+        "@('-m','agenttalk','--root','D:\\other','wrap','--for','worker','--','codex.exe') $true 'wrap'",
+        "Invoke-RegularCase 'regular_duplicate_root' 'python.exe' "
+        "@('-m','agenttalk','--root','D:\\one','--root=D:\\two','wrap','--for','worker','--','codex.exe') $true 'wrap'",
         "Invoke-EphemeralCase 'ephemeral_python_wrap' 'python.exe' "
-        "@('-m','agenttalk','wrap')",
+        "@('-m','agenttalk','wrap','--for','reviewer','--','codex.exe')",
         "Invoke-EphemeralCase 'ephemeral_console_wrap' 'agenttalk.exe' "
-        "@('wrap')",
+        "@('wrap','--for','reviewer','--','codex.exe')",
+        "Invoke-EphemeralCase 'ephemeral_wrong_agent' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','other','--','codex.exe')",
+        "Invoke-EphemeralCase 'ephemeral_duplicate_agent' 'agenttalk.exe' "
+        "@('wrap','--for','reviewer','--for','other','--','codex.exe')",
+        "Invoke-EphemeralCase 'ephemeral_for_in_remainder' 'python.exe' "
+        "@('-m','agenttalk','wrap','codex.exe','--for','reviewer')",
+        "Invoke-EphemeralCase 'ephemeral_empty_cli_tail' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','reviewer','--')",
+        "Invoke-EphemeralCase 'ephemeral_positional_before_tail' 'python.exe' "
+        "@('-m','agenttalk','wrap','codex.exe','--for','reviewer','--','codex.exe')",
+        "Invoke-EphemeralCase 'ephemeral_option_as_value' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','reviewer','--model','--loop','--','codex.exe')",
+        "Invoke-EphemeralCase 'ephemeral_empty_option_value' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','reviewer','--model','','--','codex.exe')",
+        "Invoke-EphemeralCase 'ephemeral_invalid_global_value' 'python.exe' "
+        "@('-m','agenttalk','--root','--','wrap','--for','reviewer','--','codex.exe')",
+        "Invoke-EphemeralCase 'ephemeral_wrong_root' 'python.exe' "
+        "@('-m','agenttalk','--root','D:\\other','wrap','--for','reviewer','--','codex.exe')",
+        "Invoke-EphemeralCase 'ephemeral_duplicate_root' 'python.exe' "
+        "@('-m','agenttalk','--root','D:\\one','--root=D:\\two','wrap','--for','reviewer','--','codex.exe')",
         "Invoke-EphemeralCase 'ephemeral_no_args' 'python.exe' @()",
         "Invoke-EphemeralCase 'ephemeral_script_prefix' 'python.exe' "
         "@('helper.py','-m','agenttalk','wrap')",
@@ -7708,27 +7757,21 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "regular_wrap_help",
         "regular_wrap_invalid_flag",
         "regular_unbuffered_wrap",
+        "regular_wrong_root",
         "ephemeral_python_wrap",
         "ephemeral_console_wrap",
+        "ephemeral_wrong_root",
     }
     assert {row["name"] for row in rows} == {
         "regular_python_wrap",
         "regular_wrap_help",
         "regular_wrap_invalid_flag",
         "regular_unbuffered_wrap",
-        "regular_xoption_wrap",
-        "regular_no_args",
-        "regular_script_prefix",
-        "regular_command_prefix",
-        "regular_wait",
-        "regular_not_wrapped",
         "regular_not_wrap_mode",
+        "regular_wrong_root",
         "ephemeral_python_wrap",
         "ephemeral_console_wrap",
-        "ephemeral_no_args",
-        "ephemeral_script_prefix",
-        "ephemeral_command_prefix",
-        "ephemeral_wait",
+        "ephemeral_wrong_root",
     }
     for row in rows:
         should_log = row["name"] in expected_logged
@@ -7736,6 +7779,9 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         assert row["stderr_redirect"] is should_log, row
         assert bool(row["nonce"]) is should_log, row
         assert bool(row["stdout_capability"]) is should_log, row
+        if row["name"] in {"regular_wrong_root", "ephemeral_wrong_root"}:
+            assert str(tmp_path) in row["argument_line"], row
+            assert r"D:\other" not in row["argument_line"], row
 
 
 def test_ps_start_wrapper_process_fallback_strips_logging_env_vars(
@@ -8114,7 +8160,8 @@ def test_ps_launch_discards_targets_when_fallback_is_unredirected(
         "function Assert-ActionsEnabled([string]$what) { return $true }",
         "$agent = [pscustomobject]@{ backend_profile = $null; wrapped = $true; "
         "cwd = $Root; env = $null; launch = [pscustomobject]@{ "
-        "windows_file = 'python.exe'; windows_args = @('-m','agenttalk','wrap') } }",
+        "windows_file = 'python.exe'; windows_args = @('-m','agenttalk','wrap',"
+        "'--for','worker','--','codex.exe') } }",
         "$cfg = [pscustomobject]@{ agents = [pscustomobject]@{ worker = $agent } }",
         "$plan = [pscustomobject]@{ launch_mode = 'wrap'; window_style = 'Hidden'; "
         "window_style_warning = $null; session_id = $null; session_args = @() }",
@@ -8149,7 +8196,7 @@ def test_ps_launch_discards_targets_when_fallback_is_unredirected(
     )
 
 
-def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_path: Path) -> None:
+def test_wrapped_launch_helper_pins_root_before_wrap_for_legacy_configs(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
         return
@@ -8164,6 +8211,10 @@ def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_p
         "$legacyConsole = Ensure-AgenttalkWrapRootArg @('wrap','--for',"
         "'Altair','--cli','codex','--loop','--','codex.exe')",
         "$alreadyRooted = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','--root','R','wrap','--for','Vega','--loop')",
+        "$alreadyRootedInline = Ensure-AgenttalkWrapRootArg "
+        "@('-m','agenttalk','--root=R','wrap','--for','Vega','--loop')",
+        "$duplicateRoot = Ensure-AgenttalkWrapRootArg "
+        "@('-m','agenttalk','--root','R','--root=R2','wrap','--for','Vega','--loop')",
         "$nonWrap = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','wait','--for','Cygnus')",
         # Case-sensitivity sweep (PR 98 connector, supervisor.py:6483's
         # class): argparse would reject 'WRAP'/'--ROOT' as unrecognized -
@@ -8174,6 +8225,7 @@ def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_p
         "@('-m','agenttalk','--ROOT','R','wrap','--for','Vega')",
         "@{ legacyPy = $legacyPy; legacyConsole = $legacyConsole; "
         "alreadyRooted = $alreadyRooted; nonWrap = $nonWrap; "
+        "alreadyRootedInline = $alreadyRootedInline; duplicateRoot = $duplicateRoot; "
         "upperCaseWrap = $upperCaseWrap; "
         "upperCaseRootAlreadyPresent = $upperCaseRootAlreadyPresent } | ConvertTo-Json -Depth 6 | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
@@ -8186,7 +8238,13 @@ def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_p
     data = json.loads(out.read_text(encoding="utf-8-sig"))
     assert data["legacyPy"][:5] == ["-m", "agenttalk", "--root", str(tmp_path), "wrap"]
     assert data["legacyConsole"][:3] == ["--root", str(tmp_path), "wrap"]
-    assert data["alreadyRooted"][:5] == ["-m", "agenttalk", "--root", "R", "wrap"]
+    assert data["alreadyRooted"][:5] == [
+        "-m", "agenttalk", "--root", str(tmp_path), "wrap",
+    ]
+    assert data["alreadyRootedInline"][:4] == [
+        "-m", "agenttalk", f"--root={tmp_path}", "wrap",
+    ]
+    assert data["duplicateRoot"] is None
     assert data["nonWrap"] == ["-m", "agenttalk", "wait", "--for", "Cygnus"]
     # 'WRAP' is not 'wrap' to argparse - no insertion point is found, so
     # the argv passes through unchanged (not backfilled as if it matched).
@@ -14524,6 +14582,48 @@ def test_ephemeral_record_prepared_persists_declared_module_args_from() -> None:
     )
     entry = state["ephemeral_reviewers"]["active"]["R1"]
     assert entry["launch"] == {"windows_file": "python.exe", "module_args_from": 1}
+
+
+def test_ephemeral_record_prepared_keeps_active_allocation_history() -> None:
+    state = {
+        "ephemeral_reviewers": {
+            "active": {
+                "R1": {
+                    "request_id": "R1",
+                    "agent": "adversary-1",
+                },
+            },
+            "launch_history": [{
+                "request_id": "R1",
+                "agent": "adversary-1",
+                "at_epoch": NOW - 86401,
+            }],
+        },
+    }
+
+    eph.record_prepared(
+        state,
+        request_id="R2",
+        agent="adversary-2",
+        requested_by="lead",
+        profile="codex-evidence-reviewer",
+        timeout_seconds=1800,
+        now_epoch=NOW,
+        review_request_id="m2",
+    )
+
+    assert state["ephemeral_reviewers"]["launch_history"] == [
+        {
+            "request_id": "R1",
+            "agent": "adversary-1",
+            "at_epoch": NOW - 86401,
+        },
+        {
+            "request_id": "R2",
+            "agent": "adversary-2",
+            "at_epoch": NOW,
+        },
+    ]
 
 
 def test_ephemeral_owned_process_view_reconstructs_declared_module_args_from(

@@ -3066,7 +3066,7 @@ const root = {
 const payloads = {
   lastState: { roots: [root], _fetchedAt: now },
   attentionData: {
-    count: 4,
+    count: 5,
     items: [
       {
         source: 'escalation',
@@ -3104,6 +3104,11 @@ const payloads = {
           argv: ['C:\\Python\\python.exe', '-m', 'agenttalk', 'wrap', '--for', 'codex-test'],
           cwd: 'D:\\work\\demo-root',
         },
+        restart_request: {
+          request_id: 'rr-progressing',
+          state: 'applied_pending_readiness',
+          pending_progress: true,
+        },
         agent: 'codex-test',
         ts: iso,
         age_seconds: 5,
@@ -3114,11 +3119,36 @@ const payloads = {
         severity: 'high',
         title: 'supervisor process-tree HOLD: beta',
         detail: 'Automatic teardown is HOLD because the tree is invalid.',
-        recommendation: 'no scripted remedy applies in this state.',
+        recommendation: (
+          'The identity-accounting warning fills the bounded recommendation. ' + 'x'.repeat(300)
+        ).slice(0, 300),
         configured_launch_unavailable: 'the agent has no supervisor.json launch entry',
+        restart_request: {
+          request_id: null,
+          state: 'blocked_by_process_tree_hold',
+          pending_progress: false,
+          unavailable: true,
+        },
         agent: 'beta',
         ts: iso,
         age_seconds: 4,
+      },
+      {
+        source: 'supervisor',
+        source_label: 'SUPERVISOR HOLD',
+        severity: 'high',
+        title: 'supervisor process-tree HOLD: gamma',
+        recommendation: (
+          'A restart request is blocked by this refusal and is not pending progress.'
+        ),
+        restart_request: {
+          request_id: 'rr-blocked',
+          state: 'blocked_by_process_tree_hold',
+          pending_progress: false,
+        },
+        agent: 'gamma',
+        ts: iso,
+        age_seconds: 3,
       },
     ],
   },
@@ -3296,6 +3326,7 @@ const cases = [
       'C:\\\\Python\\\\python.exe',
       'D:\\work\\demo-root',
       'Configured detached launch unavailable: the agent has no supervisor.json launch entry',
+      'A restart request is blocked by this refusal and is not pending progress.',
     ],
   },
   { view: 'lead-chat', expected: ['Lead chat', 'Direct channel', 'route received'] },
@@ -3353,6 +3384,11 @@ for (const tc of cases) {
     `${tc.view} title missing view: ${document.title}`);
   for (const expected of tc.expected) {
     assert(text.includes(expected), `${tc.view} missing expected text: ${expected}\nrendered: ${text}`);
+  }
+  if (tc.view === 'attention') {
+    const restartLines = main.querySelectorAll('.tc-attn-restart');
+    assert(restartLines.length === 1,
+      `attention: expected exactly one blocked restart line, got ${restartLines.length}`);
   }
   if (tc.view === 'overview') {
     // v0.75.1: the runtime-identity line renders ONLY for agents with a model.
@@ -5096,9 +5132,10 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
     ]
     (s.dir / "supervisor.json").write_text(
         json.dumps({
-            "agents": {
-                "alpha": {
-                    "cwd": str(tmp_path / "alpha cwd"),
+                "agents": {
+                    "alpha": {
+                        "wrapped": True,
+                        "cwd": str(tmp_path / "alpha cwd"),
                     "launch": {
                         "windows_file": r"C:\Python\python.exe",
                         "windows_args": launch_args,

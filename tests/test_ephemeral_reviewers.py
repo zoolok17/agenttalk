@@ -609,17 +609,40 @@ def test_prepare_inactive_lane_worktree_archives_denied_after_claim(tmp_path: Pa
 def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path) -> None:
     s = _store(tmp_path)
     agent = "adversary-lr-cli-archive"
-    marker = _marker("lr-cli-archive", state=eph.STATE_REQUESTED, agent=agent)
-    s.write_launch_request(marker)
     s.add_agent(agent, role="reviewer", groups=["ephemeral-reviewers"])
+    review_request = s.send(
+        sender="lead",
+        recipient=agent,
+        kind="review-request",
+        body="review",
+        meta={
+            "request_id": "lr-cli-archive",
+            "ephemeral_request_id": "lr-cli-archive",
+            "evidence_only": "true",
+            "counted_signoff": "false",
+        },
+    )
+    marker = _marker(
+        "lr-cli-archive",
+        state=eph.STATE_REQUESTED,
+        agent=agent,
+        review_request_msg_id=review_request.id,
+    )
+    s.write_launch_request(marker)
     state_path = tmp_path / "supervisor-state.json"
     state_path.write_text(json.dumps({
         "ephemeral_reviewers": {
+            "launch_history": [{
+                "request_id": "lr-cli-archive",
+                "agent": agent,
+                "at_epoch": NOW,
+            }],
             "active": {
                 "lr-cli-archive": {
                     "request_id": "lr-cli-archive",
                     "agent": agent,
                     "requested_by": "lead",
+                    "review_request_id": review_request.id,
                     "phase": eph.STATE_LAUNCHED,
                 }
             }
@@ -680,6 +703,7 @@ def test_archive_failure_retains_ephemeral_active_state(
             request_id,
             terminal_state=eph.STATE_FAILED,
             reason="archive write failed",
+            retire=False,
         )
 
     assert request_id in state["ephemeral_reviewers"]["active"]
@@ -692,6 +716,8 @@ def test_retired_name_is_not_reused(tmp_path: Path) -> None:
     name = eph.choose_agent_name("lr-repeat", s.load_config()["agents"], s.retired_agents())
     assert name != "adversary-lr-repeat"
     assert name.startswith("adversary-lr-repeat-")
+    assert eph.agent_name_matches_request("lr-repeat", name)
+    assert not eph.agent_name_matches_request("lr-other", name)
 
 
 def test_launched_exit_without_fresh_tree_holds_without_restart_or_archive() -> None:
@@ -1020,8 +1046,22 @@ def _write_attended_ephemeral_hold_fixture(
         state=eph.STATE_LAUNCHED,
         agent=agent,
     )
-    store.write_launch_request(marker)
     store.add_agent(agent, role="reviewer", groups=["ephemeral-reviewers"])
+    review_request = store.send(
+        sender="lead",
+        recipient=agent,
+        kind="review-request",
+        subject=f"ephemeral review {request_id}",
+        body="review the change adversarially",
+        meta={
+            "request_id": request_id,
+            "ephemeral_request_id": request_id,
+            "evidence_only": "true",
+            "counted_signoff": "false",
+        },
+    )
+    marker["review_request_msg_id"] = review_request.id
+    store.write_launch_request(marker)
     held_terminal = {
         "terminal_state": eph.STATE_TIMED_OUT,
         "reason": (
@@ -1038,6 +1078,7 @@ def _write_attended_ephemeral_hold_fixture(
         "request_id": request_id,
         "agent": agent,
         "requested_by": "lead",
+        "review_request_id": review_request.id,
         "phase": eph.STATE_LAUNCHED,
         "launcher_pid": 10,
         "launcher_start": wrapper_start,
@@ -1076,6 +1117,11 @@ def _write_attended_ephemeral_hold_fixture(
     state = {
         "ephemeral_reviewers": {
             "active": {request_id: entry},
+            "launch_history": [{
+                "request_id": request_id,
+                "agent": agent,
+                "at_epoch": NOW,
+            }],
         },
     }
     sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
@@ -1090,6 +1136,225 @@ def _write_attended_ephemeral_hold_fixture(
     writer.idle()
     item = att.process_tree_hold_items(state)[0]
     return request_id, agent, item["source_hash"]
+
+
+def _write_misbound_agent_ephemeral_hold_fixture(
+    store: Store,
+    *,
+    request_id: str = "lr-misbound",
+    agent: str = "dev",
+    evidence_request_id: str | None = None,
+    allocation_request_id: str | None = None,
+    write_review_request: bool = True,
+) -> tuple[str, dict, bytes]:
+    if agent not in store.load_config()["agents"]:
+        store.add_agent(agent, role="reviewer", groups=["ephemeral-reviewers"])
+    evidence_request_id = evidence_request_id or request_id
+    allocation_request_id = allocation_request_id or request_id
+    review_request_id = "20260101-000000-000000-Ab12"
+    if write_review_request:
+        review_request_id = store.send(
+            sender="lead",
+            recipient=agent,
+            kind="review-request",
+            subject=f"ephemeral review {request_id}",
+            body="review the change adversarially",
+            meta={
+                "request_id": evidence_request_id,
+                "ephemeral_request_id": evidence_request_id,
+                "evidence_only": "true",
+                "counted_signoff": "false",
+            },
+        ).id
+    marker = _marker(
+        request_id,
+        state=eph.STATE_LAUNCHED,
+        agent=agent,
+        review_request_msg_id=review_request_id,
+    )
+    store.write_launch_request(marker)
+    held_terminal = {
+        "terminal_state": eph.STATE_TIMED_OUT,
+        "reason": "ephemeral reviewer timed out without a result",
+        "completion": {
+            "status": eph.COMPLETION_NONE,
+            "terminal": False,
+            "hold": True,
+        },
+    }
+    state = {
+        "ephemeral_reviewers": {
+            "launch_history": [{
+                "request_id": allocation_request_id,
+                "agent": agent,
+                "at_epoch": NOW,
+            }],
+            "active": {
+                request_id: {
+                    "request_id": request_id,
+                    "agent": agent,
+                    "requested_by": "lead",
+                    "review_request_id": review_request_id,
+                    "phase": eph.STATE_LAUNCHED,
+                    "process_tree_hold_reason": "process_tree_truncated",
+                    "held_terminal": held_terminal,
+                },
+            },
+        },
+    }
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+    marker_bytes = (
+        store.launch_requests_dir / f"{request_id}.json"
+    ).read_bytes()
+    return request_id, state, marker_bytes
+
+
+def test_normal_agent_misbound_to_ephemeral_hold_has_no_archive_remedy(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, state, _marker_bytes = _write_misbound_agent_ephemeral_hold_fixture(
+        store
+    )
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+
+    assert "operator_argv" not in item
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+
+
+def test_finish_ephemeral_archive_refuses_normal_agent_before_effects(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, state, marker_bytes = _write_misbound_agent_ephemeral_hold_fixture(
+        store
+    )
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    marker = store.read_launch_request(request_id)
+    assert marker is not None
+    source_hash = att.process_tree_hold_items(state)[0]["source_hash"]
+    sup.stage_attended_ephemeral_archive(
+        state,
+        request_id,
+        agent="dev",
+        launch_marker=marker,
+        held_terminal=entry["held_terminal"],
+        hold_source_hash=source_hash,
+        acknowledged_by="lead",
+        verification_mode="operator_attested",
+        verified_launch_nonce=None,
+        verified_identity_count=0,
+        reason="operator verified the terminal request can be archived",
+        now_epoch=NOW,
+    )
+
+    with pytest.raises(eph.EphemeralError, match="ephemeral identity does not match"):
+        sup.finish_attended_ephemeral_archive(store, state, request_id)
+
+    assert (store.launch_requests_dir / f"{request_id}.json").read_bytes() == marker_bytes
+    assert not (store.launch_requests_archive_dir / f"{request_id}.json").exists()
+    assert "dev" in store.load_config()["agents"]
+    assert "dev" not in store.retired_agents()
+
+
+def test_terminal_ephemeral_archive_refuses_normal_agent_before_effects(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, state, marker_bytes = _write_misbound_agent_ephemeral_hold_fixture(
+        store
+    )
+
+    with pytest.raises(eph.EphemeralError, match="ephemeral identity does not match"):
+        sup.archive_ephemeral_request(
+            store,
+            state,
+            request_id,
+            terminal_state=eph.STATE_TIMED_OUT,
+            reason="timed out",
+            now_epoch=NOW,
+        )
+
+    assert (store.launch_requests_dir / f"{request_id}.json").read_bytes() == marker_bytes
+    assert not (store.launch_requests_archive_dir / f"{request_id}.json").exists()
+    assert "dev" in store.load_config()["agents"]
+    assert "dev" not in store.retired_agents()
+
+
+def test_ephemeral_archive_requires_exact_durable_request_binding(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    prefix = "a" * 48
+    original_request = f"{prefix}x"
+    copied_request = f"{prefix}y"
+    agent = eph.choose_agent_name(
+        original_request,
+        store.load_config()["agents"],
+        store.retired_agents(),
+    )
+    request_id, state, marker_bytes = _write_misbound_agent_ephemeral_hold_fixture(
+        store,
+        request_id=copied_request,
+        agent=agent,
+        allocation_request_id=original_request,
+    )
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    assert eph.agent_name_matches_request(original_request, agent)
+    assert eph.agent_name_matches_request(copied_request, agent)
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+    assert "operator_argv" not in item
+    with pytest.raises(eph.EphemeralError, match="ephemeral identity does not match"):
+        sup.archive_ephemeral_request(
+            store,
+            state,
+            request_id,
+            terminal_state=eph.STATE_TIMED_OUT,
+            reason="timed out",
+            now_epoch=NOW,
+        )
+
+    assert (store.launch_requests_dir / f"{request_id}.json").read_bytes() == marker_bytes
+    assert agent in store.load_config()["agents"]
+    assert agent not in store.retired_agents()
+
+
+def test_ephemeral_archive_requires_validated_review_request_evidence(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id = "lr-missing-evidence"
+    agent = eph.choose_agent_name(
+        request_id,
+        store.load_config()["agents"],
+        store.retired_agents(),
+    )
+    request_id, state, marker_bytes = _write_misbound_agent_ephemeral_hold_fixture(
+        store,
+        request_id=request_id,
+        agent=agent,
+        write_review_request=False,
+    )
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+    assert "operator_argv" not in item
+    with pytest.raises(eph.EphemeralError, match="ephemeral identity does not match"):
+        sup.archive_ephemeral_request(
+            store,
+            state,
+            request_id,
+            terminal_state=eph.STATE_TIMED_OUT,
+            reason="timed out",
+            now_epoch=NOW,
+        )
+
+    assert (store.launch_requests_dir / f"{request_id}.json").read_bytes() == marker_bytes
+    assert agent in store.load_config()["agents"]
+    assert agent not in store.retired_agents()
 
 
 def _current_ephemeral_reset_item(

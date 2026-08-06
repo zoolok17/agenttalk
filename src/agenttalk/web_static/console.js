@@ -1876,6 +1876,18 @@
     if (item.recommendation && !(actionSession.enabled && item.answerable)) {
       body.appendChild(el('div', 'tc-attn-detail', item.recommendation));
     }
+    var restartRequest = item.restart_request;
+    if (restartRequest && typeof restartRequest === 'object'
+        && restartRequest.state === 'blocked_by_process_tree_hold'
+        && restartRequest.pending_progress === false) {
+      var blockedRestartText =
+        'A restart request is blocked by this refusal and is not pending progress.';
+      if (typeof item.recommendation !== 'string'
+          || !item.recommendation.includes(blockedRestartText)) {
+        body.appendChild(el(
+          'div', 'tc-attn-detail tc-attn-restart', blockedRestartText));
+      }
+    }
     if (item.configured_launch && Array.isArray(item.configured_launch.argv)) {
       body.appendChild(el('div', 'tc-attn-detail', 'Configured detached launch'));
       var launchArgv = el(

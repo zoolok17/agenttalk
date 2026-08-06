@@ -399,17 +399,39 @@ def capacity_errors(state: dict, supervisor_config: dict | None, now_epoch: floa
     return errors
 
 
-def choose_agent_name(request_id: str, active_names: list[str], retired_names: list[str]) -> str:
+def _agent_name_base(request_id: str) -> str:
     seed = re.sub(r"[^A-Za-z0-9_.-]", "-", request_id)
     seed = seed[:48].strip(".-") or uuid.uuid4().hex[:12]
-    base = f"adversary-{seed}"
+    return f"adversary-{seed}"
+
+
+def _agent_name_candidate(base: str, ordinal: int) -> str:
+    if ordinal == 1:
+        return base[:64]
+    suffix = f"-{ordinal}"
+    return base[:64 - len(suffix)] + suffix
+
+
+def agent_name_matches_request(request_id: object, agent: object) -> bool:
+    """Whether an agent is one this request's allocator could have minted."""
+    if (
+        not isinstance(request_id, str)
+        or not is_safe_id(request_id)
+        or not isinstance(agent, str)
+    ):
+        return False
+    base = _agent_name_base(request_id)
+    return any(
+        agent == _agent_name_candidate(base, ordinal)
+        for ordinal in range(1, 1000)
+    )
+
+
+def choose_agent_name(request_id: str, active_names: list[str], retired_names: list[str]) -> str:
+    base = _agent_name_base(request_id)
     seen = {x.casefold() for x in [*active_names, *retired_names]}
-    name = base[:64]
-    if name.casefold() not in seen and _SAFE_AGENT_RE.match(name):
-        return name
-    for i in range(2, 1000):
-        suffix = f"-{i}"
-        name = (base[:64 - len(suffix)] + suffix)
+    for ordinal in range(1, 1000):
+        name = _agent_name_candidate(base, ordinal)
         if name.casefold() not in seen and _SAFE_AGENT_RE.match(name):
             return name
     raise EphemeralError("could not allocate a unique adversary identity")
@@ -600,11 +622,15 @@ def record_prepared(state: dict, *, request_id: str, agent: str, requested_by: s
         "review_request_id": review_request_id,
         "auto_restart": False,
     }
+    active_request_ids = set(root["active"])
     hist = [
         item for item in root["launch_history"]
         if isinstance(item, dict)
         and isinstance(item.get("at_epoch"), (int, float))
-        and now_epoch - float(item["at_epoch"]) <= 86400
+        and (
+            item.get("request_id") in active_request_ids
+            or now_epoch - float(item["at_epoch"]) <= 86400
+        )
     ]
     hist.append({"request_id": request_id, "agent": agent, "at_epoch": now_epoch})
     root["launch_history"] = hist

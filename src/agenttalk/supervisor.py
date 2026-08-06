@@ -36,7 +36,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk import ephemeral as eph
@@ -4217,7 +4217,7 @@ def _ensure_agenttalk_wrap_root_arg(
     argv: list[str],
     module_args_from: object,
     root: str,
-) -> list[str]:
+) -> list[str] | None:
     """Python mirror of generated ``Ensure-AgenttalkWrapRootArg``.
 
     A legacy configured wrapper may rely on ``AGENTTALK_ROOT`` and omit the
@@ -4229,7 +4229,8 @@ def _ensure_agenttalk_wrap_root_arg(
         return args
     flag_index = _resolve_module_flag_index(args, module_args_from)
     scan = flag_index + 2 if flag_index >= 0 else 0
-    root_present = False
+    root_value_index = -1
+    root_inline = False
     wrap_index = -1
     index = scan
     while index < len(args):
@@ -4237,20 +4238,146 @@ def _ensure_agenttalk_wrap_root_arg(
         if argument == "--":
             break
         if argument == "--root":
-            root_present = True
+            if root_value_index >= 0 or index + 1 >= len(args):
+                return None
+            value = args[index + 1]
+            if not value or value.startswith("-"):
+                return None
+            root_value_index = index + 1
             index += 2
             continue
         if argument.startswith("--root="):
-            root_present = True
+            if root_value_index >= 0:
+                return None
+            value = argument.partition("=")[2]
+            if not value or value.startswith("-"):
+                return None
+            root_value_index = index
+            root_inline = True
+            index += 1
+            continue
+        if argument == "--supervisor-launch-nonce":
+            index += 2
+            continue
+        if argument.startswith("--supervisor-launch-nonce="):
             index += 1
             continue
         if argument == "wrap":
             wrap_index = index
             break
         index += 1
-    if root_present or wrap_index < 0:
+    if wrap_index < 0:
+        return args
+    if root_value_index >= 0:
+        args[root_value_index] = (
+            f"--root={root}" if root_inline else root
+        )
         return args
     return [*args[:wrap_index], "--root", root, *args[wrap_index:]]
+
+
+_WRAP_VALUE_OPTIONS = frozenset({
+    "--for",
+    "--cli",
+    "--from",
+    "--lane-id",
+    "--min-interval",
+    "--model",
+    "--effort",
+    "--to-request",
+    "--dead-letter-max-attempts",
+    "--dead-letter-escalate-after",
+})
+
+
+def _configured_wrap_binding(
+    executable: object,
+    args: Sequence[object],
+    module_args_from: object = None,
+) -> tuple[bool, str | None]:
+    """Return whether argv dispatches to wrap and its closed agent binding."""
+    if (
+        not isinstance(executable, str)
+        or not all(isinstance(value, str) for value in args)
+    ):
+        return False, None
+    tokens = list(args)
+    executable_stem = _token_stem(executable)
+    if executable_stem in {"python", "python3", "py"}:
+        flag_index = _resolve_module_flag_index(tokens, module_args_from)
+        if flag_index < 0:
+            return False, None
+        index = flag_index + 2
+    elif executable.replace("\\", "/").rsplit("/", 1)[-1].casefold() in {
+        "agenttalk",
+        "agenttalk.exe",
+        "agenttalk.cmd",
+        "agenttalk.bat",
+    }:
+        index = 0
+    else:
+        return False, None
+    root_seen = False
+    while index < len(tokens):
+        argument = tokens[index]
+        if argument in {"--root", "--supervisor-launch-nonce"}:
+            if index + 1 >= len(tokens):
+                return False, None
+            option_value = tokens[index + 1]
+            if not option_value or option_value.startswith("-"):
+                return False, None
+            if argument == "--root":
+                if root_seen:
+                    return False, None
+                root_seen = True
+            index += 2
+            continue
+        if argument.startswith(("--root=", "--supervisor-launch-nonce=")):
+            option_value = argument.partition("=")[2]
+            if not option_value or option_value.startswith("-"):
+                return False, None
+            if argument.startswith("--root="):
+                if root_seen:
+                    return False, None
+                root_seen = True
+            index += 1
+            continue
+        if argument != "wrap":
+            return False, None
+        index += 1
+        break
+    else:
+        return False, None
+    targets: list[str] = []
+    tail_found = False
+    tail_has_command = False
+    while index < len(tokens):
+        argument = tokens[index]
+        if argument == "--":
+            tail_found = True
+            tail_has_command = index + 1 < len(tokens) and bool(tokens[index + 1])
+            break
+        if argument in _WRAP_VALUE_OPTIONS:
+            if index + 1 >= len(tokens):
+                return True, None
+            option_value = tokens[index + 1]
+            if not option_value or option_value.startswith("-"):
+                return True, None
+            if argument == "--for":
+                targets.append(option_value)
+            index += 2
+            continue
+        if argument.startswith("--for="):
+            targets.append(argument.removeprefix("--for="))
+        elif not argument.startswith("-"):
+            return True, None
+        index += 1
+    if not tail_found or not tail_has_command or len(targets) != 1:
+        return True, None
+    try:
+        return True, validate_agent_name(targets[0])
+    except (TypeError, ValueError):
+        return True, None
 
 
 def configured_detached_launch(
@@ -4329,11 +4456,24 @@ def configured_detached_launch(
         argument = argument.replace("<cwd>", cwd_token)
         args.append(argument)
     if root_text is not None:
-        args = _ensure_agenttalk_wrap_root_arg(
+        normalized_args = _ensure_agenttalk_wrap_root_arg(
             args,
             launch.get("module_args_from"),
             root_text,
         )
+        if normalized_args is None:
+            return None, "the configured launch root arguments are invalid"
+        args = normalized_args
+    dispatches_wrap, wrapped_agent = _configured_wrap_binding(
+        executable,
+        args,
+        launch.get("module_args_from"),
+    )
+    if (
+        bool(row.get("wrapped", False)) != dispatches_wrap
+        or (dispatches_wrap and wrapped_agent != agent)
+    ):
+        return None, "the configured wrapped launch is not bound to this agent"
     rendered = subprocess.list2cmdline([executable, *args])
     rendered_utf16_units = len(rendered.encode("utf-16-le")) // 2 + 1
     if rendered_utf16_units > max_command_line:
@@ -7093,6 +7233,26 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                             agent=name,
                         )
 
+            dispatches_wrap = False
+            arg_for = None
+            if isinstance(windows_args, list):
+                dispatches_wrap, arg_for = _configured_wrap_binding(
+                    windows_file,
+                    windows_args,
+                    launch.get("module_args_from"),
+                )
+            if (
+                bool(wrapped) != dispatches_wrap
+                or (dispatches_wrap and arg_for != name)
+            ):
+                _bootstrap_add(
+                    checks, "supervisor_wrapped_for_mismatch", "error",
+                    "wrapped declaration and argv are not bound to the supervisor agent name",
+                    agent=name,
+                    facts={"wrapped_for": arg_for},
+                    suggestion=f"set wrapped=true and --for {name} on an agenttalk wrap argv",
+                )
+
             if wrapped and isinstance(windows_args, list):
                 if "wrap" not in windows_args:
                     _bootstrap_add(
@@ -7118,15 +7278,6 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                         checks, "supervisor_wrapped_missing_cli_tail", "error",
                         "wrapped launch is missing the -- separator and real CLI tail",
                         agent=name,
-                    )
-                arg_for = _bootstrap_arg_value(windows_args, "--for")
-                if arg_for != name:
-                    _bootstrap_add(
-                        checks, "supervisor_wrapped_for_mismatch", "error",
-                        "wrapped --for does not match the supervisor agent name",
-                        agent=name,
-                        facts={"wrapped_for": arg_for},
-                        suggestion=f"set --for {name}",
                     )
                 arg_cli = _bootstrap_arg_value(windows_args, "--cli")
                 if isinstance(cli_name, str) and arg_cli != cli_name:
@@ -8953,8 +9104,16 @@ def evaluate_process_tree_reset_admissions(
                 # cards, and this request's command would reject the same state.
                 continue
             if pending is not None:
+                launch_marker = pending["archive_payload"]["original"]
                 if (
-                    _active_ephemeral_hold_matches_archive(
+                    _ephemeral_request_identity_matches(
+                        store,
+                        state,
+                        entry,
+                        launch_marker,
+                        request_id,
+                    )
+                    and _active_ephemeral_hold_matches_archive(
                         entry,
                         pending,
                         request_id,
@@ -8994,6 +9153,13 @@ def evaluate_process_tree_reset_admissions(
                 and launch_marker.get("request_id") == request_id
                 and launch_marker.get("agent") == agent
                 and launch_marker.get("state") in eph.ACTIVE_STATES
+                and _ephemeral_request_identity_matches(
+                    store,
+                    state,
+                    entry,
+                    launch_marker,
+                    request_id,
+                )
                 and archive_destination_admitted(request_id, None)
             ):
                 continue
@@ -9679,6 +9845,69 @@ def _active_ephemeral_hold_matches_archive(
     )
 
 
+def _ephemeral_request_identity_matches(
+    store: Store,
+    state: dict,
+    entry: object,
+    marker: object,
+    request_id: str,
+) -> bool:
+    """Whether durable request evidence binds one temporary identity exactly."""
+    if not isinstance(entry, dict) or not isinstance(marker, dict):
+        return False
+    root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    history = root.get("launch_history") if isinstance(root, dict) else None
+    agent = entry.get("agent")
+    requested_by = entry.get("requested_by")
+    review_request_id = entry.get("review_request_id")
+    if not (
+        entry.get("request_id") == request_id
+        and marker.get("request_id") == request_id
+        and marker.get("agent") == agent
+        and marker.get("requested_by") == requested_by
+        and marker.get("review_request_msg_id") == review_request_id
+        and isinstance(requested_by, str)
+        and isinstance(review_request_id, str)
+        and eph.agent_name_matches_request(request_id, agent)
+        and marker.get("state") in eph.ACTIVE_STATES
+        and not eph.validate_marker(marker)
+        and isinstance(history, list)
+    ):
+        return False
+    allocation_rows = [
+        row
+        for row in history
+        if isinstance(row, dict) and row.get("agent") == agent
+    ]
+    if not (
+        allocation_rows
+        and all(row.get("request_id") == request_id for row in allocation_rows)
+        and any(
+            isinstance(row.get("at_epoch"), (int, float))
+            and not isinstance(row.get("at_epoch"), bool)
+            and math.isfinite(float(row["at_epoch"]))
+            and float(row["at_epoch"]) >= 0
+            for row in allocation_rows
+        )
+    ):
+        return False
+    try:
+        messages = store.valid_messages()
+    except (OSError, TypeError, ValueError):
+        return False
+    return any(
+        message.id == review_request_id
+        and message.kind == "review-request"
+        and message.sender == requested_by
+        and message.recipient == agent
+        and message.meta.get("request_id") == request_id
+        and message.meta.get("ephemeral_request_id") == request_id
+        and message.meta.get("evidence_only") == "true"
+        and message.meta.get("counted_signoff") == "false"
+        for message in messages
+    )
+
+
 def attended_ephemeral_archive_pending(
     state: dict,
     request_id: str,
@@ -9798,6 +10027,16 @@ def finish_attended_ephemeral_archive(
         raise ValueError(
             "active ephemeral HOLD changed after its attended archive was staged"
         )
+    if not _ephemeral_request_identity_matches(
+        store,
+        state,
+        entry,
+        record["archive_payload"]["original"],
+        request_id,
+    ):
+        raise eph.EphemeralError(
+            "ephemeral identity does not match the request"
+        )
     if not store.complete_launch_request_archive(
         request_id,
         record["archive_payload"],
@@ -9853,6 +10092,16 @@ def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,
     agent = entry.get("agent") or (marker or {}).get("agent")
     retire_error = None
     if retire and isinstance(agent, str):
+        if not _ephemeral_request_identity_matches(
+            store,
+            state,
+            entry,
+            marker,
+            request_id,
+        ):
+            raise eph.EphemeralError(
+                "ephemeral identity does not match the request"
+            )
         try:
             cfg = store.load_config()
             if agent in (cfg.get("agents") or []):
@@ -10900,7 +11149,8 @@ function Ensure-AgenttalkWrapRootArg($argv, $moduleArgsFrom = $null) {
   $scan = 0
   $flagIndex = Resolve-AgenttalkModuleFlagIndex $args $moduleArgsFrom
   if ($flagIndex -ge 0) { $scan = $flagIndex + 2 }
-  $rootPresent = $false
+  $rootValueIndex = -1
+  $rootInline = $false
   $wrapIndex = -1
   $i = $scan
   while ($i -lt $args.Count) {
@@ -10911,12 +11161,27 @@ function Ensure-AgenttalkWrapRootArg($argv, $moduleArgsFrom = $null) {
     $arg = [string]$args[$i]
     if ($arg -ceq '--') { break }
     if ($arg -ceq '--root') {
-      $rootPresent = $true
+      if ($rootValueIndex -ge 0 -or ($i + 1) -ge $args.Count) { return $null }
+      $value = [string]$args[$i + 1]
+      if (-not $value -or $value -clike '-*') { return $null }
+      $rootValueIndex = $i + 1
       $i += 2
       continue
     }
     if ($arg -clike '--root=*') {
-      $rootPresent = $true
+      if ($rootValueIndex -ge 0) { return $null }
+      $value = $arg.Substring(7)
+      if (-not $value -or $value -clike '-*') { return $null }
+      $rootValueIndex = $i
+      $rootInline = $true
+      $i += 1
+      continue
+    }
+    if ($arg -ceq '--supervisor-launch-nonce') {
+      $i += 2
+      continue
+    }
+    if ($arg -clike '--supervisor-launch-nonce=*') {
       $i += 1
       continue
     }
@@ -10926,7 +11191,13 @@ function Ensure-AgenttalkWrapRootArg($argv, $moduleArgsFrom = $null) {
     }
     $i += 1
   }
-  if ($rootPresent -or $wrapIndex -lt 0) { return $args }
+  if ($wrapIndex -lt 0) { return $args }
+  if ($rootValueIndex -ge 0) {
+    $out = @($args)
+    if ($rootInline) { $out[$rootValueIndex] = '--root=' + $Root }
+    else { $out[$rootValueIndex] = $Root }
+    return $out
+  }
   $out = @()
   if ($wrapIndex -gt 0) { $out += $args[0..($wrapIndex - 1)] }
   $out += @('--root', $Root)
@@ -11112,11 +11383,11 @@ function Resolve-AgenttalkOwnArgvIndex($file, [object[]]$argTokens, $moduleArgsF
   }
   return 0
 }
-function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFrom = $null) {
-  if (-not $nonceResult.injected) { return $false }
-  $args = @($argv)
-  $index = Resolve-AgenttalkOwnArgvIndex $file $args $moduleArgsFrom
-  if ($index -lt 0) { return $false }
+function Resolve-AgenttalkWrapArgvIndex($file, [object[]]$argTokens, $moduleArgsFrom = $null) {
+  $tokens = @($argTokens)
+  $index = Resolve-AgenttalkOwnArgvIndex $file $tokens $moduleArgsFrom
+  if ($index -lt 0) { return -1 }
+  $rootSeen = $false
   # The CLI has two value-taking global options. The first remaining token is
   # the subcommand; only a literal `wrap` there may receive the cooperative
   # byte-bound log capability.
@@ -11129,21 +11400,82 @@ function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFro
   # granted the logging capability (nonce injection, generation commit) to
   # a launch that CPython's own argparse would refuse - the same class of
   # leak as I2's execution-mode prefix, one call site over.
-  while ($index -lt $args.Count) {
-    $token = [string]$args[$index]
+  while ($index -lt $tokens.Count) {
+    $token = [string]$tokens[$index]
     if ($token -cin @('--root','--supervisor-launch-nonce')) {
-      if (($index + 1) -ge $args.Count) { return $false }
+      if (($index + 1) -ge $tokens.Count) { return -1 }
+      $optionValue = [string]$tokens[$index + 1]
+      if (-not $optionValue -or $optionValue -clike '-*') { return -1 }
+      if ($token -ceq '--root') {
+        if ($rootSeen) { return -1 }
+        $rootSeen = $true
+      }
       $index += 2
       continue
     }
     if ($token -clike '--root=*' -or
         $token -clike '--supervisor-launch-nonce=*') {
+      $optionValue = $token.Substring($token.IndexOf('=') + 1)
+      if (-not $optionValue -or $optionValue -clike '-*') { return -1 }
+      if ($token -clike '--root=*') {
+        if ($rootSeen) { return -1 }
+        $rootSeen = $true
+      }
       $index += 1
       continue
     }
-    return $token -ceq 'wrap'
+    if ($token -ceq 'wrap') { return $index + 1 }
+    return -1
   }
-  return $false
+  return -1
+}
+function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFrom = $null) {
+  if (-not $nonceResult.injected) { return $false }
+  return ((Resolve-AgenttalkWrapArgvIndex $file @($argv) $moduleArgsFrom) -ge 0)
+}
+function Test-AgenttalkWrapDispatch($file, [object[]]$argTokens, $moduleArgsFrom = $null) {
+  return ((Resolve-AgenttalkWrapArgvIndex $file $argTokens $moduleArgsFrom) -ge 0)
+}
+function Test-AgenttalkWrapAgentBinding($file, [object[]]$argTokens, [string]$expectedAgent, $moduleArgsFrom = $null) {
+  $tokens = @($argTokens)
+  $index = Resolve-AgenttalkWrapArgvIndex $file $tokens $moduleArgsFrom
+  if ($index -lt 0) { return $false }
+  $targets = @()
+  $tailFound = $false
+  $tailHasCommand = $false
+  $valueOptions = @(
+    '--for','--cli','--from','--lane-id','--min-interval','--model','--effort',
+    '--to-request','--dead-letter-max-attempts','--dead-letter-escalate-after')
+  while ($index -lt $tokens.Count) {
+    $token = [string]$tokens[$index]
+    if ($token -ceq '--') {
+      $tailFound = $true
+      $tailHasCommand = (($index + 1) -lt $tokens.Count -and [bool]([string]$tokens[$index + 1]))
+      break
+    }
+    if ($token -cin $valueOptions) {
+      if (($index + 1) -ge $tokens.Count) { return $false }
+      $optionValue = [string]$tokens[$index + 1]
+      if (-not $optionValue -or $optionValue -clike '-*') { return $false }
+      if ($token -ceq '--for') {
+        $targets += $optionValue
+      }
+      $index += 2
+      continue
+    }
+    if ($token -clike '--for=*') {
+      $targets += $token.Substring(6)
+    } elseif ($token -cnotlike '-*') {
+      return $false
+    }
+    $index += 1
+  }
+  return (
+    $tailFound -and
+    $tailHasCommand -and
+    $targets.Count -eq 1 -and
+    [string]$targets[0] -ceq $expectedAgent
+  )
 }
 function Preflight($name, $plan, $file, $codexHome, [object[]]$prefixTokens = @()) {
   # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
@@ -12240,7 +12572,23 @@ function Launch($name, $plan, $codexHome) {
     if ($x -ceq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
   }
   $moduleArgsFrom = $a.launch.module_args_from
-  $argv = @(Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom)
+  $normalizedArgv = Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom
+  if ($null -eq $normalizedArgv) {
+    Write-Warning (
+      "supervisor: {0}: CONFIG ERROR - wrapped launch has invalid or duplicate root arguments; NOT launching (fail closed)" -f
+      $name)
+    return $null
+  }
+  $argv = @($normalizedArgv)
+  $dispatchesWrap = Test-AgenttalkWrapDispatch $file $argv $moduleArgsFrom
+  if (([bool]$a.wrapped -ne $dispatchesWrap) -or
+      ($dispatchesWrap -and -not (
+        Test-AgenttalkWrapAgentBinding $file $argv $name $moduleArgsFrom))) {
+    Write-Warning (
+      "supervisor: {0}: CONFIG ERROR - wrapped launch is not bound to this agent; NOT launching (fail closed)" -f
+      $name)
+    return $null
+  }
   $launchNonce = [guid]::NewGuid().ToString('N')
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
   $argv = @($nonceResult.argv)
@@ -12371,7 +12719,21 @@ function Launch-Spec($name, $spec, $codexHome) {
   $argv = @($spec.launch.windows_args)
   $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
   $moduleArgsFrom = $spec.launch.module_args_from
-  $argv = @(Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom)
+  $normalizedArgv = Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom
+  if ($null -eq $normalizedArgv) {
+    Write-Warning (
+      "supervisor: ephemeral {0}: CONFIG ERROR - wrapped launch has invalid or duplicate root arguments; NOT launching (fail closed)" -f
+      $name)
+    return $null
+  }
+  $argv = @($normalizedArgv)
+  if (-not (
+      Test-AgenttalkWrapAgentBinding $file $argv $name $moduleArgsFrom)) {
+    Write-Warning (
+      "supervisor: ephemeral {0}: CONFIG ERROR - wrapped launch is not bound to this agent; NOT launching (fail closed)" -f
+      $name)
+    return $null
+  }
   $launchNonce = [guid]::NewGuid().ToString('N')
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
   $argv = @($nonceResult.argv)

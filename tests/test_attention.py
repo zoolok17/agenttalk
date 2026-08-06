@@ -694,6 +694,7 @@ def test_process_tree_refusal_is_operator_visible_with_working_manual_launch(
     config = {
         "agents": {
             "worker": {
+                "wrapped": True,
                 "cwd": r"D:\work\fleet\worker space",
                 "launch": {
                     "windows_file": r"C:\Python\python.exe",
@@ -748,6 +749,296 @@ def test_process_tree_refusal_is_operator_visible_with_working_manual_launch(
     }
 
 
+@pytest.mark.parametrize(
+    ("wrapped", "windows_args"),
+    [
+        (
+            True,
+            [
+                "-m", "agenttalk", "--root", "{ROOT}", "wrap",
+                "--for", "other-agent", "--loop", "--", "codex.exe",
+            ],
+        ),
+        (
+            True,
+            [
+                "-m", "agenttalk", "--root", "{ROOT}", "wrap",
+                "--for", "worker", "--for", "other-agent", "--loop", "--",
+                "codex.exe",
+            ],
+        ),
+        (
+            "true",
+            [
+                "-m", "agenttalk", "--root", "{ROOT}", "wrap",
+                "--for", "other-agent", "--loop", "--", "codex.exe",
+            ],
+        ),
+        (
+            True,
+            [
+                "-m", "agenttalk", "wait", "wrap", "--for", "worker",
+                "--loop", "--", "codex.exe",
+            ],
+        ),
+        (
+            True,
+            [
+                "-m", "agenttalk", "wrap", "codex.exe", "--for", "worker",
+            ],
+        ),
+        (
+            False,
+            [
+                "-m", "agenttalk", "wrap", "--for", "other-agent",
+                "--loop", "--", "codex.exe",
+            ],
+        ),
+        (
+            True,
+            [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--",
+            ],
+        ),
+        (
+            True,
+            [
+                "-m", "agenttalk", "wrap", "codex.exe", "--for", "worker",
+                "--", "codex.exe",
+            ],
+        ),
+        (
+            True,
+            [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--model",
+                "--loop", "--", "codex.exe",
+            ],
+        ),
+        (
+            True,
+            [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--model",
+                "--", "--", "codex.exe",
+            ],
+        ),
+        (
+            True,
+            [
+                "-m", "agenttalk", "--root", "--", "wrap", "--for",
+                "worker", "--", "codex.exe",
+            ],
+        ),
+        (
+            True,
+            [
+                "-m", "agenttalk", "--supervisor-launch-nonce", "--help",
+                "wrap", "--for", "worker", "--", "codex.exe",
+            ],
+        ),
+    ],
+    ids=[
+        "different-agent",
+        "duplicate-last-wins",
+        "truthy-wrapped",
+        "wrap-token-is-not-subcommand",
+        "for-is-in-remainder-without-tail-delimiter",
+        "wrapped-declaration-disagrees-with-argv",
+        "empty-cli-tail",
+        "positional-starts-remainder-before-delimiter",
+        "value-option-cannot-consume-another-option",
+        "value-option-cannot-consume-tail-delimiter",
+        "root-cannot-consume-tail-delimiter",
+        "nonce-cannot-consume-another-option",
+    ],
+)
+def test_configured_wrapped_launch_rejects_cross_agent_binding(
+    wrapped: object,
+    windows_args: list[str],
+) -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )
+
+    item = att.process_tree_hold_items(
+        state,
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "wrapped": wrapped,
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": windows_args,
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    expected_unavailable = (
+        "root arguments are invalid"
+        if windows_args[:4] == ["-m", "agenttalk", "--root", "--"]
+        else "not bound to this agent"
+    )
+    assert expected_unavailable in item["configured_launch_unavailable"]
+    assert "run the configured argv below" not in item["recommendation"]
+
+
+@pytest.mark.parametrize(
+    ("windows_file", "windows_args"),
+    [
+        (
+            "python.exe",
+            ["wrap", "--for", "worker", "--loop", "--", "codex.exe"],
+        ),
+        (
+            "codex.exe",
+            ["wrap", "--for", "worker", "--loop", "--", "codex.exe"],
+        ),
+        (
+            "agenttalk.py",
+            ["wrap", "--for", "worker", "--loop", "--", "codex.exe"],
+        ),
+    ],
+    ids=[
+        "python-without-module-entrypoint",
+        "non-agenttalk-executable",
+        "unsupported-agenttalk-extension",
+    ],
+)
+def test_configured_wrapped_launch_requires_agenttalk_entrypoint(
+    windows_file: str,
+    windows_args: list[str],
+) -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "wrapped": True,
+                    "launch": {
+                        "windows_file": windows_file,
+                        "windows_args": windows_args,
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "not bound to this agent" in item["configured_launch_unavailable"]
+
+
+@pytest.mark.parametrize(
+    "windows_file",
+    ["agenttalk", "agenttalk.exe", "agenttalk.cmd", "agenttalk.bat"],
+)
+def test_configured_wrapped_launch_accepts_supported_direct_entrypoint(
+    windows_file: str,
+) -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "wrapped": True,
+                    "launch": {
+                        "windows_file": windows_file,
+                        "windows_args": [
+                            "wrap", "--for", "worker", "--loop", "--",
+                            "codex.exe",
+                        ],
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert item["configured_launch"]["argv"][0] == windows_file
+
+
+@pytest.mark.parametrize(
+    "root_arguments",
+    [
+        ["--root", r"D:\other"],
+        [r"--root=D:\other"],
+    ],
+    ids=["separate", "equals"],
+)
+def test_configured_wrapped_launch_pins_existing_root(
+    root_arguments: list[str],
+) -> None:
+    projected_root = r"D:\fleet"
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "wrapped": True,
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": [
+                            "-m", "agenttalk", *root_arguments, "wrap",
+                            "--for", "worker", "--loop", "--", "codex.exe",
+                        ],
+                    },
+                },
+            },
+        },
+        root=projected_root,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    argv = item["configured_launch"]["argv"]
+    assert any(projected_root in argument for argument in argv)
+    assert not any(r"D:\other" in argument for argument in argv)
+
+
+def test_configured_wrapped_launch_rejects_duplicate_roots() -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "wrapped": True,
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": [
+                            "-m", "agenttalk", "--root", r"D:\one",
+                            r"--root=D:\two", "wrap", "--for", "worker",
+                            "--", "codex.exe",
+                        ],
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "root arguments are invalid" in item["configured_launch_unavailable"]
+
+
 def test_process_tree_hold_hash_resurfaces_for_new_restart_and_launch() -> None:
     state = _process_tree_state(
         status="invalid",
@@ -779,10 +1070,12 @@ def test_process_tree_hold_hash_resurfaces_for_new_restart_and_launch() -> None:
     config = {
         "agents": {
             "worker": {
+                "wrapped": True,
                 "launch": {
                     "windows_file": "python.exe",
                     "windows_args": [
                         "-m", "agenttalk", "wrap", "--for", "worker", "--loop",
+                        "--", "codex.exe",
                     ],
                 },
             },
