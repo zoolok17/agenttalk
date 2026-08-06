@@ -336,6 +336,12 @@ class WrapperLogInstallation:
     generation_dir: Path | None = None
     stdout_path: Path | None = None
     stderr_path: Path | None = None
+    # Populated only when enabled is False because allocation itself was
+    # attempted and rejected every candidate (see WrapperLogAllocationFailed).
+    # Stays None for the other disabled cases (unauthenticated supervised
+    # environment, no project/agent to allocate for) where there is no
+    # single failure to name.
+    disabled_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -705,11 +711,32 @@ def _write_restrictive_text(path: Path, text: str) -> None:
         stream.write(text)
 
 
+class WrapperLogAllocationFailed(OSError):
+    """Every candidate wrapper-log root was rejected; carries why each was.
+
+    ``_allocate_wrapper_log_targets`` previously returned ``None`` on total
+    failure, discarding every candidate's own ``OSError`` along the way. That
+    collapsed "could not allocate anywhere, and here is why" into a bare
+    "did not allocate" - the caller (and anyone reading logs afterward) had
+    no way to distinguish a transient permission problem from, say, a path
+    long enough to exceed Windows' legacy MAX_PATH. This carries the reason
+    for every attempt so total failure is diagnosable instead of silent.
+    """
+
+    def __init__(self, attempts: tuple[tuple[Path, str], ...]) -> None:
+        self.attempts = attempts
+        if attempts:
+            detail = "; ".join(f"{root}: {reason}" for root, reason in attempts)
+        else:
+            detail = "no candidate wrapper log root was available"
+        super().__init__(f"no writable wrapper log root ({detail})")
+
+
 def _allocate_wrapper_log_targets(
     project_root: Path,
     agent: str,
     environ: Mapping[str, str],
-) -> _AllocatedWrapperLogTargets | None:
+) -> _AllocatedWrapperLogTargets:
     roots = wrapper_log_root_candidates(project_root, environ=environ)
     agent_leaf = _wrapper_log_agent_leaf(agent)
     _owned, max_sequence, uncertain = _owned_committed_generations(
@@ -718,6 +745,7 @@ def _allocate_wrapper_log_targets(
     )
     sequence = max_sequence + 1
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")[:-3] + "Z"
+    attempts: list[tuple[Path, str]] = []
     for root in roots:
         generation_dir: Path | None = None
         try:
@@ -774,14 +802,15 @@ def _allocate_wrapper_log_targets(
                 agent_leaf=agent_leaf,
                 sequence_uncertain=uncertain,
             )
-        except OSError:
+        except OSError as exc:
+            attempts.append((root, str(exc)))
             if (
                 generation_dir is not None
                 and not _has_reparse_or_symlink_component(generation_dir)
             ):
                 with contextlib.suppress(OSError):
                     shutil.rmtree(generation_dir)
-    return None
+    raise WrapperLogAllocationFailed(tuple(attempts))
 
 
 def _prune_wrapper_log_generations(
@@ -1377,16 +1406,24 @@ def installed_standard_streams_from_environment(
         stdout_mirror = None
         stderr_mirror = None
     elif diagnostic_project is not None and agent:
+        allocation_failure_reason: str | None = None
         try:
             allocated = _allocate_wrapper_log_targets(
                 diagnostic_project,
                 str(agent),
                 env,
             )
-        except (OSError, RuntimeError):
+        except WrapperLogAllocationFailed as exc:
             allocated = None
+            allocation_failure_reason = str(exc)
+        except (OSError, RuntimeError) as exc:
+            allocated = None
+            allocation_failure_reason = str(exc)
         if allocated is None:
-            yield WrapperLogInstallation(False)
+            yield WrapperLogInstallation(
+                False,
+                disabled_reason=allocation_failure_reason,
+            )
             return
         stdout_path = allocated.stdout_path
         stderr_path = allocated.stderr_path

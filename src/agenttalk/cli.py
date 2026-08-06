@@ -10718,6 +10718,17 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         project_root=project_root,
         agent=str(agent),
     ) as log_installation:
+        if not log_installation.enabled and log_installation.disabled_reason:
+            # sys.stderr is still the original, unwrapped stream here - bounded
+            # capture never started, so there is nothing to corrupt by writing
+            # to it directly. Without this, allocation failing for every
+            # candidate root is silently indistinguishable from log capture
+            # never having been attempted at all.
+            print(
+                "agenttalk wrap: bounded log capture disabled: "
+                f"{log_installation.disabled_reason}",
+                file=sys.stderr,
+            )
         lifecycle_log = WrapperLifecycleLog(
             str(agent),
             enabled=log_installation.enabled,

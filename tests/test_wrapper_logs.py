@@ -129,7 +129,10 @@ def test_direct_wrap_launch_owns_bounded_log_capture(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "Plan: I would compute" in result.stdout
     logs = _captured_stderr_logs(tmp_path)
-    assert len(logs) == 1
+    assert len(logs) == 1, (
+        f"expected exactly one stderr.log under {tmp_path}, found {len(logs)}; "
+        f"wrapper stderr was: {result.stderr!r}"
+    )
     generation = logs[0].parent
     assert (generation / ".committed").exists()
     captured = "".join(
@@ -218,7 +221,12 @@ def test_report_names_the_root_that_accepted_the_wrapper_generation(
 
     result = _run_direct_wrapper(project, env)
     assert result.returncode == 0, result.stderr
-    [stderr_log] = _captured_stderr_logs(tmp_path)
+    logs = _captured_stderr_logs(tmp_path)
+    assert len(logs) == 1, (
+        f"expected exactly one stderr.log under {tmp_path}, found {len(logs)}; "
+        f"wrapper stderr was: {result.stderr!r}"
+    )
+    [stderr_log] = logs
     actual_generation = stderr_log.parent.resolve()
     actual_root = actual_generation.parent.parent
     assert actual_root != preferred.resolve()
