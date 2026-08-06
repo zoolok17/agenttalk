@@ -923,9 +923,17 @@ def process_tree_hold_items(
                 "request_id": restart["request_id"],
                 "state": restart["state"],
                 "pending_progress": restart["pending"],
+                **(
+                    {"unavailable": True}
+                    if restart.get("unavailable") is True
+                    else {}
+                ),
             }
             if restart["blocked"]
-            and eph.is_safe_reason(restart["request_id"], max_length=256)
+            and (
+                restart.get("unavailable") is True
+                or eph.is_safe_reason(restart["request_id"], max_length=256)
+            )
             else None
         )
         remedy = admissions.get(identity)

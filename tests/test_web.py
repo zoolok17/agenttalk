@@ -5160,6 +5160,10 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
             }
         },
     )
+    (s.state_dir / "alpha.restart-request").write_text(
+        '{"agent": "alpha"}',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         supervisor_mod,
         "evaluate_process_tree_reset_admissions",
@@ -5217,8 +5221,15 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         "detail": internal["why_it_matters"],
         "recommendation": web._envelope_str(internal["recommendation"]),
         "configured_launch": internal["configured_launch"],
+        "restart_request": internal["restart_request"],
         "age_seconds": 0.0,
         "human_can_unblock_now": True,
+    }
+    assert wire["restart_request"] == {
+        "request_id": None,
+        "state": "blocked_by_process_tree_hold",
+        "pending_progress": False,
+        "unavailable": True,
     }
     assert wire["configured_launch"] == {
         "source": "supervisor.json",

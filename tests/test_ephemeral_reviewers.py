@@ -1244,6 +1244,46 @@ def test_staged_ephemeral_terminal_drift_does_not_name_kill_switch(
     assert ".agenttalk/supervisor.kill" in matching["recommendation"]
 
 
+def test_finish_attended_ephemeral_archive_rejects_drifted_terminal_before_effects(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    _stage_ephemeral_archive_retry(
+        store,
+        state,
+        request_id,
+        agent,
+        source_hash,
+        verification_mode="operator_attested",
+        verified_launch_nonce=None,
+    )
+    _drift_ephemeral_terminal(state, request_id)
+    active_before = json.loads(json.dumps(
+        state["ephemeral_reviewers"]["active"][request_id]
+    ))
+    pending_before = json.loads(json.dumps(
+        state["ephemeral_reviewers"]["attended_archive_pending"][request_id]
+    ))
+
+    with pytest.raises(
+        ValueError,
+        match="active ephemeral HOLD changed after its attended archive was staged",
+    ):
+        sup.finish_attended_ephemeral_archive(store, state, request_id)
+
+    assert state["ephemeral_reviewers"]["active"][request_id] == active_before
+    assert (
+        state["ephemeral_reviewers"]["attended_archive_pending"][request_id]
+        == pending_before
+    )
+    assert store.read_launch_request(request_id) is not None
+    assert not (store.launch_requests_archive_dir / f"{request_id}.json").exists()
+    assert agent in store.load_config()["agents"]
+    assert agent not in store.retired_agents()
+
+
 def test_cli_attended_ephemeral_tree_hold_archives_exact_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

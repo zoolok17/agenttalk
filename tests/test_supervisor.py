@@ -524,6 +524,39 @@ def test_report_reflects_restart_request(tmp_path: Path) -> None:
     assert rr is not None and rr["agent"] == "worker" and rr["request_id"].startswith("rr-")
 
 
+@pytest.mark.parametrize(
+    "marker_payload",
+    [
+        pytest.param(b'{"agent": "worker"}', id="missing-request-id"),
+        pytest.param(
+            b'{"agent": "worker", "request_id": ""}',
+            id="empty-request-id",
+        ),
+        pytest.param(
+            b'{"agent": "worker", "request_id": 7}',
+            id="non-string-request-id",
+        ),
+        pytest.param(
+            b'{"agent": "worker", "request_id": "unsafe id"}',
+            id="unsafe-request-id",
+        ),
+        pytest.param(b'{broken', id="malformed-json"),
+        pytest.param(b'["not", "an", "object"]', id="non-object"),
+        pytest.param(b"\xff", id="invalid-utf8"),
+    ],
+)
+def test_restart_request_reader_marks_existing_unusable_marker(
+    tmp_path: Path,
+    marker_payload: bytes,
+) -> None:
+    store = _team(tmp_path)
+    (store.state_dir / "worker.restart-request").write_bytes(marker_payload)
+
+    assert store.read_restart_request("worker") == {
+        "_agenttalk_restart_request_status": "unusable",
+    }
+
+
 # ----------------------------------------- request-restart + clear command
 
 def test_request_restart_writes_marker(tmp_path: Path) -> None:
@@ -1437,6 +1470,106 @@ def test_current_restart_is_not_completed_by_an_old_request_readiness(
         "request_id": "rr-new",
         "state": "blocked_by_process_tree_hold",
         "pending_progress": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        pytest.param({"agent": "worker"}, id="missing-request-id"),
+        pytest.param(
+            {"agent": "worker", "request_id": ""},
+            id="empty-request-id",
+        ),
+        pytest.param(
+            {"agent": "worker", "request_id": 7},
+            id="non-string-request-id",
+        ),
+    ],
+)
+def test_unusable_current_restart_never_borrows_old_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: dict,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    state["agents"]["worker"].update({
+        "restart_request_state": "readiness_seen",
+        "pending_restart_request_id": "rr-old",
+        "restart_requested_by": "lead",
+    })
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+    (store.state_dir / "worker.restart-request").write_text(
+        json.dumps(marker),
+        encoding="utf-8",
+    )
+    stale_plan = {
+        "action": sup.WARN_ONLY,
+        "state": "PROCESS_TREE_INVALID",
+        "reason": "operator-visible process ownership refusal",
+        "next_state": state["agents"]["worker"],
+    }
+    monkeypatch.setattr(
+        sup,
+        "plan_actions",
+        lambda *_args, **_kwargs: {"agents": {"worker": stale_plan}},
+    )
+
+    observation = sup.build_supervisor_observation(
+        store,
+        now_epoch=NOW,
+        state=state,
+        supervisor_config=_WRAP_CONFIG,
+        snapshot=_wrap_snap(),
+    )
+    assessment = next(
+        row for row in observation["agents"] if row["name"] == "worker"
+    )
+    assert observation["report"]["agents"]["worker"]["restart_request"] == {
+        "unavailable": True,
+    }
+    unusable_marker = store.read_restart_request("worker")
+    attention_item = att.process_tree_hold_items(
+        state,
+        restart_requests={"worker": unusable_marker},
+        reset_admissions={"evaluated": True, "admissions": {}},
+    )[0]
+
+    assert assessment["restart_request"] == {
+        "present": True,
+        "pending": False,
+        "blocked": True,
+        "state": "blocked_by_process_tree_hold",
+        "request_id": None,
+        "unavailable": True,
+        "requested_by": None,
+    }
+    assert attention_item["restart_request"] == {
+        "request_id": None,
+        "state": "blocked_by_process_tree_hold",
+        "pending_progress": False,
+        "unavailable": True,
+    }
+
+
+def test_unusable_restart_request_is_unknown_without_a_hold() -> None:
+    progress = sup.restart_request_progress(
+        {
+            "restart_request_state": "readiness_seen",
+            "pending_restart_request_id": "rr-old",
+        },
+        {"_agenttalk_restart_request_status": "unusable"},
+    )
+
+    assert progress == {
+        "present": True,
+        "pending": False,
+        "blocked": False,
+        "state": "unknown",
+        "request_id": None,
+        "unavailable": True,
     }
 
 

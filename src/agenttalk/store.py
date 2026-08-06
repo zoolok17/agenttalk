@@ -52,6 +52,22 @@ logger = logging.getLogger(__name__)
 
 DIRNAME = ".agenttalk"
 
+RESTART_REQUEST_READ_STATUS_KEY = "_agenttalk_restart_request_status"
+RESTART_REQUEST_UNUSABLE = "unusable"
+
+
+def unusable_restart_request_marker() -> dict[str, str]:
+    """Return the closed in-memory fact for an existing unusable marker."""
+    return {RESTART_REQUEST_READ_STATUS_KEY: RESTART_REQUEST_UNUSABLE}
+
+
+def is_unusable_restart_request(marker: object) -> bool:
+    """Whether ``marker`` is the Store-owned unusable-marker fact."""
+    return (
+        isinstance(marker, dict)
+        and marker == unusable_restart_request_marker()
+    )
+
 # Capability tokens the RUNNING store code supports. Surfaced by `doctor` so two
 # writers reporting the same --version (e.g. a PYTHONPATH=src build and an
 # installed wheel) are still discriminable — a writer lacking a token here is one
@@ -5861,15 +5877,30 @@ class Store:
                                json.dumps(payload, ensure_ascii=False))
 
     def read_restart_request(self, agent: str) -> dict | None:
-        """Return ``agent``'s restart-request marker, or None if absent/corrupt."""
+        """Return a valid marker, ``None`` when absent, or an unusable fact.
+
+        An existing marker whose request id cannot be trusted must remain
+        distinguishable from absence.  Otherwise a consumer can incorrectly
+        borrow progress persisted for an older request.  The unusable fact is
+        closed and carries none of the untrusted marker fields.
+        """
         p = self.state_dir / f"{agent}.restart-request"
-        if not p.exists():
-            return None
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, ValueError, OSError):
+            raw = p.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
-        return data if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            return unusable_restart_request_marker()
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return unusable_restart_request_marker()
+        if not isinstance(data, dict):
+            return unusable_restart_request_marker()
+        from agenttalk import ephemeral as _eph
+        if not _eph.is_safe_id(data.get("request_id")):
+            return unusable_restart_request_marker()
+        return data
 
     def clear_restart_request(self, agent: str, request_id: str) -> bool:
         """Clear ``agent``'s restart-request marker ONLY if its current

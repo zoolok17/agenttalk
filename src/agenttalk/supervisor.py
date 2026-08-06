@@ -46,6 +46,7 @@ from agenttalk.store import (
     Store,
     _owner_identity_gone,
     _process_alive,
+    is_unusable_restart_request,
     validate_agent_name,
 )
 from agenttalk import powershell_host as psh
@@ -1124,6 +1125,8 @@ def record_coordination_availability_observation(
 def _restart_request_with_live_authority(store: Store, marker: dict | None) -> dict | None:
     if not isinstance(marker, dict):
         return marker
+    if is_unusable_restart_request(marker):
+        return dict(marker)
     out = dict(marker)
     authority = resolve_restart_request_authority(
         store,
@@ -1687,6 +1690,19 @@ def restart_request_progress(
     clear_marker: str | None = None,
 ) -> dict:
     """Classify one restart request without borrowing another request's state."""
+    if is_unusable_restart_request(marker):
+        blocked = decision_state in {
+            "PROCESS_TREE_INVALID",
+            "PROCESS_TREE_TRUNCATED",
+        }
+        return {
+            "present": True,
+            "pending": False,
+            "blocked": blocked,
+            "state": "blocked_by_process_tree_hold" if blocked else "unknown",
+            "request_id": None,
+            "unavailable": True,
+        }
     persisted_state = state_row.get("restart_request_state")
     persisted_request_id = state_row.get("pending_restart_request_id")
     current_request_id = (
@@ -1849,6 +1865,8 @@ def _redacted_observation_value(value: object) -> object:
 def _redacted_restart_request(marker: object) -> dict | None:
     if not isinstance(marker, dict):
         return None
+    if is_unusable_restart_request(marker):
+        return {"unavailable": True}
     out: dict[str, object] = {}
     for key in (
         "request_id",
