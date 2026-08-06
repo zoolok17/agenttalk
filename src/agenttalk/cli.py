@@ -10729,6 +10729,33 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                 f"{log_installation.disabled_reason}",
                 file=sys.stderr,
             )
+        elif log_installation.enabled and log_installation.allocated_via_fallback_search:
+            # Only for the direct/unsupervised path, where root/rejected_attempts
+            # came from actually running the candidate-search allocator. The
+            # pre-authenticated supervised path reuses supervisor-resolved
+            # fixed paths - root is not a meaningful allocator result there,
+            # and that path's stderr stream is parsed as pure JSONL elsewhere
+            # (see test_cmd_wrap_records_terminating_signal_without_exception_duplicate),
+            # so printing free text into it would corrupt that contract.
+            #
+            # A candidate being rejected and a fallback quietly accepted is
+            # exactly as silent as total allocation failure was before the
+            # block above existed - name what was actually accepted, not just
+            # what wasn't. sys.stderr here is the bounded tee, which mirrors
+            # to the real console the same way the wrapped CLI's own stderr
+            # does, so this reaches the operator (and any test reading the
+            # wrapper subprocess's stderr) the same way.
+            print(
+                f"agenttalk wrap: bounded log capture accepted root: "
+                f"{log_installation.root}",
+                file=sys.stderr,
+            )
+            for rejected_root, reason in log_installation.rejected_attempts:
+                print(
+                    f"agenttalk wrap: candidate root rejected before "
+                    f"acceptance: {rejected_root}: {reason}",
+                    file=sys.stderr,
+                )
         lifecycle_log = WrapperLifecycleLog(
             str(agent),
             enabled=log_installation.enabled,

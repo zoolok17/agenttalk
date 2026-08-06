@@ -342,6 +342,18 @@ class WrapperLogInstallation:
     # environment, no project/agent to allocate for) where there is no
     # single failure to name.
     disabled_reason: str | None = None
+    # Candidates tried and rejected BEFORE the accepted root, when enabled is
+    # True. A partial failure (preferred root rejected, a fallback quietly
+    # accepted) is exactly as silent as total failure was before
+    # disabled_reason existed unless this is surfaced too - this is that.
+    rejected_attempts: tuple[tuple[Path, str], ...] = ()
+    # True only when `root`/`rejected_attempts` came from actually running the
+    # fallback-search allocator (the direct/unsupervised launch path). False
+    # for the pre-authenticated supervised path, where the supervisor already
+    # resolved fixed stdout/stderr paths and `root` is not a meaningful
+    # candidate-search result - callers must not print or otherwise surface
+    # `root`/`rejected_attempts` as allocator diagnostics unless this is True.
+    allocated_via_fallback_search: bool = False
 
 
 @dataclass(frozen=True)
@@ -353,6 +365,7 @@ class _AllocatedWrapperLogTargets:
     roots: tuple[Path, ...]
     agent_leaf: str
     sequence_uncertain: bool
+    rejected_attempts: tuple[tuple[Path, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -801,6 +814,7 @@ def _allocate_wrapper_log_targets(
                 roots=roots,
                 agent_leaf=agent_leaf,
                 sequence_uncertain=uncertain,
+                rejected_attempts=tuple(attempts),
             )
         except OSError as exc:
             attempts.append((root, str(exc)))
@@ -1513,6 +1527,10 @@ def installed_standard_streams_from_environment(
         generation_dir=generation_dir,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        rejected_attempts=(
+            allocated.rejected_attempts if allocated is not None else ()
+        ),
+        allocated_via_fallback_search=allocated is not None,
     )
     if diagnostic_project is not None and agent:
         _record_wrapper_log_location(
