@@ -524,27 +524,27 @@ def test_report_reflects_restart_request(tmp_path: Path) -> None:
     assert rr is not None and rr["agent"] == "worker" and rr["request_id"].startswith("rr-")
 
 
-@pytest.mark.parametrize(
-    "marker_payload",
-    [
-        pytest.param(b'{"agent": "worker"}', id="missing-request-id"),
-        pytest.param(
-            b'{"agent": "worker", "request_id": ""}',
-            id="empty-request-id",
-        ),
-        pytest.param(
-            b'{"agent": "worker", "request_id": 7}',
-            id="non-string-request-id",
-        ),
-        pytest.param(
-            b'{"agent": "worker", "request_id": "unsafe id"}',
-            id="unsafe-request-id",
-        ),
-        pytest.param(b'{broken', id="malformed-json"),
-        pytest.param(b'["not", "an", "object"]', id="non-object"),
-        pytest.param(b"\xff", id="invalid-utf8"),
-    ],
-)
+_UNUSABLE_RESTART_MARKER_PAYLOADS = [
+    pytest.param(b'{"agent": "worker"}', id="missing-request-id"),
+    pytest.param(
+        b'{"agent": "worker", "request_id": ""}',
+        id="empty-request-id",
+    ),
+    pytest.param(
+        b'{"agent": "worker", "request_id": 7}',
+        id="non-string-request-id",
+    ),
+    pytest.param(
+        b'{"agent": "worker", "request_id": "unsafe id"}',
+        id="unsafe-request-id",
+    ),
+    pytest.param(b'{broken', id="malformed-json"),
+    pytest.param(b'["not", "an", "object"]', id="non-object"),
+    pytest.param(b"\xff", id="invalid-utf8"),
+]
+
+
+@pytest.mark.parametrize("marker_payload", _UNUSABLE_RESTART_MARKER_PAYLOADS)
 def test_restart_request_reader_marks_existing_unusable_marker(
     tmp_path: Path,
     marker_payload: bytes,
@@ -715,6 +715,52 @@ def test_clear_restart_request_store_level_compare(tmp_path: Path) -> None:
     assert s.read_restart_request("worker") is None
     # clearing an absent marker is a no-op False
     assert s.clear_restart_request("worker", "rr-2") is False
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        pytest.param(None, id="none"),
+        pytest.param("", id="empty"),
+        pytest.param(7, id="integer"),
+        pytest.param(True, id="boolean"),
+        pytest.param("unsafe id", id="unsafe-string"),
+    ],
+)
+def test_clear_restart_rejects_unusable_id_before_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_id: object,
+) -> None:
+    store = _team(tmp_path)
+
+    def unexpected_read(_agent: str) -> None:
+        pytest.fail("invalid clear id reached the restart-marker reader")
+
+    monkeypatch.setattr(store, "read_restart_request", unexpected_read)
+
+    assert store.clear_restart_request("worker", request_id) is False
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        pytest.param(None, id="none"),
+        pytest.param("rr-old", id="safe-mismatch"),
+    ],
+)
+@pytest.mark.parametrize("marker_payload", _UNUSABLE_RESTART_MARKER_PAYLOADS)
+def test_clear_restart_preserves_unusable_marker_bytes(
+    tmp_path: Path,
+    marker_payload: bytes,
+    request_id: object,
+) -> None:
+    store = _team(tmp_path)
+    marker_path = store.state_dir / "worker.restart-request"
+    marker_path.write_bytes(marker_payload)
+
+    assert store.clear_restart_request("worker", request_id) is False
+    assert marker_path.read_bytes() == marker_payload
 
 
 # ----------------------------------------- supervise --init / --plan CLI

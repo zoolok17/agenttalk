@@ -5911,6 +5911,9 @@ class Store:
         C5b: the read/compare/unlink runs UNDER the config lock so a concurrent
         ``write_restart_request`` cannot replace the marker between the compare and the
         unlink (a stale clearer must never remove a newer request)."""
+        from agenttalk import ephemeral as _eph
+        if not _eph.is_safe_id(request_id):
+            return False
         with self._config_lock():
             marker = self.read_restart_request(agent)
             if not marker or marker.get("request_id") != request_id:
