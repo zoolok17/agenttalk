@@ -469,6 +469,44 @@ def test_default_wrapper_log_root_falls_back_to_tempdir_when_home_is_unresolvabl
     assert checkout.resolve() not in resolved.resolve().parents
 
 
+def test_default_wrapper_log_root_falls_back_when_project_is_a_filesystem_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project rooted at a filesystem anchor has no same-volume "outside":
+    every absolute candidate resolves as relative to the project. This must
+    degrade to a fixed fallback, not raise - restoring a guarantee an earlier
+    revision had (`if not roots: roots.append(<tempdir fallback>)`) and a
+    later one silently dropped when it added the raise this test guards
+    against (#113 review)."""
+    anchor = Path(tmp_path.anchor)
+    monkeypatch.setenv("TEMP", str(anchor))
+    monkeypatch.setenv("TMP", str(anchor))
+    monkeypatch.setattr(wrapper_logs.tempfile, "tempdir", None)
+    env = {
+        "LOCALAPPDATA": str(anchor),
+        "USERPROFILE": str(anchor),
+        "TEMP": str(anchor),
+        "TMP": str(anchor),
+    }
+
+    resolved = wrapper_logs.default_wrapper_log_root(anchor, platform="nt", environ=env)
+    assert resolved is not None
+
+    roots = wrapper_logs.wrapper_log_root_candidates(anchor, platform="nt", environ=env)
+    assert roots, "candidates must never be empty for this edge case"
+
+    targets = wrapper_logs._allocate_wrapper_log_targets(anchor, "worker", env)
+    assert targets is not None
+    # _allocate_wrapper_log_targets' own contract stops at ".pending" -
+    # ".committed" is written later, by the confirm step inside
+    # installed_standard_streams_from_environment, which this test does not
+    # exercise. Assert what this function actually promises.
+    assert (targets.generation_dir / ".pending").exists()
+    assert targets.stdout_path.exists()
+    assert targets.stderr_path.exists()
+
+
 def test_wrapper_log_candidates_do_not_consult_later_home_after_valid_configured_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -567,6 +605,91 @@ def test_wrapper_log_candidate_rechecks_original_ancestry_after_resolution(
     assert roots[0].is_relative_to(home.resolve())
 
 
+def test_read_wrapper_log_sequence_honors_persisted_uncertainty_marker(
+    tmp_path: Path,
+) -> None:
+    """.sequence-uncertain is written when the allocator that created a
+    generation could not fully scan every root, so its OWN sequence number
+    may already be lower than the true prior maximum. A later launch
+    reading a perfectly well-formed .sequence file back must not conclude
+    that uncertainty has gone away - the marker's fact is about the
+    generation's history, not about whether .sequence itself parses
+    (#113 review comment #5: a marker nothing reads back is not a check,
+    it's a costume)."""
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / ".sequence").write_text("5", encoding="utf-8")
+    (generation / ".sequence-uncertain").write_bytes(b"")
+
+    sequence, uncertain = wrapper_logs._read_wrapper_log_sequence(
+        generation, committed=True,
+    )
+
+    assert sequence == 5
+    assert uncertain is True
+
+
+def test_read_wrapper_log_sequence_marker_is_inert_when_not_committed(
+    tmp_path: Path,
+) -> None:
+    """Matches the existing `committed and ...` gating used everywhere else
+    in this function - an uncommitted generation's uncertainty is not this
+    function's concern regardless of the marker."""
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / ".sequence").write_text("5", encoding="utf-8")
+    (generation / ".sequence-uncertain").write_bytes(b"")
+
+    sequence, uncertain = wrapper_logs._read_wrapper_log_sequence(
+        generation, committed=False,
+    )
+
+    assert sequence == 5
+    assert uncertain is False
+
+
+def test_read_wrapper_log_sequence_stays_certain_without_the_marker(
+    tmp_path: Path,
+) -> None:
+    """Negative control: a valid record with no marker at all must not be
+    flagged uncertain just because the check now also looks for one."""
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / ".sequence").write_text("5", encoding="utf-8")
+
+    sequence, uncertain = wrapper_logs._read_wrapper_log_sequence(
+        generation, committed=True,
+    )
+
+    assert sequence == 5
+    assert uncertain is False
+
+
+def test_owned_committed_generations_propagates_persisted_sequence_uncertainty(
+    tmp_path: Path,
+) -> None:
+    """Integration-level proof the marker actually changes a retention
+    decision, not just the direct unit's return value: a generation with a
+    syntactically perfect .sequence but a .sequence-uncertain marker must
+    still make the aggregate `uncertain` True."""
+    root = tmp_path / "logs"
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    generation = root / agent_leaf / f"20260804T120001000Z-{'1' * 32}"
+    generation.mkdir(parents=True)
+    (generation / ".sequence").write_text("1", encoding="utf-8")
+    (generation / ".sequence-uncertain").write_bytes(b"")
+    (generation / ".committed").write_bytes(b"")
+    (generation / "stdout.log").write_bytes(b"")
+    (generation / "stderr.log").write_bytes(b"")
+
+    _owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+
+    assert uncertain is True
+
+
 def test_corrupt_committed_sequence_marks_retention_uncertain(
     tmp_path: Path,
 ) -> None:
@@ -582,6 +705,88 @@ def test_corrupt_committed_sequence_marks_retention_uncertain(
     )
 
     assert uncertain is True
+
+
+def test_inaccessible_agent_dir_marks_retention_uncertain_not_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transiently unreadable agent_dir (a disconnected volume reporting
+    not-ready, ...) must not read the same as a root this agent has
+    genuinely never used - #113 review.
+
+    Path.exists() is a boolean wrapper that swallows SOME OSErrors into
+    False rather than raising - on 3.10's pathlib, only a curated list
+    (ENOENT/ENOTDIR/EBADF/ELOOP, plus WinError 21 "not ready" on Windows),
+    not an arbitrary PermissionError (confirmed directly against 3.10's
+    pathlib.py source: a plain PermissionError is NOT in that list and
+    propagates normally, so it does not actually exercise the bug this
+    test is for - the failure has to be shaped like one exists() truly
+    swallows). WinError 21 is exactly that shape, and it's the realistic
+    one anyway (a disconnected network share or removed media), so build
+    the exception exists() would have swallowed, and confirm the fix's
+    lstat()-based probe does NOT swallow it, unlike exists() does.
+
+    Tried and abandoned a real ACL-based repro first: Windows'
+    GetFileAttributes-class calls (what stat()/lstat() use) are
+    permissive enough against ordinary NTFS ACL edits that even an
+    explicit full-control deny left os.stat() succeeding - not something
+    this environment could reproduce for real, only construct.
+    """
+    root = tmp_path / "logs"
+    root.mkdir()
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    agent_dir = root / agent_leaf
+    agent_dir.mkdir()  # genuinely exists - the point is we can't SEE that
+
+    real_stat = Path.stat
+    real_lstat = Path.lstat
+
+    def _not_ready() -> OSError:
+        err = OSError("drive not ready")
+        err.winerror = 21
+        return err
+
+    def denied_stat(self: Path, *args: object, **kwargs: object):
+        if self == agent_dir:
+            raise _not_ready()
+        return real_stat(self, *args, **kwargs)
+
+    def denied_lstat(self: Path, *args: object, **kwargs: object):
+        if self == agent_dir:
+            raise _not_ready()
+        return real_lstat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied_stat)
+    monkeypatch.setattr(Path, "lstat", denied_lstat)
+
+    owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+
+    assert owned == []
+    assert uncertain is True
+
+
+def test_genuinely_absent_agent_dir_is_not_flagged_uncertain(tmp_path: Path) -> None:
+    """The other side of the same check: a root this agent has truly never
+    used (no agent_dir at all) must still read as a plain, confident
+    absence - the fix must not turn every unused root into a false
+    'uncertain', only a genuinely unreadable one."""
+    root = tmp_path / "logs"
+    root.mkdir()
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    assert not (root / agent_leaf).exists()
+
+    owned, max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+
+    assert owned == []
+    assert max_sequence == 0
+    assert uncertain is False
 
 
 def test_prune_preserves_newest_generation_when_its_sequence_is_corrupt(

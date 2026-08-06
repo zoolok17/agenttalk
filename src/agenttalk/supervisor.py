@@ -11297,6 +11297,14 @@ function Protect-WrapperLogPaths(
   }
 }
 function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
+  # .sequence-uncertain records that THIS generation's own sequence number
+  # may already be lower than the true prior maximum, because the
+  # allocator that wrote it could not fully scan every root. That fact
+  # belongs to the generation permanently, independent of whether
+  # .sequence later reads back as perfectly well-formed - mirrors
+  # _read_wrapper_log_sequence in wrapper_logs.py; keep both in sync.
+  $markerUncertain = $committed -and
+    (Test-Path -LiteralPath (Join-Path $generation '.sequence-uncertain'))
   $seqFile = Join-Path $generation '.sequence'
   $sequenceEntry = $null
   try {
@@ -11309,14 +11317,16 @@ function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
     }
     return [pscustomobject]@{
       sequence = $null
-      uncertain = ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state])
+      uncertain = ($markerUncertain -or
+        ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state]))
       state = $state
     }
   } catch {
     $state = 'present-invalid'
     return [pscustomobject]@{
       sequence = $null
-      uncertain = ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state])
+      uncertain = ($markerUncertain -or
+        ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state]))
       state = $state
     }
   }
@@ -11338,7 +11348,8 @@ function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
   } catch {}
   return [pscustomobject]@{
     sequence = $sequence
-    uncertain = ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state])
+    uncertain = ($markerUncertain -or
+      ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state]))
     state = $state
   }
 }

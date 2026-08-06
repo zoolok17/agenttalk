@@ -193,6 +193,17 @@ def default_wrapper_log_root(
     refusal itself. Doing so here would make this report indistinguishable
     from what the allocator actually accepted, hiding a refusal instead of
     proving one happened.
+
+    A project rooted at a filesystem anchor (``/`` on POSIX, usually a drive
+    root on Windows) has no same-volume "outside": every absolute candidate
+    resolves as relative to the project, so the loop below never accepts one.
+    Falls back to a fixed temp-based path rather than raising in that case -
+    restores a guarantee an earlier revision of this function had and later
+    silently lost (#113 review), not a new one. Every reachable caller of
+    this function currently treats a raised OSError as fatal (see
+    ``_marker_placeholder_bundle``, called from ``supervise --init``/
+    ``--refresh-scripts``), so exhausting candidates here previously took
+    supervisor scaffolding down entirely for this one edge case.
     """
     env = os.environ if environ is None else environ
     target = os.name if platform is None else platform
@@ -212,7 +223,7 @@ def default_wrapper_log_root(
             continue
         if not resolved.is_relative_to(project):
             return raw_result
-    raise OSError("no safe wrapper log root is available")
+    return Path(tempfile.gettempdir()).absolute() / "agenttalk" / "wrapper-logs" / project_id
 
 
 def wrapper_log_root_candidates(
@@ -230,6 +241,12 @@ def wrapper_log_root_candidates(
     launchers, and the final candidate is independent of user state. Resolving
     any later candidate is fail-soft and can never invalidate an
     already-viable preferred root.
+
+    A project rooted at a filesystem anchor has no same-volume "outside", so
+    every one of the candidates above can end up relative to the project and
+    get filtered out - restores the same guaranteed last-resort fallback
+    :func:`default_wrapper_log_root` restores, rather than returning an empty
+    tuple and letting the allocator report total failure for this edge case.
     """
     env = os.environ if environ is None else environ
     target = os.name if platform is None else platform
@@ -296,6 +313,18 @@ def wrapper_log_root_candidates(
         # _prepare_agent_log_dir's pre/post-create race checks can see it.
         roots.append(raw_candidate)
 
+    if not roots:
+        # A checkout rooted at the filesystem anchor has no same-volume
+        # "outside" - every candidate above was filtered for being relative
+        # to the project. Keep wrapping usable; allocation remains fail-soft
+        # if this cannot open either. (Restores a guarantee this function
+        # had before it was silently dropped; #113 review.)
+        roots.append(
+            Path(tempfile.gettempdir()).absolute()
+            / "agenttalk"
+            / "wrapper-logs"
+            / project_id
+        )
     return tuple(roots)
 
 
@@ -636,7 +665,21 @@ def _read_wrapper_log_sequence(
     *,
     committed: bool,
 ) -> tuple[int | None, bool]:
-    """Read one launch sequence under the shared Python/PowerShell policy."""
+    """Read one launch sequence under the shared Python/PowerShell policy.
+
+    ``.sequence-uncertain`` records that THIS generation's own sequence
+    number may already be lower than the true prior maximum, because the
+    allocator that wrote it could not fully scan every root (see
+    ``_owned_committed_generations``). That fact belongs to the generation
+    itself, permanently, independent of whether ``.sequence`` later reads
+    back as perfectly well-formed - a later launch seeing a syntactically
+    valid ``.sequence`` file must not conclude the uncertainty it was
+    marked with has gone away. Without this, the marker is written but
+    never consulted: retention on a later launch would rank this
+    generation as confidently ordered, exactly the silent-uncertainty
+    pattern #113 raised the marker to prevent in the first place.
+    """
+    marker_uncertain = committed and (generation / ".sequence-uncertain").exists()
     sequence_path = generation / ".sequence"
     try:
         sequence_info = sequence_path.lstat()
@@ -646,10 +689,14 @@ def _read_wrapper_log_sequence(
             if (generation / ".sequence-failed").exists()
             else "missing-legacy"
         )
-        return None, bool(committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+        return None, bool(
+            marker_uncertain or (committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+        )
     except OSError:
         state = "present-invalid"
-        return None, bool(committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+        return None, bool(
+            marker_uncertain or (committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+        )
 
     state = "present-invalid"
     sequence: int | None = None
@@ -669,7 +716,9 @@ def _read_wrapper_log_sequence(
         state = "present-valid"
     except (OSError, UnicodeError, ValueError):
         pass
-    return sequence, bool(committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+    return sequence, bool(
+        marker_uncertain or (committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+    )
 
 
 def _owned_committed_generations(
@@ -682,10 +731,25 @@ def _owned_committed_generations(
     for root in roots:
         agent_dir = root / agent_leaf
         try:
-            if not agent_dir.exists():
+            # Path.exists()/is_dir() are boolean wrappers that SWALLOW OSError
+            # into False on some runtimes - only some error codes on 3.10
+            # (e.g. a disconnected/not-ready volume), but ANY OSError on 3.14+
+            # (Path.exists() there delegates to os.path.exists(), whose own
+            # implementation is a bare except (OSError, ValueError)). A
+            # temporarily unreadable agent_dir would then read exactly like
+            # one this agent has never used - a confident "no" instead of
+            # "unknown" - and this function's whole caller-visible contract
+            # is that ambiguity becomes `uncertain`, not silence (#113
+            # review). lstat() is the raw, non-swallowing primitive: only
+            # FileNotFoundError means genuinely absent; anything else means
+            # "could not tell," so it takes the same branch as the sibling
+            # non-directory/reparse case two lines below.
+            try:
+                agent_lstat = agent_dir.lstat()
+            except FileNotFoundError:
                 continue
             if (
-                not agent_dir.is_dir()
+                not stat.S_ISDIR(agent_lstat.st_mode)
                 or _has_reparse_or_symlink_component(agent_dir)
             ):
                 uncertain = True

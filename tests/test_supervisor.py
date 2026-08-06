@@ -6447,6 +6447,55 @@ def test_ps_wrapper_log_sequence_uncertainty_persists_to_the_next_launch(
     )
 
 
+def test_ps_read_wrapper_log_sequence_record_honors_persisted_uncertainty_marker(
+    tmp_path: Path,
+) -> None:
+    """#113 review comment #5, PowerShell side: mirrors
+    test_read_wrapper_log_sequence_honors_persisted_uncertainty_marker in
+    test_wrapper_logs.py. A .sequence-uncertain marker means THIS
+    generation's own sequence number may already be lower than the true
+    prior maximum - that fact must survive a later launch seeing a
+    perfectly well-formed .sequence file, or the marker is written and
+    never consulted."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / ".sequence").write_text("5", encoding="utf-8")
+    (generation / ".sequence-uncertain").write_bytes(b"")
+    result_path = tmp_path / "ps-sequence-marker.json"
+    script = tmp_path / "ps-sequence-marker.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            f"$record = Read-WrapperLogSequenceRecord {_pslit(str(generation))} $true",
+            "@{ sequence = $record.sequence; uncertain = [bool]$record.uncertain; "
+            "state = [string]$record.state } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["sequence"] == 5
+    assert payload["state"] == "present-valid"
+    assert payload["uncertain"] is True
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
 def test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker(
     tmp_path: Path,
