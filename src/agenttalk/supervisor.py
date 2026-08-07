@@ -30,6 +30,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess  # nosec B404 - list2cmdline formats argv; no process is launched
 import sys
 import tempfile
@@ -4280,6 +4281,12 @@ _WRAP_VALUE_OPTIONS = frozenset({
     "--dead-letter-max-attempts",
     "--dead-letter-escalate-after",
 })
+_WRAP_FLAG_OPTIONS = frozenset({
+    "--lead-loop",
+    "--loop",
+    "--no-render",
+    "--one-shot",
+})
 
 
 def _configured_wrap_binding(
@@ -4376,21 +4383,544 @@ def _configured_wrap_binding(
         return True, None
 
 
+def _configured_ephemeral_wrap_binding(
+    executable: object,
+    args: Sequence[object],
+    module_args_from: object,
+    *,
+    agent: str,
+    request_id: str,
+    cli: str,
+    lane_id: str | None,
+) -> bool:
+    """Validate one closed, post-substitution ephemeral wrapper command."""
+    dispatches_wrap, wrapped_agent = _configured_wrap_binding(
+        executable,
+        args,
+        module_args_from,
+    )
+    if not dispatches_wrap or wrapped_agent != agent:
+        return False
+    tokens = list(args)
+    executable_stem = _token_stem(executable)
+    if executable_stem in {"python", "python3", "py"}:
+        flag_index = _resolve_module_flag_index(tokens, module_args_from)
+        if flag_index < 0:
+            return False
+        scan = flag_index + 2
+    else:
+        scan = 0
+    try:
+        wrap_index = tokens.index("wrap", scan)
+        delimiter = tokens.index("--", wrap_index + 1)
+    except ValueError:
+        return False
+    if delimiter + 1 >= len(tokens):
+        return False
+    if any(
+        token == _SUPERVISOR_LAUNCH_NONCE_ARG
+        or (
+            isinstance(token, str)
+            and token.startswith(f"{_SUPERVISOR_LAUNCH_NONCE_ARG}=")
+        )
+        for token in tokens
+    ):
+        return False
+
+    values: dict[str, str] = {}
+    flags: set[str] = set()
+    index = wrap_index + 1
+    while index < delimiter:
+        argument = tokens[index]
+        if not isinstance(argument, str):
+            return False
+        if argument in _WRAP_VALUE_OPTIONS:
+            if argument in values or index + 1 >= delimiter:
+                return False
+            option_value = tokens[index + 1]
+            if (
+                not isinstance(option_value, str)
+                or not option_value
+                or option_value.startswith("-")
+            ):
+                return False
+            values[argument] = option_value
+            index += 2
+            continue
+        option, separator, option_value = argument.partition("=")
+        if separator and option in _WRAP_VALUE_OPTIONS:
+            if option in values or not option_value or option_value.startswith("-"):
+                return False
+            values[option] = option_value
+            index += 1
+            continue
+        if argument in _WRAP_FLAG_OPTIONS:
+            if argument in flags:
+                return False
+            flags.add(argument)
+            index += 1
+            continue
+        return False
+
+    if flags & {"--lead-loop"} or not {"--loop", "--one-shot"}.issubset(flags):
+        return False
+    if values.get("--for") != agent:
+        return False
+    if values.get("--cli") != cli:
+        return False
+    if values.get("--to-request") != request_id:
+        return False
+    if values.get("--from", agent) != agent:
+        return False
+    if "--min-interval" in values:
+        try:
+            interval = float(values["--min-interval"])
+        except ValueError:
+            return False
+        if not math.isfinite(interval) or interval < 0:
+            return False
+    for option in (
+        "--dead-letter-max-attempts",
+        "--dead-letter-escalate-after",
+    ):
+        if option in values:
+            try:
+                limit = int(values[option])
+            except ValueError:
+                return False
+            if limit < 0:
+                return False
+    if lane_id is None:
+        return "--lane-id" not in values
+    return values.get("--lane-id") == lane_id
+
+
+def _ephemeral_recovery_environment(
+    root: str | Path,
+    spec: dict,
+    agent: str,
+    *,
+    launch_agenttalk_python: str | None = None,
+    launch_src_on_pythonpath: bool | None = None,
+) -> dict:
+    """Return the supervisor-owned environment facts an operator must replay."""
+    root_path = Path(root).resolve()
+    if launch_agenttalk_python is None:
+        try:
+            agenttalk_python = _baked_python_pin(
+                (root_path / ".agenttalk" / "bin" / "agenttalk.cmd").read_bytes()
+            )
+        except (ArtifactValidationError, OSError) as exc:
+            raise eph.EphemeralError(
+                "the prepared agenttalk Python pin is unavailable"
+            ) from exc
+    elif (
+        not isinstance(launch_agenttalk_python, str)
+        or not launch_agenttalk_python
+        or any(ord(ch) < 32 or 0xD800 <= ord(ch) <= 0xDFFF
+               for ch in launch_agenttalk_python)
+    ):
+        raise eph.EphemeralError(
+            "the running supervisor's agenttalk Python pin is invalid"
+        )
+    else:
+        agenttalk_python = launch_agenttalk_python
+    src_path = root_path / "src"
+    src_on_pythonpath = (
+        (src_path / "agenttalk" / "__init__.py").is_file()
+        if launch_src_on_pythonpath is None
+        else launch_src_on_pythonpath
+    )
+    codex_home = None
+    if spec.get("cli") == "codex" and bool(spec.get("codex_home_isolation")):
+        codex_home = str(root_path / ".agenttalk" / "codex-home" / agent)
+    return {
+        "AGENTTALK_ROOT": str(root_path),
+        "AGENTTALK_PY": agenttalk_python,
+        "PYTHONPATH_prepend": str(src_path) if src_on_pythonpath else None,
+        "CODEX_HOME": codex_home,
+        "AGENTTALK_NO_CHILD_WINDOW": (
+            "1"
+            if str(spec.get("window_style", "Hidden")).casefold() == "hidden"
+            else None
+        ),
+    }
+
+
+_EPHEMERAL_ENV_BINDING_EXCLUDED = frozenset({
+    "agenttalk_python",
+    "agenttalk_shim_active",
+    "agenttalk_shim_parent_pythonpath",
+    "agenttalk_shim_parent_pythonpath_absent",
+    "agenttalk_wrapper_stdout_log",
+    "agenttalk_wrapper_stderr_log",
+    "agenttalk_wrapper_log_max_bytes",
+    "agenttalk_wrapper_log_segments",
+    "agenttalk_wrapper_log_nonce",
+})
+
+
+def _validated_ephemeral_parent_environment(environment: object) -> dict[str, str]:
+    """Return a bounded Windows environment projection without lossy aliases."""
+    if not isinstance(environment, dict):
+        raise eph.EphemeralError(
+            "the running supervisor's launch environment is unavailable"
+        )
+    canonical: dict[str, str] = {}
+    for key, value in environment.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or not key.isascii()
+            or "=" in key
+            or not isinstance(value, str)
+            or any(
+                ord(ch) < 32 or 0xD800 <= ord(ch) <= 0xDFFF
+                for ch in key
+            )
+            or any(
+                ch == "\x00" or 0xD800 <= ord(ch) <= 0xDFFF
+                for ch in value
+            )
+        ):
+            raise eph.EphemeralError(
+                "the running supervisor's launch environment is invalid"
+            )
+        folded = key.lower()
+        if folded in _EPHEMERAL_ENV_BINDING_EXCLUDED:
+            continue
+        previous = canonical.get(folded)
+        if previous is not None and previous != value:
+            raise eph.EphemeralError(
+                "the running supervisor's launch environment has duplicate keys"
+            )
+        canonical[folded] = value
+    try:
+        eph.effective_launch_environment_digest(canonical)
+    except eph.EphemeralError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise eph.EphemeralError(
+            "the running supervisor's launch environment is unavailable"
+        ) from exc
+    return canonical
+
+
+def _current_ephemeral_parent_environment() -> dict[str, str]:
+    """Undo project-shim-only mutations and return the caller environment."""
+    current = dict(os.environ)
+    if current.get("AGENTTALK_SHIM_ACTIVE") == "1":
+        if current.get("AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT") == "1":
+            current.pop("PYTHONPATH", None)
+        elif "AGENTTALK_SHIM_PARENT_PYTHONPATH" in current:
+            current["PYTHONPATH"] = current[
+                "AGENTTALK_SHIM_PARENT_PYTHONPATH"
+            ]
+    return _validated_ephemeral_parent_environment(current)
+
+
+def _effective_ephemeral_environment_digest(
+    parent_environment: dict[str, str],
+    spec: dict,
+    recovery_environment: dict,
+) -> str:
+    """Hash exactly the inherited environment Launch-Spec will expose."""
+    effective = dict(parent_environment)
+
+    def apply(name: str, value: object) -> None:
+        folded = name.lower()
+        if folded in _EPHEMERAL_ENV_BINDING_EXCLUDED:
+            effective.pop(folded, None)
+        elif value is None:
+            effective.pop(folded, None)
+        elif isinstance(value, str):
+            effective[folded] = value
+        else:
+            raise eph.EphemeralError(
+                "the prepared launch environment is invalid"
+            )
+
+    apply("AGENTTALK_ROOT", recovery_environment.get("AGENTTALK_ROOT"))
+    apply("AGENTTALK_PY", recovery_environment.get("AGENTTALK_PY"))
+    pythonpath_prepend = recovery_environment.get("PYTHONPATH_prepend")
+    if pythonpath_prepend is not None:
+        if not isinstance(pythonpath_prepend, str):
+            raise eph.EphemeralError(
+                "the prepared launch environment is invalid"
+            )
+        apply(
+            "PYTHONPATH",
+            f"{pythonpath_prepend};{effective.get('pythonpath', '')}",
+        )
+    codex_home = recovery_environment.get("CODEX_HOME")
+    if codex_home is not None:
+        apply("CODEX_HOME", codex_home)
+    no_child_window = recovery_environment.get("AGENTTALK_NO_CHILD_WINDOW")
+    if no_child_window is not None:
+        apply("AGENTTALK_NO_CHILD_WINDOW", no_child_window)
+    configured = spec.get("env")
+    if not isinstance(configured, dict):
+        raise eph.EphemeralError("the prepared launch environment is invalid")
+    for key, value in configured.items():
+        if not isinstance(key, str):
+            raise eph.EphemeralError("the prepared launch environment is invalid")
+        apply(key, value)
+    for name in _EPHEMERAL_ENV_BINDING_EXCLUDED:
+        effective.pop(name, None)
+    return eph.effective_launch_environment_digest(effective)
+
+
+def _normalize_ephemeral_launch_root(
+    spec: dict,
+    root: str | Path,
+) -> None:
+    """Bind the exact effective project root into a prepared launch spec."""
+    launch = spec.get("launch")
+    if not isinstance(launch, dict):
+        raise eph.EphemeralError("the prepared launch mapping is unavailable")
+    args = launch.get("windows_args")
+    if not isinstance(args, list):
+        raise eph.EphemeralError("the prepared launch arguments are unavailable")
+    normalized = _ensure_agenttalk_wrap_root_arg(
+        args,
+        launch.get("module_args_from"),
+        str(Path(root).resolve()),
+    )
+    if normalized is None:
+        raise eph.EphemeralError("the prepared launch root arguments are invalid")
+    launch["windows_args"] = normalized
+
+
+def _effective_windows_env_value(
+    configured: dict,
+    name: str,
+) -> str | None:
+    folded = name.casefold()
+    for key, value in configured.items():
+        if isinstance(key, str) and key.casefold() == folded:
+            return value if isinstance(value, str) else None
+    for key, value in os.environ.items():
+        if key.casefold() == folded:
+            return value
+    return None
+
+
+def _resolve_configured_executable(
+    executable: str,
+    *,
+    relative_base: str,
+    configured_env: dict,
+) -> Path | None:
+    """Resolve one Windows launch token against cwd/PATH/PATHEXT."""
+    candidate = Path(executable)
+    if candidate.is_absolute():
+        return candidate if candidate.is_file() else None
+    has_path = "/" in executable or "\\" in executable
+    if has_path:
+        relative = Path(relative_base) / candidate
+        return relative if relative.is_file() else None
+    path_value = _effective_windows_env_value(configured_env, "PATH")
+    found = shutil.which(executable, path=path_value)
+    if found and Path(found).is_file():
+        return Path(found)
+    search_dirs = [Path(relative_base)]
+    if path_value:
+        search_dirs.extend(
+            Path(part.strip('"'))
+            for part in path_value.split(os.pathsep)
+            if part.strip('"')
+        )
+    suffixes = [""]
+    if not candidate.suffix:
+        pathext = (
+            _effective_windows_env_value(configured_env, "PATHEXT")
+            or ".COM;.EXE;.BAT;.CMD"
+        )
+        suffixes.extend(
+            ext if ext.startswith(".") else f".{ext}"
+            for ext in pathext.split(";")
+            if ext
+        )
+    for directory in search_dirs:
+        if not directory.is_absolute():
+            directory = Path(relative_base) / directory
+        for suffix in suffixes:
+            resolved = directory / f"{executable}{suffix}"
+            if resolved.is_file():
+                return resolved
+    return None
+
+
+def _pin_ephemeral_launch_executables(
+    spec: dict,
+    root: str | Path,
+) -> None:
+    """Resolve and pin both process layers before hashing or launching."""
+    launch = spec.get("launch")
+    cwd = spec.get("cwd")
+    configured_env = spec.get("env")
+    if (
+        not isinstance(launch, dict)
+        or not isinstance(cwd, str)
+        or not Path(cwd).is_dir()
+        or not isinstance(configured_env, dict)
+    ):
+        raise eph.EphemeralError(
+            "the prepared launch working directory is unavailable"
+        )
+    executable = launch.get("windows_file")
+    args = launch.get("windows_args")
+    if not isinstance(executable, str) or not isinstance(args, list):
+        raise eph.EphemeralError("the prepared launch command is unavailable")
+    outer = _resolve_configured_executable(
+        executable,
+        relative_base=cwd,
+        configured_env=configured_env,
+    )
+    if outer is None:
+        raise eph.EphemeralError(
+            "the prepared launch executable cannot be resolved"
+        )
+    try:
+        delimiter = args.index("--")
+    except ValueError as exc:
+        raise eph.EphemeralError(
+            "the prepared wrapped launch has no child executable"
+        ) from exc
+    child = args[delimiter + 1] if delimiter + 1 < len(args) else None
+    cli = str(spec.get("cli", ""))
+    if cli == "codex":
+        child = _effective_windows_env_value(
+            configured_env,
+            "AGENTTALK_CODEX",
+        ) or child
+    if not isinstance(child, str) or not child:
+        raise eph.EphemeralError(
+            "the prepared wrapped child executable is unavailable"
+        )
+    child_path = _resolve_configured_executable(
+        child,
+        relative_base=cwd,
+        configured_env=configured_env,
+    )
+    if child_path is None:
+        raise eph.EphemeralError(
+            "the prepared wrapped child executable cannot be resolved"
+        )
+    from agenttalk.wrapper import run as wrapper_run
+
+    if wrapper_run._is_windows_shim(child_path):  # noqa: SLF001
+        native = (
+            wrapper_run._resolve_known_npm_codex_shim(child_path)  # noqa: SLF001
+            if cli == "codex"
+            else None
+        )
+        if native is None:
+            raise eph.EphemeralError(
+                "the prepared wrapped child resolves to an unsupported shim"
+            )
+        child_path = native
+    try:
+        launch["windows_file"] = str(outer.resolve(strict=True))
+        pinned_child = str(child_path.resolve(strict=True))
+        args[delimiter + 1] = pinned_child
+        for key in configured_env:
+            if isinstance(key, str) and key.casefold() == "agenttalk_codex":
+                configured_env[key] = pinned_child
+    except OSError as exc:
+        raise eph.EphemeralError(
+            "the prepared launch executable identity is unavailable"
+        ) from exc
+
+
+def _ephemeral_recovery_resources_problem(
+    *,
+    executable: str,
+    args: list[str],
+    cwd: str,
+    configured_env: dict,
+    recovery_environment: dict,
+    cli: str,
+) -> str | None:
+    """Return why the exact prepared recovery command cannot run now."""
+    cwd_path = Path(cwd)
+    if not cwd_path.is_dir():
+        return "the configured launch working directory does not exist"
+    if _resolve_configured_executable(
+        executable,
+        relative_base=cwd,
+        configured_env=configured_env,
+    ) is None:
+        return "the configured launch executable cannot be resolved"
+    try:
+        delimiter = args.index("--")
+    except ValueError:
+        return "the configured wrapped launch has no child executable"
+    child = args[delimiter + 1] if delimiter + 1 < len(args) else None
+    if cli == "codex":
+        child = _effective_windows_env_value(
+            configured_env,
+            "AGENTTALK_CODEX",
+        ) or child
+    child_path = (
+        _resolve_configured_executable(
+            child,
+            relative_base=cwd,
+            configured_env=configured_env,
+        )
+        if isinstance(child, str)
+        else None
+    )
+    if child_path is None:
+        return "the configured wrapped child executable cannot be resolved"
+    from agenttalk.wrapper import run as wrapper_run
+
+    if wrapper_run._is_windows_shim(child_path):  # noqa: SLF001
+        native = (
+            wrapper_run._resolve_known_npm_codex_shim(child_path)  # noqa: SLF001
+            if cli == "codex"
+            else None
+        )
+        if native is None:
+            return "the configured wrapped child resolves to an unsupported shim"
+    agenttalk_python = recovery_environment.get("AGENTTALK_PY")
+    if (
+        not isinstance(agenttalk_python, str)
+        or not Path(agenttalk_python).is_file()
+    ):
+        return "the prepared agenttalk Python executable is unavailable"
+    codex_home = recovery_environment.get("CODEX_HOME")
+    if codex_home is not None:
+        home = Path(codex_home)
+        if not (
+            home.is_dir()
+            and (home / "auth.json").is_file()
+            and (home / "config.toml").is_file()
+            and (home / "skills" / "agenttalk-listen").exists()
+        ):
+            return "the prepared isolated CODEX_HOME is unavailable"
+    return None
+
+
 def configured_detached_launch(
     supervisor_config: dict | None,
     agent: str,
     *,
     root: str | Path | None,
+    store_config: dict | None = None,
     request_id: str | None = None,
     request_entry: dict | None = None,
     request_marker: dict | None = None,
+    request_delivery: dict | None = None,
     lane_workspaces: dict[str, str] | None = None,
+    now_epoch: float | None = None,
 ) -> tuple[dict | None, str]:
     """Return one bounded, normalized configured launch argv for display.
 
     This is recovery information, never launch authority.  Regular agents are
     reconstructed from static configuration; active ephemeral agents also
-    require their exact durable request entry and marker.  The returned
+    require their exact durable request entry and marker, current launch
+    admission, and the prepared effective-launch binding.  The returned
     environment metadata calls out the supervisor-owned context that an
     attended detached launch must reproduce.
     """
@@ -4411,6 +4941,10 @@ def configured_detached_launch(
             return None
         return value
 
+    root_text = clean(str(Path(root).resolve())) if root is not None else None
+    if root is not None and root_text is None:
+        return None, "the configured launch root is unavailable"
+    recovery_environment: dict | None = None
     if not isinstance(supervisor_config, dict):
         return None, "supervisor.json was unavailable"
     if request_id is None:
@@ -4423,6 +4957,43 @@ def configured_detached_launch(
             return None, "the active ephemeral request entry was unavailable"
         if not isinstance(request_marker, dict):
             return None, "the active ephemeral request marker was unavailable"
+        current_epoch = time.time()
+        if now_epoch is not None:
+            if (
+                isinstance(now_epoch, bool)
+                or not isinstance(now_epoch, (int, float))
+                or not math.isfinite(float(now_epoch))
+            ):
+                return None, "the active ephemeral recovery time is unavailable"
+            current_epoch = float(now_epoch)
+        phase = request_entry.get("phase")
+        timeout_seconds = request_entry.get("timeout_seconds")
+        deadline_epoch = request_entry.get("deadline_epoch")
+        lifecycle_epoch = request_entry.get(
+            "prepared_epoch"
+            if phase == eph.STATE_REQUESTED
+            else "launched_epoch"
+        )
+        if (
+            phase not in {eph.STATE_REQUESTED, eph.STATE_LAUNCHED}
+            or "held_terminal" in request_entry
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or timeout_seconds <= 0
+            or isinstance(lifecycle_epoch, bool)
+            or not isinstance(lifecycle_epoch, (int, float))
+            or not math.isfinite(float(lifecycle_epoch))
+            or isinstance(deadline_epoch, bool)
+            or not isinstance(deadline_epoch, (int, float))
+            or not math.isfinite(float(deadline_epoch))
+            or float(deadline_epoch)
+            != float(lifecycle_epoch) + timeout_seconds
+            or float(deadline_epoch) <= current_epoch
+        ):
+            return None, (
+                "the active ephemeral request is no longer eligible for "
+                "detached recovery"
+            )
         profile_name = request_entry.get("profile")
         marker_lane = request_marker.get("lane_id")
         marker_workspace = request_marker.get("workspace_path")
@@ -4444,7 +5015,8 @@ def configured_detached_launch(
             != request_marker.get("review_request_msg_id")
             or not isinstance(profile_name, str)
             or request_marker.get("profile") != profile_name
-            or request_marker.get("state") not in eph.ACTIVE_STATES
+            or request_marker.get("state")
+            not in {eph.STATE_REQUESTED, eph.STATE_LAUNCHED}
             or bool(eph.validate_marker(request_marker))
         ):
             return None, "the active ephemeral request launch binding is invalid"
@@ -4463,12 +5035,34 @@ def configured_detached_launch(
                 return None, "the active ephemeral lane registry was unavailable"
             if lane_workspaces.get(marker_lane) != marker_workspace:
                 return None, "the active ephemeral lane workspace no longer matches"
-        profile = eph.profile_config(
-            eph.config_block(supervisor_config),
-            profile_name,
+        if not isinstance(store_config, dict):
+            return None, "the active ephemeral request launch admission is unavailable"
+        roster = store_config.get("agents")
+        if not isinstance(roster, list) or agent not in roster:
+            return None, "the active ephemeral temporary identity is no longer active"
+        admission_errors, profile = eph.validate_launch_request(
+            request_marker,
+            store_config,
+            supervisor_config,
         )
-        if profile is None:
-            return None, "the active ephemeral request profile is unavailable"
+        if admission_errors or profile is None:
+            return None, "the active ephemeral request failed current launch admission"
+        roles = store_config.get("roles")
+        current_role = roles.get(agent) if isinstance(roles, dict) else None
+        groups = store_config.get("groups")
+        current_groups = {
+            group
+            for group, members in (groups.items() if isinstance(groups, dict) else ())
+            if isinstance(members, list) and agent in members
+        }
+        if (
+            current_role != eph.effective_role(request_marker, profile)
+            or current_groups != set(eph.effective_groups(request_marker, profile))
+        ):
+            return None, (
+                "the active ephemeral temporary identity no longer matches "
+                "its prepared role and groups"
+            )
         profile_cli = (
             profile.get("cli")
             if isinstance(profile.get("cli"), str) and profile.get("cli")
@@ -4480,7 +5074,87 @@ def configured_detached_launch(
             or request_entry.get("launch") != profile.get("launch")
         ):
             return None, "the active ephemeral request profile no longer matches"
-        row = eph.launch_spec(request_marker, profile, agent)
+        if root_text is None:
+            return None, "the active ephemeral launch root is unavailable"
+        row = eph.launch_spec(
+            request_marker,
+            profile,
+            agent,
+            root=root_text,
+        )
+        window_style, window_warning = resolve_window_style(
+            supervisor_config,
+            profile,
+        )
+        row["window_style"] = window_style
+        row["window_style_warning"] = window_warning
+        row["review_request_msg_id"] = request_marker.get(
+            "review_request_msg_id"
+        )
+        if row.get("timeout_seconds") != timeout_seconds:
+            return None, (
+                "the active ephemeral request timeout no longer matches "
+                "its prepared lifecycle"
+            )
+        try:
+            _normalize_ephemeral_launch_root(row, root_text)
+            _pin_ephemeral_launch_executables(row, root_text)
+            recovery_environment = _ephemeral_recovery_environment(
+                root_text,
+                row,
+                agent,
+            )
+            row["effective_environment_sha256"] = (
+                _effective_ephemeral_environment_digest(
+                    _current_ephemeral_parent_environment(),
+                    row,
+                    recovery_environment,
+                )
+            )
+        except eph.EphemeralError as recovery_error:
+            return None, str(recovery_error)
+        row["recovery_environment"] = recovery_environment
+        prepared_binding = eph.validate_effective_launch_binding(
+            request_entry.get("effective_launch_binding")
+        )
+        if prepared_binding is None:
+            return None, "the prepared launch binding is unavailable"
+        delivery_digest = (
+            request_delivery.get("review_request_sha256")
+            if isinstance(request_delivery, dict)
+            else None
+        )
+        if (
+            not isinstance(request_delivery, dict)
+            or frozenset(request_delivery) != {
+                "status",
+                "message_id",
+                "review_request_sha256",
+            }
+            or request_delivery.get("status") != "deliverable"
+            or request_delivery.get("message_id")
+            != request_entry.get("review_request_id")
+            or not isinstance(delivery_digest, str)
+            or delivery_digest
+            != prepared_binding.get("review_request_sha256")
+        ):
+            return None, (
+                "the prepared one-shot review request is not currently "
+                "deliverable"
+            )
+        try:
+            current_binding = eph.make_effective_launch_binding(
+                request_marker,
+                row,
+                review_request_sha256=delivery_digest,
+            )
+        except eph.EphemeralError:
+            return None, "the current effective launch evidence is unavailable"
+        if current_binding != prepared_binding:
+            return None, (
+                "the prepared effective launch binding no longer matches "
+                "current request and profile evidence"
+            )
         row["wrapped"] = True
     launch = row.get("launch")
     if not isinstance(launch, dict):
@@ -4493,9 +5167,6 @@ def configured_detached_launch(
     raw_args = launch.get("windows_args")
     if not isinstance(raw_args, list) or len(raw_args) > max_args:
         return None, "the configured launch argument list is invalid"
-    root_text = clean(str(root)) if root is not None else None
-    if root is not None and root_text is None:
-        return None, "the configured launch root is unavailable"
     raw_cwd = row.get("cwd")
     if raw_cwd is None:
         cwd = root_text
@@ -4555,10 +5226,6 @@ def configured_detached_launch(
                 value = argument.partition("=")[2]
                 if not value or value.startswith("-"):
                     return None, "the configured Codex workspace arguments are invalid"
-    rendered = subprocess.list2cmdline([executable, *args])
-    rendered_utf16_units = len(rendered.encode("utf-16-le")) // 2 + 1
-    if rendered_utf16_units > max_command_line:
-        return None, "the configured launch exceeds the runnable command-line bound"
     config_env = row.get("env")
     if config_env is not None and not isinstance(config_env, dict):
         return None, "the configured launch environment is invalid"
@@ -4568,25 +5235,63 @@ def configured_detached_launch(
             cleaned_key = clean(key)
             if cleaned_key is None:
                 return None, "the configured launch environment is invalid"
+            value = config_env[key]
+            if (
+                not isinstance(value, str)
+                or any(
+                    char == "\x00" or 0xD800 <= ord(char) <= 0xDFFF
+                    for char in value
+                )
+            ):
+                return None, "the configured launch environment is invalid"
             env_keys.append(cleaned_key)
         env_keys.sort()
-    agenttalk_python = None
-    if root_text is not None:
-        try:
-            agenttalk_python = _baked_python_pin(
-                (Path(root_text) / ".agenttalk" / "bin" / "agenttalk.cmd").read_bytes()
-            )
-        except (ArtifactValidationError, OSError):
-            agenttalk_python = None
-    if agenttalk_python is None and _token_stem(executable) in {"python", "python3", "py"}:
-        agenttalk_python = executable
-    environment = {
-        "AGENTTALK_ROOT": root_text,
-        "AGENTTALK_PY": agenttalk_python,
-        "supervisor_json_env_keys": env_keys,
-    }
-    if root_text is not None and (Path(root_text) / "src" / "agenttalk").is_dir():
-        environment["PYTHONPATH_prepend"] = str(Path(root_text) / "src")
+    if request_id is not None:
+        if recovery_environment is None:
+            return None, "the configured launch environment is invalid"
+        resource_problem = _ephemeral_recovery_resources_problem(
+            executable=executable,
+            args=args,
+            cwd=cwd,
+            configured_env=(config_env if isinstance(config_env, dict) else {}),
+            recovery_environment=recovery_environment,
+            cli=str(row.get("cli", "")),
+        )
+        if resource_problem is not None:
+            return None, resource_problem
+        environment = {
+            **recovery_environment,
+            "supervisor_json_env_keys": env_keys,
+            "effective_environment_sha256": row[
+                "effective_environment_sha256"
+            ],
+        }
+    else:
+        agenttalk_python = None
+        if root_text is not None:
+            try:
+                agenttalk_python = _baked_python_pin(
+                    (Path(root_text) / ".agenttalk" / "bin" / "agenttalk.cmd").read_bytes()
+                )
+            except (ArtifactValidationError, OSError):
+                agenttalk_python = None
+        if agenttalk_python is None and _token_stem(executable) in {
+            "python",
+            "python3",
+            "py",
+        }:
+            agenttalk_python = executable
+        environment = {
+            "AGENTTALK_ROOT": root_text,
+            "AGENTTALK_PY": agenttalk_python,
+            "supervisor_json_env_keys": env_keys,
+        }
+        if root_text is not None and (Path(root_text) / "src" / "agenttalk").is_dir():
+            environment["PYTHONPATH_prepend"] = str(Path(root_text) / "src")
+    rendered = subprocess.list2cmdline([executable, *args])
+    rendered_utf16_units = len(rendered.encode("utf-16-le")) // 2 + 1
+    if rendered_utf16_units > max_command_line:
+        return None, "the configured launch exceeds the runnable command-line bound"
     return {
         "source": "supervisor.json",
         "mode": "detached",
@@ -4594,9 +5299,20 @@ def configured_detached_launch(
         "cwd": cwd,
         "environment": environment,
         "environment_note": (
-            "Reproduce the listed values and any configured per-agent values; "
-            "a null AGENTTALK_PY must be recovered from the supervisor artifact, "
-            "and the supervisor may also supply an isolated CODEX_HOME and wrapper-log paths."
+            (
+                "The admitted command is bound to the exact current inherited "
+                "environment hash, every listed supervisor-owned value, and "
+                "the values for the unchanged supervisor.json keys. Wrapper-"
+                "log paths and launch nonces are intentionally fresh "
+                "capabilities and are not replayed."
+            )
+            if request_id is not None
+            else (
+                "Reproduce the listed values and any configured per-agent "
+                "values; a null AGENTTALK_PY must be recovered from the "
+                "supervisor artifact, and the supervisor may also supply an "
+                "isolated CODEX_HOME and wrapper-log paths."
+            )
         ),
     }, ""
 
@@ -4657,6 +5373,85 @@ def active_ephemeral_launch_markers(
         if isinstance(marker, dict):
             markers[request_id] = copy.deepcopy(marker)
     return markers
+
+
+def active_ephemeral_one_shot_deliveries(
+    store: Store,
+    state: dict,
+    launch_requests: dict[str, dict],
+    *,
+    limit: int = 1024,
+) -> dict[str, dict]:
+    """Classify exact one-shot request messages at the runtime receive floor."""
+    root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    active = root.get("active") if isinstance(root, dict) else None
+    if not isinstance(active, dict):
+        return {}
+    deliveries: dict[str, dict] = {}
+    request_ids = sorted(
+        request_id for request_id in active if eph.is_safe_id(request_id)
+    )[:limit]
+    for request_id in request_ids:
+        deliveries[request_id] = {"status": "unavailable"}
+        entry = active.get(request_id)
+        marker = launch_requests.get(request_id)
+        if not isinstance(entry, dict) or not isinstance(marker, dict):
+            continue
+        agent = entry.get("agent")
+        message_id = entry.get("review_request_id")
+        requested_by = entry.get("requested_by")
+        try:
+            agent = validate_agent_name(agent)
+            requested_by = validate_agent_name(requested_by)
+        except (TypeError, ValueError):
+            continue
+        prepared_binding = eph.validate_effective_launch_binding(
+            entry.get("effective_launch_binding")
+        )
+        if (
+            not eph.is_safe_id(message_id)
+            or marker.get("request_id") != request_id
+            or marker.get("agent") != agent
+            or marker.get("requested_by") != requested_by
+            or marker.get("review_request_msg_id") != message_id
+            or prepared_binding is None
+        ):
+            continue
+        try:
+            from agenttalk.wrapper import recv_api as _recv_api
+
+            envelope = _recv_api.poll(
+                store,
+                agent,
+                scoped_request_id=request_id,
+            )
+            record = envelope.get("record")
+            scoped = envelope.get("scoped")
+            review_request_sha256 = eph.effective_review_request_digest(record)
+        except Exception:  # noqa: BLE001 - unavailable is a closed projection fact
+            record = None
+            scoped = None
+            review_request_sha256 = None
+        if (
+            not isinstance(record, dict)
+            or not isinstance(scoped, dict)
+            or scoped.get("closed") is True
+            or scoped.get("superseded") is True
+            or record.get("id") != message_id
+            or record.get("kind") != "review-request"
+            or record.get("from") != requested_by
+            or record.get("to") != agent
+            or record.get("request_id") != request_id
+            or review_request_sha256
+            != prepared_binding.get("review_request_sha256")
+        ):
+            continue
+        deliveries[request_id] = {
+            "status": "deliverable",
+            "message_id": message_id,
+            "review_request_sha256": review_request_sha256,
+        }
+    return deliveries
 
 
 def active_ephemeral_lane_workspaces(store: Store) -> dict[str, str] | None:
@@ -7020,7 +7815,7 @@ def build_report(store: Store, *, now_epoch: float,
     }
 
 
-_BOOTSTRAP_SUPPORTED_CLIS = {"claude", "codex"}
+_BOOTSTRAP_SUPPORTED_CLIS = eph.SUPPORTED_WRAPPER_CLIS
 _BOOTSTRAP_PLACEHOLDER_TOKENS = (
     "REPLACE:",
     "REPLACE_WITH_PROJECT_DIR",
@@ -9676,13 +10471,21 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
 
 
 def prepare_launch_request(store: Store, state: dict, config: dict, request_id: str,
-                           *, now_epoch: float, claimed_by: str = "supervisor") -> dict:
+                           *, now_epoch: float, claimed_by: str = "supervisor",
+                           launch_agenttalk_python: str | None = None,
+                           launch_src_on_pythonpath: bool | None = None,
+                           launch_parent_environment: dict[str, str] | None = None) -> dict:
     """Claim and prepare one queued ephemeral launch request.
 
     Side effects are deliberately before process launch and are request-id
     checked: claim marker, roster temporary identity, send the review-request,
     persist active supervisor state, and return a fully substituted launch spec.
     """
+    parent_environment = (
+        _current_ephemeral_parent_environment()
+        if launch_parent_environment is None
+        else _validated_ephemeral_parent_environment(launch_parent_environment)
+    )
     marker0 = store.read_launch_request(request_id)
     if marker0 is None:
         raise eph.EphemeralError(f"launch request {request_id!r} is absent")
@@ -9775,40 +10578,165 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
             ),
         )
         raise
-    store.update_launch_request(request_id, {
+    prepared_updates = {
         "state": eph.STATE_REQUESTED,
         "agent": agent,
         "review_request_msg_id": msg.id,
         "requested_at": eph.utc_now(),
         "requested_at_epoch": now_epoch,
+        "timeout_seconds": timeout,
         "lane_id": lane_id,
         "workspace_path": workspace_path,
-    })
-    eph.record_prepared(
-        state,
-        request_id=request_id,
-        agent=agent,
-        requested_by=marker["requested_by"],
-        profile=str(marker.get("profile", "")),
-        timeout_seconds=timeout,
-        now_epoch=now_epoch,
-        review_request_id=msg.id,
-        cli=(
-            profile.get("cli")
-            if isinstance(profile.get("cli"), str)
-            else "codex"
-        ),
-        launch=(
-            profile.get("launch")
-            if isinstance(profile.get("launch"), dict)
-            else None
-        ),
+        "scope": marker.get("scope"),
+    }
+    expected_marker = {**marker, **prepared_updates}
+    durable_marker = store.update_launch_request(
+        request_id,
+        prepared_updates,
     )
-    spec = eph.launch_spec(marker, profile, agent)
+    if not isinstance(durable_marker, dict):
+        try:
+            store.retire_agent(
+                agent,
+                reason=(
+                    f"ephemeral launch {request_id} failed because its "
+                    "request marker disappeared during preparation"
+                ),
+            )
+        except ValueError:
+            pass
+        raise eph.EphemeralError(
+            f"launch request {request_id!r} disappeared during preparation"
+        )
+    try:
+        durable_errors, durable_profile = eph.validate_launch_request(
+            durable_marker,
+            store.load_config(),
+            config,
+        )
+        expected_request_digest = eph.effective_launch_request_digest(
+            expected_marker
+        )
+        durable_request_digest = eph.effective_launch_request_digest(
+            durable_marker
+        )
+    except (OSError, TypeError, ValueError) as validation_error:
+        durable_errors = [
+            f"durable launch admission was unavailable: {validation_error}"
+        ]
+        durable_profile = None
+        expected_request_digest = None
+        durable_request_digest = None
+    if (
+        durable_errors
+        or durable_profile is None
+        or durable_request_digest != expected_request_digest
+    ):
+        failure_reason = (
+            "; ".join(durable_errors)
+            if durable_errors
+            else "launch request changed during durable preparation"
+        )
+        extra = {"agent": agent}
+        try:
+            store.retire_agent(
+                agent,
+                reason=(
+                    f"ephemeral launch {request_id} failed durable "
+                    "launch admission"
+                ),
+            )
+        except ValueError as cleanup_error:
+            extra["cleanup_error"] = str(cleanup_error)
+        store.archive_launch_request(
+            request_id,
+            eph.terminal_archive(
+                durable_marker,
+                terminal_state=eph.STATE_FAILED,
+                reason=f"failed durable launch admission: {failure_reason}",
+                at_epoch=now_epoch,
+                extra=extra,
+            ),
+        )
+        raise eph.EphemeralError(failure_reason)
+    profile = durable_profile
+    spec = eph.launch_spec(
+        durable_marker,
+        profile,
+        agent,
+        root=store.root,
+    )
     window_style, warning = resolve_window_style(config, profile)
     spec["window_style"] = window_style
     spec["window_style_warning"] = warning
     spec["review_request_msg_id"] = msg.id
+    try:
+        _normalize_ephemeral_launch_root(spec, store.root)
+        _pin_ephemeral_launch_executables(spec, store.root)
+        spec["recovery_environment"] = _ephemeral_recovery_environment(
+            store.root,
+            spec,
+            agent,
+            launch_agenttalk_python=launch_agenttalk_python,
+            launch_src_on_pythonpath=launch_src_on_pythonpath,
+        )
+        spec["effective_environment_sha256"] = (
+            _effective_ephemeral_environment_digest(
+                parent_environment,
+                spec,
+                spec["recovery_environment"],
+            )
+        )
+        review_request_sha256 = eph.effective_review_request_digest(msg)
+        effective_launch_binding = eph.make_effective_launch_binding(
+            durable_marker,
+            spec,
+            review_request_sha256=review_request_sha256,
+        )
+        eph.record_prepared(
+            state,
+            request_id=request_id,
+            agent=agent,
+            requested_by=durable_marker["requested_by"],
+            profile=str(durable_marker.get("profile", "")),
+            timeout_seconds=timeout,
+            now_epoch=now_epoch,
+            review_request_id=msg.id,
+            cli=(
+                profile.get("cli")
+                if isinstance(profile.get("cli"), str)
+                else "codex"
+            ),
+            launch=(
+                profile.get("launch")
+                if isinstance(profile.get("launch"), dict)
+                else None
+            ),
+            effective_launch_binding=effective_launch_binding,
+        )
+    except eph.EphemeralError as binding_error:
+        extra = {"agent": agent}
+        try:
+            store.retire_agent(
+                agent,
+                reason=(
+                    f"ephemeral launch {request_id} failed before durable "
+                    "launch binding"
+                ),
+            )
+        except ValueError as cleanup_error:
+            extra["cleanup_error"] = str(cleanup_error)
+        store.archive_launch_request(
+            request_id,
+            eph.terminal_archive(
+                durable_marker,
+                terminal_state=eph.STATE_FAILED,
+                reason=f"failed to bind prepared launch evidence: {binding_error}",
+                at_epoch=now_epoch,
+                extra=extra,
+            ),
+        )
+        raise
     return spec
 
 
@@ -10715,6 +11643,10 @@ function Supervisor-IdentityArgs {
   if ($SupervisorStart) { $argv += @('--pid-start', $SupervisorStart) }
   return $argv
 }
+function Supervisor-InstanceIdentityArgs {
+  if (-not $InstanceToken) { throw 'supervisor instance token is unavailable' }
+  return @('--instance-token', $InstanceToken) + (Supervisor-IdentityArgs)
+}
 $InstanceToken = $null
 if (Test-Path $KillSwitchPath) { exit 3 }
 if ($DryRun) {
@@ -10764,6 +11696,29 @@ $WrapperLogEnvKeys = @(
   'AGENTTALK_WRAPPER_LOG_SEGMENTS',
   'AGENTTALK_WRAPPER_LOG_NONCE'
 )
+
+function Get-SupervisorEnvironmentCapture {
+  $values = @{}
+  $environment = [Environment]::GetEnvironmentVariables()
+  $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+  foreach ($rawName in $environment.Keys) {
+    $name = [string]$rawName
+    $value = [string]$environment[$rawName]
+    foreach ($character in $name.ToCharArray()) {
+      if ([int]$character -gt 0x7f) {
+        return [pscustomobject]@{ status = 'invalid'; values = $null }
+      }
+    }
+    try {
+      [void]$strictUtf8.GetBytes($name)
+      [void]$strictUtf8.GetBytes($value)
+    } catch {
+      return [pscustomobject]@{ status = 'invalid'; values = $null }
+    }
+    $values[$name] = $value
+  }
+  return [pscustomobject]@{ status = 'valid'; values = $values }
+}
 
 function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }
 function Assert-ActionsEnabled([string]$what) {
@@ -12236,7 +13191,7 @@ function Start-WrapperProcess([hashtable]$startArgs) {
     # the operator's visible window goes silent forever once that budget is
     # spent, while still looking healthy otherwise.
     foreach ($key in $WrapperLogEnvKeys) {
-      Remove-Item -Path ("Env:" + $key) -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath ("Env:" + $key) -ErrorAction SilentlyContinue
     }
     return [pscustomobject]@{
       Process = (Start-Process @startArgs)
@@ -12880,9 +13835,9 @@ function Launch($name, $plan, $codexHome) {
   foreach ($k in $applied.Keys) {
     $saved[$k] = [Environment]::GetEnvironmentVariable($k)
     if ($null -eq $applied[$k]) {
-      Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath ("Env:" + $k) -ErrorAction SilentlyContinue
     } else {
-      Set-Item -Path ("Env:" + $k) -Value $applied[$k]
+      Set-Item -LiteralPath ("Env:" + $k) -Value $applied[$k]
     }
   }
   try {
@@ -12912,8 +13867,8 @@ function Launch($name, $plan, $codexHome) {
     }
   } finally {
     foreach ($k in $saved.Keys) {
-      if ($null -eq $saved[$k]) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
-      else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
+      if ($null -eq $saved[$k]) { Remove-Item -LiteralPath ("Env:" + $k) -ErrorAction SilentlyContinue }
+      else { Set-Item -LiteralPath ("Env:" + $k) -Value $saved[$k] }
     }
   }
   $proc = $launch.Process
@@ -12994,6 +13949,15 @@ function Launch-Spec($name, $spec, $codexHome) {
   # .NET binding is inherently case-insensitive on the fallback path.
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }
+  # The project shim's interpreter selector belongs to the controller. The
+  # wrapped process is launched directly and must neither inherit nor bind it.
+  foreach ($controllerKey in @(
+      'AGENTTALK_PYTHON',
+      'AGENTTALK_SHIM_ACTIVE',
+      'AGENTTALK_SHIM_PARENT_PYTHONPATH',
+      'AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT')) {
+    $applied[$controllerKey] = $null
+  }
   foreach ($reserved in $WrapperLogEnvKeys) {
     $null = $applied.Remove($reserved)
     $applied[$reserved] = $null
@@ -13008,9 +13972,9 @@ function Launch-Spec($name, $spec, $codexHome) {
   foreach ($k in $applied.Keys) {
     $saved[$k] = [Environment]::GetEnvironmentVariable($k)
     if ($null -eq $applied[$k]) {
-      Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath ("Env:" + $k) -ErrorAction SilentlyContinue
     } else {
-      Set-Item -Path ("Env:" + $k) -Value $applied[$k]
+      Set-Item -LiteralPath ("Env:" + $k) -Value $applied[$k]
     }
   }
   try {
@@ -13037,8 +14001,8 @@ function Launch-Spec($name, $spec, $codexHome) {
     }
   } finally {
     foreach ($k in $saved.Keys) {
-      if ($null -eq $saved[$k]) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
-      else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
+      if ($null -eq $saved[$k]) { Remove-Item -LiteralPath ("Env:" + $k) -ErrorAction SilentlyContinue }
+      else { Set-Item -LiteralPath ("Env:" + $k) -Value $saved[$k] }
     }
   }
   $proc = $launch.Process
@@ -13299,7 +14263,8 @@ $pollNum = 0
         if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
         $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
           '--request-id', $rid, '--terminal-state', 'denied', '--reason', $p.reason,
-          '--state-file', $StatePath, '--now', [string]$now)
+          '--state-file', $StatePath, '--now', [string]$now) +
+          (Supervisor-InstanceIdentityArgs)
         if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
           Wait-ForNextPoll $cfg
           continue supervisorPoll
@@ -13308,7 +14273,19 @@ $pollNum = 0
       }
       'ephemeral_launch' {
         if (-not (Assert-ActionsEnabled ("prepare-launch-request {0}" -f $rid))) { continue }
-        $prepText = & $AgenttalkCmd --root $Root supervise --prepare-launch-request --request-id $rid --state-file $StatePath --now $now
+        $prepEnvironmentCapture = Get-SupervisorEnvironmentCapture
+        if ($prepEnvironmentCapture.status -cne 'valid') {
+          Write-Warning (
+            "supervisor: launch-request {0}: inherited environment is not " +
+            "canonically representable; NOT launching" -f $rid)
+          Wait-ForNextPoll $cfg
+          continue supervisorPoll
+        }
+        $prepEnvironment = $prepEnvironmentCapture.values
+        $prepEnvironmentJson = $prepEnvironment | ConvertTo-Json -Compress -Depth 3
+        $prepEnvironmentEnvelope = [Convert]::ToBase64String(
+          [Text.Encoding]::UTF8.GetBytes($prepEnvironmentJson))
+        $prepText = $prepEnvironmentEnvelope | & $AgenttalkCmd --root $Root supervise --prepare-launch-request --request-id $rid --state-file $StatePath --now $now --launch-agenttalk-python $AgenttalkPython --launch-src-on-pythonpath ([string]$SrcOnPyPath).ToLowerInvariant() --launch-environment-stdin
         if ($LASTEXITCODE -ne 0) {
           Write-Warning ("supervisor: launch-request {0}: prepare failed; will retry/deny on a later poll" -f $rid)
           continue
@@ -13322,7 +14299,8 @@ $pollNum = 0
             if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
             $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
               '--request-id', $rid, '--terminal-state', 'failed', '--reason',
-              'codex home seed failed', '--state-file', $StatePath, '--now', [string]$now)
+              'codex home seed failed', '--state-file', $StatePath, '--now', [string]$now) +
+              (Supervisor-InstanceIdentityArgs)
             if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
               Wait-ForNextPoll $cfg
               continue supervisorPoll
@@ -13358,7 +14336,8 @@ $pollNum = 0
           if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
           $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
             '--request-id', $rid, '--terminal-state', 'failed', '--reason',
-            'launch returned no pid', '--state-file', $StatePath, '--now', [string]$now)
+            'launch returned no pid', '--state-file', $StatePath, '--now', [string]$now) +
+            (Supervisor-InstanceIdentityArgs)
           if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
             Wait-ForNextPoll $cfg
             continue supervisorPoll
@@ -13425,7 +14404,7 @@ $pollNum = 0
         $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
           '--request-id', $rid, '--terminal-state', $p.terminal_state, '--reason', $p.reason,
           '--completion-json', $completionJson, '--state-file', $StatePath,
-          '--now', [string]$now)
+          '--now', [string]$now) + (Supervisor-InstanceIdentityArgs)
         if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
           Wait-ForNextPoll $cfg
           continue supervisorPoll
@@ -13481,6 +14460,9 @@ def agenttalk_shim(
         f"@rem agenttalk-checkout-id: {checkout_id}\r\n"
         "@echo off\r\n"
         "setlocal\r\n"
+        "set \"AGENTTALK_SHIM_ACTIVE=1\"\r\n"
+        "if defined PYTHONPATH (set \"AGENTTALK_SHIM_PARENT_PYTHONPATH=%PYTHONPATH%\") "
+        "else (set \"AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT=1\")\r\n"
         f'if not defined AGENTTALK_PYTHON set "AGENTTALK_PYTHON={py}"\r\n'
         # %~dp0 = <root>\\.agenttalk\\bin\\ ; ..\\..\\src = <root>\\src
         'if exist "%~dp0..\\..\\src\\agenttalk\\__init__.py" '

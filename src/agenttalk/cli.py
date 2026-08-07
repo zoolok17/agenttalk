@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import dataclasses
 import io
@@ -6251,6 +6252,10 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
             supervisor_config = _load_supervisor_config(store)
         except Exception:  # noqa: BLE001 - the HOLD must survive bad config
             supervisor_config = None
+        try:
+            store_config = store.load_config()
+        except Exception:  # noqa: BLE001 - fail closed without blanking the HOLD
+            store_config = None
         restart_requests: dict[str, dict] = {}
         for name in A.configured_process_tree_hold_agents(supervisor_state):
             try:
@@ -6269,15 +6274,23 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
             store,
             supervisor_state,
         )
+        launch_deliveries = sup.active_ephemeral_one_shot_deliveries(
+            store,
+            supervisor_state,
+            launch_requests,
+        )
         lane_workspaces = sup.active_ephemeral_lane_workspaces(store)
         items += A.process_tree_hold_items(
             supervisor_state,
             supervisor_config=supervisor_config,
+            store_config=store_config,
             root=store.root,
             restart_requests=restart_requests,
             launch_requests=launch_requests,
+            launch_deliveries=launch_deliveries,
             lane_workspaces=lane_workspaces,
             reset_admissions=reset_admissions,
+            now_epoch=time.time(),
         )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
@@ -12243,6 +12256,10 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                         supervisor_config = _load_supervisor_config(store)
                     except Exception:  # noqa: BLE001 - match attention fail-closed view
                         supervisor_config = None
+                    try:
+                        store_config = store.load_config()
+                    except Exception:  # noqa: BLE001 - match attention fail-closed view
+                        store_config = None
                     restart_requests: dict[str, dict] = {}
                     if configured_reset:
                         try:
@@ -12262,16 +12279,24 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                         store,
                         state,
                     )
+                    launch_deliveries = sup.active_ephemeral_one_shot_deliveries(
+                        store,
+                        state,
+                        launch_requests,
+                    )
                     lane_workspaces = sup.active_ephemeral_lane_workspaces(store)
                     current_items = []
                     for item in A.process_tree_hold_items(
                         state,
                         supervisor_config=supervisor_config,
+                        store_config=store_config,
                         root=store.root,
                         restart_requests=restart_requests,
                         launch_requests=launch_requests,
+                        launch_deliveries=launch_deliveries,
                         lane_workspaces=lane_workspaces,
                         reset_admissions=reset_admissions,
+                        now_epoch=now,
                     ):
                         refs = item.get("source_refs")
                         if not (
@@ -12538,16 +12563,56 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         return 0
 
     if args.prepare_launch_request:
-        if not args.request_id or not args.state_file:
+        if (
+            not args.request_id
+            or not args.state_file
+            or args.launch_agenttalk_python is None
+            or args.launch_src_on_pythonpath is None
+            or not args.launch_environment_stdin
+        ):
             sys.stderr.write("agenttalk supervise --prepare-launch-request: need "
-                             "--request-id <rid> and --state-file <path>\n")
+                             "--request-id <rid>, --state-file <path>, "
+                             "--launch-agenttalk-python <path>, and "
+                             "--launch-src-on-pythonpath true|false with "
+                             "--launch-environment-stdin\n")
+            return 2
+        try:
+            stream = getattr(sys.stdin, "buffer", sys.stdin)
+            raw_environment = stream.read(1024 * 1024 + 1)
+            if isinstance(raw_environment, str):
+                raw_environment = raw_environment.encode("ascii")
+            if len(raw_environment) > 1024 * 1024:
+                raise ValueError("environment input exceeds 1 MiB")
+            launch_parent_environment = json.loads(
+                base64.b64decode(
+                    raw_environment.strip(),
+                    validate=True,
+                ).decode("utf-8")
+            )
+            if not isinstance(launch_parent_environment, dict):
+                raise ValueError("environment input must be a JSON object")
+        except (UnicodeError, ValueError) as exc:
+            sys.stderr.write(
+                "agenttalk supervise --prepare-launch-request: invalid "
+                f"base64 launch environment: {exc}\n"
+            )
             return 2
         state = _read_state()
         config = _load_supervisor_config(store)
         now = args.now if args.now is not None else time.time()
         try:
-            spec = sup.prepare_launch_request(store, state, config, args.request_id,
-                                              now_epoch=now)
+            spec = sup.prepare_launch_request(
+                store,
+                state,
+                config,
+                args.request_id,
+                now_epoch=now,
+                launch_agenttalk_python=args.launch_agenttalk_python,
+                launch_src_on_pythonpath=(
+                    args.launch_src_on_pythonpath == "true"
+                ),
+                launch_parent_environment=launch_parent_environment,
+            )
         except eph.EphemeralError as e:
             sys.stderr.write(f"agenttalk supervise --prepare-launch-request: {e}\n")
             return 3
@@ -12583,6 +12648,28 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                              "--request-id <rid>, --terminal-state <state>, and "
                              "--state-file <path>\n")
             return 2
+        state_path = store.dir / "supervisor-state.json"
+        try:
+            selected_state_path = Path(args.state_file).resolve()
+            official_state_path = state_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            sys.stderr.write(
+                "agenttalk supervise --archive-launch-request: state path "
+                f"could not be resolved: {exc}\n"
+            )
+            return 2
+        if selected_state_path != official_state_path:
+            sys.stderr.write(
+                "agenttalk supervise --archive-launch-request: --state-file "
+                "must be the official .agenttalk/supervisor-state.json\n"
+            )
+            return 2
+        if not args.instance_token or args.pid is None:
+            sys.stderr.write(
+                "agenttalk supervise --archive-launch-request: need the live "
+                "supervisor --instance-token and --pid identity\n"
+            )
+            return 2
         completion = None
         if args.completion_json:
             try:
@@ -12595,21 +12682,40 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 sys.stderr.write("agenttalk supervise --archive-launch-request: "
                                  "--completion-json must be a JSON object\n")
                 return 2
-        state = _read_state()
         try:
-            sup.archive_ephemeral_request(
-                store, state, args.request_id,
-                terminal_state=args.terminal_state,
-                reason=args.reason or "",
-                now_epoch=(args.now if args.now is not None else time.time()),
-                completion=completion,
-            )
-        except eph.EphemeralError as exc:
+            with store._supervisor_lifecycle_lock():
+                marker_status, instance, marker_detail = (
+                    store._read_supervisor_instance_strict_locked()
+                )
+                if marker_status != "valid" or not isinstance(instance, dict):
+                    raise ValueError(
+                        "supervisor instance marker is "
+                        f"{marker_status}: "
+                        f"{marker_detail or 'no live supervisor identity is available'}"
+                    )
+                if (
+                    instance.get("token") != args.instance_token
+                    or instance.get("pid") != args.pid
+                    or instance.get("pid_start") != args.pid_start
+                ):
+                    raise ValueError(
+                        "supervisor instance token/pid/start did not match the "
+                        "live owner"
+                    )
+                state = sup.load_supervisor_state(state_path)
+                sup.archive_ephemeral_request(
+                    store, state, args.request_id,
+                    terminal_state=args.terminal_state,
+                    reason=args.reason or "",
+                    now_epoch=(args.now if args.now is not None else time.time()),
+                    completion=completion,
+                )
+                sup.save_supervisor_state(state_path, state)
+        except (OSError, ValueError, sup.SupervisorPersistenceError) as exc:
             sys.stderr.write(
                 f"agenttalk supervise --archive-launch-request: {exc}\n"
             )
             return 3
-        _write_state(state)
         return 0
 
     if args.launch_barrier:
@@ -14535,6 +14641,20 @@ def build_parser() -> argparse.ArgumentParser:
                       action="store_true",
                       help="(script use) Claim an ephemeral launch request, roster "
                            "the temp identity, and print its launch spec.")
+    psup.add_argument(
+        "--launch-agenttalk-python",
+        help="(script use) Running supervisor's exact AGENTTALK_PY value.",
+    )
+    psup.add_argument(
+        "--launch-src-on-pythonpath",
+        choices=("true", "false"),
+        help="(script use) Whether the running supervisor prepends <root>/src.",
+    )
+    psup.add_argument(
+        "--launch-environment-stdin",
+        action="store_true",
+        help="(script use) Read the running supervisor environment as JSON.",
+    )
     gsup.add_argument("--record-ephemeral-launch", dest="record_ephemeral_launch",
                       action="store_true",
                       help="(script use) Record ephemeral launch pid/deadline.")
@@ -14581,10 +14701,11 @@ def build_parser() -> argparse.ArgumentParser:
                                      "(default 'bypassPermissions').")
     psup.add_argument("--cli", help="(--record-launch) the agent CLI ('claude'|'codex').")
     psup.add_argument("--pid", type=int, default=None,
-                      help="(--record-launch) the LAUNCHER process id from Start-Process.")
+                       help="Process id for record-launch or live-supervisor "
+                            "identity checks.")
     psup.add_argument("--pid-start", dest="pid_start", default=None,
-                      help="(--record-launch) the launcher process start-time "
-                           "(anti-pid-reuse guard).")
+                       help="Process start-time for record-launch or live-supervisor "
+                            "anti-pid-reuse checks.")
     psup.add_argument("--pwsh",
                       help="Absolute pwsh.exe path (terminal explicit selection; no fallback).")
     psup.add_argument("--artifact-boundary", dest="artifact_boundary",
@@ -14631,7 +14752,8 @@ def build_parser() -> argparse.ArgumentParser:
              "recording the attended reset.",
     )
     psup.add_argument("--instance-token", dest="instance_token",
-                      help="(--release-instance/--drain-intents) supervisor instance token.")
+                       help="(--release-instance/--drain-intents/"
+                            "--archive-launch-request) supervisor instance token.")
     psup.add_argument("--max-per-tick", dest="max_per_tick", type=int, default=25,
                       help="(--drain-intents) maximum queued intents to claim in one tick.")
     psup.add_argument("--session-id", dest="session_id",

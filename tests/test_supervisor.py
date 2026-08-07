@@ -1215,6 +1215,35 @@ def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
     assert "Set-Content $StatePath" not in ps
 
 
+def test_generated_archive_mutations_carry_live_instance_identity() -> None:
+    ps = sup.PS_TEMPLATE
+    helper = ps[
+        ps.index("function Supervisor-InstanceIdentityArgs"):
+        ps.index("$InstanceToken = $null")
+    ]
+    assert "if (-not $InstanceToken)" in helper
+    assert (
+        "return @('--instance-token', $InstanceToken) + "
+        "(Supervisor-IdentityArgs)"
+    ) in helper
+
+    poll_loop = ps[
+        ps.index("$pollNum = 0\n:supervisorPoll do {"):
+        ps.index("} while (-not $Once)")
+    ]
+    archive_assignment = (
+        "$archiveArgs = @('--root', $Root, 'supervise', "
+        "'--archive-launch-request'"
+    )
+    archive_chunks = poll_loop.split(archive_assignment)
+    assert len(archive_chunks) == 5
+    for chunk in archive_chunks[1:]:
+        assignment = chunk.split(
+            "Invoke-CheckedSupervisorMutation", 1,
+        )[0]
+        assert "(Supervisor-InstanceIdentityArgs)" in assignment
+
+
 def test_supervisor_hosting_doc_covers_degraded_mode_and_services() -> None:
     text = Path("docs/supervisor-hosting.md").read_text(encoding="utf-8")
     assert "Scheduled Task" in text
@@ -4069,6 +4098,19 @@ def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
     assert not raw.startswith(b"\xef\xbb\xbf"), "supervisor.ps1 must be BOM-free"
     non_ascii = [b for b in raw if b > 0x7F]
     assert not non_ascii, f"supervisor.ps1 body must be ASCII-only; found {non_ascii[:5]}"
+    text = raw.decode("ascii")
+    capture = "$prepEnvironmentCapture = Get-SupervisorEnvironmentCapture"
+    status_check = "$prepEnvironmentCapture.status -cne 'valid'"
+    serialize = "$prepEnvironment | ConvertTo-Json"
+    assert "function Get-SupervisorEnvironmentCapture" in text
+    assert capture in text
+    assert status_check in text
+    assert "$prepEnvironment = $prepEnvironmentCapture.values" in text
+    assert text.index(capture) < text.index(status_check) < text.index(serialize)
+    assert "[Convert]::ToBase64String(" in text
+    assert "--launch-agenttalk-python $AgenttalkPython" in text
+    assert "--launch-src-on-pythonpath" in text
+    assert "--launch-environment-stdin" in text
     shell = shutil.which("pwsh")
     if not shell:
         return
@@ -4080,6 +4122,161 @@ def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
                          capture_output=True, text=True, timeout=60)
     assert res.returncode == 0, (
         f"supervisor.ps1 failed to parse under {shell}: {res.stdout}{res.stderr}")
+
+
+def test_supervisor_environment_capture_distinguishes_malformed_utf16(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helper = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Get-SupervisorEnvironmentCapture"):
+        sup.PS_TEMPLATE.index("function Actions-Enabled")
+    ]
+    output = tmp_path / "environment-capture.json"
+    script = tmp_path / "environment-capture.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helper,
+            "$name = 'AGENTTALK_P1A_UTF16'",
+            "$unicodeName = 'AGENTTALK_P1A_' + [char]0x212A",
+            "$asciiName = 'AGENTTALK_P1A_K'",
+            "try {",
+            "  [Environment]::SetEnvironmentVariable("
+            "$name, [string][char]0xD800, 'Process')",
+            "  $invalid = Get-SupervisorEnvironmentCapture",
+            "  [Environment]::SetEnvironmentVariable("
+            "$name, [char]::ConvertFromUtf32(0x1F642), 'Process')",
+            "  $valid = Get-SupervisorEnvironmentCapture",
+            "  [Environment]::SetEnvironmentVariable($name, $null, 'Process')",
+            "  [Environment]::SetEnvironmentVariable("
+            "$unicodeName, 'same-value', 'Process')",
+            "  [Environment]::SetEnvironmentVariable("
+            "$asciiName, 'same-value', 'Process')",
+            "  $alias = Get-SupervisorEnvironmentCapture",
+            "  [pscustomobject]@{",
+            "    invalid_status = $invalid.status;",
+            "    valid_status = $valid.status;",
+            "    alias_status = $alias.status;",
+            "    valid_codepoint = [char]::ConvertToUtf32("
+            "$valid.values[$name], 0)",
+            "  } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(output))} -Encoding utf8",
+            "} finally {",
+            "  [Environment]::SetEnvironmentVariable($name, $null, 'Process')",
+            "  [Environment]::SetEnvironmentVariable("
+            "$unicodeName, $null, 'Process')",
+            "  [Environment]::SetEnvironmentVariable("
+            "$asciiName, $null, 'Process')",
+            "}",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    assert json.loads(output.read_text(encoding="utf-8-sig")) == {
+        "invalid_status": "invalid",
+        "valid_status": "valid",
+        "alias_status": "invalid",
+        "valid_codepoint": 0x1F642,
+    }
+
+
+def test_ephemeral_launcher_applies_environment_names_literally(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    launchers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# Console action log")
+    ]
+    output = tmp_path / "literal-environment.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        "$AgenttalkPython = 'python.exe'",
+        "$SrcOnPyPath = $false",
+        "$WrapperLogMaxBytes = 1024",
+        "$WrapperLogSegments = 2",
+        "$WrapperLogEnvKeys = @('AGENTTALK_WRAPPER_STDOUT_LOG',"
+        "'AGENTTALK_WRAPPER_STDERR_LOG','AGENTTALK_WRAPPER_LOG_MAX_BYTES',"
+        "'AGENTTALK_WRAPPER_LOG_SEGMENTS','AGENTTALK_WRAPPER_LOG_NONCE')",
+        helpers,
+        "function New-WrapperLogTargets($name, $nonce) { return $null }",
+        "function Discard-PendingWrapperLogTargets($targets) {}",
+        "function Proc-Start($id) { return '1' }",
+        "function Quote-Arg([string]$arg) { return $arg }",
+        "$script:inside = $null",
+        "function Start-WrapperProcess($startArgs) {",
+        "  $script:inside = [pscustomobject]@{",
+        "    wildcard = [Environment]::GetEnvironmentVariable('AGENTTALK_P1A_*')",
+        "    sibling_a = $env:AGENTTALK_P1A_A",
+        "    sibling_b = $env:AGENTTALK_P1A_B",
+        "    python = [Environment]::GetEnvironmentVariable('AGENTTALK_PYTHON')",
+        "    shim = [Environment]::GetEnvironmentVariable('AGENTTALK_SHIM_ACTIVE')",
+        "  }",
+        "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; Redirected = $false }",
+        "}",
+        launchers,
+        "$env:AGENTTALK_P1A_A = 'old-a'",
+        "$env:AGENTTALK_P1A_B = 'old-b'",
+        "$env:AGENTTALK_PYTHON = 'controller-only'",
+        "$env:AGENTTALK_SHIM_ACTIVE = '1'",
+        "$profileEnv = [pscustomobject]@{}",
+        "$profileEnv | Add-Member -NotePropertyName 'AGENTTALK_P1A_*' -NotePropertyValue 'literal-new'",
+        "$spec = [pscustomobject]@{",
+        "  cli = 'codex'; cwd = $Root; env = $profileEnv;",
+        "  window_style = 'Hidden'; window_style_warning = $null;",
+        "  launch = [pscustomobject]@{",
+        "    windows_file = 'python.exe';",
+        "    windows_args = @('-m','agenttalk','--root',$Root,'wrap','--for',"
+        "      'reviewer','--cli','codex','--loop','--one-shot','--to-request',"
+        "      'lr-env','--','codex.exe')",
+        "  }",
+        "}",
+        "$null = Launch-Spec 'reviewer' $spec $null",
+        "[pscustomobject]@{",
+        "  inside = $script:inside;",
+        "  after_a = $env:AGENTTALK_P1A_A;",
+        "  after_b = $env:AGENTTALK_P1A_B;",
+        "  after_wildcard = [Environment]::GetEnvironmentVariable('AGENTTALK_P1A_*')",
+        "} | ConvertTo-Json -Depth 4 | "
+        f"Set-Content {_pslit(str(output))} -Encoding utf8",
+    ])
+    script = tmp_path / "literal-environment.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(output.read_text(encoding="utf-8-sig"))
+    assert payload["inside"] == {
+        "wildcard": "literal-new",
+        "sibling_a": "old-a",
+        "sibling_b": "old-b",
+        "python": None,
+        "shim": None,
+    }
+    assert payload["after_a"] == "old-a"
+    assert payload["after_b"] == "old-b"
+    assert payload["after_wildcard"] is None
 
 def test_generated_helper_ps1_are_bom_ascii_and_parse(tmp_path: Path) -> None:
     s = _team(tmp_path)
@@ -14719,6 +14916,18 @@ def test_ephemeral_record_prepared_persists_declared_module_args_from() -> None:
     Stored wholesale here (entry["launch"] = dict(launch)), not as a
     hand-picked key, so a future field of launch survives the same way."""
     state: dict = {}
+    launch = {"windows_file": "python.exe", "module_args_from": 1}
+    effective_launch_binding = eph.make_effective_launch_binding(
+        {
+            "request_id": "R1",
+            "requested_by": "lead",
+            "profile": "codex-evidence-reviewer",
+            "agent": "adversary-1",
+            "review_request_msg_id": "m1",
+        },
+        {"cli": "codex", "launch": launch},
+        review_request_sha256="a" * 64,
+    )
     eph.record_prepared(
         state,
         request_id="R1",
@@ -14729,11 +14938,13 @@ def test_ephemeral_record_prepared_persists_declared_module_args_from() -> None:
         now_epoch=NOW,
         review_request_id="m1",
         cli="codex",
-        launch={"windows_file": "python.exe", "module_args_from": 1},
+        launch=launch,
+        effective_launch_binding=effective_launch_binding,
     )
     entry = state["ephemeral_reviewers"]["active"]["R1"]
-    assert entry["launch"] == {"windows_file": "python.exe", "module_args_from": 1}
+    assert entry["launch"] == launch
     assert entry["identity_binding_version"] == 1
+    assert entry["effective_launch_binding"] == effective_launch_binding
 
 
 def test_ephemeral_record_prepared_keeps_active_allocation_history() -> None:
@@ -14753,6 +14964,17 @@ def test_ephemeral_record_prepared_keeps_active_allocation_history() -> None:
         },
     }
 
+    effective_launch_binding = eph.make_effective_launch_binding(
+        {
+            "request_id": "R2",
+            "requested_by": "lead",
+            "profile": "codex-evidence-reviewer",
+            "agent": "adversary-2",
+            "review_request_msg_id": "m2",
+        },
+        {"cli": "codex", "launch": {}},
+        review_request_sha256="b" * 64,
+    )
     eph.record_prepared(
         state,
         request_id="R2",
@@ -14762,6 +14984,7 @@ def test_ephemeral_record_prepared_keeps_active_allocation_history() -> None:
         timeout_seconds=1800,
         now_epoch=NOW,
         review_request_id="m2",
+        effective_launch_binding=effective_launch_binding,
     )
 
     assert state["ephemeral_reviewers"]["launch_history"] == [

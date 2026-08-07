@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -30,6 +33,9 @@ SUPERVISOR_NONCE = "A" * 32
 def _store(tmp_path: Path) -> Store:
     s = Store(tmp_path)
     s.init(["lead", "dev"])
+    shim = s.dir / "bin" / "agenttalk.cmd"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes(sup.agenttalk_shim(sys.executable).encode("utf-8"))
     s.set_role("lead", "lead")
     return s
 
@@ -54,11 +60,11 @@ def _cfg(**overrides) -> dict:
                     "role": "reviewer",
                     "groups": ["ephemeral-reviewers"],
                     "launch": {
-                        "windows_file": "python.exe",
+                        "windows_file": sys.executable,
                         "windows_args": [
                             "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "{AGENT}",
                             "--cli", "codex", "--loop", "--one-shot",
-                            "--to-request", "{REQUEST_ID}", "--", "codex",
+                            "--to-request", "{REQUEST_ID}", "--", sys.executable,
                         ],
                     },
                 },
@@ -164,6 +170,21 @@ def test_marker_schema_rejects_counted_signoff_and_short_revision() -> None:
     assert any("counted_signoff" in e for e in errors)
 
 
+def test_effective_launch_binding_rejects_unbounded_or_noncanonical_evidence() -> None:
+    with pytest.raises(eph.EphemeralError, match="bounded canonical size"):
+        eph.make_effective_launch_binding(
+            {"request_id": "lr-bounded"},
+            {"env": {"TOO_LARGE": "x" * 1_100_000}},
+            review_request_sha256="0" * 64,
+        )
+    with pytest.raises(eph.EphemeralError, match="non-canonical JSON"):
+        eph.make_effective_launch_binding(
+            {"request_id": "lr-canonical"},
+            {"timeout_seconds": float("nan")},
+            review_request_sha256="0" * 64,
+        )
+
+
 def test_config_validation_fails_closed_for_prompt_unauthorized_and_stale(tmp_path: Path) -> None:
     s = _store(tmp_path)
     marker = _marker(requested_by="dev", prompt="x" * 30, scope={"revision": SHA})
@@ -173,6 +194,170 @@ def test_config_validation_fails_closed_for_prompt_unauthorized_and_stale(tmp_pa
     assert any("sole lead requester required" in e for e in errors)
     assert any("above max_prompt_bytes=10" in e for e in errors)
     assert any("stale" in e for e in errors)
+
+
+def test_config_validation_rejects_unsupported_wrapper_cli(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    profile = _cfg()["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    profile["cli"] = "bogus"
+
+    errors, admitted_profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        _cfg(allowed_profiles={"codex-evidence-reviewer": profile}),
+    )
+
+    assert admitted_profile is not None
+    assert any("cli must be one of" in error for error in errors)
+
+
+def test_prepare_launch_request_rejects_unsupported_wrapper_cli_before_effects(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    request_id = "lr-unsupported-cli"
+    s.write_launch_request(_marker(request_id))
+    cfg = _cfg()
+    cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["cli"] = "bogus"
+    roster_before = s.load_config()["agents"]
+
+    with pytest.raises(eph.EphemeralError, match="cli must be one of"):
+        sup.prepare_launch_request(
+            s,
+            {},
+            cfg,
+            request_id,
+            now_epoch=NOW,
+        )
+
+    assert s.load_config()["agents"] == roster_before
+    marker = s.read_launch_request(request_id)
+    assert marker is not None
+    assert marker["state"] == eph.STATE_QUEUED
+
+
+@pytest.mark.parametrize(
+    "mode_drift",
+    [
+        "missing-loop",
+        "missing-one-shot",
+        "lead-loop",
+        "reserved-nonce",
+        "bad-min-interval",
+        "bad-dead-letter-limit",
+    ],
+)
+def test_launch_admission_requires_exact_ephemeral_one_shot_mode(
+    tmp_path: Path,
+    mode_drift: str,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    args = cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["launch"]["windows_args"]
+    if mode_drift == "missing-loop":
+        args.remove("--loop")
+    elif mode_drift == "missing-one-shot":
+        args.remove("--one-shot")
+    elif mode_drift == "lead-loop":
+        args.insert(args.index("--one-shot"), "--lead-loop")
+    elif mode_drift == "reserved-nonce":
+        args.insert(args.index("wrap"), "--supervisor-launch-nonce=forged")
+    elif mode_drift == "bad-min-interval":
+        delimiter = args.index("--")
+        args[delimiter:delimiter] = ["--min-interval", "not-a-float"]
+    else:
+        delimiter = args.index("--")
+        args[delimiter:delimiter] = [
+            "--dead-letter-max-attempts",
+            "not-an-int",
+        ]
+
+    errors, profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert profile is not None
+    assert any("exact agenttalk wrap --loop --one-shot" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "AGENTTALK_ROOT",
+        "agenttalk_self",
+        "AGENTTALK_PY",
+        "AGENTTALK_PYTHON",
+        "AGENTTALK_SHIM_ACTIVE",
+        "AGENTTALK_SHIM_PARENT_PYTHONPATH",
+        "AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT",
+        "PYTHONPATH",
+        "CODEX_HOME",
+    ],
+)
+def test_launch_admission_rejects_supervisor_owned_profile_environment(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["env"] = {name: "forged"}
+
+    errors, profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert profile is not None
+    assert any("supervisor-owned variable" in error for error in errors)
+
+
+def test_launch_admission_rejects_casefold_environment_duplicates(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["env"] = {"BOUND": "one", "bound": "two"}
+
+    errors, _profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert any("case-insensitive duplicate" in error for error in errors)
+
+
+def test_launch_admission_rejects_non_ascii_environment_names(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["env"] = {"AGENTTALK_P1A_K": "distinct-on-windows"}
+
+    errors, _profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert any("invalid variable name" in error for error in errors)
 
 
 def test_validate_launch_request_rejects_module_args_from_the_resolver_would_reject(
@@ -559,6 +744,232 @@ def test_prepare_launch_request_resolves_ephemeral_window_style(tmp_path: Path) 
     assert spec["window_style_warning"] is None
 
 
+def test_prepare_launch_request_binds_final_spec_without_persisting_env_secrets(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    s.write_launch_request(_marker("lr-bound"))
+    cfg = _cfg()
+    profile = cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    secret = "prepared-only-secret-value"
+    prepared_cwd = tmp_path / "prepared-cwd"
+    prepared_cwd.mkdir()
+    profile["cwd"] = str(prepared_cwd)
+    profile["env"] = {
+        "PREPARED_SECRET": secret,
+        "BOUND_SKILL": "{SKILL}",
+    }
+    state: dict = {}
+
+    spec = sup.prepare_launch_request(
+        s,
+        state,
+        cfg,
+        "lr-bound",
+        now_epoch=NOW,
+    )
+
+    durable_marker = s.read_launch_request("lr-bound")
+    entry = state["ephemeral_reviewers"]["active"]["lr-bound"]
+    opener = s.messages_for(spec["agent"])[0]
+    expected = eph.make_effective_launch_binding(
+        durable_marker,
+        spec,
+        review_request_sha256=eph.effective_review_request_digest(opener),
+    )
+    assert entry["effective_launch_binding"] == expected
+    assert eph.validate_effective_launch_binding(
+        entry["effective_launch_binding"]
+    ) == expected
+    assert secret not in json.dumps(state, sort_keys=True)
+    assert spec["env"]["PREPARED_SECRET"] == secret
+    assert spec["env"]["BOUND_SKILL"] == "review-code"
+    assert spec["timeout_seconds"] == 60
+    assert durable_marker["timeout_seconds"] == 60
+    assert entry["timeout_seconds"] == 60
+    codex_home = Path(spec["recovery_environment"]["CODEX_HOME"])
+    (codex_home / "skills" / "agenttalk-listen").mkdir(
+        parents=True,
+    )
+    (codex_home / "auth.json").write_text("{}", encoding="utf-8")
+    (codex_home / "config.toml").write_text("", encoding="utf-8")
+    launch_deliveries = sup.active_ephemeral_one_shot_deliveries(
+        s,
+        state,
+        {"lr-bound": durable_marker},
+    )
+    configured, problem = sup.configured_detached_launch(
+        cfg,
+        spec["agent"],
+        root=s.root,
+        store_config=s.load_config(),
+        request_id="lr-bound",
+        request_entry=entry,
+        request_marker=durable_marker,
+        request_delivery=launch_deliveries["lr-bound"],
+        now_epoch=NOW + 1,
+    )
+    assert problem == ""
+    assert configured is not None
+    assert configured["cwd"] == str(tmp_path / "prepared-cwd")
+    assert configured["environment"]["supervisor_json_env_keys"] == [
+        "AGENTTALK_SELF",
+        "BOUND_SKILL",
+        "PREPARED_SECRET",
+    ]
+
+
+def test_prepare_cli_binds_utf8_running_supervisor_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _store(tmp_path)
+    s.write_launch_request(_marker("lr-env-transport"))
+    (s.dir / "supervisor.json").write_text(
+        json.dumps(_cfg()),
+        encoding="utf-8",
+    )
+    state_path = s.dir / "supervisor-state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    parent_environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "UNICODE_BINDING": "café-雪",
+    }
+    envelope = base64.b64encode(
+        json.dumps(
+            parent_environment,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    monkeypatch.setattr(sys, "stdin", io.BytesIO(envelope))
+
+    rc = cli.main([
+        "--root", str(tmp_path),
+        "supervise",
+        "--prepare-launch-request",
+        "--request-id", "lr-env-transport",
+        "--state-file", str(state_path),
+        "--now", str(NOW),
+        "--launch-agenttalk-python", sys.executable,
+        "--launch-src-on-pythonpath", "false",
+        "--launch-environment-stdin",
+    ])
+
+    assert rc == 0
+    spec = json.loads(capsys.readouterr().out)
+    expected_spec = dict(spec)
+    expected_spec.pop("effective_environment_sha256")
+    expected = sup._effective_ephemeral_environment_digest(  # noqa: SLF001
+        sup._validated_ephemeral_parent_environment(parent_environment),  # noqa: SLF001
+        expected_spec,
+        expected_spec["recovery_environment"],
+    )
+    assert spec["effective_environment_sha256"] == expected
+    assert "café-雪" not in state_path.read_text(encoding="utf-8")
+
+
+def test_prepare_cli_rejects_lossy_unicode_environment_key_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _store(tmp_path)
+    request_id = "lr-env-key-alias"
+    s.write_launch_request(_marker(request_id))
+    (s.dir / "supervisor.json").write_text(
+        json.dumps(_cfg()),
+        encoding="utf-8",
+    )
+    state_path = s.dir / "supervisor-state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    marker_path = s.launch_requests_dir / f"{request_id}.json"
+    marker_before = marker_path.read_bytes()
+    parent_environment = {
+        "AGENTTALK_P1A_K": "same-value",
+        "AGENTTALK_P1A_K": "same-value",
+    }
+    envelope = base64.b64encode(
+        json.dumps(
+            parent_environment,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    monkeypatch.setattr(sys, "stdin", io.BytesIO(envelope))
+
+    rc = cli.main([
+        "--root", str(tmp_path),
+        "supervise",
+        "--prepare-launch-request",
+        "--request-id", request_id,
+        "--state-file", str(state_path),
+        "--now", str(NOW),
+        "--launch-agenttalk-python", sys.executable,
+        "--launch-src-on-pythonpath", "false",
+        "--launch-environment-stdin",
+    ])
+
+    assert rc == 3
+    assert "launch environment is invalid" in capsys.readouterr().err
+    assert state_path.read_text(encoding="utf-8") == "{}"
+    assert marker_path.read_bytes() == marker_before
+
+
+@pytest.mark.parametrize(
+    "drift_updates",
+    [
+        {"profile": "not-allowed-after-validation", "skill": "review-docs"},
+        {"prompt": "allowed but different after validation"},
+    ],
+    ids=["fails-current-admission", "changes-immutable-request"],
+)
+def test_prepare_launch_request_readmits_fresh_durable_marker_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift_updates: dict,
+) -> None:
+    s = _store(tmp_path)
+    request_id = "lr-durable-race"
+    s.write_launch_request(_marker(request_id))
+    original_update = s.update_launch_request
+
+    def drift_then_update(rid: str, updates: dict) -> dict | None:
+        original_update(rid, drift_updates)
+        return original_update(rid, updates)
+
+    monkeypatch.setattr(s, "update_launch_request", drift_then_update)
+    state: dict = {}
+
+    with pytest.raises(eph.EphemeralError):
+        sup.prepare_launch_request(
+            s,
+            state,
+            _cfg(),
+            request_id,
+            now_epoch=NOW,
+        )
+
+    assert s.read_launch_request(request_id) is None
+    archive = json.loads(
+        (s.launch_requests_archive_dir / f"{request_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert archive["terminal_state"] == eph.STATE_FAILED
+    assert "durable launch admission" in archive["reason"]
+    assert state.get("ephemeral_reviewers", {}).get("active", {}) == {}
+    retired = [
+        agent
+        for agent in s.retired_agents()
+        if agent.startswith(f"adversary-{request_id}")
+    ]
+    assert len(retired) == 1
+
+
 def test_prepare_lane_without_worktree_archives_denied_after_claim(tmp_path: Path) -> None:
     s = _store(tmp_path)
     lane = lanes.new_lane(
@@ -606,48 +1017,67 @@ def test_prepare_inactive_lane_worktree_archives_denied_after_claim(tmp_path: Pa
     assert "not active" in archived["reason"]
 
 
-def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path) -> None:
+def _prepared_cli_archive_fixture(
+    tmp_path: Path,
+    *,
+    request_id: str = "lr-cli-archive",
+) -> tuple[Store, str, Path]:
     s = _store(tmp_path)
-    agent = "adversary-lr-cli-archive"
-    s.add_agent(agent, role="reviewer", groups=["ephemeral-reviewers"])
-    review_request = s.send(
-        sender="lead",
-        recipient=agent,
-        kind="review-request",
-        body="review",
-        meta={
-            "request_id": "lr-cli-archive",
-            "ephemeral_request_id": "lr-cli-archive",
-            "evidence_only": "true",
-            "counted_signoff": "false",
-        },
+    s.write_launch_request(_marker(request_id))
+    state: dict = {}
+    spec = sup.prepare_launch_request(
+        s,
+        state,
+        _cfg(),
+        request_id,
+        now_epoch=NOW,
     )
-    marker = _marker(
-        "lr-cli-archive",
-        state=eph.STATE_REQUESTED,
-        agent=agent,
-        review_request_msg_id=review_request.id,
+    state_path = s.dir / "supervisor-state.json"
+    sup.save_supervisor_state(state_path, state)
+    return s, spec["agent"], state_path
+
+
+def _archive_cli_args(
+    root: Path,
+    request_id: str,
+    state_path: Path,
+    *,
+    instance: dict | None = None,
+    completion: dict | None = None,
+) -> list[str]:
+    args = [
+        "--root", str(root),
+        "supervise",
+        "--archive-launch-request",
+        "--request-id", request_id,
+        "--terminal-state", eph.STATE_COMPLETED,
+        "--reason", "typed review-result status=rejected",
+        "--state-file", str(state_path),
+        "--now", str(NOW + 1),
+    ]
+    if completion is not None:
+        args.extend(["--completion-json", json.dumps(completion)])
+    if instance is not None:
+        args.extend([
+            "--instance-token", instance["token"],
+            "--pid", str(instance["pid"]),
+        ])
+        if instance.get("pid_start") is not None:
+            args.extend(["--pid-start", instance["pid_start"]])
+    return args
+
+
+def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path) -> None:
+    request_id = "lr-cli-archive"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
     )
-    s.write_launch_request(marker)
-    state_path = tmp_path / "supervisor-state.json"
-    state_path.write_text(json.dumps({
-        "ephemeral_reviewers": {
-            "launch_history": [{
-                "request_id": "lr-cli-archive",
-                "agent": agent,
-                "at_epoch": NOW,
-            }],
-            "active": {
-                "lr-cli-archive": {
-                    "request_id": "lr-cli-archive",
-                    "agent": agent,
-                    "requested_by": "lead",
-                    "review_request_id": review_request.id,
-                    "phase": eph.STATE_LAUNCHED,
-                }
-            }
-        }
-    }), encoding="utf-8")
+    instance = s.claim_supervisor_instance(
+        pid=os.getpid(),
+        pid_start="test-supervisor-start",
+    )
+    assert instance is not None
     completion = {
         "status": eph.COMPLETION_REJECTED,
         "terminal": True,
@@ -657,25 +1087,187 @@ def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path
         "evidence_only": True,
     }
 
-    rc = cli.main([
-        "--root", str(tmp_path),
-        "supervise",
-        "--archive-launch-request",
-        "--request-id", "lr-cli-archive",
-        "--terminal-state", eph.STATE_COMPLETED,
-        "--reason", "typed review-result status=rejected",
-        "--completion-json", json.dumps(completion),
-        "--state-file", str(state_path),
-        "--now", str(NOW + 1),
-    ])
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+        completion=completion,
+    ))
 
     assert rc == 0
     archived = json.loads(
-        (s.launch_requests_archive_dir / "lr-cli-archive.json").read_text(encoding="utf-8"))
+        (s.launch_requests_archive_dir / f"{request_id}.json").read_text(encoding="utf-8"))
     assert archived["completion"] == completion
     saved_state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert "lr-cli-archive" not in saved_state["ephemeral_reviewers"]["active"]
+    assert request_id not in saved_state["ephemeral_reviewers"]["active"]
     assert agent in s.retired_agents()
+
+
+def test_cli_archive_launch_request_holds_lifecycle_lock_across_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id = "lr-cli-locked-archive"
+    s, _agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    instance = s.claim_supervisor_instance(
+        pid=os.getpid(),
+        pid_start="test-supervisor-start",
+    )
+    assert instance is not None
+    held = False
+    events: list[str] = []
+    original_read_instance = Store._read_supervisor_instance_strict_locked
+    original_load = sup.load_supervisor_state
+    original_archive = sup.archive_ephemeral_request
+    original_save = sup.save_supervisor_state
+
+    @contextmanager
+    def tracked_lifecycle_lock(_store: Store):
+        nonlocal held
+        assert held is False
+        held = True
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+            held = False
+
+    def checked_read_instance(store: Store):
+        assert held is True
+        events.append("identity")
+        return original_read_instance(store)
+
+    def checked_load(path: Path) -> dict:
+        assert held is True
+        events.append("load")
+        return original_load(path)
+
+    def checked_archive(*args, **kwargs) -> dict:
+        assert held is True
+        events.append("archive")
+        return original_archive(*args, **kwargs)
+
+    def checked_save(path: Path, state: dict) -> None:
+        assert held is True
+        events.append("save")
+        original_save(path, state)
+
+    monkeypatch.setattr(
+        Store,
+        "_supervisor_lifecycle_lock",
+        tracked_lifecycle_lock,
+    )
+    monkeypatch.setattr(
+        Store,
+        "_read_supervisor_instance_strict_locked",
+        checked_read_instance,
+    )
+    monkeypatch.setattr(sup, "load_supervisor_state", checked_load)
+    monkeypatch.setattr(sup, "archive_ephemeral_request", checked_archive)
+    monkeypatch.setattr(sup, "save_supervisor_state", checked_save)
+
+    assert cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+    )) == 0
+    assert events == ["enter", "identity", "load", "archive", "save", "exit"]
+    assert held is False
+
+
+@pytest.mark.parametrize("downgrade_copy", [False, True], ids=["versioned", "downgraded"])
+def test_cli_archive_launch_request_rejects_copied_state_before_effects(
+    tmp_path: Path,
+    downgrade_copy: bool,
+) -> None:
+    request_id = "lr-copy-archive"
+    s, agent, official_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    copied_path = tmp_path / "copied-supervisor-state.json"
+    copied_state = sup.load_supervisor_state(official_path)
+    if downgrade_copy:
+        entry = copied_state["ephemeral_reviewers"]["active"][request_id]
+        entry.pop("identity_binding_version")
+        copied_state["ephemeral_reviewers"]["launch_history"] = []
+    sup.save_supervisor_state(copied_path, copied_state)
+    instance = s.claim_supervisor_instance(
+        pid=os.getpid(),
+        pid_start="test-supervisor-start",
+    )
+    assert instance is not None
+    official_before = official_path.read_bytes()
+    copy_before = copied_path.read_bytes()
+    marker_path = s.launch_requests_dir / f"{request_id}.json"
+    marker_before = marker_path.read_bytes()
+    config_before = s.load_config()
+
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        copied_path,
+        instance=instance,
+    ))
+
+    assert rc == 2
+    assert official_path.read_bytes() == official_before
+    assert copied_path.read_bytes() == copy_before
+    assert marker_path.read_bytes() == marker_before
+    assert not (s.launch_requests_archive_dir / f"{request_id}.json").exists()
+    assert s.load_config() == config_before
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
+
+
+@pytest.mark.parametrize(
+    "identity_break",
+    ["missing", "token", "pid", "pid_start"],
+)
+def test_cli_archive_launch_request_requires_exact_live_instance_before_effects(
+    tmp_path: Path,
+    identity_break: str,
+) -> None:
+    request_id = "lr-instance-archive"
+    s, agent, official_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    instance = s.claim_supervisor_instance(
+        pid=os.getpid(),
+        pid_start="test-supervisor-start",
+    )
+    assert instance is not None
+    supplied = dict(instance)
+    if identity_break == "token":
+        supplied["token"] = "0" * 32
+    elif identity_break == "pid":
+        supplied["pid"] += 1
+    elif identity_break == "pid_start":
+        supplied["pid_start"] = "different-start"
+    official_before = official_path.read_bytes()
+    marker_path = s.launch_requests_dir / f"{request_id}.json"
+    marker_before = marker_path.read_bytes()
+
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        official_path,
+        instance=(None if identity_break == "missing" else supplied),
+    ))
+
+    assert rc == (2 if identity_break == "missing" else 3)
+    assert official_path.read_bytes() == official_before
+    assert marker_path.read_bytes() == marker_before
+    assert not (s.launch_requests_archive_dir / f"{request_id}.json").exists()
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
 
 
 def test_archive_failure_retains_ephemeral_active_state(
@@ -1578,6 +2170,7 @@ def _current_ephemeral_reset_item(
         for item in att.process_tree_hold_items(
             state,
             supervisor_config=cli._load_supervisor_config(store),  # noqa: SLF001
+            store_config=store.load_config(),
             root=store.root,
             launch_requests=sup.active_ephemeral_launch_markers(store, state),
             lane_workspaces=sup.active_ephemeral_lane_workspaces(store),

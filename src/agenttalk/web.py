@@ -2375,6 +2375,10 @@ def _collect_web_attention_items(store: Store, roster: list[str],
             )
         except Exception:  # noqa: BLE001 - the HOLD must survive bad config
             supervisor_config = None
+        try:
+            store_config = store.load_config()
+        except Exception:  # noqa: BLE001 - fail closed without blanking the HOLD
+            store_config = None
         restart_requests: dict[str, dict] = {}
         for name in A.configured_process_tree_hold_agents(state):
             try:
@@ -2392,15 +2396,23 @@ def _collect_web_attention_items(store: Store, roster: list[str],
             store,
             state,
         )
+        launch_deliveries = _supervisor.active_ephemeral_one_shot_deliveries(
+            store,
+            state,
+            launch_requests,
+        )
         lane_workspaces = _supervisor.active_ephemeral_lane_workspaces(store)
         items += A.process_tree_hold_items(
             state,
             supervisor_config=supervisor_config,
+            store_config=store_config,
             root=store.root,
             restart_requests=restart_requests,
             launch_requests=launch_requests,
+            launch_deliveries=launch_deliveries,
             lane_workspaces=lane_workspaces,
             reset_admissions=reset_admissions,
+            now_epoch=time.time(),
         )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))

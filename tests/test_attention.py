@@ -8,12 +8,14 @@ deterministic ranking, dedupe keys, and the append-only/skip-invalid disposition
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from agenttalk import attention as att
 from agenttalk import ephemeral as eph
+from agenttalk import supervisor as sup
 from agenttalk.store import Store
 
 
@@ -1335,19 +1337,95 @@ def test_configured_launch_resolves_supported_cwd_placeholder() -> None:
     assert item["configured_launch"]["argv"] == ["python.exe", "--cwd", cwd]
 
 
-def _ephemeral_launch_attention_fixture() -> tuple[str, str, dict, dict, dict]:
+def _ephemeral_attention_store_config() -> dict:
+    agent = "adversary-lr-0123456789ab"
+    return {
+        "agents": ["lead", agent],
+        "operator_facing": "lead",
+        "roles": {"lead": "lead", agent: "reviewer"},
+        "groups": {},
+    }
+
+
+def _ephemeral_attention_delivery(row: dict) -> dict:
+    return {
+        "status": "deliverable",
+        "message_id": row["review_request_id"],
+        "review_request_sha256": row["effective_launch_binding"][
+            "review_request_sha256"
+        ],
+    }
+
+
+def _refresh_ephemeral_launch_binding(
+    row: dict,
+    marker: dict,
+    config: dict,
+    agent: str,
+) -> None:
+    profile = eph.profile_config(
+        eph.config_block(config),
+        marker["profile"],
+    )
+    assert profile is not None
+    root = config["_test_root"]
+    spec = eph.launch_spec(marker, profile, agent, root=root)
+    window_style, warning = sup.resolve_window_style(config, profile)
+    spec["window_style"] = window_style
+    spec["window_style_warning"] = warning
+    spec["review_request_msg_id"] = marker["review_request_msg_id"]
+    sup._normalize_ephemeral_launch_root(spec, root)  # noqa: SLF001
+    sup._pin_ephemeral_launch_executables(spec, root)  # noqa: SLF001
+    spec["recovery_environment"] = sup._ephemeral_recovery_environment(  # noqa: SLF001
+        root,
+        spec,
+        agent,
+    )
+    spec["effective_environment_sha256"] = (  # noqa: SLF001
+        sup._effective_ephemeral_environment_digest(  # noqa: SLF001
+            sup._current_ephemeral_parent_environment(),  # noqa: SLF001
+            spec,
+            spec["recovery_environment"],
+        )
+    )
+    existing = eph.validate_effective_launch_binding(
+        row.get("effective_launch_binding")
+    )
+    review_request_sha256 = (
+        existing["review_request_sha256"]
+        if existing is not None
+        else "0" * 64
+    )
+    row["effective_launch_binding"] = eph.make_effective_launch_binding(
+        marker,
+        spec,
+        review_request_sha256=review_request_sha256,
+    )
+
+
+def _ephemeral_launch_attention_fixture(
+    tmp_path: Path,
+) -> tuple[str, str, dict, dict, dict]:
     request_id = "lr-0123456789ab"
     agent = f"adversary-{request_id}"
+    root = tmp_path / "fleet"
+    store = Store(root)
+    store.init(["lead", agent])
+    shim = store.dir / "bin" / "agenttalk.cmd"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes(sup.agenttalk_shim(sys.executable).encode("utf-8"))
+    configured_cwd = root / "configured-cwd"
+    configured_cwd.mkdir()
     row = _process_tree_state(
         status="invalid",
         reason_code="process_tree_invalid_wrapper_state_mismatch",
     )["agents"]["worker"]
     launch = {
-        "windows_file": "python.exe",
+        "windows_file": sys.executable,
         "windows_args": [
             "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for",
             "{AGENT}", "--cli", "codex", "--loop", "--one-shot",
-            "--to-request", "{REQUEST_ID}", "--", "codex.exe",
+            "--to-request", "{REQUEST_ID}", "--", sys.executable,
         ],
     }
     row.update({
@@ -1357,6 +1435,7 @@ def _ephemeral_launch_attention_fixture() -> tuple[str, str, dict, dict, dict]:
         "review_request_id": "msg-review",
         "profile": "codex-evidence-reviewer",
         "cli": "codex",
+        "codex_home_isolation": False,
         "launch": launch,
     })
     marker = {
@@ -1371,6 +1450,7 @@ def _ephemeral_launch_attention_fixture() -> tuple[str, str, dict, dict, dict]:
         "scope": {"revision": "a" * 40, "paths": ["src"]},
         "agent": agent,
         "review_request_msg_id": "msg-review",
+        "timeout_seconds": 60,
     }
     config = {
         "agents": {},
@@ -1379,45 +1459,194 @@ def _ephemeral_launch_attention_fixture() -> tuple[str, str, dict, dict, dict]:
             "allowed_profiles": {
                 "codex-evidence-reviewer": {
                     "cli": "codex",
-                    "cwd": r"D:\fleet",
+                    "codex_home_isolation": False,
+                    "cwd": str(configured_cwd),
                     "launch": launch,
                 },
             },
         },
+        "_test_root": str(root),
     }
+    row.update({
+        "phase": eph.STATE_LAUNCHED,
+        "prepared_epoch": 999_999_999_880.0,
+        "launched_epoch": 999_999_999_940.0,
+        "timeout_seconds": 60,
+        "deadline_epoch": 1_000_000_000_000.0,
+    })
+    _refresh_ephemeral_launch_binding(row, marker, config, agent)
     return request_id, agent, row, marker, config
 
 
-def test_ephemeral_hold_uses_its_request_profile_for_detached_launch() -> None:
+def test_ephemeral_hold_uses_its_request_profile_for_detached_launch(
+    tmp_path: Path,
+) -> None:
     request_id, agent, row, marker, config = (
-        _ephemeral_launch_attention_fixture()
+        _ephemeral_launch_attention_fixture(tmp_path)
     )
     item = att.process_tree_hold_items(
         {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
 
     configured = item["configured_launch"]
-    assert configured["cwd"] == r"D:\fleet"
-    assert configured["argv"][:3] == ["python.exe", "-m", "agenttalk"]
+    assert configured["cwd"] == config["ephemeral_reviewers"][
+        "allowed_profiles"
+    ]["codex-evidence-reviewer"]["cwd"]
+    assert configured["argv"][:3] == [
+        str(Path(sys.executable).resolve()),
+        "-m",
+        "agenttalk",
+    ]
     assert configured["argv"][configured["argv"].index("--for") + 1] == agent
     assert configured["argv"][configured["argv"].index("--to-request") + 1] == request_id
     assert "configured_launch_unavailable" not in item
 
 
-def test_ephemeral_hold_rejects_profile_drift_from_persisted_request() -> None:
+def test_ephemeral_hold_without_prepared_launch_binding_is_unavailable(
+    tmp_path: Path,
+) -> None:
     request_id, _agent, row, marker, config = (
-        _ephemeral_launch_attention_fixture()
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    row.pop("effective_launch_binding", None)
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "prepared launch binding" in item["configured_launch_unavailable"]
+
+
+def test_ephemeral_hold_without_current_store_config_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "launch admission is unavailable" in item[
+        "configured_launch_unavailable"
+    ]
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        [],
+        {
+            "schema_version": 3,
+            "algorithm": "sha256",
+            "request_sha256": "a" * 64,
+            "launch_sha256": "b" * 64,
+            "review_request_sha256": "c" * 64,
+        },
+        {
+            "schema_version": True,
+            "algorithm": "sha256",
+            "request_sha256": "a" * 64,
+            "launch_sha256": "b" * 64,
+            "review_request_sha256": "c" * 64,
+        },
+        {
+            "schema_version": 2.0,
+            "algorithm": "sha256",
+            "request_sha256": "a" * 64,
+            "launch_sha256": "b" * 64,
+            "review_request_sha256": "c" * 64,
+        },
+        {
+            "schema_version": 2,
+            "algorithm": "sha256",
+            "request_sha256": "not-a-digest",
+            "launch_sha256": "b" * 64,
+            "review_request_sha256": "c" * 64,
+        },
+        {
+            "schema_version": 2,
+            "algorithm": "sha256",
+            "request_sha256": "a" * 64,
+            "launch_sha256": "b" * 64,
+            "review_request_sha256": "c" * 64,
+            "unexpected": True,
+        },
+        {
+            "schema_version": 2,
+            "algorithm": "sha256",
+            "request_sha256": "a" * 64,
+            "launch_sha256": "b" * 64,
+        },
+    ],
+    ids=[
+        "non-object",
+        "unknown-version",
+        "bool-version",
+        "float-version",
+        "bad-digest",
+        "extra-field",
+        "missing-review-digest",
+    ],
+)
+def test_ephemeral_hold_rejects_malformed_prepared_launch_binding(
+    tmp_path: Path,
+    binding: object,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    row["effective_launch_binding"] = binding
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "prepared launch binding" in item["configured_launch_unavailable"]
+
+
+def test_ephemeral_hold_rejects_profile_drift_from_persisted_request(
+    tmp_path: Path,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
     )
     row["launch"] = {"windows_file": "stale.exe", "windows_args": []}
 
     item = att.process_tree_hold_items(
         {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={request_id: marker},
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
@@ -1426,15 +1655,361 @@ def test_ephemeral_hold_rejects_profile_drift_from_persisted_request() -> None:
     assert "profile no longer matches" in item["configured_launch_unavailable"]
 
 
-def test_ephemeral_hold_reports_missing_request_launch_evidence() -> None:
+@pytest.mark.parametrize(
+    "drift",
+    ["marker-skill", "marker-prompt", "marker-scope", "profile-cwd", "profile-env"],
+)
+def test_ephemeral_hold_rejects_effective_launch_evidence_drift(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    if drift == "marker-skill":
+        marker["skill"] = "review-security"
+    elif drift == "marker-prompt":
+        marker["prompt"] = "review a different boundary"
+    elif drift == "marker-scope":
+        marker["scope"] = {"revision": "b" * 40, "paths": ["tests"]}
+    elif drift == "profile-cwd":
+        drifted_cwd = tmp_path / "drifted-cwd"
+        drifted_cwd.mkdir()
+        profile["cwd"] = str(drifted_cwd)
+    else:
+        profile["env"] = {"DRIFTED": "true"}
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert item["configured_launch_unavailable"] == (
+        "the prepared effective launch binding no longer matches current "
+        "request and profile evidence"
+    )
+
+
+def test_ephemeral_hold_binds_complete_inherited_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "prepared-secret-a")
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    kwargs = {
+        "store_config": _ephemeral_attention_store_config(),
+        "supervisor_config": config,
+        "root": config["_test_root"],
+        "launch_requests": {request_id: marker},
+        "launch_deliveries": {
+            request_id: _ephemeral_attention_delivery(row),
+        },
+        "reset_admissions": _NO_RESET_ADMITTED,
+    }
+
+    admitted = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        **kwargs,
+    )[0]
+    assert "configured_launch" in admitted
+    environment = admitted["configured_launch"]["environment"]
+    assert len(environment["effective_environment_sha256"]) == 64
+    assert "prepared-secret-a" not in json.dumps(admitted, sort_keys=True)
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "drifted-secret-b")
+    refused = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        **kwargs,
+    )[0]
+    assert "configured_launch" not in refused
+    assert refused["configured_launch_unavailable"] == (
+        "the prepared effective launch binding no longer matches current "
+        "request and profile evidence"
+    )
+
+
+def test_ephemeral_relative_child_is_pinned_against_launch_cwd(
+    tmp_path: Path,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    cwd_child = Path(profile["cwd"]) / "tools" / "child.exe"
+    root_child = Path(config["_test_root"]) / "tools" / "child.exe"
+    cwd_child.parent.mkdir()
+    root_child.parent.mkdir()
+    cwd_child.write_bytes(b"cwd")
+    root_child.write_bytes(b"root")
+    profile["launch"]["windows_args"][-1] = r"tools\child.exe"
+    row["launch"] = profile["launch"]
+    _refresh_ephemeral_launch_binding(row, marker, config, row["agent"])
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    argv = item["configured_launch"]["argv"]
+    assert argv[argv.index("--") + 1] == str(cwd_child.resolve())
+    assert str(root_child.resolve()) not in argv
+
+
+def test_ephemeral_hold_reruns_full_current_launch_admission(
+    tmp_path: Path,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    config["ephemeral_reviewers"]["allowed_skills"] = ["review-docs"]
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "failed current launch admission" in item[
+        "configured_launch_unavailable"
+    ]
+
+
+def test_ephemeral_hold_rejects_unsupported_current_wrapper_cli(
+    tmp_path: Path,
+) -> None:
+    request_id, agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    profile["cli"] = "bogus"
+    row["cli"] = "bogus"
+    _refresh_ephemeral_launch_binding(row, marker, config, agent)
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "failed current launch admission" in item[
+        "configured_launch_unavailable"
+    ]
+
+
+@pytest.mark.parametrize(
+    "mode_drift",
+    [
+        "missing-loop",
+        "missing-one-shot",
+        "lead-loop",
+        "reserved-nonce",
+        "bad-min-interval",
+        "bad-dead-letter-limit",
+    ],
+)
+def test_ephemeral_hold_rejects_wrong_current_wrapper_mode(
+    tmp_path: Path,
+    mode_drift: str,
+) -> None:
+    request_id, agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    args = profile["launch"]["windows_args"]
+    if mode_drift == "missing-loop":
+        args.remove("--loop")
+    elif mode_drift == "missing-one-shot":
+        args.remove("--one-shot")
+    elif mode_drift == "lead-loop":
+        args.insert(args.index("--one-shot"), "--lead-loop")
+    elif mode_drift == "reserved-nonce":
+        args.insert(args.index("wrap"), "--supervisor-launch-nonce=forged")
+    elif mode_drift == "bad-min-interval":
+        delimiter = args.index("--")
+        args[delimiter:delimiter] = ["--min-interval", "not-a-float"]
+    else:
+        delimiter = args.index("--")
+        args[delimiter:delimiter] = [
+            "--dead-letter-max-attempts",
+            "not-an-int",
+        ]
+    row["launch"] = profile["launch"]
+    _refresh_ephemeral_launch_binding(row, marker, config, agent)
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "failed current launch admission" in item[
+        "configured_launch_unavailable"
+    ]
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["retired", "role", "missing-group", "extra-group"],
+)
+def test_ephemeral_hold_requires_exact_current_temporary_identity(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    request_id, agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    marker["groups"] = ["security"]
+    config["ephemeral_reviewers"]["allowed_groups"] = ["security"]
+    _refresh_ephemeral_launch_binding(row, marker, config, agent)
+    store_config = _ephemeral_attention_store_config()
+    store_config["groups"] = {"security": [agent]}
+    if drift == "retired":
+        store_config["agents"].remove(agent)
+        store_config["roles"].pop(agent)
+        store_config["groups"]["security"].remove(agent)
+    elif drift == "role":
+        store_config["roles"][agent] = "developer"
+    elif drift == "missing-group":
+        store_config["groups"]["security"].remove(agent)
+    else:
+        store_config["groups"]["release"] = [agent]
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=store_config,
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "temporary identity" in item["configured_launch_unavailable"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prompt", "malformed-\ud800-prompt"),
+        ("timeout_seconds", float("nan")),
+        ("timeout_seconds", float("inf")),
+        ("timeout_seconds", float("-inf")),
+    ],
+    ids=[
+        "invalid-utf8-prompt",
+        "nan-timeout",
+        "positive-infinity",
+        "negative-infinity",
+    ],
+)
+def test_ephemeral_hold_reports_malformed_current_marker_as_unavailable(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    marker[field] = value
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "launch binding is invalid" in item["configured_launch_unavailable"]
+
+
+@pytest.mark.parametrize(
+    "limit",
+    [
+        "max_concurrent",
+        "max_per_hour",
+        "max_per_day",
+        "default_timeout_seconds",
+        "max_prompt_bytes",
+    ],
+)
+def test_ephemeral_hold_treats_nonfinite_config_limits_as_defaults(
+    tmp_path: Path,
+    limit: str,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    config["ephemeral_reviewers"][limit] = float("inf")
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" in item
+    assert "configured_launch_unavailable" not in item
+
+
+def test_ephemeral_hold_reports_missing_request_launch_evidence(
+    tmp_path: Path,
+) -> None:
     request_id, _agent, row, _marker, config = (
-        _ephemeral_launch_attention_fixture()
+        _ephemeral_launch_attention_fixture(tmp_path)
     )
 
     item = att.process_tree_hold_items(
         {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={},
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
@@ -1453,11 +2028,12 @@ def test_ephemeral_hold_reports_missing_request_launch_evidence() -> None:
     ids=["non-string-workspace", "empty-workspace", "scope-lane-mismatch"],
 )
 def test_ephemeral_hold_rejects_malformed_lane_launch_binding(
+    tmp_path: Path,
     workspace_path: object,
     scope_lane: str,
 ) -> None:
     request_id, _agent, row, marker, config = (
-        _ephemeral_launch_attention_fixture()
+        _ephemeral_launch_attention_fixture(tmp_path)
     )
     marker["lane_id"] = "review-lane"
     marker["workspace_path"] = workspace_path
@@ -1465,8 +2041,9 @@ def test_ephemeral_hold_rejects_malformed_lane_launch_binding(
 
     item = att.process_tree_hold_items(
         {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={request_id: marker},
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
@@ -1479,27 +2056,37 @@ def test_ephemeral_hold_requires_current_lane_workspace_binding(
     tmp_path: Path,
 ) -> None:
     request_id, _agent, row, marker, config = (
-        _ephemeral_launch_attention_fixture()
+        _ephemeral_launch_attention_fixture(tmp_path)
     )
     workspace = str(tmp_path / "review-lane")
+    Path(workspace).mkdir()
     marker["lane_id"] = "review-lane"
     marker["workspace_path"] = workspace
     marker["scope"]["lane_id"] = "review-lane"
+    _refresh_ephemeral_launch_binding(row, marker, config, row["agent"])
     state = {"ephemeral_reviewers": {"active": {request_id: row}}}
 
     exact = att.process_tree_hold_items(
         state,
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
         lane_workspaces={"review-lane": workspace},
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
     drifted = att.process_tree_hold_items(
         state,
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
         lane_workspaces={"review-lane": str(tmp_path / "other-lane")},
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
@@ -1509,7 +2096,7 @@ def test_ephemeral_hold_requires_current_lane_workspace_binding(
     tail_index = argv.index("--")
     assert argv[tail_index - 2:tail_index] == ["--lane-id", "review-lane"]
     assert argv[tail_index + 1:tail_index + 4] == [
-        "codex.exe",
+        str(Path(sys.executable).resolve()),
         "--add-dir",
         workspace,
     ]
@@ -1530,21 +2117,27 @@ def test_ephemeral_lane_launch_canonicalizes_duplicate_profile_binding(
     profile_lane_args: list[str],
 ) -> None:
     request_id, _agent, row, marker, config = (
-        _ephemeral_launch_attention_fixture()
+        _ephemeral_launch_attention_fixture(tmp_path)
     )
     workspace = str(tmp_path / "review-lane")
+    Path(workspace).mkdir()
     marker["lane_id"] = "review-lane"
     marker["workspace_path"] = workspace
     marker["scope"]["lane_id"] = "review-lane"
     launch = row["launch"]
     tail_index = launch["windows_args"].index("--")
     launch["windows_args"][tail_index:tail_index] = profile_lane_args
+    _refresh_ephemeral_launch_binding(row, marker, config, row["agent"])
 
     item = att.process_tree_hold_items(
         {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
         lane_workspaces={"review-lane": workspace},
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
@@ -1571,31 +2164,43 @@ def test_ephemeral_codex_lane_canonicalizes_workspace_child_binding(
     profile_child_args: list[str],
 ) -> None:
     request_id, _agent, row, marker, config = (
-        _ephemeral_launch_attention_fixture()
+        _ephemeral_launch_attention_fixture(tmp_path)
     )
     workspace = str(tmp_path / "review-lane")
+    Path(workspace).mkdir()
     marker["lane_id"] = "review-lane"
     marker["workspace_path"] = workspace
     marker["scope"]["lane_id"] = "review-lane"
     row["launch"]["windows_args"].extend(profile_child_args)
+    _refresh_ephemeral_launch_binding(row, marker, config, row["agent"])
 
     item = att.process_tree_hold_items(
         {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
         lane_workspaces={"review-lane": workspace},
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
 
     argv = item["configured_launch"]["argv"]
     tail_index = argv.index("--")
-    assert argv[tail_index + 1:] == ["codex.exe", "--add-dir", workspace]
+    assert argv[tail_index + 1:] == [
+        str(Path(sys.executable).resolve()),
+        "--add-dir",
+        workspace,
+    ]
 
 
-def test_ephemeral_launch_canonicalizes_all_dynamic_request_bindings() -> None:
+def test_ephemeral_launch_canonicalizes_all_dynamic_request_bindings(
+    tmp_path: Path,
+) -> None:
     request_id, agent, row, marker, config = (
-        _ephemeral_launch_attention_fixture()
+        _ephemeral_launch_attention_fixture(tmp_path)
     )
     launch = row["launch"]
     tail_index = launch["windows_args"].index("--")
@@ -1608,12 +2213,17 @@ def test_ephemeral_launch_canonicalizes_all_dynamic_request_bindings() -> None:
         "--to-request=lr-other",
         "--lane-id", "stale-lane",
     ]
+    _refresh_ephemeral_launch_binding(row, marker, config, agent)
 
     item = att.process_tree_hold_items(
         {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
 
@@ -1631,17 +2241,24 @@ def test_ephemeral_launch_canonicalizes_all_dynamic_request_bindings() -> None:
     assert not any(arg.startswith("--lane-id=") for arg in wrapper_args)
 
 
-def test_ephemeral_launch_rejects_orphan_codex_workspace_option() -> None:
+def test_ephemeral_launch_rejects_orphan_codex_workspace_option(
+    tmp_path: Path,
+) -> None:
     request_id, _agent, row, marker, config = (
-        _ephemeral_launch_attention_fixture()
+        _ephemeral_launch_attention_fixture(tmp_path)
     )
     row["launch"]["windows_args"].append("--add-dir")
+    _refresh_ephemeral_launch_binding(row, marker, config, row["agent"])
 
     item = att.process_tree_hold_items(
         {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
         supervisor_config=config,
-        root=r"D:\fleet",
+        root=config["_test_root"],
         launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
         reset_admissions=_NO_RESET_ADMITTED,
     )[0]
 

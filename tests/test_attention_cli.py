@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import sys
+import time
 
 import pytest
 
@@ -21,6 +23,11 @@ _DISPOSITION_RACE_LOCK_TIMEOUT = 60.0
 def _team(tmp_path: Path) -> Store:
     s = Store(tmp_path)
     s.init(["beta", "claude"])
+    shim = s.dir / "bin" / "agenttalk.cmd"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes(
+        supervisor_mod.agenttalk_shim(sys.executable).encode("utf-8")
+    )
     s.set_operator_facing("claude")     # so escalate from beta resolves target=claude
     return s
 
@@ -825,93 +832,127 @@ def test_attention_collector_fail_closed_for_each_field_refusal_reason(
     assert "operator_command" not in hold
 
 
-def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
+def _write_effective_launch_bound_ephemeral_hold(
     tmp_path: Path,
-) -> None:
+    *,
+    with_lane: bool,
+) -> tuple[Store, str, str, str, Path]:
     s = _team(tmp_path)
     request_id = "lr-0123456789ab"
-    agent = f"adversary-{request_id}"
-    workspace = str(tmp_path / "ephemeral lane")
-    lane_mod.save_lanes(s, {
-        "schema_version": lane_mod.SCHEMA_VERSION,
-        "lanes": {
-            "review-lane": {
-                "status": lane_mod.STATUS_ACTIVE,
-                "worktree_path": workspace,
+    configured_cwd = str(tmp_path / "configured cwd")
+    workspace = str(tmp_path / "ephemeral lane") if with_lane else configured_cwd
+    Path(configured_cwd).mkdir()
+    Path(workspace).mkdir(exist_ok=True)
+    if with_lane:
+        lane_mod.save_lanes(s, {
+            "schema_version": lane_mod.SCHEMA_VERSION,
+            "lanes": {
+                "review-lane": {
+                    "status": lane_mod.STATUS_ACTIVE,
+                    "worktree_path": workspace,
+                },
             },
-        },
-    })
+        })
     launch = {
-        "windows_file": "python.exe",
+        "windows_file": sys.executable,
         "windows_args": [
             "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for",
             "{AGENT}", "--cli", "codex", "--loop", "--one-shot",
-            "--to-request", "{REQUEST_ID}", "--", "codex.exe",
+            "--to-request", "{REQUEST_ID}", "--", sys.executable,
         ],
     }
-    (s.dir / "supervisor.json").write_text(
-        json.dumps({
-            "agents": {},
-            "ephemeral_reviewers": {
-                "enabled": True,
-                "allowed_profiles": {
-                    "codex-evidence-reviewer": {
-                        "cli": "codex",
-                        "cwd": str(tmp_path),
-                        "launch": launch,
-                    },
-                },
+    profile = {
+        "cli": "codex",
+        "codex_home_isolation": False,
+        "cwd": configured_cwd,
+        "env": {"BOUND_ENV": "original"},
+        "launch": launch,
+    }
+    supervisor_config = {
+        "agents": {},
+        "ephemeral_reviewers": {
+            "enabled": True,
+            # Both values are admitted so the skill-drift case reaches the
+            # immutable binding comparison rather than being stopped by the
+            # independent allowlist check.
+            "allowed_skills": [
+                "review-code",
+                "review-failure-injection",
+            ],
+            "allowed_profiles": {
+                "codex-evidence-reviewer": profile,
             },
-        }),
+        },
+    }
+    supervisor_config_path = s.dir / "supervisor.json"
+    supervisor_config_path.write_text(
+        json.dumps(supervisor_config),
         encoding="utf-8",
     )
     marker = {
         "schema_version": eph.SCHEMA_VERSION,
         "kind": eph.REQUEST_KIND,
         "request_id": request_id,
-        "state": eph.STATE_LAUNCHED,
+        "state": eph.STATE_QUEUED,
         "requested_by": "claude",
         "profile": "codex-evidence-reviewer",
         "skill": "review-code",
         "prompt": "review the diff",
         "scope": {"revision": "a" * 40, "paths": ["src"]},
-        "agent": agent,
-        "review_request_msg_id": "msg-review",
-        "lane_id": "review-lane",
-        "workspace_path": workspace,
     }
-    marker["scope"]["lane_id"] = "review-lane"
+    if with_lane:
+        marker.update({
+            "lane_id": "review-lane",
+            "workspace_path": workspace,
+        })
+        marker["scope"]["lane_id"] = "review-lane"
     s.write_launch_request(marker)
+    state: dict = {}
+    now_epoch = time.time()
+    prepared_spec = supervisor_mod.prepare_launch_request(
+        s,
+        state,
+        supervisor_config,
+        request_id,
+        now_epoch=now_epoch,
+    )
+    agent = prepared_spec["agent"]
+    supervisor_mod.record_ephemeral_launch(
+        state,
+        request_id,
+        pid=1234,
+        pid_start="linux:12345678-1234-1234-1234-123456789abc:100",
+        now_epoch=now_epoch,
+        timeout_seconds=prepared_spec["timeout_seconds"],
+    )
+    durable_marker = s.read_launch_request(request_id)
+    assert durable_marker is not None
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    entry["process_tree_hold_reason"] = (
+        "process_tree_invalid_wrapper_state_mismatch"
+    )
+    entry["owned_process_tree"] = {
+        "status": "invalid",
+        "reason_code": "process_tree_invalid_wrapper_state_mismatch",
+        "observed_count": 1,
+        "limit": 64,
+        "entries": [],
+    }
     supervisor_mod.save_supervisor_state(
         s.dir / "supervisor-state.json",
-        {
-            "ephemeral_reviewers": {
-                "active": {
-                    request_id: {
-                        "request_id": request_id,
-                        "agent": agent,
-                        "requested_by": "claude",
-                        "review_request_id": "msg-review",
-                        "profile": "codex-evidence-reviewer",
-                        "cli": "codex",
-                        "launch": launch,
-                        "process_tree_hold_reason": (
-                            "process_tree_invalid_wrapper_state_mismatch"
-                        ),
-                        "owned_process_tree": {
-                            "status": "invalid",
-                            "reason_code": (
-                                "process_tree_invalid_wrapper_state_mismatch"
-                            ),
-                            "observed_count": 1,
-                            "limit": 64,
-                            "entries": [],
-                        },
-                    },
-                },
-                "launch_history": [],
-            },
-        },
+        state,
+    )
+    return s, request_id, agent, workspace, supervisor_config_path
+
+
+def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
+    tmp_path: Path,
+) -> None:
+    s, request_id, agent, workspace, _config_path = (
+        _write_effective_launch_bound_ephemeral_hold(
+            tmp_path,
+            with_lane=True,
+        )
     )
 
     cli_item = next(
@@ -934,6 +975,7 @@ def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
     )
 
     assert cli_item["configured_launch"] == web_item["configured_launch"]
+    assert cli_item["source_hash"] == web_item["source_hash"]
     assert cli_item["configured_launch"]["cwd"] == workspace
     argv = cli_item["configured_launch"]["argv"]
     assert argv[argv.index("--for") + 1] == agent
@@ -941,7 +983,80 @@ def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
     tail_index = argv.index("--")
     assert argv[tail_index - 2:tail_index] == ["--lane-id", "review-lane"]
     assert argv[tail_index + 1:tail_index + 4] == [
-        "codex.exe",
+        str(Path(sys.executable).resolve()),
         "--add-dir",
         workspace,
     ]
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "marker_skill",
+        "marker_prompt",
+        "marker_scope",
+        "profile_cwd",
+        "profile_env",
+    ],
+)
+def test_attention_cli_hides_ephemeral_launch_when_effective_binding_drifts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    drift: str,
+) -> None:
+    s, request_id, _agent, _workspace, config_path = (
+        _write_effective_launch_bound_ephemeral_hold(
+            tmp_path,
+            with_lane=False,
+        )
+    )
+    if drift.startswith("marker_"):
+        marker = s.read_launch_request(request_id)
+        assert marker is not None
+        if drift == "marker_skill":
+            marker["skill"] = "review-failure-injection"
+        elif drift == "marker_prompt":
+            marker["prompt"] = "review a different change"
+        else:
+            marker["scope"] = {"revision": "a" * 40, "paths": ["tests"]}
+        s.update_launch_request(request_id, marker)
+    else:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        profile = config["ephemeral_reviewers"]["allowed_profiles"][
+            "codex-evidence-reviewer"
+        ]
+        if drift == "profile_cwd":
+            drifted_cwd = tmp_path / "drifted cwd"
+            drifted_cwd.mkdir()
+            profile["cwd"] = str(drifted_cwd)
+        else:
+            profile["env"] = {"BOUND_ENV": "drifted"}
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert cli.main([*_root(tmp_path), "attention", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    item = next(
+        row
+        for row in payload["items"]
+        if row["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+    web_item = next(
+        row
+        for row in web_mod._collect_web_attention_items(  # noqa: SLF001
+            s,
+            ["beta", "claude"],
+            "claude",
+        )
+        if row["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+
+    assert "configured_launch" not in item
+    assert "configured_launch" not in web_item
+    assert item["configured_launch_unavailable"] == (
+        "the prepared effective launch binding no longer matches current "
+        "request and profile evidence"
+    )
+    assert web_item["configured_launch_unavailable"] == item[
+        "configured_launch_unavailable"
+    ]
+    assert web_item["source_hash"] == item["source_hash"]

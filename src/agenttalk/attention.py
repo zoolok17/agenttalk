@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -803,11 +804,14 @@ def process_tree_hold_items(
     state: dict,
     *,
     supervisor_config: dict | None = None,
+    store_config: dict | None = None,
     root: str | Path | None = None,
     restart_requests: dict[str, dict] | None = None,
     launch_requests: dict[str, dict] | None = None,
+    launch_deliveries: dict[str, dict] | None = None,
     lane_workspaces: dict[str, str] | None = None,
     reset_admissions: dict | None = None,
+    now_epoch: float | None = None,
 ) -> list[dict]:
     """Project strict supervisor process-tree HOLDs into global human attention.
 
@@ -821,6 +825,7 @@ def process_tree_hold_items(
     """
     from agenttalk import supervisor as supervisor_mod
 
+    projection_epoch = time.time() if now_epoch is None else now_epoch
     operator_root = str(root) if root is not None else None
     if (
         not operator_root
@@ -916,6 +921,7 @@ def process_tree_hold_items(
             supervisor_config,
             agent,
             root=root,
+            store_config=store_config,
             request_id=request_id,
             request_entry=(row if request_id is not None else None),
             request_marker=(
@@ -925,7 +931,15 @@ def process_tree_hold_items(
                 and isinstance(launch_requests.get(request_id), dict)
                 else None
             ),
+            request_delivery=(
+                launch_deliveries.get(request_id)
+                if request_id is not None
+                and isinstance(launch_deliveries, dict)
+                and isinstance(launch_deliveries.get(request_id), dict)
+                else None
+            ),
             lane_workspaces=lane_workspaces,
+            now_epoch=projection_epoch,
         )
         marker = (
             restart_requests.get(agent)
