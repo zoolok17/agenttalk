@@ -67,7 +67,9 @@
         "tests"
       ],
       "args": [
-        "-q"
+        "-q",
+        "-o",
+        "verbosity_assertions=2"
       ],
       "test_requirement": "pytest>=8.0",
       "timeout_seconds": 2700

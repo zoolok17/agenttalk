@@ -20,6 +20,53 @@ def _manifest() -> dict:
     return json.loads(Path("dev-gate.json").read_text(encoding="utf-8"))
 
 
+def _pytest_sidecar_payload(
+    *,
+    status: str = "captured",
+    complete: bool = True,
+    observed_failures: int = 1,
+    first_failure: dict[str, str] | None = None,
+    reporter_error: str | None = None,
+) -> dict:
+    if first_failure is None and status == "captured":
+        first_failure = {
+            "nodeid": "tests/test_failure.py::test_first",
+            "phase": "call",
+            "frame": "tests/test_failure.py:12 in test_first",
+            "assertion": "AssertionError: expected != actual",
+            "traceback": "priority traceback",
+        }
+    return {
+        "schema_version": 1,
+        "status": status,
+        "complete": complete,
+        "observed_failures": observed_failures,
+        "first_failure": first_failure,
+        "reporter_error": reporter_error,
+    }
+
+
+def _pytest_report(nodeid: str, phase: str, *, detail: str = "EXPECTED != ACTUAL") -> SimpleNamespace:
+    crash = SimpleNamespace(
+        path="tests/test_failure.py",
+        lineno=37,
+        message=f"AssertionError: {detail}",
+    )
+    longrepr = SimpleNamespace(reprcrash=crash)
+    return SimpleNamespace(
+        failed=True,
+        nodeid=nodeid,
+        when=phase,
+        location=("tests/test_failure.py", 36, nodeid.rsplit("::", 1)[-1]),
+        longrepr=longrepr,
+        longreprtext=(
+            f"{nodeid}\n"
+            "tests/test_failure.py:37: AssertionError\n"
+            f"E       AssertionError: {detail}\n"
+        ),
+    )
+
+
 def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -> dict:
     kind = check_id.split("-", 1)[0]
     mode = None
@@ -77,9 +124,9 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
         argv = [tool_path, "status", "--porcelain=v1", "--untracked-files=all"]
     elif check_id.startswith("pytest-"):
         spec = manifest["checks"]["pytest"]
-        argv = dev_gate.isolated_tool_argv(
+        argv = dev_gate.isolated_pytest_argv(
             tool_path,
-            "pytest",
+            (Path.cwd() / f"{check_id}.pytest.json").resolve(),
             *spec["args"],
             "-p",
             "no:cacheprovider",
@@ -435,6 +482,7 @@ def test_manifest_declares_real_ci_matrix_separately_from_local_interpreters() -
         lambda data: data["checks"].pop("semgrep"),
         lambda data: data.update({"ci_native_exceptions": []}),
         lambda data: data["checks"]["pytest"].update({"paths": ["tests/test_dev_gate.py"]}),
+        lambda data: data["checks"]["pytest"].update({"args": ["-q"]}),
         lambda data: data["checks"]["ruff"].update({"paths": []}),
         lambda data: data["checks"]["bandit"].update({"exclude": ["src"]}),
         lambda data: data["checks"]["gitleaks"].update({"require_full_history": False}),
@@ -589,6 +637,25 @@ def test_passing_check_command_must_match_committed_plan() -> None:
         dev_gate.validate_run_artifact(artifact, manifest)
 
 
+@pytest.mark.parametrize("mutation", ["launcher", "sidecar", "verbosity"])
+def test_pytest_command_contract_requires_reporter_and_assertion_verbosity(
+    mutation: str,
+) -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "windows/3.10")
+    record = next(check for check in artifact["checks"] if check["id"].startswith("pytest-source"))
+    if mutation == "launcher":
+        record["argv"][3] = dev_gate._ISOLATED_TOOL_LAUNCHER
+    elif mutation == "sidecar":
+        record["argv"][5] = "relative-report.json"
+    else:
+        option_index = record["argv"].index("verbosity_assertions=2")
+        record["argv"][option_index] = "verbosity_assertions=0"
+
+    with pytest.raises(dev_gate.GateBlock, match="command"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
 def test_import_provenance_rejects_parent_traversal() -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     artifact = _leg_artifact(manifest, "windows/3.10")
@@ -650,6 +717,66 @@ def test_aggregate_is_complete_but_blocked_when_one_leg_failed(tmp_path: Path) -
 
     assert aggregate["complete"] is True
     assert aggregate["verdict"] == "block"
+
+
+def test_aggregate_propagates_first_failed_check_summary(tmp_path: Path) -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest, "release")]
+    failed = artifacts[0]
+    source = next(check for check in failed["checks"] if check["id"].startswith("pytest-source"))
+    wheel = next(check for check in failed["checks"] if check["id"].startswith("pytest-wheel"))
+    first_detail = (
+        "[agenttalk pytest diagnostic v1]\n"
+        "source: gate reporter\n"
+        "test: tests/test_failure.py::test_first\n"
+        "failing frame: tests/test_failure.py:37 in test_first\n"
+        "assertion: FIRST_ASSERTION_SENTINEL\n"
+    )
+    for check, detail in (
+        (source, first_detail),
+        (wheel, "SECOND_FAILURE_MUST_NOT_REPLACE_FIRST"),
+    ):
+        check.update(
+            {
+                "status": "fail",
+                "exit_code": 1,
+                "reason_code": "check_failed",
+                "diagnostic": detail,
+            }
+        )
+    failed["verdict"] = "block"
+    failed["blockers"] = [
+        {
+            "code": "check_failed",
+            "check_id": check["id"],
+            "detail": "stale leg blocker detail",
+        }
+        for check in failed["checks"]
+        if check["status"] != "pass"
+    ]
+    failed["summary"] = {
+        "required": len(failed["checks"]),
+        "passed": len(failed["checks"]) - 2,
+        "blocked": 2,
+    }
+
+    aggregate = dev_gate.aggregate_leg_artifacts(
+        manifest,
+        "release",
+        artifacts,
+        _binding(manifest, root=_gate_repo(tmp_path)),
+    )
+
+    blocker = aggregate["blockers"][0]
+    assert blocker["code"] == "check_failed"
+    assert blocker["check_id"] == failed["ci_leg"]
+    assert blocker["detail"].startswith(f"[{source['id']}]\n")
+    assert "tests/test_failure.py::test_first" in blocker["detail"]
+    assert "FIRST_ASSERTION_SENTINEL" in blocker["detail"]
+    assert "SECOND_FAILURE_MUST_NOT_REPLACE_FIRST" not in blocker["detail"]
+    assert "stale leg blocker detail" not in blocker["detail"]
+    assert len(blocker["detail"]) <= dev_gate.DIAGNOSTIC_LIMIT
+    dev_gate.validate_aggregate_artifact(aggregate, manifest)
 
 
 def test_malformed_aggregate_header_blocks_without_type_error(tmp_path: Path) -> None:
@@ -789,6 +916,541 @@ def test_isolated_tool_launcher_cannot_be_shadowed_by_candidate_module(tmp_path:
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert not sentinel.exists()
+
+
+def test_pytest_diagnostic_keeps_reported_failure_when_terminal_tail_evicted(
+    tmp_path: Path,
+) -> None:
+    nodeid = "tests/test_large_failure.py::test_priority_failure"
+    assertion = "AssertionError: EXPECTED_SENTINEL != ACTUAL_SENTINEL"
+    frame = "tests/test_large_failure.py:37 in test_priority_failure"
+    log_path = tmp_path / "pytest.log"
+    log_path.write_text(
+        f"{nodeid}\n{frame}\n{assertion}\n" + ("late teardown noise\n" * 400),
+        encoding="utf-8",
+    )
+    terminal_tail = dev_gate._log_tail(log_path)
+    assert all(marker not in terminal_tail for marker in (nodeid, frame, assertion))
+    sidecar = tmp_path / "pytest-report.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "captured",
+                "complete": True,
+                "observed_failures": 2,
+                "first_failure": {
+                    "nodeid": nodeid,
+                    "phase": "call",
+                    "frame": frame,
+                    "assertion": assertion,
+                    "traceback": "short priority traceback",
+                },
+                "reporter_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    outcome = dev_gate.CommandOutcome(
+        argv=(sys.executable, "-m", "pytest"),
+        returncode=1,
+        duration_ms=1,
+        status="fail",
+        reason_code="check_failed",
+        diagnostic=terminal_tail,
+        log_path=log_path,
+    )
+
+    diagnostic = dev_gate._pytest_diagnostic(outcome, sidecar)
+
+    assert len(diagnostic) <= 2000
+    assert "source: gate reporter" in diagnostic
+    assert "additional failures omitted: 1" in diagnostic
+    assert all(marker in diagnostic for marker in (nodeid, frame, assertion))
+
+
+@pytest.mark.parametrize(
+    ("sidecar_text", "reason"),
+    [(None, "sidecar missing"), ("{not-json", "sidecar corrupt")],
+)
+def test_pytest_invalid_sidecar_uses_labelled_bounded_tail(
+    tmp_path: Path, sidecar_text: str | None, reason: str
+) -> None:
+    log_path = tmp_path / "pytest.log"
+    log_path.write_text(("old output\n" * 400) + "TAIL_SENTINEL\n", encoding="utf-8")
+    sidecar = tmp_path / "pytest-report.json"
+    if sidecar_text is not None:
+        sidecar.write_text(sidecar_text, encoding="utf-8")
+    outcome = dev_gate.CommandOutcome(
+        argv=(sys.executable, "-m", "pytest"),
+        returncode=1,
+        duration_ms=1,
+        status="fail",
+        reason_code="check_failed",
+        diagnostic=dev_gate._log_tail(log_path),
+        log_path=log_path,
+    )
+
+    diagnostic = dev_gate._pytest_diagnostic(outcome, sidecar)
+
+    assert len(diagnostic) <= 2000
+    assert "source: terminal-tail fallback" in diagnostic
+    assert f"reason: {reason}" in diagnostic
+    assert "TAIL_SENTINEL" in diagnostic
+
+
+@pytest.mark.parametrize("phase", ["collect", "setup", "call", "teardown"])
+def test_pytest_reporter_writes_first_failure_immediately(tmp_path: Path, phase: str) -> None:
+    sidecar = tmp_path / "pytest-report.json"
+    reporter = dev_gate._PytestFailureReporter(sidecar)
+    report = _pytest_report(f"tests/test_failure.py::test_{phase}", phase)
+
+    if phase == "collect":
+        del report.when
+        reporter.pytest_collectreport(report)
+    else:
+        reporter.pytest_runtest_logreport(report)
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["status"] == "captured"
+    assert payload["complete"] is False
+    assert payload["observed_failures"] == 1
+    assert payload["first_failure"]["nodeid"].endswith(f"test_{phase}")
+    assert payload["first_failure"]["phase"] == phase
+    assert "tests/test_failure.py:37" in payload["first_failure"]["frame"]
+    assert "EXPECTED != ACTUAL" in payload["first_failure"]["assertion"]
+
+
+def test_pytest_reporter_does_not_mislabel_a_helper_failure_frame(tmp_path: Path) -> None:
+    sidecar = tmp_path / "pytest-report.json"
+    reporter = dev_gate._PytestFailureReporter(sidecar)
+    report = _pytest_report("tests/test_failure.py::test_calls_helper", "call")
+    report.longrepr.reprcrash.path = "src/agenttalk/helper.py"
+    report.longrepr.reprcrash.lineno = 20
+
+    reporter.pytest_runtest_logreport(report)
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["first_failure"]["frame"] == "src/agenttalk/helper.py:20"
+
+
+def test_pytest_reporter_keeps_first_failure_counts_later_and_bounds_sidecar(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "pytest-report.json"
+    reporter = dev_gate._PytestFailureReporter(sidecar)
+    first = _pytest_report(
+        "tests/test_failure.py::test_first",
+        "call",
+        detail="FIRST_SENTINEL " + ("wide-Δ" * 10_000),
+    )
+    second = _pytest_report("tests/test_failure.py::test_second", "call", detail="SECOND_SENTINEL")
+
+    reporter.pytest_runtest_logreport(first)
+    reporter.pytest_runtest_logreport(second)
+    reporter.pytest_sessionfinish(None, 1)
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert len(sidecar.read_bytes()) <= dev_gate._PYTEST_REPORT_SIDECAR_LIMIT
+    assert payload["status"] == "captured"
+    assert payload["complete"] is True
+    assert payload["observed_failures"] == 2
+    assert payload["first_failure"]["nodeid"].endswith("test_first")
+    assert "SECOND_SENTINEL" not in json.dumps(payload["first_failure"])
+
+
+def test_pytest_reporter_hook_error_is_fail_soft(tmp_path: Path) -> None:
+    class BrokenReport:
+        failed = True
+        nodeid = "tests/test_failure.py::test_broken_report"
+        when = "call"
+        location = ("tests/test_failure.py", 4, "test_broken_report")
+        longrepr = SimpleNamespace(reprcrash=None)
+
+        @property
+        def longreprtext(self) -> str:
+            raise RuntimeError("REPORT_HOOK_SENTINEL")
+
+    sidecar = tmp_path / "pytest-report.json"
+    reporter = dev_gate._PytestFailureReporter(sidecar)
+
+    reporter.pytest_runtest_logreport(BrokenReport())
+    reporter.pytest_sessionfinish(None, 1)
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["status"] == "error"
+    assert payload["complete"] is True
+    assert "REPORT_HOOK_SENTINEL" in payload["reporter_error"]
+
+
+def test_pytest_reporter_unprintable_hook_error_is_fail_soft(tmp_path: Path) -> None:
+    class UnprintableError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("BROKEN_EXCEPTION_STRING")
+
+    class BrokenReport:
+        failed = True
+        nodeid = "tests/test_failure.py::test_unprintable_error"
+        when = "call"
+        location = ("tests/test_failure.py", 4, "test_unprintable_error")
+        longrepr = SimpleNamespace(reprcrash=None)
+
+        @property
+        def longreprtext(self) -> str:
+            raise UnprintableError()
+
+    sidecar = tmp_path / "pytest-report.json"
+    reporter = dev_gate._PytestFailureReporter(sidecar)
+
+    reporter.pytest_runtest_logreport(BrokenReport())
+    reporter.pytest_sessionfinish(None, 1)
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["status"] == "error"
+    assert payload["reporter_error"] == "unprintable reporter failure"
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        (
+            _pytest_sidecar_payload(
+                status="unavailable",
+                complete=False,
+                observed_failures=0,
+                first_failure=None,
+                reporter_error="RuntimeError: load failed",
+            ),
+            "reporter unavailable",
+        ),
+        (
+            _pytest_sidecar_payload(
+                status="error",
+                observed_failures=0,
+                first_failure=None,
+                reporter_error="RuntimeError: hook failed",
+            ),
+            "reporter error",
+        ),
+        (
+            _pytest_sidecar_payload(
+                status="no_failure",
+                observed_failures=0,
+                first_failure=None,
+            ),
+            "reporter produced no failure",
+        ),
+        (
+            _pytest_sidecar_payload(
+                status="running",
+                complete=False,
+                observed_failures=0,
+                first_failure=None,
+            ),
+            "reporter incomplete",
+        ),
+    ],
+)
+def test_pytest_unusable_sidecar_falls_back_without_changing_vote(
+    tmp_path: Path, payload: dict, reason: str
+) -> None:
+    log_path = tmp_path / "pytest.log"
+    log_path.write_text("TAIL_SENTINEL\n", encoding="utf-8")
+    sidecar = tmp_path / "pytest-report.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    outcome = dev_gate.CommandOutcome(
+        argv=(sys.executable,),
+        returncode=1,
+        duration_ms=1,
+        status="fail",
+        reason_code="check_failed",
+        diagnostic=dev_gate._log_tail(log_path),
+        log_path=log_path,
+    )
+
+    diagnostic = dev_gate._pytest_diagnostic(outcome, sidecar)
+
+    assert outcome.status == "fail"
+    assert len(diagnostic) <= dev_gate.DIAGNOSTIC_LIMIT
+    assert reason in diagnostic
+    assert "TAIL_SENTINEL" in diagnostic
+
+
+def test_pytest_oversized_sidecar_falls_back(tmp_path: Path) -> None:
+    log_path = tmp_path / "pytest.log"
+    log_path.write_text("TAIL_SENTINEL\n", encoding="utf-8")
+    sidecar = tmp_path / "pytest-report.json"
+    sidecar.write_bytes(b"x" * (dev_gate._PYTEST_REPORT_SIDECAR_LIMIT + 1))
+    outcome = dev_gate.CommandOutcome(
+        argv=(sys.executable,),
+        returncode=1,
+        duration_ms=1,
+        status="fail",
+        reason_code="check_failed",
+        diagnostic=dev_gate._log_tail(log_path),
+        log_path=log_path,
+    )
+
+    diagnostic = dev_gate._pytest_diagnostic(outcome, sidecar)
+
+    assert "sidecar oversized" in diagnostic
+    assert "TAIL_SENTINEL" in diagnostic
+    assert len(diagnostic) <= dev_gate.DIAGNOSTIC_LIMIT
+
+
+def test_pytest_sidecar_reader_never_allocates_beyond_its_bound() -> None:
+    observed: list[int] = []
+
+    class GuardedHandle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            observed.append(size)
+            return b"x" * size
+
+    class GuardedPath:
+        @staticmethod
+        def open(_mode: str) -> GuardedHandle:
+            return GuardedHandle()
+
+    report, problem = dev_gate._load_pytest_report(GuardedPath())
+
+    assert report is None
+    assert problem == "sidecar oversized"
+    assert observed == [dev_gate._PYTEST_REPORT_SIDECAR_LIMIT + 1]
+
+
+def test_pytest_sidecar_with_lone_surrogate_uses_serializable_fallback(tmp_path: Path) -> None:
+    log_path = tmp_path / "pytest.log"
+    log_path.write_text("TAIL_SENTINEL\n", encoding="utf-8")
+    payload = _pytest_sidecar_payload()
+    payload["first_failure"]["nodeid"] = "\ud800"
+    sidecar = tmp_path / "pytest-report.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    outcome = dev_gate.CommandOutcome(
+        argv=(sys.executable,),
+        returncode=1,
+        duration_ms=1,
+        status="fail",
+        reason_code="check_failed",
+        diagnostic=dev_gate._log_tail(log_path),
+        log_path=log_path,
+    )
+
+    diagnostic = dev_gate._pytest_diagnostic(outcome, sidecar)
+
+    assert "reason: sidecar invalid" in diagnostic
+    assert "TAIL_SENTINEL" in diagnostic
+    json.dumps({"diagnostic": diagnostic}, ensure_ascii=False).encode("utf-8")
+
+
+def test_pytest_timeout_uses_labelled_tail_when_reporter_cannot_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def time_out(argv, **kwargs):
+        kwargs["stdout"].write(("late process output\n" * 300) + "KILL_TAIL_SENTINEL\n")
+        kwargs["stdout"].flush()
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(dev_gate.subprocess, "run", time_out)
+    outcome = dev_gate.run_command(
+        check_id="pytest-source-py314",
+        argv=[sys.executable, "-c", "pass"],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        timeout_seconds=1,
+        logs_dir=tmp_path / "logs",
+    )
+    sidecar = tmp_path / "pytest-report.json"
+    sidecar.write_text(
+        json.dumps(_pytest_sidecar_payload(complete=False)),
+        encoding="utf-8",
+    )
+
+    diagnostic = dev_gate._pytest_diagnostic(outcome, sidecar)
+
+    assert outcome.status == "timeout"
+    assert outcome.reason_code == "check_timeout"
+    assert "reason: pytest process timeout" in diagnostic
+    assert "timed out after 1s" in diagnostic
+    assert len(diagnostic) <= dev_gate.DIAGNOSTIC_LIMIT
+
+
+def test_pytest_selector_exception_cannot_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_path = tmp_path / "pytest.log"
+    log_path.write_text("TAIL_SENTINEL\n", encoding="utf-8")
+    outcome = dev_gate.CommandOutcome(
+        argv=(sys.executable,),
+        returncode=1,
+        duration_ms=1,
+        status="fail",
+        reason_code="check_failed",
+        diagnostic=dev_gate._log_tail(log_path),
+        log_path=log_path,
+    )
+
+    def explode(_path: Path):
+        raise RuntimeError("SELECTOR_SENTINEL")
+
+    monkeypatch.setattr(dev_gate, "_load_pytest_report", explode)
+
+    diagnostic = dev_gate._pytest_diagnostic(outcome, tmp_path / "sidecar.json")
+
+    assert "diagnostic selector error: RuntimeError" in diagnostic
+    assert "TAIL_SENTINEL" in diagnostic
+
+
+def test_successful_pytest_without_failures_keeps_existing_diagnostic(tmp_path: Path) -> None:
+    log_path = tmp_path / "pytest.log"
+    log_path.write_text("7 passed\n", encoding="utf-8")
+    sidecar = tmp_path / "pytest-report.json"
+    sidecar.write_text(
+        json.dumps(
+            _pytest_sidecar_payload(
+                status="no_failure",
+                observed_failures=0,
+                first_failure=None,
+            )
+        ),
+        encoding="utf-8",
+    )
+    outcome = dev_gate.CommandOutcome(
+        argv=(sys.executable,),
+        returncode=0,
+        duration_ms=1,
+        status="pass",
+        reason_code=None,
+        diagnostic="7 passed\n",
+        log_path=log_path,
+    )
+
+    assert dev_gate._pytest_diagnostic(outcome, sidecar) == outcome.diagnostic
+
+
+def test_isolated_pytest_launcher_captures_verbose_assertion(tmp_path: Path) -> None:
+    test_file = tmp_path / "test_verbose_failure.py"
+    test_file.write_text(
+        "def test_verbose_failure():\n"
+        "    left = [f'item-{index}' for index in range(180)]\n"
+        "    right = list(left)\n"
+        "    left[90] = 'LEFT_ASSERTION_SENTINEL'\n"
+        "    right[90] = 'RIGHT_ASSERTION_SENTINEL'\n"
+        "    assert left == right\n",
+        encoding="utf-8",
+    )
+    shadow = tmp_path / "pytest.py"
+    shadow_sentinel = tmp_path / "shadow-ran.txt"
+    shadow.write_text(
+        f"from pathlib import Path\nPath({str(shadow_sentinel)!r}).write_text('shadow')\n",
+        encoding="utf-8",
+    )
+    sidecar = tmp_path / "pytest-report.json"
+    child_temp = tmp_path / "child-temp"
+    child_temp.mkdir()
+    argv = dev_gate.isolated_pytest_argv(
+        sys.executable,
+        sidecar,
+        "-q",
+        "-o",
+        "verbosity_assertions=2",
+        "-p",
+        "no:cacheprovider",
+        "--basetemp",
+        str((tmp_path / "pytest-temp").resolve()),
+        str(test_file.resolve()),
+        candidate_import_root=(Path.cwd() / "src").resolve(),
+    )
+
+    outcome = dev_gate.run_command(
+        check_id="pytest-reporter-integration",
+        argv=argv,
+        cwd=tmp_path,
+        env=dev_gate._base_env(child_temp),
+        timeout_seconds=30,
+        logs_dir=tmp_path / "logs",
+    )
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    captured = json.dumps(payload["first_failure"], ensure_ascii=False)
+    diagnostic = dev_gate._pytest_diagnostic(outcome, sidecar)
+    assert outcome.status == "fail"
+    assert payload["status"] == "captured"
+    assert payload["complete"] is True
+    assert payload["first_failure"]["nodeid"].endswith("test_verbose_failure")
+    assert "test_verbose_failure.py:6" in payload["first_failure"]["frame"]
+    assert "LEFT_ASSERTION_SENTINEL" in captured
+    assert "RIGHT_ASSERTION_SENTINEL" in captured
+    assert "LEFT_ASSERTION_SENTINEL" in diagnostic
+    assert "RIGHT_ASSERTION_SENTINEL" in diagnostic
+    assert len(diagnostic) <= dev_gate.DIAGNOSTIC_LIMIT
+    assert not shadow_sentinel.exists()
+
+
+@pytest.mark.parametrize("failure_mode", ["import", "construct", "unprintable"])
+def test_isolated_pytest_reporter_unavailable_does_not_vote(
+    tmp_path: Path, failure_mode: str
+) -> None:
+    candidate = tmp_path / "candidate"
+    package = candidate / "agenttalk"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    if failure_mode == "import":
+        module_text = "raise RuntimeError('REPORTER_IMPORT_SENTINEL')\n"
+    elif failure_mode == "construct":
+        module_text = (
+            "class _PytestFailureReporter:\n"
+            "    def __init__(self, path):\n"
+            "        raise RuntimeError('REPORTER_CONSTRUCT_SENTINEL')\n"
+        )
+    else:
+        module_text = (
+            "class UnprintableError(RuntimeError):\n"
+            "    def __str__(self):\n"
+            "        raise RuntimeError('BROKEN_EXCEPTION_STRING')\n"
+            "raise UnprintableError()\n"
+        )
+    (package / "dev_gate.py").write_text(module_text, encoding="utf-8")
+    test_file = tmp_path / "test_pass.py"
+    test_file.write_text("def test_pass():\n    assert True\n", encoding="utf-8")
+    sidecar = tmp_path / "pytest-report.json"
+    child_temp = tmp_path / "child-temp"
+    child_temp.mkdir()
+    argv = dev_gate.isolated_pytest_argv(
+        sys.executable,
+        sidecar,
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "--basetemp",
+        str((tmp_path / "pytest-temp").resolve()),
+        str(test_file.resolve()),
+        candidate_import_root=candidate,
+    )
+
+    outcome = dev_gate.run_command(
+        check_id=f"pytest-reporter-{failure_mode}",
+        argv=argv,
+        cwd=tmp_path,
+        env=dev_gate._base_env(child_temp),
+        timeout_seconds=30,
+        logs_dir=tmp_path / "logs",
+    )
+    diagnostic = dev_gate._pytest_diagnostic(outcome, sidecar)
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    assert outcome.status == "pass"
+    assert outcome.returncode == 0
+    assert payload["status"] == "unavailable"
+    assert failure_mode in payload["reporter_error"].casefold()
+    assert "source: terminal-tail fallback" in diagnostic
+    assert "reason: reporter unavailable" in diagnostic
+    assert len(diagnostic) <= dev_gate.DIAGNOSTIC_LIMIT
 
 
 def test_isolated_source_launcher_prefers_committed_export_over_candidate_cwd(

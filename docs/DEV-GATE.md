@@ -88,14 +88,20 @@ the evidence never presents them as content-addressed inputs.
 ## Evidence contract
 
 Run artifacts use `artifact_type: agenttalk-dev-gate-run`. They contain exact required check IDs, commands,
-resolved tool paths and versions, exit codes, durations, log hashes and tails, isolated-venv creator/prefix
-proofs, pip-configuration and child-`PATH` isolation assertions, import provenance, package
+resolved tool paths and versions, exit codes, durations, log hashes and bounded diagnostics, isolated-venv
+creator/prefix proofs, pip-configuration and child-`PATH` isolation assertions, import provenance, package
 artifact hashes, isolation assertions, blockers, and recomputed summary counts. The writer validates the full
 schema before and after a normalized durable JSON write.
 
+For a pytest failure, the 2,000-character diagnostic prioritizes the first failing test, phase, frame, and
+assertion before using any remaining space for the terminal log tail. If the gate-owned reporter is missing,
+invalid, incomplete, or unavailable, the diagnostic labels that fallback explicitly and keeps a bounded
+terminal tail. Reporter failure never changes pytest's exit status.
+
 Aggregate artifacts use `artifact_type: agenttalk-dev-gate-aggregate`. Each leg entry binds the raw input
 artifact SHA-256. A passing aggregate proves that all declared legs share the same candidate SHA, tree,
-version, manifest blob/digest, and logical plan digest and that the current checkout still matches them.
+version, manifest blob/digest, and logical plan digest and that the current checkout still matches them. A
+blocked aggregate carries the first failed check and its bounded diagnostic for each blocked leg.
 
 CI uploads every leg artifact even when its gate command blocks. The always-run aggregate converts a crashed
 or evidence-less leg into an incomplete blocking artifact instead of silently reducing the matrix.
