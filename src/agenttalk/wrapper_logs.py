@@ -803,8 +803,13 @@ class _MarkerScanOutcome(enum.Enum):
     directory does, so a distinct, narrower outcome type is the honest
     fit, not a bolted-on boolean at the file level - #113 review, round
     3). ``ABSENT`` only for ``FileNotFoundError``; ``UNUSABLE`` for
-    anything else this cannot positively confirm either way. A marker
-    that cannot be read is not a marker that is not there.
+    anything else this cannot positively confirm either way, INCLUDING a
+    successful stat of something that is not a plain file (#113 review,
+    round 4: a closed outcome set with an under-specified member is not
+    closed - ``PRESENT`` must mean a valid marker leaf, not merely that
+    some filesystem object occupies the name; a directory placed where
+    `.committed` is expected read as PRESENT before this check existed).
+    A marker that cannot be read is not a marker that is not there.
     """
 
     ABSENT = "absent"
@@ -814,10 +819,16 @@ class _MarkerScanOutcome(enum.Enum):
 
 def _scan_marker(path: Path) -> _MarkerScanOutcome:
     try:
-        path.lstat()
+        info = path.lstat()
     except FileNotFoundError:
         return _MarkerScanOutcome.ABSENT
     except OSError:
+        return _MarkerScanOutcome.UNUSABLE
+    if not stat.S_ISREG(info.st_mode):
+        # Also covers a symlink/reparse point AT the leaf itself: lstat()
+        # does not follow it, so its mode is S_ISLNK, never S_ISREG - no
+        # separate symlink check is needed here the way the directory
+        # classifier needs one for its ancestry.
         return _MarkerScanOutcome.UNUSABLE
     return _MarkerScanOutcome.PRESENT
 
@@ -847,17 +858,23 @@ def _owned_committed_generations(
                     continue
                 committed_marker = _scan_marker(generation / ".committed")
                 if committed_marker is _MarkerScanOutcome.UNUSABLE:
-                    # Cannot confirm committed one way or the other. Fail
-                    # toward TREATING it as committed - excluding it here
-                    # would make it invisible to the size-based safety
-                    # bound below without ever costing it a place in
-                    # `owned`, which is a worse blind spot than including
-                    # an uncertain candidate the bound already exists to
-                    # protect (#113 review, round 3: this exact swallow
-                    # produced owned_count 0 for a physically present
-                    # committed generation).
+                    # Cannot confirm committed one way or the other.
+                    # Counting this generation's ambiguity toward the
+                    # safety bound is conservative and fine; resolving the
+                    # ambiguity AS committed is not - that makes an
+                    # unconfirmed, possibly still-pending generation
+                    # DELETION-ELIGIBLE the moment the bound is crossed.
+                    # Deletion needs positive proof of commitment, never a
+                    # permissive resolution of an unknown (#113 review,
+                    # round 4: reviewer-1's reproduction did exactly this
+                    # - 13 generations, the oldest genuinely pending with
+                    # captured stdout, only its .committed probe
+                    # unreadable, and prune deleted it once the bound was
+                    # crossed). Treat it the same as genuinely not
+                    # committed - excluded from `owned`, never a prune
+                    # candidate - but still flag the whole scan uncertain.
                     uncertain = True
-                committed = committed_marker is not _MarkerScanOutcome.ABSENT
+                committed = committed_marker is _MarkerScanOutcome.PRESENT
                 sequence, sequence_uncertain = _read_wrapper_log_sequence(
                     generation,
                     committed=committed,
@@ -1132,13 +1149,29 @@ def read_wrapper_log_location(state_dir: Path, agent: str) -> dict[str, object]:
         # confirmed gone (stale) any more than it is confirmed present
         # (observed) - report "unusable" rather than picking either
         # confident answer from an unreadable probe.
-        generation_marker = _scan_marker(generation)
-        stdout_marker = _scan_marker(paths["stdout"])
-        stderr_marker = _scan_marker(paths["stderr"])
-        markers = (generation_marker, stdout_marker, stderr_marker)
-        if all(marker is _MarkerScanOutcome.PRESENT for marker in markers):
+        #
+        # Round 4 correction: these three expect DIFFERENT object kinds -
+        # generation must be a directory, stdout/stderr must be plain
+        # files - so this must classify each through the type-aware
+        # classifier for its own kind, not the presence-only marker
+        # probe. A presence-only check would report "observed" for a
+        # directory sitting where stdout.log belongs, exactly the
+        # under-specified-PRESENT defect just fixed in _scan_marker
+        # itself (#113 review, round 4).
+        generation_outcome = _scan_path(generation)
+        stdout_outcome = _scan_marker(paths["stdout"])
+        stderr_outcome = _scan_marker(paths["stderr"])
+        if (
+            generation_outcome is _PathScanOutcome.PLAIN_DIRECTORY
+            and stdout_outcome is _MarkerScanOutcome.PRESENT
+            and stderr_outcome is _MarkerScanOutcome.PRESENT
+        ):
             status = "observed"
-        elif any(marker is _MarkerScanOutcome.UNUSABLE for marker in markers):
+        elif (
+            generation_outcome is _PathScanOutcome.UNUSABLE
+            or stdout_outcome is _MarkerScanOutcome.UNUSABLE
+            or stderr_outcome is _MarkerScanOutcome.UNUSABLE
+        ):
             status = "unusable"
         else:
             status = "stale"

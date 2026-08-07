@@ -509,7 +509,21 @@ capture. It names the generation that actually opened, including a fallback
 selected after the preferred state root failed; it is never recomputed from
 the current environment. `observed` means those recorded files still exist,
 not that their `wrapper_pid` is currently live or that no later launch failed
-to allocate capture. Correlate `wrapper_pid` and `observed_at` with the incident.
+to allocate capture. `stale` means the recorded generation or its files are
+confirmed gone. `absent` means no record was ever written. `invalid` means a
+record exists but failed to parse. `unusable` means the record itself could
+not be read, or its generation/log files could not be confirmed to exist -
+neither `observed` nor `stale` would be an honest answer, so it is reported
+as its own state rather than guessed either way; treat it like a stale
+network share or a permissions problem, not like a genuinely missing record.
+Correlate `wrapper_pid` and `observed_at` with the incident.
+
+`--for <agent>` also resolves a **retired** ephemeral identity: if `agent` is
+not in the active roster but is a tombstoned retirement in the store, the
+report returns a sparse row (`{"retired": true, "wrapper_log": {...}}`)
+instead of refusing, so crash forensics after a timed-out or completed
+ephemeral run can still read its logs. A name that was never registered at
+all still refuses, even if a stray record happens to exist for it.
 
 Use `--bootstrap-check` before treating a roster as a live team. It emits JSON
 and verifies the operator-facing liaison, supervisor-managed agent entries,
@@ -1125,8 +1139,14 @@ Common cases:
   `agents.<agent>.wrapper_log`: an `observed` record names the last recorded
   `root`, `generation_dir`, `stdout`, and `stderr` that still exist, including
   direct launches and fallback roots. It is not liveness authority; compare
-  `wrapper_pid` and `observed_at` with the incident. `stale`, `absent`, and
-  `invalid` are explicit; the report never guesses the preferred candidate. Also check
+  `wrapper_pid` and `observed_at` with the incident. `stale`, `absent`,
+  `invalid`, and `unusable` are explicit; the report never guesses the
+  preferred candidate. `unusable` means the record or its files could not be
+  read (a permissions problem, a disconnected volume) - it is neither a
+  confirmed `observed` nor a confirmed `stale`, so it is not collapsed into
+  either. If `agent` was archived as an ephemeral reviewer, the report still
+  resolves it (`"retired": true`) as long as it is a genuine tombstone in the
+  store, not merely a name with a leftover file. Also check
   `supervise --plan`, wrapper health files, and the dead-letter sink. The wrapper
   owns the heartbeat for wrapped agents.
 - Dashboard unavailable. Use `agenttalk dashboard --port 0` to avoid port

@@ -368,6 +368,44 @@ def test_unreadable_location_record_reports_unusable_not_absent(
     assert result["generation_dir"] is None
 
 
+def test_location_status_rejects_a_directory_where_a_log_file_is_expected(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 4: the observed/stale determination expects
+    THREE different object kinds - generation must be a directory,
+    stdout/stderr must be plain files - so it must classify each through
+    the type-aware classifier for its own kind, not a presence-only
+    marker probe. A directory sitting where stdout.log belongs must not
+    read as "observed" - that status is what the manual and tutorial
+    promise means the captured output is really there."""
+    project = tmp_path / "project"
+    store = Store(project)
+    store.init(["worker"])
+    root = tmp_path / "logs"
+    generation = root / wrapper_logs._wrapper_log_agent_leaf("worker") / f"20260804T120000000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    stdout = generation / "stdout.log"
+    stderr = generation / "stderr.log"
+    stdout.mkdir()  # a directory, not a log file
+    stderr.write_text("err", encoding="utf-8")
+    wrapper_logs._record_wrapper_log_location(
+        project,
+        "worker",
+        wrapper_logs.WrapperLogInstallation(
+            True,
+            confirmed=True,
+            root=root,
+            generation_dir=generation,
+            stdout_path=stdout,
+            stderr_path=stderr,
+        ),
+    )
+
+    result = wrapper_logs.read_wrapper_log_location(store.state_dir, "worker")
+
+    assert result["status"] != "observed"
+
+
 def test_supervise_plan_never_probes_wrapper_log_filesystem(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -837,19 +875,22 @@ def test_scan_marks_retention_uncertain_not_absent_at_every_depth(
     assert uncertain is True
 
 
-def test_unreadable_committed_marker_is_counted_not_dropped(
+def test_unreadable_committed_marker_is_not_deletion_eligible_but_still_flagged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#113 review, round 3: a physically present `.committed` marker
-    that cannot be read must not collapse to "not committed" - reviewer-1
-    measured that exact collapse producing owned_count 0 for a generation
-    that was genuinely committed. Excluding it from `owned` entirely would
-    make it invisible to the size-based safety bound without ever costing
-    it a place in the count, so the fix fails toward treating an unusable
-    `.committed` probe as committed (counted, subject to the same
-    uncertain-aware safety bound as any other ambiguous generation) and
-    flags the whole scan uncertain."""
+    """#113 review, round 3 then corrected in round 4: a `.committed`
+    marker that cannot be read must not collapse to a confident "not
+    committed" (round 3's finding - reviewer-1 measured that exact
+    collapse producing owned_count 0 and uncertain False for a generation
+    that was genuinely committed) - round 3's OWN fix over-corrected by
+    resolving the ambiguity AS committed, which round 4 found makes an
+    unconfirmed generation deletion-eligible once the safety bound is
+    crossed. The correct resolution: still flag the scan uncertain (so
+    retention knows its view is incomplete) and still track its sequence
+    number (so max_sequence is not lost), but do NOT count it as owned -
+    deletion needs positive proof of commitment, never a permissive
+    resolution of an unknown."""
     root = tmp_path / "logs"
     root.mkdir()
     agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
@@ -868,8 +909,31 @@ def test_unreadable_committed_marker_is_counted_not_dropped(
         agent_leaf,
     )
 
-    assert owned == [(f"1-{9:020d}-{generation.name}", generation)]
+    assert owned == []
     assert max_sequence == 9
+    assert uncertain is True
+
+
+def test_marker_that_is_a_directory_is_not_present(tmp_path: Path) -> None:
+    """#113 review, round 4: a closed outcome set with an under-specified
+    member is not closed - PRESENT must mean a valid marker leaf, not
+    merely that some filesystem object occupies the name. A directory
+    placed where `.committed` is expected must not read as PRESENT, or
+    an unconfirmed generation is counted committed and becomes prunable
+    on nothing more than "something exists at that path"."""
+    root = tmp_path / "logs"
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    generation = root / agent_leaf / f"20260804T120001000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    (generation / ".sequence").write_text("9", encoding="utf-8")
+    (generation / ".committed").mkdir()
+
+    owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+
+    assert owned == []
     assert uncertain is True
 
 
@@ -988,6 +1052,48 @@ def test_collapsed_marker_cannot_prune_data_it_could_not_read(
     assert oldest.is_dir(), (
         "prune deleted the generation its own uncertainty marker existed to protect"
     )
+
+
+def test_unusable_committed_probe_cannot_make_a_pending_generation_deletion_eligible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review, round 4: round 3's fix covered only one member of the
+    uncertainty union - a physically PRESENT `.committed` marker that
+    could not be read. It missed the other member: a genuinely PENDING
+    generation (no real `.committed` at all) whose PROBE for `.committed`
+    itself raises. Counting that ambiguity toward the safety bound is
+    conservative and fine; resolving it AS committed is not - that makes
+    an unconfirmed, still-pending generation deletion-eligible the moment
+    the bound is crossed. Reproduces reviewer-1's exact numbers:
+    WRAPPER_LOG_GENERATIONS*3 + 1 (13) generations, the oldest genuinely
+    pending with captured stdout, only its `.committed` probe poisoned.
+    """
+    root = tmp_path / "logs"
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    total = wrapper_logs.WRAPPER_LOG_GENERATIONS * 3 + 1
+    generations: list[Path] = []
+    for sequence in range(1, total + 1):
+        generation = root / agent_leaf / f"20260804T12{sequence:04d}000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / "stdout.log").write_bytes(b"captured output")
+        (generation / "stderr.log").write_bytes(b"")
+        generations.append(generation)
+    oldest = generations[0]
+    # oldest is genuinely PENDING - no .committed at all. Every later
+    # generation is properly committed with a real sequence.
+    for index, generation in enumerate(generations[1:], start=2):
+        (generation / ".sequence").write_text(str(index), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+
+    _poison_lstat(monkeypatch, oldest / ".committed")
+
+    wrapper_logs._prune_wrapper_log_generations((root,), agent_leaf)
+
+    assert oldest.is_dir(), (
+        "prune deleted a pending generation whose .committed probe was merely unreadable"
+    )
+    assert (oldest / "stdout.log").read_bytes() == b"captured output"
 
 
 def test_prune_preserves_newest_generation_when_its_sequence_is_corrupt(

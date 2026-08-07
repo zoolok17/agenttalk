@@ -11304,13 +11304,22 @@ function Test-WrapperLogMarkerPresence([string]$path) {
   # .exists() does. A marker that cannot be read is not a marker that is
   # not there (#113 review, round 3).
   try {
-    Get-Item -LiteralPath $path -Force -ErrorAction Stop | Out-Null
-    return 'present'
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
   } catch [System.Management.Automation.ItemNotFoundException] {
     return 'absent'
   } catch {
     return 'unusable'
   }
+  # Round 4: a closed outcome set with an under-specified member is not
+  # closed - 'present' must mean a valid marker leaf, not merely that
+  # some filesystem object occupies the name. A directory or a
+  # reparse/symlink point placed where a marker is expected must not
+  # read as present.
+  if ($item.PSIsContainer -or
+      (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    return 'unusable'
+  }
+  return 'present'
 }
 function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
   # .sequence-uncertain records that THIS generation's own sequence number
@@ -11417,15 +11426,18 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
       )) {
         $committedMarker = Test-WrapperLogMarkerPresence (Join-Path $existing.FullName '.committed')
         if ($committedMarker -eq 'unusable') {
-          # Cannot confirm committed one way or the other - fail toward
-          # TREATING it as committed so its sequence still counts toward
-          # the true maximum, and flag this cycle uncertain rather than
-          # silently letting a swallowed .committed probe understate the
-          # next sequence value (#113 review, round 3; mirrors the
-          # _owned_committed_generations fix in wrapper_logs.py).
+          # Cannot confirm committed one way or the other. Counting this
+          # ambiguity toward the caller's view is conservative and fine;
+          # resolving it AS committed is not, so $committed stays $false
+          # here just like a genuinely absent marker - only flag this
+          # cycle uncertain (#113 review, round 4 correction: round 3
+          # resolved this permissively, which made an unconfirmed
+          # generation deletion-eligible downstream once a safety bound
+          # was crossed; mirrors the _owned_committed_generations fix in
+          # wrapper_logs.py).
           $uncertain = $true
         }
-        $committed = $committedMarker -ne 'absent'
+        $committed = $committedMarker -eq 'present'
         # One state policy is rendered from wrapper_logs.py and consumed by
         # both languages: a bare missing record is legacy-compatible, a
         # write-failed missing record is uncertain, and every present record
@@ -11648,7 +11660,15 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
             $old.FullName)
           continue
         }
-        $committed = Test-Path -LiteralPath (Join-Path $old.FullName '.committed')
+        # Round 4: routed through the same closed-outcome classifier as
+        # Get-NextWrapperLogSequence rather than a raw Test-Path, so
+        # there is only one implementation of "what counts as
+        # committed" left to keep in sync. Behavior here is unchanged -
+        # this site already failed toward preservation on any falsy
+        # $committed (an unusable probe now resolves the same way an
+        # absent one always did) - this closes the last raw-Test-Path
+        # instance of the pattern, not a behavior change.
+        $committed = (Test-WrapperLogMarkerPresence (Join-Path $old.FullName '.committed')) -eq 'present'
         if (-not $committed) {
           # A crash, a launch that never reached cmd_wrap (wrap --help, a
           # parse-invalid tail), or a filesystem failure can all leave a

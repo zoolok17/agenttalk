@@ -6675,17 +6675,10 @@ def test_ps_wrapper_log_marker_presence_distinguishes_absent_from_present(
     Get-NextWrapperLogSequence that swallowed an unreadable marker into a
     confident absence (mirrors _scan_marker in wrapper_logs.py). This is a
     wiring/sanity check for the confirmed-present and confirmed-absent
-    ends, not a reproduction of the OSError-swallowing case itself: unlike
-    the Python side (where Path.stat/lstat can be monkeypatched directly),
-    a real-condition repro of an unreadable-but-present file needs an
-    actual unreadable filesystem entry in a separate PowerShell process,
-    and the ACL-based attempt already tried for the equivalent Python
-    directory case was abandoned as unreliable on this environment (see
-    test_inaccessible_agent_dir_marks_retention_uncertain_not_absent's
-    docstring) - the same limitation applies here, more sharply, since
-    there is no monkeypatch seam available at all. The 'unusable' branch
-    is verified by direct mirroring of the tested-and-verified Python
-    implementation, not by an executed PowerShell failing-first test.
+    ends; the 'unusable' branch itself is exercised by an executed
+    reproduction in test_ps_unreadable_sequence_uncertain_marker_returns_unusable
+    and its neighbours below, using a real cmdlet-shadowing seam (round
+    3's note claiming no such seam existed was wrong - see those tests).
     """
     shell = _pick_powershell()
     if not shell:
@@ -6722,6 +6715,177 @@ def test_ps_wrapper_log_marker_presence_distinguishes_absent_from_present(
     payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
     assert payload["present"] == "present"
     assert payload["absent"] == "absent"
+
+
+def _ps_shadow_get_item_denying(poisoned_path: str) -> list[str]:
+    """PS lines shadowing the unqualified Get-Item cmdlet for exactly one
+    path: functions resolve before cmdlets in PowerShell's command lookup
+    order, so an unqualified `Get-Item` call inside the generated helpers
+    (how Test-WrapperLogMarkerPresence calls it) hits this shadow, while
+    `Microsoft.PowerShell.Management\\Get-Item` - the fully-qualified
+    provider form - bypasses it entirely, which is how the shadow
+    delegates for every other path without recursing into itself. This
+    is the seam that disproves round 3's "no monkeypatch seam" claim."""
+    return [
+        f"$PoisonedPath = {_pslit(poisoned_path)}",
+        "function Get-Item {",
+        "  [CmdletBinding()]",
+        "  param([Parameter(Mandatory=$true)][string]$LiteralPath, [switch]$Force)",
+        "  if ($LiteralPath -eq $PoisonedPath) {",
+        "    throw [System.UnauthorizedAccessException]::new(",
+        "      \"simulated access denied: $PoisonedPath\")",
+        "  }",
+        "  Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath "
+        "-Force:$Force -ErrorAction Stop",
+        "}",
+    ]
+
+
+def test_ps_unreadable_sequence_uncertain_marker_returns_unusable(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 4 correction: an executed reproduction of the
+    branch round 3 claimed had no monkeypatch seam - see
+    _ps_shadow_get_item_denying. A physically present `.sequence-uncertain`
+    marker whose OWN readability is poisoned must still mark the
+    generation uncertain, exactly like the Python-side test of the same
+    name."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / ".sequence").write_text("5", encoding="utf-8")
+    marker = generation / ".sequence-uncertain"
+    marker.write_bytes(b"")
+    result_path = tmp_path / "ps-shadow-sequence-uncertain.json"
+    script = tmp_path / "ps-shadow-sequence-uncertain.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            *_ps_shadow_get_item_denying(str(marker)),
+            f"$record = Read-WrapperLogSequenceRecord {_pslit(str(generation))} $true",
+            "@{ sequence = $record.sequence; uncertain = [bool]$record.uncertain; "
+            "state = [string]$record.state } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["sequence"] == 5
+    assert payload["uncertain"] is True
+
+
+def test_ps_unreadable_sequence_failed_marker_produces_write_failed_state(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 4 correction, second branch: `.sequence` is
+    genuinely absent and only `.sequence-failed` exists, but its OWN
+    readability is poisoned. Cannot confirm this is a legacy generation
+    that predates the marker system, so it must fail toward the
+    write-failed/uncertain state, not the legacy/certain one."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    marker = generation / ".sequence-failed"
+    marker.write_bytes(b"")
+    result_path = tmp_path / "ps-shadow-sequence-failed.json"
+    script = tmp_path / "ps-shadow-sequence-failed.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            *_ps_shadow_get_item_denying(str(marker)),
+            f"$record = Read-WrapperLogSequenceRecord {_pslit(str(generation))} $true",
+            "@{ sequence = $record.sequence; uncertain = [bool]$record.uncertain; "
+            "state = [string]$record.state } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["sequence"] is None
+    assert payload["state"] == "missing-write-failed"
+    assert payload["uncertain"] is True
+
+
+def test_ps_unreadable_committed_marker_retains_sequence_and_marks_uncertain(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 4 correction, third branch: Get-NextWrapperLogSequence
+    must still count a generation's real `.sequence` value toward the
+    true maximum even when its `.committed` probe itself is unreadable,
+    and must flag the scan uncertain rather than silently understating
+    the next sequence value."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    root = tmp_path / "logs"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    generation = root / agent_leaf / f"20260804T120001000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    (generation / ".sequence").write_text("9", encoding="utf-8")
+    marker = generation / ".committed"
+    marker.write_bytes(b"")
+    result_path = tmp_path / "ps-shadow-committed.json"
+    script = tmp_path / "ps-shadow-committed.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            *_ps_shadow_get_item_denying(str(marker)),
+            f"$result = Get-NextWrapperLogSequence @({_pslit(str(root))}) {_pslit(agent_leaf)}",
+            "@{ next_sequence = $result.next_sequence; "
+            "uncertain = [bool]$result.uncertain } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["next_sequence"] == 10
+    assert payload["uncertain"] is True
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")

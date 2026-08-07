@@ -175,8 +175,16 @@ Read `agents.<agent>.wrapper_log`. `status: observed` means the recorded
 generation and both files still exist; it is not wrapper-liveness or
 current-process authority. Compare `wrapper_pid` and `observed_at` when
 correlating an incident. `stale` preserves the last paths after files disappear;
-`absent` or `invalid` never substitutes the preferred candidate. A later launch
+`absent` or `invalid` never substitutes the preferred candidate. `unusable`
+means the record or its generation/files could not be confirmed to exist
+either way (a permissions problem, a disconnected volume) - it is reported
+as its own state rather than guessed into `observed` or `stale`. A later launch
 for which no root accepts capture leaves the previous record in place.
+
+`--for <agent>` also resolves a genuinely retired ephemeral identity (a
+sparse `{"retired": true, "wrapper_log": {...}}` row) if the store's own
+tombstone list confirms it was actually retired, not merely because a
+location record happens to exist for the name.
 
 Before a supervised process starts, the supervisor tries its preferred root,
 the OS temporary fallback, and the project-parent fallback in order, creating a
