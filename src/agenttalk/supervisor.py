@@ -11290,13 +11290,20 @@ function Protect-WrapperLogPaths(
   try {
     [IO.File]::WriteAllBytes($stdoutPath, [byte[]]@())
     [IO.File]::WriteAllBytes($stderrPath, [byte[]]@())
+    # #113 review, round 11: & $chmod.Source is a dynamic invocation - its
+    # target is a variable, not a literal command name, so a static
+    # scanner cannot resolve it in the general case. Allowlisted rather
+    # than refused because $chmod.Source is always the resolved PATH of
+    # the external `chmod` application (never a PowerShell function or
+    # cmdlet name), so it cannot hide a filesystem-presence/type
+    # primitive the way a dynamic PowerShell command invocation could.
     $chmod = Get-Command chmod -CommandType Application -ErrorAction Stop
     foreach ($path in @($rootDir, $agentDir, $generationDir)) {
-      & $chmod.Source '700' $path
+      & $chmod.Source '700' $path  # wrapper-log-dynamic-invocation: [justified-exception:posix-chmod] invokes the external chmod binary via its own resolved application path, see comment above
       if ($LASTEXITCODE -ne 0) { throw "chmod 700 failed for '$path'" }
     }
     foreach ($path in @($stdoutPath, $stderrPath)) {
-      & $chmod.Source '600' $path
+      & $chmod.Source '600' $path  # wrapper-log-dynamic-invocation: [justified-exception:posix-chmod] invokes the external chmod binary via its own resolved application path, see comment above
       if ($LASTEXITCODE -ne 0) { throw "chmod 600 failed for '$path'" }
     }
     return $true

@@ -660,11 +660,55 @@ foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Langua
 }
 
 $commands = @()
+$dynamicInvocations = @()
+$stringConstantType = [System.Management.Automation.Language.StringConstantExpressionAst]
 foreach ($cmd in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+  $firstElement = $cmd.CommandElements[0]
+  if (-not ($firstElement -is $stringConstantType)) {
+    # #113 review, round 11: the command name is not a static literal -
+    # "& $name ..." or dot-sourcing a variable/expression. GetCommandName()
+    # returns $null for exactly this shape, which is why it was silently
+    # invisible before: it never reached the "if ($name)" filter at all.
+    # This construct cannot be resolved statically in the general case -
+    # that is a property of the construct, not a gap to close by looking
+    # harder - so it is collected separately and REFUSED, not chased.
+    $dynamicInvocations += [ordered]@{
+      kind = "dynamic-command-invocation"
+      start = $cmd.Extent.StartOffset
+      line = $cmd.Extent.StartLineNumber
+      rawLine = $cmd.Extent.StartScriptPosition.Line
+    }
+    continue
+  }
   $name = $cmd.GetCommandName()
   if ($name) {
+    $resolved = $name
+    $stripped = $name -replace '^.*\\', ''
+    if ($stripped -ieq "Invoke-Expression" -or $stripped -ieq "iex") {
+      # #113 review, round 11: the string this evaluates is opaque to a
+      # static scan regardless of what it looks like at the call site -
+      # refused unconditionally, not just when its argument is itself
+      # non-literal.
+      $dynamicInvocations += [ordered]@{
+        kind = "invoke-expression"
+        start = $cmd.Extent.StartOffset
+        line = $cmd.Extent.StartLineNumber
+        rawLine = $cmd.Extent.StartScriptPosition.Line
+      }
+      continue
+    }
+    $cmdInfo = Get-Command -Name $stripped -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmdInfo -and $cmdInfo.CommandType -eq [System.Management.Automation.CommandTypes]::Alias) {
+      # #113 review, round 11: resolve the alias to its canonical command
+      # via the live session's own alias table (never by guessing a
+      # hardcoded list) - "gi" and "Get-Item" invoke the identical cmdlet,
+      # so a discovery mechanism that treats them as different strings is
+      # not describing PowerShell.
+      $resolved = $cmdInfo.ResolvedCommandName
+    }
     $commands += [ordered]@{
       name = $name
+      resolved = $resolved
       start = $cmd.Extent.StartOffset
       line = $cmd.Extent.StartLineNumber
       rawLine = $cmd.Extent.StartScriptPosition.Line
@@ -674,6 +718,19 @@ foreach ($cmd in $ast.FindAll({ $args[0] -is [System.Management.Automation.Langu
 
 $members = @()
 foreach ($m in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.MemberExpressionAst] }, $true)) {
+  if (-not ($m.Member -is $stringConstantType)) {
+    # #113 review, round 11: the same unanalysable shape one level up -
+    # $obj.($nameExpr) computes the property/method NAME at runtime, so
+    # the primitive-member scan's "$m.Member.Value" would be $null here
+    # too, the identical silent-miss shape as the dynamic-invocation case.
+    $dynamicInvocations += [ordered]@{
+      kind = "dynamic-member-access"
+      start = $m.Extent.StartOffset
+      line = $m.Extent.StartLineNumber
+      rawLine = $m.Extent.StartScriptPosition.Line
+    }
+    continue
+  }
   $memberName = $m.Member.Value
   if ($memberName) {
     $members += [ordered]@{
@@ -704,6 +761,7 @@ $result = [ordered]@{
   commands = @($commands)
   members = @($members)
   staticCalls = @($staticCalls)
+  dynamicInvocations = @($dynamicInvocations)
   parseErrors = @($errors | ForEach-Object { $_.Message })
 }
 $result | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath $OutPath -Encoding utf8
@@ -784,20 +842,80 @@ def _reachable_powershell_functions(functions: list[dict], commands: list[dict])
     return reachable
 
 
+_WRAPPER_LOG_DYNAMIC_ALLOWLIST_MARKER = "wrapper-log-dynamic-invocation:"
+
+# A dynamic construct that is genuinely unrelated to filesystem-presence
+# probing (invoking an already-resolved EXTERNAL BINARY's path, never a
+# PowerShell function or cmdlet, so it cannot hide a Test-Path/Get-Item
+# call) may be allowlisted the same way a raw primitive can - visibly,
+# with a reason, under its own marker so a dynamic-invocation exception
+# reads differently from a primitive one. Protect-WrapperLogPaths'
+# `& $chmod.Source ...` calls are the one pre-existing, reviewed case.
+_POWERSHELL_DYNAMIC_MANIFEST: frozenset[tuple[str, str, str]] = frozenset({
+    ("protect-wrapperlogpaths", "justified-exception", "posix-chmod"),
+})
+
+
+def _classify_powershell_dynamic_constructs(
+    functions: list[dict], reachable: set[str], dynamic_invocations: list[dict]
+) -> tuple[set[tuple[str, str, str]], list[str], list[str]]:
+    """#113 review, round 11: a dynamic command invocation (`& $name ...`,
+    dot-sourcing a variable/expression), an `Invoke-Expression`/`iex` call,
+    or a dynamic member-name access (`$obj.($nameExpr)`) all make the call
+    graph or the primitive set UNKNOWABLE rather than merely wider - "&
+    $name" cannot be resolved statically in the general case; that is a
+    property of the construct, not a gap in this scanner. Applying this
+    project's own boundary-outcome discipline to the analyser itself:
+    when a construct cannot be analysed, REFUSE it rather than silently
+    passing it - absent, present, and cannot-tell must render as three
+    different answers, never as "fine." An allowlisted exception is still
+    visible and deliberate, never a silent pass. Scoped the same way
+    primitive hits are: only constructs inside a function reachable from
+    a real wrapper-log entry point are refused; the same construct in
+    unrelated supervisor code is not this scan's concern."""
+    discovered: set[tuple[str, str, str]] = set()
+    refused: list[str] = []
+    malformed: list[str] = []
+    for item in dynamic_invocations:
+        enclosing = _innermost_powershell_function(functions, item["start"])
+        if enclosing is None or enclosing["name"].lower() not in reachable:
+            continue
+        func_name = enclosing["name"].lower()
+        raw_line = item["rawLine"]
+        location = f"{func_name}:{item['line']}: [{item['kind']}] {raw_line.strip()}"
+        marker_idx = raw_line.find(_WRAPPER_LOG_DYNAMIC_ALLOWLIST_MARKER)
+        if marker_idx == -1:
+            refused.append(location)
+            continue
+        reason = raw_line[marker_idx + len(_WRAPPER_LOG_DYNAMIC_ALLOWLIST_MARKER):].strip()
+        tag = _WRAPPER_LOG_ALLOWLIST_TAG_RE.match(reason)
+        if not tag:
+            malformed.append(
+                f"{location} - allowlist comment has no '[category:area]' tag: {reason!r}"
+            )
+            continue
+        discovered.add((func_name, tag["category"], tag["area"]))
+    return discovered, refused, malformed
+
+
 def _discover_powershell_wrapper_log_primitives(
     ast_data: dict,
-) -> tuple[set[tuple[str, str, str]], list[str], list[str]]:
+) -> tuple[set[tuple[str, str, str]], list[str], list[str], list[str]]:
     """The discovery core, shared by the main manifest test and every
     pinned-evasion regression test below - a real function, not an
     inline block, so an evasion test can assert exactly what it needs:
     that a specific injected shape still surfaces as unallowlisted,
-    malformed, or an unexpected manifest key."""
+    malformed, refused, or an unexpected manifest key."""
     functions = ast_data["functions"]
     reachable = _reachable_powershell_functions(functions, ast_data["commands"])
+    dynamic_discovered, refused, dynamic_malformed = _classify_powershell_dynamic_constructs(
+        functions, reachable, ast_data.get("dynamicInvocations", [])
+    )
 
     hits: list[dict] = []
     for cmd in ast_data["commands"]:
-        if _strip_module_qualifier(cmd["name"]).lower() in _POWERSHELL_PRIMITIVE_CMDLETS:
+        resolved_name = cmd.get("resolved", cmd["name"])
+        if _strip_module_qualifier(resolved_name).lower() in _POWERSHELL_PRIMITIVE_CMDLETS:
             hits.append(cmd)
     for member in ast_data["members"]:
         if member["name"].lower() in _POWERSHELL_PRIMITIVE_MEMBERS:
@@ -836,7 +954,9 @@ def _discover_powershell_wrapper_log_primitives(
             )
             continue
         discovered.add((func_name, tag["category"], tag["area"]))
-    return discovered, unallowlisted, malformed
+    discovered |= dynamic_discovered
+    malformed += dynamic_malformed
+    return discovered, unallowlisted, malformed, refused
 
 
 _PYTHON_PRIMITIVE_METHOD_NAMES = frozenset({
@@ -955,8 +1075,15 @@ def test_wrapper_log_powershell_side_matches_the_manifest_exactly(tmp_path: Path
     fails this rebuilt check. Scope is a CALL GRAPH reachable from the
     subsystem's two real external entry points, not a name pattern."""
     ast_data = _parse_powershell_wrapper_log_ast(sup.PS_TEMPLATE, tmp_path)
-    discovered, unallowlisted, malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    discovered, unallowlisted, malformed, refused = _discover_powershell_wrapper_log_primitives(ast_data)
 
+    assert not refused, (
+        "an unanalysable construct (dynamic command invocation, "
+        "Invoke-Expression, or dynamic member-name access) was found in a "
+        "function reachable from the wrapper-log subsystem's entry points "
+        "(#113 review, round 11) - this defeats static scope discovery and "
+        "must not be used here:\n" + "\n".join(refused)
+    )
     assert not unallowlisted, (
         "raw presence/type primitive(s) found in a function reachable from "
         "the wrapper-log subsystem's entry points, without a "
@@ -977,12 +1104,14 @@ def test_wrapper_log_powershell_side_matches_the_manifest_exactly(tmp_path: Path
         f"  found:    {sorted(debt_keys)}"
     )
 
-    missing = _POWERSHELL_MANIFEST - discovered
-    unexpected = discovered - _POWERSHELL_MANIFEST
+    full_manifest = _POWERSHELL_MANIFEST | _POWERSHELL_DYNAMIC_MANIFEST
+    missing = full_manifest - discovered
+    unexpected = discovered - full_manifest
     assert not missing and not unexpected, (
-        "the discovered PowerShell raw-primitive (function, category, area) "
-        "set no longer equals _POWERSHELL_MANIFEST - edit the manifest "
-        "deliberately if this is an intended change:\n"
+        "the discovered PowerShell raw-primitive/dynamic-invocation "
+        "(function, category, area) set no longer equals "
+        "_POWERSHELL_MANIFEST | _POWERSHELL_DYNAMIC_MANIFEST - edit the "
+        "manifest deliberately if this is an intended change:\n"
         f"  manifest entries no longer found (fixed or removed?): {sorted(missing)}\n"
         f"  new entries not yet in the manifest: {sorted(unexpected)}"
     )
@@ -1031,7 +1160,7 @@ def test_evasion_after_marker_function_is_still_caught(tmp_path: Path) -> None:
         injected_call="$null = Get-WrapperLogEvasionAfterMarker $candidateAgentDir",
     )
     ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
-    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    _discovered, unallowlisted, _malformed, _refused = _discover_powershell_wrapper_log_primitives(ast_data)
     assert any("get-wrapperlogevasionaftermarker" in line for line in unallowlisted)
 
 
@@ -1047,7 +1176,7 @@ def test_evasion_fully_qualified_provider_form_is_still_caught(tmp_path: Path) -
         ),
     )
     ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
-    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    _discovered, unallowlisted, _malformed, _refused = _discover_powershell_wrapper_log_primitives(ast_data)
     assert any("invoke-wrapperlogretentionprune" in line for line in unallowlisted)
 
 
@@ -1063,7 +1192,7 @@ def test_evasion_untagged_allowlist_reason_is_still_caught(tmp_path: Path) -> No
         ),
     )
     ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
-    _discovered, _unallowlisted, malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    _discovered, _unallowlisted, malformed, _refused = _discover_powershell_wrapper_log_primitives(ast_data)
     assert any("invoke-wrapperlogretentionprune" in line for line in malformed)
 
 
@@ -1088,7 +1217,7 @@ def test_evasion_generic_helper_name_without_wrapperlog_substring_is_still_caugh
         injected_call="$null = Get-QuotaSnapshot $candidateAgentDir",
     )
     ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
-    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    _discovered, unallowlisted, _malformed, _refused = _discover_powershell_wrapper_log_primitives(ast_data)
     assert any("get-quotasnapshot" in line for line in unallowlisted)
 
 
@@ -1109,7 +1238,7 @@ def test_evasion_param_block_function_declaration_is_still_caught(tmp_path: Path
         injected_call="$null = Get-WrapperLogEvasionParamBlock $candidateAgentDir",
     )
     ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
-    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    _discovered, unallowlisted, _malformed, _refused = _discover_powershell_wrapper_log_primitives(ast_data)
     assert any("get-wrapperlogevasionparamblock" in line for line in unallowlisted)
 
 
@@ -1124,7 +1253,7 @@ def test_evasion_lowercase_cmdlet_spelling_is_still_caught(tmp_path: Path) -> No
         injected_call="if (test-path -LiteralPath $candidateAgentDir) { $null = 1 }",
     )
     ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
-    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    _discovered, unallowlisted, _malformed, _refused = _discover_powershell_wrapper_log_primitives(ast_data)
     assert any("invoke-wrapperlogretentionprune" in line for line in unallowlisted)
 
 
@@ -1141,7 +1270,7 @@ def test_evasion_alternate_raw_api_is_still_caught(tmp_path: Path) -> None:
         ),
     )
     ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
-    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    _discovered, unallowlisted, _malformed, _refused = _discover_powershell_wrapper_log_primitives(ast_data)
     assert any("invoke-wrapperlogretentionprune" in line for line in unallowlisted)
 
 
@@ -1188,6 +1317,124 @@ def test_evasion_python_os_path_isdir_is_still_caught() -> None:
     )
     hits = _python_wrapper_log_primitive_hits(mutated)
     assert ("_wrapper_log_evasion_os_path_isdir", "isdir") in hits
+
+
+def test_evasion_cmdlet_alias_is_still_caught(tmp_path: Path) -> None:
+    """#113 review, round 11's first new escape: `gi` is the standard
+    built-in alias for `Get-Item` - it invokes the identical cmdlet, so a
+    discovery mechanism that treats the two as different strings is not
+    describing PowerShell, it is describing one spelling convention.
+    Resolved via the live PowerShell session's own alias table (Get-Command
+    on `gi`), never a hardcoded guess list - reviewer-1's exact repro:
+    `gi -LiteralPath ...` inside an already-reachable retention function."""
+    mutated = _mutate_ps_template(
+        injected_functions="",
+        injected_call="$null = gi -LiteralPath $candidateAgentDir -Force -ErrorAction SilentlyContinue",
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, unallowlisted, _malformed, _refused = _discover_powershell_wrapper_log_primitives(
+        ast_data
+    )
+    assert any("invoke-wrapperlogretentionprune" in line for line in unallowlisted)
+
+
+def test_evasion_dynamic_command_invocation_is_refused_not_silently_missed(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 11's second new escape, and the one this project's
+    own rule applies to: `& $name ...` cannot be resolved to a command name
+    statically in the general case - GetCommandName() returns null for it,
+    which is exactly why it used to vanish before ever reaching the
+    "if ($name)" filter. This is not a coverage gap to close by looking
+    harder; it is refused outright. reviewer-1's exact repro: a helper
+    containing a raw presence check, invoked from the reachable prune
+    function via a variable holding its name."""
+    mutated = _mutate_ps_template(
+        injected_functions=(
+            "function Get-DynamicRetentionProbe([string]$path) {\n"
+            "  if (Test-Path -LiteralPath $path) { return $true }\n"
+            "  return $false\n"
+            "}"
+        ),
+        injected_call="$dynamicProbeName = 'Get-DynamicRetentionProbe'; "
+        "$null = & $dynamicProbeName $candidateAgentDir",
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, _unallowlisted, _malformed, refused = _discover_powershell_wrapper_log_primitives(
+        ast_data
+    )
+    assert any(
+        "invoke-wrapperlogretentionprune" in line and "dynamic-command-invocation" in line
+        for line in refused
+    )
+
+
+def test_evasion_invoke_expression_is_refused_not_silently_missed(tmp_path: Path) -> None:
+    """#113 review, round 11: the same unanalysable-construct class as
+    dynamic command invocation - Invoke-Expression evaluates a STRING as
+    code, whose content is opaque to a static AST scan regardless of what
+    the call site itself looks like. Refused unconditionally."""
+    mutated = _mutate_ps_template(
+        injected_functions="",
+        injected_call="$null = Invoke-Expression \"Test-Path -LiteralPath '$candidateAgentDir'\"",
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, _unallowlisted, _malformed, refused = _discover_powershell_wrapper_log_primitives(
+        ast_data
+    )
+    assert any(
+        "invoke-wrapperlogretentionprune" in line and "invoke-expression" in line
+        for line in refused
+    )
+
+
+def test_evasion_dynamic_member_access_is_refused_not_silently_missed(tmp_path: Path) -> None:
+    """#113 review, round 11: the same unanalysable-construct class one
+    level up from a command call - `$item.($propName)` computes the
+    property NAME at runtime, so `.Member.Value` would be null here too,
+    the identical silent-miss shape a dynamic command invocation has."""
+    mutated = _mutate_ps_template(
+        injected_functions="",
+        injected_call=(
+            "$dynamicPropName = 'Attributes'; "
+            "$fakeItem = Microsoft.PowerShell.Management\\Get-Item -LiteralPath "
+            "$candidateAgentDir -Force -ErrorAction SilentlyContinue; "
+            "if ($fakeItem) { $null = $fakeItem.($dynamicPropName) }"
+        ),
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, _unallowlisted, _malformed, refused = _discover_powershell_wrapper_log_primitives(
+        ast_data
+    )
+    assert any(
+        "invoke-wrapperlogretentionprune" in line and "dynamic-member-access" in line
+        for line in refused
+    )
+
+
+def test_dynamic_invocation_allowlist_requires_a_tagged_reason(tmp_path: Path) -> None:
+    """A dynamic-invocation exception must be visible and deliberate, the
+    same discipline as a raw-primitive exception - a bare, untagged reason
+    on the allowlist marker must still fail, not silently pass."""
+    mutated = _mutate_ps_template(
+        injected_functions=(
+            "function Get-DynamicRetentionProbe([string]$path) {\n"
+            "  if (Test-Path -LiteralPath $path) { return $true }\n"
+            "  return $false\n"
+            "}"
+        ),
+        injected_call=(
+            "$dynamicProbeName = 'Get-DynamicRetentionProbe'; "
+            "$null = & $dynamicProbeName $candidateAgentDir "
+            "# wrapper-log-dynamic-invocation: trust me, this is fine"
+        ),
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, _unallowlisted, malformed, refused = _discover_powershell_wrapper_log_primitives(
+        ast_data
+    )
+    assert not refused, "a present-but-untagged reason must be malformed, not silently refused"
+    assert any("invoke-wrapperlogretentionprune" in line for line in malformed)
 
 
 def test_supervise_plan_never_probes_wrapper_log_filesystem(
