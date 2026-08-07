@@ -1818,11 +1818,12 @@ def test_ephemeral_hold_does_not_claim_or_bind_ambient_environment(
     environment = admitted["configured_launch"]["environment"]
     assert "effective_environment_sha256" not in environment
     note = admitted["configured_launch"]["environment_note"]
-    assert "reconstructed launch-effective projection" in note
-    assert "unchanged configured launch profile" not in note
-    assert "Equivalent cwd or configured-environment edits remain valid" in note
-    assert "any launch-mapping edit" in note
-    assert "requires re-preparation" in note
+    assert "Re-prepare after editing the configured profile" in note
+    assert (
+        "configured launch mapping or reconstructed launch-effective projection "
+        "no longer matches"
+    ) in note
+    assert "equivalent-looking edits are not guaranteed to remain valid" in note
     assert "environment the child actually receives is not verified" in note
     assert "neither ambient nor configured values are guaranteed" in note
 

@@ -979,11 +979,12 @@ def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
     assert cli_item["source_hash"] == web_item["source_hash"]
     assert cli_item["configured_launch"]["cwd"] == workspace
     note = cli_item["configured_launch"]["environment_note"]
-    assert "reconstructed launch-effective projection" in note
-    assert "unchanged configured launch profile" not in note
-    assert "Equivalent cwd or configured-environment edits remain valid" in note
-    assert "any launch-mapping edit" in note
-    assert "requires re-preparation" in note
+    assert "Re-prepare after editing the configured profile" in note
+    assert (
+        "configured launch mapping or reconstructed launch-effective projection "
+        "no longer matches"
+    ) in note
+    assert "equivalent-looking edits are not guaranteed to remain valid" in note
     assert "environment the child actually receives is not verified" in note
     assert "neither ambient nor configured values are guaranteed" in note
     argv = cli_item["configured_launch"]["argv"]

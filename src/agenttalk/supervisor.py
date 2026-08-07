@@ -5386,11 +5386,11 @@ def configured_detached_launch(
         "environment": environment,
         "environment_note": (
             (
-                "The admitted command is bound to the prepared request's "
-                "reconstructed launch-effective projection. Equivalent cwd "
-                "or configured-environment edits remain valid; any "
-                "launch-mapping edit, even one resolving identically, requires "
-                "re-preparation. The environment the "
+                "Re-prepare after editing the configured profile. Recovery "
+                "emits a named refusal rather than a command when the "
+                "configured launch mapping or reconstructed launch-effective "
+                "projection no longer matches; equivalent-looking edits are "
+                "not guaranteed to remain valid. The environment the "
                 "child actually receives is not verified and must be reviewed "
                 "by the operator; neither ambient nor configured values are "
                 "guaranteed to be delivered."

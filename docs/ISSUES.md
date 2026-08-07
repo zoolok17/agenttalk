@@ -20,12 +20,12 @@ be labeled `SHIPPED` once the changelog closes them.
 ## P1 · PLANNED — exact child-environment proof across supported PowerShell hosts (2026-08-07)
 
 **What.** Detached ephemeral recovery currently binds the prepared request and
-its reconstructed launch-effective projection. Equivalent working-directory
-and configured-environment edits remain valid. Any edit to the configured
-launch mapping—even one producing identical effective argv—requires
-re-preparation and produces a named refusal instead of a command. Recovery does
-not verify the environment the child actually receives, and the operator
-surfaces state that limitation explicitly.
+its reconstructed launch-effective projection. Re-prepare after editing the
+configured profile. Recovery emits a named refusal rather than a command when
+the configured launch mapping or reconstructed launch-effective projection no
+longer matches; equivalent-looking edits are not guaranteed to remain valid.
+Recovery does not verify the environment the child actually receives, and the
+operator surfaces state that limitation explicitly.
 
 **Why.** Three implementations that appeared internally consistent failed at
 the real process boundary. The tested preferred PowerShell 7 host dropped
@@ -43,23 +43,29 @@ bound to an exact inherited or effective child environment.
 
 ---
 
-## P2 · PLANNED — effective-equivalent launch mappings in detached recovery (2026-08-07)
+## P2 · PLANNED — normalized configured-profile binding in detached recovery (2026-08-07)
 
 **What.** Detached recovery compares the prepared and current configured launch
-mappings by raw equality before it reconstructs the launch-effective
-projection. Replacing a placeholder with the identical resolved literal
-therefore produces a safe but unnecessary refusal and requires re-preparation.
+mappings by raw equality, then binds the reconstructed launch-effective
+projection. Placeholder substitution happens before hashing, so replacing a
+configured working-directory or environment-value placeholder with its resolved
+literal remains valid. An equivalent edit inside the raw launch mapping refuses.
+The existing Windows environment-name comparer considers case variants equal,
+but the binding hashes their spelling and refuses the edit. OS-equivalent working
+directory aliases are likewise not normalized before hashing.
 
-**Why.** The reconstructed binding already distinguishes effective drift from
-equivalent working-directory and environment edits. Extending that equivalence
-to the launch mapping is the better operator experience, but changing the
-release's admission behavior during final review would add risk to a path that
-currently fails closed.
+**Why.** The current behavior fails closed, but equivalent-looking profile edits
+do not share one tolerance rule. A public equivalence promise would therefore be
+stronger than the implementation and could mislead an operator about whether
+re-preparation is required.
 
-**Disposition.** `PLANNED`. Make recovery use the reconstructed binding for
-launch-mapping equivalence while retaining full current admission. Preserve
-consumer controls for both placeholder-to-literal equivalence and real argv
-drift; until then, document and retain the named refusal.
+**Disposition.** `PLANNED`. If recovery is to tolerate equivalent edits, hash a
+normalized configured-profile projection rather than its spelling, while
+retaining full current admission and refusal on real drift. Cover configured
+environment-name case variants, OS-equivalent working-directory aliases,
+placeholder-to-literal values, launch-mapping equivalence, and real drift at the
+consumer. Until then, operators should re-prepare after any profile edit and no
+surface should promise that an equivalent-looking edit remains valid.
 
 ---
 

@@ -344,14 +344,13 @@ two parallel ownership concepts.
 - **Detached refusal guidance (v0.82.0):** for an active ephemeral request, the
   displayed argv is bound to the durable prepared request and reconstructed
   launch-effective projection: the values produced after marker-derived
-  substitutions, including argv and working directory. Equivalent edits to the
-  configured working directory or environment remain valid. The configured
-  launch mapping is also compared by raw equality before reconstruction, so any
-  edit to that mapping—even one producing identical effective argv—requires
-  re-preparation and yields a named refusal instead of a command. Environment
-  metadata is deliberately advisory: it neither binds the ambient environment
-  nor proves what the child receives, and the operator-facing text says so
-  explicitly.
+  substitutions, including argv and working directory. Re-prepare after editing
+  the configured profile. Recovery emits a named refusal instead of a command
+  when the configured launch mapping or reconstructed
+  launch-effective projection no longer matches; equivalent-looking edits are
+  not guaranteed to remain valid. Environment metadata is deliberately advisory:
+  it neither binds the ambient environment nor proves what the child receives,
+  and the operator-facing text says so explicitly.
 
 ### 4.7 Supporting modules
 - `signing.py` — optional HMAC message signing (constant-time, length-floored);

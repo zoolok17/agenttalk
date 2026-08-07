@@ -606,11 +606,11 @@ normal fail-closed adoption.
 When Attention shows a configured detached launch for a refusal, an active
 ephemeral launch is bound to its prepared request's reconstructed
 launch-effective projection: the values produced after marker-derived
-substitutions, including argv and working directory. Equivalent edits to the
-configured working directory or environment remain valid. Any edit to the
-configured launch mapping—even one producing the same effective argv—requires
-you to re-prepare the request; Attention reports a named refusal instead of a
-command. The listed environment is guidance only: agenttalk does not verify the
+substitutions, including argv and working directory. Re-prepare after editing the
+configured profile. Recovery emits a named refusal rather than a command when
+the configured launch mapping or reconstructed launch-effective projection no
+longer matches; equivalent-looking edits are not guaranteed to remain valid.
+The listed environment is guidance only: agenttalk does not verify the
 environment that the child actually receives, so the operator must review both
 ambient and configured values before launching it.
 
