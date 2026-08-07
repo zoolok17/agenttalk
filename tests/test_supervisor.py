@@ -711,6 +711,53 @@ def test_supervisor_report_surfaces_kill_switch_and_mutations_refuse(
     assert report["kill_switch_active"] is True
 
 
+def test_report_for_active_agent_resolves_wrapper_log_unmarked_as_retired(
+    tmp_path: Path, capsys,
+) -> None:
+    """The other side of the same check (reviewer-1 executed both): an
+    agent that IS in the active roster must resolve its wrapper-log
+    location exactly as before, and must not be marked "retired" - the
+    fallback path is for a roster miss only, not a shortcut that fires on
+    every lookup."""
+    s = _team(tmp_path, agents="lead,worker")
+
+    root = tmp_path / "wrapper-logs-root"
+    agent_leaf = wlogs._wrapper_log_agent_leaf("worker")
+    generation = root / agent_leaf / f"20260804T120001000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    stdout_path = generation / "stdout.log"
+    stderr_path = generation / "stderr.log"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+
+    location_path = wlogs._wrapper_log_location_path(s.state_dir, "worker")
+    location_path.parent.mkdir(parents=True, exist_ok=True)
+    location_path.write_text(
+        json.dumps({
+            "schema_version": wlogs._LOCATION_SCHEMA_VERSION,
+            "agent": "worker",
+            "root": str(root),
+            "generation_dir": str(generation),
+            "stdout": str(stdout_path),
+            "stderr": str(stderr_path),
+            "wrapper_pid": 4242,
+            "observed_at": "2026-08-04T12:00:01Z",
+        }),
+        encoding="utf-8",
+    )
+
+    rc = _run(
+        ["supervise", "--report", "--now", str(NOW), "--for", "worker"],
+        tmp_path,
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    selected = report["agents"]["worker"]
+    assert "retired" not in selected
+    assert selected["wrapper_log"]["status"] == "observed"
+
+
 def test_report_for_agent_resolves_wrapper_log_after_ephemeral_retirement(
     tmp_path: Path, capsys,
 ) -> None:

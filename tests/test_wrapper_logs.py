@@ -707,25 +707,20 @@ def test_corrupt_committed_sequence_marks_retention_uncertain(
     assert uncertain is True
 
 
-def test_inaccessible_agent_dir_marks_retention_uncertain_not_absent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A transiently unreadable agent_dir (a disconnected volume reporting
-    not-ready, ...) must not read the same as a root this agent has
-    genuinely never used - #113 review.
+def _poison_lstat(monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+    """Make stat()/lstat() raise a real-shaped 'could not tell' OSError for
+    exactly `target`, leaving every other path's real stat/lstat behavior
+    untouched.
 
-    Path.exists() is a boolean wrapper that swallows SOME OSErrors into
-    False rather than raising - on 3.10's pathlib, only a curated list
-    (ENOENT/ENOTDIR/EBADF/ELOOP, plus WinError 21 "not ready" on Windows),
-    not an arbitrary PermissionError (confirmed directly against 3.10's
-    pathlib.py source: a plain PermissionError is NOT in that list and
-    propagates normally, so it does not actually exercise the bug this
-    test is for - the failure has to be shaped like one exists() truly
-    swallows). WinError 21 is exactly that shape, and it's the realistic
-    one anyway (a disconnected network share or removed media), so build
-    the exception exists() would have swallowed, and confirm the fix's
-    lstat()-based probe does NOT swallow it, unlike exists() does.
+    Path.exists()/.is_dir() are boolean wrappers that swallow SOME
+    OSErrors into False rather than raising - on 3.10's pathlib, only a
+    curated list (ENOENT/ENOTDIR/EBADF/ELOOP, plus WinError 21 "not ready"
+    on Windows), not an arbitrary PermissionError (confirmed directly
+    against 3.10's pathlib.py source: a plain PermissionError is NOT in
+    that list and propagates normally, so it would not actually exercise
+    the bug this classifier exists for). WinError 21 is exactly that
+    shape, and it's the realistic one anyway (a disconnected network
+    share or removed media).
 
     Tried and abandoned a real ACL-based repro first: Windows'
     GetFileAttributes-class calls (what stat()/lstat() use) are
@@ -733,12 +728,6 @@ def test_inaccessible_agent_dir_marks_retention_uncertain_not_absent(
     explicit full-control deny left os.stat() succeeding - not something
     this environment could reproduce for real, only construct.
     """
-    root = tmp_path / "logs"
-    root.mkdir()
-    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
-    agent_dir = root / agent_leaf
-    agent_dir.mkdir()  # genuinely exists - the point is we can't SEE that
-
     real_stat = Path.stat
     real_lstat = Path.lstat
 
@@ -748,24 +737,59 @@ def test_inaccessible_agent_dir_marks_retention_uncertain_not_absent(
         return err
 
     def denied_stat(self: Path, *args: object, **kwargs: object):
-        if self == agent_dir:
+        if self == target:
             raise _not_ready()
         return real_stat(self, *args, **kwargs)
 
     def denied_lstat(self: Path, *args: object, **kwargs: object):
-        if self == agent_dir:
+        if self == target:
             raise _not_ready()
         return real_lstat(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", denied_stat)
     monkeypatch.setattr(Path, "lstat", denied_lstat)
 
-    owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+
+@pytest.mark.parametrize("depth", ["agent_dir", "generation"])
+def test_scan_marks_retention_uncertain_not_absent_at_every_depth(
+    depth: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The consumer-level control for the shared classifier (#113 review,
+    reviewer-1's sharpened class fix): an UNUSABLE outcome must surface as
+    ``uncertain=True`` from ``_owned_committed_generations`` at EVERY scan
+    depth - parametrized so a depth added later without a matching entry
+    here is conspicuous, not silently uncovered.
+
+    This asserts the CONSUMER's behavior, not just that ``_scan_path``
+    returns the right enum member in isolation: a future call site that
+    mishandles the classifier's outcome and collapses UNUSABLE back into
+    behaving like ABSENT fails HERE, at the same boundary retention
+    actually reads, not only in a classifier-local unit test a careless
+    refactor could leave green while the real bug ships (the exact gap
+    that let the same mistake recur once already in this PR).
+    """
+    root = tmp_path / "logs"
+    root.mkdir()
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    agent_dir = root / agent_leaf
+    agent_dir.mkdir()
+    if depth == "agent_dir":
+        target = agent_dir
+    else:
+        target = agent_dir / f"20260804T120001000Z-{1:032x}"
+        target.mkdir()
+
+    _poison_lstat(monkeypatch, target)
+
+    owned, max_sequence, uncertain = wrapper_logs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
 
     assert owned == []
+    assert max_sequence == 0
     assert uncertain is True
 
 
@@ -787,58 +811,6 @@ def test_genuinely_absent_agent_dir_is_not_flagged_uncertain(tmp_path: Path) -> 
     assert owned == []
     assert max_sequence == 0
     assert uncertain is False
-
-
-def test_inaccessible_generation_marks_retention_uncertain_not_absent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Same bug as test_inaccessible_agent_dir_marks_retention_uncertain_not_absent,
-    one level down (#113 review, third instance of the same class): the
-    agent_dir itself enumerates fine, but one specific generation inside it
-    cannot be stat'ed (read without search permission, in the review's
-    example). Path.is_dir() swallows that into a confident False exactly
-    like Path.exists() did for the agent_dir - a hidden high sequence would
-    be replaced by a low fallback sequence, and once access returns,
-    retention could rank and delete the genuinely newer generation. Both
-    levels must go through the same non-swallowing predicate so a third
-    level cannot regress independently."""
-    root = tmp_path / "logs"
-    root.mkdir()
-    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
-    agent_dir = root / agent_leaf
-    agent_dir.mkdir()
-    blocked = agent_dir / f"20260804T120001000Z-{1:032x}"
-    blocked.mkdir()
-
-    real_stat = Path.stat
-    real_lstat = Path.lstat
-
-    def _not_ready() -> OSError:
-        err = OSError("drive not ready")
-        err.winerror = 21
-        return err
-
-    def denied_stat(self: Path, *args: object, **kwargs: object):
-        if self == blocked:
-            raise _not_ready()
-        return real_stat(self, *args, **kwargs)
-
-    def denied_lstat(self: Path, *args: object, **kwargs: object):
-        if self == blocked:
-            raise _not_ready()
-        return real_lstat(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "stat", denied_stat)
-    monkeypatch.setattr(Path, "lstat", denied_lstat)
-
-    owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
-        (root,),
-        agent_leaf,
-    )
-
-    assert owned == []
-    assert uncertain is True
 
 
 def test_allocator_continues_to_next_candidate_when_cleanup_probe_itself_fails(
