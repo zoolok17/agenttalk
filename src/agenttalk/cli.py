@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import contextlib
 import dataclasses
 import io
@@ -9630,8 +9629,19 @@ def cmd_release(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_supervisor_config(store: Store) -> dict:
-    return sup.load_supervisor_config(store.dir / "supervisor.json")
+def _load_supervisor_config(
+    store: Store,
+    *,
+    expected_sha256: str | None = None,
+    require_powershell_transport: bool = False,
+) -> dict:
+    return sup.load_supervisor_config(
+        store.dir / "supervisor.json",
+        expected_sha256=expected_sha256,
+        powershell_transport_store=(
+            store if require_powershell_transport else None
+        ),
+    )
 
 
 def cmd_heartbeat(args: argparse.Namespace) -> int:
@@ -12568,13 +12578,13 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             or not args.state_file
             or args.launch_agenttalk_python is None
             or args.launch_src_on_pythonpath is None
-            or not args.launch_environment_stdin
+            or args.supervisor_config_sha256 is None
         ):
             sys.stderr.write("agenttalk supervise --prepare-launch-request: need "
                              "--request-id <rid>, --state-file <path>, "
                              "--launch-agenttalk-python <path>, and "
-                             "--launch-src-on-pythonpath true|false with "
-                             "--launch-environment-stdin\n")
+                             "--launch-src-on-pythonpath true|false, and a "
+                             "PowerShell-accepted supervisor config SHA-256\n")
             return 2
         state_path = store.dir / "supervisor-state.json"
         try:
@@ -12593,28 +12603,18 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             )
             return 2
         try:
-            stream = getattr(sys.stdin, "buffer", sys.stdin)
-            raw_environment = stream.read(1024 * 1024 + 1)
-            if isinstance(raw_environment, str):
-                raw_environment = raw_environment.encode("ascii")
-            if len(raw_environment) > 1024 * 1024:
-                raise ValueError("environment input exceeds 1 MiB")
-            launch_parent_environment = json.loads(
-                base64.b64decode(
-                    raw_environment.strip(),
-                    validate=True,
-                ).decode("utf-8")
+            config = _load_supervisor_config(
+                store,
+                expected_sha256=args.supervisor_config_sha256,
+                require_powershell_transport=True,
             )
-            if not isinstance(launch_parent_environment, dict):
-                raise ValueError("environment input must be a JSON object")
-        except (UnicodeError, ValueError) as exc:
+        except sup.SupervisorPersistenceError as exc:
             sys.stderr.write(
-                "agenttalk supervise --prepare-launch-request: invalid "
-                f"base64 launch environment: {exc}\n"
+                "agenttalk supervise --prepare-launch-request: "
+                f"{exc}\n"
             )
-            return 2
+            return 3
         state = sup.load_supervisor_state(state_path)
-        config = _load_supervisor_config(store)
         now = args.now if args.now is not None else time.time()
         try:
             spec = sup.prepare_launch_request(
@@ -12627,7 +12627,6 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 launch_src_on_pythonpath=(
                     args.launch_src_on_pythonpath == "true"
                 ),
-                launch_parent_environment=launch_parent_environment,
             )
         except eph.EphemeralError as e:
             sys.stderr.write(f"agenttalk supervise --prepare-launch-request: {e}\n")
@@ -12739,8 +12738,15 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --launch-barrier: need --for "
                              "<agent> and --state-file <path>\n")
             return 2
+        try:
+            config = _load_supervisor_config(
+                store,
+                expected_sha256=args.supervisor_config_sha256,
+            )
+        except sup.SupervisorPersistenceError as exc:
+            sys.stderr.write(f"agenttalk supervise --launch-barrier: {exc}\n")
+            return 3
         state = _read_state()
-        config = _load_supervisor_config(store)
         now = args.now if args.now is not None else time.time()
         result = sup.evaluate_launch_barrier(
             _read_snapshot_file(args.snapshot_file),
@@ -12783,13 +12789,23 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                              "<agent> and --state-file <path>\n")
             return 2
         state = _read_state()
-        rl_cfg = _load_supervisor_config(store)
-        grace = rl_cfg.get("launch_grace_seconds")
-        grace = float(grace) if isinstance(grace, (int, float)) else None
-        cfg_agent = {}
-        if isinstance(rl_cfg.get("agents"), dict):
-            raw_cfg_agent = rl_cfg["agents"].get(args.agent)
-            cfg_agent = raw_cfg_agent if isinstance(raw_cfg_agent, dict) else {}
+        state_agents = state.get("agents")
+        state_agent = (
+            state_agents.get(args.agent)
+            if isinstance(state_agents, dict)
+            else None
+        )
+        try:
+            grace, cfg_agent = sup.decode_launch_record_context(
+                state_agent.get("pending_launch_record")
+                if isinstance(state_agent, dict)
+                else None,
+                agent=args.agent,
+                cli=args.cli or "claude",
+            )
+        except ValueError as exc:
+            sys.stderr.write(f"agenttalk supervise --record-launch: {exc}\n")
+            return 3
         sup.record_launch(state, args.agent, cli=args.cli or "claude",
                           pid=args.pid, pid_start=args.pid_start,
                           now_epoch=(args.now if args.now is not None else time.time()),
@@ -12802,6 +12818,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                           launcher_nonce_injected=bool(args.launcher_nonce_injected),
                           launcher_nonce_source=args.launcher_nonce_source,
                           launcher_nonce_missing_reason=args.launcher_nonce_missing_reason)
+        state["agents"][args.agent].pop("pending_launch_record", None)
         _write_state(state)
         return 0
     if args.clear_restart:
@@ -12822,7 +12839,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
               else f"no matching restart-request for {args.agent!r} "
                    f"[{args.request_id}] (already cleared or superseded)")
         return 0
-    config = _load_supervisor_config(store)
+    try:
+        config = _load_supervisor_config(
+            store,
+            expected_sha256=args.supervisor_config_sha256,
+        )
+    except sup.SupervisorPersistenceError as exc:
+        sys.stderr.write(f"agenttalk supervise: {exc}\n")
+        return 3
     now = args.now if args.now is not None else time.time()
     stuck = config.get("stuck_after_seconds")
     stuck = float(stuck) if isinstance(stuck, (int, float)) else None
@@ -14667,9 +14691,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="(script use) Whether the running supervisor prepends <root>/src.",
     )
     psup.add_argument(
-        "--launch-environment-stdin",
-        action="store_true",
-        help="(script use) Read the running supervisor environment as JSON.",
+        "--supervisor-config-sha256",
+        help=argparse.SUPPRESS,
     )
     gsup.add_argument("--record-ephemeral-launch", dest="record_ephemeral_launch",
                       action="store_true",

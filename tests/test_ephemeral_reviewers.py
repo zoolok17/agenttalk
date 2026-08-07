@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import base64
-import io
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -18,6 +18,7 @@ from agenttalk import cli
 from agenttalk import lanes
 from agenttalk import store as store_mod
 from agenttalk import supervisor as sup
+from agenttalk import supervisor_lifecycle as lifecycle
 from agenttalk import wrapper_runtime as wrt
 from agenttalk.store import Store
 from agenttalk.wrapper import loop
@@ -38,6 +39,15 @@ def _store(tmp_path: Path) -> Store:
     shim.write_bytes(sup.agenttalk_shim(sys.executable).encode("utf-8"))
     s.set_role("lead", "lead")
     return s
+
+
+def _select_powershell_for_prepare(store: Store) -> None:
+    if os.name != "nt":
+        return
+    shell = shutil.which("pwsh")
+    if shell is None:
+        pytest.skip("PowerShell Core is unavailable")
+    lifecycle.select_powershell_host(store, explicit_path=shell)
 
 
 def _cfg(**overrides) -> dict:
@@ -342,14 +352,18 @@ def test_launch_admission_rejects_casefold_environment_duplicates(
     assert any("case-insensitive duplicate" in error for error in errors)
 
 
-def test_launch_admission_rejects_non_ascii_environment_names(
+@pytest.mark.skipif(os.name != "nt", reason="uses the Windows environment comparer")
+def test_launch_admission_rejects_windows_unicode_case_duplicates(
     tmp_path: Path,
 ) -> None:
     s = _store(tmp_path)
     cfg = _cfg()
     cfg["ephemeral_reviewers"]["allowed_profiles"][
         "codex-evidence-reviewer"
-    ]["env"] = {"AGENTTALK_P1A_K": "distinct-on-windows"}
+    ]["env"] = {
+        "AGENTTALK_P1A_Å": "upper",
+        "AGENTTALK_P1A_å": "lower",
+    }
 
     errors, _profile = eph.validate_launch_request(
         _marker(),
@@ -357,7 +371,30 @@ def test_launch_admission_rejects_non_ascii_environment_names(
         cfg,
     )
 
-    assert any("invalid variable name" in error for error in errors)
+    assert any("case-insensitive duplicate" in error for error in errors)
+
+
+def test_launch_admission_preserves_windows_distinct_unicode_environment_names(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["env"] = {
+        "AGENTTALK_P1A_K": "ascii-k",
+        "AGENTTALK_P1A_K": "kelvin",
+        "AGENTTALK_P1A_雪": "snow",
+        "AGENTTALK_ſELF": "long-s",
+    }
+
+    errors, _profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert errors == []
 
 
 def test_validate_launch_request_rejects_module_args_from_the_resolver_would_reject(
@@ -823,7 +860,6 @@ def test_prepare_launch_request_binds_final_spec_without_persisting_env_secrets(
 
 def test_prepare_cli_rejects_copied_state_before_effects(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     s = _store(tmp_path)
@@ -847,9 +883,9 @@ def test_prepare_cli_rejects_copied_state_before_effects(
         path.name: path.read_bytes()
         for path in s.messages_dir.glob("*.json")
     }
-    envelope = base64.b64encode(b'{"PATH":""}')
-    monkeypatch.setattr(sys, "stdin", io.BytesIO(envelope))
-
+    config_sha256 = hashlib.sha256(
+        (s.dir / "supervisor.json").read_bytes()
+    ).hexdigest()
     rc = cli.main([
         "--root", str(tmp_path),
         "supervise",
@@ -859,7 +895,7 @@ def test_prepare_cli_rejects_copied_state_before_effects(
         "--now", str(NOW),
         "--launch-agenttalk-python", sys.executable,
         "--launch-src-on-pythonpath", "false",
-        "--launch-environment-stdin",
+        "--supervisor-config-sha256", config_sha256,
     ])
 
     assert rc == 2
@@ -876,88 +912,32 @@ def test_prepare_cli_rejects_copied_state_before_effects(
     } == messages_before
 
 
-def test_prepare_cli_binds_utf8_running_supervisor_environment(
+def test_prepare_cli_preserves_unicode_profile_environment_names(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     s = _store(tmp_path)
-    s.write_launch_request(_marker("lr-env-transport"))
-    (s.dir / "supervisor.json").write_text(
-        json.dumps(_cfg()),
-        encoding="utf-8",
-    )
-    state_path = s.dir / "supervisor-state.json"
-    state_path.write_text("{}", encoding="utf-8")
-    parent_environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "UNICODE_雪": "café-雪",
-    }
-    envelope = base64.b64encode(
-        json.dumps(
-            parent_environment,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
-    monkeypatch.setattr(sys, "stdin", io.BytesIO(envelope))
-
-    rc = cli.main([
-        "--root", str(tmp_path),
-        "supervise",
-        "--prepare-launch-request",
-        "--request-id", "lr-env-transport",
-        "--state-file", str(state_path),
-        "--now", str(NOW),
-        "--launch-agenttalk-python", sys.executable,
-        "--launch-src-on-pythonpath", "false",
-        "--launch-environment-stdin",
-    ])
-
-    assert rc == 0
-    spec = json.loads(capsys.readouterr().out)
-    expected_spec = dict(spec)
-    expected_spec.pop("effective_environment_sha256")
-    expected = sup._effective_ephemeral_environment_digest(  # noqa: SLF001
-        sup._validated_ephemeral_parent_environment(parent_environment),  # noqa: SLF001
-        expected_spec,
-        expected_spec["recovery_environment"],
-    )
-    assert spec["effective_environment_sha256"] == expected
-    assert "UNICODE_雪" in json.loads(
-        base64.b64decode(envelope).decode("utf-8")
-    )
-    assert "café-雪" not in state_path.read_text(encoding="utf-8")
-
-
-def test_prepare_cli_rejects_lossy_unicode_environment_key_aliases(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    s = _store(tmp_path)
-    request_id = "lr-env-key-alias"
+    request_id = "lr-unicode-env"
     s.write_launch_request(_marker(request_id))
+    cfg = _cfg()
+    cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["env"] = {
+        "UNICODE_雪": "café-雪",
+        "AGENTTALK_P1A_K": "ascii-k",
+        "AGENTTALK_P1A_K": "kelvin",
+        "AGENTTALK_ſELF": "long-s",
+    }
     (s.dir / "supervisor.json").write_text(
-        json.dumps(_cfg()),
-        encoding="utf-8",
+        json.dumps(cfg, ensure_ascii=False),
+        encoding="utf-8-sig",
     )
     state_path = s.dir / "supervisor-state.json"
     state_path.write_text("{}", encoding="utf-8")
-    marker_path = s.launch_requests_dir / f"{request_id}.json"
-    marker_before = marker_path.read_bytes()
-    parent_environment = {
-        "AGENTTALK_P1A_K": "same-value",
-        "AGENTTALK_P1A_K": "same-value",
-    }
-    envelope = base64.b64encode(
-        json.dumps(
-            parent_environment,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
-    monkeypatch.setattr(sys, "stdin", io.BytesIO(envelope))
+    _select_powershell_for_prepare(s)
+    config_sha256 = hashlib.sha256(
+        (s.dir / "supervisor.json").read_bytes()
+    ).hexdigest()
 
     rc = cli.main([
         "--root", str(tmp_path),
@@ -968,13 +948,151 @@ def test_prepare_cli_rejects_lossy_unicode_environment_key_aliases(
         "--now", str(NOW),
         "--launch-agenttalk-python", sys.executable,
         "--launch-src-on-pythonpath", "false",
-        "--launch-environment-stdin",
+        "--supervisor-config-sha256", config_sha256,
+    ])
+
+    assert rc == 0
+    spec = json.loads(capsys.readouterr().out)
+    assert spec["env"] == {
+        "UNICODE_雪": "café-雪",
+        "AGENTTALK_P1A_K": "ascii-k",
+        "AGENTTALK_P1A_K": "kelvin",
+        "AGENTTALK_ſELF": "long-s",
+        "AGENTTALK_SELF": spec["agent"],
+    }
+    assert "café-雪" not in state_path.read_text(encoding="utf-8")
+
+
+def test_prepare_cli_rejects_colliding_environment_names_before_effects(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _store(tmp_path)
+    request_id = "lr-env-key-alias"
+    s.write_launch_request(_marker(request_id))
+    cfg = _cfg()
+    cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["env"] = {
+        "AGENTTALK_P1A_CASE": "first",
+        "agenttalk_p1a_case": "second",
+    }
+    (s.dir / "supervisor.json").write_text(
+        json.dumps(cfg),
+        encoding="utf-8",
+    )
+    state_path = s.dir / "supervisor-state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    marker_path = s.launch_requests_dir / f"{request_id}.json"
+    marker_before = marker_path.read_bytes()
+    config_before = s.load_config()
+    retired_before = s.retired_agents()
+    messages_before = list(s.messages_dir.glob("*.json"))
+    _select_powershell_for_prepare(s)
+    config_sha256 = hashlib.sha256(
+        (s.dir / "supervisor.json").read_bytes()
+    ).hexdigest()
+
+    rc = cli.main([
+        "--root", str(tmp_path),
+        "supervise",
+        "--prepare-launch-request",
+        "--request-id", request_id,
+        "--state-file", str(state_path),
+        "--now", str(NOW),
+        "--launch-agenttalk-python", sys.executable,
+        "--launch-src-on-pythonpath", "false",
+        "--supervisor-config-sha256", config_sha256,
     ])
 
     assert rc == 3
-    assert "launch environment has duplicate keys" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert (
+        "case-insensitive duplicate variable names" in error
+        or "not accepted by the selected PowerShell transport" in error
+    )
     assert state_path.read_text(encoding="utf-8") == "{}"
     assert marker_path.read_bytes() == marker_before
+    assert s.load_config() == config_before
+    assert s.retired_agents() == retired_before
+    assert list(s.messages_dir.glob("*.json")) == messages_before
+
+
+@pytest.mark.parametrize(
+    "binding_case",
+    ["missing", "changed", "transport_ambiguous"],
+)
+def test_prepare_cli_requires_powershell_accepted_config_before_effects(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    binding_case: str,
+) -> None:
+    if binding_case == "transport_ambiguous" and os.name != "nt":
+        pytest.skip("the generated PowerShell transport is Windows-only")
+    s = _store(tmp_path)
+    request_id = "lr-env-transport-alias"
+    s.write_launch_request(_marker(request_id))
+    cfg = _cfg()
+    accepted_config = json.dumps(cfg, ensure_ascii=False).encode("utf-8")
+    accepted_sha256 = hashlib.sha256(accepted_config).hexdigest()
+    cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["env"] = {
+        "AGENTTALK_P1A_Μ": "greek-capital-mu",
+        "AGENTTALK_P1A_µ": "micro-sign",
+    }
+    (s.dir / "supervisor.json").write_text(
+        json.dumps(cfg, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    if binding_case == "transport_ambiguous":
+        _select_powershell_for_prepare(s)
+        accepted_sha256 = hashlib.sha256(
+            (s.dir / "supervisor.json").read_bytes()
+        ).hexdigest()
+    state_path = s.dir / "supervisor-state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    marker_path = s.launch_requests_dir / f"{request_id}.json"
+    state_before = state_path.read_bytes()
+    marker_before = marker_path.read_bytes()
+    config_before = s.load_config()
+    retired_before = s.retired_agents()
+    messages_before = {
+        path.name: path.read_bytes()
+        for path in s.messages_dir.glob("*.json")
+    }
+
+    argv = [
+        "--root", str(tmp_path),
+        "supervise",
+        "--prepare-launch-request",
+        "--request-id", request_id,
+        "--state-file", str(state_path),
+        "--now", str(NOW),
+        "--launch-agenttalk-python", sys.executable,
+        "--launch-src-on-pythonpath", "false",
+    ]
+    if binding_case != "missing":
+        argv.extend(["--supervisor-config-sha256", accepted_sha256])
+    rc = cli.main(argv)
+
+    assert rc == (2 if binding_case == "missing" else 3)
+    error = capsys.readouterr().err
+    if binding_case == "missing":
+        assert "PowerShell-accepted supervisor config SHA-256" in error
+    elif binding_case == "changed":
+        assert "changed after PowerShell accepted it" in error
+    else:
+        assert "not accepted by the selected PowerShell transport" in error
+    assert state_path.read_bytes() == state_before
+    assert marker_path.read_bytes() == marker_before
+    assert not (s.launch_requests_archive_dir / f"{request_id}.json").exists()
+    assert s.load_config() == config_before
+    assert s.retired_agents() == retired_before
+    assert {
+        path.name: path.read_bytes()
+        for path in s.messages_dir.glob("*.json")
+    } == messages_before
 
 
 @pytest.mark.parametrize(

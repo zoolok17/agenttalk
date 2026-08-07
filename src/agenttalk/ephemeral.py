@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import uuid
@@ -192,11 +193,6 @@ def effective_review_request_digest(message: object) -> str:
         for field in _REVIEW_REQUEST_BINDING_FIELDS
     }
     return _bounded_canonical_sha256(projection)
-
-
-def effective_launch_environment_digest(environment: dict[str, str]) -> str:
-    """Hash the complete effective launch environment without persisting it."""
-    return _bounded_canonical_sha256(environment)
 
 
 def make_effective_launch_binding(
@@ -466,6 +462,37 @@ def strict_authority(store_cfg: dict, requested_by: str, *, require_authorized_l
     return False, "multiple leads are configured; launch authority is ambiguous"
 
 
+def _windows_environment_names_equal(left: str, right: str) -> bool:
+    """Match the ordinal, case-insensitive comparer used by Windows env blocks."""
+    if left == right:
+        return True
+    if os.name != "nt":
+        # Non-Windows hosts never apply this launch environment. Preserve every
+        # non-ASCII spelling; still catch the ASCII case aliases used by config.
+        def ascii_fold(value: str) -> str:
+            return "".join(
+                char.lower() if char.isascii() else char
+                for char in value
+            )
+
+        return ascii_fold(left) == ascii_fold(right)
+    import ctypes
+
+    compare = ctypes.WinDLL("kernel32", use_last_error=True).CompareStringOrdinal
+    compare.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    compare.restype = ctypes.c_int
+    result = compare(left, -1, right, -1, True)
+    # Valid environment names cannot make this call fail. If the platform does
+    # fail to compare them, treat the pair as ambiguous and refuse it.
+    return result in {0, 2}
+
+
 def validate_launch_request(
     marker: object,
     store_cfg: dict,
@@ -500,12 +527,11 @@ def validate_launch_request(
                 f"profile {marker.get('profile')!r} env must be an object"
             )
         else:
-            seen_env_keys: set[str] = set()
+            seen_env_keys: list[str] = []
             for key, value in raw_env.items():
                 if (
                     not isinstance(key, str)
                     or not key
-                    or not key.isascii()
                     or "=" in key
                     or any(
                         ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
@@ -517,14 +543,19 @@ def validate_launch_request(
                         "invalid variable name"
                     )
                     continue
-                folded = key.lower()
-                if folded in seen_env_keys:
+                if any(
+                    _windows_environment_names_equal(key, previous)
+                    for previous in seen_env_keys
+                ):
                     errors.append(
                         f"profile {marker.get('profile')!r} env contains "
                         "case-insensitive duplicate variable names"
                     )
-                seen_env_keys.add(folded)
-                if folded in _SUPERVISOR_OWNED_ENV_KEYS:
+                seen_env_keys.append(key)
+                if any(
+                    _windows_environment_names_equal(key, reserved)
+                    for reserved in _SUPERVISOR_OWNED_ENV_KEYS
+                ):
                     errors.append(
                         f"profile {marker.get('profile')!r} env cannot override "
                         f"supervisor-owned variable {key!r}"
@@ -763,7 +794,8 @@ def launch_spec(
     env = {
         key: str(sub(value))
         for key, value in env.items()
-        if isinstance(key, str) and key.casefold() != "agenttalk_self"
+        if isinstance(key, str)
+        and not _windows_environment_names_equal(key, "AGENTTALK_SELF")
     }
     env["AGENTTALK_SELF"] = agent
     spec = {

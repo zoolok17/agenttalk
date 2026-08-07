@@ -121,6 +121,22 @@ def _write_supervisor_config(store: Store, agents: dict) -> None:
     )
 
 
+def _record_launch_context(
+    *,
+    cli_name: str = "codex",
+    grace_seconds: float = 120,
+    wrapped: bool = False,
+    brain_pattern: str | None = None,
+) -> dict:
+    return sup._launch_record_context(
+        agent="worker",
+        cli=cli_name,
+        grace_seconds=grace_seconds,
+        wrapped=wrapped,
+        brain_pattern=brain_pattern or cli_name,
+    )
+
+
 def _write_idle_wrapper_runtime(
     store: Store,
     *,
@@ -895,6 +911,26 @@ def test_supervisor_config_loader_accepts_utf8_bom(tmp_path: Path) -> None:
     assert sup.load_supervisor_config(path) == expected
 
 
+def test_supervisor_config_loader_binds_the_exact_accepted_bytes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "supervisor.json"
+    accepted = json.dumps({"agents": {"worker": {"cli": "codex"}}}).encode()
+    path.write_bytes(accepted)
+    digest = hashlib.sha256(accepted).hexdigest()
+
+    assert sup.load_supervisor_config(path, expected_sha256=digest) == {
+        "agents": {"worker": {"cli": "codex"}},
+    }
+
+    path.write_bytes(accepted + b"\n")
+    with pytest.raises(
+        sup.SupervisorPersistenceError,
+        match="changed after PowerShell accepted it",
+    ):
+        sup.load_supervisor_config(path, expected_sha256=digest)
+
+
 def test_supervise_plan_loads_bom_prefixed_project_config(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1020,8 +1056,9 @@ def test_supervise_plan_refuses_two_corrupt_state_copies_without_actions(
     assert backup_file.read_bytes() == backup_before
 
 
-def test_supervise_record_launch_creates_missing_state_with_atomic_codec(
+def test_supervise_record_launch_refuses_missing_reserved_state(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     s = _team(tmp_path)
     state_file = s.dir / "supervisor-state.json"
@@ -1031,9 +1068,9 @@ def test_supervise_record_launch_creates_missing_state_with_atomic_codec(
         "--pid", "777", "--state-file", str(state_file), "--now", str(NOW),
     ], tmp_path)
 
-    assert rc == 0
-    state = sup.load_supervisor_state(state_file)
-    assert state["agents"]["worker"]["launcher_pid"] == 777
+    assert rc == 3
+    assert "accepted launch record context is missing" in capsys.readouterr().err
+    assert not state_file.exists()
 
 
 def test_record_launch_authoritatively_persists_launch_clock_and_grace(
@@ -1049,7 +1086,17 @@ def test_record_launch_authoritatively_persists_launch_clock_and_grace(
     )
     state_file = store.dir / "supervisor-state.json"
     state_file.write_text(
-        json.dumps({"agents": {"worker": {"last_launch_epoch": NOW - 100}}}),
+        json.dumps({
+            "agents": {
+                "worker": {
+                    "last_launch_epoch": NOW - 100,
+                    "pending_launch_record": _record_launch_context(
+                        cli_name="claude",
+                        grace_seconds=75,
+                    ),
+                },
+            },
+        }),
         encoding="utf-8",
     )
 
@@ -1062,6 +1109,200 @@ def test_record_launch_authoritatively_persists_launch_clock_and_grace(
     persisted = sup.load_supervisor_state(state_file)["agents"]["worker"]
     assert persisted["last_launch_epoch"] == NOW
     assert persisted["launch_grace_until"] == NOW + 75
+    assert "pending_launch_record" not in persisted
+
+
+def test_record_launch_uses_pre_spawn_context_after_config_drift(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _team(tmp_path)
+    config_path = store.dir / "supervisor.json"
+    config_path.write_text(
+        json.dumps({
+            "agents": {
+                "worker": {
+                    "auto_restart": True,
+                    "cli": "codex",
+                    "wrapped": False,
+                    "brain_pattern": "accepted-child",
+                },
+            },
+            "launch_grace_seconds": 75,
+        }),
+        encoding="utf-8",
+    )
+    accepted_config = {
+        "root": TEST_ROOT,
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "codex",
+                "activity_hook": True,
+                "wrapped": False,
+                "brain_pattern": "accepted-child",
+            },
+        },
+        "backoff": _CONFIG["backoff"],
+        "launch_grace_seconds": 75,
+    }
+    plan = _plan(
+        _report(restart_request=_auth_marker("rr-record-context")),
+        {"agents": {"worker": _ready(backoff_next_epoch=0)}},
+        config=accepted_config,
+        snapshot=[],
+    )
+    assert plan["action"] == sup.RELAUNCH
+    accepted_context = plan["record_launch_context"]
+    assert accepted_context == {
+        "schema_version": 1,
+        "agent": "worker",
+        "cli": "codex",
+        "grace_seconds": 75.0,
+        "wrapped": False,
+        "brain_pattern": "accepted-child",
+    }
+    # This is the dangerous cut point: the child already exists, but the file
+    # accepted by the planner changes before record-launch runs. Recording must
+    # use the bounded pre-spawn context, not reopen this mutable file.
+    config_path.write_text(
+        json.dumps({
+            "agents": {
+                "worker": {
+                    "auto_restart": True,
+                    "cli": "codex",
+                    "wrapped": True,
+                    "brain_pattern": "drifted-child",
+                },
+            },
+            "launch_grace_seconds": 999,
+        }),
+        encoding="utf-8",
+    )
+    state_file = store.dir / "supervisor-state.json"
+    reserved_state = plan["next_state"]
+    reserved_state["pending_launch_record"] = accepted_context
+    state_file.write_text(
+        json.dumps({"agents": {"worker": reserved_state}}),
+        encoding="utf-8",
+    )
+    pre_snapshot = store.dir / "record-pre.json"
+    post_snapshot = store.dir / "record-post.json"
+    pre_snapshot.write_text("[]", encoding="utf-8")
+    post_snapshot.write_text(
+        json.dumps([
+            _proc(
+                778,
+                777,
+                "accepted-child.exe",
+                "accepted-child.exe",
+                BRAIN_START,
+            ),
+        ]),
+        encoding="utf-8",
+    )
+
+    rc = _run([
+        "supervise", "--record-launch", "--for", "worker", "--cli", "codex",
+        "--pid", "777", "--pid-start", LAUNCHER_START,
+        "--state-file", str(state_file), "--now", str(NOW),
+        "--pre-snapshot-file", str(pre_snapshot),
+        "--post-snapshot-file", str(post_snapshot),
+    ], tmp_path)
+
+    assert rc == 0
+    persisted = sup.load_supervisor_state(state_file)["agents"]["worker"]
+    assert persisted["launch_grace_until"] == NOW + 75
+    assert [row["pid"] for row in persisted["managed_pids"]] == [778]
+    assert persisted["managed_pids"][0]["seed_descendants"] is True
+    assert "pending_launch_record" not in persisted
+    persisted_before_replay = state_file.read_bytes()
+
+    replay_rc = _run([
+        "supervise", "--record-launch", "--for", "worker", "--cli", "codex",
+        "--pid", "777", "--pid-start", LAUNCHER_START,
+        "--state-file", str(state_file), "--now", str(NOW),
+    ], tmp_path)
+
+    assert replay_rc == 3
+    assert "accepted launch record context is missing" in capsys.readouterr().err
+    assert state_file.read_bytes() == persisted_before_replay
+
+
+def test_record_launch_rejects_missing_accepted_context_before_state_change(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _team(tmp_path)
+    state_file = store.dir / "supervisor-state.json"
+    state_file.write_text(
+        json.dumps({"agents": {"worker": {"sentinel": "unchanged"}}}),
+        encoding="utf-8",
+    )
+    before = state_file.read_bytes()
+
+    rc = _run([
+        "supervise", "--record-launch", "--for", "worker", "--cli", "codex",
+        "--pid", "777", "--state-file", str(state_file), "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 3
+    assert "accepted launch record context is missing" in capsys.readouterr().err
+    assert state_file.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "float_schema",
+        "extra_field",
+        "wrong_agent",
+        "string_grace",
+        "integer_wrapped",
+        "non_string_brain_pattern",
+    ],
+)
+def test_record_launch_rejects_malformed_reserved_context_before_state_change(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    corruption: str,
+) -> None:
+    store = _team(tmp_path)
+    context = _record_launch_context()
+    if corruption == "float_schema":
+        context["schema_version"] = 1.0
+    elif corruption == "extra_field":
+        context["unaccepted"] = True
+    elif corruption == "wrong_agent":
+        context["agent"] = "lead"
+    elif corruption == "string_grace":
+        context["grace_seconds"] = "120"
+    elif corruption == "integer_wrapped":
+        context["wrapped"] = 1
+    else:
+        context["brain_pattern"] = None
+    state_file = store.dir / "supervisor-state.json"
+    state_file.write_text(
+        json.dumps({
+            "agents": {
+                "worker": {
+                    "sentinel": "unchanged",
+                    "pending_launch_record": context,
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    before = state_file.read_bytes()
+
+    rc = _run([
+        "supervise", "--record-launch", "--for", "worker", "--cli", "codex",
+        "--pid", "777", "--state-file", str(state_file), "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 3
+    assert "accepted launch record" in capsys.readouterr().err
+    assert state_file.read_bytes() == before
 
 
 @pytest.mark.parametrize("winerror", [5, 32, 33])
@@ -1135,9 +1376,12 @@ def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
     assert "$delayMs = [Math]::Min(250, $delayMs * 2)" in block
     assert "function Save-StateForPoll" in block
     assert "state write failed this poll; will retry next poll" in block
-    assert poll_loop.count("Save-StateForPoll $state") == 7
-    assert poll_loop.count("if (-not (Save-StateForPoll $state))") == 7
-    assert poll_loop.count("continue supervisorPoll") >= 7
+    # Eight durability cut points: the eighth clears the one-shot accepted
+    # launch context when Start-Process returns no PID, so stale authority is
+    # not left behind for a later record call.
+    assert poll_loop.count("Save-StateForPoll $state") == 8
+    assert poll_loop.count("if (-not (Save-StateForPoll $state))") == 8
+    assert poll_loop.count("continue supervisorPoll") >= 8
     reserve = "Set-AgentState $state $name $p.next_state\n          if (-not (Save-StateForPoll $state))"
     launch_index = poll_loop.index("$res = Launch $name $p $homeEnv")
     record_index = poll_loop.index("$recordArgs = @('--root', $Root, 'supervise', '--record-launch'")
@@ -2078,7 +2322,10 @@ def test_ps_template_applies_and_restores_env() -> None:
     RESTORES the supervisor's own env afterward. AGENTTALK_PYTHON stays
     supervisor-only for the shim."""
     ps = sup.PS_TEMPLATE
-    assert "$applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }" in ps
+    assert (
+        "$applied = @{ AGENTTALK_ROOT = $Root; "
+        "AGENTTALK_PY = $AgenttalkPython }"
+    ) in ps
     assert "$a.env" in ps                                  # applies per-agent env
     assert "'src') + ';' + $env:PYTHONPATH" in ps          # src on PYTHONPATH for module import
     assert "finally" in ps                                 # restore in a finally
@@ -2128,16 +2375,21 @@ def test_record_launch_codex_marks_launched_no_fake_id(tmp_path: Path) -> None:
     planner input."""
     _team(tmp_path)
     sf = tmp_path / "state.json"
-    sf.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    sf.write_text(json.dumps({"agents": {"worker": {
+        "pending_launch_record": _record_launch_context(),
+    }}}), encoding="utf-8")
     # codex launch success: no --session-id passed
     assert _run(["supervise", "--record-launch", "--for", "worker", "--cli", "codex",
                  "--pid", "777", "--state-file", str(sf)], tmp_path) == 0
     e = json.loads(sf.read_text(encoding="utf-8"))["agents"]["worker"]
     assert e["pid"] == 777 and e["launched"] is True and e["session_id"] is None
     # claude launch success: minted id pinned
-    sf.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    sf.write_text(json.dumps({"agents": {"worker": {
+        "pending_launch_record": _record_launch_context(cli_name="claude"),
+    }}}), encoding="utf-8")
     assert _run(["supervise", "--record-launch", "--for", "worker", "--cli", "claude",
-                 "--pid", "888", "--session-id", "sess-x", "--state-file", str(sf)],
+                 "--pid", "888", "--session-id", "sess-x", "--state-file", str(sf),
+                 ],
                 tmp_path) == 0
     e2 = json.loads(sf.read_text(encoding="utf-8"))["agents"]["worker"]
     assert e2["pid"] == 888 and e2["launched"] is True and e2["session_id"] == "sess-x"
@@ -2196,11 +2448,15 @@ def test_zombie_wait_reaps_orphans_then_relaunches() -> None:
 def test_in_grace_launcher_dead_is_none_no_brain_yet() -> None:
     # still in grace, brain not found yet, launcher already dead -> LAUNCHING
     # (NOT a failure): launcher death during grace is expected.
+    pending = _record_launch_context()
     st = {"agents": {"worker": {"launcher_pid": 199, "launching": True,
-                                "launch_grace_until": NOW + 100, "readiness_seen": False}}}
+                                "launch_grace_until": NOW + 100,
+                                "readiness_seen": False,
+                                "pending_launch_record": pending}}}
     p = _plan(_report(heartbeat_stale=True), st, snapshot=[])
     assert p["action"] == sup.NONE and p["state"] == "LAUNCHING"
     assert p["discover_brain"] is True
+    assert p["next_state"]["pending_launch_record"] == pending
 
 
 def test_no_brain_by_grace_expiry_relaunches() -> None:
@@ -2950,7 +3206,10 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     ps = sup.PS_TEMPLATE
     # the agent env carries AGENTTALK_PY, while AGENTTALK_PYTHON and the
     # .agenttalk/bin shim remain supervisor-only.
-    assert "$applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }" in ps
+    assert (
+        "$applied = @{ AGENTTALK_ROOT = $Root; "
+        "AGENTTALK_PY = $AgenttalkPython }"
+    ) in ps
     assert "AGENTTALK_PYTHON = $AgenttalkPython" not in ps   # not in the AGENT env
     # Seed-CodexHome copies config.toml then overlays via the python core
     assert "function Seed-CodexHome" in ps
@@ -4105,18 +4364,10 @@ def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
     non_ascii = [b for b in raw if b > 0x7F]
     assert not non_ascii, f"supervisor.ps1 body must be ASCII-only; found {non_ascii[:5]}"
     text = raw.decode("ascii")
-    capture = "$prepEnvironmentCapture = Get-SupervisorEnvironmentCapture"
-    status_check = "$prepEnvironmentCapture.status -cne 'valid'"
-    serialize = "$prepEnvironment | ConvertTo-Json"
-    assert "function Get-SupervisorEnvironmentCapture" in text
-    assert capture in text
-    assert status_check in text
-    assert "$prepEnvironment = $prepEnvironmentCapture.values" in text
-    assert text.index(capture) < text.index(status_check) < text.index(serialize)
-    assert "[Convert]::ToBase64String(" in text
+    assert "Get-SupervisorEnvironmentCapture" not in text
+    assert "--launch-environment-stdin" not in text
     assert "--launch-agenttalk-python $AgenttalkPython" in text
     assert "--launch-src-on-pythonpath" in text
-    assert "--launch-environment-stdin" in text
     shell = shutil.which("pwsh")
     if not shell:
         return
@@ -4130,83 +4381,93 @@ def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
         f"supervisor.ps1 failed to parse under {shell}: {res.stdout}{res.stderr}")
 
 
-def test_supervisor_environment_capture_distinguishes_malformed_utf16(
+def _run_supervisor_config_reader(
     tmp_path: Path,
-) -> None:
-    shell = _pick_powershell()
+    environment: dict[str, str],
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    shell = shutil.which("pwsh")
     if not shell:
-        return
-    helper = sup.PS_TEMPLATE[
-        sup.PS_TEMPLATE.index("function Get-SupervisorEnvironmentCapture"):
-        sup.PS_TEMPLATE.index("function Actions-Enabled")
+        pytest.skip("PowerShell Core is unavailable")
+    config_path = tmp_path / "supervisor.json"
+    config_path.write_text(
+        "\ufeff" + json.dumps({
+            "agents": {},
+            "ephemeral_reviewers": {
+                "allowed_profiles": {"unicode-profile": {"env": environment}},
+            },
+        }),
+        encoding="utf-8",
+    )
+    output = tmp_path / "environment-names.json"
+    reader = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Read-SupervisorConfig"):
+        sup.PS_TEMPLATE.index("$cfg = Read-SupervisorConfig")
     ]
-    output = tmp_path / "environment-capture.json"
-    script = tmp_path / "environment-capture.ps1"
+    script = tmp_path / "read-supervisor-config.ps1"
     script.write_text(
         "\n".join([
             "$ErrorActionPreference = 'Stop'",
-            helper,
-            "$name = 'AGENTTALK_P1A_UTF16'",
-            "$unicodeName = 'AGENTTALK_P1A_' + [char]0x212A",
-            "$asciiName = 'AGENTTALK_P1A_K'",
-            "try {",
-            "  [Environment]::SetEnvironmentVariable("
-            "$name, [string][char]0xD800, 'Process')",
-            "  $invalid = Get-SupervisorEnvironmentCapture",
-            "  [Environment]::SetEnvironmentVariable("
-            "$name, [char]::ConvertFromUtf32(0x1F642), 'Process')",
-            "  $valid = Get-SupervisorEnvironmentCapture",
-            "  [Environment]::SetEnvironmentVariable($name, $null, 'Process')",
-            "  [Environment]::SetEnvironmentVariable("
-            "$unicodeName, 'same-value', 'Process')",
-            "  $unicode = Get-SupervisorEnvironmentCapture",
-            "  [Environment]::SetEnvironmentVariable("
-            "$asciiName, 'same-value', 'Process')",
-            "  $alias = Get-SupervisorEnvironmentCapture",
-            "  [pscustomobject]@{",
-            "    invalid_status = $invalid.status;",
-            "    valid_status = $valid.status;",
-            "    unicode_status = $unicode.status;",
-            "    unicode_value = $unicode.values[$unicodeName];",
-            "    alias_status = $alias.status;",
-            "    valid_codepoint = [char]::ConvertToUtf32("
-            "$valid.values[$name], 0)",
-            "  } | ConvertTo-Json | "
+            f"$ConfigPath = {_pslit(str(config_path))}",
+            reader,
+            "$config = Read-SupervisorConfig",
+            "$profileEnv = $config.ephemeral_reviewers.allowed_profiles."
+            "'unicode-profile'.env",
+            "$payload = [pscustomobject]@{ "
+            "names = @($profileEnv.PSObject.Properties.Name); "
+            "sha256 = $script:SupervisorConfigSha256 }",
+            "$payload | ConvertTo-Json | "
             f"Set-Content {_pslit(str(output))} -Encoding utf8",
-            "} finally {",
-            "  [Environment]::SetEnvironmentVariable($name, $null, 'Process')",
-            "  [Environment]::SetEnvironmentVariable("
-            "$unicodeName, $null, 'Process')",
-            "  [Environment]::SetEnvironmentVariable("
-            "$asciiName, $null, 'Process')",
-            "}",
         ]),
         encoding="utf-8-sig",
     )
-
-    result = subprocess.run(
+    return subprocess.run(
         [shell, "-NoProfile", "-File", str(script)],
         capture_output=True,
         text=True,
         timeout=120,
-    )
+    ), output
+
+
+def test_supervisor_config_transport_preserves_unicode_environment_names(
+    tmp_path: Path,
+) -> None:
+    environment = {
+        "AGENTTALK_P1A_雪": "snow",
+        "AGENTTALK_P1A_K": "ascii-k",
+        "AGENTTALK_P1A_K": "kelvin",
+        "AGENTTALK_ſELF": "long-s",
+    }
+
+    result, output = _run_supervisor_config_reader(tmp_path, environment)
 
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
-    assert json.loads(output.read_text(encoding="utf-8-sig")) == {
-        "invalid_status": "invalid",
-        "valid_status": "valid",
-        "unicode_status": "valid",
-        "unicode_value": "same-value",
-        "alias_status": "invalid",
-        "valid_codepoint": 0x1F642,
-    }
+    payload = json.loads(output.read_text(encoding="utf-8-sig"))
+    assert set(payload["names"]) == set(environment)
+    assert payload["sha256"] == hashlib.sha256(
+        (tmp_path / "supervisor.json").read_bytes()
+    ).hexdigest()
+
+
+def test_supervisor_config_transport_rejects_ambiguous_environment_names(
+    tmp_path: Path,
+) -> None:
+    result, output = _run_supervisor_config_reader(
+        tmp_path,
+        {
+            "AGENTTALK_P1A_Μ": "greek-mu",
+            "AGENTTALK_P1A_µ": "micro",
+        },
+    )
+
+    assert result.returncode != 0
+    assert not output.exists()
 
 
 def test_ephemeral_launcher_applies_environment_names_literally(
     tmp_path: Path,
 ) -> None:
-    shell = _pick_powershell()
-    if not shell:
+    shells = (shutil.which("pwsh"),)
+    if shells[0] is None:
         return
     helpers = _exec_helpers(tmp_path)
     launchers = sup.PS_TEMPLATE[
@@ -4219,6 +4480,10 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         f"$Root = {_pslit(str(tmp_path))}",
         "$AgenttalkPython = 'python.exe'",
         "$SrcOnPyPath = $false",
+        "$snowName = 'AGENTTALK_P1A_' + [char]0x96EA",
+        "$kelvinName = 'AGENTTALK_P1A_' + [char]0x212A",
+        "$asciiKName = 'AGENTTALK_P1A_K'",
+        "$longSName = 'AGENTTALK_' + [char]0x017F + 'ELF'",
         "$WrapperLogMaxBytes = 1024",
         "$WrapperLogSegments = 2",
         "$WrapperLogEnvKeys = @('AGENTTALK_WRAPPER_STDOUT_LOG',"
@@ -4235,6 +4500,10 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "    wildcard = [Environment]::GetEnvironmentVariable('AGENTTALK_P1A_*')",
         "    sibling_a = $env:AGENTTALK_P1A_A",
         "    sibling_b = $env:AGENTTALK_P1A_B",
+        "    snow = [Environment]::GetEnvironmentVariable($snowName)",
+        "    ascii_k = [Environment]::GetEnvironmentVariable($asciiKName)",
+        "    kelvin = [Environment]::GetEnvironmentVariable($kelvinName)",
+        "    long_s = [Environment]::GetEnvironmentVariable($longSName)",
         "    python = [Environment]::GetEnvironmentVariable('AGENTTALK_PYTHON')",
         "    shim = [Environment]::GetEnvironmentVariable('AGENTTALK_SHIM_ACTIVE')",
         "  }",
@@ -4248,6 +4517,10 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "$profileEnv = [pscustomobject]@{}",
         "$profileEnv | Add-Member -NotePropertyName 'AGENTTALK_P1A_*' -NotePropertyValue 'literal-new'",
         "$profileEnv | Add-Member -NotePropertyName 'AGENTTALK_P1A_A' -NotePropertyValue 'new-a'",
+        "$profileEnv | Add-Member -NotePropertyName $snowName -NotePropertyValue 'unicode'",
+        "$profileEnv | Add-Member -NotePropertyName $asciiKName -NotePropertyValue 'ascii-k'",
+        "$profileEnv | Add-Member -NotePropertyName $kelvinName -NotePropertyValue 'kelvin'",
+        "$profileEnv | Add-Member -NotePropertyName $longSName -NotePropertyValue 'long-s'",
         "$spec = [pscustomobject]@{",
         "  cli = 'codex'; cwd = $Root; env = $profileEnv;",
         "  window_style = 'Hidden'; window_style_warning = $null;",
@@ -4264,31 +4537,44 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "  after_a = $env:AGENTTALK_P1A_A;",
         "  after_b = $env:AGENTTALK_P1A_B;",
         "  after_wildcard = [Environment]::GetEnvironmentVariable('AGENTTALK_P1A_*')",
+        "  after_snow = [Environment]::GetEnvironmentVariable($snowName);",
+        "  after_ascii_k = [Environment]::GetEnvironmentVariable($asciiKName);",
+        "  after_kelvin = [Environment]::GetEnvironmentVariable($kelvinName);",
+        "  after_long_s = [Environment]::GetEnvironmentVariable($longSName);",
         "} | ConvertTo-Json -Depth 4 | "
         f"Set-Content {_pslit(str(output))} -Encoding utf8",
     ])
     script = tmp_path / "literal-environment.ps1"
     script.write_text(harness, encoding="utf-8-sig")
 
-    result = subprocess.run(
-        [shell, "-NoProfile", "-File", str(script)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    for shell in shells:
+        result = subprocess.run(
+            [shell, "-NoProfile", "-File", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
 
-    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
-    payload = json.loads(output.read_text(encoding="utf-8-sig"))
-    assert payload["inside"] == {
-        "wildcard": "literal-new",
-        "sibling_a": "new-a",
-        "sibling_b": "old-b",
-        "python": None,
-        "shim": None,
-    }
-    assert payload["after_a"] == "old-a"
-    assert payload["after_b"] == "old-b"
-    assert payload["after_wildcard"] is None
+        assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+        payload = json.loads(output.read_text(encoding="utf-8-sig"))
+        assert payload["inside"] == {
+            "wildcard": "literal-new",
+            "sibling_a": "new-a",
+            "sibling_b": "old-b",
+            "snow": "unicode",
+            "ascii_k": "ascii-k",
+            "kelvin": "kelvin",
+            "long_s": "long-s",
+            "python": None,
+            "shim": None,
+        }
+        assert payload["after_a"] == "old-a"
+        assert payload["after_b"] == "old-b"
+        assert payload["after_wildcard"] is None
+        assert payload["after_snow"] is None
+        assert payload["after_ascii_k"] is None
+        assert payload["after_kelvin"] is None
+        assert payload["after_long_s"] is None
 
 def test_generated_helper_ps1_are_bom_ascii_and_parse(tmp_path: Path) -> None:
     s = _team(tmp_path)
@@ -4486,7 +4772,7 @@ def _start_live_generated_supervisor(
 
 
 @pytest.mark.source_layout
-def test_generated_ps1_survives_malformed_config_poll_with_last_good(
+def test_generated_ps1_holds_malformed_config_poll_until_refresh_recovers(
     tmp_path: Path,
 ) -> None:
     shell = _pick_powershell()
@@ -4497,7 +4783,9 @@ def test_generated_ps1_survives_malformed_config_poll_with_last_good(
         shell,
     )
     state_path = store.dir / "supervisor-state.json"
-    warning = "supervisor.json refresh failed; keeping last-good config"
+    warning = "supervisor.json refresh failed; holding this poll"
+    config_path = store.dir / "supervisor.json"
+    valid_config = config_path.read_text(encoding="utf-8")
     try:
         _wait_for_live_supervisor(
             proc,
@@ -4506,19 +4794,28 @@ def test_generated_ps1_survives_malformed_config_poll_with_last_good(
             and _log_contains(log_path, "supervisor: lead:"),
         )
         time.sleep(0.25)
-        _replace_text_when_unlocked(
-            state_path,
-            json.dumps({"agents": {}}),
+        _replace_text_when_unlocked(config_path, "{")
+        _wait_for_live_supervisor(
+            proc,
+            log_path,
+            lambda: _log_occurrences(log_path, warning) >= 1,
         )
-        (store.dir / "supervisor.json").write_text("{", encoding="utf-8")
+        _replace_text_when_unlocked(state_path, json.dumps({"agents": {}}))
 
         _wait_for_live_supervisor(
             proc,
             log_path,
-            lambda: _log_occurrences(log_path, warning) >= 2
-            and _state_has_agent(state_path, "lead"),
+            lambda: _log_occurrences(log_path, warning) >= 3,
         )
         assert proc.poll() is None
+        assert not _state_has_agent(state_path, "lead")
+
+        _replace_text_when_unlocked(config_path, valid_config)
+        _wait_for_live_supervisor(
+            proc,
+            log_path,
+            lambda: _state_has_agent(state_path, "lead"),
+        )
     finally:
         _stop_live_supervisor(proc)
         log_handle.close()
@@ -17617,8 +17914,44 @@ def test_ps_template_refreshes_config_before_each_poll() -> None:
     before_state = loop[:loop.index("$state = Load-State")]
     if "try {" not in before_state or "catch {" not in before_state:
         pytest.fail("per-poll config refresh is not guarded")
-    if "keeping last-good config" not in before_state:
-        pytest.fail("config refresh failure does not preserve last-good behavior")
+    if "supervisor.json refresh failed; holding this poll" not in before_state:
+        pytest.fail("config refresh failure does not name the held poll")
+    wait = "Wait-ForNextPoll $cfg"
+    hold = "continue supervisorPoll"
+    if wait not in before_state or hold not in before_state:
+        pytest.fail("config refresh failure can reach planning or effects")
+    if before_state.index(wait) > before_state.index(hold):
+        pytest.fail("config refresh failure must wait before retrying")
+
+
+def test_ps_template_binds_python_consumers_to_accepted_config_snapshot() -> None:
+    ps = sup.PS_TEMPLATE
+    assert "[IO.File]::ReadAllBytes($ConfigPath)" in ps
+    assert "$cfgSha256 = $script:SupervisorConfigSha256" in ps
+    assert "$nextCfgSha256 = $script:SupervisorConfigSha256" in ps
+    assert ps.count("--supervisor-config-sha256 $cfgSha256") == 4
+    reserve = (
+        "$p.next_state | Add-Member -NotePropertyName pending_launch_record"
+    )
+    assert reserve in ps
+    reserve_index = ps.index(reserve)
+    preflight_index = ps.rindex("Preflight $name", 0, reserve_index)
+    launch_index = ps.index("$res = Launch $name", reserve_index)
+    assert preflight_index < reserve_index < launch_index
+    record_start = ps.index("$recordArgs = @('--root', $Root, 'supervise', '--record-launch'")
+    record_end = ps.index("Invoke-CheckedSupervisorMutation", record_start)
+    record = ps[record_start:record_end]
+    assert "record-launch-context" not in record
+    assert "supervisor-config-sha256" not in record
+    no_pid = ps[record_end:ps.index("'clear_marker'", record_end)]
+    remove_context = (
+        "$p.next_state.PSObject.Properties.Remove('pending_launch_record')"
+    )
+    assert remove_context in no_pid
+    assert no_pid.index(remove_context) < no_pid.index("Save-StateForPoll $state")
+    plan = ps[ps.index("$planText ="):ps.index("$pollNum++")]
+    assert "$LASTEXITCODE -ne 0" in plan
+    assert "continue supervisorPoll" in plan
 
 
 def test_process_ownership_stop_tree_closed_set_pin() -> None:

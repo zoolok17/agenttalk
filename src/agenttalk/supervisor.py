@@ -35,7 +35,6 @@ import subprocess  # nosec B404 - list2cmdline formats argv; no process is launc
 import sys
 import tempfile
 import time
-import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterable, Sequence
@@ -480,11 +479,110 @@ def save_supervisor_state(path: Path, state: dict) -> None:
     _atomic_write_supervisor_json(path, state, source="supervisor state")
 
 
-def load_supervisor_config(path: Path) -> dict:
-    """Load supervisor.json as a BOM-tolerant JSON object."""
+_POWERSHELL_CONFIG_TRANSPORT_PROBE = r"""
+$ErrorActionPreference = 'Stop'
+$stdin = [Console]::OpenStandardInput()
+$buffer = [IO.MemoryStream]::new()
+try {
+  $stdin.CopyTo($buffer)
+  $bytes = $buffer.ToArray()
+} finally {
+  $buffer.Dispose()
+}
+$strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+$text = $strictUtf8.GetString($bytes)
+if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) {
+  $text = $text.Substring(1)
+}
+$value = $text | ConvertFrom-Json
+if (($null -eq $value) -or
+    (($value -isnot [System.Management.Automation.PSCustomObject]) -and
+     ($value -isnot [hashtable]))) {
+  throw 'supervisor config must be a JSON object'
+}
+$agents = $value.PSObject.Properties['agents']
+if (($null -eq $agents) -or ($null -eq $agents.Value) -or
+    (($agents.Value -isnot [System.Management.Automation.PSCustomObject]) -and
+     ($agents.Value -isnot [hashtable]))) {
+  throw 'supervisor config agents must be a JSON object'
+}
+"""
+
+
+def _validate_powershell_config_transport(store: Store, raw: bytes) -> None:
+    """Require the selected PowerShell to accept the exact bound JSON bytes."""
+    if os.name != "nt":
+        # Generated PowerShell supervision is Windows-only. Cross-platform
+        # planner/unit consumers still exercise the deterministic Python side.
+        return
+    try:
+        with lifecycle.selected_host_for_spawn(store) as selected:
+            result = subprocess.run(  # noqa: S603  # nosec B603
+                [
+                    str(selected["path"]),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    _POWERSHELL_CONFIG_TRANSPORT_PROBE,
+                ],
+                input=raw,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+    except (OSError, subprocess.TimeoutExpired, lifecycle.SupervisorLifecycleError) as exc:
+        raise SupervisorPersistenceError(
+            "selected PowerShell could not validate the supervisor config transport"
+        ) from exc
+    if result.returncode != 0:
+        raise SupervisorPersistenceError(
+            "supervisor config was not accepted by the selected PowerShell transport"
+        )
+
+
+def load_supervisor_config(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    powershell_transport_store: Store | None = None,
+) -> dict:
+    """Load supervisor.json, optionally bound to an accepted byte snapshot."""
     path = Path(path)
     if not path.exists():
+        if expected_sha256 is not None:
+            raise SupervisorPersistenceError(
+                "supervisor config is unavailable or changed after PowerShell accepted it"
+            )
         return {}
+    if expected_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise SupervisorPersistenceError(
+                "PowerShell-accepted supervisor config SHA-256 is invalid"
+            )
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise SupervisorPersistenceError(
+                "supervisor config is unavailable or changed after PowerShell accepted it"
+            ) from exc
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise SupervisorPersistenceError(
+                "supervisor config changed after PowerShell accepted it"
+            )
+        if powershell_transport_store is not None:
+            _validate_powershell_config_transport(powershell_transport_store, raw)
+        try:
+            value = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise SupervisorPersistenceError(
+                f"supervisor config is unreadable or invalid: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise SupervisorPersistenceError("supervisor config must be a JSON object")
+        return value
     return _read_supervisor_json(path, source="supervisor config")
 
 
@@ -2192,6 +2290,80 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
             "resume_mode": "last" if resume else "fresh",
             "session_args": session_args(cli, mode, session_id, cfg_agent,
                                          perm_mode=perm_mode)}
+
+
+_LAUNCH_RECORD_CONTEXT_SCHEMA = 1
+
+
+def _launch_record_context(
+    *,
+    agent: str,
+    cli: str,
+    grace_seconds: float,
+    wrapped: bool,
+    brain_pattern: str,
+) -> dict:
+    """Return the bounded accepted-config facts needed after process spawn.
+
+    The generated executor persists this value in the reserved next-state before
+    launching. Keeping the context bounded avoids persisting cwd/environment
+    values (and their possible secrets), while avoiding a second read of mutable
+    ``supervisor.json`` after ``Start-Process`` has succeeded.
+    """
+    return {
+        "schema_version": _LAUNCH_RECORD_CONTEXT_SCHEMA,
+        "agent": agent,
+        "cli": cli,
+        "grace_seconds": grace_seconds,
+        "wrapped": wrapped,
+        "brain_pattern": brain_pattern,
+    }
+
+
+def decode_launch_record_context(
+    value: object,
+    *,
+    agent: str,
+    cli: str,
+) -> tuple[float, dict]:
+    """Validate one plan-produced launch-record context, failing closed."""
+    if value is None:
+        raise ValueError("accepted launch record context is missing")
+    if not isinstance(value, dict):
+        raise ValueError("accepted launch record context must be an object")
+    if set(value) != {
+        "schema_version",
+        "agent",
+        "cli",
+        "grace_seconds",
+        "wrapped",
+        "brain_pattern",
+    }:
+        raise ValueError("accepted launch record context fields are invalid")
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != _LAUNCH_RECORD_CONTEXT_SCHEMA
+        or value.get("agent") != agent
+        or value.get("cli") != cli
+    ):
+        raise ValueError("accepted launch record context identity does not match")
+    grace = value.get("grace_seconds")
+    if (
+        not isinstance(grace, (int, float))
+        or isinstance(grace, bool)
+        or not math.isfinite(float(grace))
+        or float(grace) < 0
+    ):
+        raise ValueError("accepted launch record grace is invalid")
+    wrapped = value.get("wrapped")
+    brain_pattern = value.get("brain_pattern")
+    if not isinstance(wrapped, bool) or not isinstance(brain_pattern, str):
+        raise ValueError("accepted launch record agent projection is invalid")
+    return float(grace), {
+        "cli": cli,
+        "wrapped": wrapped,
+        "brain_pattern": brain_pattern,
+    }
 
 
 # ---- process-snapshot interpretation (PURE; testable from synthetic rows) ---
@@ -4548,132 +4720,6 @@ def _ephemeral_recovery_environment(
     }
 
 
-_EPHEMERAL_ENV_BINDING_EXCLUDED = frozenset({
-    "agenttalk_python",
-    "agenttalk_shim_active",
-    "agenttalk_shim_parent_pythonpath",
-    "agenttalk_shim_parent_pythonpath_absent",
-    "agenttalk_wrapper_stdout_log",
-    "agenttalk_wrapper_stderr_log",
-    "agenttalk_wrapper_log_max_bytes",
-    "agenttalk_wrapper_log_segments",
-    "agenttalk_wrapper_log_nonce",
-})
-
-
-def _ephemeral_environment_name_key(name: str) -> str:
-    """Return the stable comparer key used by the environment binding."""
-    return unicodedata.normalize("NFC", name).casefold()
-
-
-def _validated_ephemeral_parent_environment(environment: object) -> dict[str, str]:
-    """Return a bounded Windows environment projection without lossy aliases."""
-    if not isinstance(environment, dict):
-        raise eph.EphemeralError(
-            "the running supervisor's launch environment is unavailable"
-        )
-    canonical: dict[str, str] = {}
-    for key, value in environment.items():
-        if (
-            not isinstance(key, str)
-            or not key
-            or "=" in key
-            or not isinstance(value, str)
-            or any(
-                ord(ch) < 32 or 0xD800 <= ord(ch) <= 0xDFFF
-                for ch in key
-            )
-            or any(
-                ch == "\x00" or 0xD800 <= ord(ch) <= 0xDFFF
-                for ch in value
-            )
-        ):
-            raise eph.EphemeralError(
-                "the running supervisor's launch environment is invalid"
-            )
-        folded = _ephemeral_environment_name_key(key)
-        if folded in _EPHEMERAL_ENV_BINDING_EXCLUDED:
-            continue
-        if folded in canonical:
-            raise eph.EphemeralError(
-                "the running supervisor's launch environment has duplicate keys"
-            )
-        canonical[folded] = value
-    try:
-        eph.effective_launch_environment_digest(canonical)
-    except eph.EphemeralError:
-        raise
-    except (TypeError, ValueError) as exc:
-        raise eph.EphemeralError(
-            "the running supervisor's launch environment is unavailable"
-        ) from exc
-    return canonical
-
-
-def _current_ephemeral_parent_environment() -> dict[str, str]:
-    """Undo project-shim-only mutations and return the caller environment."""
-    current = dict(os.environ)
-    if current.get("AGENTTALK_SHIM_ACTIVE") == "1":
-        if current.get("AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT") == "1":
-            current.pop("PYTHONPATH", None)
-        elif "AGENTTALK_SHIM_PARENT_PYTHONPATH" in current:
-            current["PYTHONPATH"] = current[
-                "AGENTTALK_SHIM_PARENT_PYTHONPATH"
-            ]
-    return _validated_ephemeral_parent_environment(current)
-
-
-def _effective_ephemeral_environment_digest(
-    parent_environment: dict[str, str],
-    spec: dict,
-    recovery_environment: dict,
-) -> str:
-    """Hash exactly the inherited environment Launch-Spec will expose."""
-    effective = dict(parent_environment)
-
-    def apply(name: str, value: object) -> None:
-        folded = _ephemeral_environment_name_key(name)
-        if folded in _EPHEMERAL_ENV_BINDING_EXCLUDED:
-            effective.pop(folded, None)
-        elif value is None:
-            effective.pop(folded, None)
-        elif isinstance(value, str):
-            effective[folded] = value
-        else:
-            raise eph.EphemeralError(
-                "the prepared launch environment is invalid"
-            )
-
-    apply("AGENTTALK_ROOT", recovery_environment.get("AGENTTALK_ROOT"))
-    apply("AGENTTALK_PY", recovery_environment.get("AGENTTALK_PY"))
-    pythonpath_prepend = recovery_environment.get("PYTHONPATH_prepend")
-    if pythonpath_prepend is not None:
-        if not isinstance(pythonpath_prepend, str):
-            raise eph.EphemeralError(
-                "the prepared launch environment is invalid"
-            )
-        apply(
-            "PYTHONPATH",
-            f"{pythonpath_prepend};{effective.get('pythonpath', '')}",
-        )
-    codex_home = recovery_environment.get("CODEX_HOME")
-    if codex_home is not None:
-        apply("CODEX_HOME", codex_home)
-    no_child_window = recovery_environment.get("AGENTTALK_NO_CHILD_WINDOW")
-    if no_child_window is not None:
-        apply("AGENTTALK_NO_CHILD_WINDOW", no_child_window)
-    configured = spec.get("env")
-    if not isinstance(configured, dict):
-        raise eph.EphemeralError("the prepared launch environment is invalid")
-    for key, value in configured.items():
-        if not isinstance(key, str):
-            raise eph.EphemeralError("the prepared launch environment is invalid")
-        apply(key, value)
-    for name in _EPHEMERAL_ENV_BINDING_EXCLUDED:
-        effective.pop(name, None)
-    return eph.effective_launch_environment_digest(effective)
-
-
 def _normalize_ephemeral_launch_root(
     spec: dict,
     root: str | Path,
@@ -5115,13 +5161,6 @@ def configured_detached_launch(
                 row,
                 agent,
             )
-            row["effective_environment_sha256"] = (
-                _effective_ephemeral_environment_digest(
-                    _current_ephemeral_parent_environment(),
-                    row,
-                    recovery_environment,
-                )
-            )
         except eph.EphemeralError as recovery_error:
             return None, str(recovery_error)
         row["recovery_environment"] = recovery_environment
@@ -5273,9 +5312,6 @@ def configured_detached_launch(
         environment = {
             **recovery_environment,
             "supervisor_json_env_keys": env_keys,
-            "effective_environment_sha256": row[
-                "effective_environment_sha256"
-            ],
         }
     else:
         agenttalk_python = None
@@ -8622,6 +8658,14 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         nxt["revoked_wrapper_runtime"] = copy.deepcopy(
             st.get("revoked_wrapper_runtime")
         )
+    if "pending_launch_record" in st:
+        # This is the only durable copy of the accepted pre-spawn config facts
+        # when a child exists but record-launch has not committed yet. Preserve
+        # even malformed evidence so a later consumer fails closed rather than
+        # silently laundering an incomplete launch into ordinary state.
+        nxt["pending_launch_record"] = copy.deepcopy(
+            st.get("pending_launch_record")
+        )
     if owned_tree is not None:
         nxt["owned_process_tree"] = copy.deepcopy(owned_tree)
     legacy_process_evidence = liveness.get("legacy_process_evidence")
@@ -8704,6 +8748,17 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         if action in (RELAUNCH, STUCK_RECOVER):
             res.update(_launch_detail({**st, "resume_available": resume_available},
                                       cfg_agent, perm_mode=perm_mode))
+            res["record_launch_context"] = _launch_record_context(
+                agent=name,
+                cli=cli_name,
+                grace_seconds=grace_seconds,
+                wrapped=wrapped,
+                brain_pattern=(
+                    _lcfg.get("brain_pattern")
+                    if isinstance(_lcfg.get("brain_pattern"), str)
+                    else ""
+                ),
+            )
             if isinstance(barrier_state, dict):
                 res["barrier_state"] = barrier_state
         return res
@@ -10484,19 +10539,13 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
 def prepare_launch_request(store: Store, state: dict, config: dict, request_id: str,
                            *, now_epoch: float, claimed_by: str = "supervisor",
                            launch_agenttalk_python: str | None = None,
-                           launch_src_on_pythonpath: bool | None = None,
-                           launch_parent_environment: dict[str, str] | None = None) -> dict:
+                           launch_src_on_pythonpath: bool | None = None) -> dict:
     """Claim and prepare one queued ephemeral launch request.
 
     Side effects are deliberately before process launch and are request-id
     checked: claim marker, roster temporary identity, send the review-request,
     persist active supervisor state, and return a fully substituted launch spec.
     """
-    parent_environment = (
-        _current_ephemeral_parent_environment()
-        if launch_parent_environment is None
-        else _validated_ephemeral_parent_environment(launch_parent_environment)
-    )
     marker0 = store.read_launch_request(request_id)
     if marker0 is None:
         raise eph.EphemeralError(f"launch request {request_id!r} is absent")
@@ -10690,13 +10739,6 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
             agent,
             launch_agenttalk_python=launch_agenttalk_python,
             launch_src_on_pythonpath=launch_src_on_pythonpath,
-        )
-        spec["effective_environment_sha256"] = (
-            _effective_ephemeral_environment_digest(
-                parent_environment,
-                spec,
-                spec["recovery_environment"],
-            )
         )
         review_request_sha256 = eph.effective_review_request_digest(msg)
         effective_launch_binding = eph.make_effective_launch_binding(
@@ -11674,7 +11716,13 @@ if ($DryRun) {
 
 try {
 function Read-SupervisorConfig {
-  $value = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+  $bytes = [IO.File]::ReadAllBytes($ConfigPath)
+  $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+  $text = $strictUtf8.GetString($bytes)
+  if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) {
+    $text = $text.Substring(1)
+  }
+  $value = $text | ConvertFrom-Json
   if (($null -eq $value) -or
       (($value -isnot [System.Management.Automation.PSCustomObject]) -and
        ($value -isnot [hashtable]))) {
@@ -11686,9 +11734,19 @@ function Read-SupervisorConfig {
        ($agents.Value -isnot [hashtable]))) {
     throw "supervisor config agents must be a JSON object"
   }
+  $hasher = [Security.Cryptography.SHA256]::Create()
+  try {
+    $script:SupervisorConfigSha256 = (
+      [BitConverter]::ToString($hasher.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+    )
+  } finally {
+    $hasher.Dispose()
+  }
   return $value
 }
+$script:SupervisorConfigSha256 = $null
 $cfg = Read-SupervisorConfig
+$cfgSha256 = $script:SupervisorConfigSha256
 # Baked at `supervise --init`: the Python that runs the bus + whether this is a
 # source checkout (prepend <root>/src to PYTHONPATH) vs a pip install.
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
@@ -11707,32 +11765,6 @@ $WrapperLogEnvKeys = @(
   'AGENTTALK_WRAPPER_LOG_SEGMENTS',
   'AGENTTALK_WRAPPER_LOG_NONCE'
 )
-
-function Get-SupervisorEnvironmentCapture {
-  $values = New-Object 'System.Collections.Generic.Dictionary[string,string]' (
-    [StringComparer]::Ordinal)
-  $seenNames = New-Object 'System.Collections.Generic.HashSet[string]' (
-    [StringComparer]::Ordinal)
-  $environment = [Environment]::GetEnvironmentVariables()
-  $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
-  foreach ($rawName in $environment.Keys) {
-    $name = [string]$rawName
-    $value = [string]$environment[$rawName]
-    try {
-      [void]$strictUtf8.GetBytes($name)
-      [void]$strictUtf8.GetBytes($value)
-      $nameKey = $name.Normalize(
-        [Text.NormalizationForm]::FormC).ToUpperInvariant()
-    } catch {
-      return [pscustomobject]@{ status = 'invalid'; values = $null }
-    }
-    if (-not $seenNames.Add($nameKey)) {
-      return [pscustomobject]@{ status = 'invalid'; values = $null }
-    }
-    $values[$name] = $value
-  }
-  return [pscustomobject]@{ status = 'valid'; values = $values }
-}
 
 function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }
 function Assert-ActionsEnabled([string]$what) {
@@ -14046,9 +14078,13 @@ $pollNum = 0
 :supervisorPoll do {
   try {
     $nextCfg = Read-SupervisorConfig
+    $nextCfgSha256 = $script:SupervisorConfigSha256
     $cfg = $nextCfg
+    $cfgSha256 = $nextCfgSha256
   } catch {
-    Write-Warning "supervisor: supervisor.json refresh failed; keeping last-good config"
+    Write-Warning "supervisor: supervisor.json refresh failed; holding this poll"
+    Wait-ForNextPoll $cfg
+    continue supervisorPoll
   }
   $state = Load-State
   if (-not $state.agents) { $state | Add-Member agents ([pscustomobject]@{}) -Force }
@@ -14082,7 +14118,20 @@ $pollNum = 0
   # unambiguous UTC and locale-independent.
   $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
   $eventArgs = @(); if (-not $DryRun) { $eventArgs += @('--record-events') }
-  $plan = (& $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath @snapshotArgs @eventArgs --now $now) | ConvertFrom-Json
+  $planText = & $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath `
+    --supervisor-config-sha256 $cfgSha256 @snapshotArgs @eventArgs --now $now
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "supervisor: plan config binding failed; holding this poll"
+    Wait-ForNextPoll $cfg
+    continue supervisorPoll
+  }
+  try {
+    $plan = $planText | ConvertFrom-Json
+  } catch {
+    Write-Warning "supervisor: plan output was unavailable; holding this poll"
+    Wait-ForNextPoll $cfg
+    continue supervisorPoll
+  }
   $pollNum++; $healthy = 0; $total = 0
   foreach ($name in $plan.agents.PSObject.Properties.Name) {
     $p = $plan.agents.$name
@@ -14138,7 +14187,9 @@ $pollNum = 0
         # to classify process command lines itself.
         $barrierPath = Join-Path $PSScriptRoot ("supervisor-barrier-{0}.json" -f $name)
         Get-ProcSnapshot $barrierPath | Out-Null
-        $barrierText = & $AgenttalkCmd --root $Root supervise --launch-barrier --for $name --state-file $StatePath --snapshot-file $barrierPath @eventArgs --now $now
+        $barrierText = & $AgenttalkCmd --root $Root supervise --launch-barrier `
+          --for $name --state-file $StatePath --snapshot-file $barrierPath `
+          --supervisor-config-sha256 $cfgSha256 @eventArgs --now $now
         $barrier = $null
         try { $barrier = $barrierText | ConvertFrom-Json } catch {}
         if (($null -eq $barrier) -or $barrier.blocked) {
@@ -14218,6 +14269,8 @@ $pollNum = 0
           # launching/grace and consumes a manual restart id, so a failed
           # post-spawn PID record cannot make the next poll launch a second
           # legacy-direct process from the old state.
+          $p.next_state | Add-Member -NotePropertyName pending_launch_record `
+            -NotePropertyValue $p.record_launch_context -Force
           Set-AgentState $state $name $p.next_state
           if (-not (Save-StateForPoll $state)) {
             Wait-ForNextPoll $cfg
@@ -14251,6 +14304,12 @@ $pollNum = 0
             # Manual restart markers clear on a later readiness-seen plan tick, not on PID return.
             if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
           } else {
+            $p.next_state.PSObject.Properties.Remove('pending_launch_record')
+            Set-AgentState $state $name $p.next_state
+            if (-not (Save-StateForPoll $state)) {
+              Wait-ForNextPoll $cfg
+              continue supervisorPoll
+            }
             Write-Warning ("supervisor: {0}: {1} FAILED (no PID) - keeping marker/state for retry" -f $name, $p.action)
           }
         }
@@ -14287,19 +14346,11 @@ $pollNum = 0
       }
       'ephemeral_launch' {
         if (-not (Assert-ActionsEnabled ("prepare-launch-request {0}" -f $rid))) { continue }
-        $prepEnvironmentCapture = Get-SupervisorEnvironmentCapture
-        if ($prepEnvironmentCapture.status -cne 'valid') {
-          Write-Warning (
-            "supervisor: launch-request {0}: inherited environment is not " +
-            "canonically representable; NOT launching" -f $rid)
-          Wait-ForNextPoll $cfg
-          continue supervisorPoll
-        }
-        $prepEnvironment = $prepEnvironmentCapture.values
-        $prepEnvironmentJson = $prepEnvironment | ConvertTo-Json -Compress -Depth 3
-        $prepEnvironmentEnvelope = [Convert]::ToBase64String(
-          [Text.Encoding]::UTF8.GetBytes($prepEnvironmentJson))
-        $prepText = $prepEnvironmentEnvelope | & $AgenttalkCmd --root $Root supervise --prepare-launch-request --request-id $rid --state-file $StatePath --now $now --launch-agenttalk-python $AgenttalkPython --launch-src-on-pythonpath ([string]$SrcOnPyPath).ToLowerInvariant() --launch-environment-stdin
+        $prepText = & $AgenttalkCmd --root $Root supervise --prepare-launch-request `
+          --request-id $rid --state-file $StatePath --now $now `
+          --launch-agenttalk-python $AgenttalkPython `
+          --launch-src-on-pythonpath ([string]$SrcOnPyPath).ToLowerInvariant() `
+          --supervisor-config-sha256 $cfgSha256
         if ($LASTEXITCODE -ne 0) {
           Write-Warning ("supervisor: launch-request {0}: prepare failed; will retry/deny on a later poll" -f $rid)
           continue
@@ -14381,7 +14432,8 @@ $pollNum = 0
         Get-ProcSnapshot $teardownBarrierPath | Out-Null
         $teardownBarrierText = & $AgenttalkCmd --root $Root supervise `
           --launch-barrier --for $p.agent --request-id $rid `
-          --state-file $StatePath --snapshot-file $teardownBarrierPath --now $now
+          --state-file $StatePath --snapshot-file $teardownBarrierPath `
+          --supervisor-config-sha256 $cfgSha256 --now $now
         $teardownBarrier = $null
         try { $teardownBarrier = $teardownBarrierText | ConvertFrom-Json } catch {}
         if (($null -eq $teardownBarrier) -or $teardownBarrier.blocked) {
