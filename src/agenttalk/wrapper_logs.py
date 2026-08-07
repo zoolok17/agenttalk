@@ -481,6 +481,18 @@ _WIN32_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
 _WIN32_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
+class _RawAttributeLookupFailed(Exception):
+    """The raw Win32 attribute lookup was attempted but failed - distinct
+    from simply not being on Windows, where there is nothing to attempt
+    at all (#113 review, round 7, finding 4). A "not on Windows" result
+    is silent and expected; this failure must not look the same as that.
+    If this platform-specific safety net just went dark, the caller must
+    treat that as ambiguous, never as license to trust the OTHER check's
+    answer alone - a transiently failing lookup must not silently read
+    the same as a lookup that was never relevant here.
+    """
+
+
 def _windows_raw_file_attributes(path: Path) -> int | None:
     """Return the raw Win32 file attributes for `path` via
     GetFileAttributesW, bypassing os.lstat()'s populated
@@ -491,11 +503,15 @@ def _windows_raw_file_attributes(path: Path) -> int | None:
     PowerShell's Get-Item/.Attributes uses) but Python's os.lstat() does
     not reflect it on this host - the two languages' classifiers
     disagreed about the identical input, which this scan exists to
-    prevent. Returns None on a non-Windows platform or if the call
-    itself fails (an ambiguous result here must not silently downgrade
-    to "definitely not a reparse point" - the caller ORs this in as an
-    additional positive signal, never a replacement one, so a None here
-    just means "no additional information," not "confirmed clear").
+    prevent.
+
+    Returns None ONLY on a non-Windows platform - there is nothing to
+    attempt there, and that is not ambiguous, it is simply inapplicable.
+    Raises ``_RawAttributeLookupFailed`` if the call was attempted (this
+    IS Windows) and failed - #113 review, round 7, finding 4: the prior
+    version returned None for both cases alike, so a caller could not
+    tell "not relevant" from "the safety net just failed," and silently
+    trusted whatever the ordinary check found either way.
     """
     if os.name != "nt":
         return None
@@ -503,10 +519,10 @@ def _windows_raw_file_attributes(path: Path) -> int | None:
         import ctypes
 
         result = ctypes.windll.kernel32.GetFileAttributesW(str(path))  # type: ignore[attr-defined]
-    except (OSError, AttributeError, ValueError):
-        return None
+    except (OSError, AttributeError, ValueError) as exc:
+        raise _RawAttributeLookupFailed(str(path)) from exc
     if result == _WIN32_INVALID_FILE_ATTRIBUTES:
-        return None
+        raise _RawAttributeLookupFailed(str(path))
     return result
 
 
@@ -521,7 +537,18 @@ def _is_reparse_or_symlink(path: Path) -> bool:
     file_attributes = getattr(info, "st_file_attributes", 0)
     if stat.S_ISLNK(info.st_mode) or bool(file_attributes & reparse_flag):
         return True
-    windows_attributes = _windows_raw_file_attributes(path)
+    try:
+        windows_attributes = _windows_raw_file_attributes(path)
+    except _RawAttributeLookupFailed as exc:
+        # Re-raised as a plain OSError, matching this function's own
+        # existing ambiguous-lstat() contract just above - every current
+        # caller (_has_reparse_or_symlink_component, and _scan_path
+        # through it) already converts an OSError here into UNUSABLE /
+        # fail-closed, so this reuses that path rather than inventing a
+        # new one (#113 review, round 7, finding 4).
+        raise OSError(
+            f"cannot validate wrapper log path component via raw attributes: {path}"
+        ) from exc
     if windows_attributes is not None:
         return bool(windows_attributes & _WIN32_FILE_ATTRIBUTE_REPARSE_POINT)
     return False
@@ -895,6 +922,26 @@ def _scan_marker(path: Path) -> _MarkerScanOutcome:
         # does not follow it, so its mode is S_ISLNK, never S_ISREG - no
         # separate symlink check is needed here the way the directory
         # classifier needs one for its ancestry.
+        return _MarkerScanOutcome.UNUSABLE
+    # #113 review, round 7, finding 2: S_ISREG alone can be True for a
+    # non-name-surrogate reparse point (the exact OneDrive-placeholder
+    # class _windows_raw_file_attributes exists to catch) - its
+    # underlying-type bit still reads as a regular file even though it
+    # is a reparse point. The round 5 fix wired this signal into
+    # _is_reparse_or_symlink for DIRECTORY ancestry, but never into this
+    # marker classifier, so a marker leaf could still read PRESENT for
+    # exactly the input class this scan exists to unify. Executed and
+    # confirmed: the helper correctly says reparse, this classifier said
+    # PRESENT anyway, and a consumer-level prune then deleted the
+    # generation. A failed lookup propagates UNUSABLE (finding 4), never
+    # a silent fall-through to "the ordinary check found nothing."
+    try:
+        windows_attributes = _windows_raw_file_attributes(path)
+    except _RawAttributeLookupFailed:
+        return _MarkerScanOutcome.UNUSABLE
+    if windows_attributes is not None and bool(
+        windows_attributes & _WIN32_FILE_ATTRIBUTE_REPARSE_POINT
+    ):
         return _MarkerScanOutcome.UNUSABLE
     return _MarkerScanOutcome.PRESENT
 

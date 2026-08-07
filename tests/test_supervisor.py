@@ -7079,6 +7079,154 @@ def test_ps_listing_failure_during_prune_rescan_marks_uncertain_not_warns_only(
     )
 
 
+def test_ps_hidden_agent_dir_at_the_resolver_call_marks_prune_uncertain(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 7, finding 1 (BLOCKING): the destructive prune's
+    OWN `if ($null -eq $agentDir) { continue }` - the call to the
+    agent-directory resolver, one step earlier than finding #17's
+    listing-failure catch - never asked WHY $agentDir was null. Null
+    means "genuinely absent, nothing to miss" and "exists but could not
+    be resolved" alike. #15's and #17's controls both genuinely
+    discriminate (this file's own two tests above prove it) but neither
+    reaches THIS earlier exit. Two roots: a GOOD root with real
+    over-quota generations, a HIDDEN root whose agent directory exists
+    but is access-denied at the exact call the resolver itself makes.
+    The good root's generations must survive - the whole cycle's view is
+    incomplete, not just the hidden root's."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    good_root = tmp_path / "good"
+    hidden_root = tmp_path / "hidden"
+    good_agent_dir = good_root / agent_leaf
+    hidden_agent_dir = hidden_root / agent_leaf
+    generations = []
+    for sequence in range(1, sup.WRAPPER_LOG_GENERATIONS + 2):
+        generation = good_agent_dir / f"2026080{sequence}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+    hidden_agent_dir.mkdir(parents=True)
+
+    result_path = tmp_path / "ps-hidden-resolver.json"
+    script = tmp_path / "ps-hidden-resolver.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            *_ps_shadow_access_denied(str(hidden_agent_dir)),
+            f"Invoke-WrapperLogRetentionPrune {_pslit(agent_leaf)} "
+            f"@({_pslit(str(good_root))}, {_pslit(str(hidden_root))}) $false",
+            "@{ survivorCount = @("
+            "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath "
+            f"{_pslit(str(good_agent_dir))} -Directory "
+            "-ErrorAction SilentlyContinue).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["survivorCount"] == len(generations), (
+        "the good root's generations were pruned toward quota while the "
+        "hidden root's inaccessibility was silently treated as absence, "
+        "not uncertainty"
+    )
+
+
+def test_ps_uncertain_bound_check_uses_observed_count_not_owned_count(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 7, finding 3: port of the Python-side #7 fix
+    (candidates/observed split) to Invoke-WrapperLogRetentionPrune -
+    round 4 built the safety-valve bound check but coupled it to
+    $owned.Count, the same conflation #7 fixed on the Python side. A
+    pending (uncommitted) generation is never a candidate and so never
+    reaches $owned, but it is still a real generation-shaped directory
+    that the bound exists to protect against runaway accumulation of.
+
+    12 committed generations (the deletion-eligible pool) plus 1
+    pending one = 13 physically observed. With WRAPPER_LOG_GENERATIONS=4
+    the bound is Max(4*3, 4+2) = 12. $owned.Count is exactly 12 - at
+    the old code's bound, so it skips pruning entirely and all 13
+    directories survive untouched (the executed report's "13 physical
+    generations, bound 4" - the exact number reported does not match
+    the real formula, but the shape - an off-by-the-uncommitted-one
+    undercount silently disabling the safety valve - is the same
+    defect either way, and this reproduces it against the real bound).
+    The fix counts every physical generation found ($observedCount=13),
+    correctly exceeds the bound, and prunes anyway: 4 committed
+    generations survive (the configured quota) plus the 1 pending one
+    (never deletion-eligible, always preserved) = 5."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    root = tmp_path / "root"
+    agent_dir = root / agent_leaf
+    for sequence in range(1, 13):
+        generation = agent_dir / f"202608{sequence:02d}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+    pending = agent_dir / "20260813T120000000Z-{:032x}".format(13)
+    pending.mkdir(parents=True)
+
+    result_path = tmp_path / "ps-observed-bound.json"
+    script = tmp_path / "ps-observed-bound.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            f"Invoke-WrapperLogRetentionPrune {_pslit(agent_leaf)} "
+            f"@({_pslit(str(root))}) $true",
+            "@{ survivorCount = @("
+            "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath "
+            f"{_pslit(str(agent_dir))} -Directory "
+            "-ErrorAction SilentlyContinue).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["survivorCount"] == sup.WRAPPER_LOG_GENERATIONS + 1, (
+        "the safety-valve bound compared against $owned.Count (12, "
+        "excluding the pending generation) instead of every physically "
+        "observed generation (13), so it stayed at-or-under bound and "
+        "skipped pruning entirely instead of enforcing the quota"
+    )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
 def test_ps_wrapper_log_security_does_not_depend_on_ambient_os_marker(
     tmp_path: Path,

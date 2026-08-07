@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import io
 import json
 import os
@@ -585,105 +586,223 @@ def test_location_status_rejects_a_directory_where_a_log_file_is_expected(
 
 
 _WRAPPER_LOG_ALLOWLIST_MARKER = "wrapper-log-raw-primitive:"
-_PYTHON_RAW_PRIMITIVE_RE = re.compile(r"\.exists\(\)|\.is_dir\(\)|\.is_file\(\)")
-_POWERSHELL_RAW_PRIMITIVE_RE = re.compile(
-    r"Test-Path\b"
-    r"|(?<!Microsoft\.PowerShell\.Management\\)Get-Item\b"
-    r"|PSIsContainer"
-    r"|-band \[IO\.FileAttributes\]::ReparsePoint"
+_WRAPPER_LOG_ALLOWLIST_TAG_RE = re.compile(r"^\s*\[(?P<category>[\w-]+):(?P<area>[\w-]+)\]")
+_PYTHON_RAW_PRIMITIVE_METHODS = frozenset({"exists", "is_dir", "is_file"})
+_PYTHON_STREAMING_CLASSES_EXCLUDED = frozenset({"BoundedStreamTee"})
+_POWERSHELL_FUNCTION_NAME_RE = re.compile(r"function\s+([\w-]*WrapperLog[\w-]*)\s*\(")
+_POWERSHELL_PRIMITIVE_RE = re.compile(
+    r"(?P<testpath>Test-Path)\b"
+    r"|(?P<getitem>Get-Item)\b"
+    r"|(?P<container>PSIsContainer)"
+    r"|(?P<reparse>-band \[IO\.FileAttributes\]::ReparsePoint)"
 )
 
+# #113 review, round 7: the manifest itself. Keyed by (function, category,
+# area) - not by line number, not by a printed length - so a NEW site
+# (a new key) or a CHANGED site (a count that no longer matches) both
+# make the discovered set stop equaling this one, and the check fails
+# until this dict is edited on purpose. category is one of
+# 'classifier-internal' (the closed-outcome classifiers' own bodies -
+# primitive access is their entire purpose), 'reference-correct' (already
+# wrapped in the same non-swallowing exception discrimination the
+# classifiers use), or 'debt' (deliberately left as a raw primitive,
+# tracked, not yet converted). area groups related lines within one
+# category for the printed report; it carries no other meaning.
+_POWERSHELL_MANIFEST: dict[tuple[str, str, str], dict[str, int]] = {
+    ("Get-SafeWrapperLogAgentDir", "debt", "agent-resolver"): {
+        "testpath": 2, "getitem": 3, "reparse": 3, "container": 1,
+    },
+    ("Test-WrapperLogMarkerPresence", "classifier-internal", "self"): {
+        "getitem": 1, "container": 1, "reparse": 1,
+    },
+    ("Test-WrapperLogDirectoryPresence", "classifier-internal", "self"): {
+        "getitem": 1, "container": 1, "reparse": 1,
+    },
+    ("Read-WrapperLogSequenceRecord", "reference-correct", "sequence-file"): {
+        "getitem": 1, "container": 1, "reparse": 1,
+    },
+    ("Invoke-WrapperLogRetentionPrune", "reference-correct", "already-retrieved"): {
+        "reparse": 1,
+    },
+    ("Invoke-WrapperLogRetentionPrune", "debt", "175-active-lock"): {
+        "testpath": 1, "getitem": 1, "container": 1, "reparse": 1,
+    },
+    ("Discard-PendingWrapperLogTargets", "debt", "pending-discard"): {
+        "getitem": 1, "reparse": 1,
+    },
+}
 
-def _wrapper_log_region(text: str, start_marker: str, end_marker: str) -> str:
-    return text[text.index(start_marker):text.index(end_marker)]
 
-
-def _scan_wrapper_log_raw_primitives(
-    region_text: str, pattern: re.Pattern[str]
-) -> tuple[list[str], list[tuple[str, str]]]:
-    """Return (unallowlisted, allowlisted) - unallowlisted is a list of
-    "<line>: <text>" strings; allowlisted is a list of (entry, reason)
-    strings, one per matching line carrying a
-    '# wrapper-log-raw-primitive: <reason>' comment."""
-    unallowlisted: list[str] = []
-    allowlisted: list[tuple[str, str]] = []
-    for lineno, line in enumerate(region_text.splitlines(), start=1):
-        # A full-line comment (Python and PowerShell both use '#') can
-        # legitimately discuss these primitives in prose - e.g. this
-        # very docstring - without being a code site that needs routing
-        # or an allowlist entry. A trailing inline comment on an actual
-        # code line is not stripped, deliberately: the check would
-        # rather over-report a real site than let a comment appended to
-        # code hide it.
-        if line.strip().startswith("#"):
-            continue
-        if not pattern.search(line):
-            continue
-        marker_idx = line.find(_WRAPPER_LOG_ALLOWLIST_MARKER)
-        if marker_idx == -1:
-            unallowlisted.append(f"{lineno}: {line.strip()}")
-            continue
-        reason = line[marker_idx + len(_WRAPPER_LOG_ALLOWLIST_MARKER):].strip()
-        code_text = line[:marker_idx].rstrip().rstrip("#").rstrip()
-        allowlisted.append((f"{lineno}: {code_text}", reason))
-    return unallowlisted, allowlisted
-
-
-def test_wrapper_log_region_uses_only_shared_classifiers() -> None:
-    """#113 review, round 5 (standing rule #76): the mechanical sweep.
-
-    Every "does this exist" / "what kind of thing is this" check in the
-    wrapper-log retention and report region - Python
-    (`# region wrapper-log-retention` in wrapper_logs.py) and generated
-    PowerShell (`# region wrapper-log-helpers` in supervisor.py) both -
-    must go through the shared closed-outcome classifiers or carry an
-    explicit `# wrapper-log-raw-primitive: <reason>` comment. Five rounds
-    of review each closing the sites it was given and revealing another
-    level below is the reason this exists: an unstated class is the
-    defect, a stated and CHECKED one is not. This converts "did review
-    find them all" into "does the check find them all."
-
-    The allowlist is reported in full on every run (the assertion
-    message below), not only on failure - a suppressible check that
-    looks identical whether the allowlist has 2 entries or 20 is exactly
-    the thing this check exists to prevent from happening quietly.
+def _python_wrapper_log_primitive_counts(module_path: Path) -> dict[str, int]:
+    """AST-scan the WHOLE Python module (never marker-bounded - a
+    marker-delimited scan is blind to anything placed outside the
+    markers, which is exactly the escape round 7 found) for
+    `.exists()`/`.is_dir()`/`.is_file()` calls, keyed by
+    "<function>:<method>" to an occurrence count. Excludes
+    BoundedStreamTee's methods by class name (streaming byte-accounting,
+    a different concern that happens to call similarly-named methods) -
+    the ONLY named exclusion; everything else in the file is covered.
     """
-    python_region = _wrapper_log_region(
-        Path(wrapper_logs.__file__).read_text(encoding="utf-8"),
-        "# region wrapper-log-retention",
-        "# endregion wrapper-log-retention",
-    )
-    python_bad, python_allowed = _scan_wrapper_log_raw_primitives(
-        python_region, _PYTHON_RAW_PRIMITIVE_RE
+    tree = ast.parse(module_path.read_text(encoding="utf-8"))
+    counts: dict[str, int] = {}
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.func_stack: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            if node.name in _PYTHON_STREAMING_CLASSES_EXCLUDED:
+                return
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.func_stack.append(node.name)
+            self.generic_visit(node)
+            self.func_stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in _PYTHON_RAW_PRIMITIVE_METHODS
+            ):
+                func_name = self.func_stack[-1] if self.func_stack else "<module>"
+                key = f"{func_name}:{node.func.attr}"
+                counts[key] = counts.get(key, 0) + 1
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return counts
+
+
+def _powershell_wrapper_log_function_bodies(ps_text: str) -> dict[str, str]:
+    """Find every function whose name contains "WrapperLog" ANYWHERE in
+    ps_text (never marker-bounded, for the same reason as the Python
+    scan above) and extract its full body by brace-depth matching from
+    the opening '{'. A new helper defined anywhere in the generated
+    script, inside or outside any region markers, is found by this scan
+    because it is found by NAME, not by position."""
+    bodies: dict[str, str] = {}
+    for match in _POWERSHELL_FUNCTION_NAME_RE.finditer(ps_text):
+        name = match.group(1)
+        brace_start = ps_text.index("{", match.end())
+        depth = 0
+        i = brace_start
+        while i < len(ps_text):
+            if ps_text[i] == "{":
+                depth += 1
+            elif ps_text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        bodies[name] = ps_text[brace_start:i + 1]
+    return bodies
+
+
+def test_wrapper_log_python_side_uses_only_shared_classifiers() -> None:
+    """#113 review, round 7: the Python half of the mechanical sweep,
+    rebuilt as a manifest rather than a printed count (round 5's version
+    only asserted each allowlist reason was non-empty - a 26th primitive
+    with any non-empty reason passed silently, and a marker-bounded scan
+    was blind to anything placed outside the region markers). Whole-file
+    AST scan, not text/marker based - round 5's fixes converted every
+    Python-side site, so the expected set is empty; ANY hit here, of any
+    kind, anywhere in the file outside BoundedStreamTee, is new debt that
+    was not here when this round ended and must be dealt with, not
+    printed and ignored."""
+    counts = _python_wrapper_log_primitive_counts(Path(wrapper_logs.__file__))
+    assert counts == {}, (
+        f"raw presence/type primitive(s) found outside the shared "
+        f"classifiers, with no manifest entry (none are expected on the "
+        f"Python side after round 5's conversions): {counts}"
     )
 
-    ps_region = _wrapper_log_region(
-        sup.PS_TEMPLATE,
-        "# region wrapper-log-helpers",
-        "# endregion wrapper-log-helpers",
+
+def test_wrapper_log_powershell_side_matches_the_manifest_exactly() -> None:
+    """#113 review, round 7: the PowerShell half, as an asserted SET
+    rather than a printed length. Every *WrapperLog*-named function
+    anywhere in the generated script (found by NAME, not by position
+    between region markers - closing the escape round 7 found: a
+    fully-qualified provider call used to be exempted by the regex
+    itself, and anything placed after the old end marker was invisible
+    either way) is scanned for raw primitives. Each hit must carry a
+    structured `[category:area]` allowlist tag; the discovered
+    (function, category, area) -> {primitive: count} map must equal
+    _POWERSHELL_MANIFEST EXACTLY - editing that dict is the only way to
+    add, remove, or change a site, and that edit is a visible diff, not
+    an invisible pass.
+    """
+    bodies = _powershell_wrapper_log_function_bodies(sup.PS_TEMPLATE)
+    discovered: dict[tuple[str, str, str], dict[str, int]] = {}
+    unallowlisted: list[str] = []
+    malformed: list[str] = []
+
+    for func_name, body in bodies.items():
+        for lineno, line in enumerate(body.splitlines(), start=1):
+            code_part = line.split("#", 1)[0]
+            hits = list(_POWERSHELL_PRIMITIVE_RE.finditer(code_part))
+            if not hits:
+                continue
+            marker_idx = line.find(_WRAPPER_LOG_ALLOWLIST_MARKER)
+            if marker_idx == -1:
+                unallowlisted.append(f"{func_name}:{lineno}: {line.strip()}")
+                continue
+            reason = line[marker_idx + len(_WRAPPER_LOG_ALLOWLIST_MARKER):].strip()
+            tag = _WRAPPER_LOG_ALLOWLIST_TAG_RE.match(reason)
+            if not tag:
+                malformed.append(
+                    f"{func_name}:{lineno}: allowlist comment has no "
+                    f"'[category:area]' tag: {reason!r}"
+                )
+                continue
+            key = (func_name, tag["category"], tag["area"])
+            bucket = discovered.setdefault(key, {})
+            for hit in hits:
+                bucket[hit.lastgroup] = bucket.get(hit.lastgroup, 0) + 1
+
+    assert not unallowlisted, (
+        "raw presence/type primitive(s) found in a *WrapperLog* function "
+        "without a '# wrapper-log-raw-primitive: [category:area] <reason>' "
+        "allowlist comment - route through the shared classifier or "
+        "allowlist explicitly:\n" + "\n".join(unallowlisted)
     )
-    ps_bad, ps_allowed = _scan_wrapper_log_raw_primitives(
-        ps_region, _POWERSHELL_RAW_PRIMITIVE_RE
+    assert not malformed, (
+        "allowlist comment(s) missing the required [category:area] tag "
+        "(bare reasons are not enough - round 7 found a printed length is "
+        "not a ratchet):\n" + "\n".join(malformed)
     )
 
-    allowed = [(f"python {e}", r) for e, r in python_allowed] + [
-        (f"powershell {e}", r) for e, r in ps_allowed
-    ]
-    report = "wrapper-log raw-primitive allowlist ({} entries):\n{}".format(
-        len(allowed),
-        "\n".join(f"  {entry} -> {reason or 'NO REASON GIVEN'}" for entry, reason in allowed)
-        or "  (none)",
+    by_category: dict[str, int] = {}
+    for (_func_name, category, _area), counts in sorted(discovered.items()):
+        by_category[category] = by_category.get(category, 0) + sum(counts.values())
+    report = "wrapper-log PowerShell manifest ({} total, {}):\n{}".format(
+        sum(by_category.values()),
+        ", ".join(f"{cat}={n}" for cat, n in sorted(by_category.items())),
+        "\n".join(
+            f"  [{category}:{area}] {func_name}: {counts}"
+            for (func_name, category, area), counts in sorted(discovered.items())
+        ) or "  (none)",
     )
     print("\n" + report)
-    for entry, reason in allowed:
-        assert reason, f"allowlist entry has no stated reason: {entry}"
 
-    bad = [f"python {e}" for e in python_bad] + [f"powershell {e}" for e in ps_bad]
-    assert not bad, (
-        "raw presence/type primitive(s) found in the wrapper-log region "
-        "without a '# wrapper-log-raw-primitive: <reason>' allowlist "
-        "comment - route through the shared classifier or allowlist "
-        "explicitly with a reason:\n" + "\n".join(bad) + "\n\n" + report
+    missing = {k: v for k, v in _POWERSHELL_MANIFEST.items() if k not in discovered}
+    unexpected = {k: v for k, v in discovered.items() if k not in _POWERSHELL_MANIFEST}
+    changed = {
+        k: (v, discovered[k])
+        for k, v in _POWERSHELL_MANIFEST.items()
+        if k in discovered and discovered[k] != v
+    }
+    assert not missing and not unexpected and not changed, (
+        "the discovered PowerShell raw-primitive site set no longer "
+        "equals _POWERSHELL_MANIFEST - edit the manifest deliberately if "
+        "this is an intended change:\n"
+        f"  manifest entries no longer found (fixed or removed?): {missing}\n"
+        f"  new entries not yet in the manifest (new debt, or missing "
+        f"[category:area] grouping?): {unexpected}\n"
+        f"  entries whose primitive counts changed "
+        f"(expected, discovered): {changed}\n\n" + report
     )
 
 
@@ -1429,6 +1548,117 @@ def test_unusable_committed_probe_cannot_make_a_pending_generation_deletion_elig
         "the 12 real candidates were not pruned toward quota - the bound "
         "check used the undercounted candidate total instead of the true "
         "observed generation count"
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-specific reparse detection")
+def test_raw_attribute_reparse_signal_actually_reaches_the_destructive_prune(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review, round 7, finding 2 (BLOCKING): the reframe, applied to
+    this PR's own #1/#2/#6 fix. `_windows_raw_file_attributes` works
+    correctly in isolation (the round-5 test above proves that), and
+    `_scan_marker` now consults it (wired in this round) - but neither
+    of those facts alone proves the CORRECTED VALUE ever reaches the
+    place a deletion decision is made. This is that proof, one level
+    up the call chain from the existing test: the oldest of
+    WRAPPER_LOG_GENERATIONS + 1 committed generations has a `.committed`
+    marker that `os.lstat()` reports as a perfectly ordinary file (so an
+    unwired classifier would read PRESENT and this generation would be
+    a normal, oldest-first deletion candidate) but the raw Win32 signal
+    flags as a reparse point - the same measured OneDrive-placeholder
+    discrepancy, at the one marker whose misclassification is
+    destructive rather than merely observed. If the classifier's
+    corrected value is collapsed anywhere between `_scan_marker` and
+    `_prune_wrapper_log_generations`, this generation gets pruned away
+    on schedule instead of preserved as unconfirmed."""
+    root = tmp_path / "logs"
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    generations: list[Path] = []
+    for sequence in range(1, wrapper_logs.WRAPPER_LOG_GENERATIONS + 2):
+        generation = root / agent_leaf / f"20260804T12000{sequence}000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+    oldest = generations[0]
+    disputed_marker = oldest / ".committed"
+    assert not stat.S_ISLNK(disputed_marker.lstat().st_mode)
+
+    monkeypatch.setattr(
+        wrapper_logs,
+        "_windows_raw_file_attributes",
+        lambda path: (
+            wrapper_logs._WIN32_FILE_ATTRIBUTE_REPARSE_POINT
+            if path == disputed_marker
+            else None
+        ),
+    )
+
+    wrapper_logs._prune_wrapper_log_generations((root,), agent_leaf)
+
+    assert oldest.is_dir(), (
+        "the oldest generation's .committed marker disagreed between "
+        "os.lstat() and the raw Win32 attribute signal, and the "
+        "classifier's UNUSABLE verdict never reached the prune decision "
+        "- it was pruned as an ordinary committed candidate instead"
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-specific reparse detection")
+def test_failed_raw_attribute_lookup_reaches_the_destructive_prune_as_unusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review, round 7, finding 4 (low-confidence, reported and
+    fixed rather than dropped): `_windows_raw_file_attributes` used to
+    conflate "not on Windows, nothing to attempt" and "this IS Windows,
+    and the call itself just failed" into the same silent `None`,
+    contradicting this PR's own documented contract that an
+    inconclusive raw call must mean "no additional signal," never
+    "confirmed clear." A caller that could not tell the two apart would
+    fall through to whatever `os.lstat()` alone found - exactly the
+    failure mode finding 2 exists to close, just reached from a
+    genuinely failing lookup instead of a successful, disagreeing one.
+    Same consumer-level shape as the finding-2 test immediately above:
+    the oldest of WRAPPER_LOG_GENERATIONS + 1 committed generations has
+    an ordinary-looking `.committed` marker whose raw attribute lookup
+    raises `_RawAttributeLookupFailed` rather than returning a value -
+    if that failure fell through silently, this generation is an
+    ordinary committed candidate and gets pruned on schedule; if it
+    propagates as UNUSABLE the way an unreadable marker already does,
+    the generation is preserved."""
+    root = tmp_path / "logs"
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    generations: list[Path] = []
+    for sequence in range(1, wrapper_logs.WRAPPER_LOG_GENERATIONS + 2):
+        generation = root / agent_leaf / f"20260804T12000{sequence}000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+    oldest = generations[0]
+    disputed_marker = oldest / ".committed"
+    assert not stat.S_ISLNK(disputed_marker.lstat().st_mode)
+
+    def _failing_raw_attributes(path: Path) -> int | None:
+        if path == disputed_marker:
+            raise wrapper_logs._RawAttributeLookupFailed(str(path))
+        return None
+
+    monkeypatch.setattr(
+        wrapper_logs, "_windows_raw_file_attributes", _failing_raw_attributes
+    )
+
+    wrapper_logs._prune_wrapper_log_generations((root,), agent_leaf)
+
+    assert oldest.is_dir(), (
+        "the raw attribute lookup for the oldest generation's .committed "
+        "marker FAILED (not merely 'not on Windows') and that failure "
+        "fell through to os.lstat()'s confident PRESENT instead of "
+        "propagating as UNUSABLE - it was pruned as an ordinary "
+        "committed candidate instead"
     )
 
 
