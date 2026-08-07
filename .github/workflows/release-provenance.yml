@@ -1,0 +1,227 @@
+name: release candidate provenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact 40-character post-bump master commit to re-gate.
+        required: true
+        type: string
+      version:
+        description: Stable release version in X.Y.Z form.
+        required: true
+        type: string
+
+# This first increment is deliberately read-only. It creates evidence and keeps
+# the tested bytes; it never tags, publishes, or writes repository contents.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-provenance-${{ inputs.candidate_sha }}
+  cancel-in-progress: false
+
+env:
+  ARTIFACT_PREFIX: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  validate:
+    name: validate exact post-bump candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      preflight_at: ${{ steps.clock.outputs.preflight_at }}
+    steps:
+      - name: Refuse an ambiguous or retargeted dispatch
+        shell: bash
+        env:
+          CANDIDATE_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::release_candidate_invalid: candidate_sha must be 40 lowercase hexadecimal characters"
+            exit 1
+          fi
+          if [[ "$CANDIDATE_REF" != "refs/heads/master" ]]; then
+            echo "::error::release_candidate_invalid: dispatch must select refs/heads/master"
+            exit 1
+          fi
+          if [[ "$EVENT_SHA" != "$CANDIDATE_SHA" ]]; then
+            echo "::error::release_evidence_sha_mismatch: master moved or candidate_sha differs from the selected commit"
+            exit 1
+          fi
+          if [[ "$RUN_ATTEMPT" != "1" ]]; then
+            echo "::error::release_evidence_stale: use a fresh dispatch instead of a partial workflow rerun"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install the candidate's preflight command
+        run: |
+          python -I -m pip install -r dev-gate-requirements.txt
+          python -I -m pip install --no-deps --no-build-isolation .
+      - name: Record the dispatch boundary
+        id: clock
+        shell: bash
+        run: echo "preflight_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Validate every release version surface
+        shell: bash
+        env:
+          CANDIDATE_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          RELEASE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: >
+          python -I .github/scripts/prepare_release_provenance.py preflight
+          --repo-root "$GITHUB_WORKSPACE"
+          --candidate-sha "$CANDIDATE_SHA"
+          --event-sha "$EVENT_SHA"
+          --event-ref "$CANDIDATE_REF"
+          --workflow-sha "$RELEASE_WORKFLOW_SHA"
+          --version "$RELEASE_VERSION"
+          --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+  gate:
+    name: re-gate exact candidate
+    needs: validate
+    uses: ./.github/workflows/tests.yml
+    permissions:
+      contents: read
+    with:
+      candidate_sha: ${{ inputs.candidate_sha }}
+      release_version: ${{ inputs.version }}
+      artifact_prefix: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+      preflight_at: ${{ needs.validate.outputs.preflight_at }}
+
+  codeql:
+    name: scan exact candidate
+    needs: validate
+    uses: ./.github/workflows/security.yml
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    with:
+      candidate_sha: ${{ inputs.candidate_sha }}
+
+  provenance:
+    name: retain exact bytes and durable evidence
+    needs: [validate, gate, codeql]
+    if: ${{ !cancelled() && needs.validate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Refuse a failed or missing gate
+        if: needs.gate.result != 'success' || needs.codeql.result != 'success'
+        shell: bash
+        env:
+          GATE_RESULT: ${{ needs.gate.result }}
+          CODEQL_RESULT: ${{ needs.codeql.result }}
+        run: |
+          echo "::error::release_gate_failed: dev-gate=$GATE_RESULT codeql=$CODEQL_RESULT"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: needs.gate.result == 'success' && needs.codeql.result == 'success'
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        if: needs.gate.result == 'success' && needs.codeql.result == 'success'
+        with:
+          python-version: '3.12'
+      - name: Install the candidate's provenance command
+        if: needs.gate.result == 'success' && needs.codeql.result == 'success'
+        run: |
+          python -I -m pip install -r dev-gate-requirements.txt
+          python -I -m pip install --no-deps --no-build-isolation .
+      - name: Download gate evidence
+        if: needs.gate.result == 'success' && needs.codeql.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: ${{ env.ARTIFACT_PREFIX }}-leg-*
+          path: ${{ runner.temp }}/release-candidate-legs
+          merge-multiple: false
+      - name: Download gate aggregate
+        if: needs.gate.result == 'success' && needs.codeql.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-aggregate
+          path: ${{ runner.temp }}/release-candidate-aggregate
+      - name: Download canonical gate-built packages
+        if: needs.gate.result == 'success' && needs.codeql.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-packages
+          path: ${{ runner.temp }}/release-candidate-packages
+      - name: Verify custody and assemble provenance
+        if: ${{ !cancelled() && success() && needs.gate.result == 'success' && needs.codeql.result == 'success' }}
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_PREFLIGHT_AT: ${{ needs.validate.outputs.preflight_at }}
+          RELEASE_WORKFLOW_REF: ${{ github.workflow_ref }}
+          RELEASE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CODEQL_RESULT: ${{ needs.codeql.result }}
+        run: >
+          python -I .github/scripts/prepare_release_provenance.py assemble
+          --repo-root "$GITHUB_WORKSPACE"
+          --aggregate-dir "$RUNNER_TEMP/release-candidate-aggregate"
+          --legs-dir "$RUNNER_TEMP/release-candidate-legs"
+          --packages-dir "$RUNNER_TEMP/release-candidate-packages"
+          --runner-temp "$RUNNER_TEMP"
+          --output "$RUNNER_TEMP/release-candidate-provenance"
+          --candidate-sha "$CANDIDATE_SHA"
+          --version "$RELEASE_VERSION"
+          --artifact-prefix "$ARTIFACT_PREFIX"
+          --repository "$GITHUB_REPOSITORY"
+          --workflow-ref "$RELEASE_WORKFLOW_REF"
+          --workflow-sha "$RELEASE_WORKFLOW_SHA"
+          --actor "$GITHUB_ACTOR"
+          --event-name "$GITHUB_EVENT_NAME"
+          --run-id "$GITHUB_RUN_ID"
+          --run-attempt "$GITHUB_RUN_ATTEMPT"
+          --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+          --preflight-at "$RELEASE_PREFLIGHT_AT"
+          --codeql-result "$CODEQL_RESULT"
+      - name: Upload the self-contained candidate provenance
+        id: upload
+        if: success() && needs.gate.result == 'success' && needs.codeql.result == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: release-provenance-${{ inputs.version }}-${{ inputs.candidate_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-candidate-provenance
+          if-no-files-found: error
+          retention-days: 90
+      - name: Record the carrier digest
+        if: success() && needs.gate.result == 'success' && needs.codeql.result == 'success'
+        shell: bash
+        env:
+          ARTIFACT_NAME: release-provenance-${{ inputs.version }}-${{ inputs.candidate_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            echo "## Release-candidate provenance"
+            echo
+            echo "- SHA: \`$GITHUB_SHA\`"
+            echo "- Actions artifact name: \`$ARTIFACT_NAME\`"
+            echo "- Actions artifact id: \`$ARTIFACT_ID\`"
+            echo "- Actions artifact digest: \`$ARTIFACT_DIGEST\`"
+            echo "- Actions artifact: $ARTIFACT_URL"
+            echo "- Retention: 90 days; tagging and publishing remain manual"
+          } >> "$GITHUB_STEP_SUMMARY"

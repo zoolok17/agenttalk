@@ -9,6 +9,24 @@ on:
     # Keep dependency/security checks current when the repository is quiet.
     - cron: '17 9 * * 1'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Exact post-bump commit to gate; empty only for the ordinary CI triggers.
+        required: true
+        type: string
+      release_version:
+        description: Stable X.Y.Z version bound to the release-candidate evidence.
+        required: true
+        type: string
+      artifact_prefix:
+        description: Run-attempt-specific namespace for release-candidate artifacts.
+        required: true
+        type: string
+      preflight_at:
+        description: UTC timestamp emitted by the release-candidate preflight.
+        required: true
+        type: string
 
 # One in-flight run per workflow+ref. A later push to a topic branch supersedes
 # the earlier one, which is otherwise pure waste: without this, every push
@@ -18,11 +36,14 @@ on:
 # master is deliberately EXEMPT from cancellation - a release-gating or
 # version-ratchet run must never be killed by a following push.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 permissions:
   contents: read
+
+env:
+  EVIDENCE_ARTIFACT_PREFIX: ${{ inputs.artifact_prefix || 'dev-gate' }}
 
 jobs:
   dev-gate-leg:
@@ -56,6 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -85,12 +107,35 @@ jobs:
           python -I -m agenttalk dev-gate
           --profile release
           --ci-leg "${{ matrix.os.id }}/${{ matrix.python-version }}"
+          --temp-root "${{ runner.temp }}/dev-gate-run"
           --evidence "${{ runner.temp }}/dev-gate-evidence.json"
+      - name: Retain the canonical gate-built packages
+        if: inputs.candidate_sha != '' && matrix.os.id == 'linux' && matrix.python-version == '3.12' && success()
+        shell: bash
+        env:
+          RELEASE_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: >
+          python -I .github/scripts/prepare_release_provenance.py export
+          --repo-root "$GITHUB_WORKSPACE"
+          --raw-evidence "$RUNNER_TEMP/dev-gate-evidence.json"
+          --runner-temp "$RUNNER_TEMP"
+          --output "$RUNNER_TEMP/release-candidate-packages"
+          --candidate-sha "$RELEASE_CANDIDATE_SHA"
+          --version "$RELEASE_VERSION"
+      - name: Upload the canonical gate-built packages
+        if: inputs.candidate_sha != '' && matrix.os.id == 'linux' && matrix.python-version == '3.12' && success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ env.EVIDENCE_ARTIFACT_PREFIX }}-packages
+          path: ${{ runner.temp }}/release-candidate-packages
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload leg evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: dev-gate-leg-${{ matrix.os.id }}-${{ matrix.python-version }}
+          name: ${{ env.EVIDENCE_ARTIFACT_PREFIX }}-leg-${{ matrix.os.id }}-${{ matrix.python-version }}
           path: ${{ runner.temp }}/dev-gate-evidence.json
           if-no-files-found: error
           retention-days: 14
@@ -107,6 +152,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -120,7 +166,7 @@ jobs:
         if: always()
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          pattern: dev-gate-leg-*
+          pattern: ${{ env.EVIDENCE_ARTIFACT_PREFIX }}-leg-*
           path: ${{ runner.temp }}/dev-gate-legs
           merge-multiple: false
       - name: Aggregate the exact declared matrix
@@ -130,11 +176,37 @@ jobs:
           --profile release
           --aggregate "${{ runner.temp }}/dev-gate-legs"
           --evidence "${{ runner.temp }}/dev-gate-aggregate.json"
+      - name: Bind the aggregate to this release-candidate run attempt
+        if: inputs.candidate_sha != '' && success()
+        shell: bash
+        env:
+          RELEASE_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_PREFLIGHT_AT: ${{ inputs.preflight_at }}
+          RELEASE_WORKFLOW_REF: ${{ github.workflow_ref }}
+          RELEASE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: >
+          python -I .github/scripts/prepare_release_provenance.py gate-receipt
+          --repo-root "$GITHUB_WORKSPACE"
+          --aggregate "$RUNNER_TEMP/dev-gate-aggregate.json"
+          --output "$RUNNER_TEMP/release-gate-receipt.json"
+          --candidate-sha "$RELEASE_CANDIDATE_SHA"
+          --version "$RELEASE_VERSION"
+          --artifact-prefix "$EVIDENCE_ARTIFACT_PREFIX"
+          --repository "$GITHUB_REPOSITORY"
+          --workflow-ref "$RELEASE_WORKFLOW_REF"
+          --workflow-sha "$RELEASE_WORKFLOW_SHA"
+          --actor "$GITHUB_ACTOR"
+          --run-id "$GITHUB_RUN_ID"
+          --run-attempt "$GITHUB_RUN_ATTEMPT"
+          --preflight-at "$RELEASE_PREFLIGHT_AT"
       - name: Upload aggregate evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: dev-gate-aggregate
-          path: ${{ runner.temp }}/dev-gate-aggregate.json
+          name: ${{ env.EVIDENCE_ARTIFACT_PREFIX }}-aggregate
+          path: |
+            ${{ runner.temp }}/dev-gate-aggregate.json
+            ${{ runner.temp }}/release-gate-receipt.json
           if-no-files-found: error
           retention-days: 14
