@@ -821,6 +821,61 @@ def test_prepare_launch_request_binds_final_spec_without_persisting_env_secrets(
     ]
 
 
+def test_prepare_cli_rejects_copied_state_before_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _store(tmp_path)
+    request_id = "lr-copy-prepare"
+    s.write_launch_request(_marker(request_id))
+    (s.dir / "supervisor.json").write_text(
+        json.dumps(_cfg()),
+        encoding="utf-8",
+    )
+    official_path = s.dir / "supervisor-state.json"
+    official_path.write_text("{}", encoding="utf-8")
+    copied_path = tmp_path / "copied-supervisor-state.json"
+    copied_path.write_bytes(official_path.read_bytes())
+    marker_path = s.launch_requests_dir / f"{request_id}.json"
+    official_before = official_path.read_bytes()
+    copy_before = copied_path.read_bytes()
+    marker_before = marker_path.read_bytes()
+    config_before = s.load_config()
+    retired_before = s.retired_agents()
+    messages_before = {
+        path.name: path.read_bytes()
+        for path in s.messages_dir.glob("*.json")
+    }
+    envelope = base64.b64encode(b'{"PATH":""}')
+    monkeypatch.setattr(sys, "stdin", io.BytesIO(envelope))
+
+    rc = cli.main([
+        "--root", str(tmp_path),
+        "supervise",
+        "--prepare-launch-request",
+        "--request-id", request_id,
+        "--state-file", str(copied_path),
+        "--now", str(NOW),
+        "--launch-agenttalk-python", sys.executable,
+        "--launch-src-on-pythonpath", "false",
+        "--launch-environment-stdin",
+    ])
+
+    assert rc == 2
+    assert "official .agenttalk/supervisor-state.json" in capsys.readouterr().err
+    assert official_path.read_bytes() == official_before
+    assert copied_path.read_bytes() == copy_before
+    assert marker_path.read_bytes() == marker_before
+    assert not (s.launch_requests_archive_dir / f"{request_id}.json").exists()
+    assert s.load_config() == config_before
+    assert s.retired_agents() == retired_before
+    assert {
+        path.name: path.read_bytes()
+        for path in s.messages_dir.glob("*.json")
+    } == messages_before
+
+
 def test_prepare_cli_binds_utf8_running_supervisor_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -836,7 +891,7 @@ def test_prepare_cli_binds_utf8_running_supervisor_environment(
     state_path.write_text("{}", encoding="utf-8")
     parent_environment = {
         "PATH": os.environ.get("PATH", ""),
-        "UNICODE_BINDING": "café-雪",
+        "UNICODE_雪": "café-雪",
     }
     envelope = base64.b64encode(
         json.dumps(
@@ -869,6 +924,9 @@ def test_prepare_cli_binds_utf8_running_supervisor_environment(
         expected_spec["recovery_environment"],
     )
     assert spec["effective_environment_sha256"] == expected
+    assert "UNICODE_雪" in json.loads(
+        base64.b64decode(envelope).decode("utf-8")
+    )
     assert "café-雪" not in state_path.read_text(encoding="utf-8")
 
 
@@ -914,7 +972,7 @@ def test_prepare_cli_rejects_lossy_unicode_environment_key_aliases(
     ])
 
     assert rc == 3
-    assert "launch environment is invalid" in capsys.readouterr().err
+    assert "launch environment has duplicate keys" in capsys.readouterr().err
     assert state_path.read_text(encoding="utf-8") == "{}"
     assert marker_path.read_bytes() == marker_before
 

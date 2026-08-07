@@ -12576,6 +12576,22 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                              "--launch-src-on-pythonpath true|false with "
                              "--launch-environment-stdin\n")
             return 2
+        state_path = store.dir / "supervisor-state.json"
+        try:
+            selected_state_path = Path(args.state_file).resolve()
+            official_state_path = state_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            sys.stderr.write(
+                "agenttalk supervise --prepare-launch-request: state path "
+                f"could not be resolved: {exc}\n"
+            )
+            return 2
+        if selected_state_path != official_state_path:
+            sys.stderr.write(
+                "agenttalk supervise --prepare-launch-request: --state-file "
+                "must be the official .agenttalk/supervisor-state.json\n"
+            )
+            return 2
         try:
             stream = getattr(sys.stdin, "buffer", sys.stdin)
             raw_environment = stream.read(1024 * 1024 + 1)
@@ -12597,7 +12613,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 f"base64 launch environment: {exc}\n"
             )
             return 2
-        state = _read_state()
+        state = sup.load_supervisor_state(state_path)
         config = _load_supervisor_config(store)
         now = args.now if args.now is not None else time.time()
         try:
@@ -12616,7 +12632,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         except eph.EphemeralError as e:
             sys.stderr.write(f"agenttalk supervise --prepare-launch-request: {e}\n")
             return 3
-        _write_state(state)
+        sup.save_supervisor_state(state_path, state)
         print(json.dumps(spec, indent=2))
         return 0
 

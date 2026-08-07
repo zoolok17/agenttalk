@@ -2082,7 +2082,13 @@ def test_ps_template_applies_and_restores_env() -> None:
     assert "$a.env" in ps                                  # applies per-agent env
     assert "'src') + ';' + $env:PYTHONPATH" in ps          # src on PYTHONPATH for module import
     assert "finally" in ps                                 # restore in a finally
-    assert "Remove-Item -Path (\"Env:\"" in ps             # restore: unset what wasn't set
+    # LiteralPath is load-bearing: configured names may contain wildcard
+    # characters, and restoration must remove only the exact variable that was
+    # absent before launch. The runtime Launch-Spec test below proves both the
+    # absent and pre-existing-value restoration branches.
+    assert "Remove-Item -LiteralPath (\"Env:\"" in ps
+    assert "Set-Item -LiteralPath (\"Env:\"" in ps
+    assert "Remove-Item -Path (\"Env:\"" not in ps
     assert "Invoke-Expression" not in ps
     # Launch wires Quote-Arg -> a single joined command-line -> Start-Process
     # (BLOCKER 2): the raw $argv array must NEVER go straight to -ArgumentList,
@@ -4153,12 +4159,15 @@ def test_supervisor_environment_capture_distinguishes_malformed_utf16(
             "  [Environment]::SetEnvironmentVariable($name, $null, 'Process')",
             "  [Environment]::SetEnvironmentVariable("
             "$unicodeName, 'same-value', 'Process')",
+            "  $unicode = Get-SupervisorEnvironmentCapture",
             "  [Environment]::SetEnvironmentVariable("
             "$asciiName, 'same-value', 'Process')",
             "  $alias = Get-SupervisorEnvironmentCapture",
             "  [pscustomobject]@{",
             "    invalid_status = $invalid.status;",
             "    valid_status = $valid.status;",
+            "    unicode_status = $unicode.status;",
+            "    unicode_value = $unicode.values[$unicodeName];",
             "    alias_status = $alias.status;",
             "    valid_codepoint = [char]::ConvertToUtf32("
             "$valid.values[$name], 0)",
@@ -4186,6 +4195,8 @@ def test_supervisor_environment_capture_distinguishes_malformed_utf16(
     assert json.loads(output.read_text(encoding="utf-8-sig")) == {
         "invalid_status": "invalid",
         "valid_status": "valid",
+        "unicode_status": "valid",
+        "unicode_value": "same-value",
         "alias_status": "invalid",
         "valid_codepoint": 0x1F642,
     }
@@ -4236,6 +4247,7 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "$env:AGENTTALK_SHIM_ACTIVE = '1'",
         "$profileEnv = [pscustomobject]@{}",
         "$profileEnv | Add-Member -NotePropertyName 'AGENTTALK_P1A_*' -NotePropertyValue 'literal-new'",
+        "$profileEnv | Add-Member -NotePropertyName 'AGENTTALK_P1A_A' -NotePropertyValue 'new-a'",
         "$spec = [pscustomobject]@{",
         "  cli = 'codex'; cwd = $Root; env = $profileEnv;",
         "  window_style = 'Hidden'; window_style_warning = $null;",
@@ -4269,7 +4281,7 @@ def test_ephemeral_launcher_applies_environment_names_literally(
     payload = json.loads(output.read_text(encoding="utf-8-sig"))
     assert payload["inside"] == {
         "wildcard": "literal-new",
-        "sibling_a": "old-a",
+        "sibling_a": "new-a",
         "sibling_b": "old-b",
         "python": None,
         "shim": None,

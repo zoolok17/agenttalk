@@ -35,8 +35,9 @@ import subprocess  # nosec B404 - list2cmdline formats argv; no process is launc
 import sys
 import tempfile
 import time
+import unicodedata
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterable, Sequence
 
 from agenttalk._atomic import write_text as _atomic_write_text
@@ -4560,6 +4561,11 @@ _EPHEMERAL_ENV_BINDING_EXCLUDED = frozenset({
 })
 
 
+def _ephemeral_environment_name_key(name: str) -> str:
+    """Return the stable comparer key used by the environment binding."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
 def _validated_ephemeral_parent_environment(environment: object) -> dict[str, str]:
     """Return a bounded Windows environment projection without lossy aliases."""
     if not isinstance(environment, dict):
@@ -4571,7 +4577,6 @@ def _validated_ephemeral_parent_environment(environment: object) -> dict[str, st
         if (
             not isinstance(key, str)
             or not key
-            or not key.isascii()
             or "=" in key
             or not isinstance(value, str)
             or any(
@@ -4586,11 +4591,10 @@ def _validated_ephemeral_parent_environment(environment: object) -> dict[str, st
             raise eph.EphemeralError(
                 "the running supervisor's launch environment is invalid"
             )
-        folded = key.lower()
+        folded = _ephemeral_environment_name_key(key)
         if folded in _EPHEMERAL_ENV_BINDING_EXCLUDED:
             continue
-        previous = canonical.get(folded)
-        if previous is not None and previous != value:
+        if folded in canonical:
             raise eph.EphemeralError(
                 "the running supervisor's launch environment has duplicate keys"
             )
@@ -4628,7 +4632,7 @@ def _effective_ephemeral_environment_digest(
     effective = dict(parent_environment)
 
     def apply(name: str, value: object) -> None:
-        folded = name.lower()
+        folded = _ephemeral_environment_name_key(name)
         if folded in _EPHEMERAL_ENV_BINDING_EXCLUDED:
             effective.pop(folded, None)
         elif value is None:
@@ -4713,6 +4717,13 @@ def _resolve_configured_executable(
 ) -> Path | None:
     """Resolve one Windows launch token against cwd/PATH/PATHEXT."""
     candidate = Path(executable)
+    if not candidate.is_absolute():
+        # This projection models Windows argv even when its deterministic tests
+        # run on POSIX, where a backslash is otherwise treated as a filename.
+        windows_candidate = PureWindowsPath(executable)
+        if windows_candidate.is_absolute():
+            return None
+        candidate = Path(*windows_candidate.parts)
     if candidate.is_absolute():
         return candidate if candidate.is_file() else None
     has_path = "/" in executable or "\\" in executable
@@ -4941,7 +4952,7 @@ def configured_detached_launch(
             return None
         return value
 
-    root_text = clean(str(Path(root).resolve())) if root is not None else None
+    root_text = clean(str(root)) if root is not None else None
     if root is not None and root_text is None:
         return None, "the configured launch root is unavailable"
     recovery_environment: dict | None = None
@@ -11698,21 +11709,24 @@ $WrapperLogEnvKeys = @(
 )
 
 function Get-SupervisorEnvironmentCapture {
-  $values = @{}
+  $values = New-Object 'System.Collections.Generic.Dictionary[string,string]' (
+    [StringComparer]::Ordinal)
+  $seenNames = New-Object 'System.Collections.Generic.HashSet[string]' (
+    [StringComparer]::Ordinal)
   $environment = [Environment]::GetEnvironmentVariables()
   $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
   foreach ($rawName in $environment.Keys) {
     $name = [string]$rawName
     $value = [string]$environment[$rawName]
-    foreach ($character in $name.ToCharArray()) {
-      if ([int]$character -gt 0x7f) {
-        return [pscustomobject]@{ status = 'invalid'; values = $null }
-      }
-    }
     try {
       [void]$strictUtf8.GetBytes($name)
       [void]$strictUtf8.GetBytes($value)
+      $nameKey = $name.Normalize(
+        [Text.NormalizationForm]::FormC).ToUpperInvariant()
     } catch {
+      return [pscustomobject]@{ status = 'invalid'; values = $null }
+    }
+    if (-not $seenNames.Add($nameKey)) {
       return [pscustomobject]@{ status = 'invalid'; values = $null }
     }
     $values[$name] = $value
