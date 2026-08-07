@@ -518,7 +518,22 @@ def _windows_raw_file_attributes(path: Path) -> int | None:
     try:
         import ctypes
 
-        result = ctypes.windll.kernel32.GetFileAttributesW(str(path))  # type: ignore[attr-defined]
+        # #113 review, round 9, finding 3: GetFileAttributesW is
+        # documented to return a DWORD (unsigned 32-bit), with
+        # INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) on failure - but ctypes'
+        # default restype for an undeclared foreign function is a
+        # SIGNED c_int, so an actual failure came back as Python -1, not
+        # 4294967295, and the sentinel comparison below never matched.
+        # Every caller still ended up fail-closed only by accident: -1's
+        # infinite-leading-ones two's-complement representation makes
+        # `-1 & _WIN32_FILE_ATTRIBUTE_REPARSE_POINT` truthy too, so the
+        # bit test happened to look like a reparse point. An accidental
+        # safety is not a contract - declare the real, unsigned return
+        # type so the sentinel comparison actually fires on failure.
+        get_file_attributes = ctypes.windll.kernel32.GetFileAttributesW  # type: ignore[attr-defined]
+        get_file_attributes.restype = ctypes.c_uint32
+        get_file_attributes.argtypes = [ctypes.c_wchar_p]
+        result = get_file_attributes(str(path))
     except (OSError, AttributeError, ValueError) as exc:
         raise _RawAttributeLookupFailed(str(path)) from exc
     if result == _WIN32_INVALID_FILE_ATTRIBUTES:

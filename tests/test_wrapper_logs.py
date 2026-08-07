@@ -587,64 +587,292 @@ def test_location_status_rejects_a_directory_where_a_log_file_is_expected(
 
 _WRAPPER_LOG_ALLOWLIST_MARKER = "wrapper-log-raw-primitive:"
 _WRAPPER_LOG_ALLOWLIST_TAG_RE = re.compile(r"^\s*\[(?P<category>[\w-]+):(?P<area>[\w-]+)\]")
-_PYTHON_RAW_PRIMITIVE_METHODS = frozenset({"exists", "is_dir", "is_file"})
-_PYTHON_STREAMING_CLASSES_EXCLUDED = frozenset({"BoundedStreamTee"})
-_POWERSHELL_FUNCTION_NAME_RE = re.compile(r"function\s+([\w-]*WrapperLog[\w-]*)\s*\(")
-_POWERSHELL_PRIMITIVE_RE = re.compile(
-    r"(?P<testpath>Test-Path)\b"
-    r"|(?P<getitem>Get-Item)\b"
-    r"|(?P<container>PSIsContainer)"
-    r"|(?P<reparse>-band \[IO\.FileAttributes\]::ReparsePoint)"
-)
 
-# #113 review, round 7: the manifest itself. Keyed by (function, category,
-# area) - not by line number, not by a printed length - so a NEW site
-# (a new key) or a CHANGED site (a count that no longer matches) both
-# make the discovered set stop equaling this one, and the check fails
-# until this dict is edited on purpose. category is one of
-# 'classifier-internal' (the closed-outcome classifiers' own bodies -
-# primitive access is their entire purpose), 'reference-correct' (already
-# wrapped in the same non-swallowing exception discrimination the
-# classifiers use), or 'debt' (deliberately left as a raw primitive,
-# tracked, not yet converted). area groups related lines within one
-# category for the printed report; it carries no other meaning.
-_POWERSHELL_MANIFEST: dict[tuple[str, str, str], dict[str, int]] = {
-    ("Get-SafeWrapperLogAgentDir", "debt", "agent-resolver"): {
-        "testpath": 2, "getitem": 3, "reparse": 3, "container": 1,
-    },
-    ("Test-WrapperLogMarkerPresence", "classifier-internal", "self"): {
-        "getitem": 1, "container": 1, "reparse": 1,
-    },
-    ("Test-WrapperLogDirectoryPresence", "classifier-internal", "self"): {
-        "getitem": 1, "container": 1, "reparse": 1,
-    },
-    ("Read-WrapperLogSequenceRecord", "reference-correct", "sequence-file"): {
-        "getitem": 1, "container": 1, "reparse": 1,
-    },
-    ("Invoke-WrapperLogRetentionPrune", "reference-correct", "already-retrieved"): {
-        "reparse": 1,
-    },
-    ("Invoke-WrapperLogRetentionPrune", "debt", "175-active-lock"): {
-        "testpath": 1, "getitem": 1, "container": 1, "reparse": 1,
-    },
-    ("Discard-PendingWrapperLogTargets", "debt", "pending-discard"): {
-        "getitem": 1, "reparse": 1,
-    },
+# ---------------------------------------------------------------------------
+# #113 review, round 9: text/regex discovery has the exact defect it was
+# built to catch - "no hits" meant "none of the spellings/shapes I
+# enumerated," not "none exist." reviewer-1 executed four PowerShell-side
+# evasions against round 7's check unchanged: a generic helper without the
+# "WrapperLog" substring, a param-block function declaration, lowercase
+# spelling, and an alternate raw API; and the Python AST walk banned exactly
+# three method names, so lstat, os.stat, and os.path.isdir were all
+# invisible. Discovery is now REAL PARSING - PowerShell's own AST (a real
+# pwsh/powershell subprocess; ParseInput never executes anything) walks the
+# WHOLE template - and scope is a CALL GRAPH reachable from the subsystem's
+# actual external entry points, not a name pattern: a helper is in scope
+# because something in scope calls it, never because of what it is named.
+# Every evasion named above, plus round 7's own three, is pinned below as a
+# permanent regression - the durable part is that the NEXT evasion has to be
+# one nobody has thought of yet, not one already found and forgotten.
+# ---------------------------------------------------------------------------
+
+_POWERSHELL_ENTRY_POINTS = frozenset(
+    {"new-wrapperlogtargets", "discard-pendingwrapperlogtargets"}
+)
+_POWERSHELL_PRIMITIVE_CMDLETS = frozenset({
+    "test-path", "get-item", "get-itemproperty",
+    "resolve-path", "get-itempropertyvalue",
+})
+_POWERSHELL_PRIMITIVE_MEMBERS = frozenset({"psiscontainer", "attributes", "linktype", "target"})
+_POWERSHELL_PRIMITIVE_STATIC_TYPES = frozenset({"io.file", "io.directory"})
+_POWERSHELL_PRIMITIVE_STATIC_MEMBERS = frozenset({"exists", "getattributes", "resolvelinktarget"})
+
+# #113 review, round 9: the ratchet is the SET of debt (function, area)
+# pairs, not a token count ("token counts are an audit detail, not the
+# metric"). Three semantic debt areas: the agent-resolver's whole-function
+# allowlist, #175's active-lock check (tracked and fixed separately), and
+# pending-discard's honestly-reclassified low-severity debt.
+_POWERSHELL_DEBT_KEYS = frozenset({
+    ("get-safewrapperlogagentdir", "agent-resolver"),
+    ("invoke-wrapperlogretentionprune", "175-active-lock"),
+    ("discard-pendingwrapperlogtargets", "pending-discard"),
+})
+
+# Every (function, category, area) key this scan is allowed to discover,
+# lower-cased so a case-swapped spelling of a KNOWN site cannot silently
+# open a second, unmatched entry - editing this set on purpose is the only
+# way to add, remove, or reclassify a site.
+_POWERSHELL_MANIFEST: frozenset[tuple[str, str, str]] = frozenset({
+    ("get-safewrapperlogagentdir", "debt", "agent-resolver"),
+    ("test-wrapperlogmarkerpresence", "classifier-internal", "self"),
+    ("test-wrapperlogdirectorypresence", "classifier-internal", "self"),
+    ("read-wrapperlogsequencerecord", "reference-correct", "sequence-file"),
+    ("invoke-wrapperlogretentionprune", "reference-correct", "already-retrieved"),
+    ("invoke-wrapperlogretentionprune", "debt", "175-active-lock"),
+    ("discard-pendingwrapperlogtargets", "debt", "pending-discard"),
+})
+assert {(f, a) for f, cat, a in _POWERSHELL_MANIFEST if cat == "debt"} == _POWERSHELL_DEBT_KEYS
+
+
+# ParseInput parses source text without ever executing it - this is safe to
+# run against arbitrary/mutated PowerShell text, including the evasion
+# injections below.
+_POWERSHELL_AST_SCAN_SCRIPT = r"""
+param([string]$SourcePath, [string]$OutPath)
+$text = [System.IO.File]::ReadAllText($SourcePath)
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
+
+$functions = @()
+foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+  $functions += [ordered]@{ name = $fn.Name; start = $fn.Extent.StartOffset; end = $fn.Extent.EndOffset }
 }
 
+$commands = @()
+foreach ($cmd in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+  $name = $cmd.GetCommandName()
+  if ($name) {
+    $commands += [ordered]@{
+      name = $name
+      start = $cmd.Extent.StartOffset
+      line = $cmd.Extent.StartLineNumber
+      rawLine = $cmd.Extent.StartScriptPosition.Line
+    }
+  }
+}
 
-def _python_wrapper_log_primitive_counts(module_path: Path) -> dict[str, int]:
-    """AST-scan the WHOLE Python module (never marker-bounded - a
-    marker-delimited scan is blind to anything placed outside the
-    markers, which is exactly the escape round 7 found) for
-    `.exists()`/`.is_dir()`/`.is_file()` calls, keyed by
-    "<function>:<method>" to an occurrence count. Excludes
-    BoundedStreamTee's methods by class name (streaming byte-accounting,
-    a different concern that happens to call similarly-named methods) -
-    the ONLY named exclusion; everything else in the file is covered.
+$members = @()
+foreach ($m in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.MemberExpressionAst] }, $true)) {
+  $memberName = $m.Member.Value
+  if ($memberName) {
+    $members += [ordered]@{
+      name = $memberName
+      start = $m.Extent.StartOffset
+      line = $m.Extent.StartLineNumber
+      rawLine = $m.Extent.StartScriptPosition.Line
+    }
+  }
+}
+
+$staticCalls = @()
+$invokeMemberType = [System.Management.Automation.Language.InvokeMemberExpressionAst]
+foreach ($m in $ast.FindAll({ $args[0] -is $invokeMemberType }, $true)) {
+  if ($m.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
+    $staticCalls += [ordered]@{
+      type = $m.Expression.TypeName.FullName
+      name = $m.Member.Value
+      start = $m.Extent.StartOffset
+      line = $m.Extent.StartLineNumber
+      rawLine = $m.Extent.StartScriptPosition.Line
+    }
+  }
+}
+
+$result = [ordered]@{
+  functions = @($functions)
+  commands = @($commands)
+  members = @($members)
+  staticCalls = @($staticCalls)
+  parseErrors = @($errors | ForEach-Object { $_.Message })
+}
+$result | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath $OutPath -Encoding utf8
+"""
+
+
+def _pick_powershell_for_ast_parsing() -> str | None:
+    """Prefer pwsh (cross-platform, ships on GitHub-hosted runners of every
+    OS); fall back to Windows PowerShell. ParseInput never executes the
+    source, so either host is safe to use purely for parsing."""
+    return shutil.which("pwsh") or shutil.which("powershell")
+
+
+def _parse_powershell_wrapper_log_ast(ps_text: str, tmp_path: Path) -> dict:
+    shell = _pick_powershell_for_ast_parsing()
+    if not shell:
+        pytest.skip("no PowerShell host available to parse the template")
+    source_path = tmp_path / "wrapper-log-ast-source.txt"
+    out_path = tmp_path / "wrapper-log-ast-result.json"
+    script_path = tmp_path / "wrapper-log-ast-scan.ps1"
+    source_path.write_text(ps_text, encoding="utf-8")
+    script_path.write_text(_POWERSHELL_AST_SCAN_SCRIPT, encoding="utf-8")
+    result = subprocess.run(
+        [
+            shell, "-NoProfile", "-File", str(script_path),
+            "-SourcePath", str(source_path), "-OutPath", str(out_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    data = json.loads(out_path.read_text(encoding="utf-8"))
+    assert not data["parseErrors"], (
+        f"template does not parse as PowerShell: {data['parseErrors']}"
+    )
+    return data
+
+
+def _strip_module_qualifier(name: str) -> str:
+    return name.rsplit("\\", 1)[-1]
+
+
+def _innermost_powershell_function(functions: list[dict], offset: int) -> dict | None:
+    containing = [f for f in functions if f["start"] <= offset < f["end"]]
+    if not containing:
+        return None
+    return min(containing, key=lambda f: f["end"] - f["start"])
+
+
+def _reachable_powershell_functions(functions: list[dict], commands: list[dict]) -> set[str]:
+    """BFS over real call edges (a CommandAst whose name matches another
+    function's name) from the wrapper-log subsystem's actual external
+    entry points (New-WrapperLogTargets, Discard-PendingWrapperLogTargets -
+    verified by grep to be the only two called from outside this
+    subsystem). A helper is in scope because something in scope calls it -
+    never because of what it happens to be named. Closes the "generic
+    helper without the WrapperLog substring" evasion, which any
+    name-pattern filter is structurally unable to close."""
+    by_lower = {f["name"].lower(): f for f in functions}
+    edges: dict[str, set[str]] = {name: set() for name in by_lower}
+    for cmd in commands:
+        callee = _strip_module_qualifier(cmd["name"]).lower()
+        if callee not in by_lower:
+            continue
+        caller_fn = _innermost_powershell_function(functions, cmd["start"])
+        caller = caller_fn["name"].lower() if caller_fn else None
+        if caller and caller != callee:
+            edges[caller].add(callee)
+    reachable: set[str] = set()
+    queue = [name for name in _POWERSHELL_ENTRY_POINTS if name in by_lower]
+    while queue:
+        current = queue.pop()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        queue.extend(edges.get(current, ()))
+    return reachable
+
+
+def _discover_powershell_wrapper_log_primitives(
+    ast_data: dict,
+) -> tuple[set[tuple[str, str, str]], list[str], list[str]]:
+    """The discovery core, shared by the main manifest test and every
+    pinned-evasion regression test below - a real function, not an
+    inline block, so an evasion test can assert exactly what it needs:
+    that a specific injected shape still surfaces as unallowlisted,
+    malformed, or an unexpected manifest key."""
+    functions = ast_data["functions"]
+    reachable = _reachable_powershell_functions(functions, ast_data["commands"])
+
+    hits: list[dict] = []
+    for cmd in ast_data["commands"]:
+        if _strip_module_qualifier(cmd["name"]).lower() in _POWERSHELL_PRIMITIVE_CMDLETS:
+            hits.append(cmd)
+    for member in ast_data["members"]:
+        if member["name"].lower() in _POWERSHELL_PRIMITIVE_MEMBERS:
+            hits.append(member)
+    for call in ast_data["staticCalls"]:
+        type_name = call["type"].lower().removeprefix("system.")
+        if (
+            type_name in _POWERSHELL_PRIMITIVE_STATIC_TYPES
+            and call["name"].lower() in _POWERSHELL_PRIMITIVE_STATIC_MEMBERS
+        ):
+            hits.append(call)
+
+    discovered: set[tuple[str, str, str]] = set()
+    unallowlisted: list[str] = []
+    malformed: list[str] = []
+    for hit in hits:
+        enclosing = _innermost_powershell_function(functions, hit["start"])
+        if enclosing is None or enclosing["name"].lower() not in reachable:
+            # Not reachable from a real wrapper-log entry point - out of
+            # this scan's scope the same way an unrelated supervisor
+            # function always was, just determined by a call edge now
+            # instead of a name pattern.
+            continue
+        func_name = enclosing["name"].lower()
+        raw_line = hit["rawLine"]
+        marker_idx = raw_line.find(_WRAPPER_LOG_ALLOWLIST_MARKER)
+        location = f"{func_name}:{hit['line']}: {raw_line.strip()}"
+        if marker_idx == -1:
+            unallowlisted.append(location)
+            continue
+        reason = raw_line[marker_idx + len(_WRAPPER_LOG_ALLOWLIST_MARKER):].strip()
+        tag = _WRAPPER_LOG_ALLOWLIST_TAG_RE.match(reason)
+        if not tag:
+            malformed.append(
+                f"{location} - allowlist comment has no '[category:area]' tag: {reason!r}"
+            )
+            continue
+        discovered.add((func_name, tag["category"], tag["area"]))
+    return discovered, unallowlisted, malformed
+
+
+_PYTHON_PRIMITIVE_METHOD_NAMES = frozenset({
+    "exists", "is_dir", "is_file", "is_symlink", "lstat", "stat",
+})
+_PYTHON_PRIMITIVE_OS_FUNCTIONS = frozenset({"stat", "lstat"})
+_PYTHON_PRIMITIVE_OS_PATH_FUNCTIONS = frozenset({"exists", "isdir", "isfile", "islink"})
+_PYTHON_STREAMING_CLASSES_EXCLUDED = frozenset({"BoundedStreamTee"})
+
+# #113 review, round 9: every (function, primitive) pair this scan is
+# allowed to discover on the Python side, keyed exactly like the
+# PowerShell manifest - explicit classifier and reference exceptions, not
+# a bare list of banned method names with no attribution (which is what
+# let lstat, os.stat, and os.path.isdir go unseen in round 7's version).
+_PYTHON_MANIFEST: frozenset[tuple[str, str, str, str]] = frozenset({
+    ("_is_reparse_or_symlink", "lstat", "classifier-internal", "self"),
+    ("_scan_path", "lstat", "classifier-internal", "self"),
+    ("_scan_marker", "lstat", "classifier-internal", "self"),
+    ("_validate_open_lock_path", "lstat", "reference-correct", "open-lock-identity"),
+    ("_read_wrapper_log_sequence", "lstat", "reference-correct", "sequence-file"),
+})
+_PYTHON_MANIFEST_KEYS = frozenset((func, name) for func, name, _cat, _area in _PYTHON_MANIFEST)
+
+
+def _python_wrapper_log_primitive_hits(module_text: str) -> dict[tuple[str, str], int]:
+    """Whole-module AST scan for every raw presence/type primitive SHAPE:
+    Path.exists()/.is_dir()/.is_file()/.is_symlink()/.lstat()/.stat(),
+    os.stat()/os.lstat(), and os.path.exists()/isdir()/isfile()/islink() -
+    not the three method names round 7's version happened to enumerate
+    (#113 review, round 9: lstat, os.stat, and os.path.isdir were all
+    invisible to it). Keyed by (function, primitive), never a bare count.
+    BoundedStreamTee excluded by class name - streaming byte-accounting,
+    a different concern this scan was never meant to police.
     """
-    tree = ast.parse(module_path.read_text(encoding="utf-8"))
-    counts: dict[str, int] = {}
+    tree = ast.parse(module_text)
+    hits: dict[tuple[str, str], int] = {}
 
     class _Visitor(ast.NodeVisitor):
         def __init__(self) -> None:
@@ -662,148 +890,304 @@ def _python_wrapper_log_primitive_counts(module_path: Path) -> dict[str, int]:
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
+        def _record(self, primitive: str) -> None:
+            func_name = self.func_stack[-1] if self.func_stack else "<module>"
+            key = (func_name, primitive)
+            hits[key] = hits.get(key, 0) + 1
+
         def visit_Call(self, node: ast.Call) -> None:
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr in _PYTHON_RAW_PRIMITIVE_METHODS
-            ):
-                func_name = self.func_stack[-1] if self.func_stack else "<module>"
-                key = f"{func_name}:{node.func.attr}"
-                counts[key] = counts.get(key, 0) + 1
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                if (
+                    func.attr in _PYTHON_PRIMITIVE_OS_FUNCTIONS
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                ):
+                    self._record(func.attr)
+                elif (
+                    func.attr in _PYTHON_PRIMITIVE_OS_PATH_FUNCTIONS
+                    and isinstance(func.value, ast.Attribute)
+                    and func.value.attr == "path"
+                    and isinstance(func.value.value, ast.Name)
+                    and func.value.value.id == "os"
+                ):
+                    self._record(func.attr)
+                elif func.attr in _PYTHON_PRIMITIVE_METHOD_NAMES:
+                    self._record(func.attr)
             self.generic_visit(node)
 
     _Visitor().visit(tree)
-    return counts
-
-
-def _powershell_wrapper_log_function_bodies(ps_text: str) -> dict[str, str]:
-    """Find every function whose name contains "WrapperLog" ANYWHERE in
-    ps_text (never marker-bounded, for the same reason as the Python
-    scan above) and extract its full body by brace-depth matching from
-    the opening '{'. A new helper defined anywhere in the generated
-    script, inside or outside any region markers, is found by this scan
-    because it is found by NAME, not by position."""
-    bodies: dict[str, str] = {}
-    for match in _POWERSHELL_FUNCTION_NAME_RE.finditer(ps_text):
-        name = match.group(1)
-        brace_start = ps_text.index("{", match.end())
-        depth = 0
-        i = brace_start
-        while i < len(ps_text):
-            if ps_text[i] == "{":
-                depth += 1
-            elif ps_text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        bodies[name] = ps_text[brace_start:i + 1]
-    return bodies
+    return hits
 
 
 def test_wrapper_log_python_side_uses_only_shared_classifiers() -> None:
-    """#113 review, round 7: the Python half of the mechanical sweep,
-    rebuilt as a manifest rather than a printed count (round 5's version
-    only asserted each allowlist reason was non-empty - a 26th primitive
-    with any non-empty reason passed silently, and a marker-bounded scan
-    was blind to anything placed outside the region markers). Whole-file
-    AST scan, not text/marker based - round 5's fixes converted every
-    Python-side site, so the expected set is empty; ANY hit here, of any
-    kind, anywhere in the file outside BoundedStreamTee, is new debt that
-    was not here when this round ended and must be dealt with, not
-    printed and ignored."""
-    counts = _python_wrapper_log_primitive_counts(Path(wrapper_logs.__file__))
-    assert counts == {}, (
-        f"raw presence/type primitive(s) found outside the shared "
-        f"classifiers, with no manifest entry (none are expected on the "
-        f"Python side after round 5's conversions): {counts}"
+    """#113 review, round 9: the round-7 AST walk banned exactly three
+    method names - exists, is_dir, is_file - so `lstat`, `os.stat`, and
+    `os.path.isdir` were all invisible to it: "no hits" meant "none of
+    the three spellings I enumerated," not "none exist." Every
+    primitive-shaped call anywhere in the module is now inventoried and
+    keyed to an explicit (function, primitive) manifest exception - the
+    shared classifiers' own bodies plus two already-correct reference
+    sites - rather than a bare banned-name list with no attribution.
+    Anything else is new, unexplained debt."""
+    hits = _python_wrapper_log_primitive_hits(
+        Path(wrapper_logs.__file__).read_text(encoding="utf-8")
+    )
+    discovered_keys = frozenset(hits)
+    unexplained = discovered_keys - _PYTHON_MANIFEST_KEYS
+    missing = _PYTHON_MANIFEST_KEYS - discovered_keys
+    assert not unexplained, (
+        "raw presence/type primitive(s) found with no manifest exception "
+        f"(function, primitive): {sorted(unexplained)}"
+    )
+    assert not missing, (
+        "a manifest exception no longer corresponds to any real call - "
+        f"edit _PYTHON_MANIFEST deliberately if this site was removed: {sorted(missing)}"
     )
 
 
-def test_wrapper_log_powershell_side_matches_the_manifest_exactly() -> None:
-    """#113 review, round 7: the PowerShell half, as an asserted SET
-    rather than a printed length. Every *WrapperLog*-named function
-    anywhere in the generated script (found by NAME, not by position
-    between region markers - closing the escape round 7 found: a
-    fully-qualified provider call used to be exempted by the regex
-    itself, and anything placed after the old end marker was invisible
-    either way) is scanned for raw primitives. Each hit must carry a
-    structured `[category:area]` allowlist tag; the discovered
-    (function, category, area) -> {primitive: count} map must equal
-    _POWERSHELL_MANIFEST EXACTLY - editing that dict is the only way to
-    add, remove, or change a site, and that edit is a visible diff, not
-    an invisible pass.
-    """
-    bodies = _powershell_wrapper_log_function_bodies(sup.PS_TEMPLATE)
-    discovered: dict[tuple[str, str, str], dict[str, int]] = {}
-    unallowlisted: list[str] = []
-    malformed: list[str] = []
-
-    for func_name, body in bodies.items():
-        for lineno, line in enumerate(body.splitlines(), start=1):
-            code_part = line.split("#", 1)[0]
-            hits = list(_POWERSHELL_PRIMITIVE_RE.finditer(code_part))
-            if not hits:
-                continue
-            marker_idx = line.find(_WRAPPER_LOG_ALLOWLIST_MARKER)
-            if marker_idx == -1:
-                unallowlisted.append(f"{func_name}:{lineno}: {line.strip()}")
-                continue
-            reason = line[marker_idx + len(_WRAPPER_LOG_ALLOWLIST_MARKER):].strip()
-            tag = _WRAPPER_LOG_ALLOWLIST_TAG_RE.match(reason)
-            if not tag:
-                malformed.append(
-                    f"{func_name}:{lineno}: allowlist comment has no "
-                    f"'[category:area]' tag: {reason!r}"
-                )
-                continue
-            key = (func_name, tag["category"], tag["area"])
-            bucket = discovered.setdefault(key, {})
-            for hit in hits:
-                bucket[hit.lastgroup] = bucket.get(hit.lastgroup, 0) + 1
+def test_wrapper_log_powershell_side_matches_the_manifest_exactly(tmp_path: Path) -> None:
+    """#113 review, round 9: rebuilt on REAL PARSING after reviewer-1
+    executed four evasions against round 7's text/regex check unchanged -
+    a generically-named helper, a param-block function declaration,
+    lowercase spelling, and an alternate raw API. Every pinned-evasion
+    test below proves each of those, plus round 7's own three, still
+    fails this rebuilt check. Scope is a CALL GRAPH reachable from the
+    subsystem's two real external entry points, not a name pattern."""
+    ast_data = _parse_powershell_wrapper_log_ast(sup.PS_TEMPLATE, tmp_path)
+    discovered, unallowlisted, malformed = _discover_powershell_wrapper_log_primitives(ast_data)
 
     assert not unallowlisted, (
-        "raw presence/type primitive(s) found in a *WrapperLog* function "
-        "without a '# wrapper-log-raw-primitive: [category:area] <reason>' "
-        "allowlist comment - route through the shared classifier or "
-        "allowlist explicitly:\n" + "\n".join(unallowlisted)
+        "raw presence/type primitive(s) found in a function reachable from "
+        "the wrapper-log subsystem's entry points, without a "
+        "'# wrapper-log-raw-primitive: [category:area] <reason>' allowlist "
+        "comment - route through the shared classifier or allowlist "
+        "explicitly:\n" + "\n".join(unallowlisted)
     )
     assert not malformed, (
         "allowlist comment(s) missing the required [category:area] tag "
-        "(bare reasons are not enough - round 7 found a printed length is "
-        "not a ratchet):\n" + "\n".join(malformed)
+        "(bare reasons are not enough):\n" + "\n".join(malformed)
     )
 
-    by_category: dict[str, int] = {}
-    for (_func_name, category, _area), counts in sorted(discovered.items()):
-        by_category[category] = by_category.get(category, 0) + sum(counts.values())
-    report = "wrapper-log PowerShell manifest ({} total, {}):\n{}".format(
-        sum(by_category.values()),
-        ", ".join(f"{cat}={n}" for cat, n in sorted(by_category.items())),
-        "\n".join(
-            f"  [{category}:{area}] {func_name}: {counts}"
-            for (func_name, category, area), counts in sorted(discovered.items())
-        ) or "  (none)",
+    debt_keys = {(func, area) for func, category, area in discovered if category == "debt"}
+    assert debt_keys == _POWERSHELL_DEBT_KEYS, (
+        "the three debt keys have changed - the ratchet is the SET of debt "
+        "(function, area) pairs, not a count (#113 review, round 9):\n"
+        f"  expected: {sorted(_POWERSHELL_DEBT_KEYS)}\n"
+        f"  found:    {sorted(debt_keys)}"
     )
-    print("\n" + report)
 
-    missing = {k: v for k, v in _POWERSHELL_MANIFEST.items() if k not in discovered}
-    unexpected = {k: v for k, v in discovered.items() if k not in _POWERSHELL_MANIFEST}
-    changed = {
-        k: (v, discovered[k])
-        for k, v in _POWERSHELL_MANIFEST.items()
-        if k in discovered and discovered[k] != v
-    }
-    assert not missing and not unexpected and not changed, (
-        "the discovered PowerShell raw-primitive site set no longer "
-        "equals _POWERSHELL_MANIFEST - edit the manifest deliberately if "
-        "this is an intended change:\n"
-        f"  manifest entries no longer found (fixed or removed?): {missing}\n"
-        f"  new entries not yet in the manifest (new debt, or missing "
-        f"[category:area] grouping?): {unexpected}\n"
-        f"  entries whose primitive counts changed "
-        f"(expected, discovered): {changed}\n\n" + report
+    missing = _POWERSHELL_MANIFEST - discovered
+    unexpected = discovered - _POWERSHELL_MANIFEST
+    assert not missing and not unexpected, (
+        "the discovered PowerShell raw-primitive (function, category, area) "
+        "set no longer equals _POWERSHELL_MANIFEST - edit the manifest "
+        "deliberately if this is an intended change:\n"
+        f"  manifest entries no longer found (fixed or removed?): {sorted(missing)}\n"
+        f"  new entries not yet in the manifest: {sorted(unexpected)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# #113 review, round 9: "COMMIT reviewer-1's escape injections as permanent
+# controls... That is the durable part: it means the next evasion has to be
+# one nobody has thought of yet, rather than one we already found and
+# forgotten." Each test below injects exactly one named evasion shape into a
+# COPY of the real template (never the real one - these must keep failing,
+# not pass) and asserts the rebuilt discovery mechanism still catches it.
+# ---------------------------------------------------------------------------
+
+_WRAPPER_LOG_MUTATION_ANCHOR = "  $observedCount = 0\n"
+
+
+def _mutate_ps_template(injected_functions: str, injected_call: str) -> str:
+    """Append new function definition(s) anywhere in the template (position
+    must not matter - that is round 7's "after-marker" escape, closed by
+    call-graph reachability rather than physical position) and splice a
+    call to the injected code directly into Invoke-WrapperLogRetentionPrune
+    - a real external entry point's transitive callee - so it is reachable
+    exactly the way a genuine evasion would need to be to matter."""
+    ps = sup.PS_TEMPLATE
+    assert ps.count(_WRAPPER_LOG_MUTATION_ANCHOR) == 1
+    mutated = ps.replace(
+        _WRAPPER_LOG_MUTATION_ANCHOR,
+        _WRAPPER_LOG_MUTATION_ANCHOR + "  " + injected_call + "\n",
+        1,
+    )
+    return mutated + "\n" + injected_functions + "\n"
+
+
+def test_evasion_after_marker_function_is_still_caught(tmp_path: Path) -> None:
+    """#113 review, round 7's own first escape, pinned permanently: a new
+    WrapperLog-named function, reachable via a real call edge, defined
+    physically after the (no longer scope-relevant) old end marker."""
+    mutated = _mutate_ps_template(
+        injected_functions=(
+            "function Get-WrapperLogEvasionAfterMarker([string]$path) {\n"
+            "  if (Test-Path -LiteralPath $path) { return $true }\n"
+            "  return $false\n"
+            "}"
+        ),
+        injected_call="$null = Get-WrapperLogEvasionAfterMarker $candidateAgentDir",
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    assert any("get-wrapperlogevasionaftermarker" in line for line in unallowlisted)
+
+
+def test_evasion_fully_qualified_provider_form_is_still_caught(tmp_path: Path) -> None:
+    """#113 review, round 7's second escape, pinned permanently: the
+    fully-qualified provider form used to dodge test-time cmdlet shadows
+    is not exempt from discovery just because it is qualified."""
+    mutated = _mutate_ps_template(
+        injected_functions="",
+        injected_call=(
+            "$null = Microsoft.PowerShell.Management\\Get-Item "
+            "-LiteralPath $candidateAgentDir -Force -ErrorAction SilentlyContinue"
+        ),
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    assert any("invoke-wrapperlogretentionprune" in line for line in unallowlisted)
+
+
+def test_evasion_untagged_allowlist_reason_is_still_caught(tmp_path: Path) -> None:
+    """#113 review, round 7's third escape, pinned permanently: a
+    non-empty allowlist reason with no '[category:area]' tag is not a
+    ratchet - it is a printed length with extra words."""
+    mutated = _mutate_ps_template(
+        injected_functions="",
+        injected_call=(
+            "if (Test-Path -LiteralPath $candidateAgentDir) { "
+            "$null = 1 } # wrapper-log-raw-primitive: allowlisted, trust me"
+        ),
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, _unallowlisted, malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    assert any("invoke-wrapperlogretentionprune" in line for line in malformed)
+
+
+def test_evasion_generic_helper_name_without_wrapperlog_substring_is_still_caught(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 9's first new escape: a helper whose name has
+    nothing to do with "WrapperLog" is in scope because
+    Invoke-WrapperLogRetentionPrune (a real transitive callee of a real
+    external entry point) calls it - never because of what it is named.
+    Any name-pattern filter is structurally unable to close this; a call
+    graph closes it by construction."""
+    mutated = _mutate_ps_template(
+        injected_functions=(
+            "function Get-QuotaSnapshot([string]$path) {\n"
+            "  if (Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue) {\n"
+            "    return $true\n"
+            "  }\n"
+            "  return $false\n"
+            "}"
+        ),
+        injected_call="$null = Get-QuotaSnapshot $candidateAgentDir",
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    assert any("get-quotasnapshot" in line for line in unallowlisted)
+
+
+def test_evasion_param_block_function_declaration_is_still_caught(tmp_path: Path) -> None:
+    """#113 review, round 9's second new escape: `function Name { param
+    (...); ... }` is just as valid PowerShell as `function Name(...) {
+    ... }`, and a real parser does not care which form was used to
+    reach the same AST shape - only a text regex anchored on a specific
+    declaration syntax could miss this."""
+    mutated = _mutate_ps_template(
+        injected_functions=(
+            "function Get-WrapperLogEvasionParamBlock {\n"
+            "  param([string]$path)\n"
+            "  if (Test-Path -LiteralPath $path) { return $true }\n"
+            "  return $false\n"
+            "}"
+        ),
+        injected_call="$null = Get-WrapperLogEvasionParamBlock $candidateAgentDir",
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    assert any("get-wrapperlogevasionparamblock" in line for line in unallowlisted)
+
+
+def test_evasion_lowercase_cmdlet_spelling_is_still_caught(tmp_path: Path) -> None:
+    """#113 review, round 9's third new escape: PowerShell cmdlet names
+    are case-insensitive at the language level - `test-path` and
+    `Test-Path` invoke the identical cmdlet - so a discovery mechanism
+    that treats them as different strings is not describing PowerShell,
+    it is describing one convention someone happened to type."""
+    mutated = _mutate_ps_template(
+        injected_functions="",
+        injected_call="if (test-path -LiteralPath $candidateAgentDir) { $null = 1 }",
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    assert any("invoke-wrapperlogretentionprune" in line for line in unallowlisted)
+
+
+def test_evasion_alternate_raw_api_is_still_caught(tmp_path: Path) -> None:
+    """#113 review, round 9's fourth new escape: `[System.IO.File]`'s
+    static methods answer the identical existence/attribute questions
+    Test-Path/Get-Item do, via a completely different AST shape (a
+    static type-member invocation, not a command call) - a cmdlet-only
+    scan is blind to it no matter how it finds cmdlets."""
+    mutated = _mutate_ps_template(
+        injected_functions="",
+        injected_call=(
+            "if ([System.IO.File]::Exists($candidateAgentDir)) { $null = 1 }"
+        ),
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, unallowlisted, _malformed = _discover_powershell_wrapper_log_primitives(ast_data)
+    assert any("invoke-wrapperlogretentionprune" in line for line in unallowlisted)
+
+
+def test_evasion_python_os_lstat_is_still_caught() -> None:
+    """#113 review, round 9: `os.lstat(path)` answers the identical
+    question `path.lstat()` does but was invisible to round 7's
+    three-method-name AST walk."""
+    mutated = Path(wrapper_logs.__file__).read_text(encoding="utf-8").replace(
+        "def _prune_wrapper_log_generations(",
+        "def _wrapper_log_evasion_os_lstat(path):\n"
+        "    return os.lstat(path)\n\n\n"
+        "def _prune_wrapper_log_generations(",
+        1,
+    )
+    hits = _python_wrapper_log_primitive_hits(mutated)
+    assert ("_wrapper_log_evasion_os_lstat", "lstat") in hits
+
+
+def test_evasion_python_os_stat_is_still_caught() -> None:
+    """#113 review, round 9: `os.stat(path)` - the follow-symlinks sibling
+    of `os.lstat` - was equally invisible to round 7's three-method-name
+    AST walk."""
+    mutated = Path(wrapper_logs.__file__).read_text(encoding="utf-8").replace(
+        "def _prune_wrapper_log_generations(",
+        "def _wrapper_log_evasion_os_stat(path):\n"
+        "    return os.stat(path)\n\n\n"
+        "def _prune_wrapper_log_generations(",
+        1,
+    )
+    hits = _python_wrapper_log_primitive_hits(mutated)
+    assert ("_wrapper_log_evasion_os_stat", "stat") in hits
+
+
+def test_evasion_python_os_path_isdir_is_still_caught() -> None:
+    """#113 review, round 9: `os.path.isdir(path)` answers the identical
+    question `path.is_dir()` does, in the one Python idiom round 7's
+    named-method ban list did not enumerate at all."""
+    mutated = Path(wrapper_logs.__file__).read_text(encoding="utf-8").replace(
+        "def _prune_wrapper_log_generations(",
+        "def _wrapper_log_evasion_os_path_isdir(path):\n"
+        "    return os.path.isdir(path)\n\n\n"
+        "def _prune_wrapper_log_generations(",
+        1,
+    )
+    hits = _python_wrapper_log_primitive_hits(mutated)
+    assert ("_wrapper_log_evasion_os_path_isdir", "isdir") in hits
 
 
 def test_supervise_plan_never_probes_wrapper_log_filesystem(
@@ -1067,6 +1451,28 @@ def test_reparse_detection_uses_raw_windows_attributes_when_stat_disagrees(
     )
 
     assert wrapper_logs._is_reparse_or_symlink(target) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="exercises the real Win32 boundary")
+def test_windows_raw_file_attributes_native_boundary_raises_on_real_failure() -> None:
+    """#113 review, round 9, finding 3: the native call itself, not a
+    mock of it. GetFileAttributesW is documented to return an unsigned
+    DWORD, with INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) on failure - but an
+    undeclared ctypes foreign-function call defaults to a SIGNED
+    restype, so a real failure came back as -1, which the sentinel
+    comparison (against 4294967295) never matched. Every existing
+    caller still ended up fail-closed, but only because `-1 & <any bit>`
+    is truthy by accident of two's-complement representation, not
+    because the contract actually fired. This calls the REAL WinAPI
+    function against a genuinely nonexistent path (no OneDrive
+    placeholder needed for a plain lookup failure), with no mock of
+    _windows_raw_file_attributes itself, and asserts the documented
+    exception - not merely that some caller's bit test still happens to
+    come out truthy."""
+    nonexistent = Path(r"\\?\C:\agenttalk-113-round9-finding3-does-not-exist")
+
+    with pytest.raises(wrapper_logs._RawAttributeLookupFailed):
+        wrapper_logs._windows_raw_file_attributes(nonexistent)
 
 
 def test_reparse_attribute_check_is_exercised_without_symlink_privilege(

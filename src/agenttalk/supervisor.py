@@ -11730,9 +11730,22 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
     # untouched - the same "resolver correctly can't tell, caller
     # doesn't ask" shape as #15, one call site earlier, which #15's own
     # fix never reached.
-    $candidateAgentPresence = Test-WrapperLogDirectoryPresence $candidateAgentDir
+    #
+    # #113 review, round 9, finding 1: round 7's own fix checked presence
+    # BEFORE calling the resolver, then trusted that pre-check's answer
+    # to interpret a LATER null - two observations of the same path
+    # taken at different times, exactly the class round 5 already
+    # named. reviewer-1 injected the transition (absent at the pre-check,
+    # unusable by the time the resolver's own internal probe ran) and
+    # reproduced the same five-to-four deletion. The presence check now
+    # runs ONLY after the resolver has already returned null, as close
+    # to that decision as a second observation can get, rather than
+    # trusting a snapshot taken before the resolver did its own work. A
+    # scan that succeeded once does not stay true, and neither does one
+    # that failed once.
     $agentDir = Get-SafeWrapperLogAgentDir $candidate $name $false
     if ($null -eq $agentDir) {
+      $candidateAgentPresence = Test-WrapperLogDirectoryPresence $candidateAgentDir
       if ($candidateAgentPresence -ne 'absent') { $sequenceUncertain = $true }
       continue
     }

@@ -7150,6 +7150,124 @@ def test_ps_hidden_agent_dir_at_the_resolver_call_marks_prune_uncertain(
     )
 
 
+def test_ps_stale_presence_snapshot_taken_before_resolver_does_not_suppress_uncertainty(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 9, finding 1: round 7's own fix combined two
+    OBSERVATIONS of the same path taken at different times - a presence
+    check BEFORE calling the resolver, trusted to interpret a null the
+    resolver returns LATER. reviewer-1 injected exactly this transition:
+    the agent directory reads as genuinely absent at the moment of the
+    pre-check, then becomes access-denied by the time the resolver's own
+    internal probe runs. A pre-check that was correct when taken is
+    stale by the time it is used.
+
+    A single hidden root whose agent-directory path answers its FIRST
+    probe (whichever cmdlet asks first) as absent, and its SECOND and
+    every later probe as access-denied - modelling the real transition,
+    not just a permanently-hidden directory (that scenario is already
+    covered by the test above). Under the OLD ordering (presence check
+    first), the pre-check's Get-Item call is probe #1 and sees the
+    stale 'absent' answer; the resolver's Test-Path call is probe #2
+    and returns false either way (Test-Path cannot distinguish absent
+    from denied), so the pre-check's stale 'absent' verdict survives
+    unquestioned and $sequenceUncertain is never set. Under the FIXED
+    ordering (resolver first, presence check only after its null),
+    the resolver's Test-Path call is probe #1 (still just false), and
+    the presence check's Get-Item call is probe #2 - now landing AFTER
+    the transition, correctly observing 'unusable'. A GOOD root with
+    real over-quota generations must survive either way - the whole
+    cycle's view is incomplete, not just the hidden root's."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    good_root = tmp_path / "good"
+    hidden_root = tmp_path / "hidden"
+    good_agent_dir = good_root / agent_leaf
+    hidden_agent_dir = hidden_root / agent_leaf
+    generations = []
+    for sequence in range(1, sup.WRAPPER_LOG_GENERATIONS + 2):
+        generation = good_agent_dir / f"2026080{sequence}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+    hidden_agent_dir.mkdir(parents=True)
+
+    transition_shadow = [
+        f"$PoisonedTransitionPath = {_pslit(str(hidden_agent_dir))}",
+        "$TransitionProbeCount = 0",
+        "function Get-Item {",
+        "  [CmdletBinding()]",
+        "  param([Parameter(Mandatory=$true)][string]$LiteralPath, [switch]$Force)",
+        "  if ($LiteralPath -eq $PoisonedTransitionPath) {",
+        "    $script:TransitionProbeCount++",
+        "    if ($script:TransitionProbeCount -eq 1) {",
+        "      throw [System.Management.Automation.ItemNotFoundException]::new(",
+        "        \"simulated absent: $PoisonedTransitionPath\")",
+        "    }",
+        "    throw [System.UnauthorizedAccessException]::new(",
+        "      \"simulated access denied: $PoisonedTransitionPath\")",
+        "  }",
+        "  Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath "
+        "-Force:$Force -ErrorAction Stop",
+        "}",
+        "function Test-Path {",
+        "  [CmdletBinding()]",
+        "  param([string]$LiteralPath, [string]$PathType)",
+        "  if ($LiteralPath -eq $PoisonedTransitionPath) {",
+        "    $script:TransitionProbeCount++",
+        "    return $false",
+        "  }",
+        "  if ($PSBoundParameters.ContainsKey('PathType')) {",
+        "    return (Microsoft.PowerShell.Management\\Test-Path "
+        "-LiteralPath $LiteralPath -PathType $PathType)",
+        "  }",
+        "  return (Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath)",
+        "}",
+    ]
+
+    result_path = tmp_path / "ps-stale-presence.json"
+    script = tmp_path / "ps-stale-presence.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            *transition_shadow,
+            f"Invoke-WrapperLogRetentionPrune {_pslit(agent_leaf)} "
+            f"@({_pslit(str(good_root))}, {_pslit(str(hidden_root))}) $false",
+            "@{ survivorCount = @("
+            "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath "
+            f"{_pslit(str(good_agent_dir))} -Directory "
+            "-ErrorAction SilentlyContinue).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["survivorCount"] == len(generations), (
+        "the presence check's answer was taken before the resolver's own "
+        "call observed a DIFFERENT, later state for the same path - a "
+        "stale snapshot suppressed uncertainty instead of a fresh "
+        "observation taken after the resolver's null"
+    )
+
+
 def test_ps_uncertain_bound_check_uses_observed_count_not_owned_count(
     tmp_path: Path,
 ) -> None:
