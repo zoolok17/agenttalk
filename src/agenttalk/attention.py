@@ -805,6 +805,8 @@ def process_tree_hold_items(
     supervisor_config: dict | None = None,
     root: str | Path | None = None,
     restart_requests: dict[str, dict] | None = None,
+    launch_requests: dict[str, dict] | None = None,
+    lane_workspaces: dict[str, str] | None = None,
     reset_admissions: dict | None = None,
 ) -> list[dict]:
     """Project strict supervisor process-tree HOLDs into global human attention.
@@ -914,6 +916,16 @@ def process_tree_hold_items(
             supervisor_config,
             agent,
             root=root,
+            request_id=request_id,
+            request_entry=(row if request_id is not None else None),
+            request_marker=(
+                launch_requests.get(request_id)
+                if request_id is not None
+                and isinstance(launch_requests, dict)
+                and isinstance(launch_requests.get(request_id), dict)
+                else None
+            ),
+            lane_workspaces=lane_workspaces,
         )
         marker = (
             restart_requests.get(agent)
@@ -1089,7 +1101,7 @@ def process_tree_hold_items(
         else:
             recommendation += (
                 " The configured detached launch could not be established from "
-                f"supervisor.json: {launch_problem}."
+                f"durable supervisor evidence: {launch_problem}."
             )
         it = _mk_item(
             SOURCE_PROCESS_TREE_HOLD,

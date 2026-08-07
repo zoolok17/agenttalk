@@ -1037,9 +1037,11 @@ def test_ephemeral_cap_exceeded_holds_archive_and_escalates_attention() -> None:
 
 def _write_attended_ephemeral_hold_fixture(
     store: Store,
+    *,
+    request_id: str = "lr-attended",
+    agent: str | None = None,
 ) -> tuple[str, str, str]:
-    request_id = "lr-attended"
-    agent = "adversary-lr-attended"
+    agent = agent or f"adversary-{request_id}"
     wrapper_start = "1970-01-01T00:10:00Z"
     marker = _marker(
         request_id,
@@ -1052,12 +1054,15 @@ def _write_attended_ephemeral_hold_fixture(
         recipient=agent,
         kind="review-request",
         subject=f"ephemeral review {request_id}",
-        body="review the change adversarially",
+        body=eph.review_request_body(marker, agent),
         meta={
             "request_id": request_id,
             "ephemeral_request_id": request_id,
             "evidence_only": "true",
             "counted_signoff": "false",
+            "profile": marker["profile"],
+            "skill": marker["skill"],
+            "revision": marker["scope"]["revision"],
         },
     )
     marker["review_request_msg_id"] = review_request.id
@@ -1136,6 +1141,27 @@ def _write_attended_ephemeral_hold_fixture(
     writer.idle()
     item = att.process_tree_hold_items(state)[0]
     return request_id, agent, item["source_hash"]
+
+
+def _make_preupgrade_pruned_allocation_fixture(
+    store: Store,
+    state: dict,
+    request_id: str,
+) -> None:
+    """Model an active request whose old 24h retention pruned its row."""
+    marker = store.read_launch_request(request_id)
+    assert marker is not None
+    updated = store.update_launch_request(request_id, {
+        "claimed_by": "supervisor",
+        "claimed_at_epoch": NOW,
+        "requested_at_epoch": NOW,
+    })
+    assert updated is not None
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    entry["profile"] = marker["profile"]
+    entry["prepared_epoch"] = NOW
+    state["ephemeral_reviewers"]["launch_history"] = []
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
 
 
 def _write_misbound_agent_ephemeral_hold_fixture(
@@ -1357,6 +1383,183 @@ def test_ephemeral_archive_requires_validated_review_request_evidence(
     assert agent not in store.retired_agents()
 
 
+@pytest.mark.parametrize(
+    ("request_id", "agent"),
+    [
+        ("lr-0123456789ab", "adversary-lr-0123456789ab"),
+        ("operator-review", "adversary-operator-review"),
+        ("lr-abcdef012345", "adversary-lr-abcdef012345-2"),
+    ],
+    ids=["generated-id", "explicit-id", "later-agent-ordinal"],
+)
+def test_preupgrade_pruned_allocation_can_finish_terminal_archive(
+    tmp_path: Path,
+    request_id: str,
+    agent: str,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, _source_hash = _write_attended_ephemeral_hold_fixture(
+        store,
+        request_id=request_id,
+        agent=agent,
+    )
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    _make_preupgrade_pruned_allocation_fixture(store, state, request_id)
+
+    sup.archive_ephemeral_request(
+        store,
+        state,
+        request_id,
+        terminal_state=eph.STATE_TIMED_OUT,
+        reason="timed out",
+        now_epoch=NOW,
+    )
+
+    assert request_id not in state["ephemeral_reviewers"]["active"]
+    assert store.read_launch_request(request_id) is None
+    assert agent not in store.load_config()["agents"]
+    assert agent in store.retired_agents()
+
+
+def test_preupgrade_pruned_allocation_can_finish_attended_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, _source_hash = _write_attended_ephemeral_hold_fixture(
+        store,
+        request_id="lr-0123456789ab",
+    )
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    _make_preupgrade_pruned_allocation_fixture(store, state, request_id)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    monkeypatch.setattr(cli, "_owner_identity_gone", lambda _pid, _start: True)
+    monkeypatch.setattr(cli.time, "time", lambda: NOW)
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+    rc = cli.main(item["operator_argv"][1:])
+
+    assert rc == 0
+    persisted = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    assert request_id not in persisted["ephemeral_reviewers"]["active"]
+    assert store.read_launch_request(request_id) is None
+    assert agent not in store.load_config()["agents"]
+    assert agent in store.retired_agents()
+
+
+@pytest.mark.parametrize(
+    "break_evidence",
+    [
+        lambda _store, state, rid: state["ephemeral_reviewers"].update({
+            "launch_history": [{"request_id": rid}],
+        }),
+        lambda _store, state, rid: state["ephemeral_reviewers"]["active"][rid].update({
+            "prepared_epoch": NOW + 1,
+        }),
+        lambda _store, state, rid: state["ephemeral_reviewers"]["active"][rid].update({
+            "prepared_epoch": 10 ** 400,
+        }),
+        lambda store, _state, rid: store.update_launch_request(
+            rid, {"claimed_by": "other"},
+        ),
+        lambda store, _state, rid: store.update_launch_request(
+            rid, {"profile": "other-profile"},
+        ),
+        lambda _store, state, rid: state["ephemeral_reviewers"]["active"][rid].update({
+            "identity_binding_version": 1,
+        }),
+        lambda _store, state, rid: state["ephemeral_reviewers"]["active"][rid].update({
+            "identity_binding_version": None,
+        }),
+        lambda _store, state, rid: state["ephemeral_reviewers"].update({
+            "launch_history": [{
+                "request_id": "lr-other",
+                "agent": state["ephemeral_reviewers"]["active"][rid]["agent"],
+                "at_epoch": NOW,
+            }],
+        }),
+    ],
+    ids=[
+        "malformed-history",
+        "epoch-mismatch",
+        "unbounded-epoch",
+        "wrong-claimer",
+        "profile-mismatch",
+        "new-binding-version",
+        "malformed-binding-version",
+        "conflicting-allocation",
+    ],
+)
+def test_preupgrade_pruned_allocation_fallback_requires_closed_exact_evidence(
+    tmp_path: Path,
+    break_evidence,
+) -> None:
+    store = _store(tmp_path)
+    request_id, _agent, _source_hash = _write_attended_ephemeral_hold_fixture(
+        store,
+        request_id="lr-0123456789ab",
+    )
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    _make_preupgrade_pruned_allocation_fixture(store, state, request_id)
+    break_evidence(store, state, request_id)
+
+    marker = store.read_launch_request(request_id)
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    assert not sup._ephemeral_request_identity_matches(  # noqa: SLF001
+        store,
+        state,
+        entry,
+        marker,
+        request_id,
+    )
+
+
+@pytest.mark.parametrize("binding_version", [None, False, True, 1.0, 2, "1"])
+def test_ephemeral_archive_rejects_unknown_identity_binding_version(
+    tmp_path: Path,
+    binding_version: object,
+) -> None:
+    store = _store(tmp_path)
+    request_id, _agent, _source_hash = _write_attended_ephemeral_hold_fixture(store)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    entry["identity_binding_version"] = binding_version
+
+    assert not sup._ephemeral_request_identity_matches(  # noqa: SLF001
+        store,
+        state,
+        entry,
+        store.read_launch_request(request_id),
+        request_id,
+    )
+
+
+def test_attention_marker_loader_distinguishes_corrupt_from_archived(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    _stage_ephemeral_archive_retry(
+        store,
+        state,
+        request_id,
+        agent,
+        source_hash,
+        verification_mode="operator_attested",
+        verified_launch_nonce=None,
+    )
+    marker_path = store.launch_requests_dir / f"{request_id}.json"
+    original = store.read_launch_request(request_id)
+    assert original is not None
+
+    marker_path.write_text("{corrupt", encoding="utf-8")
+    assert request_id not in sup.active_ephemeral_launch_markers(store, state)
+
+    marker_path.unlink()
+    assert sup.active_ephemeral_launch_markers(store, state)[request_id] == original
+
+
 def _current_ephemeral_reset_item(
     store: Store,
     state: dict,
@@ -1376,6 +1579,8 @@ def _current_ephemeral_reset_item(
             state,
             supervisor_config=cli._load_supervisor_config(store),  # noqa: SLF001
             root=store.root,
+            launch_requests=sup.active_ephemeral_launch_markers(store, state),
+            lane_workspaces=sup.active_ephemeral_lane_workspaces(store),
             reset_admissions=admissions,
         )
         if item["item_id"] == f"process_tree_hold:ephemeral:{request_id}"

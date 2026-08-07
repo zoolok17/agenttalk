@@ -4347,7 +4347,11 @@ def _configured_wrap_binding(
         argument = tokens[index]
         if argument == "--":
             tail_found = True
-            tail_has_command = index + 1 < len(tokens) and bool(tokens[index + 1])
+            tail_has_command = (
+                index + 1 < len(tokens)
+                and bool(tokens[index + 1])
+                and not tokens[index + 1].startswith("-")
+            )
             break
         if argument in _WRAP_VALUE_OPTIONS:
             if index + 1 >= len(tokens):
@@ -4377,13 +4381,18 @@ def configured_detached_launch(
     agent: str,
     *,
     root: str | Path | None,
+    request_id: str | None = None,
+    request_entry: dict | None = None,
+    request_marker: dict | None = None,
+    lane_workspaces: dict[str, str] | None = None,
 ) -> tuple[dict | None, str]:
     """Return one bounded, normalized configured launch argv for display.
 
-    This is recovery information, never launch authority.  Dynamic session
-    splices cannot be reconstructed truthfully from static configuration and
-    therefore fail closed.  The returned environment metadata calls out the
-    supervisor-owned context that an attended detached launch must reproduce.
+    This is recovery information, never launch authority.  Regular agents are
+    reconstructed from static configuration; active ephemeral agents also
+    require their exact durable request entry and marker.  The returned
+    environment metadata calls out the supervisor-owned context that an
+    attended detached launch must reproduce.
     """
     max_args = 256
     max_token = 4096
@@ -4404,10 +4413,75 @@ def configured_detached_launch(
 
     if not isinstance(supervisor_config, dict):
         return None, "supervisor.json was unavailable"
-    agents = supervisor_config.get("agents")
-    row = agents.get(agent) if isinstance(agents, dict) else None
-    if not isinstance(row, dict):
-        return None, "the agent has no supervisor.json launch entry"
+    if request_id is None:
+        agents = supervisor_config.get("agents")
+        row = agents.get(agent) if isinstance(agents, dict) else None
+        if not isinstance(row, dict):
+            return None, "the agent has no supervisor.json launch entry"
+    else:
+        if not isinstance(request_entry, dict):
+            return None, "the active ephemeral request entry was unavailable"
+        if not isinstance(request_marker, dict):
+            return None, "the active ephemeral request marker was unavailable"
+        profile_name = request_entry.get("profile")
+        marker_lane = request_marker.get("lane_id")
+        marker_workspace = request_marker.get("workspace_path")
+        marker_scope = request_marker.get("scope")
+        scope_lane = (
+            marker_scope.get("lane_id")
+            if isinstance(marker_scope, dict)
+            else None
+        )
+        if (
+            not eph.is_safe_id(request_id)
+            or request_entry.get("request_id") != request_id
+            or request_marker.get("request_id") != request_id
+            or request_entry.get("agent") != agent
+            or request_marker.get("agent") != agent
+            or request_entry.get("requested_by")
+            != request_marker.get("requested_by")
+            or request_entry.get("review_request_id")
+            != request_marker.get("review_request_msg_id")
+            or not isinstance(profile_name, str)
+            or request_marker.get("profile") != profile_name
+            or request_marker.get("state") not in eph.ACTIVE_STATES
+            or bool(eph.validate_marker(request_marker))
+        ):
+            return None, "the active ephemeral request launch binding is invalid"
+        if marker_lane is None:
+            if marker_workspace is not None or scope_lane is not None:
+                return None, "the active ephemeral request launch binding is invalid"
+        else:
+            if (
+                scope_lane != marker_lane
+                or clean(marker_workspace) is None
+                or not marker_workspace.strip()
+                or not Path(marker_workspace).is_absolute()
+            ):
+                return None, "the active ephemeral request launch binding is invalid"
+            if lane_workspaces is None:
+                return None, "the active ephemeral lane registry was unavailable"
+            if lane_workspaces.get(marker_lane) != marker_workspace:
+                return None, "the active ephemeral lane workspace no longer matches"
+        profile = eph.profile_config(
+            eph.config_block(supervisor_config),
+            profile_name,
+        )
+        if profile is None:
+            return None, "the active ephemeral request profile is unavailable"
+        profile_cli = (
+            profile.get("cli")
+            if isinstance(profile.get("cli"), str) and profile.get("cli")
+            else "codex"
+        )
+        if (
+            request_entry.get("cli") != profile_cli
+            or not isinstance(request_entry.get("launch"), dict)
+            or request_entry.get("launch") != profile.get("launch")
+        ):
+            return None, "the active ephemeral request profile no longer matches"
+        row = eph.launch_spec(request_marker, profile, agent)
+        row["wrapped"] = True
     launch = row.get("launch")
     if not isinstance(launch, dict):
         return None, "the agent's supervisor.json launch entry is invalid"
@@ -4466,6 +4540,21 @@ def configured_detached_launch(
         or (dispatches_wrap and wrapped_agent != agent)
     ):
         return None, "the configured wrapped launch is not bound to this agent"
+    if dispatches_wrap and row.get("cli") == "codex":
+        tail_index = args.index("--")
+        child_args = args[tail_index + 2:]
+        for index, argument in enumerate(child_args):
+            if argument == "--add-dir":
+                if (
+                    index + 1 >= len(child_args)
+                    or not child_args[index + 1]
+                    or child_args[index + 1].startswith("-")
+                ):
+                    return None, "the configured Codex workspace arguments are invalid"
+            elif argument.startswith("--add-dir="):
+                value = argument.partition("=")[2]
+                if not value or value.startswith("-"):
+                    return None, "the configured Codex workspace arguments are invalid"
     rendered = subprocess.list2cmdline([executable, *args])
     rendered_utf16_units = len(rendered.encode("utf-16-le")) // 2 + 1
     if rendered_utf16_units > max_command_line:
@@ -4510,6 +4599,98 @@ def configured_detached_launch(
             "and the supervisor may also supply an isolated CODEX_HOME and wrapper-log paths."
         ),
     }, ""
+
+
+def active_ephemeral_launch_markers(
+    store: Store,
+    state: dict,
+    *,
+    limit: int = 1024,
+) -> dict[str, dict]:
+    """Read bounded active request markers for the Attention projection.
+
+    Missing, unreadable, or malformed marker files are omitted deliberately:
+    the HOLD remains visible and its configured launch becomes unavailable.
+    """
+    root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    active = root.get("active") if isinstance(root, dict) else None
+    if not isinstance(active, dict):
+        return {}
+    markers: dict[str, dict] = {}
+    request_ids = sorted(
+        request_id for request_id in active if eph.is_safe_id(request_id)
+    )[:limit]
+    for request_id in request_ids:
+        try:
+            marker = store.read_launch_request(request_id)
+        except (OSError, TypeError, ValueError):
+            marker = None
+        if not isinstance(marker, dict):
+            active_path = store.launch_requests_dir / f"{request_id}.json"
+            try:
+                active_path.lstat()
+            except FileNotFoundError:
+                live_marker_absent = True
+            except OSError:
+                live_marker_absent = False
+            else:
+                live_marker_absent = False
+            if live_marker_absent:
+                try:
+                    pending = attended_ephemeral_archive_pending(
+                        state,
+                        request_id,
+                    )
+                except (TypeError, ValueError):
+                    pending = None
+                payload = (
+                    pending.get("archive_payload")
+                    if isinstance(pending, dict)
+                    else None
+                )
+                original = (
+                    payload.get("original")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                marker = original if isinstance(original, dict) else None
+        if isinstance(marker, dict):
+            markers[request_id] = copy.deepcopy(marker)
+    return markers
+
+
+def active_ephemeral_lane_workspaces(store: Store) -> dict[str, str] | None:
+    """Return exact active lane-to-workspace bindings, or unavailable."""
+    try:
+        data = lane_mod.load_lanes(store)
+    except (OSError, TypeError, ValueError, lane_mod.LaneError):
+        return None
+    lanes = data.get("lanes") if isinstance(data, dict) else None
+    if not isinstance(lanes, dict):
+        return None
+    workspaces: dict[str, str] = {}
+    for raw_lane_id, row in lanes.items():
+        if not isinstance(row, dict) or row.get("status") != lane_mod.STATUS_ACTIVE:
+            continue
+        try:
+            lane_id = lane_mod.validate_lane_id(raw_lane_id)
+        except (TypeError, ValueError, lane_mod.LaneError):
+            continue
+        raw_path = row.get("worktree_path")
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or len(raw_path) > 4096
+            or any(
+                ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
+                for char in raw_path
+            )
+        ):
+            continue
+        workspace = Path(raw_path)
+        if workspace.is_absolute():
+            workspaces[lane_id] = str(workspace)
+    return workspaces
 
 
 def _agenttalk_argv(command_line: object, module_args_from: object = None) -> list[str] | None:
@@ -9624,17 +9805,6 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
         ),
     )
     spec = eph.launch_spec(marker, profile, agent)
-    if workspace_path:
-        spec["lane_id"] = lane_id
-        spec["workspace_path"] = workspace_path
-        spec["cwd"] = workspace_path
-        if spec.get("cli") == "codex":
-            launch = spec.setdefault("launch", {})
-            args = list(launch.get("windows_args") or [])
-            if not any(args[i] == "--add-dir" and i + 1 < len(args)
-                       and str(args[i + 1]) == workspace_path for i in range(len(args))):
-                args = ["--add-dir", workspace_path, *args]
-            launch["windows_args"] = args
     window_style, warning = resolve_window_style(config, profile)
     spec["window_style"] = window_style
     spec["window_style_warning"] = warning
@@ -9837,6 +10007,65 @@ def _active_ephemeral_hold_matches_archive(
     )
 
 
+def _valid_ephemeral_identity_epoch(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        epoch = float(value)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(epoch) and 0 <= epoch <= 253_402_300_799
+
+
+def _valid_ephemeral_allocation_history(history: list) -> bool:
+    """Return whether every persisted allocation row has a closed shape."""
+    for row in history:
+        if not isinstance(row, dict):
+            return False
+        epoch = row.get("at_epoch")
+        try:
+            validate_agent_name(row.get("agent"))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not eph.is_safe_id(row.get("request_id"))
+            or not _valid_ephemeral_identity_epoch(epoch)
+        ):
+            return False
+    return True
+
+
+def _legacy_pruned_ephemeral_allocation_matches(
+    entry: dict,
+    marker: dict,
+    request_id: str,
+) -> bool:
+    """Recognize only unambiguous pre-version allocation evidence.
+
+    Older releases could prune a still-active request's history row after 24
+    hours.  Require the exact agent shape that the request allocator could
+    have minted; the marker, entry, and original review request then supply
+    the remaining independent durable bindings.
+    """
+    if "identity_binding_version" in entry:
+        return False
+    agent = entry.get("agent")
+    if (
+        not eph.agent_name_matches_request(request_id, agent)
+        or marker.get("claimed_by") != "supervisor"
+        or entry.get("profile") != marker.get("profile")
+    ):
+        return False
+    epochs = (
+        entry.get("prepared_epoch"),
+        marker.get("claimed_at_epoch"),
+        marker.get("requested_at_epoch"),
+    )
+    if not all(_valid_ephemeral_identity_epoch(epoch) for epoch in epochs):
+        return False
+    return float(epochs[0]) == float(epochs[1]) == float(epochs[2])
+
+
 def _ephemeral_request_identity_matches(
     store: Store,
     state: dict,
@@ -9866,21 +10095,26 @@ def _ephemeral_request_identity_matches(
         and isinstance(history, list)
     ):
         return False
-    allocation_rows = [
-        row
-        for row in history
-        if isinstance(row, dict) and row.get("agent") == agent
-    ]
-    if not (
+    if not _valid_ephemeral_allocation_history(history):
+        return False
+    binding_version_present = "identity_binding_version" in entry
+    binding_version = entry.get("identity_binding_version")
+    if (
+        binding_version_present
+        and (type(binding_version) is not int or binding_version != 1)
+    ):
+        return False
+    allocation_rows = [row for row in history if row.get("agent") == agent]
+    legacy_pruned = not binding_version_present and not allocation_rows and (
+        _legacy_pruned_ephemeral_allocation_matches(
+            entry,
+            marker,
+            request_id,
+        )
+    )
+    if not legacy_pruned and not (
         allocation_rows
         and all(row.get("request_id") == request_id for row in allocation_rows)
-        and any(
-            isinstance(row.get("at_epoch"), (int, float))
-            and not isinstance(row.get("at_epoch"), bool)
-            and math.isfinite(float(row["at_epoch"]))
-            and float(row["at_epoch"]) >= 0
-            for row in allocation_rows
-        )
     ):
         return False
     try:
@@ -9896,6 +10130,17 @@ def _ephemeral_request_identity_matches(
         and message.meta.get("ephemeral_request_id") == request_id
         and message.meta.get("evidence_only") == "true"
         and message.meta.get("counted_signoff") == "false"
+        and (
+            not legacy_pruned
+            or (
+                message.subject == f"ephemeral review {request_id}"
+                and message.body == eph.review_request_body(marker, agent)
+                and message.meta.get("profile") == marker.get("profile")
+                and message.meta.get("skill") == marker.get("skill")
+                and message.meta.get("revision")
+                == (marker.get("scope") or {}).get("revision")
+            )
+        )
         for message in messages
     )
 
@@ -11442,7 +11687,8 @@ function Test-AgenttalkWrapAgentBinding($file, [object[]]$argTokens, [string]$ex
     $token = [string]$tokens[$index]
     if ($token -ceq '--') {
       $tailFound = $true
-      $tailHasCommand = (($index + 1) -lt $tokens.Count -and [bool]([string]$tokens[$index + 1]))
+      $tailCommand = if (($index + 1) -lt $tokens.Count) { [string]$tokens[$index + 1] } else { '' }
+      $tailHasCommand = ([bool]$tailCommand -and $tailCommand -cnotlike '-*')
       break
     }
     if ($token -cin $valueOptions) {

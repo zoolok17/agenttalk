@@ -8,7 +8,10 @@ import json
 import pytest
 
 from agenttalk import cli
+from agenttalk import ephemeral as eph
+from agenttalk import lanes as lane_mod
 from agenttalk import supervisor as supervisor_mod
+from agenttalk import web as web_mod
 from agenttalk.store import Store
 
 
@@ -820,3 +823,125 @@ def test_attention_collector_fail_closed_for_each_field_refusal_reason(
     assert "no scripted remedy applies in this state" in hold["recommendation"]
     assert "operator_argv" not in hold
     assert "operator_command" not in hold
+
+
+def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    request_id = "lr-0123456789ab"
+    agent = f"adversary-{request_id}"
+    workspace = str(tmp_path / "ephemeral lane")
+    lane_mod.save_lanes(s, {
+        "schema_version": lane_mod.SCHEMA_VERSION,
+        "lanes": {
+            "review-lane": {
+                "status": lane_mod.STATUS_ACTIVE,
+                "worktree_path": workspace,
+            },
+        },
+    })
+    launch = {
+        "windows_file": "python.exe",
+        "windows_args": [
+            "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for",
+            "{AGENT}", "--cli", "codex", "--loop", "--one-shot",
+            "--to-request", "{REQUEST_ID}", "--", "codex.exe",
+        ],
+    }
+    (s.dir / "supervisor.json").write_text(
+        json.dumps({
+            "agents": {},
+            "ephemeral_reviewers": {
+                "enabled": True,
+                "allowed_profiles": {
+                    "codex-evidence-reviewer": {
+                        "cli": "codex",
+                        "cwd": str(tmp_path),
+                        "launch": launch,
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    marker = {
+        "schema_version": eph.SCHEMA_VERSION,
+        "kind": eph.REQUEST_KIND,
+        "request_id": request_id,
+        "state": eph.STATE_LAUNCHED,
+        "requested_by": "claude",
+        "profile": "codex-evidence-reviewer",
+        "skill": "review-code",
+        "prompt": "review the diff",
+        "scope": {"revision": "a" * 40, "paths": ["src"]},
+        "agent": agent,
+        "review_request_msg_id": "msg-review",
+        "lane_id": "review-lane",
+        "workspace_path": workspace,
+    }
+    marker["scope"]["lane_id"] = "review-lane"
+    s.write_launch_request(marker)
+    supervisor_mod.save_supervisor_state(
+        s.dir / "supervisor-state.json",
+        {
+            "ephemeral_reviewers": {
+                "active": {
+                    request_id: {
+                        "request_id": request_id,
+                        "agent": agent,
+                        "requested_by": "claude",
+                        "review_request_id": "msg-review",
+                        "profile": "codex-evidence-reviewer",
+                        "cli": "codex",
+                        "launch": launch,
+                        "process_tree_hold_reason": (
+                            "process_tree_invalid_wrapper_state_mismatch"
+                        ),
+                        "owned_process_tree": {
+                            "status": "invalid",
+                            "reason_code": (
+                                "process_tree_invalid_wrapper_state_mismatch"
+                            ),
+                            "observed_count": 1,
+                            "limit": 64,
+                            "entries": [],
+                        },
+                    },
+                },
+                "launch_history": [],
+            },
+        },
+    )
+
+    cli_item = next(
+        item
+        for item in cli._collect_attention_items(  # noqa: SLF001
+            s,
+            for_agent="claude",
+            roster=["beta", "claude"],
+        )
+        if item["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+    web_item = next(
+        item
+        for item in web_mod._collect_web_attention_items(  # noqa: SLF001
+            s,
+            ["beta", "claude"],
+            "claude",
+        )
+        if item["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+
+    assert cli_item["configured_launch"] == web_item["configured_launch"]
+    assert cli_item["configured_launch"]["cwd"] == workspace
+    argv = cli_item["configured_launch"]["argv"]
+    assert argv[argv.index("--for") + 1] == agent
+    assert argv[argv.index("--to-request") + 1] == request_id
+    tail_index = argv.index("--")
+    assert argv[tail_index - 2:tail_index] == ["--lane-id", "review-lane"]
+    assert argv[tail_index + 1:tail_index + 4] == [
+        "codex.exe",
+        "--add-dir",
+        workspace,
+    ]

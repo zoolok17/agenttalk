@@ -482,7 +482,7 @@ def launch_spec(marker: dict, profile: dict, agent: str) -> dict:
     env = _as_dict(profile.get("env"))
     env = {str(k): str(sub(v)) for k, v in env.items() if isinstance(k, str)}
     env.setdefault("AGENTTALK_SELF", agent)
-    return {
+    spec = {
         "request_id": request_id,
         "agent": agent,
         "profile": marker.get("profile"),
@@ -507,6 +507,89 @@ def launch_spec(marker: dict, profile: dict, agent: str) -> dict:
         "lane_id": marker.get("lane_id"),
         "workspace_path": marker.get("workspace_path"),
     }
+    workspace_path = marker.get("workspace_path")
+    launch_spec = spec["launch"]
+    launch_args = list(launch_spec.get("windows_args") or [])
+    try:
+        tail_index = launch_args.index("--")
+    except ValueError:
+        tail_index = -1
+    lane_id = marker.get("lane_id")
+    if tail_index >= 0:
+        bindings = [
+            ("--for", agent),
+            ("--cli", spec["cli"]),
+            ("--to-request", request_id),
+        ]
+        if isinstance(lane_id, str) and lane_id:
+            bindings.append(("--lane-id", lane_id))
+        binding_options = {"--for", "--cli", "--to-request", "--lane-id"}
+        binding_prefixes = tuple(f"{option}=" for option in binding_options)
+        wrapper_args: list[str] = []
+        index = 0
+        while index < tail_index:
+            argument = launch_args[index]
+            if isinstance(argument, str) and argument in binding_options:
+                index += 1
+                if (
+                    index < tail_index
+                    and isinstance(launch_args[index], str)
+                    and launch_args[index]
+                    and not launch_args[index].startswith("-")
+                ):
+                    index += 1
+                continue
+            if isinstance(argument, str) and argument.startswith(binding_prefixes):
+                index += 1
+                continue
+            wrapper_args.append(argument)
+            index += 1
+        canonical_bindings = [
+            token
+            for option, value in bindings
+            for token in (option, value)
+        ]
+        launch_args = [
+            *wrapper_args,
+            *canonical_bindings,
+            *launch_args[tail_index:],
+        ]
+        tail_index = len(wrapper_args) + len(canonical_bindings)
+    if isinstance(workspace_path, str) and workspace_path:
+        spec["cwd"] = workspace_path
+        if (
+            spec["cli"] == "codex"
+            and tail_index >= 0
+            and tail_index + 1 < len(launch_args)
+        ):
+            child_args_start = tail_index + 2
+            child_args: list[object] = []
+            index = child_args_start
+            while index < len(launch_args):
+                argument = launch_args[index]
+                if argument == "--add-dir":
+                    index += 1
+                    if (
+                        index < len(launch_args)
+                        and isinstance(launch_args[index], str)
+                        and launch_args[index]
+                        and not launch_args[index].startswith("-")
+                    ):
+                        index += 1
+                    continue
+                if isinstance(argument, str) and argument.startswith("--add-dir="):
+                    index += 1
+                    continue
+                child_args.append(argument)
+                index += 1
+            launch_args = [
+                *launch_args[:child_args_start],
+                "--add-dir",
+                workspace_path,
+                *child_args,
+            ]
+    launch_spec["windows_args"] = launch_args
+    return spec
 
 
 def classify_review_result(messages: list, *, request_id: str, agent: str, requester: str) -> dict:
@@ -620,6 +703,9 @@ def record_prepared(state: dict, *, request_id: str, agent: str, requested_by: s
         "timeout_seconds": int(timeout_seconds),
         "deadline_epoch": now_epoch + int(timeout_seconds),
         "review_request_id": review_request_id,
+        # Version the allocation proof so a compatibility path for request
+        # rows pruned by older releases can never weaken newly prepared work.
+        "identity_binding_version": 1,
         "auto_restart": False,
     }
     active_request_ids = set(root["active"])

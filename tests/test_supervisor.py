@@ -7583,6 +7583,7 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "'AGENTTALK_WRAPPER_LOG_NONCE')",
         "    stdout_capability = [Environment]::GetEnvironmentVariable("
         "'AGENTTALK_WRAPPER_STDOUT_LOG')",
+        "    has_argument_list = $startArgs.ContainsKey('ArgumentList')",
         "    argument_line = [string]$startArgs.ArgumentList",
         "  }",
         "  return [pscustomobject]@{ "
@@ -7605,6 +7606,53 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "      windows_args = @($argv)",
         "      module_args_from = $moduleArgsFrom",
         "    }",
+        "  }",
+        "  $script:cfg = [pscustomobject]@{",
+        "    agents = [pscustomobject]@{ worker = $agent }",
+        "  }",
+        "  $plan = [pscustomobject]@{",
+        "    launch_mode = $mode",
+        "    window_style = 'Hidden'",
+        "    window_style_warning = $null",
+        "    session_id = $null",
+        "    session_args = @()",
+        "  }",
+        "  $null = Launch 'worker' $plan $null",
+        "}",
+        "function Invoke-RegularArgBoundaryCase([string]$label, [string]$shape) {",
+        "  $script:caseName = $label",
+        "  $launch = [pscustomobject]@{",
+        "    windows_file = 'dummy.exe'",
+        "    module_args_from = $null",
+        "  }",
+        "  $wrapped = $false",
+        "  $mode = 'fresh'",
+        "  if ($shape -eq 'absent') {",
+        "    $wrapped = $true",
+        "    $mode = 'wrap'",
+        "  } elseif ($shape -eq 'malformed') {",
+        "    $wrapped = $true",
+        "    $mode = 'wrap'",
+        "    $launch | Add-Member -NotePropertyName windows_args "
+        "-NotePropertyValue 'not-an-array'",
+        "  } elseif ($shape -eq 'valid-empty') {",
+        "    $launch | Add-Member -NotePropertyName windows_args "
+        "-NotePropertyValue @()",
+        "  } elseif ($shape -eq 'one') {",
+        "    $launch | Add-Member -NotePropertyName windows_args "
+        "-NotePropertyValue @('alpha')",
+        "  } elseif ($shape -eq 'many') {",
+        "    $launch | Add-Member -NotePropertyName windows_args "
+        "-NotePropertyValue @('alpha','beta')",
+        "  } else {",
+        "    throw ('unknown boundary shape: ' + $shape)",
+        "  }",
+        "  $agent = [pscustomobject]@{",
+        "    backend_profile = $null",
+        "    wrapped = $wrapped",
+        "    cwd = $Root",
+        "    env = $null",
+        "    launch = $launch",
         "  }",
         "  $script:cfg = [pscustomobject]@{",
         "    agents = [pscustomobject]@{ worker = $agent }",
@@ -7682,8 +7730,16 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "@('-m','agenttalk','wrap','--for','other','--','codex.exe') $false 'wrap'",
         "Invoke-RegularCase 'regular_manual_literal_wrap' 'codex.exe' "
         "@('--mode','wrap','--literal') $false 'fresh'",
+        "Invoke-RegularCase 'regular_manual_no_args' 'dummy.exe' @() $false 'fresh'",
+        "Invoke-RegularArgBoundaryCase 'args_absent' 'absent'",
+        "Invoke-RegularArgBoundaryCase 'args_malformed' 'malformed'",
+        "Invoke-RegularArgBoundaryCase 'args_valid_empty' 'valid-empty'",
+        "Invoke-RegularArgBoundaryCase 'args_one' 'one'",
+        "Invoke-RegularArgBoundaryCase 'args_many' 'many'",
         "Invoke-RegularCase 'regular_empty_cli_tail' 'python.exe' "
         "@('-m','agenttalk','wrap','--for','worker','--') $true 'wrap'",
+        "Invoke-RegularCase 'regular_option_cli_tail' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','worker','--','--bad') $true 'wrap'",
         "Invoke-RegularCase 'regular_positional_before_tail' 'python.exe' "
         "@('-m','agenttalk','wrap','codex.exe','--for','worker','--','codex.exe') $true 'wrap'",
         "Invoke-RegularCase 'regular_option_as_value' 'python.exe' "
@@ -7708,6 +7764,8 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "@('-m','agenttalk','wrap','codex.exe','--for','reviewer')",
         "Invoke-EphemeralCase 'ephemeral_empty_cli_tail' 'python.exe' "
         "@('-m','agenttalk','wrap','--for','reviewer','--')",
+        "Invoke-EphemeralCase 'ephemeral_option_cli_tail' 'python.exe' "
+        "@('-m','agenttalk','wrap','--for','reviewer','--','--bad')",
         "Invoke-EphemeralCase 'ephemeral_positional_before_tail' 'python.exe' "
         "@('-m','agenttalk','wrap','codex.exe','--for','reviewer','--','codex.exe')",
         "Invoke-EphemeralCase 'ephemeral_option_as_value' 'python.exe' "
@@ -7772,6 +7830,10 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "regular_not_wrap_mode",
         "regular_wrong_root",
         "regular_manual_literal_wrap",
+        "regular_manual_no_args",
+        "args_valid_empty",
+        "args_one",
+        "args_many",
         "ephemeral_python_wrap",
         "ephemeral_console_wrap",
         "ephemeral_wrong_root",
@@ -7787,6 +7849,17 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
             assert r"D:\other" not in row["argument_line"], row
         if row["name"] == "regular_manual_literal_wrap":
             assert row["argument_line"] == "--mode wrap --literal"
+        if row["name"] == "regular_manual_no_args":
+            assert row["argument_line"] == ""
+            assert row["has_argument_list"] is False
+    boundary = {row["name"]: row for row in rows if row["name"].startswith("args_")}
+    assert set(boundary) == {"args_valid_empty", "args_one", "args_many"}
+    assert boundary["args_valid_empty"]["has_argument_list"] is False
+    assert boundary["args_valid_empty"]["argument_line"] == ""
+    assert boundary["args_one"]["has_argument_list"] is True
+    assert boundary["args_one"]["argument_line"] == "alpha"
+    assert boundary["args_many"]["has_argument_list"] is True
+    assert boundary["args_many"]["argument_line"] == "alpha beta"
 
 
 def test_ps_start_wrapper_process_fallback_strips_logging_env_vars(
@@ -14660,6 +14733,7 @@ def test_ephemeral_record_prepared_persists_declared_module_args_from() -> None:
     )
     entry = state["ephemeral_reviewers"]["active"]["R1"]
     assert entry["launch"] == {"windows_file": "python.exe", "module_args_from": 1}
+    assert entry["identity_binding_version"] == 1
 
 
 def test_ephemeral_record_prepared_keeps_active_allocation_history() -> None:

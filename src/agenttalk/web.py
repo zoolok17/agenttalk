@@ -2388,11 +2388,18 @@ def _collect_web_attention_items(store: Store, roster: list[str],
             state,
             actor=for_agent,
         )
+        launch_requests = _supervisor.active_ephemeral_launch_markers(
+            store,
+            state,
+        )
+        lane_workspaces = _supervisor.active_ephemeral_lane_workspaces(store)
         items += A.process_tree_hold_items(
             state,
             supervisor_config=supervisor_config,
             root=store.root,
             restart_requests=restart_requests,
+            launch_requests=launch_requests,
+            lane_workspaces=lane_workspaces,
             reset_admissions=reset_admissions,
         )
     except Exception as e:  # noqa: BLE001

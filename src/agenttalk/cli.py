@@ -6265,11 +6265,18 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
             actor=for_agent,
             identity_gone=_owner_identity_gone,
         )
+        launch_requests = sup.active_ephemeral_launch_markers(
+            store,
+            supervisor_state,
+        )
+        lane_workspaces = sup.active_ephemeral_lane_workspaces(store)
         items += A.process_tree_hold_items(
             supervisor_state,
             supervisor_config=supervisor_config,
             root=store.root,
             restart_requests=restart_requests,
+            launch_requests=launch_requests,
+            lane_workspaces=lane_workspaces,
             reset_admissions=reset_admissions,
         )
     except Exception as e:  # noqa: BLE001
@@ -12251,12 +12258,19 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                         now_epoch=now,
                         identity_gone=_owner_identity_gone,
                     )
+                    launch_requests = sup.active_ephemeral_launch_markers(
+                        store,
+                        state,
+                    )
+                    lane_workspaces = sup.active_ephemeral_lane_workspaces(store)
                     current_items = []
                     for item in A.process_tree_hold_items(
                         state,
                         supervisor_config=supervisor_config,
                         root=store.root,
                         restart_requests=restart_requests,
+                        launch_requests=launch_requests,
+                        lane_workspaces=lane_workspaces,
                         reset_admissions=reset_admissions,
                     ):
                         refs = item.get("source_refs")

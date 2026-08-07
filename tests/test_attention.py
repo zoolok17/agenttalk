@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk import attention as att
+from agenttalk import ephemeral as eph
 from agenttalk.store import Store
 
 
@@ -803,6 +804,13 @@ def test_process_tree_refusal_is_operator_visible_with_working_manual_launch(
         (
             True,
             [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--",
+                "--not-an-executable",
+            ],
+        ),
+        (
+            True,
+            [
                 "-m", "agenttalk", "wrap", "codex.exe", "--for", "worker",
                 "--", "codex.exe",
             ],
@@ -844,6 +852,7 @@ def test_process_tree_refusal_is_operator_visible_with_working_manual_launch(
         "for-is-in-remainder-without-tail-delimiter",
         "wrapped-declaration-disagrees-with-argv",
         "empty-cli-tail",
+        "option-like-cli-tail",
         "positional-starts-remainder-before-delimiter",
         "value-option-cannot-consume-another-option",
         "value-option-cannot-consume-tail-delimiter",
@@ -1324,6 +1333,320 @@ def test_configured_launch_resolves_supported_cwd_placeholder() -> None:
     )[0]
 
     assert item["configured_launch"]["argv"] == ["python.exe", "--cwd", cwd]
+
+
+def _ephemeral_launch_attention_fixture() -> tuple[str, str, dict, dict, dict]:
+    request_id = "lr-0123456789ab"
+    agent = f"adversary-{request_id}"
+    row = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_wrapper_state_mismatch",
+    )["agents"]["worker"]
+    launch = {
+        "windows_file": "python.exe",
+        "windows_args": [
+            "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for",
+            "{AGENT}", "--cli", "codex", "--loop", "--one-shot",
+            "--to-request", "{REQUEST_ID}", "--", "codex.exe",
+        ],
+    }
+    row.update({
+        "request_id": request_id,
+        "agent": agent,
+        "requested_by": "lead",
+        "review_request_id": "msg-review",
+        "profile": "codex-evidence-reviewer",
+        "cli": "codex",
+        "launch": launch,
+    })
+    marker = {
+        "schema_version": eph.SCHEMA_VERSION,
+        "kind": eph.REQUEST_KIND,
+        "request_id": request_id,
+        "state": eph.STATE_LAUNCHED,
+        "requested_by": "lead",
+        "profile": "codex-evidence-reviewer",
+        "skill": "review-code",
+        "prompt": "review the diff",
+        "scope": {"revision": "a" * 40, "paths": ["src"]},
+        "agent": agent,
+        "review_request_msg_id": "msg-review",
+    }
+    config = {
+        "agents": {},
+        "ephemeral_reviewers": {
+            "enabled": True,
+            "allowed_profiles": {
+                "codex-evidence-reviewer": {
+                    "cli": "codex",
+                    "cwd": r"D:\fleet",
+                    "launch": launch,
+                },
+            },
+        },
+    }
+    return request_id, agent, row, marker, config
+
+
+def test_ephemeral_hold_uses_its_request_profile_for_detached_launch() -> None:
+    request_id, agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture()
+    )
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    configured = item["configured_launch"]
+    assert configured["cwd"] == r"D:\fleet"
+    assert configured["argv"][:3] == ["python.exe", "-m", "agenttalk"]
+    assert configured["argv"][configured["argv"].index("--for") + 1] == agent
+    assert configured["argv"][configured["argv"].index("--to-request") + 1] == request_id
+    assert "configured_launch_unavailable" not in item
+
+
+def test_ephemeral_hold_rejects_profile_drift_from_persisted_request() -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture()
+    )
+    row["launch"] = {"windows_file": "stale.exe", "windows_args": []}
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "profile no longer matches" in item["configured_launch_unavailable"]
+
+
+def test_ephemeral_hold_reports_missing_request_launch_evidence() -> None:
+    request_id, _agent, row, _marker, config = (
+        _ephemeral_launch_attention_fixture()
+    )
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "request marker" in item["configured_launch_unavailable"]
+
+
+@pytest.mark.parametrize(
+    ("workspace_path", "scope_lane"),
+    [
+        (7, "review-lane"),
+        ("", "review-lane"),
+        (r"D:\fleet\lanes\review", "other-lane"),
+    ],
+    ids=["non-string-workspace", "empty-workspace", "scope-lane-mismatch"],
+)
+def test_ephemeral_hold_rejects_malformed_lane_launch_binding(
+    workspace_path: object,
+    scope_lane: str,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture()
+    )
+    marker["lane_id"] = "review-lane"
+    marker["workspace_path"] = workspace_path
+    marker["scope"]["lane_id"] = scope_lane
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "launch binding is invalid" in item["configured_launch_unavailable"]
+
+
+def test_ephemeral_hold_requires_current_lane_workspace_binding(
+    tmp_path: Path,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture()
+    )
+    workspace = str(tmp_path / "review-lane")
+    marker["lane_id"] = "review-lane"
+    marker["workspace_path"] = workspace
+    marker["scope"]["lane_id"] = "review-lane"
+    state = {"ephemeral_reviewers": {"active": {request_id: row}}}
+
+    exact = att.process_tree_hold_items(
+        state,
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={request_id: marker},
+        lane_workspaces={"review-lane": workspace},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+    drifted = att.process_tree_hold_items(
+        state,
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={request_id: marker},
+        lane_workspaces={"review-lane": str(tmp_path / "other-lane")},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert exact["configured_launch"]["cwd"] == workspace
+    argv = exact["configured_launch"]["argv"]
+    tail_index = argv.index("--")
+    assert argv[tail_index - 2:tail_index] == ["--lane-id", "review-lane"]
+    assert argv[tail_index + 1:tail_index + 4] == [
+        "codex.exe",
+        "--add-dir",
+        workspace,
+    ]
+    assert "configured_launch" not in drifted
+    assert "no longer matches" in drifted["configured_launch_unavailable"]
+
+
+@pytest.mark.parametrize(
+    "profile_lane_args",
+    [
+        ["--lane-id", "review-lane", "--lane-id", "other-lane"],
+        ["--lane-id", "other-lane", "--lane-id=review-lane"],
+    ],
+    ids=["matching-first", "matching-last"],
+)
+def test_ephemeral_lane_launch_canonicalizes_duplicate_profile_binding(
+    tmp_path: Path,
+    profile_lane_args: list[str],
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture()
+    )
+    workspace = str(tmp_path / "review-lane")
+    marker["lane_id"] = "review-lane"
+    marker["workspace_path"] = workspace
+    marker["scope"]["lane_id"] = "review-lane"
+    launch = row["launch"]
+    tail_index = launch["windows_args"].index("--")
+    launch["windows_args"][tail_index:tail_index] = profile_lane_args
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={request_id: marker},
+        lane_workspaces={"review-lane": workspace},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    argv = item["configured_launch"]["argv"]
+    wrapper_args = argv[:argv.index("--")]
+    assert wrapper_args.count("--lane-id") == 1
+    assert not any(arg.startswith("--lane-id=") for arg in wrapper_args)
+    lane_index = wrapper_args.index("--lane-id")
+    assert wrapper_args[lane_index + 1] == "review-lane"
+
+
+@pytest.mark.parametrize(
+    "profile_child_args",
+    [
+        ["--add-dir"],
+        ["--add-dir", "other", "--add-dir"],
+        ["--add-dir=other"],
+    ],
+    ids=["orphan", "duplicate-and-orphan", "inline"],
+)
+def test_ephemeral_codex_lane_canonicalizes_workspace_child_binding(
+    tmp_path: Path,
+    profile_child_args: list[str],
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture()
+    )
+    workspace = str(tmp_path / "review-lane")
+    marker["lane_id"] = "review-lane"
+    marker["workspace_path"] = workspace
+    marker["scope"]["lane_id"] = "review-lane"
+    row["launch"]["windows_args"].extend(profile_child_args)
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={request_id: marker},
+        lane_workspaces={"review-lane": workspace},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    argv = item["configured_launch"]["argv"]
+    tail_index = argv.index("--")
+    assert argv[tail_index + 1:] == ["codex.exe", "--add-dir", workspace]
+
+
+def test_ephemeral_launch_canonicalizes_all_dynamic_request_bindings() -> None:
+    request_id, agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture()
+    )
+    launch = row["launch"]
+    tail_index = launch["windows_args"].index("--")
+    launch["windows_args"][tail_index:tail_index] = [
+        "--for", agent,
+        "--for=other-agent",
+        "--cli", "codex",
+        "--cli=claude",
+        "--to-request", request_id,
+        "--to-request=lr-other",
+        "--lane-id", "stale-lane",
+    ]
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    wrapper_args = item["configured_launch"]["argv"]
+    wrapper_args = wrapper_args[:wrapper_args.index("--")]
+    for option, value in (
+        ("--for", agent),
+        ("--cli", "codex"),
+        ("--to-request", request_id),
+    ):
+        assert wrapper_args.count(option) == 1
+        assert not any(arg.startswith(f"{option}=") for arg in wrapper_args)
+        assert wrapper_args[wrapper_args.index(option) + 1] == value
+    assert "--lane-id" not in wrapper_args
+    assert not any(arg.startswith("--lane-id=") for arg in wrapper_args)
+
+
+def test_ephemeral_launch_rejects_orphan_codex_workspace_option() -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture()
+    )
+    row["launch"]["windows_args"].append("--add-dir")
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        supervisor_config=config,
+        root=r"D:\fleet",
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "workspace arguments are invalid" in item["configured_launch_unavailable"]
 
 
 def test_configured_launch_does_not_reinterpret_tokens_inside_project_root() -> None:
