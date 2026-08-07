@@ -99,3 +99,140 @@ version, manifest blob/digest, and logical plan digest and that the current chec
 
 CI uploads every leg artifact even when its gate command blocks. The always-run aggregate converts a crashed
 or evidence-less leg into an incomplete blocking artifact instead of silently reducing the matrix.
+
+## Release-candidate provenance and package custody
+
+`.github/workflows/release-provenance.yml` is an explicit, read-only
+`workflow_dispatch` for a post-bump release candidate. The operator selects
+`master` and supplies both the full 40-character candidate SHA and stable
+`X.Y.Z` version. Preflight requires the selected event SHA, checked-out HEAD,
+and executing workflow SHA to equal that input; it also checks the package and
+module versions, dated changelog heading, every install pin (including the
+new-user manual), the new-user-manual and roadmap baselines,
+assurance ledger entry, clean checkout, empty runtime dependency list, and
+monotonic version against existing stable tags. The generated
+`docs/AGENTTALK-NEW-USER-MANUAL.pdf` must be a non-empty regular file changed
+somewhere since the latest stable tag. That guards against shipping a completely
+unchanged PDF, but it does not prove semantic source/render parity; the operator
+must inspect its rendered version and install pin before tagging.
+Master advancing before the dispatch therefore produces
+`release_evidence_sha_mismatch`; the workflow never retargets to the new tip.
+
+The dispatch calls the same committed 12-leg workflow and CodeQL workflow at
+that SHA. Only a fresh run attempt is accepted: GitHub partial reruns can reuse
+an older successful job, so a rerun refuses as `release_evidence_stale` and the
+operator starts a new dispatch. The whole dispatch also expires after 24 hours,
+which bounds the age of the same-attempt CodeQL result even though GitHub owns
+that analysis runtime. The gate's canonical `linux/3.12` leg copies its
+exact wheel and sdist from the external gate temp root before runner cleanup.
+The final job downloads all 12 raw leg records, the aggregate plus run-attempt
+receipt, and those package bytes from the same run namespace; validates their
+schema, SHA/tree/version, freshness, raw-byte digests, and exact set; then
+rehashes the packages during the custody transfer.
+
+One self-contained Actions artifact carries `release-provenance.json`,
+`SHA256SUMS`, the exact wheel/sdist, all raw leg records, the aggregate, and its
+receipt. Its 90-day retention is a requested ceiling, not a durability promise:
+repository policy or deletion can shorten it. The upload action's carrier
+digest is published in the run summary. Increment 2 must attach these exact
+bytes to the eventual GitHub Release before expiry; it must not rebuild them.
+
+### Verify a downloaded provenance artifact
+
+Use the artifact id and `sha256:` carrier digest from the successful run
+summary. This PowerShell procedure creates a fresh, plain verification
+directory, downloads the original archive, verifies the carrier before
+extraction, rejects reparse points, then requires the extracted file set to
+equal the inner manifest exactly:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$repository = gh repo view --json nameWithOwner --jq .nameWithOwner
+$artifactId = '<artifact-id-from-run-summary>'
+$expectedCarrier = '<sha256-digest-from-run-summary>' -replace '^sha256:', ''
+$verificationRoot = Join-Path (Get-Location) ('.release-verify-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $verificationRoot | Out-Null
+$rootInfo = Get-Item -Force -LiteralPath $verificationRoot
+if (($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+  throw 'verification root is a reparse point'
+}
+$archive = Join-Path $verificationRoot 'release-provenance.zip'
+$bundle = Join-Path $verificationRoot 'bundle'
+New-Item -ItemType Directory -Path $bundle | Out-Null
+$headers = @{
+  Accept = 'application/vnd.github+json'
+  Authorization = "Bearer $(gh auth token)"
+  'X-GitHub-Api-Version' = '2022-11-28'
+}
+Invoke-WebRequest -Headers $headers `
+  -Uri "https://api.github.com/repos/$repository/actions/artifacts/$artifactId/zip" `
+  -OutFile $archive
+$actualCarrier = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+if ($actualCarrier -ne $expectedCarrier.ToLowerInvariant()) { throw 'carrier digest mismatch' }
+Expand-Archive -LiteralPath $archive -DestinationPath $bundle
+$bundle = (Resolve-Path -LiteralPath $bundle).Path
+$reparse = @(Get-ChildItem -Force -Recurse -LiteralPath $bundle | Where-Object {
+  ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+})
+if ($reparse.Count -ne 0) { throw 'artifact contains a reparse point' }
+$expectedMembers = [Collections.Generic.Dictionary[string,string]]::new(
+  [StringComparer]::Ordinal
+)
+Get-Content -LiteralPath (Join-Path $bundle SHA256SUMS) | ForEach-Object {
+  if ($_ -notmatch '^([0-9a-f]{64})  (.+)$') { throw "invalid SHA256SUMS row: $_" }
+  $expected = $Matches[1]
+  $relative = $Matches[2]
+  if ($expectedMembers.ContainsKey($relative)) { throw "duplicate manifest member: $relative" }
+  $candidate = [IO.Path]::GetFullPath((Join-Path $bundle $relative))
+  $prefix = $bundle + [IO.Path]::DirectorySeparatorChar
+  if (-not $candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "manifest path escapes bundle: $candidate"
+  }
+  $canonical = [IO.Path]::GetRelativePath($bundle, $candidate).Replace('\', '/')
+  if ($canonical -cne $relative) { throw "manifest path is not canonical: $relative" }
+  $memberInfo = Get-Item -Force -LiteralPath $candidate
+  if ($memberInfo.PSIsContainer -or
+      (($memberInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    throw "manifest member is not a plain file: $relative"
+  }
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) { throw "member digest mismatch: $candidate" }
+  $expectedMembers.Add($relative, $expected)
+}
+$actualMembers = @(
+  Get-ChildItem -Force -File -Recurse -LiteralPath $bundle |
+    ForEach-Object { [IO.Path]::GetRelativePath($bundle, $_.FullName).Replace('\', '/') } |
+    Where-Object { $_ -cne 'SHA256SUMS' } |
+    Sort-Object
+)
+$manifestMembers = @($expectedMembers.Keys | Sort-Object)
+if (@(Compare-Object $manifestMembers $actualMembers -CaseSensitive).Count -ne 0) {
+  throw 'artifact file set differs from SHA256SUMS'
+}
+Write-Host "verified release provenance in $bundle"
+```
+
+Finally inspect `release-provenance.json`, confirm its candidate SHA and version
+match the intended tag, and confirm the artifact root contains the named wheel
+and sdist. Open the shipped new-user PDF and confirm its rendered baseline and
+install pin match the candidate. Do not tag from a missing download, a partial rerun, a different SHA, or
+an artifact older than the workflow's 24-hour evidence window.
+
+Evidence refusal reasons remain distinct and machine-readable:
+
+- `release_evidence_missing` — a required record or package is absent;
+- `release_evidence_stale` — evidence is too old or belongs to another dispatch/run attempt;
+- `release_evidence_sha_mismatch` — evidence is bound to another candidate SHA or tree.
+
+Corrupt schema/content, digest substitution, an incomplete/failed gate, and a
+version mismatch have separate refusal codes as well. The workflow has no
+repository-content, package, or release mutation permission; the reusable
+CodeQL job alone receives its required scoped `security-events: write` plus
+`actions: read`. It creates no tag, GitHub Release, or package publication.
+Cancelling the dispatch prevents the new provenance job from assembling or
+uploading an artifact (the pre-existing gate aggregate may still finish its
+bounded diagnostic cleanup).
+This project has one human operator, so the later manual publish action is a
+temporal double-check rather than two-party control. There is deliberately no
+username allowlist pretending otherwise.
