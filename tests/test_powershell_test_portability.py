@@ -10,6 +10,13 @@ EXPECTED_WINDOWS_ONLY = {
     "test_powershell_cli.py": {
         "test_start_host_failure_occurs_before_server_bind",
         "test_start_validates_before_bind_and_launches_absolute_selected_host",
+        # These specify the Windows-only supervisor auto-start branch. Running
+        # them elsewhere would simulate the OS, not cover a portable path.
+        "test_start_contains_child_when_identity_capture_fails",
+        "test_start_does_not_report_unclaimed_spawn_pid",
+        "test_start_precondition_precedes_explicit_host_selection",
+        "test_start_refuses_dead_marker_before_server_bind_or_spawn",
+        "test_start_terminates_an_alive_child_that_never_claimed",
     },
     "test_powershell_host.py": {
         "test_automatic_candidates_continue_in_native_order",
@@ -25,6 +32,14 @@ EXPECTED_WINDOWS_ONLY = {
         "test_task_install_prepare_refuses_different_existing_binding",
         "test_task_uninstall_clears_binding_before_new_name_prepare",
         "test_validate_ancestry_accepts_direct_and_cmd_hop",
+        # Exact FILETIME pairs are a Windows process-identity contract.
+        "test_repair_marker_refuses_inconsistent_exact_identity_fields",
+        # Toolhelp32 enumeration and its WinError semantics only exist on Windows.
+        "test_process_parent_map_rejects_partial_snapshot",
+        # Exact marker-owner stopping is intentionally a Windows-only command.
+        "test_stop_instance_requires_kill_switch_without_mutating_marker",
+        # This exercises GetProcessTimes and termination through one Win32 handle.
+        "test_stop_instance_verifies_creation_time_on_the_terminated_handle",
     },
 }
 
