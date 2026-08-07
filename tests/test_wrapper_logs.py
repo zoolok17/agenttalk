@@ -653,27 +653,44 @@ $text = [System.IO.File]::ReadAllText($SourcePath)
 $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
+$stringConstantType = [System.Management.Automation.Language.StringConstantExpressionAst]
+
+# #113 review, round 13: THE INVERSION. Inside this region, the set of
+# commands that can execute must be STATICALLY DETERMINABLE FROM THE
+# SOURCE. Each AST node type below is checked against that ONE positive
+# property - not against a growing list of specific dangerous shapes -
+# and refused by default whenever it fails the property, whether or not
+# anyone has named that exact failure mode before.
 
 $functions = @()
 foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
   $functions += [ordered]@{ name = $fn.Name; start = $fn.Extent.StartOffset; end = $fn.Extent.EndOffset }
 }
 
+# The live session's OWN alias table - valid for installed/built-in
+# aliases ("gi" -> Get-Item) but blind by construction to anything the
+# TEMPLATE ITSELF defines, since ParseInput never executes it. Overlaid
+# in Python with any LITERAL Set-Alias/New-Alias found below, which is
+# the "resolved through the alias table" form the property explicitly
+# permits - a literal alias definition is just as statically
+# determinable as a literal command name.
+$aliasTable = @()
+foreach ($a in Get-Alias) {
+  $aliasTable += [ordered]@{ name = $a.Name; resolved = $a.Definition }
+}
+
 $commands = @()
+$sourceAliasDefinitions = @()
 $dynamicInvocations = @()
-$stringConstantType = [System.Management.Automation.Language.StringConstantExpressionAst]
 foreach ($cmd in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
   $firstElement = $cmd.CommandElements[0]
   if (-not ($firstElement -is $stringConstantType)) {
-    # #113 review, round 11: the command name is not a static literal -
-    # "& $name ..." or dot-sourcing a variable/expression. GetCommandName()
-    # returns $null for exactly this shape, which is why it was silently
-    # invisible before: it never reached the "if ($name)" filter at all.
-    # This construct cannot be resolved statically in the general case -
-    # that is a property of the construct, not a gap to close by looking
-    # harder - so it is collected separately and REFUSED, not chased.
+    # ALLOWED form: CommandElements[0] is a literal string. Anything else
+    # ("& $name ...", dot-sourcing a variable/expression, "& (expr)") is
+    # refused BY DEFAULT for failing that property - not because this
+    # specific shape is on a list.
     $dynamicInvocations += [ordered]@{
-      kind = "dynamic-command-invocation"
+      kind = "non-literal-command-head"
       start = $cmd.Extent.StartOffset
       line = $cmd.Extent.StartLineNumber
       rawLine = $cmd.Extent.StartScriptPosition.Line
@@ -681,37 +698,90 @@ foreach ($cmd in $ast.FindAll({ $args[0] -is [System.Management.Automation.Langu
     continue
   }
   $name = $cmd.GetCommandName()
-  if ($name) {
-    $resolved = $name
-    $stripped = $name -replace '^.*\\', ''
-    if ($stripped -ieq "Invoke-Expression" -or $stripped -ieq "iex") {
-      # #113 review, round 11: the string this evaluates is opaque to a
-      # static scan regardless of what it looks like at the call site -
-      # refused unconditionally, not just when its argument is itself
-      # non-literal.
+  if (-not $name) { continue }
+  $stripped = $name -replace '^.*\\', ''
+  if ($stripped -ieq "Invoke-Expression" -or $stripped -ieq "iex") {
+    # Invoke-Expression's command IDENTITY is perfectly determinable (it
+    # is always, literally, Invoke-Expression) - what defeats the
+    # property is that its own defined contract is "execute this STRING
+    # as code," which is opaque to this scan no matter how the call site
+    # itself is written. This is the one built-in cmdlet whose entire
+    # purpose is dynamic code execution from text, not an item on a
+    # denylist of things that happened to be found.
+    $dynamicInvocations += [ordered]@{
+      kind = "invoke-expression"
+      start = $cmd.Extent.StartOffset
+      line = $cmd.Extent.StartLineNumber
+      rawLine = $cmd.Extent.StartScriptPosition.Line
+    }
+    continue
+  }
+  if ($stripped -ieq "Import-Alias") {
+    # Reads alias definitions from an external file at runtime - the
+    # resulting alias table is unknowable from the source text no matter
+    # what this call's own arguments look like. Same class as a write
+    # through the Alias: drive below.
+    $dynamicInvocations += [ordered]@{
+      kind = "import-alias"
+      start = $cmd.Extent.StartOffset
+      line = $cmd.Extent.StartLineNumber
+      rawLine = $cmd.Extent.StartScriptPosition.Line
+    }
+    continue
+  }
+  if ($stripped -ieq "Set-Alias" -or $stripped -ieq "New-Alias") {
+    $aliasName = $null
+    $aliasValue = $null
+    $allLiteral = $true
+    for ($i = 1; $i -lt $cmd.CommandElements.Count; $i++) {
+      $el = $cmd.CommandElements[$i]
+      if ($el -is [System.Management.Automation.Language.CommandParameterAst]) { continue }
+      if (-not ($el -is $stringConstantType)) { $allLiteral = $false; break }
+      if ($null -eq $aliasName) { $aliasName = $el.Value }
+      elseif ($null -eq $aliasValue) { $aliasValue = $el.Value }
+    }
+    if ($allLiteral -and $aliasName -and $aliasValue) {
+      # ALLOWED form: a literal Name and a literal Value - the resulting
+      # mapping is exactly as statically determinable as a literal
+      # command name, so it is permitted and feeds the alias table
+      # rather than being refused.
+      $sourceAliasDefinitions += [ordered]@{ name = $aliasName; value = $aliasValue }
+    } else {
+      # A non-literal Name or Value means the resulting alias table
+      # entry cannot be pinned down from the source text - refused, the
+      # same class as Import-Alias and an Alias: drive write.
       $dynamicInvocations += [ordered]@{
-        kind = "invoke-expression"
+        kind = "unresolvable-alias-definition"
         start = $cmd.Extent.StartOffset
         line = $cmd.Extent.StartLineNumber
         rawLine = $cmd.Extent.StartScriptPosition.Line
       }
-      continue
     }
-    $cmdInfo = Get-Command -Name $stripped -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cmdInfo -and $cmdInfo.CommandType -eq [System.Management.Automation.CommandTypes]::Alias) {
-      # #113 review, round 11: resolve the alias to its canonical command
-      # via the live session's own alias table (never by guessing a
-      # hardcoded list) - "gi" and "Get-Item" invoke the identical cmdlet,
-      # so a discovery mechanism that treats them as different strings is
-      # not describing PowerShell.
-      $resolved = $cmdInfo.ResolvedCommandName
-    }
-    $commands += [ordered]@{
-      name = $name
-      resolved = $resolved
-      start = $cmd.Extent.StartOffset
-      line = $cmd.Extent.StartLineNumber
-      rawLine = $cmd.Extent.StartScriptPosition.Line
+    continue
+  }
+  $commands += [ordered]@{
+    name = $name
+    start = $cmd.Extent.StartOffset
+    line = $cmd.Extent.StartLineNumber
+    rawLine = $cmd.Extent.StartScriptPosition.Line
+  }
+}
+
+# A write through the Alias: drive - ${Alias:name} = ... - is the same
+# "unknowable alias table" class as Import-Alias, reached through
+# assignment syntax rather than a command call.
+$assignType = [System.Management.Automation.Language.AssignmentStatementAst]
+foreach ($assign in $ast.FindAll({ $args[0] -is $assignType }, $true)) {
+  $target = $assign.Left
+  if ($target -is [System.Management.Automation.Language.VariableExpressionAst]) {
+    $path = $target.VariablePath
+    if ($path.IsDriveQualified -and $path.DriveName -ieq "Alias") {
+      $dynamicInvocations += [ordered]@{
+        kind = "alias-drive-write"
+        start = $assign.Extent.StartOffset
+        line = $assign.Extent.StartLineNumber
+        rawLine = $assign.Extent.StartScriptPosition.Line
+      }
     }
   }
 }
@@ -719,10 +789,9 @@ foreach ($cmd in $ast.FindAll({ $args[0] -is [System.Management.Automation.Langu
 $members = @()
 foreach ($m in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.MemberExpressionAst] }, $true)) {
   if (-not ($m.Member -is $stringConstantType)) {
-    # #113 review, round 11: the same unanalysable shape one level up -
-    # $obj.($nameExpr) computes the property/method NAME at runtime, so
-    # the primitive-member scan's "$m.Member.Value" would be $null here
-    # too, the identical silent-miss shape as the dynamic-invocation case.
+    # ALLOWED form: a literal property/method name. $obj.($nameExpr)
+    # computes the NAME at runtime and fails the property the same way a
+    # non-literal command head does.
     $dynamicInvocations += [ordered]@{
       kind = "dynamic-member-access"
       start = $m.Extent.StartOffset
@@ -743,8 +812,38 @@ foreach ($m in $ast.FindAll({ $args[0] -is [System.Management.Automation.Languag
 }
 
 $staticCalls = @()
+$callableInvocationMembers = @("invoke", "invokereturnasis", "dynamicinvoke")
 $invokeMemberType = [System.Management.Automation.Language.InvokeMemberExpressionAst]
 foreach ($m in $ast.FindAll({ $args[0] -is $invokeMemberType }, $true)) {
+  if (-not ($m.Member -is $stringConstantType)) {
+    # Same "literal member name" property as a plain member access,
+    # applied to a method call instead of a property read.
+    $dynamicInvocations += [ordered]@{
+      kind = "dynamic-member-access"
+      start = $m.Extent.StartOffset
+      line = $m.Extent.StartLineNumber
+      rawLine = $m.Extent.StartScriptPosition.Line
+    }
+    continue
+  }
+  if ($m.Member.Value.ToLowerInvariant() -in $callableInvocationMembers) {
+    # Invoke/InvokeReturnAsIs/DynamicInvoke are the closed set of
+    # .NET/PowerShell method names whose entire defined purpose is
+    # "execute this callable VALUE" (ScriptBlock.Invoke,
+    # Delegate.DynamicInvoke, PowerShell.Invoke, CommandInfo.Invoke) -
+    # runtime code creation (e.g. [scriptblock]::Create(...)) is only
+    # dangerous once something like this actually calls it, and this is
+    # the point that catches that regardless of how the callable value
+    # was produced or obtained (a created scriptblock, a captured
+    # function object, anything else).
+    $dynamicInvocations += [ordered]@{
+      kind = "callable-value-invocation"
+      start = $m.Extent.StartOffset
+      line = $m.Extent.StartLineNumber
+      rawLine = $m.Extent.StartScriptPosition.Line
+    }
+    continue
+  }
   if ($m.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
     $staticCalls += [ordered]@{
       type = $m.Expression.TypeName.FullName
@@ -761,6 +860,8 @@ $result = [ordered]@{
   commands = @($commands)
   members = @($members)
   staticCalls = @($staticCalls)
+  aliasTable = @($aliasTable)
+  sourceAliasDefinitions = @($sourceAliasDefinitions)
   dynamicInvocations = @($dynamicInvocations)
   parseErrors = @($errors | ForEach-Object { $_.Message })
 }
@@ -812,19 +913,45 @@ def _innermost_powershell_function(functions: list[dict], offset: int) -> dict |
     return min(containing, key=lambda f: f["end"] - f["start"])
 
 
-def _reachable_powershell_functions(functions: list[dict], commands: list[dict]) -> set[str]:
-    """BFS over real call edges (a CommandAst whose name matches another
-    function's name) from the wrapper-log subsystem's actual external
-    entry points (New-WrapperLogTargets, Discard-PendingWrapperLogTargets -
-    verified by grep to be the only two called from outside this
-    subsystem). A helper is in scope because something in scope calls it -
-    never because of what it happens to be named. Closes the "generic
-    helper without the WrapperLog substring" evasion, which any
-    name-pattern filter is structurally unable to close."""
+def _build_powershell_alias_table(ast_data: dict) -> dict[str, str]:
+    """#113 review, round 13: the property is "a literal command name,
+    RESOLVED THROUGH THE ALIAS TABLE" - built from the live session's own
+    aliases (valid for installed/built-in aliases like "gi", since those
+    do not vary at scan time) overlaid with every LITERAL Set-Alias/
+    New-Alias definition found anywhere in the template (the session
+    never executed the template, so it cannot know these on its own; a
+    literal alias definition is exactly as statically determinable as a
+    literal command name, so it is resolved, not refused). Source
+    definitions win on conflict - they describe what the template will
+    actually do at runtime, overriding whatever the live host happened
+    to ship as a default."""
+    table = {a["name"].lower(): a["resolved"] for a in ast_data.get("aliasTable", [])}
+    for entry in ast_data.get("sourceAliasDefinitions", []):
+        table[entry["name"].lower()] = entry["value"]
+    return table
+
+
+def _resolve_powershell_command_name(name: str, alias_table: dict[str, str]) -> str:
+    stripped = _strip_module_qualifier(name).lower()
+    return _strip_module_qualifier(alias_table.get(stripped, stripped)).lower()
+
+
+def _reachable_powershell_functions(
+    functions: list[dict], commands: list[dict], alias_table: dict[str, str]
+) -> set[str]:
+    """BFS over real call edges (a CommandAst whose name - resolved
+    through the alias table - matches another function's name) from the
+    wrapper-log subsystem's actual external entry points
+    (New-WrapperLogTargets, Discard-PendingWrapperLogTargets - verified
+    by grep to be the only two called from outside this subsystem). A
+    helper is in scope because something in scope calls it - never
+    because of what it happens to be named. Closes the "generic helper
+    without the WrapperLog substring" evasion, which any name-pattern
+    filter is structurally unable to close."""
     by_lower = {f["name"].lower(): f for f in functions}
     edges: dict[str, set[str]] = {name: set() for name in by_lower}
     for cmd in commands:
-        callee = _strip_module_qualifier(cmd["name"]).lower()
+        callee = _resolve_powershell_command_name(cmd["name"], alias_table)
         if callee not in by_lower:
             continue
         caller_fn = _innermost_powershell_function(functions, cmd["start"])
@@ -907,15 +1034,15 @@ def _discover_powershell_wrapper_log_primitives(
     that a specific injected shape still surfaces as unallowlisted,
     malformed, refused, or an unexpected manifest key."""
     functions = ast_data["functions"]
-    reachable = _reachable_powershell_functions(functions, ast_data["commands"])
+    alias_table = _build_powershell_alias_table(ast_data)
+    reachable = _reachable_powershell_functions(functions, ast_data["commands"], alias_table)
     dynamic_discovered, refused, dynamic_malformed = _classify_powershell_dynamic_constructs(
         functions, reachable, ast_data.get("dynamicInvocations", [])
     )
 
     hits: list[dict] = []
     for cmd in ast_data["commands"]:
-        resolved_name = cmd.get("resolved", cmd["name"])
-        if _strip_module_qualifier(resolved_name).lower() in _POWERSHELL_PRIMITIVE_CMDLETS:
+        if _resolve_powershell_command_name(cmd["name"], alias_table) in _POWERSHELL_PRIMITIVE_CMDLETS:
             hits.append(cmd)
     for member in ast_data["members"]:
         if member["name"].lower() in _POWERSHELL_PRIMITIVE_MEMBERS:
@@ -1364,7 +1491,7 @@ def test_evasion_dynamic_command_invocation_is_refused_not_silently_missed(
         ast_data
     )
     assert any(
-        "invoke-wrapperlogretentionprune" in line and "dynamic-command-invocation" in line
+        "invoke-wrapperlogretentionprune" in line and "non-literal-command-head" in line
         for line in refused
     )
 
@@ -1435,6 +1562,67 @@ def test_dynamic_invocation_allowlist_requires_a_tagged_reason(tmp_path: Path) -
     )
     assert not refused, "a present-but-untagged reason must be malformed, not silently refused"
     assert any("invoke-wrapperlogretentionprune" in line for line in malformed)
+
+
+def test_evasion_source_defined_alias_is_still_caught(tmp_path: Path) -> None:
+    """#113 review, round 13's first new escape: `Set-Alias zzwrapperprobe
+    Test-Path` followed by a call through that name produced an empty
+    finding set under round 11's live-session-only alias resolution,
+    because ParseInput never executes the template and the session has
+    no way to know about an alias the template itself defines. A LITERAL
+    Set-Alias/New-Alias is exactly the "resolved through the alias
+    table" form the round-13 property explicitly permits - it is just as
+    statically determinable as a literal command name - so this is
+    ALLOWED and correctly analysed (surfaces as an unallowlisted
+    Test-Path hit), not refused; refusing every alias would make the
+    scanner useless on ordinary PowerShell."""
+    mutated = _mutate_ps_template(
+        injected_functions="Set-Alias zzwrapperprobe Test-Path",
+        injected_call="$null = zzwrapperprobe -LiteralPath $candidateAgentDir",
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, unallowlisted, _malformed, refused = _discover_powershell_wrapper_log_primitives(
+        ast_data
+    )
+    assert not refused
+    assert any(
+        "invoke-wrapperlogretentionprune" in line and "zzwrapperprobe" in line
+        for line in unallowlisted
+    )
+
+
+def test_evasion_runtime_scriptblock_invoke_is_refused_not_silently_missed(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 13's second new escape: creating a script block
+    from a literal string and invoking it is exactly the unknowable
+    category already refused for other shapes, but it entered none of
+    round 11's three named refusal sets - [scriptblock]::Create(...) is
+    a static call the scanner already walks (an InvokeMemberExpressionAst
+    on a TypeExpressionAst), but nothing about creating a callable VALUE
+    is itself dangerous; the danger is invoking it, wherever the
+    resulting scriptblock came from or however it was obtained (a
+    created scriptblock here, an otherwise-unreachable helper's function
+    object just as easily). `.Invoke()` is the point that catches all of
+    those uniformly, keyed to the closed set of .NET/PowerShell
+    "execute this callable" method names, not to how the callable was
+    produced."""
+    mutated = _mutate_ps_template(
+        injected_functions="",
+        injected_call=(
+            "$dynamicBlock = [scriptblock]::Create("
+            "'param($p) Test-Path -LiteralPath $p'); "
+            "$null = $dynamicBlock.Invoke($candidateAgentDir)"
+        ),
+    )
+    ast_data = _parse_powershell_wrapper_log_ast(mutated, tmp_path)
+    _discovered, _unallowlisted, _malformed, refused = _discover_powershell_wrapper_log_primitives(
+        ast_data
+    )
+    assert any(
+        "invoke-wrapperlogretentionprune" in line and "callable-value-invocation" in line
+        for line in refused
+    )
 
 
 def test_supervise_plan_never_probes_wrapper_log_filesystem(
