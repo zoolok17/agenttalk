@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -48,6 +50,22 @@ def _select_powershell_for_prepare(store: Store) -> None:
     if shell is None:
         pytest.skip("PowerShell Core is unavailable")
     lifecycle.select_powershell_host(store, explicit_path=shell)
+
+
+def _set_prepare_environment_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str] | None = None,
+) -> dict[str, str]:
+    captured = dict(environment or {"PATH": os.environ.get("PATH", "")})
+    envelope = base64.b64encode(
+        json.dumps(
+            captured,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    monkeypatch.setattr(sys, "stdin", io.BytesIO(envelope))
+    return captured
 
 
 def _cfg(**overrides) -> dict:
@@ -895,6 +913,7 @@ def test_prepare_cli_rejects_copied_state_before_effects(
         "--now", str(NOW),
         "--launch-agenttalk-python", sys.executable,
         "--launch-src-on-pythonpath", "false",
+        "--launch-environment-stdin",
         "--supervisor-config-sha256", config_sha256,
     ])
 
@@ -914,6 +933,7 @@ def test_prepare_cli_rejects_copied_state_before_effects(
 
 def test_prepare_cli_preserves_unicode_profile_environment_names(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     s = _store(tmp_path)
@@ -938,6 +958,16 @@ def test_prepare_cli_preserves_unicode_profile_environment_names(
     config_sha256 = hashlib.sha256(
         (s.dir / "supervisor.json").read_bytes()
     ).hexdigest()
+    _set_prepare_environment_stdin(
+        monkeypatch,
+        {
+            "PATH": os.environ.get("PATH", ""),
+            "=C:": r"C:\prepared-drive-cwd",
+            "INHERITED_雪": "café-雪",
+            "INHERITED_K": "ascii-k",
+            "INHERITED_K": "kelvin",
+        },
+    )
 
     rc = cli.main([
         "--root", str(tmp_path),
@@ -948,6 +978,7 @@ def test_prepare_cli_preserves_unicode_profile_environment_names(
         "--now", str(NOW),
         "--launch-agenttalk-python", sys.executable,
         "--launch-src-on-pythonpath", "false",
+        "--launch-environment-stdin",
         "--supervisor-config-sha256", config_sha256,
     ])
 
@@ -961,10 +992,84 @@ def test_prepare_cli_preserves_unicode_profile_environment_names(
         "AGENTTALK_SELF": spec["agent"],
     }
     assert "café-雪" not in state_path.read_text(encoding="utf-8")
+    assert "prepared-drive-cwd" not in state_path.read_text(encoding="utf-8")
+    assert len(spec["effective_environment_sha256"]) == 64
+
+
+def test_prepare_cli_rejects_colliding_inherited_environment_before_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _store(tmp_path)
+    request_id = "lr-parent-env-alias"
+    s.write_launch_request(_marker(request_id))
+    (s.dir / "supervisor.json").write_text(
+        json.dumps(_cfg()),
+        encoding="utf-8",
+    )
+    state_path = s.dir / "supervisor-state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    marker_path = s.launch_requests_dir / f"{request_id}.json"
+    marker_before = marker_path.read_bytes()
+    _select_powershell_for_prepare(s)
+    config_sha256 = hashlib.sha256(
+        (s.dir / "supervisor.json").read_bytes()
+    ).hexdigest()
+    _set_prepare_environment_stdin(
+        monkeypatch,
+        {"INHERITED_CASE": "one", "inherited_case": "two"},
+    )
+
+    rc = cli.main([
+        "--root", str(tmp_path),
+        "supervise",
+        "--prepare-launch-request",
+        "--request-id", request_id,
+        "--state-file", str(state_path),
+        "--now", str(NOW),
+        "--launch-agenttalk-python", sys.executable,
+        "--launch-src-on-pythonpath", "false",
+        "--launch-environment-stdin",
+        "--supervisor-config-sha256", config_sha256,
+    ])
+
+    assert rc == 3
+    assert "duplicate keys" in capsys.readouterr().err
+    assert state_path.read_text(encoding="utf-8") == "{}"
+    assert marker_path.read_bytes() == marker_before
+    assert list(s.messages_dir.glob("*.json")) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows environment block contract")
+def test_current_parent_environment_preserves_distinct_unicode_names() -> None:
+    import ctypes
+
+    ascii_name = "AGENTTALK_RAW_PARENT_K"
+    kelvin_name = "AGENTTALK_RAW_PARENT_K"
+    emoji_name = "AGENTTALK_RAW_PARENT_🙂"
+    setter = ctypes.WinDLL(
+        "kernel32", use_last_error=True
+    ).SetEnvironmentVariableW
+    setter.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    setter.restype = ctypes.c_int
+    try:
+        assert setter(ascii_name, "ascii")
+        assert setter(kelvin_name, "kelvin")
+        assert setter(emoji_name, "value-🙂")
+        captured = sup._current_ephemeral_parent_environment()  # noqa: SLF001
+        assert captured[ascii_name] == "ascii"
+        assert captured[kelvin_name] == "kelvin"
+        assert captured[emoji_name] == "value-🙂"
+    finally:
+        setter(ascii_name, None)
+        setter(kelvin_name, None)
+        setter(emoji_name, None)
 
 
 def test_prepare_cli_rejects_colliding_environment_names_before_effects(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     s = _store(tmp_path)
@@ -992,6 +1097,7 @@ def test_prepare_cli_rejects_colliding_environment_names_before_effects(
     config_sha256 = hashlib.sha256(
         (s.dir / "supervisor.json").read_bytes()
     ).hexdigest()
+    _set_prepare_environment_stdin(monkeypatch)
 
     rc = cli.main([
         "--root", str(tmp_path),
@@ -1002,6 +1108,7 @@ def test_prepare_cli_rejects_colliding_environment_names_before_effects(
         "--now", str(NOW),
         "--launch-agenttalk-python", sys.executable,
         "--launch-src-on-pythonpath", "false",
+        "--launch-environment-stdin",
         "--supervisor-config-sha256", config_sha256,
     ])
 
@@ -1024,6 +1131,7 @@ def test_prepare_cli_rejects_colliding_environment_names_before_effects(
 )
 def test_prepare_cli_requires_powershell_accepted_config_before_effects(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     binding_case: str,
 ) -> None:
@@ -1071,7 +1179,9 @@ def test_prepare_cli_requires_powershell_accepted_config_before_effects(
         "--now", str(NOW),
         "--launch-agenttalk-python", sys.executable,
         "--launch-src-on-pythonpath", "false",
+        "--launch-environment-stdin",
     ]
+    _set_prepare_environment_stdin(monkeypatch)
     if binding_case != "missing":
         argv.extend(["--supervisor-config-sha256", accepted_sha256])
     rc = cli.main(argv)

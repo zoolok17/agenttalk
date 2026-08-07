@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import dataclasses
 import io
@@ -12578,12 +12579,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             or not args.state_file
             or args.launch_agenttalk_python is None
             or args.launch_src_on_pythonpath is None
+            or not args.launch_environment_stdin
             or args.supervisor_config_sha256 is None
         ):
             sys.stderr.write("agenttalk supervise --prepare-launch-request: need "
                              "--request-id <rid>, --state-file <path>, "
                              "--launch-agenttalk-python <path>, and "
-                             "--launch-src-on-pythonpath true|false, and a "
+                             "--launch-src-on-pythonpath true|false with "
+                             "--launch-environment-stdin, and a "
                              "PowerShell-accepted supervisor config SHA-256\n")
             return 2
         state_path = store.dir / "supervisor-state.json"
@@ -12600,6 +12603,44 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 "agenttalk supervise --prepare-launch-request: --state-file "
                 "must be the official .agenttalk/supervisor-state.json\n"
+            )
+            return 2
+        try:
+            stream = getattr(sys.stdin, "buffer", sys.stdin)
+            raw_envelope = stream.read(2 * 1024 * 1024 + 1)
+            if isinstance(raw_envelope, str):
+                raw_envelope = raw_envelope.encode("ascii")
+            if len(raw_envelope) > 2 * 1024 * 1024:
+                raise ValueError("environment envelope exceeds 2 MiB")
+            raw_environment = base64.b64decode(
+                raw_envelope.strip(),
+                validate=True,
+            )
+            if len(raw_environment) > 1024 * 1024:
+                raise ValueError("environment input exceeds 1 MiB")
+
+            def reject_duplicate_keys(
+                pairs: list[tuple[str, object]],
+            ) -> dict[str, object]:
+                value: dict[str, object] = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError(
+                            "environment input contains duplicate names"
+                        )
+                    value[key] = item
+                return value
+
+            launch_parent_environment = json.loads(
+                raw_environment.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+            )
+            if not isinstance(launch_parent_environment, dict):
+                raise ValueError("environment input must be a JSON object")
+        except (UnicodeError, ValueError) as exc:
+            sys.stderr.write(
+                "agenttalk supervise --prepare-launch-request: invalid "
+                f"base64 launch environment: {exc}\n"
             )
             return 2
         try:
@@ -12627,6 +12668,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 launch_src_on_pythonpath=(
                     args.launch_src_on_pythonpath == "true"
                 ),
+                launch_parent_environment=launch_parent_environment,
             )
         except eph.EphemeralError as e:
             sys.stderr.write(f"agenttalk supervise --prepare-launch-request: {e}\n")
@@ -14696,6 +14738,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--launch-src-on-pythonpath",
         choices=("true", "false"),
         help="(script use) Whether the running supervisor prepends <root>/src.",
+    )
+    psup.add_argument(
+        "--launch-environment-stdin",
+        action="store_true",
+        help="(script use) Read the running supervisor environment as JSON.",
     )
     psup.add_argument(
         "--supervisor-config-sha256",

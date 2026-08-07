@@ -195,6 +195,11 @@ def effective_review_request_digest(message: object) -> str:
     return _bounded_canonical_sha256(projection)
 
 
+def effective_launch_environment_digest(environment: dict[str, str]) -> str:
+    """Hash the complete effective launch environment without persisting it."""
+    return _bounded_canonical_sha256(environment)
+
+
 def make_effective_launch_binding(
     marker: dict,
     spec: dict,

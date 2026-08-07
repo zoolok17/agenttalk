@@ -2293,6 +2293,34 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
 
 
 _LAUNCH_RECORD_CONTEXT_SCHEMA = 1
+_LAUNCH_RECORD_BRAIN_PATTERN_MAX_BYTES = 4096
+_LAUNCH_RECORD_CONTEXT_MAX_BYTES = 8192
+
+
+def _valid_launch_record_brain_pattern(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or any(ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF
+               for character in value)
+    ):
+        return False
+    try:
+        return len(value.encode("utf-8")) <= _LAUNCH_RECORD_BRAIN_PATTERN_MAX_BYTES
+    except UnicodeError:
+        return False
+
+
+def _valid_launch_record_context_size(value: object) -> bool:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, UnicodeError, ValueError):
+        return False
+    return len(encoded) <= _LAUNCH_RECORD_CONTEXT_MAX_BYTES
 
 
 def _launch_record_context(
@@ -2303,14 +2331,15 @@ def _launch_record_context(
     wrapped: bool,
     brain_pattern: str,
 ) -> dict:
-    """Return the bounded accepted-config facts needed after process spawn.
+    """Return byte-bounded accepted-config facts needed after process spawn.
 
     The generated executor persists this value in the reserved next-state before
-    launching. Keeping the context bounded avoids persisting cwd/environment
-    values (and their possible secrets), while avoiding a second read of mutable
-    ``supervisor.json`` after ``Start-Process`` has succeeded.
+    launching. It deliberately excludes cwd/environment values while avoiding a
+    second read of mutable ``supervisor.json`` after ``Start-Process`` succeeds.
     """
-    return {
+    if not _valid_launch_record_brain_pattern(brain_pattern):
+        raise ValueError("accepted launch record brain pattern is invalid")
+    context = {
         "schema_version": _LAUNCH_RECORD_CONTEXT_SCHEMA,
         "agent": agent,
         "cli": cli,
@@ -2318,6 +2347,9 @@ def _launch_record_context(
         "wrapped": wrapped,
         "brain_pattern": brain_pattern,
     }
+    if not _valid_launch_record_context_size(context):
+        raise ValueError("accepted launch record context is too large")
+    return context
 
 
 def decode_launch_record_context(
@@ -2331,6 +2363,8 @@ def decode_launch_record_context(
         raise ValueError("accepted launch record context is missing")
     if not isinstance(value, dict):
         raise ValueError("accepted launch record context must be an object")
+    if not _valid_launch_record_context_size(value):
+        raise ValueError("accepted launch record context is too large")
     if set(value) != {
         "schema_version",
         "agent",
@@ -2357,7 +2391,9 @@ def decode_launch_record_context(
         raise ValueError("accepted launch record grace is invalid")
     wrapped = value.get("wrapped")
     brain_pattern = value.get("brain_pattern")
-    if not isinstance(wrapped, bool) or not isinstance(brain_pattern, str):
+    if not isinstance(wrapped, bool) or not _valid_launch_record_brain_pattern(
+        brain_pattern
+    ):
         raise ValueError("accepted launch record agent projection is invalid")
     return float(grace), {
         "cli": cli,
@@ -4720,6 +4756,237 @@ def _ephemeral_recovery_environment(
     }
 
 
+_EPHEMERAL_ENV_BINDING_EXCLUDED = frozenset({
+    "AGENTTALK_PYTHON",
+    "AGENTTALK_SHIM_ACTIVE",
+    "AGENTTALK_SHIM_PARENT_PYTHONPATH",
+    "AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT",
+    "AGENTTALK_WRAPPER_STDOUT_LOG",
+    "AGENTTALK_WRAPPER_STDERR_LOG",
+    "AGENTTALK_WRAPPER_LOG_MAX_BYTES",
+    "AGENTTALK_WRAPPER_LOG_SEGMENTS",
+    "AGENTTALK_WRAPPER_LOG_NONCE",
+})
+
+
+def _equivalent_environment_key(
+    environment: dict[str, str],
+    name: str,
+) -> str | None:
+    """Find the unique Windows-equivalent key in one validated mapping."""
+    matches = [
+        key
+        for key in environment
+        if eph._windows_environment_names_equal(key, name)  # noqa: SLF001
+    ]
+    if len(matches) > 1:
+        raise eph.EphemeralError(
+            "the running supervisor's launch environment has duplicate keys"
+        )
+    return matches[0] if matches else None
+
+
+def _set_effective_environment_value(
+    environment: dict[str, str],
+    name: str,
+    value: str | None,
+) -> None:
+    """Model Windows SetEnvironmentVariable without lossy name folding."""
+    existing = _equivalent_environment_key(environment, name)
+    if value is None:
+        if existing is not None:
+            environment.pop(existing)
+        return
+    if existing is None:
+        environment[name] = value
+    else:
+        # Windows updates the equivalent entry while retaining its spelling.
+        environment[existing] = value
+
+
+def _validated_ephemeral_parent_environment(
+    environment: object,
+) -> dict[str, str]:
+    """Return a complete, collision-free Windows environment projection."""
+    if not isinstance(environment, dict):
+        raise eph.EphemeralError(
+            "the running supervisor's launch environment is unavailable"
+        )
+    validated: dict[str, str] = {}
+    for key, value in environment.items():
+        hidden_drive_entry = (
+            isinstance(key, str)
+            and re.fullmatch(r"=[A-Za-z]:", key) is not None
+        )
+        if (
+            not isinstance(key, str)
+            or not key
+            or ("=" in key and not hidden_drive_entry)
+            or not isinstance(value, str)
+            or any(
+                ch == "\x00" or 0xD800 <= ord(ch) <= 0xDFFF
+                for ch in key
+            )
+            or any(
+                ch == "\x00" or 0xD800 <= ord(ch) <= 0xDFFF
+                for ch in value
+            )
+        ):
+            raise eph.EphemeralError(
+                "the running supervisor's launch environment is invalid"
+            )
+        if _equivalent_environment_key(validated, key) is not None:
+            raise eph.EphemeralError(
+                "the running supervisor's launch environment has duplicate keys"
+            )
+        validated[key] = value
+
+    shim_active = _equivalent_environment_key(
+        validated, "AGENTTALK_SHIM_ACTIVE"
+    )
+    if shim_active is not None and validated[shim_active] == "1":
+        absent_key = _equivalent_environment_key(
+            validated, "AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT"
+        )
+        parent_key = _equivalent_environment_key(
+            validated, "AGENTTALK_SHIM_PARENT_PYTHONPATH"
+        )
+        if absent_key is not None and validated[absent_key] == "1":
+            _set_effective_environment_value(validated, "PYTHONPATH", None)
+        elif parent_key is not None:
+            _set_effective_environment_value(
+                validated,
+                "PYTHONPATH",
+                validated[parent_key],
+            )
+
+    for excluded in _EPHEMERAL_ENV_BINDING_EXCLUDED:
+        _set_effective_environment_value(validated, excluded, None)
+    eph.effective_launch_environment_digest(validated)
+    return validated
+
+
+def _raw_current_windows_environment() -> dict[str, str]:
+    """Read the raw process environment without Python's key normalization."""
+    if os.name != "nt":
+        return dict(os.environ)
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_block = kernel32.GetEnvironmentStringsW
+    get_block.argtypes = []
+    get_block.restype = ctypes.c_void_p
+    free_block = kernel32.FreeEnvironmentStringsW
+    free_block.argtypes = [ctypes.c_void_p]
+    free_block.restype = ctypes.c_int
+    address = get_block()
+    if not address:
+        raise eph.EphemeralError(
+            "the running supervisor's launch environment is unavailable"
+        )
+    environment: dict[str, str] = {}
+    try:
+        block = ctypes.cast(address, ctypes.POINTER(ctypes.c_uint16))
+        unit_count = 0
+        while True:
+            if block[unit_count] == 0 and block[unit_count + 1] == 0:
+                unit_count += 2
+                break
+            unit_count += 1
+        try:
+            text = ctypes.string_at(address, unit_count * 2).decode(
+                "utf-16-le",
+                errors="strict",
+            )
+        except UnicodeDecodeError as exc:
+            raise eph.EphemeralError(
+                "the running supervisor's launch environment is invalid"
+            ) from exc
+        for entry in text.split("\x00"):
+            if not entry:
+                continue
+            name, separator, value = entry.partition("=")
+            if entry.startswith("="):
+                hidden_separator = entry.find("=", 1)
+                if hidden_separator < 0:
+                    raise eph.EphemeralError(
+                        "the running supervisor's launch environment is invalid"
+                    )
+                name = entry[:hidden_separator]
+                separator = "="
+                value = entry[hidden_separator + 1:]
+            if not separator:
+                raise eph.EphemeralError(
+                    "the running supervisor's launch environment is invalid"
+                )
+            if _equivalent_environment_key(environment, name) is not None:
+                raise eph.EphemeralError(
+                    "the running supervisor's launch environment has duplicate keys"
+                )
+            environment[name] = value
+    finally:
+        free_block(address)
+    return environment
+
+
+def _current_ephemeral_parent_environment() -> dict[str, str]:
+    """Return the current parent environment with shim-only changes undone."""
+    return _validated_ephemeral_parent_environment(
+        _raw_current_windows_environment()
+    )
+
+
+def _effective_ephemeral_environment_digest(
+    parent_environment: dict[str, str],
+    spec: dict,
+    recovery_environment: dict,
+) -> str:
+    """Hash exactly the inherited environment Launch-Spec will expose."""
+    effective = _validated_ephemeral_parent_environment(parent_environment)
+
+    def apply(name: str, value: object) -> None:
+        if value is not None and not isinstance(value, str):
+            raise eph.EphemeralError(
+                "the prepared launch environment is invalid"
+            )
+        _set_effective_environment_value(effective, name, value)
+
+    apply("AGENTTALK_ROOT", recovery_environment.get("AGENTTALK_ROOT"))
+    apply("AGENTTALK_PY", recovery_environment.get("AGENTTALK_PY"))
+    pythonpath_prepend = recovery_environment.get("PYTHONPATH_prepend")
+    if pythonpath_prepend is not None:
+        if not isinstance(pythonpath_prepend, str):
+            raise eph.EphemeralError(
+                "the prepared launch environment is invalid"
+            )
+        pythonpath_key = _equivalent_environment_key(effective, "PYTHONPATH")
+        inherited_pythonpath = (
+            effective[pythonpath_key] if pythonpath_key is not None else ""
+        )
+        apply(
+            "PYTHONPATH",
+            f"{pythonpath_prepend};{inherited_pythonpath}",
+        )
+    codex_home = recovery_environment.get("CODEX_HOME")
+    if codex_home is not None:
+        apply("CODEX_HOME", codex_home)
+    no_child_window = recovery_environment.get("AGENTTALK_NO_CHILD_WINDOW")
+    if no_child_window is not None:
+        apply("AGENTTALK_NO_CHILD_WINDOW", no_child_window)
+    configured = spec.get("env")
+    if not isinstance(configured, dict):
+        raise eph.EphemeralError("the prepared launch environment is invalid")
+    for key, value in configured.items():
+        if not isinstance(key, str):
+            raise eph.EphemeralError(
+                "the prepared launch environment is invalid"
+            )
+        apply(key, value)
+    for excluded in _EPHEMERAL_ENV_BINDING_EXCLUDED:
+        apply(excluded, None)
+    return eph.effective_launch_environment_digest(effective)
+
+
 def _normalize_ephemeral_launch_root(
     spec: dict,
     root: str | Path,
@@ -5161,6 +5428,13 @@ def configured_detached_launch(
                 row,
                 agent,
             )
+            row["effective_environment_sha256"] = (
+                _effective_ephemeral_environment_digest(
+                    _current_ephemeral_parent_environment(),
+                    row,
+                    recovery_environment,
+                )
+            )
         except eph.EphemeralError as recovery_error:
             return None, str(recovery_error)
         row["recovery_environment"] = recovery_environment
@@ -5311,6 +5585,9 @@ def configured_detached_launch(
             return None, resource_problem
         environment = {
             **recovery_environment,
+            "effective_environment_sha256": row.get(
+                "effective_environment_sha256"
+            ),
             "supervisor_json_env_keys": env_keys,
         }
     else:
@@ -10539,13 +10816,22 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
 def prepare_launch_request(store: Store, state: dict, config: dict, request_id: str,
                            *, now_epoch: float, claimed_by: str = "supervisor",
                            launch_agenttalk_python: str | None = None,
-                           launch_src_on_pythonpath: bool | None = None) -> dict:
+                           launch_src_on_pythonpath: bool | None = None,
+                           launch_parent_environment: object | None = None) -> dict:
     """Claim and prepare one queued ephemeral launch request.
 
     Side effects are deliberately before process launch and are request-id
     checked: claim marker, roster temporary identity, send the review-request,
-    persist active supervisor state, and return a fully substituted launch spec.
+    mutate the supplied active state, and return a fully substituted launch
+    spec. The caller is responsible for durably persisting that state.
     """
+    parent_environment = (
+        _current_ephemeral_parent_environment()
+        if launch_parent_environment is None
+        else _validated_ephemeral_parent_environment(
+            launch_parent_environment
+        )
+    )
     marker0 = store.read_launch_request(request_id)
     if marker0 is None:
         raise eph.EphemeralError(f"launch request {request_id!r} is absent")
@@ -10739,6 +11025,13 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
             agent,
             launch_agenttalk_python=launch_agenttalk_python,
             launch_src_on_pythonpath=launch_src_on_pythonpath,
+        )
+        spec["effective_environment_sha256"] = (
+            _effective_ephemeral_environment_digest(
+                parent_environment,
+                spec,
+                spec["recovery_environment"],
+            )
         )
         review_request_sha256 = eph.effective_review_request_digest(msg)
         effective_launch_binding = eph.make_effective_launch_binding(
@@ -11766,6 +12059,64 @@ $WrapperLogEnvKeys = @(
   'AGENTTALK_WRAPPER_LOG_NONCE'
 )
 
+if (-not ('AgenttalkSupervisorEnvironmentNative' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class AgenttalkSupervisorEnvironmentNative {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr GetEnvironmentStringsW();
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool FreeEnvironmentStringsW(IntPtr environment);
+}
+'@
+}
+
+function Get-SupervisorEnvironmentCapture {
+  # PowerShell 5.1's ordinary hashtable comparer aliases distinct Windows
+  # environment names such as ASCII K and the Kelvin sign. The .NET environment
+  # dictionary also omits Win32's inherited per-drive entries (=C:, etc.). Read
+  # the raw block so the digest covers every entry the child actually inherits.
+  $values = [Collections.Generic.Dictionary[string,string]]::new(
+    [StringComparer]::Ordinal)
+  $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+  $block = [AgenttalkSupervisorEnvironmentNative]::GetEnvironmentStringsW()
+  if ($block -eq [IntPtr]::Zero) {
+    return [pscustomobject]@{ status = 'invalid'; values = $null }
+  }
+  $freeSucceeded = $false
+  try {
+    $offset = 0
+    while ($true) {
+      $entry = [Runtime.InteropServices.Marshal]::PtrToStringUni(
+        [IntPtr]::Add($block, $offset * 2))
+      if ($entry.Length -eq 0) { break }
+      $offset += $entry.Length + 1
+      $separator = $entry.IndexOf('=', 1)
+      if ($separator -lt 1) {
+        return [pscustomobject]@{ status = 'invalid'; values = $null }
+      }
+      $name = $entry.Substring(0, $separator)
+      $value = $entry.Substring($separator + 1)
+      [void]$strictUtf8.GetBytes($name)
+      [void]$strictUtf8.GetBytes($value)
+      $values.Add($name, $value)
+    }
+  } catch {
+    return [pscustomobject]@{ status = 'invalid'; values = $null }
+  } finally {
+    $freeSucceeded = (
+      [AgenttalkSupervisorEnvironmentNative]::FreeEnvironmentStringsW($block))
+  }
+  if (-not $freeSucceeded) {
+    return [pscustomobject]@{ status = 'invalid'; values = $null }
+  }
+  return [pscustomobject]@{ status = 'valid'; values = $values }
+}
+
 function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }
 function Assert-ActionsEnabled([string]$what) {
   if (Actions-Enabled) { return $true }
@@ -11961,6 +12312,11 @@ public static class AgenttalkSupervisorNativeV2 {
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int CompareStringOrdinal(
+        string left, int leftLength, string right, int rightLength,
+        [MarshalAs(UnmanagedType.Bool)] bool ignoreCase);
 }
 '@
 }
@@ -13857,8 +14213,10 @@ function Launch($name, $plan, $codexHome) {
   # then RESTORE the supervisor's own env. The in-sandbox agent reaches the bus
   # via the explicit AGENTTALK_PY pin; AGENTTALK_PYTHON remains supervisor-only
   # for the .agenttalk/bin shim.
-  $saved = @{}
-  $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
+  $saved = [hashtable]::new([StringComparer]::Ordinal)
+  $applied = [hashtable]::new([StringComparer]::Ordinal)
+  $applied['AGENTTALK_ROOT'] = $Root
+  $applied['AGENTTALK_PY'] = $AgenttalkPython
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
   # Deliberately case-insensitive - see Start-WrapperProcess's own $window
@@ -13867,7 +14225,11 @@ function Launch($name, $plan, $codexHome) {
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
   foreach ($reserved in $WrapperLogEnvKeys) {
-    $null = $applied.Remove($reserved)
+    foreach ($candidate in @($applied.Keys)) {
+      $comparison = [AgenttalkSupervisorNativeV2]::CompareStringOrdinal(
+        [string]$candidate, -1, $reserved, -1, $true)
+      if ($comparison -in @(0, 2)) { $null = $applied.Remove($candidate) }
+    }
     $applied[$reserved] = $null
   }
   if ($null -ne $logTargets) {
@@ -13986,9 +14348,27 @@ function Launch-Spec($name, $spec, $codexHome) {
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
   } else { $null }
-  $saved = @{}
-  $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
-  if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+  $saved = [hashtable]::new([StringComparer]::Ordinal)
+  $applied = [hashtable]::new([StringComparer]::Ordinal)
+  $applied['AGENTTALK_ROOT'] = $Root
+  $applied['AGENTTALK_PY'] = $AgenttalkPython
+  $launchParentPythonPath = $env:PYTHONPATH
+  $restoreShimPythonPath = $false
+  if ($env:AGENTTALK_SHIM_ACTIVE -eq '1') {
+    if ($env:AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT -eq '1') {
+      $launchParentPythonPath = $null
+      $restoreShimPythonPath = $true
+    } elseif ($null -ne [Environment]::GetEnvironmentVariable(
+        'AGENTTALK_SHIM_PARENT_PYTHONPATH')) {
+      $launchParentPythonPath = $env:AGENTTALK_SHIM_PARENT_PYTHONPATH
+      $restoreShimPythonPath = $true
+    }
+  }
+  if ($SrcOnPyPath) {
+    $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $launchParentPythonPath
+  } elseif ($restoreShimPythonPath) {
+    $applied['PYTHONPATH'] = $launchParentPythonPath
+  }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }
   # Deliberately case-insensitive - see Start-WrapperProcess's own $window
   # switch: this value feeds the same -WindowStyle enum parameter, whose
@@ -14005,7 +14385,11 @@ function Launch-Spec($name, $spec, $codexHome) {
     $applied[$controllerKey] = $null
   }
   foreach ($reserved in $WrapperLogEnvKeys) {
-    $null = $applied.Remove($reserved)
+    foreach ($candidate in @($applied.Keys)) {
+      $comparison = [AgenttalkSupervisorNativeV2]::CompareStringOrdinal(
+        [string]$candidate, -1, $reserved, -1, $true)
+      if ($comparison -in @(0, 2)) { $null = $applied.Remove($candidate) }
+    }
     $applied[$reserved] = $null
   }
   if ($null -ne $logTargets) {
@@ -14346,11 +14730,24 @@ $pollNum = 0
       }
       'ephemeral_launch' {
         if (-not (Assert-ActionsEnabled ("prepare-launch-request {0}" -f $rid))) { continue }
-        $prepText = & $AgenttalkCmd --root $Root supervise --prepare-launch-request `
+        $prepEnvironmentCapture = Get-SupervisorEnvironmentCapture
+        if ($prepEnvironmentCapture.status -cne 'valid') {
+          Write-Warning (
+            "supervisor: launch-request {0}: inherited environment is not " +
+            "canonically representable; NOT launching" -f $rid)
+          Wait-ForNextPoll $cfg
+          continue supervisorPoll
+        }
+        $prepEnvironmentJson = ConvertTo-Json `
+          -InputObject $prepEnvironmentCapture.values -Compress -Depth 3
+        $prepEnvironmentEnvelope = [Convert]::ToBase64String(
+          [Text.Encoding]::UTF8.GetBytes($prepEnvironmentJson))
+        $prepText = $prepEnvironmentEnvelope | & $AgenttalkCmd --root $Root supervise --prepare-launch-request `
           --request-id $rid --state-file $StatePath --now $now `
           --launch-agenttalk-python $AgenttalkPython `
           --launch-src-on-pythonpath ([string]$SrcOnPyPath).ToLowerInvariant() `
-          --supervisor-config-sha256 $cfgSha256
+          --supervisor-config-sha256 $cfgSha256 `
+          --launch-environment-stdin
         if ($LASTEXITCODE -ne 0) {
           Write-Warning ("supervisor: launch-request {0}: prepare failed; will retry/deny on a later poll" -f $rid)
           continue
