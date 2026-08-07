@@ -60,7 +60,7 @@ _SAFE_AGENT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 SUPPORTED_WRAPPER_CLIS = frozenset({"claude", "codex"})
-_EFFECTIVE_LAUNCH_BINDING_VERSION = 2
+_EFFECTIVE_LAUNCH_BINDING_VERSION = 3
 _EFFECTIVE_LAUNCH_BINDING_MAX_BYTES = 1024 * 1024
 _REVIEW_REQUEST_BINDING_FIELDS = (
     "id",
@@ -195,22 +195,18 @@ def effective_review_request_digest(message: object) -> str:
     return _bounded_canonical_sha256(projection)
 
 
-def effective_launch_environment_digest(environment: dict[str, str]) -> str:
-    """Hash the complete effective launch environment without persisting it."""
-    return _bounded_canonical_sha256(environment)
-
-
 def make_effective_launch_binding(
     marker: dict,
     spec: dict,
     *,
     review_request_sha256: str,
 ) -> dict:
-    """Bind immutable request evidence to the exact prepared launch spec.
+    """Bind immutable request evidence to the prepared launch specification.
 
     Field presence is explicit so an absent optional value never hashes as an
-    explicitly persisted null. Environment values are included in the digest
-    but are not copied into supervisor state.
+    explicitly persisted null. The specification binds configured environment
+    guidance, but not the ambient environment or what the child ultimately
+    receives.
     """
     if not isinstance(spec, dict):
         raise EphemeralError("effective launch spec evidence is unavailable")

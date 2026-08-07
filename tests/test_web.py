@@ -4192,6 +4192,13 @@ def test_console_js_thread_cache_key_single_source(tmp_path: Path) -> None:
     assert "label + ' ' + rid" not in js, "cache key must go through threadKey(), not an ad-hoc build"
 
 
+def test_console_marks_launch_environment_guidance_as_unverified() -> None:
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    source = console_js.read_text(encoding="utf-8")
+
+    assert "Launch environment guidance (child value not verified):" in source
+
+
 def test_dashboard_shell_no_inline_handlers(tmp_path: Path) -> None:
     """§1 / §6: the /dashboard console shell carries no inline <style>, no
     inline event handlers, and no style= attributes — all of which would

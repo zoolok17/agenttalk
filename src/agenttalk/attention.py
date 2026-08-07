@@ -1109,8 +1109,8 @@ def process_tree_hold_items(
         if launch is not None:
             recommendation += (
                 " After independently verifying the prior agent processes are "
-                "stopped, reproduce the listed launch environment and run the "
-                "configured argv below as a detached process."
+                "stopped, review the unverified launch-environment guidance and "
+                "run the configured argv below as a detached process."
             )
         else:
             recommendation += (

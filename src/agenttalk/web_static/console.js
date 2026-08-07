@@ -1901,7 +1901,8 @@
       if (item.configured_launch.environment) {
         body.appendChild(el(
           'code', 'tc-attn-detail',
-          'Launch environment: ' + JSON.stringify(item.configured_launch.environment)));
+          'Launch environment guidance (child value not verified): ' +
+            JSON.stringify(item.configured_launch.environment)));
       }
       if (item.configured_launch.environment_note) {
         body.appendChild(el(

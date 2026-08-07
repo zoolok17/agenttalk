@@ -724,6 +724,7 @@ def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
     assert "excludes 2 candidate identities" in plain
     assert "no scripted remedy applies in this state" in plain
     assert "configured detached launch argv" in plain
+    assert "configured launch environment guidance (child value not verified)" in plain
     assert r"C:\\Program Files\\Codex\\codex.exe" in plain
 
     supervisor_config_path = s.dir / "supervisor.json"
@@ -977,6 +978,9 @@ def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
     assert cli_item["configured_launch"] == web_item["configured_launch"]
     assert cli_item["source_hash"] == web_item["source_hash"]
     assert cli_item["configured_launch"]["cwd"] == workspace
+    note = cli_item["configured_launch"]["environment_note"]
+    assert "environment the child actually receives is not verified" in note
+    assert "neither ambient nor configured values are guaranteed" in note
     argv = cli_item["configured_launch"]["argv"]
     assert argv[argv.index("--for") + 1] == agent
     assert argv[argv.index("--to-request") + 1] == request_id

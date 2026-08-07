@@ -17,6 +17,29 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ---
 
+## P1 · PLANNED — exact child-environment proof across supported PowerShell hosts (2026-08-07)
+
+**What.** Detached ephemeral recovery currently binds the prepared request,
+marker-derived substitutions, argv, working directory, and configured launch
+profile, but it does not verify the environment the child actually receives.
+The operator surfaces state that limitation explicitly.
+
+**Why.** Three implementations that appeared internally consistent failed at
+the real process boundary. The tested preferred PowerShell 7 host dropped
+hidden per-drive entries between the parent and native child, while Windows
+PowerShell 5.1 cannot represent an admitted empty-string value through its
+environment provider even though the Windows process environment can.
+Capture-and-digest agreement inside the parent therefore does not prove child
+delivery.
+
+**Disposition.** `PLANNED`. Any future design must cross a real native child
+boundary on both supported PowerShell editions and cover hidden entries, empty
+values, Unicode-distinct names, collision behavior, configured overrides, and
+restoration. Until that evidence exists, do not describe the detached remedy as
+bound to an exact inherited or effective child environment.
+
+---
+
 ## P2 · KNOWN LIMITATION — PowerShell artifact launch/refresh residuals (2026-07-15)
 
 **What.** v0.78.0 validates the selected PowerShell Core host at claim time and

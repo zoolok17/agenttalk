@@ -78,7 +78,8 @@ Assume a local caller can:
   source;
 - know and supply hidden PID/start, phase, artifact-generation, and path values;
 - start the selected PowerShell binary;
-- set the inherited, supervisor-only `AGENTTALK_PYTHON` interpreter override;
+- set the inherited `AGENTTALK_PYTHON` shim interpreter selector, which is not
+  launch authority;
 - invoke `python -m agenttalk`, an installed `agenttalk.exe`, or the public
   generated `agenttalk.cmd` shim from an interactive shell or another script;
 - create or remove `supervisor.kill`; and
@@ -247,7 +248,7 @@ information class, or PEB offsets.
 
 The generated `supervisor.ps1` always invokes
 `.agenttalk/bin/agenttalk.cmd`. The batch file runs `-m agenttalk` with the
-inherited supervisor-only `AGENTTALK_PYTHON` override when present, otherwise
+inherited `AGENTTALK_PYTHON` shim interpreter override when present, otherwise
 with its baked interpreter fallback. The override is an existing supported
 operator contract and is retained; choosing it does not grant write authority
 without all other launch checks. Therefore the only accepted launcher-role

@@ -341,6 +341,12 @@ two parallel ownership concepts.
   carries an explicit `barrier_state`, so it never fakes a launch or consumes a pending
   manual-restart request. `doctor` also warns about a stale generated `supervisor.ps1`
   that predates the per-project singleton lock.
+- **Detached refusal guidance (v0.82.0):** for an active ephemeral request, the
+  displayed argv is bound to the durable prepared request, marker-derived
+  substitutions, working directory, and unchanged configured launch profile.
+  Environment metadata is deliberately advisory: it neither binds the ambient
+  environment nor proves what the child receives, and the operator-facing text
+  says so explicitly.
 
 ### 4.7 Supporting modules
 - `signing.py` — optional HMAC message signing (constant-time, length-floored);

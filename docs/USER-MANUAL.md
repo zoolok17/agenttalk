@@ -603,6 +603,13 @@ normal fail-closed adoption.
    supervisor. The next launch must earn a fresh wrapper generation and
    complete tree before automatic teardown is available.
 
+When Attention shows a configured detached launch for a refusal, an active
+ephemeral launch is bound to its prepared request, marker-derived
+substitutions, argv, working directory, and unchanged configured launch
+profile. The listed environment is guidance only: agenttalk does not verify the
+environment that the child actually receives, so the operator must review both
+ambient and configured values before launching it.
+
 Freshness is bounded against clock error: a heartbeat farther in the future
 than the configured allowance cannot make an agent healthy. The monitor's
 `supervisor-state.json` has a validated `.bak`; a corrupt primary can be read

@@ -168,6 +168,23 @@ def test_launch_record_context_bounds_pattern_bytes_without_rejecting_unicode() 
         )
 
 
+@pytest.mark.parametrize("control", ["\x7f", "\x85"], ids=["del", "c1"])
+def test_launch_record_context_rejects_del_and_c1_at_producer_and_decoder(
+    control: str,
+) -> None:
+    with pytest.raises(ValueError, match="brain pattern"):
+        _record_launch_context(brain_pattern=f"child{control}")
+
+    persisted = _record_launch_context()
+    persisted["brain_pattern"] = f"child{control}"
+    with pytest.raises(ValueError, match="agent projection"):
+        sup.decode_launch_record_context(
+            persisted,
+            agent="worker",
+            cli="codex",
+        )
+
+
 def _write_idle_wrapper_runtime(
     store: Store,
     *,
@@ -2376,19 +2393,20 @@ def test_agenttalk_shim_resolves_both_install_modes() -> None:
     assert 'AGENTTALK_PYTHON=C:\\py\\python.exe' in shim    # known python baked
     assert "src\\agenttalk\\__init__.py" in shim           # source-checkout guard
     assert "PYTHONPATH" in shim
+    assert "AGENTTALK_SHIM_PARENT" not in shim
 
 
 def test_ps_template_applies_and_restores_env() -> None:
     """The executor applies the agent env (AGENTTALK_ROOT + AGENTTALK_PY +
     PYTHONPATH-src + per-agent env + CODEX_HOME) around Start-Process and
-    RESTORES the supervisor's own env afterward. AGENTTALK_PYTHON stays
-    supervisor-only for the shim."""
+    RESTORES the supervisor's own env afterward. Launch-Spec removes the shim
+    selector while a regular configured launch preserves ambient values."""
     ps = sup.PS_TEMPLATE
     ordinal_map = "[hashtable]::new([StringComparer]::Ordinal)"
     assert ps.count(f"$applied = {ordinal_map}") == 2
     assert ps.count(f"$saved = {ordinal_map}") == 2
     assert ps.count(
-        "[AgenttalkSupervisorNativeV2]::CompareStringOrdinal("
+        "[AgenttalkSupervisorNativeV3]::CompareStringOrdinal("
     ) >= 2
     assert "$applied['AGENTTALK_ROOT'] = $Root" in ps
     assert "$applied['AGENTTALK_PY'] = $AgenttalkPython" in ps
@@ -3270,8 +3288,8 @@ def test_claude_session_args_carry_bypass_permissions_fresh_and_resume() -> None
 
 def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None:
     ps = sup.PS_TEMPLATE
-    # the agent env carries AGENTTALK_PY, while AGENTTALK_PYTHON and the
-    # .agenttalk/bin shim remain supervisor-only.
+    # The agent env carries AGENTTALK_PY. The baked AGENTTALK_PYTHON assignment
+    # remains shim-local; a regular launch may still inherit an ambient value.
     assert "$applied['AGENTTALK_ROOT'] = $Root" in ps
     assert "$applied['AGENTTALK_PY'] = $AgenttalkPython" in ps
     assert "AGENTTALK_PYTHON = $AgenttalkPython" not in ps   # not in the AGENT env
@@ -4428,15 +4446,9 @@ def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
     non_ascii = [b for b in raw if b > 0x7F]
     assert not non_ascii, f"supervisor.ps1 body must be ASCII-only; found {non_ascii[:5]}"
     text = raw.decode("ascii")
-    capture = "$prepEnvironmentCapture = Get-SupervisorEnvironmentCapture"
-    status_check = "$prepEnvironmentCapture.status -cne 'valid'"
-    serialize = "ConvertTo-Json `"
-    assert "function Get-SupervisorEnvironmentCapture" in text
-    assert capture in text
-    assert status_check in text
-    assert text.index(capture) < text.index(status_check) < text.index(serialize)
-    assert "[Convert]::ToBase64String(" in text
-    assert "--launch-environment-stdin" in text
+    assert "function Get-SupervisorEnvironmentCapture" not in text
+    assert "$prepEnvironmentCapture" not in text
+    assert "--launch-environment-stdin" not in text
     assert "--launch-agenttalk-python $AgenttalkPython" in text
     assert "--launch-src-on-pythonpath" in text
     shell = shutil.which("pwsh")
@@ -4450,84 +4462,6 @@ def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
                          capture_output=True, text=True, timeout=60)
     assert res.returncode == 0, (
         f"supervisor.ps1 failed to parse under {shell}: {res.stdout}{res.stderr}")
-
-
-def test_supervisor_environment_capture_preserves_unicode_names_on_all_hosts(
-    tmp_path: Path,
-) -> None:
-    shells = tuple(dict.fromkeys(
-        shell
-        for shell in (shutil.which("powershell"), shutil.which("pwsh"))
-        if shell is not None
-    ))
-    if not shells:
-        return
-    helper = sup.PS_TEMPLATE[
-        sup.PS_TEMPLATE.index(
-            "if (-not ('AgenttalkSupervisorEnvironmentNative'"
-        ):
-        sup.PS_TEMPLATE.index("function Actions-Enabled")
-    ]
-    output = tmp_path / "environment-capture.json"
-    script = tmp_path / "environment-capture.ps1"
-    script.write_text(
-        "\n".join([
-            "$ErrorActionPreference = 'Stop'",
-            helper,
-            "$snowName = 'AGENTTALK_CAPTURE_' + [char]0x96EA",
-            "$asciiKName = 'AGENTTALK_CAPTURE_K'",
-            "$kelvinName = 'AGENTTALK_CAPTURE_' + [char]0x212A",
-            "try {",
-            "  [Environment]::SetEnvironmentVariable($snowName, 'snow', 'Process')",
-            "  [Environment]::SetEnvironmentVariable($asciiKName, 'ascii', 'Process')",
-            "  [Environment]::SetEnvironmentVariable($kelvinName, 'kelvin', 'Process')",
-            "  $capture = Get-SupervisorEnvironmentCapture",
-            "  [pscustomobject]@{",
-            "    status = $capture.status;",
-            "    names = @($capture.values.Keys | Where-Object { $_ -like 'AGENTTALK_CAPTURE_*' });",
-            "    ascii = $capture.values[$asciiKName];",
-            "    kelvin = $capture.values[$kelvinName];",
-            "    hidden_c = $capture.values['=C:']",
-            "  } | ConvertTo-Json -Depth 3 |",
-            f"    Set-Content {_pslit(str(output))} -Encoding utf8",
-            "} finally {",
-            "  [Environment]::SetEnvironmentVariable($snowName, $null, 'Process')",
-            "  [Environment]::SetEnvironmentVariable($asciiKName, $null, 'Process')",
-            "  [Environment]::SetEnvironmentVariable($kelvinName, $null, 'Process')",
-            "}",
-        ]),
-        encoding="utf-8-sig",
-    )
-
-    for shell in shells:
-        launcher = tmp_path / "environment-capture.cmd"
-        launcher.write_text(
-            "\r\n".join([
-                "@echo off",
-                r"cd /d C:\Windows",
-                f'"{shell}" -NoProfile -File "{script}"',
-                "exit /b %errorlevel%",
-            ]),
-            encoding="utf-8",
-        )
-        result = subprocess.run(
-            [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher)],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        assert result.returncode == 0, f"{shell}: {result.stdout}{result.stderr}"
-        payload = json.loads(output.read_text(encoding="utf-8-sig"))
-        assert payload["status"] == "valid"
-        assert set(payload["names"]) == {
-            "AGENTTALK_CAPTURE_雪",
-            "AGENTTALK_CAPTURE_K",
-            "AGENTTALK_CAPTURE_K",
-        }
-        assert payload["ascii"] == "ascii"
-        assert payload["kelvin"] == "kelvin"
-        assert payload["hidden_c"].casefold() == r"c:\windows"
-
 
 def _run_supervisor_config_reader(
     tmp_path: Path,
@@ -4662,7 +4596,6 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "    wrapper_nonce = [Environment]::GetEnvironmentVariable("
         "'AGENTTALK_WRAPPER_LOG_NONCE')",
         "    python = [Environment]::GetEnvironmentVariable('AGENTTALK_PYTHON')",
-        "    shim = [Environment]::GetEnvironmentVariable('AGENTTALK_SHIM_ACTIVE')",
         "  }",
         "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; Redirected = $false }",
         "}",
@@ -4670,10 +4603,7 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "$env:AGENTTALK_P1A_A = 'old-a'",
         "$env:AGENTTALK_P1A_B = 'old-b'",
         "$env:AGENTTALK_PYTHON = 'controller-only'",
-        "$env:AGENTTALK_SHIM_ACTIVE = '1'",
-        "$env:AGENTTALK_SHIM_PARENT_PYTHONPATH = 'ORIGINAL'",
-        "$env:AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT = $null",
-        "$env:PYTHONPATH = (Join-Path $Root 'src') + ';ORIGINAL'",
+        "$env:PYTHONPATH = 'ORIGINAL'",
         "$profileEnv = [pscustomobject]@{}",
         "$profileEnv | Add-Member -NotePropertyName 'AGENTTALK_P1A_*' -NotePropertyValue 'literal-new'",
         "$profileEnv | Add-Member -NotePropertyName 'AGENTTALK_P1A_A' -NotePropertyValue 'new-a'",
@@ -4704,10 +4634,6 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "  window_style = 'Hidden'; window_style_warning = $null",
         "}",
         "$null = Launch 'reviewer' $plan $null",
-        "$null = Launch-Spec 'reviewer' $spec $null",
-        "$env:AGENTTALK_SHIM_PARENT_PYTHONPATH = $null",
-        "$env:AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT = '1'",
-        "$env:PYTHONPATH = (Join-Path $Root 'src')",
         "$null = Launch-Spec 'reviewer' $spec $null",
         "[pscustomobject]@{",
         "  inside = $script:inside;",
@@ -4744,20 +4670,16 @@ def test_ephemeral_launcher_applies_environment_names_literally(
             "long_s": "long-s",
         }
         inside = payload["inside"]
-        assert len(inside) == 3
+        assert len(inside) == 2
         for row in inside:
             for key, value in common.items():
                 assert row[key] == value
             assert re.fullmatch(r"[0-9a-f]{32}", row["wrapper_nonce"])
             assert row["wrapper_nonce"] != "configured-alias"
         src_path = str(tmp_path / "src")
-        assert inside[0]["pythonpath"] == f"{src_path};{src_path};ORIGINAL"
-        assert inside[1]["pythonpath"] == f"{src_path};ORIGINAL"
-        assert inside[2]["pythonpath"] == f"{src_path};"
+        assert all(row["pythonpath"] == f"{src_path};ORIGINAL" for row in inside)
         assert inside[0]["python"] == "controller-only"
-        assert inside[0]["shim"] == "1"
         assert all(row["python"] is None for row in inside[1:])
-        assert all(row["shim"] is None for row in inside[1:])
         assert payload["after_a"] == "old-a"
         assert payload["after_b"] == "old-b"
         assert payload["after_wildcard"] is None
@@ -7808,6 +7730,195 @@ _CONFIRM_WRAPPER_LOG_TARGET_PS = (
 
 def _pslit(v: str) -> str:
     return "'" + str(v).replace("'", "''") + "'"
+
+
+@pytest.mark.parametrize(
+    "shell",
+    _windows_powershell_hosts(),
+    ids=lambda value: Path(value).stem if value else "unavailable",
+)
+@pytest.mark.parametrize("launcher", ["Launch", "Launch-Spec"])
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["second-before-write", "empty-after-write"],
+)
+def test_launch_environment_apply_failure_restores_parent_without_spawn(
+    tmp_path: Path,
+    shell: str | None,
+    launcher: str,
+    failure_mode: str,
+) -> None:
+    if shell is None:
+        pytest.skip("Windows PowerShell hosts are unavailable")
+    helpers = _exec_helpers(tmp_path)
+    launchers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# Console action log")
+    ]
+    output = tmp_path / "environment-rollback.json"
+    script = tmp_path / "environment-rollback.ps1"
+    invoke = (
+        "$null = Launch 'reviewer' $plan $null"
+        if launcher == "Launch"
+        else "$null = Launch-Spec 'reviewer' $spec $null"
+    )
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$Root = {_pslit(str(tmp_path))}",
+            "$AgenttalkPython = 'python.exe'",
+            "$SrcOnPyPath = $true",
+            "$WrapperLogMaxBytes = 1024",
+            "$WrapperLogSegments = 2",
+            "$WrapperLogEnvKeys = @(",
+            "  'AGENTTALK_WRAPPER_STDOUT_LOG',",
+            "  'AGENTTALK_WRAPPER_STDERR_LOG',",
+            "  'AGENTTALK_WRAPPER_LOG_MAX_BYTES',",
+            "  'AGENTTALK_WRAPPER_LOG_SEGMENTS',",
+            "  'AGENTTALK_WRAPPER_LOG_NONCE')",
+            helpers,
+            "$script:discardCount = 0",
+            "function New-WrapperLogTargets($name, $nonce) {",
+            "  return [pscustomobject]@{ stdout = 'stdout.log'; stderr = 'stderr.log' }",
+            "}",
+            "function Discard-PendingWrapperLogTargets($targets) {",
+            "  $script:discardCount += 1",
+            "}",
+            "function Proc-Start($id) { return '1' }",
+            "function Quote-Arg([string]$arg) { return $arg }",
+            "$script:spawnCount = 0",
+            "function Start-WrapperProcess($startArgs) {",
+            "  $script:spawnCount += 1",
+            "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; Redirected = $false }",
+            "}",
+            launchers,
+            "$profileEnv = [pscustomobject]@{",
+            "  AGENTTALK_FAILURE_PRESENT = 'during-present';",
+            "  AGENTTALK_FAILURE_ABSENT = 'during-absent';",
+            "  AGENTTALK_FAILURE_EMPTY = 'during-empty'",
+            "}",
+            "$spec = [pscustomobject]@{",
+            "  cli = 'codex'; cwd = $Root; env = $profileEnv;",
+            "  window_style = 'Hidden'; window_style_warning = $null;",
+            "  launch = [pscustomobject]@{",
+            "    windows_file = 'python.exe';",
+            "    windows_args = @('-m','agenttalk','--root',$Root,'wrap','--for',",
+            "      'reviewer','--cli','codex','--loop','--one-shot','--to-request',",
+            "      'lr-rollback','--','codex.exe')",
+            "  }",
+            "}",
+            "$cfg = [pscustomobject]@{ agents = [pscustomobject]@{} }",
+            "$agentConfig = [pscustomobject]@{",
+            "  cli = 'codex'; wrapped = $true; cwd = $Root; env = $profileEnv;",
+            "  launch = $spec.launch",
+            "}",
+            "$cfg.agents | Add-Member -NotePropertyName 'reviewer' -NotePropertyValue $agentConfig",
+            "$plan = [pscustomobject]@{",
+            "  launch_mode = 'wrap'; session_id = $null; session_args = @();",
+            "  window_style = 'Hidden'; window_style_warning = $null",
+            "}",
+            "$names = @(",
+            "  'AGENTTALK_ROOT', 'AGENTTALK_PY', 'PYTHONPATH',",
+            "  'AGENTTALK_NO_CHILD_WINDOW', 'AGENTTALK_FAILURE_PRESENT',",
+            "  'AGENTTALK_FAILURE_ABSENT', 'AGENTTALK_FAILURE_EMPTY',",
+            "  'AGENTTALK_PYTHON',",
+            "  'AGENTTALK_SHIM_ACTIVE', 'AGENTTALK_SHIM_PARENT_PYTHONPATH',",
+            "  'AGENTTALK_SHIM_PARENT_PYTHONPATH_ABSENT',",
+            "  'AGENTTALK_WRAPPER_STDOUT_LOG', 'AGENTTALK_WRAPPER_STDERR_LOG',",
+            "  'AGENTTALK_WRAPPER_LOG_MAX_BYTES', 'AGENTTALK_WRAPPER_LOG_SEGMENTS',",
+            "  'AGENTTALK_WRAPPER_LOG_NONCE')",
+            "foreach ($name in $names) {",
+            "  if ($name -eq 'AGENTTALK_FAILURE_ABSENT') {",
+            "    [Environment]::SetEnvironmentVariable($name, $null, 'Process')",
+            "  } elseif ($name -eq 'AGENTTALK_FAILURE_EMPTY') {",
+            "    $null = [AgenttalkSupervisorNativeV3]::DeleteEnvironmentVariable($name)",
+            "    if (-not [AgenttalkSupervisorNativeV3]::SetEmptyEnvironmentVariable($name)) {",
+            "      throw 'failed to seed an empty process-environment value'",
+            "    }",
+            "  } else {",
+            "    [Environment]::SetEnvironmentVariable($name, ('before-' + $name), 'Process')",
+            "  }",
+            "}",
+            "function Get-EnvironmentSnapshot {",
+            "  $snapshot = [ordered]@{}",
+            "  foreach ($name in $names) {",
+            "    $state = [AgenttalkSupervisorNativeV3]::ReadEnvironmentVariable($name)",
+            "    $snapshot[$name] = [ordered]@{ present = $state.Present; value = $state.Value }",
+            "  }",
+            "  return $snapshot",
+            "}",
+            "$before = Get-EnvironmentSnapshot",
+            f"$failureMode = {_pslit(failure_mode)}",
+            "$script:environmentOperation = 0",
+            "$script:injected = $false",
+            "function Set-Item {",
+            "  [CmdletBinding()] param([string]$LiteralPath, $Value)",
+            "  if ($LiteralPath -like 'Env:*') {",
+            "    $script:environmentOperation += 1",
+            "    if (-not $script:injected -and",
+            "        $failureMode -eq 'empty-after-write' -and",
+            "        $LiteralPath -eq 'Env:AGENTTALK_FAILURE_EMPTY') {",
+            "      Microsoft.PowerShell.Management\\Set-Item @PSBoundParameters",
+            "      $script:injected = $true",
+            "      throw 'injected environment application failure after empty write'",
+            "    }",
+            "    if (-not $script:injected -and",
+            "        $failureMode -eq 'second-before-write' -and",
+            "        $script:environmentOperation -eq 2) {",
+            "      $script:injected = $true",
+            "      throw 'injected environment application failure'",
+            "    }",
+            "  }",
+            "  Microsoft.PowerShell.Management\\Set-Item @PSBoundParameters",
+            "}",
+            "function Remove-Item {",
+            "  [CmdletBinding()] param([string]$LiteralPath)",
+            "  if ($LiteralPath -like 'Env:*') {",
+            "    $script:environmentOperation += 1",
+            "    if (-not $script:injected -and",
+            "        $failureMode -eq 'second-before-write' -and",
+            "        $script:environmentOperation -eq 2) {",
+            "      $script:injected = $true",
+            "      throw 'injected environment application failure'",
+            "    }",
+            "  }",
+            "  Microsoft.PowerShell.Management\\Remove-Item @PSBoundParameters",
+            "}",
+            "$caught = $false",
+            "try {",
+            f"  {invoke}",
+            "} catch {",
+            "  $caught = $true",
+            "}",
+            "$after = Get-EnvironmentSnapshot",
+            "[pscustomobject]@{",
+            "  injected = $script:injected; caught = $caught;",
+            "  spawn_count = $script:spawnCount; discard_count = $script:discardCount;",
+            "  before = $before; after = $after",
+            "} | ConvertTo-Json -Depth 5 | ",
+            f"  Set-Content {_pslit(str(output))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(output.read_text(encoding="utf-8-sig"))
+    assert payload["before"]["AGENTTALK_FAILURE_EMPTY"] == {
+        "present": True,
+        "value": "",
+    }
+    assert payload["injected"] is True
+    assert payload["caught"] is True
+    assert payload["spawn_count"] == 0
+    assert payload["discard_count"] == 1
+    assert payload["after"] == payload["before"]
 
 
 # Shared test data for the cross-language agreement contract (PR 98

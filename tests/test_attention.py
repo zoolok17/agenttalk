@@ -1381,13 +1381,6 @@ def _refresh_ephemeral_launch_binding(
         spec,
         agent,
     )
-    spec["effective_environment_sha256"] = (
-        sup._effective_ephemeral_environment_digest(  # noqa: SLF001
-            sup._current_ephemeral_parent_environment(),  # noqa: SLF001
-            spec,
-            spec["recovery_environment"],
-        )
-    )
     existing = eph.validate_effective_launch_binding(
         row.get("effective_launch_binding")
     )
@@ -1560,7 +1553,14 @@ def test_ephemeral_hold_without_current_store_config_is_unavailable(
     [
         [],
         {
-            "schema_version": 3,
+            "schema_version": 4,
+            "algorithm": "sha256",
+            "request_sha256": "a" * 64,
+            "launch_sha256": "b" * 64,
+            "review_request_sha256": "c" * 64,
+        },
+        {
+            "schema_version": 2,
             "algorithm": "sha256",
             "request_sha256": "a" * 64,
             "launch_sha256": "b" * 64,
@@ -1581,14 +1581,14 @@ def test_ephemeral_hold_without_current_store_config_is_unavailable(
             "review_request_sha256": "c" * 64,
         },
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "algorithm": "sha256",
             "request_sha256": "not-a-digest",
             "launch_sha256": "b" * 64,
             "review_request_sha256": "c" * 64,
         },
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "algorithm": "sha256",
             "request_sha256": "a" * 64,
             "launch_sha256": "b" * 64,
@@ -1596,7 +1596,7 @@ def test_ephemeral_hold_without_current_store_config_is_unavailable(
             "unexpected": True,
         },
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "algorithm": "sha256",
             "request_sha256": "a" * 64,
             "launch_sha256": "b" * 64,
@@ -1605,6 +1605,7 @@ def test_ephemeral_hold_without_current_store_config_is_unavailable(
     ids=[
         "non-object",
         "unknown-version",
+        "intermediate-environment-bound-version",
         "bool-version",
         "float-version",
         "bad-digest",
@@ -1701,18 +1702,10 @@ def test_ephemeral_hold_rejects_effective_launch_evidence_drift(
     )
 
 
-def test_ephemeral_hold_binds_complete_inherited_environment(
+def test_ephemeral_hold_does_not_claim_or_bind_ambient_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    parent_environment = sup._current_ephemeral_parent_environment()  # noqa: SLF001
-    parent_environment["ANTHROPIC_API_KEY"] = "prepared-secret-a"
-    parent_environment["=C:"] = r"C:\prepared-drive-cwd"
-    monkeypatch.setattr(
-        sup,
-        "_current_ephemeral_parent_environment",
-        lambda: dict(parent_environment),
-    )
     request_id, _agent, row, marker, config = (
         _ephemeral_launch_attention_fixture(tmp_path)
     )
@@ -1733,30 +1726,20 @@ def test_ephemeral_hold_binds_complete_inherited_environment(
     )[0]
     assert "configured_launch" in admitted
     environment = admitted["configured_launch"]["environment"]
-    assert len(environment["effective_environment_sha256"]) == 64
-    assert "prepared-secret-a" not in json.dumps(admitted, sort_keys=True)
+    assert "effective_environment_sha256" not in environment
+    note = admitted["configured_launch"]["environment_note"]
+    assert "environment the child actually receives is not verified" in note
+    assert "neither ambient nor configured values are guaranteed" in note
 
-    parent_environment["ANTHROPIC_API_KEY"] = "drifted-secret-b"
-    refused = att.process_tree_hold_items(
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-drift-is-not-bound")
+    still_admitted = att.process_tree_hold_items(
         {"ephemeral_reviewers": {"active": {request_id: row}}},
         **kwargs,
     )[0]
-    assert "configured_launch" not in refused
-    assert refused["configured_launch_unavailable"] == (
-        "the prepared effective launch binding no longer matches current "
-        "request and profile evidence"
-    )
-
-    parent_environment["ANTHROPIC_API_KEY"] = "prepared-secret-a"
-    parent_environment["=C:"] = r"C:\drifted-drive-cwd"
-    refused_hidden_drive = att.process_tree_hold_items(
-        {"ephemeral_reviewers": {"active": {request_id: row}}},
-        **kwargs,
-    )[0]
-    assert "configured_launch" not in refused_hidden_drive
-    assert refused_hidden_drive["configured_launch_unavailable"] == (
-        "the prepared effective launch binding no longer matches current "
-        "request and profile evidence"
+    assert still_admitted["configured_launch"] == admitted["configured_launch"]
+    assert "ambient-drift-is-not-bound" not in json.dumps(
+        still_admitted,
+        sort_keys=True,
     )
 
 
