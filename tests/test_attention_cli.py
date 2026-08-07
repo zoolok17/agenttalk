@@ -979,6 +979,8 @@ def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
     assert cli_item["source_hash"] == web_item["source_hash"]
     assert cli_item["configured_launch"]["cwd"] == workspace
     note = cli_item["configured_launch"]["environment_note"]
+    assert "reconstructed launch-effective projection" in note
+    assert "unchanged configured launch profile" not in note
     assert "environment the child actually receives is not verified" in note
     assert "neither ambient nor configured values are guaranteed" in note
     argv = cli_item["configured_launch"]["argv"]
@@ -1057,8 +1059,8 @@ def test_attention_cli_hides_ephemeral_launch_when_effective_binding_drifts(
     assert "configured_launch" not in item
     assert "configured_launch" not in web_item
     assert item["configured_launch_unavailable"] == (
-        "the prepared effective launch binding no longer matches current "
-        "request and profile evidence"
+        "the prepared effective launch binding no longer matches the current "
+        "request and reconstructed launch-effective projection"
     )
     assert web_item["configured_launch_unavailable"] == item[
         "configured_launch_unavailable"

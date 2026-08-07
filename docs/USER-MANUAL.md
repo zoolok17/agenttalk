@@ -604,11 +604,14 @@ normal fail-closed adoption.
    complete tree before automatic teardown is available.
 
 When Attention shows a configured detached launch for a refusal, an active
-ephemeral launch is bound to its prepared request, marker-derived
-substitutions, argv, working directory, and unchanged configured launch
-profile. The listed environment is guidance only: agenttalk does not verify the
-environment that the child actually receives, so the operator must review both
-ambient and configured values before launching it.
+ephemeral launch is bound to its prepared request's reconstructed
+launch-effective projection: the values produced after marker-derived
+substitutions, including argv and working directory. It is not bound to raw
+configured-profile identity, so an edit that produces the same effective
+values does not invalidate the binding. The listed environment is guidance
+only: agenttalk does not verify the environment that the child actually
+receives, so the operator must review both ambient and configured values before
+launching it.
 
 Freshness is bounded against clock error: a heartbeat farther in the future
 than the configured allowance cannot make an agent healthy. The monitor's

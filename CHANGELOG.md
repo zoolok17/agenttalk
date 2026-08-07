@@ -10,9 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Detached refusal guidance now states its enforceable boundary.** Active
-  ephemeral recovery argv is bound to the prepared request, marker-derived
-  substitutions, working directory, and unchanged configured launch profile.
-  The displayed environment is guidance only: the environment the child
+  ephemeral recovery argv is bound to the reconstructed launch-effective
+  projection prepared for the request, not raw configured-profile identity. A
+  profile edit that resolves to the same effective values leaves the binding
+  valid. The displayed environment is guidance only: the environment the child
   receives is not verified and must be reviewed by the operator.
 
 ### Fixed

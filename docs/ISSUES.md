@@ -19,10 +19,12 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ## P1 · PLANNED — exact child-environment proof across supported PowerShell hosts (2026-08-07)
 
-**What.** Detached ephemeral recovery currently binds the prepared request,
-marker-derived substitutions, argv, working directory, and configured launch
-profile, but it does not verify the environment the child actually receives.
-The operator surfaces state that limitation explicitly.
+**What.** Detached ephemeral recovery currently binds the prepared request and
+its reconstructed launch-effective projection, not raw configured-profile
+identity. An equivalent profile edit that produces the same effective values
+does not invalidate the binding. Recovery does not verify the environment the
+child actually receives, and the operator surfaces state that limitation
+explicitly.
 
 **Why.** Three implementations that appeared internally consistent failed at
 the real process boundary. The tested preferred PowerShell 7 host dropped

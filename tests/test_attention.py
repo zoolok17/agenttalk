@@ -1503,6 +1503,44 @@ def test_ephemeral_hold_uses_its_request_profile_for_detached_launch(
     assert "configured_launch_unavailable" not in item
 
 
+@pytest.mark.parametrize("equivalent_edit", ["cwd-root", "env-agent"])
+def test_ephemeral_hold_accepts_equivalent_effective_profile_edit(
+    tmp_path: Path,
+    equivalent_edit: str,
+) -> None:
+    request_id, agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    if equivalent_edit == "cwd-root":
+        profile["cwd"] = "{ROOT}"
+    else:
+        profile["env"] = {"BOUND_AGENT": "{AGENT}"}
+    _refresh_ephemeral_launch_binding(row, marker, config, agent)
+
+    if equivalent_edit == "cwd-root":
+        profile["cwd"] = config["_test_root"]
+    else:
+        profile["env"] = {"BOUND_AGENT": agent}
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" in item
+    assert "configured_launch_unavailable" not in item
+
+
 def test_ephemeral_hold_without_prepared_launch_binding_is_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -1697,8 +1735,8 @@ def test_ephemeral_hold_rejects_effective_launch_evidence_drift(
 
     assert "configured_launch" not in item
     assert item["configured_launch_unavailable"] == (
-        "the prepared effective launch binding no longer matches current "
-        "request and profile evidence"
+        "the prepared effective launch binding no longer matches the current "
+        "request and reconstructed launch-effective projection"
     )
 
 
@@ -1728,6 +1766,8 @@ def test_ephemeral_hold_does_not_claim_or_bind_ambient_environment(
     environment = admitted["configured_launch"]["environment"]
     assert "effective_environment_sha256" not in environment
     note = admitted["configured_launch"]["environment_note"]
+    assert "reconstructed launch-effective projection" in note
+    assert "unchanged configured launch profile" not in note
     assert "environment the child actually receives is not verified" in note
     assert "neither ambient nor configured values are guaranteed" in note
 

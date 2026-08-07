@@ -5242,7 +5242,7 @@ def configured_detached_launch(
         if current_binding != prepared_binding:
             return None, (
                 "the prepared effective launch binding no longer matches "
-                "current request and profile evidence"
+                "the current request and reconstructed launch-effective projection"
             )
         row["wrapped"] = True
     launch = row.get("launch")
@@ -5386,9 +5386,9 @@ def configured_detached_launch(
         "environment": environment,
         "environment_note": (
             (
-                "The admitted command is bound to the prepared request, "
-                "marker-derived substitutions, argv, working directory, and "
-                "unchanged configured launch profile. The environment the "
+                "The admitted command is bound to the prepared request's "
+                "reconstructed launch-effective projection, not raw "
+                "configured-profile identity. The environment the "
                 "child actually receives is not verified and must be reviewed "
                 "by the operator; neither ambient nor configured values are "
                 "guaranteed to be delivered."

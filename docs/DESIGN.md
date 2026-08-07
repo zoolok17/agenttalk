@@ -342,11 +342,13 @@ two parallel ownership concepts.
   manual-restart request. `doctor` also warns about a stale generated `supervisor.ps1`
   that predates the per-project singleton lock.
 - **Detached refusal guidance (v0.82.0):** for an active ephemeral request, the
-  displayed argv is bound to the durable prepared request, marker-derived
-  substitutions, working directory, and unchanged configured launch profile.
-  Environment metadata is deliberately advisory: it neither binds the ambient
-  environment nor proves what the child receives, and the operator-facing text
-  says so explicitly.
+  displayed argv is bound to the durable prepared request and reconstructed
+  launch-effective projection: the values produced after marker-derived
+  substitutions, including argv and working directory, rather than raw
+  configured-profile identity. Editing a profile so it produces the same
+  effective values does not invalidate the binding. Environment metadata is
+  deliberately advisory: it neither binds the ambient environment nor proves
+  what the child receives, and the operator-facing text says so explicitly.
 
 ### 4.7 Supporting modules
 - `signing.py` — optional HMAC message signing (constant-time, length-floored);
