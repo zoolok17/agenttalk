@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Read-only, exact-SHA release-candidate provenance with custody of the tested
+  packages** (#128). An explicit master dispatch now re-runs the full 12-leg
+  gate and CodeQL at the named post-bump commit, keeps the canonical gate-built
+  wheel and sdist instead of discarding them, and publishes one bounded artifact
+  containing every raw gate record, a run-attempt receipt, package/evidence
+  digests, and a provenance manifest. Missing, stale, and differently SHA-bound
+  evidence refuse with distinct codes. This first increment cannot tag or
+  publish; those irreversible actions remain manual until the evidence path has
+  proven itself on a real candidate.
+
 ## [0.81.0] - 2026-08-02
 
 Theme: **the supervisor knows what it owns, and says so when it cannot.** 0.80.0 deferred three

@@ -942,11 +942,24 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   (or record an explicit no-architecture-change note in the release evidence);
   **append a `docs/ASSURANCE.md` ledger entry attesting the release is
   GOOD/ROBUST/SECURE with its evidence (reviewer verdicts on the final SHA,
-  lead-gate result on 3.10+3.14, CI status, adversarial-pass outcome, any new
-  known-limitation)**; update README install pins; commit via `git commit -F`
-  (never `-m` for multi-line — PowerShell native-arg trap); tag; push; `gh release
-  create`; watch CI. A release that cannot truthfully carry that assurance entry
-  does not ship.
+  local lead-gate result on 3.10+3.14, CI status across 3.10-3.13,
+  adversarial-pass outcome, any new
+  known-limitation)**; update every documented install pin and baseline, and
+  regenerate the shipped new-user PDF; then commit via
+  `git commit -F` (never `-m` for multi-line — PowerShell native-arg trap).
+  Before tagging, an operator explicitly dispatches `release-provenance.yml`
+  from `master` with that exact 40-character post-bump SHA and version. The
+  read-only workflow refuses a moving/different SHA or partial rerun, repeats
+  the full gate and CodeQL at the named commit, and retains the exact canonical
+  wheel/sdist bytes beside all raw gate evidence and their digests. Increment 1
+  creates no tag or release and has no content/package/release mutation
+  permission (CodeQL retains its scoped `security-events: write`); after a human inspects
+  that evidence, tagging, pushing, and `gh release create` remain manual.
+  This repository has one human operator, so the later deliberate action is a
+  **temporal double-check**, not separation of duties or two-party control. A
+  username allowlist in workflow YAML would not create an authority boundary.
+  A release that cannot truthfully carry its assurance entry and exact-SHA
+  provenance does not ship.
 - **We dogfood the assurance arc on ourselves:** our own work is reviewed and
   gated by the same gate/close/evidence machinery this tool provides.
 

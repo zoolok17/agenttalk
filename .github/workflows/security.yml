@@ -8,11 +8,17 @@ on:
   schedule:
     - cron: '17 9 * * 1'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Exact post-bump commit to scan; empty only for the ordinary CI triggers.
+        required: true
+        type: string
 
 # See the matching block in tests.yml. master is exempt from cancellation so a
 # release-gating run is never killed by a following push.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: security-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 permissions:
@@ -31,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
           persist-credentials: false
       - uses: github/codeql-action/init@78ed0c7291d93e40c51b085850dc669a4c3ab73b  # v3
         with:

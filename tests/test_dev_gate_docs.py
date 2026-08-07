@@ -57,3 +57,28 @@ def test_dev_gate_reference_and_manifest_are_shipped_in_the_sdist() -> None:
     assert Path("dev-gate.json").is_file()
     assert Path("dev-gate-requirements.txt").is_file()
     assert Path("docs/DEV-GATE.md").is_file()
+
+
+def test_release_candidate_docs_preserve_read_only_authority_and_distinct_refusals() -> None:
+    reference = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
+    manual = Path("docs/AGENT-MANUAL.md").read_text(encoding="utf-8")
+    design = Path("docs/DESIGN.md").read_text(encoding="utf-8")
+
+    for refusal in (
+        "release_evidence_missing",
+        "release_evidence_stale",
+        "release_evidence_sha_mismatch",
+    ):
+        assert refusal in reference
+    assert "exact wheel and sdist" in reference
+    assert "90-day retention is a requested ceiling" in reference
+    assert "creates no tag, GitHub Release, or package publication" in reference
+    assert "AGENTTALK-NEW-USER-MANUAL.pdf" in reference
+    assert "carrier digest mismatch" in reference
+    assert "artifact file set differs from SHA256SUMS" in reference
+    assert "$ErrorActionPreference = 'Stop'" in reference
+    assert "security-events: write" in reference
+    assert "release-provenance.yml" in manual
+    assert "manually tagging" in manual
+    assert "temporal double-check" in design
+    assert "not separation of duties or two-party control" in design
