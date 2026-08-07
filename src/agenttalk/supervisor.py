@@ -11225,13 +11225,24 @@ function Get-SafeWrapperLogAgentDir(
   [string]$name,
   [bool]$create
 ) {
+  # #113 review, round 5 sweep: allowlisted as a whole rather than
+  # converted. The enclosing try/catch already returns $null on ANY
+  # failure here (fail-closed at the function boundary, which every
+  # caller already treats as "could not resolve, mark uncertain and
+  # continue" per the round-4/5 fixes to Get-NextWrapperLogSequence and
+  # Invoke-WrapperLogRetentionPrune). Converting these internal checks
+  # to the shared classifiers would not change that guarantee - it is
+  # already provided - while this function is the single most
+  # heavily-used entry point in the file (every scan/prune/allocate call
+  # goes through it), making a restructure here the highest-risk,
+  # lowest-behavioral-gain conversion candidate in the sweep.
   try {
-    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {  # wrapper-log-raw-primitive: allowlisted with the function, see comment above
       if (-not $create) { return $null }
       $null = New-Item -ItemType Directory -Path $candidate -Force -ErrorAction Stop
     }
-    $rootItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
-    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    $rootItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop  # wrapper-log-raw-primitive: allowlisted with the function, see comment above
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {  # wrapper-log-raw-primitive: allowlisted with the function, see comment above
       Write-Warning (
         "supervisor: refusing wrapper-log root with a reparse point: '{0}'" -f
         $candidate)
@@ -11239,10 +11250,10 @@ function Get-SafeWrapperLogAgentDir(
     }
 
     $agentDir = Join-Path $candidate $name
-    if (Test-Path -LiteralPath $agentDir) {
-      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop
-      if ((-not $agentItem.PSIsContainer) -or
-          (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    if (Test-Path -LiteralPath $agentDir) {  # wrapper-log-raw-primitive: allowlisted with the function, see comment above
+      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop  # wrapper-log-raw-primitive: allowlisted with the function, see comment above
+      if ((-not $agentItem.PSIsContainer) -or  # wrapper-log-raw-primitive: allowlisted with the function, see comment above
+          (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {  # wrapper-log-raw-primitive: allowlisted with the function, see comment above
         Write-Warning (
           "supervisor: refusing unsafe wrapper-log agent path: '{0}'" -f
           $agentDir)
@@ -11250,8 +11261,8 @@ function Get-SafeWrapperLogAgentDir(
       }
     } elseif ($create) {
       $null = New-Item -ItemType Directory -Path $agentDir -ErrorAction Stop
-      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop
-      if (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop  # wrapper-log-raw-primitive: allowlisted with the function, see comment above
+      if (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {  # wrapper-log-raw-primitive: allowlisted with the function, see comment above
         Write-Warning (
           "supervisor: refusing unsafe wrapper-log agent path: '{0}'" -f
           $agentDir)
@@ -11303,8 +11314,11 @@ function Test-WrapperLogMarkerPresence([string]$path) {
   # access-denied/disconnected into $false exactly like Python's
   # .exists() does. A marker that cannot be read is not a marker that is
   # not there (#113 review, round 3).
+  # #113 review, round 5 sweep: every primitive access in this function
+  # is allowlisted, not converted - this function IS the shared
+  # classifier; primitive access is its entire purpose.
   try {
-    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop  # wrapper-log-raw-primitive: this is the classifier itself
   } catch [System.Management.Automation.ItemNotFoundException] {
     return 'absent'
   } catch {
@@ -11315,8 +11329,32 @@ function Test-WrapperLogMarkerPresence([string]$path) {
   # some filesystem object occupies the name. A directory or a
   # reparse/symlink point placed where a marker is expected must not
   # read as present.
-  if ($item.PSIsContainer -or
-      (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+  if ($item.PSIsContainer -or  # wrapper-log-raw-primitive: this is the classifier itself
+      (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {  # wrapper-log-raw-primitive: this is the classifier itself
+    return 'unusable'
+  }
+  return 'present'
+}
+function Test-WrapperLogDirectoryPresence([string]$path) {
+  # Same closed-outcome discipline as Test-WrapperLogMarkerPresence
+  # (mirrors _scan_path in wrapper_logs.py), for a directory rather than
+  # a marker leaf: only a confirmed missing item is 'absent'; anything
+  # else this cannot tell, INCLUDING a successful stat of something that
+  # is not actually a directory, is 'unusable' (#113 review, round 5
+  # sweep). No ancestry walk - this answers "is this one path a plain,
+  # accessible directory," matching the sites that use it.
+  # #113 review, round 5 sweep: every primitive access in this function
+  # is allowlisted, not converted - this function IS the shared
+  # classifier; primitive access is its entire purpose.
+  try {
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop  # wrapper-log-raw-primitive: this is the classifier itself
+  } catch [System.Management.Automation.ItemNotFoundException] {
+    return 'absent'
+  } catch {
+    return 'unusable'
+  }
+  if ((-not $item.PSIsContainer) -or  # wrapper-log-raw-primitive: this is the classifier itself
+      (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {  # wrapper-log-raw-primitive: this is the classifier itself
     return 'unusable'
   }
   return 'present'
@@ -11336,8 +11374,14 @@ function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
     ((Test-WrapperLogMarkerPresence (Join-Path $generation '.sequence-uncertain')) -ne 'absent')
   $seqFile = Join-Path $generation '.sequence'
   $sequenceEntry = $null
+  # #113 review, round 5 sweep: allowlisted, not converted - this is the
+  # .sequence file's OWN reference-correct validation (mirrors
+  # _read_wrapper_log_sequence's stat.S_ISREG check on the same file in
+  # wrapper_logs.py), already wrapped in the same
+  # ItemNotFoundException/generic-catch discrimination the shared
+  # classifiers use, not a fresh raw existence probe.
   try {
-    $sequenceEntry = Get-Item -LiteralPath $seqFile -Force -ErrorAction Stop
+    $sequenceEntry = Get-Item -LiteralPath $seqFile -Force -ErrorAction Stop  # wrapper-log-raw-primitive: reference-correct, see comment above
   } catch [System.Management.Automation.ItemNotFoundException] {
     # Cannot confirm .sequence-failed is genuinely absent -> cannot confirm
     # this is a legacy generation that predates the marker system, so fail
@@ -11365,8 +11409,8 @@ function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
   $state = 'present-invalid'
   $sequence = $null
   try {
-    if ($sequenceEntry.PSIsContainer -or
-        (($sequenceEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    if ($sequenceEntry.PSIsContainer -or  # wrapper-log-raw-primitive: reference-correct, see comment above $sequenceEntry's Get-Item
+        (($sequenceEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {  # wrapper-log-raw-primitive: reference-correct, see comment above $sequenceEntry's Get-Item
       throw 'sequence record is not a plain file'
     }
     $text = [IO.File]::ReadAllText($seqFile).Trim()
@@ -11415,10 +11459,20 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
   foreach ($scanRoot in $roots) {
     try {
       $candidateAgentDir = Join-Path $scanRoot $name
-      $agentDirExists = Test-Path -LiteralPath $candidateAgentDir
+      # Routed through the shared classifier (#113 review, round 5
+      # sweep) - a real behavior change, not just a relabeling: only a
+      # CONFIRMED absence of the agent directory means there is nothing
+      # to miss. The prior Test-Path swallowed a hidden/inaccessible
+      # agent directory into "does not exist," so a real higher
+      # committed sequence sitting behind it was silently dropped
+      # without ever marking the scan uncertain - executed and
+      # confirmed: a hidden agent directory holding sequence 100 behind
+      # a visible root holding 1-5 produced next_sequence 6, uncertain
+      # FALSE, before this fix.
+      $agentDirPresence = Test-WrapperLogDirectoryPresence $candidateAgentDir
       $scanAgentDir = Get-SafeWrapperLogAgentDir $scanRoot $name $false
       if ($null -eq $scanAgentDir) {
-        if ($agentDirExists) { $uncertain = $true }
+        if ($agentDirPresence -ne 'absent') { $uncertain = $true }
         continue
       }
       foreach ($existing in @(
@@ -11584,7 +11638,13 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
         # Best-effort delete it now, while this attempt is still reachable -
         # Invoke-WrapperLogRetentionPrune is never even told about a candidate this
         # loop abandoned, so nothing downstream can ever clean it up otherwise.
-        if ($attempt -and (Test-Path -LiteralPath $attempt)) {
+        # Routed through the shared classifier (#113 review, round 5
+        # sweep). Behavior unchanged: proceeds only on a CONFIRMED
+        # present directory, exactly like Test-Path did - an ambiguous
+        # read already skipped this best-effort attempt before (safe,
+        # since Remove-Item itself is already tolerant of failure via
+        # -ErrorAction SilentlyContinue).
+        if ($attempt -and (Test-WrapperLogDirectoryPresence $attempt) -eq 'present') {
           Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
         }
         Write-Warning (
@@ -11654,7 +11714,12 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
             $_.Name -match '^[0-9]{8}T[0-9]{9}Z-[0-9a-f]{32}$'
           }
       )) {
-        if (($old.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        # #113 review, round 5 sweep: allowlisted, not converted - reads
+        # an attribute off $old, an object already retrieved by the
+        # Get-ChildItem -ErrorAction Stop above (whose own failure is
+        # caught by this loop's enclosing try/catch), not a fresh
+        # existence/type probe of its own.
+        if (($old.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {  # wrapper-log-raw-primitive: reads an already-retrieved object, see comment above
           Write-Warning (
             "supervisor: refusing to prune wrapper-log reparse point '{0}'" -f
             $old.FullName)
@@ -11662,12 +11727,15 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
         }
         # Round 4: routed through the same closed-outcome classifier as
         # Get-NextWrapperLogSequence rather than a raw Test-Path, so
-        # there is only one implementation of "what counts as
-        # committed" left to keep in sync. Behavior here is unchanged -
-        # this site already failed toward preservation on any falsy
-        # $committed (an unusable probe now resolves the same way an
-        # absent one always did) - this closes the last raw-Test-Path
-        # instance of the pattern, not a behavior change.
+        # there is only one implementation of "what counts as committed"
+        # left to keep in sync. Round 5 correction: this is NOT a
+        # zero-behavior-change consolidation, and it should not have
+        # been described that way - a directory or reparse point sitting
+        # where `.committed` is expected used to read as raw Test-Path's
+        # confident $true (present); it now correctly reads 'unusable'
+        # (not 'present'), so $committed becomes $false and that
+        # generation is preserved instead of treated as committed. A
+        # real, desirable hardening, disclosed as one.
         $committed = (Test-WrapperLogMarkerPresence (Join-Path $old.FullName '.committed')) -eq 'present'
         if (-not $committed) {
           # A crash, a launch that never reached cmd_wrap (wrap --help, a
@@ -11704,6 +11772,15 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
         $owned += [pscustomobject]@{ item = $old; sort_key = $sortKey }
       }
     } catch {
+      # #113 review, round 5: a listing that fails PARTWAY through this
+      # destructive rescan used to only warn - neither aborting nor
+      # marking the cycle uncertain, so pruning proceeded on a silently
+      # incomplete $owned view (executed and confirmed: five generations
+      # became four on an incomplete view). A scan that succeeded once
+      # does not stay true; match Get-NextWrapperLogSequence's own
+      # sibling catch immediately above in this file, which already does
+      # this correctly.
+      $sequenceUncertain = $true
       Write-Warning (
         "supervisor: cannot inspect wrapper log root '{0}' ({1})" -f
         $agentDir, $_.Exception.Message)
@@ -11752,12 +11829,18 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
     ) ('.' + [IO.Path]::GetFileName($full) + '.active')
     $activeStream = $null
     $prunable = $true
-    if (Test-Path -LiteralPath $activePath) {
+    # #113 review, round 5 sweep: tracked as #175, deliberately NOT
+    # fixed in this PR. $prunable defaults to $true above, so a
+    # swallowed Test-Path here skips the active-lock check entirely and
+    # can delete a generation still in active use by a live process -
+    # the most severe site in the whole sweep, and out of scope here per
+    # explicit instruction.
+    if (Test-Path -LiteralPath $activePath) {  # wrapper-log-raw-primitive: #175, tracked separately, not fixed in this PR
       try {
-        $activeItem = Get-Item -LiteralPath $activePath -Force -ErrorAction Stop
+        $activeItem = Get-Item -LiteralPath $activePath -Force -ErrorAction Stop  # wrapper-log-raw-primitive: #175, tracked separately, not fixed in this PR
         if (
-          $activeItem.PSIsContainer -or
-          (($activeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+          $activeItem.PSIsContainer -or  # wrapper-log-raw-primitive: #175, tracked separately, not fixed in this PR
+          (($activeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)  # wrapper-log-raw-primitive: #175, tracked separately, not fixed in this PR
         ) {
           $prunable = $false
         } else {
@@ -11795,7 +11878,15 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
         try { $activeStream.Unlock(0, 1) } catch {}
         $activeStream.Dispose()
       }
-      if (-not (Test-Path -LiteralPath $full)) {
+      # Routed through the shared classifier (#113 review, round 5
+      # sweep) - a real behavior change, not just a relabeling, mirroring
+      # the identical fix to _guard_wrapper_log_prune in
+      # wrapper_logs.py: only a CONFIRMED absence of the generation
+      # should reclaim this now-orphaned lock. The prior Test-Path
+      # swallowed an unreadable generation into "gone," which could
+      # remove the lock protecting a generation that might still
+      # genuinely be there.
+      if ((Test-WrapperLogDirectoryPresence $full) -eq 'absent') {
         Remove-Item -LiteralPath $activePath -Force -ErrorAction SilentlyContinue
       }
     }
@@ -11804,12 +11895,22 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
 function Discard-PendingWrapperLogTargets($targets) {
   if ($null -eq $targets) { return }
   $generationDir = [string]$targets.generation_dir
-  if (-not (Test-Path -LiteralPath (Join-Path $generationDir '.pending'))) {
+  # Routed through the shared classifier (#113 review, round 5 sweep).
+  # Behavior unchanged: proceeds only on a CONFIRMED present marker,
+  # exactly like Test-Path did - an ambiguous read already returned
+  # early here before (safe: this function goes on to delete
+  # $generationDir, so failing toward NOT discarding on an unconfirmed
+  # read is the direction that must not change).
+  if ((Test-WrapperLogMarkerPresence (Join-Path $generationDir '.pending')) -ne 'present') {
     return
   }
+  # #113 review, round 5 sweep: allowlisted, not converted - already
+  # wrapped in try/catch below; any failure here is caught by the
+  # enclosing handler and fails toward NOT deleting $generationDir,
+  # already the safe direction.
   try {
-    $item = Get-Item -LiteralPath $generationDir -Force -ErrorAction Stop
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    $item = Get-Item -LiteralPath $generationDir -Force -ErrorAction Stop  # wrapper-log-raw-primitive: already wrapped in try/catch, see comment above
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {  # wrapper-log-raw-primitive: already wrapped in try/catch, see comment above
       return
     }
     Remove-Item -LiteralPath $generationDir -Recurse -Force -ErrorAction Stop

@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import os
+import re
 import signal
 import shutil
 import stat
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk import cli, wrapper_logs
+from agenttalk import supervisor as sup
 from agenttalk import wrapper_runtime as runtime
 from agenttalk.store import Store
 
@@ -281,6 +283,53 @@ def test_report_names_the_root_that_accepted_the_wrapper_generation(
     assert Path(location["stderr"]) == actual_stderr
 
 
+def test_record_location_still_attempts_write_when_config_check_is_unusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review, round 5 sweep, site #11: _record_wrapper_log_location
+    used to skip writing the location record whenever
+    `config.json.is_file()` read False - which it also reports for a
+    config.json it could not confirm. Only a CONFIRMED absence of
+    config.json means "not a real store"; an unusable read must still
+    attempt the write (an actual write failure is already handled
+    safely by the surrounding except clause)."""
+    project = tmp_path / "project"
+    store = Store(project)
+    store.init(["worker"])
+    config_path = project / ".agenttalk" / "config.json"
+    assert config_path.is_file()
+
+    _poison_lstat(monkeypatch, config_path)
+
+    root = tmp_path / "logs"
+    generation = root / wrapper_logs._wrapper_log_agent_leaf("worker") / f"20260804T120000000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    stdout = generation / "stdout.log"
+    stderr = generation / "stderr.log"
+    stdout.write_text("out", encoding="utf-8")
+    stderr.write_text("err", encoding="utf-8")
+
+    wrapper_logs._record_wrapper_log_location(
+        project,
+        "worker",
+        wrapper_logs.WrapperLogInstallation(
+            True,
+            confirmed=True,
+            root=root,
+            generation_dir=generation,
+            stdout_path=stdout,
+            stderr_path=stderr,
+        ),
+    )
+
+    location_path = wrapper_logs._wrapper_log_location_path(store.state_dir, "worker")
+    assert location_path.is_file(), (
+        "the write was skipped because config.json's readability could not "
+        "be confirmed, not because it was confirmed absent"
+    )
+
+
 def test_wrapper_log_location_uses_hashed_windows_safe_agent_files(
     tmp_path: Path,
 ) -> None:
@@ -368,6 +417,132 @@ def test_unreadable_location_record_reports_unusable_not_absent(
     assert result["generation_dir"] is None
 
 
+def test_read_denial_past_the_first_probe_reports_unusable_not_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review, round 5, finding #13: only the FIRST probe
+    (read_wrapper_log_location's top-level presence check) classified an
+    OSError as 'unusable'. A read denial or path-resolution failure
+    occurring AFTER that - e.g. read_text() racing a deletion or
+    permission change between the first probe and the actual read - fell
+    through to the broad except clause and reported 'invalid', even
+    though nothing about the record's CONTENT was malformed. The public
+    contract this file's own docs promise ('unusable' means could not
+    read, 'invalid' means malformed content) must hold at every OSError
+    site in this function, not just the first."""
+    project = tmp_path / "project"
+    store = Store(project)
+    store.init(["worker"])
+    root = tmp_path / "logs"
+    generation = root / wrapper_logs._wrapper_log_agent_leaf("worker") / f"20260804T120000000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    stdout = generation / "stdout.log"
+    stderr = generation / "stderr.log"
+    stdout.write_text("out", encoding="utf-8")
+    stderr.write_text("err", encoding="utf-8")
+    wrapper_logs._record_wrapper_log_location(
+        project,
+        "worker",
+        wrapper_logs.WrapperLogInstallation(
+            True,
+            confirmed=True,
+            root=root,
+            generation_dir=generation,
+            stdout_path=stdout,
+            stderr_path=stderr,
+        ),
+    )
+    location_path = wrapper_logs._wrapper_log_location_path(store.state_dir, "worker")
+    assert location_path.is_file()
+
+    # Deliberately does NOT poison lstat/stat: the top-level presence
+    # probe must succeed (this is the SECOND site, past that probe).
+    real_read_text = Path.read_text
+
+    def denied_read_text(self: Path, *args: object, **kwargs: object):
+        if self == location_path:
+            raise OSError("simulated read denial past the first probe")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied_read_text)
+
+    result = wrapper_logs.read_wrapper_log_location(store.state_dir, "worker")
+
+    assert result["status"] == "unusable"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction guard")
+def test_junctioned_state_ancestor_reports_unusable_not_observed(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 5, findings #1/#2/#6 (the ancestry half): a
+    generation-relative marker correctly needs no ancestry validation
+    (it lives inside a generation directory the RETENTION scan already
+    validates via _scan_path) - but this location record does not live
+    inside a pre-validated generation directory, it lives under
+    state_dir, which nothing else in the read path validates. A
+    junctioned ancestor anywhere under state_dir must not let this
+    function confidently report content read through that redirect."""
+    real_project = tmp_path / "project"
+    real_project.mkdir()
+    store = Store(real_project)
+    store.init(["worker"])
+    root = tmp_path / "logs"
+    generation = root / wrapper_logs._wrapper_log_agent_leaf("worker") / f"20260804T120000000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    stdout = generation / "stdout.log"
+    stderr = generation / "stderr.log"
+    stdout.write_text("out", encoding="utf-8")
+    stderr.write_text("err", encoding="utf-8")
+    wrapper_logs._record_wrapper_log_location(
+        real_project,
+        "worker",
+        wrapper_logs.WrapperLogInstallation(
+            True,
+            confirmed=True,
+            root=root,
+            generation_dir=generation,
+            stdout_path=stdout,
+            stderr_path=stderr,
+        ),
+    )
+    real_state_dir = real_project / ".agenttalk" / "state"
+    assert (real_state_dir / "wrapper-log-locations").is_dir()
+
+    junctioned_state_dir = tmp_path / "junctioned-state"
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    assert powershell is not None, "Windows PowerShell is required for junction coverage"
+    junction_script = tmp_path / "create-junction.ps1"
+    junction_script.write_text(
+        "param([string]$Link, [string]$Target)\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "New-Item -ItemType Junction -Path $Link -Target $Target | Out-Null\n",
+        encoding="utf-8-sig",
+    )
+    creation = subprocess.run(
+        [
+            powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-File", str(junction_script),
+            str(junctioned_state_dir), str(real_state_dir),
+        ],
+        text=True, capture_output=True, timeout=120, check=False,
+    )
+    assert creation.returncode == 0, creation.stderr
+    assert (
+        junctioned_state_dir.lstat().st_file_attributes
+        & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+    # The junction genuinely resolves to real, valid content - proving a
+    # rejection is about the redirect, not about the record being
+    # unreadable through it.
+    assert (junctioned_state_dir / "wrapper-log-locations").is_dir()
+
+    result = wrapper_logs.read_wrapper_log_location(junctioned_state_dir, "worker")
+
+    assert result["status"] == "unusable"
+
+
 def test_location_status_rejects_a_directory_where_a_log_file_is_expected(
     tmp_path: Path,
 ) -> None:
@@ -403,7 +578,113 @@ def test_location_status_rejects_a_directory_where_a_log_file_is_expected(
 
     result = wrapper_logs.read_wrapper_log_location(store.state_dir, "worker")
 
-    assert result["status"] != "observed"
+    # Round 5 correction: != "observed" would let a collapse to "stale"
+    # pass, which is exactly the weak-assertion shape this whole review
+    # keeps catching. Assert the exact status.
+    assert result["status"] == "unusable"
+
+
+_WRAPPER_LOG_ALLOWLIST_MARKER = "wrapper-log-raw-primitive:"
+_PYTHON_RAW_PRIMITIVE_RE = re.compile(r"\.exists\(\)|\.is_dir\(\)|\.is_file\(\)")
+_POWERSHELL_RAW_PRIMITIVE_RE = re.compile(
+    r"Test-Path\b"
+    r"|(?<!Microsoft\.PowerShell\.Management\\)Get-Item\b"
+    r"|PSIsContainer"
+    r"|-band \[IO\.FileAttributes\]::ReparsePoint"
+)
+
+
+def _wrapper_log_region(text: str, start_marker: str, end_marker: str) -> str:
+    return text[text.index(start_marker):text.index(end_marker)]
+
+
+def _scan_wrapper_log_raw_primitives(
+    region_text: str, pattern: re.Pattern[str]
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Return (unallowlisted, allowlisted) - unallowlisted is a list of
+    "<line>: <text>" strings; allowlisted is a list of (entry, reason)
+    strings, one per matching line carrying a
+    '# wrapper-log-raw-primitive: <reason>' comment."""
+    unallowlisted: list[str] = []
+    allowlisted: list[tuple[str, str]] = []
+    for lineno, line in enumerate(region_text.splitlines(), start=1):
+        # A full-line comment (Python and PowerShell both use '#') can
+        # legitimately discuss these primitives in prose - e.g. this
+        # very docstring - without being a code site that needs routing
+        # or an allowlist entry. A trailing inline comment on an actual
+        # code line is not stripped, deliberately: the check would
+        # rather over-report a real site than let a comment appended to
+        # code hide it.
+        if line.strip().startswith("#"):
+            continue
+        if not pattern.search(line):
+            continue
+        marker_idx = line.find(_WRAPPER_LOG_ALLOWLIST_MARKER)
+        if marker_idx == -1:
+            unallowlisted.append(f"{lineno}: {line.strip()}")
+            continue
+        reason = line[marker_idx + len(_WRAPPER_LOG_ALLOWLIST_MARKER):].strip()
+        code_text = line[:marker_idx].rstrip().rstrip("#").rstrip()
+        allowlisted.append((f"{lineno}: {code_text}", reason))
+    return unallowlisted, allowlisted
+
+
+def test_wrapper_log_region_uses_only_shared_classifiers() -> None:
+    """#113 review, round 5 (standing rule #76): the mechanical sweep.
+
+    Every "does this exist" / "what kind of thing is this" check in the
+    wrapper-log retention and report region - Python
+    (`# region wrapper-log-retention` in wrapper_logs.py) and generated
+    PowerShell (`# region wrapper-log-helpers` in supervisor.py) both -
+    must go through the shared closed-outcome classifiers or carry an
+    explicit `# wrapper-log-raw-primitive: <reason>` comment. Five rounds
+    of review each closing the sites it was given and revealing another
+    level below is the reason this exists: an unstated class is the
+    defect, a stated and CHECKED one is not. This converts "did review
+    find them all" into "does the check find them all."
+
+    The allowlist is reported in full on every run (the assertion
+    message below), not only on failure - a suppressible check that
+    looks identical whether the allowlist has 2 entries or 20 is exactly
+    the thing this check exists to prevent from happening quietly.
+    """
+    python_region = _wrapper_log_region(
+        Path(wrapper_logs.__file__).read_text(encoding="utf-8"),
+        "# region wrapper-log-retention",
+        "# endregion wrapper-log-retention",
+    )
+    python_bad, python_allowed = _scan_wrapper_log_raw_primitives(
+        python_region, _PYTHON_RAW_PRIMITIVE_RE
+    )
+
+    ps_region = _wrapper_log_region(
+        sup.PS_TEMPLATE,
+        "# region wrapper-log-helpers",
+        "# endregion wrapper-log-helpers",
+    )
+    ps_bad, ps_allowed = _scan_wrapper_log_raw_primitives(
+        ps_region, _POWERSHELL_RAW_PRIMITIVE_RE
+    )
+
+    allowed = [(f"python {e}", r) for e, r in python_allowed] + [
+        (f"powershell {e}", r) for e, r in ps_allowed
+    ]
+    report = "wrapper-log raw-primitive allowlist ({} entries):\n{}".format(
+        len(allowed),
+        "\n".join(f"  {entry} -> {reason or 'NO REASON GIVEN'}" for entry, reason in allowed)
+        or "  (none)",
+    )
+    print("\n" + report)
+    for entry, reason in allowed:
+        assert reason, f"allowlist entry has no stated reason: {entry}"
+
+    bad = [f"python {e}" for e in python_bad] + [f"powershell {e}" for e in ps_bad]
+    assert not bad, (
+        "raw presence/type primitive(s) found in the wrapper-log region "
+        "without a '# wrapper-log-raw-primitive: <reason>' allowlist "
+        "comment - route through the shared classifier or allowlist "
+        "explicitly with a reason:\n" + "\n".join(bad) + "\n\n" + report
+    )
 
 
 def test_supervise_plan_never_probes_wrapper_log_filesystem(
@@ -631,6 +912,44 @@ def test_wrapper_log_candidates_keep_preferred_when_later_fallback_resolution_fa
     assert roots[0].parent == local / "agenttalk" / "wrapper-logs"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-specific reparse detection")
+def test_reparse_detection_uses_raw_windows_attributes_when_stat_disagrees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review, round 5, findings #1/#2/#6: a real OneDrive
+    placeholder file reports FILE_ATTRIBUTE_REPARSE_POINT to
+    GetFileAttributesW (the same call PowerShell's Get-Item/.Attributes
+    uses) but Python's os.lstat() does NOT reflect it on the host where
+    this was measured - a genuine platform discovery, not a line-level
+    bug: the two languages' classifiers disagreed about the identical
+    input this scan exists to unify.
+
+    This cannot be reproduced with a real OneDrive placeholder in this
+    environment (no OneDrive sync client configured here), so it is
+    verified by mocking the raw-attribute primitive
+    (_windows_raw_file_attributes) directly to return exactly the
+    discrepancy measured: a file lstat() reports as perfectly ordinary,
+    but the raw Win32 attribute call flags as a reparse point. Said
+    plainly rather than claimed as an executed real-condition
+    reproduction it is not."""
+    target = tmp_path / "onedrive-placeholder.txt"
+    target.write_text("looks like a plain file to os.lstat()", encoding="utf-8")
+    assert not stat.S_ISLNK(target.lstat().st_mode)
+
+    monkeypatch.setattr(
+        wrapper_logs,
+        "_windows_raw_file_attributes",
+        lambda path: (
+            wrapper_logs._WIN32_FILE_ATTRIBUTE_REPARSE_POINT
+            if path == target
+            else None
+        ),
+    )
+
+    assert wrapper_logs._is_reparse_or_symlink(target) is True
+
+
 def test_reparse_attribute_check_is_exercised_without_symlink_privilege(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -764,7 +1083,7 @@ def test_owned_committed_generations_propagates_persisted_sequence_uncertainty(
     (generation / "stdout.log").write_bytes(b"")
     (generation / "stderr.log").write_bytes(b"")
 
-    _owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+    _owned, _observed_count, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -781,7 +1100,7 @@ def test_corrupt_committed_sequence_marks_retention_uncertain(
         newest_sequence="not-a-sequence",
     )
 
-    _owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+    _owned, _observed_count, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -865,7 +1184,7 @@ def test_scan_marks_retention_uncertain_not_absent_at_every_depth(
 
     _poison_lstat(monkeypatch, target)
 
-    owned, max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+    owned, _observed_count, max_sequence, uncertain = wrapper_logs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -904,7 +1223,7 @@ def test_unreadable_committed_marker_is_not_deletion_eligible_but_still_flagged(
 
     _poison_lstat(monkeypatch, committed_marker)
 
-    owned, max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+    owned, _observed_count, max_sequence, uncertain = wrapper_logs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -928,7 +1247,7 @@ def test_marker_that_is_a_directory_is_not_present(tmp_path: Path) -> None:
     (generation / ".sequence").write_text("9", encoding="utf-8")
     (generation / ".committed").mkdir()
 
-    owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+    owned, _observed_count, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -947,7 +1266,7 @@ def test_genuinely_absent_agent_dir_is_not_flagged_uncertain(tmp_path: Path) -> 
     agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
     assert not (root / agent_leaf).exists()
 
-    owned, max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+    owned, _observed_count, max_sequence, uncertain = wrapper_logs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -1094,6 +1413,23 @@ def test_unusable_committed_probe_cannot_make_a_pending_generation_deletion_elig
         "prune deleted a pending generation whose .committed probe was merely unreadable"
     )
     assert (oldest / "stdout.log").read_bytes() == b"captured output"
+    # #113 review, round 5, finding #7: the other half of this same
+    # scenario. 13 physical generations against a bound of 12 must
+    # actually cross that bound and prune the 12 real candidates down to
+    # quota - using len(candidates)==12<=12 for the bound check instead
+    # of the true observed_count==13 made this cycle look safely under
+    # quota when it was not, so pruning never ran and all 13 generations
+    # accumulated on disk indefinitely (confirmed by execution before
+    # this fix). The ambiguous generation is never itself a candidate
+    # either way (already covered by the assertions above) - this
+    # checks that its mere presence does not ALSO block real candidates
+    # from being pruned once they should be.
+    committed_survivors = [g for g in generations[1:] if g.is_dir()]
+    assert len(committed_survivors) == wrapper_logs.WRAPPER_LOG_GENERATIONS, (
+        "the 12 real candidates were not pruned toward quota - the bound "
+        "check used the undercounted candidate total instead of the true "
+        "observed generation count"
+    )
 
 
 def test_prune_preserves_newest_generation_when_its_sequence_is_corrupt(
@@ -1119,7 +1455,7 @@ def test_bare_legacy_generation_without_sequence_remains_prunable(
         root,
         newest_sequence=None,
     )
-    _owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+    _owned, _observed_count, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -1152,7 +1488,7 @@ def test_prune_preserves_live_generation_and_reclaims_stale_active_lock(
         (generation / "stderr.log").write_bytes(b"")
         generations.append(generation)
 
-    owned, _max_sequence, _uncertain = wrapper_logs._owned_committed_generations(
+    owned, _observed_count, _max_sequence, _uncertain = wrapper_logs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -1198,6 +1534,46 @@ def test_prune_preserves_live_generation_and_reclaims_stale_active_lock(
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_guard_prune_does_not_reclaim_lock_when_generation_is_unusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review, round 5 sweep, site #10: the trailing cleanup in
+    _guard_wrapper_log_prune used to remove the now-orphaned `.active`
+    lock file whenever `generation_dir.exists()` read False - which
+    `.exists()` also reports for a generation it simply could not
+    confirm. Only a CONFIRMED absence may reclaim the lock; an unusable
+    read must leave it in place rather than prematurely freeing
+    protection for a generation that might still genuinely be there."""
+    generation = (
+        tmp_path
+        / wrapper_logs._wrapper_log_agent_leaf("worker")
+        / "20260804T120000000Z-0123456789abcdef0123456789abcdef"
+    )
+    generation.mkdir(parents=True)
+    lock = wrapper_logs._acquire_active_generation_lock(generation)
+    assert lock is not None
+    # Simulate a crash, not a clean release: _release_active_generation_lock
+    # itself unconditionally unlinks the marker, which would defeat this
+    # test's setup - closing the fd directly drops the OS-level byte lock
+    # (so _guard_wrapper_log_prune can re-acquire it) while leaving the
+    # marker FILE in place, exactly like a wrapper that died without its
+    # own cleanup running.
+    os.close(lock.fd)
+    marker = wrapper_logs._active_generation_lock_path(generation)
+    assert marker.is_file()
+
+    _poison_lstat(monkeypatch, generation)
+
+    with wrapper_logs._guard_wrapper_log_prune(generation) as prunable:
+        assert prunable is True
+
+    assert marker.is_file(), (
+        "the active lock was reclaimed for a generation whose readability "
+        "could not be confirmed, not one confirmed absent"
+    )
 
 
 def test_second_active_lock_attempt_cannot_unlink_live_holders_marker(

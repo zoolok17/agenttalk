@@ -6182,7 +6182,7 @@ def test_python_wrapper_log_sequence_contract_controls_retention(
         sequence_failed=sequence_failed,
     )
 
-    owned, max_sequence, uncertain = wlogs._owned_committed_generations(
+    owned, _observed_count, max_sequence, uncertain = wlogs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -6381,7 +6381,7 @@ def test_python_and_generated_powershell_fail_closed_on_unsafe_sequence_record(
         )
         assert created.returncode == 0, f"{created.stdout}{created.stderr}"
 
-    owned, max_sequence, uncertain = wlogs._owned_committed_generations(
+    owned, _observed_count, max_sequence, uncertain = wlogs._owned_committed_generations(
         (root,),
         agent_leaf,
     )
@@ -6741,6 +6741,52 @@ def _ps_shadow_get_item_denying(poisoned_path: str) -> list[str]:
     ]
 
 
+def _ps_shadow_access_denied(poisoned_path: str) -> list[str]:
+    """Like _ps_shadow_get_item_denying, but also shadows Test-Path for
+    the same poisoned path - Test-Path never throws even on real
+    access-denied, it silently returns $false, which is exactly what
+    made the pre-fix `$agentDirExists = Test-Path ...` bug invisible.
+    A real access-denied condition affects both cmdlets consistently
+    (Get-Item throws, Test-Path returns false); shadowing only one of
+    them does not reproduce that - it must be both to discriminate a
+    genuine fix from a reverted one."""
+    lines = _ps_shadow_get_item_denying(poisoned_path)
+    lines += [
+        "function Test-Path {",
+        "  [CmdletBinding()]",
+        "  param([string]$LiteralPath, [string]$PathType)",
+        "  if ($LiteralPath -eq $PoisonedPath) { return $false }",
+        "  if ($PSBoundParameters.ContainsKey('PathType')) {",
+        "    return (Microsoft.PowerShell.Management\\Test-Path "
+        "-LiteralPath $LiteralPath -PathType $PathType)",
+        "  }",
+        "  return (Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath)",
+        "}",
+    ]
+    return lines
+
+
+def _ps_shadow_get_childitem_denying(poisoned_path: str) -> list[str]:
+    """Shadow the unqualified Get-ChildItem cmdlet for exactly one
+    -LiteralPath, throwing for it while delegating every other call to
+    the fully-qualified provider form - same seam as
+    _ps_shadow_get_item_denying, for a directory LISTING failure rather
+    than a single-item stat."""
+    return [
+        f"$PoisonedListingPath = {_pslit(poisoned_path)}",
+        "function Get-ChildItem {",
+        "  [CmdletBinding()]",
+        "  param([string]$LiteralPath, [switch]$Directory)",
+        "  if ($LiteralPath -eq $PoisonedListingPath) {",
+        "    throw [System.UnauthorizedAccessException]::new(",
+        "      \"simulated access denied: $PoisonedListingPath\")",
+        "  }",
+        "  Microsoft.PowerShell.Management\\Get-ChildItem "
+        "-LiteralPath $LiteralPath -Directory:$Directory -ErrorAction Stop",
+        "}",
+    ]
+
+
 def test_ps_unreadable_sequence_uncertain_marker_returns_unusable(
     tmp_path: Path,
 ) -> None:
@@ -6886,6 +6932,151 @@ def test_ps_unreadable_committed_marker_retains_sequence_and_marks_uncertain(
     payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
     assert payload["next_sequence"] == 10
     assert payload["uncertain"] is True
+
+
+def test_ps_hidden_agent_directory_marks_next_sequence_uncertain(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 5, finding #15: Get-NextWrapperLogSequence used
+    to test the candidate agent directory's existence with a raw
+    Test-Path, which swallows access-denied into $false exactly like an
+    agent directory that never existed - so a hidden agent directory
+    holding a real higher committed sequence was silently skipped
+    without ever marking the scan uncertain. Two roots: one with visible
+    generations 1-5, one whose agent directory itself cannot be read.
+    next_sequence legitimately cannot recover the hidden root's true
+    maximum - but it MUST come back uncertain, not confidently wrong."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    visible_root = tmp_path / "visible"
+    hidden_root = tmp_path / "hidden"
+    visible_agent_dir = visible_root / agent_leaf
+    hidden_agent_dir = hidden_root / agent_leaf
+    for sequence in range(1, 6):
+        generation = visible_agent_dir / f"2026080{sequence}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+    hidden_generation = hidden_agent_dir / f"20260801T130000000Z-{100:032x}"
+    hidden_generation.mkdir(parents=True)
+    (hidden_generation / ".sequence").write_text("100", encoding="utf-8")
+    (hidden_generation / ".committed").write_bytes(b"")
+
+    result_path = tmp_path / "ps-hidden-agent-dir.json"
+    script = tmp_path / "ps-hidden-agent-dir.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            *_ps_shadow_access_denied(str(hidden_agent_dir)),
+            f"$result = Get-NextWrapperLogSequence "
+            f"@({_pslit(str(visible_root))}, {_pslit(str(hidden_root))}) "
+            f"{_pslit(agent_leaf)}",
+            "@{ next_sequence = $result.next_sequence; "
+            "uncertain = [bool]$result.uncertain } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["next_sequence"] == 6
+    assert payload["uncertain"] is True
+
+
+def test_ps_listing_failure_during_prune_rescan_marks_uncertain_not_warns_only(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 5, finding #17: a directory listing that fails
+    PARTWAY through Invoke-WrapperLogRetentionPrune's own destructive
+    rescan used to only Write-Warning - neither aborting nor marking
+    $sequenceUncertain - so pruning proceeded on a silently incomplete
+    view. A scan that succeeded once (at allocation time) does not stay
+    true.
+
+    Two roots, matching the shape that actually makes this dangerous: a
+    GOOD root whose listing succeeds normally (contributing real,
+    over-quota generations to $owned - a single-root, listing-fails-
+    outright test would leave $owned empty either way, which protects
+    everything for the wrong reason and would not have caught this).
+    A SEPARATE root's listing fails entirely. The good root's own
+    generations must still survive: the whole cycle's view is
+    incomplete, not just the failed root's, so treating the failure as
+    merely "skip that root and prune the rest normally" is exactly the
+    bug - $sequenceUncertain must protect the good root's generations
+    too."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    good_root = tmp_path / "good"
+    bad_root = tmp_path / "bad"
+    good_agent_dir = good_root / agent_leaf
+    bad_agent_dir = bad_root / agent_leaf
+    generations = []
+    for sequence in range(1, sup.WRAPPER_LOG_GENERATIONS + 2):
+        generation = good_agent_dir / f"2026080{sequence}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+    bad_agent_dir.mkdir(parents=True)
+
+    result_path = tmp_path / "ps-listing-failure.json"
+    script = tmp_path / "ps-listing-failure.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            *_ps_shadow_get_childitem_denying(str(bad_agent_dir)),
+            f"Invoke-WrapperLogRetentionPrune {_pslit(agent_leaf)} "
+            f"@({_pslit(str(good_root))}, {_pslit(str(bad_root))}) $false",
+            # Fully-qualified form deliberately - the unqualified
+            # Get-ChildItem is shadowed above (for $bad_agent_dir, but
+            # queried here for $good_agent_dir regardless, to bypass the
+            # shadow function's own definition entirely for this
+            # verification step).
+            "@{ survivorCount = @("
+            "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath "
+            f"{_pslit(str(good_agent_dir))} -Directory "
+            "-ErrorAction SilentlyContinue).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["survivorCount"] == len(generations), (
+        "pruning ran on an incomplete view instead of being protected by "
+        "$sequenceUncertain"
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")

@@ -476,6 +476,40 @@ def _restrictive_file_opener(path: str, flags: int) -> int:
     return os.open(path, flags, 0o600)
 
 
+# region wrapper-log-retention
+_WIN32_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+_WIN32_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _windows_raw_file_attributes(path: Path) -> int | None:
+    """Return the raw Win32 file attributes for `path` via
+    GetFileAttributesW, bypassing os.lstat()'s populated
+    st_file_attributes field entirely.
+
+    #113 review, round 5: a real OneDrive placeholder file reports
+    FILE_ATTRIBUTE_REPARSE_POINT to this exact WinAPI call (the same one
+    PowerShell's Get-Item/.Attributes uses) but Python's os.lstat() does
+    not reflect it on this host - the two languages' classifiers
+    disagreed about the identical input, which this scan exists to
+    prevent. Returns None on a non-Windows platform or if the call
+    itself fails (an ambiguous result here must not silently downgrade
+    to "definitely not a reparse point" - the caller ORs this in as an
+    additional positive signal, never a replacement one, so a None here
+    just means "no additional information," not "confirmed clear").
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        result = ctypes.windll.kernel32.GetFileAttributesW(str(path))  # type: ignore[attr-defined]
+    except (OSError, AttributeError, ValueError):
+        return None
+    if result == _WIN32_INVALID_FILE_ATTRIBUTES:
+        return None
+    return result
+
+
 def _is_reparse_or_symlink(path: Path) -> bool:
     try:
         info = path.lstat()
@@ -485,7 +519,12 @@ def _is_reparse_or_symlink(path: Path) -> bool:
         raise OSError(f"cannot validate wrapper log path component: {path}") from exc
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     file_attributes = getattr(info, "st_file_attributes", 0)
-    return stat.S_ISLNK(info.st_mode) or bool(file_attributes & reparse_flag)
+    if stat.S_ISLNK(info.st_mode) or bool(file_attributes & reparse_flag):
+        return True
+    windows_attributes = _windows_raw_file_attributes(path)
+    if windows_attributes is not None:
+        return bool(windows_attributes & _WIN32_FILE_ATTRIBUTE_REPARSE_POINT)
+    return False
 
 
 def _has_reparse_or_symlink_component(path: Path) -> bool:
@@ -500,14 +539,31 @@ def _has_reparse_or_symlink_component(path: Path) -> bool:
 
 
 def _prepare_agent_log_dir(root: Path, agent_leaf: str) -> Path:
+    # This first check runs BEFORE creation - root may genuinely not
+    # exist yet on first use, which _has_reparse_or_symlink_component
+    # already treats as "nothing unsafe here yet" at each ancestor
+    # level. _scan_path is the wrong classifier here: it requires a
+    # CONFIRMED present directory, which would wrongly reject an
+    # ordinary not-yet-created root. Left as the raw ancestry primitive
+    # deliberately - not a site the shared directory classifier fits.
     if _has_reparse_or_symlink_component(root):
         raise OSError(f"unsafe wrapper log root ancestry: {root}")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not root.is_dir() or _has_reparse_or_symlink_component(root):
+    # These two checks run AFTER creation, where the directory is
+    # expected to exist - routed through the shared classifier (#113
+    # review, round 5 sweep). PLAIN_DIRECTORY already implies both "is a
+    # directory" and "no reparse/symlink ancestry" (_scan_path calls
+    # _has_reparse_or_symlink_component internally), dropping the
+    # now-redundant standalone ancestry call. Behavior is unchanged: a
+    # swallowed-ambiguous result and a confirmed-unsafe result both
+    # raised OSError before (rejecting this candidate), and both still
+    # do - only the immediate raise site and message text differ, not
+    # the caller-visible outcome.
+    if _scan_path(root) is not _PathScanOutcome.PLAIN_DIRECTORY:
         raise OSError(f"unsafe wrapper log root: {root}")
     agent_dir = root / agent_leaf
     agent_dir.mkdir(mode=0o700, exist_ok=True)
-    if not agent_dir.is_dir() or _has_reparse_or_symlink_component(agent_dir):
+    if _scan_path(agent_dir) is not _PathScanOutcome.PLAIN_DIRECTORY:
         raise OSError(f"unsafe wrapper log agent directory: {agent_dir}")
     if os.name != "nt":
         os.chmod(root, stat.S_IRWXU)
@@ -647,7 +703,17 @@ def _guard_wrapper_log_prune(generation_dir: Path) -> Iterator[bool]:
                 _unlock_active_fd(fd)
         with contextlib.suppress(OSError):
             os.close(fd)
-        if acquired and identity is not None and not generation_dir.exists():
+        # Routed through the shared classifier (#113 review, round 5
+        # sweep) - a real behavior change, not just a relabeling: only a
+        # CONFIRMED absence should trigger cleaning up this now-orphaned
+        # lock file. The prior .exists() swallowed an unreadable
+        # generation_dir into "gone", which could remove the lock
+        # protecting a generation that might still genuinely be there.
+        if (
+            acquired
+            and identity is not None
+            and _scan_path(generation_dir) is _PathScanOutcome.ABSENT
+        ):
             with contextlib.suppress(OSError):
                 _unlink_active_lock_if_same(path, identity)
 
@@ -755,11 +821,11 @@ def _scan_path(path: Path) -> _PathScanOutcome:
     """Classify `path` for this scan via the raw, non-swallowing lstat()
     primitive into exactly one of the three outcomes above.
 
-    ``Path.exists()``/``.is_dir()`` are boolean wrappers that SWALLOW
-    OSError into a confident False - only some error codes on 3.10 (e.g. a
-    disconnected/not-ready volume), but ANY OSError on 3.14+
-    (``Path.exists()`` there delegates to ``os.path.exists()``, whose own
-    implementation is a bare ``except (OSError, ValueError)``). A
+    ``Path.exists`` / ``.is_dir`` (called) are boolean wrappers that
+    SWALLOW OSError into a confident False - only some error codes on
+    3.10 (e.g. a disconnected/not-ready volume), but ANY OSError on
+    3.14+ (``Path.exists`` there delegates to ``os.path.exists``, whose
+    own implementation is a bare ``except (OSError, ValueError)``). A
     temporarily unreadable entry would then read exactly like one that
     never existed - a confident "no" instead of "unknown" - and this
     scan's whole caller-visible contract is that ambiguity becomes
@@ -836,8 +902,28 @@ def _scan_marker(path: Path) -> _MarkerScanOutcome:
 def _owned_committed_generations(
     roots: tuple[Path, ...],
     agent_leaf: str,
-) -> tuple[list[tuple[str, Path]], int, bool]:
-    owned: list[tuple[str, Path]] = []
+) -> tuple[list[tuple[str, Path]], int, int, bool]:
+    """Return (candidates, observed_count, max_sequence, uncertain).
+
+    ``candidates`` is the deletion-eligible pool - positively-committed
+    generations only, exactly as before. ``observed_count`` is a
+    SEPARATE, wider count: every generation-shaped directory this scan
+    actually found, whether or not its commit status could be
+    confirmed. These two numbers must not be conflated (#113 review,
+    round 5, finding #7): the safety bound that decides whether pruning
+    is even attempted this cycle must be checked against how many
+    generations physically exist, not against how many happened to
+    qualify for deletion. Round 4's fix correctly excluded an ambiguous
+    generation from ``candidates`` (right, for deletion), but the caller
+    then also used ``len(candidates)`` for the bound - so the ambiguous
+    generation vanished from BOTH numbers, undercounting the bound the
+    same way undercounting a sequence value was already known to be
+    dangerous. Executed and confirmed: 13 physical generations against a
+    bound of 12, one genuinely ambiguous, survived by luck (12 <= 12)
+    rather than by the bound correctly seeing 13.
+    """
+    candidates: list[tuple[str, Path]] = []
+    observed_count = 0
     max_sequence = 0
     uncertain = False
     for root in roots:
@@ -852,10 +938,18 @@ def _owned_committed_generations(
                     continue
                 generation_outcome = _scan_path(generation)
                 if generation_outcome is not _PathScanOutcome.PLAIN_DIRECTORY:
-                    uncertain = (
-                        uncertain or generation_outcome is _PathScanOutcome.UNUSABLE
-                    )
+                    if generation_outcome is _PathScanOutcome.UNUSABLE:
+                        # Detected SOMETHING generation-shaped that could
+                        # not be fully confirmed - still counts toward
+                        # the physical population the bound must see,
+                        # even though it can never be a deletion
+                        # candidate. A genuinely ABSENT result (a
+                        # same-cycle TOCTOU vanish between iterdir() and
+                        # this probe) does not - it truly is not there.
+                        observed_count += 1
+                        uncertain = True
                     continue
+                observed_count += 1
                 committed_marker = _scan_marker(generation / ".committed")
                 if committed_marker is _MarkerScanOutcome.UNUSABLE:
                     # Cannot confirm committed one way or the other.
@@ -871,8 +965,10 @@ def _owned_committed_generations(
                     # captured stdout, only its .committed probe
                     # unreadable, and prune deleted it once the bound was
                     # crossed). Treat it the same as genuinely not
-                    # committed - excluded from `owned`, never a prune
-                    # candidate - but still flag the whole scan uncertain.
+                    # committed - excluded from `candidates`, never a
+                    # prune candidate - but still flag the whole scan
+                    # uncertain (it was already counted in
+                    # observed_count above, regardless of commit status).
                     uncertain = True
                 committed = committed_marker is _MarkerScanOutcome.PRESENT
                 sequence, sequence_uncertain = _read_wrapper_log_sequence(
@@ -889,10 +985,10 @@ def _owned_committed_generations(
                     if sequence is not None
                     else f"0-{generation.name}"
                 )
-                owned.append((sort_key, generation))
+                candidates.append((sort_key, generation))
         except OSError:
             uncertain = True
-    return owned, max_sequence, uncertain
+    return candidates, observed_count, max_sequence, uncertain
 
 
 def _write_restrictive_text(path: Path, text: str) -> None:
@@ -929,7 +1025,7 @@ def _allocate_wrapper_log_targets(
 ) -> _AllocatedWrapperLogTargets:
     roots = wrapper_log_root_candidates(project_root, environ=environ)
     agent_leaf = _wrapper_log_agent_leaf(agent)
-    _owned, max_sequence, uncertain = _owned_committed_generations(
+    _candidates, _observed_count, max_sequence, uncertain = _owned_committed_generations(
         roots,
         agent_leaf,
     )
@@ -942,10 +1038,11 @@ def _allocate_wrapper_log_targets(
             agent_dir = _prepare_agent_log_dir(root, agent_leaf)
             generation_dir = agent_dir / f"{stamp}-{secrets.token_hex(16)}"
             generation_dir.mkdir(mode=0o700)
-            if (
-                not generation_dir.is_dir()
-                or _has_reparse_or_symlink_component(generation_dir)
-            ):
+            # Routed through the shared classifier (#113 review, round 5
+            # sweep) - same reasoning as _prepare_agent_log_dir's
+            # post-creation checks: behavior is unchanged, only the raise
+            # site's message text differs.
+            if _scan_path(generation_dir) is not _PathScanOutcome.PLAIN_DIRECTORY:
                 raise OSError(
                     f"unsafe wrapper log generation directory: {generation_dir}"
                 )
@@ -1016,7 +1113,7 @@ def _prune_wrapper_log_generations(
     *,
     sequence_uncertain: bool = False,
 ) -> None:
-    owned, _max_sequence, uncertain = _owned_committed_generations(
+    candidates, observed_count, _max_sequence, uncertain = _owned_committed_generations(
         roots,
         agent_leaf,
     )
@@ -1025,9 +1122,16 @@ def _prune_wrapper_log_generations(
         WRAPPER_LOG_GENERATIONS + 2,
     )
     uncertain = uncertain or sequence_uncertain
-    if uncertain and len(owned) <= safety_bound:
+    # The bound must be checked against how many generations PHYSICALLY
+    # exist (observed_count), not how many happen to qualify for
+    # deletion (len(candidates)) - #113 review, round 5, finding #7.
+    # These can differ: an ambiguous generation is correctly excluded
+    # from candidates (never deletion-eligible) but must still count
+    # toward the bound, or the bound silently shrinks by exactly the
+    # generations it exists to protect.
+    if uncertain and observed_count <= safety_bound:
         return
-    for _sort_key, generation in sorted(owned)[:-WRAPPER_LOG_GENERATIONS]:
+    for _sort_key, generation in sorted(candidates)[:-WRAPPER_LOG_GENERATIONS]:
         if _has_reparse_or_symlink_component(generation):
             continue
         with _guard_wrapper_log_prune(generation) as prunable:
@@ -1056,7 +1160,14 @@ def _record_wrapper_log_location(
     if not installation.confirmed or installation.generation_dir is None:
         return
     store_dir = project_root / ".agenttalk"
-    if not (store_dir / "config.json").is_file():
+    # Routed through the shared classifier (#113 review, round 5 sweep) -
+    # a real behavior change: only a CONFIRMED absence of config.json
+    # should skip writing the location record. The prior .is_file()
+    # swallowed an unreadable-but-present config.json into "not a
+    # store," silently losing forensic capability for this launch; an
+    # actual write failure is still safely handled by the except clause
+    # below.
+    if _scan_marker(store_dir / "config.json") is _MarkerScanOutcome.ABSENT:
         return
     try:
         path = _wrapper_log_location_path(store_dir / "state", agent)
@@ -1110,6 +1221,23 @@ def read_wrapper_log_location(state_dir: Path, agent: str) -> dict[str, object]:
         path = _wrapper_log_location_path(state_dir, agent)
     except ValueError:
         return {**absent, "status": "invalid", "error": "unsafe_agent"}
+    # #113 review, round 5: _scan_marker deliberately has no ancestry
+    # check (reviewer-1's own guidance in round 4 - a generation-relative
+    # marker lives inside a generation directory whose ancestry the
+    # RETENTION scan already validates via _scan_path, so re-validating
+    # per marker would be redundant there). This location record does
+    # NOT live inside a pre-validated generation directory - it lives
+    # under state_dir, which nothing else in this read path validates.
+    # A junctioned ancestor anywhere under state_dir would otherwise let
+    # this function read and confidently report content from wherever
+    # that redirect actually points. Validated explicitly, once, here -
+    # not folded into _scan_marker itself, since the marker's OTHER
+    # callers correctly do not need it.
+    try:
+        if _has_reparse_or_symlink_component(path):
+            return {**absent, "status": "unusable"}
+    except OSError:
+        return {**absent, "status": "unusable"}
     location_marker = _scan_marker(path)
     if location_marker is _MarkerScanOutcome.ABSENT:
         return absent
@@ -1184,9 +1312,22 @@ def read_wrapper_log_location(state_dir: Path, agent: str) -> dict[str, object]:
             "wrapper_pid": payload.get("wrapper_pid"),
             "observed_at": payload.get("observed_at"),
         }
+    except OSError as exc:
+        # #113 review, round 5, finding #13: a read denial or a
+        # path-resolution failure occurring past the top-level probe
+        # (e.g. a race on read_text(), or an unresolvable ancestor in
+        # one of the stored paths) means "could not read/resolve," not
+        # "content is malformed" - the same distinction the docs already
+        # promise for the top-level check. Only the FIRST probe was
+        # classifying OSError this way; this closes the gap so the
+        # public contract holds end to end, not just at the first site.
+        return {
+            **absent,
+            "status": "unusable",
+            "error": type(exc).__name__,
+        }
     except (
         KeyError,
-        OSError,
         RuntimeError,
         TypeError,
         ValueError,
@@ -1197,6 +1338,7 @@ def read_wrapper_log_location(state_dir: Path, agent: str) -> dict[str, object]:
             "status": "invalid",
             "error": type(exc).__name__,
         }
+# endregion wrapper-log-retention
 
 
 class BoundedStreamTee:
