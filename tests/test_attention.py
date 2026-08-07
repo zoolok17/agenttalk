@@ -1039,6 +1039,31 @@ def test_configured_wrapped_launch_rejects_duplicate_roots() -> None:
     assert "root arguments are invalid" in item["configured_launch_unavailable"]
 
 
+def test_configured_manual_launch_preserves_literal_wrap_argument() -> None:
+    windows_args = ["run", "wrap", "payload"]
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "wrapped": False,
+                    "launch": {
+                        "windows_file": "codex.exe",
+                        "windows_args": windows_args,
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert item["configured_launch"]["argv"] == ["codex.exe", *windows_args]
+
+
 def test_process_tree_hold_hash_resurfaces_for_new_restart_and_launch() -> None:
     state = _process_tree_state(
         status="invalid",

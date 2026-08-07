@@ -1638,6 +1638,26 @@ def test_windows_exact_owner_identity_uses_one_handle(
     assert kernel32.times_queries == (1 if exit_code == 259 else 0)
 
 
+def test_windows_exact_owner_identity_rejects_filetime_above_uint64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel32 = _FakeOwnerIdentityKernel32()
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: kernel32,
+        raising=False,
+    )
+    monkeypatch.setattr(store_mod, "os", SimpleNamespace(name="nt"))
+
+    assert store_mod._owner_identity_gone(
+        321,
+        "2026-07-04T07:20:31.500000Z",
+        str(1 << 64),
+    ) is False
+    assert kernel32.opened == []
+
+
 @pytest.mark.parametrize(
     ("handle", "last_error", "exit_query_ok", "times_query_ok", "expected_gone"),
     [

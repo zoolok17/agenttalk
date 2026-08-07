@@ -7680,6 +7680,8 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "@('-m','agenttalk','wrap','codex.exe','--for','worker') $true 'wrap'",
         "Invoke-RegularCase 'regular_false_wrap_dispatch' 'python.exe' "
         "@('-m','agenttalk','wrap','--for','other','--','codex.exe') $false 'wrap'",
+        "Invoke-RegularCase 'regular_manual_literal_wrap' 'codex.exe' "
+        "@('--mode','wrap','--literal') $false 'fresh'",
         "Invoke-RegularCase 'regular_empty_cli_tail' 'python.exe' "
         "@('-m','agenttalk','wrap','--for','worker','--') $true 'wrap'",
         "Invoke-RegularCase 'regular_positional_before_tail' 'python.exe' "
@@ -7769,6 +7771,7 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "regular_unbuffered_wrap",
         "regular_not_wrap_mode",
         "regular_wrong_root",
+        "regular_manual_literal_wrap",
         "ephemeral_python_wrap",
         "ephemeral_console_wrap",
         "ephemeral_wrong_root",
@@ -7782,6 +7785,8 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         if row["name"] in {"regular_wrong_root", "ephemeral_wrong_root"}:
             assert str(tmp_path) in row["argument_line"], row
             assert r"D:\other" not in row["argument_line"], row
+        if row["name"] == "regular_manual_literal_wrap":
+            assert row["argument_line"] == "--mode wrap --literal"
 
 
 def test_ps_start_wrapper_process_fallback_strips_logging_env_vars(
@@ -11432,7 +11437,14 @@ def test_valid_owned_process_tree_keeps_nullable_hold_evidence_strictly_ordered(
     ) is None
 
 
-def test_owned_process_tree_holds_when_windows_filetime_is_unavailable() -> None:
+@pytest.mark.parametrize(
+    "start_filetime",
+    [None, str(1 << 64)],
+    ids=["missing", "outside-uint64"],
+)
+def test_owned_process_tree_holds_when_windows_filetime_is_unavailable(
+    start_filetime: str | None,
+) -> None:
     snapshot = [
         _wrap_snap()[0],
         _proc(
@@ -11444,7 +11456,7 @@ def test_owned_process_tree_holds_when_windows_filetime_is_unavailable() -> None
         ),
         _proc(302, WRAP_CHILD_PID, "node.exe", "node tool.js", _ps_iso(700000)),
     ]
-    snapshot[-1]["start_filetime"] = None
+    snapshot[-1]["start_filetime"] = start_filetime
 
     plan = _owned_tree_plan(snapshot, request_id="rr-missing-exact-filetime")
 
@@ -13100,6 +13112,72 @@ def test_oversized_process_identity_keeps_hold_visible_on_attention_surfaces(
         item.get("item_id") == "source_error:process_tree_hold"
         for item in items
     )
+
+
+def test_out_of_range_filetime_keeps_hold_visible_and_blocks_reset_admission(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    impossible_filetime = str(1 << 64)
+    state["agents"]["worker"]["owned_process_tree"]["entries"][-1][
+        "start_filetime"
+    ] = impossible_filetime
+    probed: list[tuple[int, str, str | None]] = []
+
+    def identity_gone(
+        pid: int,
+        start: str,
+        start_filetime: str | None = None,
+    ) -> bool:
+        probed.append((pid, start, start_filetime))
+        return True
+
+    item = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=identity_gone,
+    )
+
+    assert item["item_id"] == "process_tree_hold:worker"
+    assert "operator_argv" not in item
+    assert probed == []
+
+
+def test_out_of_range_filetime_is_preserved_when_reset_handler_refuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state["agents"]["worker"]["owned_process_tree"]["entries"][-1][
+        "start_filetime"
+    ] = str(1 << 64)
+    state_path = store.dir / "supervisor-state.json"
+    sup.save_supervisor_state(state_path, state)
+    source_hash = att.process_tree_hold_items(state)[0]["source_hash"]
+    before = state_path.read_bytes()
+    probed: list[tuple[int, str, str | None]] = []
+
+    def identity_gone(
+        pid: int,
+        start: str,
+        start_filetime: str | None = None,
+    ) -> bool:
+        probed.append((pid, start, start_filetime))
+        return True
+
+    monkeypatch.setattr(cli, "_owner_identity_gone", identity_gone)
+
+    assert _run(_attended_process_tree_reset_args(source_hash), tmp_path) == 3
+    assert probed == []
+    assert state_path.read_bytes() == before
 
 
 def test_attended_process_tree_reset_is_audited_and_rearms_new_generation(

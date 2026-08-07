@@ -180,6 +180,14 @@ def test_launcher_exit_observer_cannot_write_into_later_turn(
             "creation_filetime": "not-ticks",
             "exit_filetime": "200",
         },
+        pytest.param(
+            {
+                "source": wr.LAUNCHER_LIFETIME_SOURCE,
+                "creation_filetime": str(1 << 64),
+                "exit_filetime": str((1 << 64) + 1),
+            },
+            id="outside-uint64",
+        ),
     ],
 )
 def test_runtime_rejects_malformed_launcher_lifetime(
@@ -193,6 +201,26 @@ def test_runtime_rejects_malformed_launcher_lifetime(
 
     with pytest.raises(wr.RuntimeRecordError):
         wr.validate_record(record, expected_agent="worker", now_epoch=NOW)
+
+
+def test_runtime_accepts_unsigned_filetime_maximum(tmp_path: Path) -> None:
+    writer = _writer(tmp_path)
+    writer.starting(message_id="msg-1", turn_id="turn-1")
+    record = writer.active(456, "start-456")
+    lifetime = {
+        "source": wr.LAUNCHER_LIFETIME_SOURCE,
+        "creation_filetime": str((1 << 64) - 2),
+        "exit_filetime": str((1 << 64) - 1),
+    }
+    record["cli_launcher_lifetime"] = lifetime
+
+    validated = wr.validate_record(
+        record,
+        expected_agent="worker",
+        now_epoch=NOW,
+    )
+
+    assert validated["cli_launcher_lifetime"] == lifetime
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process handles only")

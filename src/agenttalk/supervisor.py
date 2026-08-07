@@ -46,6 +46,7 @@ from agenttalk.store import (
     Store,
     _owner_identity_gone,
     _process_alive,
+    _windows_filetime_ticks,
     is_unusable_restart_request,
     validate_agent_name,
 )
@@ -2367,20 +2368,16 @@ def _start_of(row: dict | None):
 
 def _filetime_of(row: dict | None) -> str | None:
     value = (row or {}).get("start_filetime")
-    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,19}", value):
-        return value
-    return None
+    return value if _windows_filetime_ticks(value) is not None else None
 
 
 def _filetime_start_token(value: object) -> str | None:
     """Render exact Windows creation ticks as a comparable ISO start token."""
-    if (
-        not isinstance(value, str)
-        or re.fullmatch(r"[1-9][0-9]{0,19}", value) is None
-    ):
+    ticks = _windows_filetime_ticks(value)
+    if ticks is None:
         return None
     try:
-        seconds = (int(value) / 10_000_000.0) - 11_644_473_600
+        seconds = (ticks / 10_000_000.0) - 11_644_473_600
         return datetime.fromtimestamp(seconds, timezone.utc).isoformat(
             timespec="microseconds"
         ).replace("+00:00", "Z")
@@ -2423,11 +2420,9 @@ def _exact_start_order_key_values(
         # Linux's boot-id/start-ticks token is already exact. Ignore any stale
         # FILETIME-shaped field rather than changing the token's platform.
         return key
-    if (
-        isinstance(start_filetime, str)
-        and re.fullmatch(r"[1-9][0-9]{0,19}", start_filetime)
-    ):
-        return ("win32-filetime", int(start_filetime))
+    ticks = _windows_filetime_ticks(start_filetime)
+    if ticks is not None:
+        return ("win32-filetime", ticks)
     return None
 
 
@@ -2881,10 +2876,7 @@ def _valid_owned_process_tree(
             or start_key is None
             or (
                 start_filetime is not None
-                and (
-                    not isinstance(start_filetime, str)
-                    or re.fullmatch(r"[1-9][0-9]{0,19}", start_filetime) is None
-                )
+                and _windows_filetime_ticks(start_filetime) is None
             )
             or (
                 status in {"complete", "absent"}
@@ -4455,7 +4447,7 @@ def configured_detached_launch(
             argument = argument.replace("{ROOT}", root_text)
         argument = argument.replace("<cwd>", cwd_token)
         args.append(argument)
-    if root_text is not None:
+    if root_text is not None and bool(row.get("wrapped", False)):
         normalized_args = _ensure_agenttalk_wrap_root_arg(
             args,
             launch.get("module_args_from"),
@@ -12572,12 +12564,15 @@ function Launch($name, $plan, $codexHome) {
     if ($x -ceq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
   }
   $moduleArgsFrom = $a.launch.module_args_from
-  $normalizedArgv = Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom
-  if ($null -eq $normalizedArgv) {
-    Write-Warning (
-      "supervisor: {0}: CONFIG ERROR - wrapped launch has invalid or duplicate root arguments; NOT launching (fail closed)" -f
-      $name)
-    return $null
+  $normalizedArgv = $argv
+  if ([bool]$a.wrapped) {
+    $normalizedArgv = Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom
+    if ($null -eq $normalizedArgv) {
+      Write-Warning (
+        "supervisor: {0}: CONFIG ERROR - wrapped launch has invalid or duplicate root arguments; NOT launching (fail closed)" -f
+        $name)
+      return $null
+    }
   }
   $argv = @($normalizedArgv)
   $dispatchesWrap = Test-AgenttalkWrapDispatch $file $argv $moduleArgsFrom

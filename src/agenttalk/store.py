@@ -7014,6 +7014,7 @@ LEAD_LOOP_CADENCE_HEALTH_THRESHOLD = 5        # consecutive failed ticks -> esca
 #                                               controller-HEALTH (NOT message poison)
 
 _WINDOWS_PID_MAX = (1 << 32) - 1
+_WINDOWS_FILETIME_MAX = (1 << 64) - 1
 
 
 def _valid_pid_value(pid: object) -> bool:
@@ -7022,6 +7023,17 @@ def _valid_pid_value(pid: object) -> bool:
 
 def _valid_windows_pid_value(pid: object) -> bool:
     return _valid_pid_value(pid) and pid <= _WINDOWS_PID_MAX
+
+
+def _windows_filetime_ticks(value: object) -> int | None:
+    """Parse one canonical positive unsigned Windows FILETIME value."""
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[1-9][0-9]{0,19}", value) is None
+    ):
+        return None
+    ticks = int(value)
+    return ticks if ticks <= _WINDOWS_FILETIME_MAX else None
 
 
 def _process_alive(pid: int) -> bool:
@@ -7304,11 +7316,8 @@ def _windows_owner_identity_gone_exact(
     recorded_start_filetime: object,
 ) -> bool:
     """Compare one live Windows process handle with an exact creation FILETIME."""
-    if (
-        not _valid_windows_pid_value(pid)
-        or not isinstance(recorded_start_filetime, str)
-        or re.fullmatch(r"[1-9][0-9]{0,19}", recorded_start_filetime) is None
-    ):
+    recorded_ticks = _windows_filetime_ticks(recorded_start_filetime)
+    if not _valid_windows_pid_value(pid) or recorded_ticks is None:
         return False
     try:
         import ctypes  # stdlib; lazy so POSIX never pays for it
@@ -7368,7 +7377,7 @@ def _windows_owner_identity_gone_exact(
             ) | int(creation.dwLowDateTime)
             if creation_ticks <= 0:
                 return False
-            return str(creation_ticks) != recorded_start_filetime
+            return creation_ticks != recorded_ticks
         finally:
             kernel32.CloseHandle(handle)
     except Exception:  # noqa: BLE001 - exact probe ambiguity is never gone
