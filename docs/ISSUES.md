@@ -20,11 +20,12 @@ be labeled `SHIPPED` once the changelog closes them.
 ## P1 · PLANNED — exact child-environment proof across supported PowerShell hosts (2026-08-07)
 
 **What.** Detached ephemeral recovery currently binds the prepared request and
-its reconstructed launch-effective projection, not raw configured-profile
-identity. An equivalent profile edit that produces the same effective values
-does not invalidate the binding. Recovery does not verify the environment the
-child actually receives, and the operator surfaces state that limitation
-explicitly.
+its reconstructed launch-effective projection. Equivalent working-directory
+and configured-environment edits remain valid. Any edit to the configured
+launch mapping—even one producing identical effective argv—requires
+re-preparation and produces a named refusal instead of a command. Recovery does
+not verify the environment the child actually receives, and the operator
+surfaces state that limitation explicitly.
 
 **Why.** Three implementations that appeared internally consistent failed at
 the real process boundary. The tested preferred PowerShell 7 host dropped
@@ -39,6 +40,26 @@ boundary on both supported PowerShell editions and cover hidden entries, empty
 values, Unicode-distinct names, collision behavior, configured overrides, and
 restoration. Until that evidence exists, do not describe the detached remedy as
 bound to an exact inherited or effective child environment.
+
+---
+
+## P2 · PLANNED — effective-equivalent launch mappings in detached recovery (2026-08-07)
+
+**What.** Detached recovery compares the prepared and current configured launch
+mappings by raw equality before it reconstructs the launch-effective
+projection. Replacing a placeholder with the identical resolved literal
+therefore produces a safe but unnecessary refusal and requires re-preparation.
+
+**Why.** The reconstructed binding already distinguishes effective drift from
+equivalent working-directory and environment edits. Extending that equivalence
+to the launch mapping is the better operator experience, but changing the
+release's admission behavior during final review would add risk to a path that
+currently fails closed.
+
+**Disposition.** `PLANNED`. Make recovery use the reconstructed binding for
+launch-mapping equivalence while retaining full current admission. Preserve
+consumer controls for both placeholder-to-literal equivalence and real argv
+drift; until then, document and retain the named refusal.
 
 ---
 

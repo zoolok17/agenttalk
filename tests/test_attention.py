@@ -1504,7 +1504,7 @@ def test_ephemeral_hold_uses_its_request_profile_for_detached_launch(
 
 
 @pytest.mark.parametrize("equivalent_edit", ["cwd-root", "env-agent"])
-def test_ephemeral_hold_accepts_equivalent_effective_profile_edit(
+def test_ephemeral_hold_accepts_equivalent_cwd_or_environment_edit(
     tmp_path: Path,
     equivalent_edit: str,
 ) -> None:
@@ -1539,6 +1539,58 @@ def test_ephemeral_hold_accepts_equivalent_effective_profile_edit(
 
     assert "configured_launch" in item
     assert "configured_launch_unavailable" not in item
+
+
+@pytest.mark.parametrize("placeholder", ["{ROOT}", "{AGENT}"])
+def test_ephemeral_hold_rejects_equivalent_launch_mapping_edit(
+    tmp_path: Path,
+    placeholder: str,
+) -> None:
+    request_id, agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    prepared_spec = eph.launch_spec(
+        marker,
+        profile,
+        agent,
+        root=config["_test_root"],
+    )
+    prepared_launch = profile["launch"]
+    profile["launch"] = {
+        **prepared_launch,
+        "windows_args": list(prepared_launch["windows_args"]),
+    }
+    resolved = config["_test_root"] if placeholder == "{ROOT}" else agent
+    profile["launch"]["windows_args"] = [
+        resolved if value == placeholder else value
+        for value in profile["launch"]["windows_args"]
+    ]
+    assert eph.launch_spec(
+        marker,
+        profile,
+        agent,
+        root=config["_test_root"],
+    ) == prepared_spec
+
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert item["configured_launch_unavailable"] == (
+        "the active ephemeral request profile no longer matches"
+    )
 
 
 def test_ephemeral_hold_without_prepared_launch_binding_is_unavailable(
@@ -1768,6 +1820,9 @@ def test_ephemeral_hold_does_not_claim_or_bind_ambient_environment(
     note = admitted["configured_launch"]["environment_note"]
     assert "reconstructed launch-effective projection" in note
     assert "unchanged configured launch profile" not in note
+    assert "Equivalent cwd or configured-environment edits remain valid" in note
+    assert "any launch-mapping edit" in note
+    assert "requires re-preparation" in note
     assert "environment the child actually receives is not verified" in note
     assert "neither ambient nor configured values are guaranteed" in note
 
