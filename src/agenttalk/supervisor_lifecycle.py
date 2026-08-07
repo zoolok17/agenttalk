@@ -13,7 +13,10 @@ import ctypes
 import json
 import os
 import re
+# Used only for TimeoutExpired while managing a caller-owned process (task #107).
+import subprocess  # nosec B404
 import tempfile
+import time
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,6 +31,40 @@ class SupervisorLifecycleError(RuntimeError):
     """A lifecycle/selection operation was refused without mutation."""
 
 
+def _rooted_supervise_command(store: Store, arguments: str) -> str:
+    return f"agenttalk --root {_powershell_literal(store.root)} supervise {arguments}"
+
+
+def _powershell_literal(value: object) -> str:
+    """Quote one operator-supplied value literally for PowerShell."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def create_kill_switch_command(store: Store) -> str:
+    """Return a PowerShell command that arms this root's kill switch."""
+    return (
+        "New-Item -ItemType File -Force -LiteralPath "
+        f"{_powershell_literal(store.dir / 'supervisor.kill')}"
+    )
+
+
+def instance_marker_repair_command(store: Store) -> str:
+    """Return the repair command pinned to ``store``'s resolved project root."""
+    return _rooted_supervise_command(
+        store,
+        "--repair-instance-marker --quarantine "
+        "--acknowledge-no-live-supervisor",
+    )
+
+
+def stop_instance_command(store: Store) -> str:
+    """Return the exact-instance stop command pinned to the project root."""
+    return _rooted_supervise_command(
+        store,
+        "--stop-instance --acknowledge-stop-supervisor",
+    )
+
+
 @dataclass
 class ProcessObservation:
     pid: int
@@ -38,6 +75,13 @@ class ProcessObservation:
     identity: psh.NativeFileIdentity
     handle: int
     image_handle: int = 0
+
+
+@dataclass(frozen=True)
+class SpawnedProcessIdentity:
+    pid: int
+    pid_start: str
+    start_filetime: int
 
 
 def selection_path(store: Store) -> Path:
@@ -179,9 +223,9 @@ def _strict_marker_allows_mutation_locked(store: Store) -> None:
     status, record, detail = store._read_supervisor_instance_strict_locked()
     if status == "invalid":
         raise SupervisorLifecycleError(
-            "supervisor instance marker is invalid or unreadable; run "
-            "`agenttalk supervise --repair-instance-marker --quarantine "
-            "--acknowledge-no-live-supervisor`"
+            "supervisor instance marker is invalid or unreadable "
+            f"({detail or 'unknown error'}); run "
+            f"`{instance_marker_repair_command(store)}`"
         )
     if status == "absent":
         return
@@ -189,7 +233,11 @@ def _strict_marker_allows_mutation_locked(store: Store) -> None:
         raise SupervisorLifecycleError(
             "supervisor instance marker validation returned no owner record"
         )
-    if not _owner_identity_gone(record.get("pid"), record.get("pid_start")):
+    if not _owner_identity_gone(
+        record.get("pid"),
+        record.get("pid_start"),
+        record.get("pid_start_filetime"),
+    ):
         raise SupervisorLifecycleError(
             "a live or unqueryable supervisor owns this project; stop it, wait until "
             "the process exits, then retry"
@@ -309,10 +357,26 @@ def _process_parent_map() -> dict[int, int]:
     try:
         entry = _PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(entry)
+        ctypes.set_last_error(0)
         ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
-        while ok:
+        if not ok:
+            raise SupervisorLifecycleError(
+                "could not read the first process ancestry snapshot entry "
+                f"(winerror {ctypes.get_last_error()})"
+            )
+        while True:
             parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            ctypes.set_last_error(0)
             ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            if ok:
+                continue
+            error = ctypes.get_last_error()
+            if error != 18:  # ERROR_NO_MORE_FILES is normal enumeration completion.
+                raise SupervisorLifecycleError(
+                    "process ancestry snapshot ended before completion "
+                    f"(winerror {error})"
+                )
+            break
     finally:
         kernel32.CloseHandle(snapshot)
     return parents
@@ -323,10 +387,37 @@ def _filetime_ticks(value: wintypes.FILETIME) -> int:
 
 
 def _ticks_to_token(ticks: int) -> str:
-    epoch_seconds = ticks / 10_000_000.0 - 11644473600
-    return datetime.fromtimestamp(epoch_seconds, timezone.utc).isoformat(
-        timespec="microseconds"
-    ).replace("+00:00", "Z")
+    unix_ticks = ticks - 116_444_736_000_000_000
+    seconds, fraction = divmod(unix_ticks, 10_000_000)
+    stamp = datetime.fromtimestamp(seconds, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    return f"{stamp}.{fraction:07d}Z"
+
+
+def _start_token_filetime(value: object) -> int | None:
+    """Parse an exact .NET round-trip process-start token to FILETIME ticks."""
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+        r"(?:\.(\d{1,7}))?(Z|[+-]\d{2}:\d{2})",
+        value,
+    )
+    if match is None:
+        return None
+    prefix, fraction, zone = match.groups()
+    try:
+        stamp = datetime.fromisoformat(
+            prefix + ("+00:00" if zone == "Z" else zone)
+        ).astimezone(timezone.utc)
+    except ValueError:
+        return None
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = stamp - epoch
+    seconds = delta.days * 86_400 + delta.seconds
+    fractional_ticks = int((fraction or "0").ljust(7, "0"))
+    return 116_444_736_000_000_000 + seconds * 10_000_000 + fractional_ticks
 
 
 def _open_process_observation(pid: int, *, parents: Mapping[int, int] | None = None) -> ProcessObservation:
@@ -710,15 +801,14 @@ def claim_powershell_supervisor(
             raise SupervisorLifecycleError(
                 "supervisor instance marker is invalid or unreadable "
                 f"({marker_detail or 'unknown error'}); run "
-                "`agenttalk supervise --repair-instance-marker --quarantine "
-                "--acknowledge-no-live-supervisor`"
+                f"`{instance_marker_repair_command(store)}`"
             )
         with store._powershell_selection_lock():
             first = _read_valid_selection_locked(store)
             host = _open_process_observation(pid)
             ancestry: tuple[ProcessObservation, ...] = ()
             try:
-                if not start_tokens_match(host.creation_token, pid_start):
+                if _start_token_filetime(pid_start) != host.creation_ticks:
                     raise SupervisorLifecycleError(
                         "PowerShell pid/start locator was reused or ambiguous"
                     )
@@ -756,7 +846,11 @@ def claim_powershell_supervisor(
                     _require_process_active(host)
                     return store._claim_supervisor_instance_locked(
                         pid=pid,
+                        # Preserve the caller's offset spelling: generated
+                        # drain/release calls reuse it. Exact equivalence to the
+                        # observed FILETIME was established above.
                         pid_start=pid_start,
+                        pid_start_filetime=str(host.creation_ticks),
                     )
             finally:
                 for observation in ancestry:
@@ -764,7 +858,451 @@ def claim_powershell_supervisor(
                 _close_process_observation(host)
 
 
-def repair_invalid_instance_marker(store: Store) -> Path | None:
-    return store.quarantine_invalid_supervisor_instance(
-        reason="operator acknowledged no live supervisor"
+def _held_marker_error(detail: str) -> SupervisorLifecycleError:
+    return SupervisorLifecycleError(
+        "supervisor instance marker holder is live or unqueryable; marker remains "
+        f"HELD ({detail})"
     )
+
+
+def _parentless_marker_error(store: Store, pid: int) -> SupervisorLifecycleError:
+    return SupervisorLifecycleError(
+        f"supervisor instance marker holder pid={pid} is parentless; arm the "
+        f"kill switch with `{create_kill_switch_command(store)}`, run the "
+        "marker-bound exact-identity "
+        f"stop `{stop_instance_command(store)}`, then run "
+        f"`{instance_marker_repair_command(store)}` to quarantine the stopped marker"
+    )
+
+
+def assert_supervisor_start_precondition(store: Store) -> None:
+    """Refuse ``start`` when an existing singleton cannot safely be replaced.
+
+    This check is deliberately observational.  It never repairs or clears a
+    marker, and every process-query ambiguity remains a held singleton.  A
+    confirmed parentless holder is called out separately because Ctrl-C on the
+    Team Console can leave its hidden supervisor child in exactly that state.
+    """
+    with store._supervisor_lifecycle_lock():
+        status, record, detail = store._read_supervisor_instance_strict_locked()
+        if status == "absent":
+            return
+        if status == "invalid":
+            raise SupervisorLifecycleError(
+                "supervisor instance marker is invalid or unreadable "
+                f"({detail or 'unknown error'}); run "
+                f"`{instance_marker_repair_command(store)}`"
+            )
+        if record is None:
+            raise _held_marker_error("valid read returned no owner record")
+
+        pid = int(record["pid"])
+        pid_start = record.get("pid_start")
+        if _owner_identity_gone(
+            pid,
+            pid_start,
+            record.get("pid_start_filetime"),
+        ):
+            raise SupervisorLifecycleError(
+                f"supervisor instance marker holder pid={pid} is dead or reused; "
+                f"run `{instance_marker_repair_command(store)}`"
+            )
+
+        holder: ProcessObservation | None = None
+        parent: ProcessObservation | None = None
+        try:
+            try:
+                parents = _process_parent_map()
+                if pid not in parents:
+                    raise SupervisorLifecycleError(
+                        f"pid {pid} was absent from the process snapshot"
+                    )
+                holder = _open_process_observation(pid, parents=parents)
+                if not start_tokens_match(holder.creation_token, pid_start):
+                    raise SupervisorLifecycleError(
+                        f"pid {pid} start identity was reused or ambiguous"
+                    )
+                exact_start = record.get("pid_start_filetime")
+                if exact_start is not None and str(holder.creation_ticks) != exact_start:
+                    raise SupervisorLifecycleError(
+                        f"pid {pid} exact start identity did not match the marker"
+                    )
+                _require_process_active(holder)
+            except Exception as exc:
+                raise _held_marker_error(str(exc)) from exc
+
+            parent_pid = holder.parent_pid
+            if parent_pid <= 0 or parent_pid not in parents:
+                raise _parentless_marker_error(store, pid)
+
+            try:
+                parent = _open_process_observation(parent_pid, parents=parents)
+                _require_process_active(parent)
+            except Exception as exc:
+                raise _held_marker_error(
+                    f"could not establish parent pid={parent_pid}: {exc}"
+                ) from exc
+            if parent.creation_ticks > holder.creation_ticks:
+                raise _parentless_marker_error(store, pid)
+            _require_process_active(holder)
+            raise SupervisorLifecycleError(
+                f"another live supervisor instance owns this root (pid={pid}); "
+                "stop it and wait for its marker to be released"
+            )
+        finally:
+            if parent is not None:
+                _close_process_observation(parent)
+            if holder is not None:
+                _close_process_observation(holder)
+
+
+def observe_spawned_supervisor(process: object) -> SpawnedProcessIdentity:
+    """Capture the exact creation identity of a newly spawned live process."""
+    pid = getattr(process, "pid", None)
+    poll = getattr(process, "poll", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not callable(poll):
+        raise SupervisorLifecycleError("spawned supervisor process handle is invalid")
+    if poll() is not None:
+        raise SupervisorLifecycleError(f"spawned supervisor pid={pid} already exited")
+    try:
+        observation = _open_process_observation(pid)
+    except psh.PowerShellHostError as exc:
+        raise SupervisorLifecycleError(
+            f"cannot capture spawned supervisor pid={pid} image identity: {exc}"
+        ) from exc
+    try:
+        if poll() is not None:
+            raise SupervisorLifecycleError(
+                f"spawned supervisor pid={pid} exited during identity capture"
+            )
+        _require_process_active(observation)
+        return SpawnedProcessIdentity(
+            pid=pid,
+            pid_start=_ticks_to_token(observation.creation_ticks),
+            start_filetime=observation.creation_ticks,
+        )
+    finally:
+        _close_process_observation(observation)
+
+
+def _marker_matches_spawned_identity(
+    record: Mapping[str, object],
+    identity: SpawnedProcessIdentity,
+) -> bool:
+    if record.get("pid") != identity.pid:
+        return False
+    exact = record.get("pid_start_filetime")
+    if exact is not None:
+        return (
+            str(identity.start_filetime) == exact
+            and _start_token_filetime(record.get("pid_start"))
+            == identity.start_filetime
+        )
+    return _start_token_filetime(record.get("pid_start")) == identity.start_filetime
+
+
+def wait_for_supervisor_claim(
+    store: Store,
+    process: object,
+    *,
+    identity: SpawnedProcessIdentity,
+    timeout_seconds: float = 35.0,
+    clock: Callable[[], float] = time.monotonic,
+    pause: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Return the claimed marker only while the exact spawned process is live."""
+    pid = getattr(process, "pid", None)
+    poll = getattr(process, "poll", None)
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not callable(poll)
+        or identity.pid != pid
+        or identity.start_filetime <= 0
+    ):
+        raise SupervisorLifecycleError("spawned supervisor process handle is invalid")
+    deadline = clock() + timeout_seconds
+    while True:
+        # Marker publication is an atomic replace.  Read without taking the
+        # lifecycle lock so the child is never delayed from publishing; failed
+        # cleanup takes that lock for its final claim-or-stop decision below.
+        exit_code = poll()
+        status, record, detail = store.read_supervisor_instance_strict()
+        if status == "invalid":
+            raise SupervisorLifecycleError(
+                "supervisor claim produced an invalid or unreadable marker "
+                f"({detail or 'unknown error'}); run "
+                f"`{instance_marker_repair_command(store)}`"
+            )
+        if status == "valid" and record is not None:
+            if record.get("pid") != pid:
+                raise SupervisorLifecycleError(
+                    "another supervisor owns the instance marker "
+                    f"(pid={record.get('pid')})"
+                )
+            if exit_code is not None:
+                raise SupervisorLifecycleError(
+                    f"spawned supervisor pid={pid} exited with code {exit_code}"
+                )
+            if not _marker_matches_spawned_identity(record, identity):
+                raise SupervisorLifecycleError(
+                    f"instance marker has the spawned pid={pid} but a different "
+                    "start identity"
+                )
+            exit_code = poll()
+            if exit_code is not None:
+                raise SupervisorLifecycleError(
+                    f"spawned supervisor pid={pid} exited with code {exit_code} "
+                    "after claiming"
+                )
+            return record
+        if exit_code is not None:
+            raise SupervisorLifecycleError(
+                f"spawned supervisor pid={pid} exited with code {exit_code} before claiming"
+            )
+        if clock() >= deadline:
+            raise SupervisorLifecycleError(
+                f"spawned supervisor pid={pid} remained alive but did not claim within "
+                f"{timeout_seconds:g}s"
+            )
+        pause(0.05)
+
+
+def stop_unverified_supervisor(
+    store: Store,
+    process: object,
+    *,
+    identity: SpawnedProcessIdentity | None,
+) -> dict | None:
+    """Contain a failed start, unless a final locked sample proves a late claim.
+
+    The termination happens while the lifecycle lock is held, closing the race
+    where the exact child publishes its claim between the waiter's last sample
+    and the parent's cleanup decision.
+    """
+    pid = getattr(process, "pid", None)
+    poll = getattr(process, "poll", None)
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not callable(poll)
+    ):
+        return None
+    identity_is_usable = bool(
+        identity is not None
+        and identity.pid == pid
+        and identity.start_filetime > 0
+    )
+
+    def terminate_exact_process() -> None:
+        terminate = getattr(process, "terminate", None)
+        wait = getattr(process, "wait", None)
+        kill = getattr(process, "kill", None)
+        if poll() is not None:
+            return
+        try:
+            if callable(terminate):
+                terminate()
+            if callable(wait):
+                wait(timeout=5)
+                return
+            if poll() is not None:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            if callable(kill):
+                kill()
+            if callable(wait):
+                wait(timeout=5)
+                return
+            if poll() is not None:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        raise SupervisorLifecycleError(
+            f"could not confirm termination of unverified supervisor pid={pid}"
+        )
+
+    try:
+        with store._supervisor_lifecycle_lock():
+            exit_code = poll()
+            status, record, _detail = store._read_supervisor_instance_strict_locked()
+            if (
+                exit_code is None
+                and status == "valid"
+                and record is not None
+                and identity_is_usable
+                and identity is not None
+                and _marker_matches_spawned_identity(record, identity)
+            ):
+                return record if poll() is None else None
+            if exit_code is not None:
+                return None
+            terminate_exact_process()
+            return None
+    except OSError:
+        # We still own the exact Popen handle even when marker state cannot be
+        # serialized.  Stopping that child grants no authority over any marker.
+        terminate_exact_process()
+        return None
+
+
+def _marker_start_filetime(record: Mapping[str, object]) -> int:
+    exact = record.get("pid_start_filetime")
+    if isinstance(exact, str) and re.fullmatch(r"[1-9][0-9]{0,19}", exact):
+        ticks = int(exact)
+        derived = _start_token_filetime(record.get("pid_start"))
+        if derived != ticks:
+            raise SupervisorLifecycleError(
+                "supervisor marker start identity fields disagree; marker remains HELD"
+            )
+        return ticks
+    legacy = _start_token_filetime(record.get("pid_start"))
+    if legacy is None:
+        raise SupervisorLifecycleError(
+            "supervisor marker has no exact Windows start identity; marker remains HELD"
+        )
+    return legacy
+
+
+def stop_supervisor_instance(store: Store) -> dict:
+    """Stop the exact marker owner through one verified Windows process handle."""
+    if os.name != "nt":
+        raise SupervisorLifecycleError("supervisor instance stop is Windows-only")
+    with store._supervisor_lifecycle_lock():
+        kill_switch = store.supervisor_kill_switch()
+        if kill_switch is not True:
+            detail = "unreadable" if kill_switch is None else "absent"
+            raise SupervisorLifecycleError(
+                f"supervisor.kill is {detail}; arm it with "
+                f"`{create_kill_switch_command(store)}` "
+                "before stopping the supervisor"
+            )
+        status, record, detail = store._read_supervisor_instance_strict_locked()
+        if status == "absent":
+            raise SupervisorLifecycleError("no supervisor instance marker is present")
+        if status == "invalid" or record is None:
+            raise SupervisorLifecycleError(
+                "supervisor instance marker is invalid or unreadable "
+                f"({detail or 'unknown error'}); run "
+                f"`{instance_marker_repair_command(store)}`"
+            )
+        pid = int(record["pid"])
+        expected_ticks = _marker_start_filetime(record)
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        # SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION.
+        # This one handle is both the identity certificate and the destructive
+        # capability, so a reused numeric PID can never redirect the stop.
+        handle = kernel32.OpenProcess(0x101001, False, pid)
+        if not handle:
+            raise SupervisorLifecycleError(
+                f"cannot open supervisor pid={pid} for exact stop "
+                f"(winerror {ctypes.get_last_error()}); marker remains HELD"
+            )
+        try:
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                raise SupervisorLifecycleError(
+                    f"cannot verify supervisor pid={pid} start identity; marker remains HELD"
+                )
+            actual_ticks = _filetime_ticks(creation)
+            if actual_ticks != expected_ticks:
+                raise SupervisorLifecycleError(
+                    f"supervisor pid={pid} start identity does not match the marker; "
+                    "marker remains HELD"
+                )
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                raise SupervisorLifecycleError(
+                    f"cannot verify supervisor pid={pid} liveness; marker remains HELD"
+                )
+            if code.value != 259:  # STILL_ACTIVE
+                raise SupervisorLifecycleError(
+                    f"supervisor pid={pid} already exited; run "
+                    f"`{instance_marker_repair_command(store)}`"
+                )
+            if not kernel32.TerminateProcess(handle, 1):
+                raise SupervisorLifecycleError(
+                    f"could not stop exact supervisor pid={pid} "
+                    f"(winerror {ctypes.get_last_error()}); marker remains HELD"
+                )
+            wait_result = int(kernel32.WaitForSingleObject(handle, 5_000))
+            if wait_result != 0:  # WAIT_OBJECT_0
+                raise SupervisorLifecycleError(
+                    f"supervisor pid={pid} stop was not confirmed within 5s "
+                    f"(wait result {wait_result}); marker remains HELD"
+                )
+            return dict(record)
+        finally:
+            kernel32.CloseHandle(handle)
+
+
+def repair_instance_marker(store: Store) -> Path | None:
+    """Quarantine an invalid marker or a valid marker with a proven-gone owner."""
+    with store._supervisor_lifecycle_lock():
+        status, record, detail = store._read_supervisor_instance_strict_locked()
+        if status == "absent":
+            return None
+        if status == "invalid":
+            return store._quarantine_supervisor_instance_locked(
+                reason=(
+                    "operator acknowledged no live supervisor: "
+                    f"{detail or 'invalid marker'}"
+                )
+            )
+        if record is None or not _owner_identity_gone(
+            record.get("pid"),
+            record.get("pid_start"),
+            record.get("pid_start_filetime"),
+        ):
+            raise ValueError(
+                "refusing to quarantine a valid marker whose holder is live or "
+                "unqueryable"
+            )
+        return store._quarantine_supervisor_instance_locked(
+            reason="operator acknowledged confirmed dead or reused supervisor owner"
+        )
+
+
+def repair_invalid_instance_marker(store: Store) -> Path | None:
+    """Compatibility alias for the broadened explicit instance repair."""
+    return repair_instance_marker(store)

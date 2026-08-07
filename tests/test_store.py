@@ -1600,7 +1600,7 @@ def test_windows_exact_owner_identity_uses_one_handle(
 
     assert store_mod._owner_identity_gone(
         321,
-        "2026-07-04T07:20:31.500000Z",
+        "2025-12-31T07:20:31.5000000Z",
         "134116392315000000",
     ) is expected_gone
     assert kernel32.opened == [(0x1000, False, 321)]
@@ -1642,7 +1642,7 @@ def test_windows_exact_owner_identity_probe_ambiguity_is_conservative(
 
     assert store_mod._owner_identity_gone(
         321,
-        "2026-07-04T07:20:31.500000Z",
+        "2025-12-31T07:20:31.5000000Z",
         "134116392315000000",
     ) is expected_gone
     assert kernel32.closed == ([404] if handle else [])
@@ -1680,7 +1680,7 @@ def test_owner_identity_exact_probe_never_falls_back_to_rounded_start(
 
     assert store_mod._owner_identity_gone(
         321,
-        "2026-07-04T07:20:31.500000Z",
+        "2025-12-31T07:20:31.5000000Z",
         "134116392315000000",
     ) is False
 

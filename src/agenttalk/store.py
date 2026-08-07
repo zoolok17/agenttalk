@@ -6526,6 +6526,12 @@ class Store:
         pid_start = data.get("pid_start")
         if pid_start is not None and (not isinstance(pid_start, str) or not pid_start):
             return "invalid", None, "marker pid_start is invalid"
+        pid_start_filetime = data.get("pid_start_filetime")
+        if pid_start_filetime is not None and (
+            not isinstance(pid_start_filetime, str)
+            or re.fullmatch(r"[1-9][0-9]{0,19}", pid_start_filetime) is None
+        ):
+            return "invalid", None, "marker pid_start_filetime is invalid"
         return "valid", data, None
 
     def read_supervisor_instance_strict(self) -> tuple[str, dict | None, str | None]:
@@ -6567,9 +6573,25 @@ class Store:
                 reason=f"{reason}: {detail or 'invalid marker'}"
             )
 
-    def _claim_supervisor_instance_locked(self, *, pid: int,
-                                          pid_start: object = None) -> dict | None:
+    def _claim_supervisor_instance_locked(
+        self,
+        *,
+        pid: int,
+        pid_start: object = None,
+        pid_start_filetime: object = None,
+    ) -> dict | None:
         """Generic marker fold/write; caller holds lifecycle and config locks."""
+        if pid_start_filetime is not None and (
+            not isinstance(pid_start_filetime, str)
+            or re.fullmatch(r"[1-9][0-9]{0,19}", pid_start_filetime) is None
+        ):
+            raise ValueError("pid_start_filetime must be exact decimal FILETIME ticks")
+        if pid_start_filetime is not None and (
+            _windows_start_token_filetime(pid_start) != int(pid_start_filetime)
+        ):
+            raise ValueError(
+                "pid_start and pid_start_filetime must identify the same process start"
+            )
         status, existing, _detail = self._read_supervisor_instance_strict_locked()
         if status == "invalid":
             return None
@@ -6581,7 +6603,9 @@ class Store:
                 )
             else:
                 reclaim = _owner_identity_gone(
-                    existing_pid, existing.get("pid_start"),
+                    existing_pid,
+                    existing.get("pid_start"),
+                    existing.get("pid_start_filetime"),
                 )
             if not reclaim:
                 return None
@@ -6593,14 +6617,21 @@ class Store:
             "token": secrets.token_hex(16),
             "started_at": _now_iso(),
         }
+        if pid_start_filetime is not None:
+            record["pid_start_filetime"] = pid_start_filetime
         _atomic_write_text(
             self.supervisor_instance_path(),
             json.dumps(record, indent=2, ensure_ascii=False),
         )
         return record
 
-    def claim_supervisor_instance(self, *, pid: int,
-                                  pid_start: object = None) -> dict | None:
+    def claim_supervisor_instance(
+        self,
+        *,
+        pid: int,
+        pid_start: object = None,
+        pid_start_filetime: object = None,
+    ) -> dict | None:
         """Claim the SINGLETON supervisor/executor instance lock.
 
         Held for the supervisor process lifetime (released in the .ps1
@@ -6614,7 +6645,9 @@ class Store:
         with self._supervisor_lifecycle_lock():
             with self._config_lock():
                 return self._claim_supervisor_instance_locked(
-                    pid=pid, pid_start=pid_start,
+                    pid=pid,
+                    pid_start=pid_start,
+                    pid_start_filetime=pid_start_filetime,
                 )
 
     def release_supervisor_instance(self, *, token: str, pid: int | None = None,
@@ -7215,6 +7248,30 @@ def _parse_start_token(value: object) -> datetime | None:
     return dt
 
 
+def _windows_start_token_filetime(value: object) -> int | None:
+    """Return exact Windows FILETIME ticks for a round-trip start token."""
+    if not isinstance(value, str) or value.startswith("linux:"):
+        return None
+    match = re.fullmatch(
+        r"(.+T\d{2}:\d{2}:\d{2})(?:\.(\d{1,7}))?(Z|[+-]\d{2}:\d{2})",
+        value,
+    )
+    if match is None:
+        return None
+    prefix, fraction, zone = match.groups()
+    try:
+        stamp = datetime.fromisoformat(
+            prefix + ("+00:00" if zone == "Z" else zone)
+        ).astimezone(timezone.utc)
+    except ValueError:
+        return None
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = stamp - epoch
+    seconds = delta.days * 86_400 + delta.seconds
+    fractional_ticks = int((fraction or "0").ljust(7, "0"))
+    return 116_444_736_000_000_000 + seconds * 10_000_000 + fractional_ticks
+
+
 def _start_tokens_differ(observed: object, recorded: object) -> bool:
     if not isinstance(observed, str) or not observed:
         return False
@@ -7333,16 +7390,22 @@ def _owner_identity_gone(
     recorded_start_filetime: object = None,
 ) -> bool:
     """True only when the recorded owner is confidently not the same process."""
-    if (
-        os.name == "nt"
-        and recorded_start_filetime is not None
-        and not (
-            isinstance(recorded_pid_start, str)
-            and recorded_pid_start.startswith("linux:")
-        )
-    ):
+    recorded_is_linux = (
+        isinstance(recorded_pid_start, str)
+        and recorded_pid_start.startswith("linux:")
+    )
+    if recorded_start_filetime is not None and not recorded_is_linux:
         # A supplied exact identity is authoritative. Probe ambiguity must not
         # regain teardown authority through the weaker rounded token path.
+        if os.name != "nt":
+            return False
+        derived_filetime = _windows_start_token_filetime(recorded_pid_start)
+        if (
+            not isinstance(recorded_start_filetime, str)
+            or re.fullmatch(r"[1-9][0-9]{0,19}", recorded_start_filetime) is None
+            or derived_filetime != int(recorded_start_filetime)
+        ):
+            return False
         return _windows_owner_identity_gone_exact(pid, recorded_start_filetime)
     liveness = _process_liveness(pid)
     if liveness == PROC_DEAD:
