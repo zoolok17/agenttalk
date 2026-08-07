@@ -144,13 +144,19 @@ fail closed. Do not delete these files casually: doing so while the monitor is
 stopped discards launch/session/backoff continuity even though bus messages and
 cursors remain.
 
-Each supervisor-launched `agenttalk wrap` process also gets distinct stdout and
-stderr logs outside the checkout. Legacy/manual direct CLI launches are not
-redirected because an arbitrary executable cannot enforce the cooperative byte
-bound described below. On Windows wrapper logs live under
+Every `agenttalk wrap` launch path attempts to install distinct, bounded stdout
+and stderr capture outside the checkout. A generated supervisor may preallocate
+and redirect the initial files; otherwise wrapper startup allocates a generation
+and mirrors the original console. If no eligible root accepts the generation,
+the wrapper still runs on its original console and no new location is recorded.
+On Windows the preferred
+wrapper-log root is
 `%LOCALAPPDATA%\agenttalk\wrapper-logs\<project-hash>\agent-<agent-hash>\<generation>\`;
 on POSIX the base is an absolute `$XDG_STATE_HOME` or `~/.local/state`. Relative
-ambient state paths are ignored. The path-derived project hash keeps projects
+ambient state paths are ignored. The shared temporary fallback is
+`<OS-temp>\agenttalk-wrapper-logs\<project-hash>`, followed by
+`<project-parent>\.agenttalk-wrapper-logs\agenttalk\wrapper-logs\<project-hash>`.
+The path-derived project hash keeps projects
 separate without relying on adopter repositories to ignore `.agenttalk/`;
 `agenttalk init` does not provision that ignore rule. Treat these files as
 sensitive: they can contain model output, tool output, and tracebacks. The
@@ -158,29 +164,54 @@ agent directory is the first 16 hex characters of SHA-256 over the exact UTF-8
 agent name, prefixed with `agent-`; hashing avoids Windows reserved-name and
 trailing-dot aliases.
 
-Before starting the process, the supervisor creates a new immutable generation
-across both the persistent and temporary fallback roots and prunes older
-generations back toward a quota of four (`WRAPPER_LOG_GENERATIONS`). Once
-`agenttalk wrap` begins command dispatch, Python-level writes through its
+Do not guess which candidate accepted the last successful capture. Ask for the
+wrapper-recorded fact:
+
+```powershell
+agenttalk supervise --report --for <agent>
+```
+
+Read `agents.<agent>.wrapper_log`. `status: observed` means the recorded
+generation and both files still exist; it is not wrapper-liveness or
+current-process authority. Compare `wrapper_pid` and `observed_at` when
+correlating an incident. `stale` preserves the last paths after files disappear;
+`absent` or `invalid` never substitutes the preferred candidate. `unusable`
+means the record or its generation/files could not be confirmed to exist
+either way (a permissions problem, a disconnected volume) - it is reported
+as its own state rather than guessed into `observed` or `stale`. A later launch
+for which no root accepts capture leaves the previous record in place.
+
+`--for <agent>` also resolves a genuinely retired ephemeral identity (a
+sparse `{"retired": true, "wrapper_log": {...}}` row) if the store's own
+tombstone list confirms it was actually retired, not merely because a
+location record happens to exist for the name.
+
+Before a supervised process starts, the supervisor tries its preferred root,
+the OS temporary fallback, and the project-parent fallback in order, creating a
+new immutable generation at the first root that accepts it. A direct wrapper
+does the equivalent at command startup and tries each eligible root in order.
+As `agenttalk wrap` enters its dispatched command, before project/store setup,
+it attempts to install the capture; Python-level writes through the installed
 standard streams are bounded to 1 MiB per stream using four fixed segments;
 suffixes `.1` through `.3` retain the newest output after the initial
 redirect segment fills. Interpreter/package bootstrap output written before
-that entry point, and direct native/file-descriptor writes, are not
+argument dispatch, and direct native/file-descriptor writes, are not
 intercepted by the cooperative Python stream bound. The switch to a new
 immutable destination happens before the relaunch, so the wrapper that just
 died is never overwritten.
 
 A generation is retained forever, uncounted against the quota, until the
-wrapper process itself confirms it - from inside `agenttalk wrap`, right
-after authenticating and installing both bounded stream tees, which is the
-earliest point that proves this launch actually reached command dispatch.
+wrapper process itself confirms it - from inside `agenttalk wrap`, after
+accepting authenticated supervisor targets or allocating its own direct-launch
+targets, then installing both bounded stream tees. That is the earliest point
+that proves this launch actually reached command dispatch.
 The supervisor never commits a generation on the launcher's behalf (a
 process existing, or even returning a PID, is not proof the wrapper reached
 that point), so a wrapper that dies before confirming leaves its generation
 preserved and unpruned rather than evicting real evidence for a launch
 attempt whose outcome was never known. Because pruning runs when a new
 generation is created - before that new generation's own fate is decided -
-a string of launches that all successfully confirm settles at one MORE than
+a string of supervisor launches that all successfully confirm settles at one MORE than
 the quota (five, by default) rather than exactly the quota: pruning trims
 existing CONFIRMED generations down to four before creating the next one,
 which itself becomes a fifth confirmed generation once it succeeds, and
@@ -188,13 +219,16 @@ nothing prunes again until the next launch repeats the same pattern. This
 is a known, currently-accepted bound violation, not a rare edge case -
 proven by running repeated successful launches against the code as shipped
 and counting the generations left on disk - to be revisited alongside the
-broader retention-timing question in a follow-up round. If the persistent
-root is unavailable, the supervisor warns and tries the OS temporary
-directory. If a stale handle or filesystem error prevents cleanup, the
+broader retention-timing question in a follow-up round. Direct wrapper-owned
+generations normally settle at the quota; filesystem or sequence uncertainty is
+fail-safe and may preserve more. If the preferred root is unavailable, the
+supervisor warns and tries the OS temporary fallback, then the project-parent
+fallback. If a stale handle or filesystem error prevents cleanup, the
 recovery launch continues with a unique generation and warns; the quota can
 remain exceeded (independent of the off-by-one above) until that filesystem
-problem is resolved. If neither root can accept a new generation, recovery
-launches without redirection.
+problem is resolved. If none accepts a generation, launch continues without
+PowerShell redirection; wrapper startup still performs its own fail-soft
+allocation attempt.
 
 Which of the three tail segments (`.1`-`.3`) is currently being written to is
 itself recorded in a sibling `<segment-base>.cursor` file, updated every time
@@ -448,6 +482,7 @@ In another terminal:
 
 ```powershell
 agenttalk supervise --report   # read-only liveness JSON: per-agent fresh/stale, threshold
+agenttalk supervise --report --for A  # plus A's last wrapper-recorded log location
 agenttalk supervise --plan     # the action plan the script will execute
 agenttalk dashboard            # browser view: heartbeat age, who's composing, open threads
 ```
@@ -754,7 +789,7 @@ without ever rebuilding state.
 | `agenttalk supervise --refresh-scripts [--pwsh ABSOLUTE_PATH]` | Regenerate/validate all four artifacts under the lifecycle lock; preserve config/runtime state. |
 | `agenttalk supervise --repair-instance-marker --quarantine --acknowledge-no-live-supervisor` | Explicitly quarantine an invalid singleton marker after the operator confirms no supervisor is live. |
 | `agenttalk supervise --reset-process-tree-ownership --from L --for A --hold-source-hash HASH --verified-launch-nonce NONCE --acknowledge-no-live-supervisor --acknowledge-owned-processes-stopped --reason TEXT` | Record an attended owned-tree boundary. Requires liaison/sole-lead authority, the kill switch, no live instance marker, the current Attention hash and nonce, and every recorded PID/start proven gone or recycled. Never kills or launches. |
-| `agenttalk supervise --report` | Read-only per-agent liveness JSON (fresh/stale + threshold). |
+| `agenttalk supervise --report [--for <agent>]` | Read-only per-agent liveness JSON; with `--for`, top-level `selected_agent` names the agent and that agent's row includes its last wrapper-recorded log location. |
 | `agenttalk supervise --plan` | The action plan (decision table) the monitor executes. |
 | `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the identity-neutral heartbeat `PostToolUse` plus checkpoint `PreCompact` and `SessionStart/compact` hooks into the **project** `.claude/settings.json`. Codex modes write only the heartbeat hook to `.codex/hooks.json`. Never global, never clobbers unrelated settings. |
 | `agenttalk supervise --install-activity-hook --interactive-for <lead>` | Merge the three Claude hooks with a fallback identity for the current operator-facing human liaison; `AGENTTALK_SELF` still takes precedence. Refuses Codex hook modes. |

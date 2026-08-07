@@ -10681,28 +10681,96 @@ def cmd_internal_check_wrap_dispatch(args: argparse.Namespace) -> int:
 
 
 def cmd_wrap(args: argparse.Namespace) -> int:
-    """Install supervisor-authenticated logging before wrapper setup begins."""
+    """Attempt wrapper-owned logging before fallible wrapper setup begins."""
     from .wrapper_logs import (
         WrapperLifecycleLog,
         capture_termination_signals,
         installed_standard_streams_from_environment,
+        record_wrapper_log_location,
     )
+
+    agent = (
+        getattr(args, "agent", None)
+        or os.environ.get("AGENTTALK_SELF")
+        or "unknown"
+    )
+    project_root: Path | None = None
+    discover_project_root = False
+    # A real argparse Namespace always has the global ``root`` attribute.
+    # Some unit-level callers intentionally construct the legacy minimal
+    # Namespace; do not make those embedders allocate process-global logs.
+    if hasattr(args, "root"):
+        raw_root = getattr(args, "root", None) or os.environ.get("AGENTTALK_ROOT")
+        if raw_root:
+            # This is only a diagnostic allocation hint. Do not perform the
+            # authoritative, fallible root resolution before bounded streams
+            # exist; _get_store does that inside the capture below.
+            project_root = Path(raw_root)
+        else:
+            # Allocate a provisional per-CWD destination without touching the
+            # filesystem. Authoritative ancestor discovery runs only after the
+            # bounded streams are installed, below.
+            project_root = Path(".")
+            discover_project_root = True
 
     with installed_standard_streams_from_environment(
         expected_nonce=getattr(args, "supervisor_launch_nonce", None),
-    ):
-        agent = (
-            getattr(args, "agent", None)
-            or os.environ.get("AGENTTALK_SELF")
-            or "unknown"
-        )
-        lifecycle_log = WrapperLifecycleLog.from_environment(
+        project_root=project_root,
+        agent=str(agent),
+    ) as log_installation:
+        if not log_installation.enabled and log_installation.disabled_reason:
+            # sys.stderr is still the original, unwrapped stream here - bounded
+            # capture never started, so there is nothing to corrupt by writing
+            # to it directly. Without this, allocation failing for every
+            # candidate root is silently indistinguishable from log capture
+            # never having been attempted at all.
+            print(
+                "agenttalk wrap: bounded log capture disabled: "
+                f"{log_installation.disabled_reason}",
+                file=sys.stderr,
+            )
+        elif log_installation.enabled and log_installation.allocated_via_fallback_search:
+            # Only for the direct/unsupervised path, where root/rejected_attempts
+            # came from actually running the candidate-search allocator. The
+            # pre-authenticated supervised path reuses supervisor-resolved
+            # fixed paths - root is not a meaningful allocator result there,
+            # and that path's stderr stream is parsed as pure JSONL elsewhere
+            # (see test_cmd_wrap_records_terminating_signal_without_exception_duplicate),
+            # so printing free text into it would corrupt that contract.
+            #
+            # A candidate being rejected and a fallback quietly accepted is
+            # exactly as silent as total allocation failure was before the
+            # block above existed - name what was actually accepted, not just
+            # what wasn't. sys.stderr here is the bounded tee, which mirrors
+            # to the real console the same way the wrapped CLI's own stderr
+            # does, so this reaches the operator (and any test reading the
+            # wrapper subprocess's stderr) the same way.
+            print(
+                f"agenttalk wrap: bounded log capture accepted root: "
+                f"{log_installation.root}",
+                file=sys.stderr,
+            )
+            for rejected_root, reason in log_installation.rejected_attempts:
+                print(
+                    f"agenttalk wrap: candidate root rejected before "
+                    f"acceptance: {rejected_root}: {reason}",
+                    file=sys.stderr,
+                )
+        lifecycle_log = WrapperLifecycleLog(
             str(agent),
-            expected_nonce=getattr(args, "supervisor_launch_nonce", None),
+            enabled=log_installation.enabled,
         )
         args._wrapper_lifecycle_log = lifecycle_log
         try:
             with capture_termination_signals(lifecycle_log):
+                if discover_project_root:
+                    discovered_root = find_root()
+                    args.root = str(discovered_root)
+                    record_wrapper_log_location(
+                        discovered_root,
+                        str(agent),
+                        log_installation,
+                    )
                 result = _cmd_wrap_with_logging(args)
         except BaseException as exc:
             # A SystemExit reaching here was ALREADY a deliberate exit with
@@ -12595,10 +12663,48 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     stuck = float(stuck) if isinstance(stuck, (int, float)) else None
 
     if args.report:
-        print(json.dumps(sup.build_report(store, now_epoch=now,
-                                          stuck_after_seconds=stuck,
-                                          state=_read_state() or None,
-                                          supervisor_config=config), indent=2))
+        report = sup.build_report(
+            store,
+            now_epoch=now,
+            stuck_after_seconds=stuck,
+            state=_read_state() or None,
+            supervisor_config=config,
+        )
+        if args.agent:
+            try:
+                agent = validate_agent_name(args.agent)
+            except ValueError as exc:
+                sys.stderr.write(f"agenttalk supervise --report: {exc}\n")
+                return 2
+            selected = report.get("agents", {}).get(agent)
+            if selected is None:
+                # archive_ephemeral_request(..., retire=True) drops an
+                # ephemeral identity from the active roster build_report()
+                # iterates, but does not remove its wrapper-log location
+                # record or generation - only its live-roster membership.
+                # Crash forensics after a timed-out or completed ephemeral
+                # run needs exactly this case to still resolve, not "unknown
+                # agent" while the logs it is asking about sit on disk
+                # (#113 review). Establish retirement from the STORE's own
+                # tombstone list, not from whether a location file happens
+                # to exist - a name that was never registered at all must
+                # not be dignified with an identity claim just because a
+                # stray record exists for it (#113 review, round 3).
+                if agent not in store.retired_agents():
+                    sys.stderr.write(
+                        f"agenttalk supervise --report: unknown agent {agent!r}\n"
+                    )
+                    return 2
+                selected = {"retired": True}
+                report.setdefault("agents", {})[agent] = selected
+            report["selected_agent"] = agent
+            # This is intentionally report-only. build_report() also feeds
+            # every supervisor --plan poll; resolving and probing an external
+            # diagnostic root must never enter that liveness/launch loop.
+            from .wrapper_logs import read_wrapper_log_location
+
+            selected["wrapper_log"] = read_wrapper_log_location(store.state_dir, agent)
+        print(json.dumps(report, indent=2))
         return 0
     if args.bootstrap_check:
         payload = sup.bootstrap_check(
@@ -14396,8 +14502,14 @@ def build_parser() -> argparse.ArgumentParser:
     gsup.add_argument("--repair-instance-marker", dest="repair_instance_marker",
                       action="store_true",
                       help="Explicitly recover an invalid singleton marker.")
-    gsup.add_argument("--report", action="store_true",
-                      help="Emit the read-only per-agent liveness snapshot (JSON).")
+    gsup.add_argument(
+        "--report",
+        action="store_true",
+        help=(
+            "Emit read-only per-agent liveness (JSON); with --for, add the "
+            "named agent's last wrapper-recorded log location."
+        ),
+    )
     gsup.add_argument("--bootstrap-check", dest="bootstrap_check", action="store_true",
                       help="Emit a read-only team bootstrap readiness check (JSON): "
                            "roster, operator-facing lead, supervisor config, wrapped "
@@ -14587,7 +14699,7 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument(
         "--for",
         dest="agent",
-        help="Agent name for --clear-restart or configured "
+        help="Agent name for --report, --clear-restart, or configured "
              "--reset-process-tree-ownership.",
     )
     psup.add_argument(

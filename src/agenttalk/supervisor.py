@@ -9767,9 +9767,8 @@ $cfg = Read-SupervisorConfig
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
 $SrcOnPyPath = __SRC_ON_PYPATH__
 $WrapperLogRoot = '__AGENTTALK_WRAPPER_LOG_ROOT__'
-$WrapperLogFallbackRoot = Join-Path (
-  Join-Path ([IO.Path]::GetTempPath()) 'agenttalk-wrapper-logs'
-) '__AGENTTALK_CHECKOUT_ID__'
+$WrapperLogFallbackRoot = '__AGENTTALK_WRAPPER_LOG_FALLBACK_ROOT__'
+$WrapperLogParentFallbackRoot = '__AGENTTALK_WRAPPER_LOG_PARENT_FALLBACK_ROOT__'
 $WrapperLogGenerations = __AGENTTALK_WRAPPER_LOG_GENERATIONS__
 $WrapperLogMaxBytes = __AGENTTALK_WRAPPER_LOG_MAX_BYTES__
 $WrapperLogSegments = __AGENTTALK_WRAPPER_LOG_SEGMENTS__
@@ -10756,6 +10755,7 @@ function Wait-ForNextPoll($config) {
 }
 # endregion checked-mutations
 # region wrapper-log-helpers
+$WrapperLogSequenceUncertaintyByState = __AGENTTALK_WRAPPER_LOG_SEQUENCE_POLICY__
 function Test-RunningOnWindows {
   # Ambient markers such as `$env:OS` are optional and are deliberately absent
   # in hermetic launch environments.
@@ -11225,13 +11225,24 @@ function Get-SafeWrapperLogAgentDir(
   [string]$name,
   [bool]$create
 ) {
+  # #113 review, round 5 sweep: allowlisted as a whole rather than
+  # converted. The enclosing try/catch already returns $null on ANY
+  # failure here (fail-closed at the function boundary, which every
+  # caller already treats as "could not resolve, mark uncertain and
+  # continue" per the round-4/5 fixes to Get-NextWrapperLogSequence and
+  # Invoke-WrapperLogRetentionPrune). Converting these internal checks
+  # to the shared classifiers would not change that guarantee - it is
+  # already provided - while this function is the single most
+  # heavily-used entry point in the file (every scan/prune/allocate call
+  # goes through it), making a restructure here the highest-risk,
+  # lowest-behavioral-gain conversion candidate in the sweep.
   try {
-    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {  # wrapper-log-raw-primitive: [debt:agent-resolver] allowlisted with the function, see comment above
       if (-not $create) { return $null }
       $null = New-Item -ItemType Directory -Path $candidate -Force -ErrorAction Stop
     }
-    $rootItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
-    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    $rootItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop  # wrapper-log-raw-primitive: [debt:agent-resolver] allowlisted with the function, see comment above
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {  # wrapper-log-raw-primitive: [debt:agent-resolver] allowlisted with the function, see comment above
       Write-Warning (
         "supervisor: refusing wrapper-log root with a reparse point: '{0}'" -f
         $candidate)
@@ -11239,10 +11250,10 @@ function Get-SafeWrapperLogAgentDir(
     }
 
     $agentDir = Join-Path $candidate $name
-    if (Test-Path -LiteralPath $agentDir) {
-      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop
-      if ((-not $agentItem.PSIsContainer) -or
-          (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    if (Test-Path -LiteralPath $agentDir) {  # wrapper-log-raw-primitive: [debt:agent-resolver] allowlisted with the function, see comment above
+      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop  # wrapper-log-raw-primitive: [debt:agent-resolver] allowlisted with the function, see comment above
+      if ((-not $agentItem.PSIsContainer) -or  # wrapper-log-raw-primitive: [debt:agent-resolver] allowlisted with the function, see comment above
+          (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {  # wrapper-log-raw-primitive: [debt:agent-resolver] allowlisted with the function, see comment above
         Write-Warning (
           "supervisor: refusing unsafe wrapper-log agent path: '{0}'" -f
           $agentDir)
@@ -11250,8 +11261,8 @@ function Get-SafeWrapperLogAgentDir(
       }
     } elseif ($create) {
       $null = New-Item -ItemType Directory -Path $agentDir -ErrorAction Stop
-      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop
-      if (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      $agentItem = Get-Item -LiteralPath $agentDir -Force -ErrorAction Stop  # wrapper-log-raw-primitive: [debt:agent-resolver] allowlisted with the function, see comment above
+      if (($agentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {  # wrapper-log-raw-primitive: [debt:agent-resolver] allowlisted with the function, see comment above
         Write-Warning (
           "supervisor: refusing unsafe wrapper-log agent path: '{0}'" -f
           $agentDir)
@@ -11279,13 +11290,20 @@ function Protect-WrapperLogPaths(
   try {
     [IO.File]::WriteAllBytes($stdoutPath, [byte[]]@())
     [IO.File]::WriteAllBytes($stderrPath, [byte[]]@())
+    # #113 review, round 11: & $chmod.Source is a dynamic invocation - its
+    # target is a variable, not a literal command name, so a static
+    # scanner cannot resolve it in the general case. Allowlisted rather
+    # than refused because $chmod.Source is always the resolved PATH of
+    # the external `chmod` application (never a PowerShell function or
+    # cmdlet name), so it cannot hide a filesystem-presence/type
+    # primitive the way a dynamic PowerShell command invocation could.
     $chmod = Get-Command chmod -CommandType Application -ErrorAction Stop
     foreach ($path in @($rootDir, $agentDir, $generationDir)) {
-      & $chmod.Source '700' $path
+      & $chmod.Source '700' $path  # wrapper-log-dynamic-invocation: [justified-exception:posix-chmod] invokes the external chmod binary via its own resolved application path, see comment above
       if ($LASTEXITCODE -ne 0) { throw "chmod 700 failed for '$path'" }
     }
     foreach ($path in @($stdoutPath, $stderrPath)) {
-      & $chmod.Source '600' $path
+      & $chmod.Source '600' $path  # wrapper-log-dynamic-invocation: [justified-exception:posix-chmod] invokes the external chmod binary via its own resolved application path, see comment above
       if ($LASTEXITCODE -ne 0) { throw "chmod 600 failed for '$path'" }
     }
     return $true
@@ -11294,6 +11312,128 @@ function Protect-WrapperLogPaths(
       "supervisor: cannot secure sensitive wrapper logs under '{0}' ({1})" -f
       $generationDir, $_.Exception.Message)
     return $false
+  }
+}
+function Test-WrapperLogMarkerPresence([string]$path) {
+  # Closed three outcomes mirroring _scan_marker in wrapper_logs.py: only a
+  # confirmed missing item is 'absent'; anything else this cannot tell is
+  # 'unusable', never a confident 'absent' - Test-Path swallows
+  # access-denied/disconnected into $false exactly like Python's
+  # .exists() does. A marker that cannot be read is not a marker that is
+  # not there (#113 review, round 3).
+  # #113 review, round 5 sweep: every primitive access in this function
+  # is allowlisted, not converted - this function IS the shared
+  # classifier; primitive access is its entire purpose.
+  try {
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop  # wrapper-log-raw-primitive: [classifier-internal:self] this is the classifier itself
+  } catch [System.Management.Automation.ItemNotFoundException] {
+    return 'absent'
+  } catch {
+    return 'unusable'
+  }
+  # Round 4: a closed outcome set with an under-specified member is not
+  # closed - 'present' must mean a valid marker leaf, not merely that
+  # some filesystem object occupies the name. A directory or a
+  # reparse/symlink point placed where a marker is expected must not
+  # read as present.
+  if ($item.PSIsContainer -or  # wrapper-log-raw-primitive: [classifier-internal:self] this is the classifier itself
+      (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {  # wrapper-log-raw-primitive: [classifier-internal:self] this is the classifier itself
+    return 'unusable'
+  }
+  return 'present'
+}
+function Test-WrapperLogDirectoryPresence([string]$path) {
+  # Same closed-outcome discipline as Test-WrapperLogMarkerPresence
+  # (mirrors _scan_path in wrapper_logs.py), for a directory rather than
+  # a marker leaf: only a confirmed missing item is 'absent'; anything
+  # else this cannot tell, INCLUDING a successful stat of something that
+  # is not actually a directory, is 'unusable' (#113 review, round 5
+  # sweep). No ancestry walk - this answers "is this one path a plain,
+  # accessible directory," matching the sites that use it.
+  # #113 review, round 5 sweep: every primitive access in this function
+  # is allowlisted, not converted - this function IS the shared
+  # classifier; primitive access is its entire purpose.
+  try {
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop  # wrapper-log-raw-primitive: [classifier-internal:self] this is the classifier itself
+  } catch [System.Management.Automation.ItemNotFoundException] {
+    return 'absent'
+  } catch {
+    return 'unusable'
+  }
+  if ((-not $item.PSIsContainer) -or  # wrapper-log-raw-primitive: [classifier-internal:self] this is the classifier itself
+      (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {  # wrapper-log-raw-primitive: [classifier-internal:self] this is the classifier itself
+    return 'unusable'
+  }
+  return 'present'
+}
+function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
+  # .sequence-uncertain records that THIS generation's own sequence number
+  # may already be lower than the true prior maximum, because the
+  # allocator that wrote it could not fully scan every root. That fact
+  # belongs to the generation permanently, independent of whether
+  # .sequence later reads back as perfectly well-formed - mirrors
+  # _read_wrapper_log_sequence in wrapper_logs.py; keep both in sync.
+  # Only a CONFIRMED absence clears this - present OR unusable both mean
+  # this generation cannot be trusted as confidently ordered (#113 review,
+  # round 3: Test-Path swallowed an unreadable marker into a confident
+  # "no marker", indistinguishable from one that was never raised at all).
+  $markerUncertain = $committed -and
+    ((Test-WrapperLogMarkerPresence (Join-Path $generation '.sequence-uncertain')) -ne 'absent')
+  $seqFile = Join-Path $generation '.sequence'
+  $sequenceEntry = $null
+  # #113 review, round 5 sweep: allowlisted, not converted - this is the
+  # .sequence file's OWN reference-correct validation (mirrors
+  # _read_wrapper_log_sequence's stat.S_ISREG check on the same file in
+  # wrapper_logs.py), already wrapped in the same
+  # ItemNotFoundException/generic-catch discrimination the shared
+  # classifiers use, not a fresh raw existence probe.
+  try {
+    $sequenceEntry = Get-Item -LiteralPath $seqFile -Force -ErrorAction Stop  # wrapper-log-raw-primitive: [reference-correct:sequence-file] reference-correct, see comment above
+  } catch [System.Management.Automation.ItemNotFoundException] {
+    # Cannot confirm .sequence-failed is genuinely absent -> cannot confirm
+    # this is a legacy generation that predates the marker system, so fail
+    # toward the state that reports uncertain (#113 review, round 3).
+    $state = if ((Test-WrapperLogMarkerPresence (Join-Path $generation '.sequence-failed')) -eq 'absent') {
+      'missing-legacy'
+    } else {
+      'missing-write-failed'
+    }
+    return [pscustomobject]@{
+      sequence = $null
+      uncertain = ($markerUncertain -or
+        ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state]))
+      state = $state
+    }
+  } catch {
+    $state = 'present-invalid'
+    return [pscustomobject]@{
+      sequence = $null
+      uncertain = ($markerUncertain -or
+        ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state]))
+      state = $state
+    }
+  }
+  $state = 'present-invalid'
+  $sequence = $null
+  try {
+    if ($sequenceEntry.PSIsContainer -or  # wrapper-log-raw-primitive: [reference-correct:sequence-file] reference-correct, see comment above $sequenceEntry's Get-Item
+        (($sequenceEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {  # wrapper-log-raw-primitive: [reference-correct:sequence-file] reference-correct, see comment above $sequenceEntry's Get-Item
+      throw 'sequence record is not a plain file'
+    }
+    $text = [IO.File]::ReadAllText($seqFile).Trim()
+    [long]$parsed = 0L
+    if (($text -cnotmatch '^[1-9][0-9]*$') -or
+        (-not [long]::TryParse($text, [ref]$parsed))) {
+      throw 'sequence record is not a canonical positive Int64'
+    }
+    $sequence = $parsed
+    $state = 'present-valid'
+  } catch {}
+  return [pscustomobject]@{
+    sequence = $sequence
+    uncertain = ($markerUncertain -or
+      ($committed -and [bool]$WrapperLogSequenceUncertaintyByState[$state]))
+    state = $state
   }
 }
 function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
@@ -11326,56 +11466,48 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
   foreach ($scanRoot in $roots) {
     try {
       $candidateAgentDir = Join-Path $scanRoot $name
-      $agentDirExists = Test-Path -LiteralPath $candidateAgentDir
+      # Routed through the shared classifier (#113 review, round 5
+      # sweep) - a real behavior change, not just a relabeling: only a
+      # CONFIRMED absence of the agent directory means there is nothing
+      # to miss. The prior Test-Path swallowed a hidden/inaccessible
+      # agent directory into "does not exist," so a real higher
+      # committed sequence sitting behind it was silently dropped
+      # without ever marking the scan uncertain - executed and
+      # confirmed: a hidden agent directory holding sequence 100 behind
+      # a visible root holding 1-5 produced next_sequence 6, uncertain
+      # FALSE, before this fix.
+      $agentDirPresence = Test-WrapperLogDirectoryPresence $candidateAgentDir
       $scanAgentDir = Get-SafeWrapperLogAgentDir $scanRoot $name $false
       if ($null -eq $scanAgentDir) {
-        if ($agentDirExists) { $uncertain = $true }
+        if ($agentDirPresence -ne 'absent') { $uncertain = $true }
         continue
       }
       foreach ($existing in @(
         Get-ChildItem -LiteralPath $scanAgentDir -Directory -ErrorAction Stop
       )) {
-        $committed = Test-Path -LiteralPath (Join-Path $existing.FullName '.committed')
-        $seqFile = Join-Path $existing.FullName '.sequence'
-        if (-not (Test-Path -LiteralPath $seqFile)) {
-          # #139-family, round 13: a COMMITTED generation with no
-          # .sequence file is exactly the write-failure gap round 12
-          # fixed - but that fix's sequence_uncertain lives only on the
-          # ONE launch that hit it, never persisted. Without this check
-          # the NEXT launch's scan silently skips this generation, reuses
-          # the sequence number it never recorded, and retention's sort
-          # key ranks it below every sequence-bearing entry even though
-          # it may be the newest generation on disk. A non-committed
-          # (pending/orphaned) generation is not in retention's ranked
-          # set at all (Invoke-WrapperLogRetentionPrune excludes it), so it
-          # does not need to propagate uncertainty here.
-          #
-          # But "no .sequence file" is ALSO the permanent, by-design shape
-          # of a pre-upgrade legacy generation that never wrote one at
-          # all (see the name-fallback sortKey comment in
-          # Invoke-WrapperLogRetentionPrune) - those must keep tolerating
-          # pruning forever, exactly as before, or a fleet with any
-          # legacy history would never prune again. The two are
-          # indistinguishable by absence alone, so a genuine write
-          # failure also drops an explicit .sequence-failed marker (see
-          # New-WrapperLogTargets) - only THAT combination propagates
-          # uncertainty; a bare missing .sequence with no failure marker
-          # is the legacy case and stays exactly as tolerant as before.
-          if ($committed -and (Test-Path -LiteralPath (Join-Path $existing.FullName '.sequence-failed'))) {
-            $uncertain = $true
-          }
-          continue
+        $committedMarker = Test-WrapperLogMarkerPresence (Join-Path $existing.FullName '.committed')
+        if ($committedMarker -eq 'unusable') {
+          # Cannot confirm committed one way or the other. Counting this
+          # ambiguity toward the caller's view is conservative and fine;
+          # resolving it AS committed is not, so $committed stays $false
+          # here just like a genuinely absent marker - only flag this
+          # cycle uncertain (#113 review, round 4 correction: round 3
+          # resolved this permissively, which made an unconfirmed
+          # generation deletion-eligible downstream once a safety bound
+          # was crossed; mirrors the _owned_committed_generations fix in
+          # wrapper_logs.py).
+          $uncertain = $true
         }
-        try {
-          $existingSeq = [int64]([IO.File]::ReadAllText($seqFile).Trim())
-          if ($existingSeq -gt $seq) { $seq = $existingSeq }
-        } catch {
-          # Corrupt/unreadable record does not veto this generation's own
-          # sequence contribution to the max, but for a COMMITTED
-          # generation it is the same uncertainty class as a missing
-          # record - propagate it the same way.
-          if ($committed) { $uncertain = $true }
+        $committed = $committedMarker -eq 'present'
+        # One state policy is rendered from wrapper_logs.py and consumed by
+        # both languages: a bare missing record is legacy-compatible, a
+        # write-failed missing record is uncertain, and every present record
+        # must be a canonical positive Int64 or fail closed as uncertain.
+        $record = Read-WrapperLogSequenceRecord $existing.FullName $committed
+        if (($null -ne $record.sequence) -and ([long]$record.sequence -gt $seq)) {
+          $seq = [long]$record.sequence
         }
+        if ([bool]$record.uncertain) { $uncertain = $true }
       }
     } catch {
       $uncertain = $true
@@ -11430,7 +11562,11 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
   if ($nonce -notmatch '^[0-9a-f]{32}$') {
     $nonce = [Guid]::NewGuid().ToString('N')
   }
-  $roots = @($WrapperLogRoot, $WrapperLogFallbackRoot) |
+  $roots = @(
+    $WrapperLogRoot,
+    $WrapperLogFallbackRoot,
+    $WrapperLogParentFallbackRoot
+  ) |
     Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
     Select-Object -Unique
   # Computed ONCE, across every configured root, before the create attempts
@@ -11509,7 +11645,13 @@ function New-WrapperLogTargets([string]$name, [string]$nonce) {
         # Best-effort delete it now, while this attempt is still reachable -
         # Invoke-WrapperLogRetentionPrune is never even told about a candidate this
         # loop abandoned, so nothing downstream can ever clean it up otherwise.
-        if ($attempt -and (Test-Path -LiteralPath $attempt)) {
+        # Routed through the shared classifier (#113 review, round 5
+        # sweep). Behavior unchanged: proceeds only on a CONFIRMED
+        # present directory, exactly like Test-Path did - an ambiguous
+        # read already skipped this best-effort attempt before (safe,
+        # since Remove-Item itself is already tolerant of failure via
+        # -ErrorAction SilentlyContinue).
+        if ($attempt -and (Test-WrapperLogDirectoryPresence $attempt) -eq 'present') {
           Remove-Item -LiteralPath $attempt -Recurse -Force -ErrorAction SilentlyContinue
         }
         Write-Warning (
@@ -11569,9 +11711,51 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
   # quota until the filesystem problem is resolved, but it never blocks
   # the recovery launch.
   $owned = @()
+  # #113 review, round 7, finding 3: port of the Python-side
+  # candidates/observed split (wrapper_logs.py's
+  # _owned_committed_generations) - $owned is the deletion-eligible
+  # pool, positively-committed generations only; $observedCount is the
+  # SEPARATE, wider count of every generation-shaped directory actually
+  # found, whether or not its commit status could be confirmed. The
+  # safety bound below must be checked against $observedCount, not
+  # $owned.Count, or an ambiguous/pending generation vanishes from BOTH
+  # numbers and the bound silently shrinks by exactly the generations it
+  # exists to protect - executed and confirmed: 13 physical generations,
+  # bound 4 (WRAPPER_LOG_GENERATIONS+2 at the low end), and pruning was
+  # skipped entirely because $owned.Count saw only 12.
+  $observedCount = 0
   foreach ($candidate in $roots) {
+    $candidateAgentDir = Join-Path $candidate $name
+    # #113 review, round 7, finding 1: this used to continue on a null
+    # $agentDir without ever asking WHY it was null - Get-SafeWrapperLogAgentDir
+    # returns null for a genuinely absent agent directory (nothing to
+    # miss) exactly the same way it does for one that exists but could
+    # not be resolved/accessed. Executed and confirmed: an initial scan
+    # sees both roots; access to one is denied before this destructive
+    # pass runs; five generations in the OTHER, readable root were
+    # pruned to four while the hidden root's generations survived
+    # untouched - the same "resolver correctly can't tell, caller
+    # doesn't ask" shape as #15, one call site earlier, which #15's own
+    # fix never reached.
+    #
+    # #113 review, round 9, finding 1: round 7's own fix checked presence
+    # BEFORE calling the resolver, then trusted that pre-check's answer
+    # to interpret a LATER null - two observations of the same path
+    # taken at different times, exactly the class round 5 already
+    # named. reviewer-1 injected the transition (absent at the pre-check,
+    # unusable by the time the resolver's own internal probe ran) and
+    # reproduced the same five-to-four deletion. The presence check now
+    # runs ONLY after the resolver has already returned null, as close
+    # to that decision as a second observation can get, rather than
+    # trusting a snapshot taken before the resolver did its own work. A
+    # scan that succeeded once does not stay true, and neither does one
+    # that failed once.
     $agentDir = Get-SafeWrapperLogAgentDir $candidate $name $false
-    if ($null -eq $agentDir) { continue }
+    if ($null -eq $agentDir) {
+      $candidateAgentPresence = Test-WrapperLogDirectoryPresence $candidateAgentDir
+      if ($candidateAgentPresence -ne 'absent') { $sequenceUncertain = $true }
+      continue
+    }
     try {
       foreach ($old in @(
         Get-ChildItem -LiteralPath $agentDir -Directory -ErrorAction Stop |
@@ -11579,13 +11763,34 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
             $_.Name -match '^[0-9]{8}T[0-9]{9}Z-[0-9a-f]{32}$'
           }
       )) {
-        if (($old.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        # Counts toward the OBSERVED population regardless of what
+        # happens next - committed, pending, or refused as a reparse
+        # point, this is a real generation-shaped directory that was
+        # found (#113 review, round 7, finding 3).
+        $observedCount++
+        # #113 review, round 5 sweep: allowlisted, not converted - reads
+        # an attribute off $old, an object already retrieved by the
+        # Get-ChildItem -ErrorAction Stop above (whose own failure is
+        # caught by this loop's enclosing try/catch), not a fresh
+        # existence/type probe of its own.
+        if (($old.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {  # wrapper-log-raw-primitive: [reference-correct:already-retrieved] reads an already-retrieved object, see comment above
           Write-Warning (
             "supervisor: refusing to prune wrapper-log reparse point '{0}'" -f
             $old.FullName)
           continue
         }
-        $committed = Test-Path -LiteralPath (Join-Path $old.FullName '.committed')
+        # Round 4: routed through the same closed-outcome classifier as
+        # Get-NextWrapperLogSequence rather than a raw Test-Path, so
+        # there is only one implementation of "what counts as committed"
+        # left to keep in sync. Round 5 correction: this is NOT a
+        # zero-behavior-change consolidation, and it should not have
+        # been described that way - a directory or reparse point sitting
+        # where `.committed` is expected used to read as raw Test-Path's
+        # confident $true (present); it now correctly reads 'unusable'
+        # (not 'present'), so $committed becomes $false and that
+        # generation is preserved instead of treated as committed. A
+        # real, desirable hardening, disclosed as one.
+        $committed = (Test-WrapperLogMarkerPresence (Join-Path $old.FullName '.committed')) -eq 'present'
         if (-not $committed) {
           # A crash, a launch that never reached cmd_wrap (wrap --help, a
           # parse-invalid tail), or a filesystem failure can all leave a
@@ -11604,24 +11809,32 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
         # Prefer the monotonic launch sequence recorded at creation time over
         # the wall-clock name: a backward clock correction must not make a
         # stale generation look permanently newest. A missing/corrupt record
-        # (pre-upgrade generations never wrote one) falls back to the name -
-        # it never blocks pruning, it only loses skew-safety for that one
-        # legacy entry.
+        # (pre-upgrade generations never wrote one) falls back to the name.
+        # A genuinely absent legacy record remains prunable; any present but
+        # invalid/unreadable record makes this prune cycle uncertain, including
+        # corruption that occurs after Get-NextWrapperLogSequence scanned it.
         $sortKey = '0-' + $old.Name
-        $seqFile = Join-Path $old.FullName '.sequence'
-        if (Test-Path -LiteralPath $seqFile) {
-          try {
-            $seqValue = [int64]([IO.File]::ReadAllText($seqFile).Trim())
-            $sortKey = '1-' + $seqValue.ToString('D20')
-          } catch {
-            Write-Warning (
-              "supervisor: unreadable wrapper log launch sequence '{0}' ({1})" -f
-              $seqFile, $_.Exception.Message)
-          }
+        $record = Read-WrapperLogSequenceRecord $old.FullName $true
+        if ([bool]$record.uncertain) { $sequenceUncertain = $true }
+        if ($null -ne $record.sequence) {
+          $seqValue = [long]$record.sequence
+          # A direct wrapper can race this singleton allocator and observe
+          # the same prior maximum. The nonce-bearing generation name is a
+          # deterministic total-order tie-break, not a claim of chronology.
+          $sortKey = '1-' + $seqValue.ToString('D20') + '-' + $old.Name
         }
         $owned += [pscustomobject]@{ item = $old; sort_key = $sortKey }
       }
     } catch {
+      # #113 review, round 5: a listing that fails PARTWAY through this
+      # destructive rescan used to only warn - neither aborting nor
+      # marking the cycle uncertain, so pruning proceeded on a silently
+      # incomplete $owned view (executed and confirmed: five generations
+      # became four on an incomplete view). A scan that succeeded once
+      # does not stay true; match Get-NextWrapperLogSequence's own
+      # sibling catch immediately above in this file, which already does
+      # this correctly.
+      $sequenceUncertain = $true
       Write-Warning (
         "supervisor: cannot inspect wrapper log root '{0}' ({1})" -f
         $agentDir, $_.Exception.Message)
@@ -11638,10 +11851,10 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
     # whatever ordering IS available - imperfect, but bounded is better
     # than leaking disk space indefinitely.
     $uncertainBound = [Math]::Max($WrapperLogGenerations * 3, $WrapperLogGenerations + 2)
-    if ($owned.Count -le $uncertainBound) {
+    if ($observedCount -le $uncertainBound) {
       Write-Warning (
         ("supervisor: wrapper log launch sequence is unreliable for '{0}' " +
-         "(a configured root could not be scanned); skipping prune this cycle") -f
+         "(a root or record could not be read safely); skipping prune this cycle") -f
         $name)
       return
     }
@@ -11649,7 +11862,7 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
       ("supervisor: wrapper log launch sequence remains unreliable for '{0}' " +
        "but the generation count ({1}) exceeds the safety bound ({2}); " +
        "pruning anyway rather than accumulating indefinitely") -f
-      $name, $owned.Count, $uncertainBound)
+      $name, $observedCount, $uncertainBound)
   }
 
   $keepCount = [Math]::Max(0, [int]$WrapperLogGenerations)
@@ -11665,6 +11878,48 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
     # check (NTFS is case-insensitive), not an argv/config token the CLI
     # parses.
     if ($keep -contains $full) { continue }
+    $activePath = Join-Path (
+      [IO.Path]::GetDirectoryName($full)
+    ) ('.' + [IO.Path]::GetFileName($full) + '.active')
+    $activeStream = $null
+    $prunable = $true
+    # #113 review, round 5 sweep: tracked as #175, deliberately NOT
+    # fixed in this PR. $prunable defaults to $true above, so a
+    # swallowed Test-Path here skips the active-lock check entirely and
+    # can delete a generation still in active use by a live process -
+    # the most severe site in the whole sweep, and out of scope here per
+    # explicit instruction.
+    if (Test-Path -LiteralPath $activePath) {  # wrapper-log-raw-primitive: [debt:175-active-lock] #175, tracked separately, not fixed in this PR
+      try {
+        $activeItem = Get-Item -LiteralPath $activePath -Force -ErrorAction Stop  # wrapper-log-raw-primitive: [debt:175-active-lock] #175, tracked separately, not fixed in this PR
+        if (
+          $activeItem.PSIsContainer -or  # wrapper-log-raw-primitive: [debt:175-active-lock] #175, tracked separately, not fixed in this PR
+          (($activeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)  # wrapper-log-raw-primitive: [debt:175-active-lock] #175, tracked separately, not fixed in this PR
+        ) {
+          $prunable = $false
+        } else {
+          $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+          $activeStream = New-Object IO.FileStream(
+            $activePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, $share)
+          if ($activeStream.Length -lt 1) { $activeStream.SetLength(1) }
+          try {
+            $activeStream.Lock(0, 1)
+          } catch {
+            $prunable = $false
+          }
+        }
+      } catch {
+        # An unreadable/unsafe marker may still be owned by a live wrapper.
+        # Diagnostic cleanup fails closed and never delays the launch.
+        $prunable = $false
+      }
+    }
+    if (-not $prunable) {
+      if ($null -ne $activeStream) { $activeStream.Dispose() }
+      Write-Warning (
+        "supervisor: preserving active wrapper log generation '{0}'" -f $full)
+      continue
+    }
     try {
       Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
     } catch {
@@ -11672,18 +11927,44 @@ function Invoke-WrapperLogRetentionPrune([string]$name, [object[]]$roots, [bool]
         ("supervisor: could not prune wrapper log generation '{0}' ({1}); " +
          "launching with a new generation") -f
         $full, $_.Exception.Message)
+    } finally {
+      if ($null -ne $activeStream) {
+        try { $activeStream.Unlock(0, 1) } catch {}
+        $activeStream.Dispose()
+      }
+      # Routed through the shared classifier (#113 review, round 5
+      # sweep) - a real behavior change, not just a relabeling, mirroring
+      # the identical fix to _guard_wrapper_log_prune in
+      # wrapper_logs.py: only a CONFIRMED absence of the generation
+      # should reclaim this now-orphaned lock. The prior Test-Path
+      # swallowed an unreadable generation into "gone," which could
+      # remove the lock protecting a generation that might still
+      # genuinely be there.
+      if ((Test-WrapperLogDirectoryPresence $full) -eq 'absent') {
+        Remove-Item -LiteralPath $activePath -Force -ErrorAction SilentlyContinue
+      }
     }
   }
 }
 function Discard-PendingWrapperLogTargets($targets) {
   if ($null -eq $targets) { return }
   $generationDir = [string]$targets.generation_dir
-  if (-not (Test-Path -LiteralPath (Join-Path $generationDir '.pending'))) {
+  # Routed through the shared classifier (#113 review, round 5 sweep).
+  # Behavior unchanged: proceeds only on a CONFIRMED present marker,
+  # exactly like Test-Path did - an ambiguous read already returned
+  # early here before (safe: this function goes on to delete
+  # $generationDir, so failing toward NOT discarding on an unconfirmed
+  # read is the direction that must not change).
+  if ((Test-WrapperLogMarkerPresence (Join-Path $generationDir '.pending')) -ne 'present') {
     return
   }
+  # #113 review, round 5 sweep: allowlisted, not converted - already
+  # wrapped in try/catch below; any failure here is caught by the
+  # enclosing handler and fails toward NOT deleting $generationDir,
+  # already the safe direction.
   try {
-    $item = Get-Item -LiteralPath $generationDir -Force -ErrorAction Stop
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    $item = Get-Item -LiteralPath $generationDir -Force -ErrorAction Stop  # wrapper-log-raw-primitive: [debt:pending-discard] already wrapped in try/catch, see comment above - round 7 reclassification: this does not propagate its own ambiguity anywhere meaningful, the same structural shape as debt even though its severity is low
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {  # wrapper-log-raw-primitive: [debt:pending-discard] already wrapped in try/catch, see comment above - round 7 reclassification: this does not propagate its own ambiguity anywhere meaningful, the same structural shape as debt even though its severity is low
       return
     }
     Remove-Item -LiteralPath $generationDir -Recurse -Force -ErrorAction Stop
@@ -12362,6 +12643,10 @@ $pollNum = 0
   }
 }
 """
+PS_TEMPLATE = PS_TEMPLATE.replace(
+    "__AGENTTALK_WRAPPER_LOG_SEQUENCE_POLICY__",
+    wrapper_log.powershell_wrapper_log_sequence_policy(),
+)
 
 def agenttalk_shim(
     python_exe: str,
@@ -12576,12 +12861,22 @@ def _marker_placeholder_bundle(
     checkout_id = hashlib.sha256(str(store.root).encode("utf-8")).hexdigest()
     src_is_checkout = (store.root / "src" / "agenttalk" / "__init__.py").exists()
     wrapper_log_root = wrapper_log.default_wrapper_log_root(store.root)
+    wrapper_log_fallback_root = wrapper_log.temporary_wrapper_log_root(store.root)
+    wrapper_log_parent_fallback_root = wrapper_log.project_parent_wrapper_log_root(
+        store.root
+    )
     substitutions = {
         "__AGENTTALK_ARTIFACT_MARKER__": _PS_MARKER,
         "__AGENTTALK_CHECKOUT_ID__": checkout_id,
         "__AGENTTALK_PREAMBLE__": psh.generated_preamble().rstrip("\n"),
         "__AGENTTALK_RUNTIME_GUARD__": psh.generated_runtime_guard().rstrip("\n"),
         "__AGENTTALK_WRAPPER_LOG_ROOT__": str(wrapper_log_root).replace("'", "''"),
+        "__AGENTTALK_WRAPPER_LOG_FALLBACK_ROOT__": str(
+            wrapper_log_fallback_root
+        ).replace("'", "''"),
+        "__AGENTTALK_WRAPPER_LOG_PARENT_FALLBACK_ROOT__": str(
+            wrapper_log_parent_fallback_root
+        ).replace("'", "''"),
         "__AGENTTALK_WRAPPER_LOG_GENERATIONS__": str(WRAPPER_LOG_GENERATIONS),
         "__AGENTTALK_WRAPPER_LOG_MAX_BYTES__": str(WRAPPER_LOG_MAX_BYTES),
         "__AGENTTALK_WRAPPER_LOG_SEGMENTS__": str(WRAPPER_LOG_SEGMENT_COUNT),

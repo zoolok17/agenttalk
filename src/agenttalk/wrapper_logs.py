@@ -1,10 +1,11 @@
 """Bounded wrapper process logs and factual lifecycle diagnostics.
 
-The generated supervisor redirects each wrapper launch to a unique generation
-directory.  Once ``agenttalk wrap`` is running, this module keeps the redirected
-bootstrap stream bounded and mirrors the newest output through a fixed segment
-ring.  The lifecycle JSONL is diagnostic output only: it is never read by the
-supervisor and carries no health or restart authority.
+``agenttalk wrap`` attempts capture as its first post-dispatch startup action on
+every launch path. A generated supervisor may preallocate and redirect a
+generation before Python starts; otherwise the wrapper allocates a generation
+itself and mirrors the original console while it keeps both files bounded. The
+lifecycle JSONL is diagnostic output only: it is never read by the supervisor
+and carries no health or restart authority.
 
 The bound is Python-level only: it wraps ``sys.stdout``/``sys.stderr`` and
 bounds whatever text is written through those objects.  A write that reaches
@@ -18,21 +19,27 @@ tracked but not yet closed.
 from __future__ import annotations
 
 import contextlib
+import enum
+import hashlib
 import io
 import json
 import os
+import re
+import secrets
 import signal
+import shutil
 import stat
 import sys
 import tempfile
 import threading
 import traceback
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
-from agenttalk.signing import project_id_for_root
+from agenttalk import _atomic
 
 
 ENV_STDOUT_PATH = "AGENTTALK_WRAPPER_STDOUT_LOG"
@@ -48,6 +55,18 @@ _MIN_MAX_BYTES = 4 * 1024
 _MAX_MAX_BYTES = 64 * 1024 * 1024
 _MIN_SEGMENTS = 2
 _MAX_SEGMENTS = 32
+_LOCATION_SCHEMA_VERSION = 1
+_GENERATION_NAME_RE = re.compile(
+    r"[0-9]{8}T[0-9]{9}Z-[0-9a-f]{32}\Z"
+)
+_SEQUENCE_RECORD_RE = re.compile(r"[1-9][0-9]*\Z")
+_SEQUENCE_MAX = (1 << 63) - 1
+_SEQUENCE_UNCERTAINTY_BY_STATE = {
+    "missing-legacy": False,
+    "missing-write-failed": True,
+    "present-valid": False,
+    "present-invalid": True,
+}
 
 _RUNTIME_FIELDS = (
     "phase",
@@ -88,9 +107,12 @@ def _home_state_root(home_env: str | None, *parts: str) -> Path | None:
     unavailable candidate rather than raising."""
     try:
         home = Path(home_env) if home_env else Path.home()
-    except RuntimeError:
+        # Preserve the operator-supplied ancestry until the candidate guard
+        # has inspected it. Resolving here would erase a symlink/junction and
+        # make the later refusal check inspect only its target.
+        return home.expanduser().absolute().joinpath(*parts)
+    except (OSError, RuntimeError):
         return None
-    return home.expanduser().resolve().joinpath(*parts)
 
 
 def _candidate_state_roots(
@@ -108,19 +130,39 @@ def _candidate_state_roots(
     home_root = _home_state_root(home_env, *home_parts)
     if home_root is not None:
         yield home_root
-    yield Path(tempfile.gettempdir()).resolve()
+    yield Path(tempfile.gettempdir()).absolute()
     yield project.parent / ".agenttalk-wrapper-logs"
 
 
-def default_wrapper_log_root(
+def _diagnostic_project_root(
     project_root: str | os.PathLike[str],
-    *,
-    platform: str | None = None,
-    environ: Mapping[str, str] | None = None,
 ) -> Path:
-    """Return a persistent per-user, per-project log root outside the checkout."""
-    env = os.environ if environ is None else environ
-    target = os.name if platform is None else platform
+    """Return a stable absolute project hint without making capture fragile.
+
+    Canonical resolution is preferred and preserves the established project
+    hash. If the operational root later proves unresolvable, logging must still
+    have a destination for that diagnostic, so use the lexical absolute path as
+    a fail-soft identity. Authoritative project validation remains the store's
+    job after the bounded streams are live.
+    """
+    raw = Path(project_root).expanduser()
+    try:
+        return raw.resolve()
+    except (OSError, RuntimeError):
+        return raw.absolute()
+
+
+def _diagnostic_project_id(project: Path) -> str:
+    # project is already canonical when canonicalization is available. This is
+    # byte-for-byte project_id_for_root's documented hash without a second,
+    # fallible resolve between capture allocation and stream installation.
+    return hashlib.sha256(str(project).encode("utf-8")).hexdigest()
+
+
+def _wrapper_log_env_inputs(
+    target: str,
+    env: Mapping[str, str],
+) -> tuple[Path | None, str | None, tuple[str, ...]]:
     if target == "nt":
         raw = env.get("LOCALAPPDATA")
         home_env, home_parts = env.get("USERPROFILE"), ("AppData", "Local")
@@ -130,21 +172,237 @@ def default_wrapper_log_root(
     # A relative state-directory value is interpreted against the process cwd.
     # The supervisor must not let ambient cwd move diagnostic logs back into the
     # checkout, so only absolute platform state roots are eligible.
-    configured = Path(raw).expanduser() if raw else None
-    project = Path(project_root).resolve()
-    project_id = project_id_for_root(project)
-    seen: set[Path] = set()
+    configured = Path(raw) if raw else None
+    if configured is not None and not configured.is_absolute():
+        configured = None
+    return configured, home_env, home_parts
+
+
+def default_wrapper_log_root(
+    project_root: str | os.PathLike[str],
+    *,
+    platform: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Return the preferred per-user, per-project log root outside the checkout.
+
+    This is a lazy candidate, not a validated one: it is baked into the
+    generated supervisor launcher and independently recomputed by the
+    allocator's own candidate search. Neither consumer trusts it blindly -
+    both refuse a reparse/symlink ancestor at the point they actually try to
+    use the root, so this function does not perform that (filesystem-probing)
+    refusal itself. Doing so here would make this report indistinguishable
+    from what the allocator actually accepted, hiding a refusal instead of
+    proving one happened.
+
+    A project rooted at a filesystem anchor (``/`` on POSIX, usually a drive
+    root on Windows) has no same-volume "outside": every absolute candidate
+    resolves as relative to the project, so the loop below never accepts one.
+    Falls back to a fixed temp-based path rather than raising in that case -
+    restores a guarantee an earlier revision of this function had and later
+    silently lost (#113 review), not a new one. Every reachable caller of
+    this function currently treats a raised OSError as fatal (see
+    ``_marker_placeholder_bundle``, called from ``supervise --init``/
+    ``--refresh-scripts``), so exhausting candidates here previously took
+    supervisor scaffolding down entirely for this one edge case.
+    """
+    env = os.environ if environ is None else environ
+    target = os.name if platform is None else platform
+    configured, home_env, home_parts = _wrapper_log_env_inputs(target, env)
+    project = _diagnostic_project_root(project_root)
+    project_id = _diagnostic_project_id(project)
     for candidate in _candidate_state_roots(configured, home_env, home_parts, project):
-        if candidate in seen:
+        try:
+            raw_result = (
+                candidate.expanduser().absolute()
+                / "agenttalk"
+                / "wrapper-logs"
+                / project_id
+            )
+            resolved = raw_result.resolve()
+        except (OSError, RuntimeError):
             continue
-        seen.add(candidate)
-        result = candidate / "agenttalk" / "wrapper-logs" / project_id
-        if not result.resolve().is_relative_to(project):
-            return result
-    # A checkout rooted at the filesystem anchor has no same-volume "outside".
-    # Keep supervision usable; the generated script still has its independent
-    # temporary fallback and logging remains fail-soft.
-    return Path(tempfile.gettempdir()).resolve() / "agenttalk" / "wrapper-logs" / project_id
+        if not resolved.is_relative_to(project):
+            return raw_result
+    return Path(tempfile.gettempdir()).absolute() / "agenttalk" / "wrapper-logs" / project_id
+
+
+def wrapper_log_root_candidates(
+    project_root: str | os.PathLike[str],
+    *,
+    platform: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[Path, ...]:
+    """Return eligible roots in launcher-compatible failover order.
+
+    The first item is the same lazy preferred candidate
+    :func:`default_wrapper_log_root` would report, filtered for reparse/symlink
+    safety here since this tuple is what the allocator actually attempts. The
+    second is the exact temporary fallback baked into generated PowerShell
+    launchers, and the final candidate is independent of user state. Resolving
+    any later candidate is fail-soft and can never invalidate an
+    already-viable preferred root.
+
+    A project rooted at a filesystem anchor has no same-volume "outside", so
+    every one of the candidates above can end up relative to the project and
+    get filtered out - restores the same guaranteed last-resort fallback
+    :func:`default_wrapper_log_root` restores, rather than returning an empty
+    tuple and letting the allocator report total failure for this edge case.
+    """
+    env = os.environ if environ is None else environ
+    target = os.name if platform is None else platform
+    configured, home_env, home_parts = _wrapper_log_env_inputs(target, env)
+    project = _diagnostic_project_root(project_root)
+    project_id = _diagnostic_project_id(project)
+    preferred: Path | None = None
+    for candidate in _candidate_state_roots(configured, home_env, home_parts, project):
+        try:
+            raw_result = (
+                candidate.expanduser().absolute()
+                / "agenttalk"
+                / "wrapper-logs"
+                / project_id
+            )
+            if _has_reparse_or_symlink_component(raw_result):
+                continue
+            resolved = raw_result.resolve()
+            # Recheck both identities after canonicalization. The raw check
+            # catches an ancestor swap; the resolved check keeps the existing
+            # refusal for unsafe targets.
+            if (
+                _has_reparse_or_symlink_component(raw_result)
+                or _has_reparse_or_symlink_component(resolved)
+            ):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_relative_to(project):
+            preferred = raw_result
+            break
+
+    candidate_factories = [
+        lambda: preferred,
+        # Keep this byte-for-byte compatible with $WrapperLogFallbackRoot in
+        # the generated launcher so direct and supervised retention scan the
+        # same temporary pool.
+        lambda: temporary_wrapper_log_root(project),
+        lambda: project_parent_wrapper_log_root(project),
+    ]
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for candidate_factory in candidate_factories:
+        try:
+            candidate = candidate_factory()
+            if candidate is None:
+                continue
+            raw_candidate = candidate.expanduser().absolute()
+            if _has_reparse_or_symlink_component(raw_candidate):
+                continue
+            resolved = raw_candidate.resolve()
+            if (
+                _has_reparse_or_symlink_component(raw_candidate)
+                or _has_reparse_or_symlink_component(resolved)
+            ):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        if resolved in seen or resolved.is_relative_to(project):
+            continue
+        seen.add(resolved)
+        # Allocation must retain the ancestry that was validated. Returning
+        # only the canonical target would make a junction disappear before
+        # _prepare_agent_log_dir's pre/post-create race checks can see it.
+        roots.append(raw_candidate)
+
+    if not roots:
+        # A checkout rooted at the filesystem anchor has no same-volume
+        # "outside" - every candidate above was filtered for being relative
+        # to the project. Keep wrapping usable; allocation remains fail-soft
+        # if this cannot open either. (Restores a guarantee this function
+        # had before it was silently dropped; #113 review.)
+        roots.append(
+            Path(tempfile.gettempdir()).absolute()
+            / "agenttalk"
+            / "wrapper-logs"
+            / project_id
+        )
+    return tuple(roots)
+
+
+def _wrapper_log_agent_leaf(agent: str) -> str:
+    digest = hashlib.sha256(agent.encode("utf-8")).hexdigest()
+    return f"agent-{digest[:16]}"
+
+
+def temporary_wrapper_log_root(
+    project_root: str | os.PathLike[str],
+) -> Path:
+    project = _diagnostic_project_root(project_root)
+    return (
+        Path(tempfile.gettempdir()).absolute()
+        / "agenttalk-wrapper-logs"
+        / _diagnostic_project_id(project)
+    )
+
+
+def project_parent_wrapper_log_root(
+    project_root: str | os.PathLike[str],
+) -> Path:
+    project = _diagnostic_project_root(project_root)
+    return (
+        project.parent
+        / ".agenttalk-wrapper-logs"
+        / "agenttalk"
+        / "wrapper-logs"
+        / _diagnostic_project_id(project)
+    )
+
+
+@dataclass(frozen=True)
+class WrapperLogInstallation:
+    enabled: bool
+    confirmed: bool = False
+    root: Path | None = None
+    generation_dir: Path | None = None
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
+    # Populated only when enabled is False because allocation itself was
+    # attempted and rejected every candidate (see WrapperLogAllocationFailed).
+    # Stays None for the other disabled cases (unauthenticated supervised
+    # environment, no project/agent to allocate for) where there is no
+    # single failure to name.
+    disabled_reason: str | None = None
+    # Candidates tried and rejected BEFORE the accepted root, when enabled is
+    # True. A partial failure (preferred root rejected, a fallback quietly
+    # accepted) is exactly as silent as total failure was before
+    # disabled_reason existed unless this is surfaced too - this is that.
+    rejected_attempts: tuple[tuple[Path, str], ...] = ()
+    # True only when `root`/`rejected_attempts` came from actually running the
+    # fallback-search allocator (the direct/unsupervised launch path). False
+    # for the pre-authenticated supervised path, where the supervisor already
+    # resolved fixed stdout/stderr paths and `root` is not a meaningful
+    # candidate-search result - callers must not print or otherwise surface
+    # `root`/`rejected_attempts` as allocator diagnostics unless this is True.
+    allocated_via_fallback_search: bool = False
+
+
+@dataclass(frozen=True)
+class _AllocatedWrapperLogTargets:
+    root: Path
+    generation_dir: Path
+    stdout_path: Path
+    stderr_path: Path
+    roots: tuple[Path, ...]
+    agent_leaf: str
+    sequence_uncertain: bool
+    rejected_attempts: tuple[tuple[Path, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class _ActiveGenerationLock:
+    path: Path
+    fd: int
+    identity: os.stat_result
 
 
 def _bounded_int(
@@ -218,6 +476,933 @@ def _restrictive_file_opener(path: str, flags: int) -> int:
     return os.open(path, flags, 0o600)
 
 
+# region wrapper-log-retention
+_WIN32_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+_WIN32_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+class _RawAttributeLookupFailed(Exception):
+    """The raw Win32 attribute lookup was attempted but failed - distinct
+    from simply not being on Windows, where there is nothing to attempt
+    at all (#113 review, round 7, finding 4). A "not on Windows" result
+    is silent and expected; this failure must not look the same as that.
+    If this platform-specific safety net just went dark, the caller must
+    treat that as ambiguous, never as license to trust the OTHER check's
+    answer alone - a transiently failing lookup must not silently read
+    the same as a lookup that was never relevant here.
+    """
+
+
+def _windows_raw_file_attributes(path: Path) -> int | None:
+    """Return the raw Win32 file attributes for `path` via
+    GetFileAttributesW, bypassing os.lstat()'s populated
+    st_file_attributes field entirely.
+
+    #113 review, round 5: a real OneDrive placeholder file reports
+    FILE_ATTRIBUTE_REPARSE_POINT to this exact WinAPI call (the same one
+    PowerShell's Get-Item/.Attributes uses) but Python's os.lstat() does
+    not reflect it on this host - the two languages' classifiers
+    disagreed about the identical input, which this scan exists to
+    prevent.
+
+    Returns None ONLY on a non-Windows platform - there is nothing to
+    attempt there, and that is not ambiguous, it is simply inapplicable.
+    Raises ``_RawAttributeLookupFailed`` if the call was attempted (this
+    IS Windows) and failed - #113 review, round 7, finding 4: the prior
+    version returned None for both cases alike, so a caller could not
+    tell "not relevant" from "the safety net just failed," and silently
+    trusted whatever the ordinary check found either way.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        # #113 review, round 9, finding 3: GetFileAttributesW is
+        # documented to return a DWORD (unsigned 32-bit), with
+        # INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) on failure - but ctypes'
+        # default restype for an undeclared foreign function is a
+        # SIGNED c_int, so an actual failure came back as Python -1, not
+        # 4294967295, and the sentinel comparison below never matched.
+        # Every caller still ended up fail-closed only by accident: -1's
+        # infinite-leading-ones two's-complement representation makes
+        # `-1 & _WIN32_FILE_ATTRIBUTE_REPARSE_POINT` truthy too, so the
+        # bit test happened to look like a reparse point. An accidental
+        # safety is not a contract - declare the real, unsigned return
+        # type so the sentinel comparison actually fires on failure.
+        get_file_attributes = ctypes.windll.kernel32.GetFileAttributesW  # type: ignore[attr-defined]
+        get_file_attributes.restype = ctypes.c_uint32
+        get_file_attributes.argtypes = [ctypes.c_wchar_p]
+        result = get_file_attributes(str(path))
+    except (OSError, AttributeError, ValueError) as exc:
+        raise _RawAttributeLookupFailed(str(path)) from exc
+    if result == _WIN32_INVALID_FILE_ATTRIBUTES:
+        raise _RawAttributeLookupFailed(str(path))
+    return result
+
+
+def _is_reparse_or_symlink(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise OSError(f"cannot validate wrapper log path component: {path}") from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(info, "st_file_attributes", 0)
+    if stat.S_ISLNK(info.st_mode) or bool(file_attributes & reparse_flag):
+        return True
+    try:
+        windows_attributes = _windows_raw_file_attributes(path)
+    except _RawAttributeLookupFailed as exc:
+        # Re-raised as a plain OSError, matching this function's own
+        # existing ambiguous-lstat() contract just above - every current
+        # caller (_has_reparse_or_symlink_component, and _scan_path
+        # through it) already converts an OSError here into UNUSABLE /
+        # fail-closed, so this reuses that path rather than inventing a
+        # new one (#113 review, round 7, finding 4).
+        raise OSError(
+            f"cannot validate wrapper log path component via raw attributes: {path}"
+        ) from exc
+    if windows_attributes is not None:
+        return bool(windows_attributes & _WIN32_FILE_ATTRIBUTE_REPARSE_POINT)
+    return False
+
+
+def _has_reparse_or_symlink_component(path: Path) -> bool:
+    current = path.absolute()
+    while True:
+        if _is_reparse_or_symlink(current):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _prepare_agent_log_dir(root: Path, agent_leaf: str) -> Path:
+    # This first check runs BEFORE creation - root may genuinely not
+    # exist yet on first use, which _has_reparse_or_symlink_component
+    # already treats as "nothing unsafe here yet" at each ancestor
+    # level. _scan_path is the wrong classifier here: it requires a
+    # CONFIRMED present directory, which would wrongly reject an
+    # ordinary not-yet-created root. Left as the raw ancestry primitive
+    # deliberately - not a site the shared directory classifier fits.
+    if _has_reparse_or_symlink_component(root):
+        raise OSError(f"unsafe wrapper log root ancestry: {root}")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # These two checks run AFTER creation, where the directory is
+    # expected to exist - routed through the shared classifier (#113
+    # review, round 5 sweep). PLAIN_DIRECTORY already implies both "is a
+    # directory" and "no reparse/symlink ancestry" (_scan_path calls
+    # _has_reparse_or_symlink_component internally), dropping the
+    # now-redundant standalone ancestry call. Behavior is unchanged: a
+    # swallowed-ambiguous result and a confirmed-unsafe result both
+    # raised OSError before (rejecting this candidate), and both still
+    # do - only the immediate raise site and message text differ, not
+    # the caller-visible outcome.
+    if _scan_path(root) is not _PathScanOutcome.PLAIN_DIRECTORY:
+        raise OSError(f"unsafe wrapper log root: {root}")
+    agent_dir = root / agent_leaf
+    agent_dir.mkdir(mode=0o700, exist_ok=True)
+    if _scan_path(agent_dir) is not _PathScanOutcome.PLAIN_DIRECTORY:
+        raise OSError(f"unsafe wrapper log agent directory: {agent_dir}")
+    if os.name != "nt":
+        os.chmod(root, stat.S_IRWXU)
+        os.chmod(agent_dir, stat.S_IRWXU)
+    return agent_dir
+
+
+def _active_generation_lock_path(generation_dir: Path) -> Path:
+    """Return a lock path outside the generation so it can guard deletion."""
+    return generation_dir.parent / f".{generation_dir.name}.active"
+
+
+def _validate_open_lock_path(path: Path, fd: int) -> None:
+    opened = os.fstat(fd)
+    current = os.lstat(path)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or not stat.S_ISREG(current.st_mode)
+        or current.st_nlink != 1
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        or _is_reparse_or_symlink(path)
+    ):
+        raise OSError(f"unsafe wrapper log active lock: {path}")
+
+
+def _try_lock_active_fd(fd: int) -> bool:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.fstat(fd).st_size < 1:
+        os.write(fd, b"\0")
+        os.fsync(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            # FileStream.Lock uses a byte-range record lock on Unix. lockf,
+            # rather than flock, keeps the Python and generated-PowerShell
+            # pruners on the same cross-language primitive.
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock_active_fd(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.lockf(fd, fcntl.LOCK_UN, 1)
+
+
+def _acquire_active_generation_lock(
+    generation_dir: Path,
+) -> _ActiveGenerationLock | None:
+    path = _active_generation_lock_path(generation_dir)
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
+    created = False
+    created_identity: os.stat_result | None = None
+    try:
+        fd = os.open(str(path), flags, 0o600)
+        created = True
+        created_identity = os.fstat(fd)
+        _validate_open_lock_path(path, fd)
+        if not _try_lock_active_fd(fd):
+            raise OSError(f"could not acquire wrapper log active lock: {path}")
+        return _ActiveGenerationLock(
+            path=path,
+            fd=fd,
+            identity=created_identity,
+        )
+    except OSError:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if created and created_identity is not None:
+            with contextlib.suppress(OSError):
+                _unlink_active_lock_if_same(path, created_identity)
+        return None
+
+
+def _unlink_active_lock_if_same(path: Path, identity: os.stat_result) -> None:
+    # Reuse the store's pathname-generation-safe removal. Closing a lock before
+    # unlinking is required on Windows, but a replacement must never be removed
+    # in the close/unlink race on either platform.
+    from agenttalk.store import _unlink_if_same_file
+
+    _unlink_if_same_file(path, identity)
+
+
+def _release_active_generation_lock(lock: _ActiveGenerationLock) -> None:
+    try:
+        _unlock_active_fd(lock.fd)
+    finally:
+        os.close(lock.fd)
+    with contextlib.suppress(OSError):
+        _unlink_active_lock_if_same(lock.path, lock.identity)
+
+
+@contextlib.contextmanager
+def _guard_wrapper_log_prune(generation_dir: Path) -> Iterator[bool]:
+    """Hold an inactive generation's byte lock through its deletion attempt."""
+    path = _active_generation_lock_path(generation_dir)
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except FileNotFoundError:
+        yield True
+        return
+    except OSError:
+        yield False
+        return
+    acquired = False
+    identity: os.stat_result | None = None
+    try:
+        _validate_open_lock_path(path, fd)
+        identity = os.fstat(fd)
+        acquired = _try_lock_active_fd(fd)
+    except OSError:
+        acquired = False
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                _unlock_active_fd(fd)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        # Routed through the shared classifier (#113 review, round 5
+        # sweep) - a real behavior change, not just a relabeling: only a
+        # CONFIRMED absence should trigger cleaning up this now-orphaned
+        # lock file. The prior .exists() swallowed an unreadable
+        # generation_dir into "gone", which could remove the lock
+        # protecting a generation that might still genuinely be there.
+        if (
+            acquired
+            and identity is not None
+            and _scan_path(generation_dir) is _PathScanOutcome.ABSENT
+        ):
+            with contextlib.suppress(OSError):
+                _unlink_active_lock_if_same(path, identity)
+
+
+def powershell_wrapper_log_sequence_policy() -> str:
+    """Render the canonical uncertainty table for the generated launcher."""
+    entries = "; ".join(
+        f"'{state}' = ${str(uncertain).lower()}"
+        for state, uncertain in _SEQUENCE_UNCERTAINTY_BY_STATE.items()
+    )
+    return "@{ " + entries + " }"
+
+
+def _read_wrapper_log_sequence(
+    generation: Path,
+    *,
+    committed: bool,
+) -> tuple[int | None, bool]:
+    """Read one launch sequence under the shared Python/PowerShell policy.
+
+    ``.sequence-uncertain`` records that THIS generation's own sequence
+    number may already be lower than the true prior maximum, because the
+    allocator that wrote it could not fully scan every root (see
+    ``_owned_committed_generations``). That fact belongs to the generation
+    itself, permanently, independent of whether ``.sequence`` later reads
+    back as perfectly well-formed - a later launch seeing a syntactically
+    valid ``.sequence`` file must not conclude the uncertainty it was
+    marked with has gone away. Without this, the marker is written but
+    never consulted: retention on a later launch would rank this
+    generation as confidently ordered, exactly the silent-uncertainty
+    pattern #113 raised the marker to prevent in the first place.
+    """
+    # Only a CONFIRMED absence of `.sequence-uncertain` clears this - a
+    # present OR unusable (unreadable) marker both mean this generation
+    # cannot be trusted as confidently ordered (#113 review, round 3: the
+    # prior `.exists()` form swallowed an unreadable marker into a
+    # confident "no marker", indistinguishable from a generation that was
+    # never marked uncertain at all).
+    marker_uncertain = committed and (
+        _scan_marker(generation / ".sequence-uncertain") is not _MarkerScanOutcome.ABSENT
+    )
+    sequence_path = generation / ".sequence"
+    try:
+        sequence_info = sequence_path.lstat()
+    except FileNotFoundError:
+        # Cannot confirm `.sequence-failed` is genuinely absent -> cannot
+        # confirm this is a legacy generation that predates the marker
+        # system, so fail toward the state that reports uncertain (#113
+        # review, round 3).
+        state = (
+            "missing-legacy"
+            if _scan_marker(generation / ".sequence-failed") is _MarkerScanOutcome.ABSENT
+            else "missing-write-failed"
+        )
+        return None, bool(
+            marker_uncertain or (committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+        )
+    except OSError:
+        state = "present-invalid"
+        return None, bool(
+            marker_uncertain or (committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+        )
+
+    state = "present-invalid"
+    sequence: int | None = None
+    try:
+        if (
+            not stat.S_ISREG(sequence_info.st_mode)
+            or _is_reparse_or_symlink(sequence_path)
+        ):
+            raise ValueError("sequence record is not a plain file")
+        text = sequence_path.read_text(encoding="utf-8").strip()
+        if not _SEQUENCE_RECORD_RE.fullmatch(text):
+            raise ValueError("sequence record is not a canonical positive integer")
+        parsed = int(text)
+        if parsed > _SEQUENCE_MAX:
+            raise ValueError("sequence record exceeds signed 64-bit range")
+        sequence = parsed
+        state = "present-valid"
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return sequence, bool(
+        marker_uncertain or (committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
+    )
+
+
+class _PathScanOutcome(enum.Enum):
+    """The three CLOSED outcomes this scan is allowed to distinguish - no
+    boolean or null channel is permitted to carry this distinction,
+    because a boolean cannot represent "I could not tell" (#113 review,
+    reviewer-1's sharpened class fix, replacing an earlier bool-pair
+    predicate that still let an impossible fourth combination typecheck).
+
+    ABSENT: genuinely not there.
+    PLAIN_DIRECTORY: confirmed a real directory, safe to use.
+    UNUSABLE: neither of the above could be positively confirmed.
+    """
+
+    ABSENT = "absent"
+    PLAIN_DIRECTORY = "plain_directory"
+    UNUSABLE = "unusable"
+
+
+def _scan_path(path: Path) -> _PathScanOutcome:
+    """Classify `path` for this scan via the raw, non-swallowing lstat()
+    primitive into exactly one of the three outcomes above.
+
+    ``Path.exists`` / ``.is_dir`` (called) are boolean wrappers that
+    SWALLOW OSError into a confident False - only some error codes on
+    3.10 (e.g. a disconnected/not-ready volume), but ANY OSError on
+    3.14+ (``Path.exists`` there delegates to ``os.path.exists``, whose
+    own implementation is a bare ``except (OSError, ValueError)``). A
+    temporarily unreadable entry would then read exactly like one that
+    never existed - a confident "no" instead of "unknown" - and this
+    scan's whole caller-visible contract is that ambiguity becomes
+    ``UNUSABLE``, never silently ``ABSENT`` (#113 review). ``lstat()`` is
+    the raw primitive: only ``FileNotFoundError`` means genuinely absent;
+    anything else (permission denied, a disconnected volume, an entry
+    that exists but is not a directory, or a reparse/symlink component
+    anywhere in its ancestry) is ``UNUSABLE`` - "could not positively
+    confirm a plain directory," which this scan is required to treat the
+    same way everywhere in it.
+
+    Every level of this scan (the agent directory, each generation inside
+    it, and any level added later) is required to go through this ONE
+    classifier rather than hand-roll its own ``is_dir()``/``exists()``
+    check - there is no other channel through which to ask the question,
+    so a new level cannot reintroduce this class independently (#113
+    review; confirmed a third instance of the same bug at a second level
+    of the same scan before this classifier existed).
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return _PathScanOutcome.ABSENT
+    except OSError:
+        return _PathScanOutcome.UNUSABLE
+    if not stat.S_ISDIR(info.st_mode):
+        return _PathScanOutcome.UNUSABLE
+    try:
+        if _has_reparse_or_symlink_component(path):
+            return _PathScanOutcome.UNUSABLE
+    except OSError:
+        return _PathScanOutcome.UNUSABLE
+    return _PathScanOutcome.PLAIN_DIRECTORY
+
+
+class _MarkerScanOutcome(enum.Enum):
+    """The closed outcomes for a marker FILE probe - the same discipline
+    as ``_PathScanOutcome``, extended honestly for files rather than
+    reusing the directory-shaped enum (a marker file needs no
+    reparse/symlink-ancestry validation the way a retention-critical
+    directory does, so a distinct, narrower outcome type is the honest
+    fit, not a bolted-on boolean at the file level - #113 review, round
+    3). ``ABSENT`` only for ``FileNotFoundError``; ``UNUSABLE`` for
+    anything else this cannot positively confirm either way, INCLUDING a
+    successful stat of something that is not a plain file (#113 review,
+    round 4: a closed outcome set with an under-specified member is not
+    closed - ``PRESENT`` must mean a valid marker leaf, not merely that
+    some filesystem object occupies the name; a directory placed where
+    `.committed` is expected read as PRESENT before this check existed).
+    A marker that cannot be read is not a marker that is not there.
+    """
+
+    ABSENT = "absent"
+    PRESENT = "present"
+    UNUSABLE = "unusable"
+
+
+def _scan_marker(path: Path) -> _MarkerScanOutcome:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return _MarkerScanOutcome.ABSENT
+    except OSError:
+        return _MarkerScanOutcome.UNUSABLE
+    if not stat.S_ISREG(info.st_mode):
+        # Also covers a symlink/reparse point AT the leaf itself: lstat()
+        # does not follow it, so its mode is S_ISLNK, never S_ISREG - no
+        # separate symlink check is needed here the way the directory
+        # classifier needs one for its ancestry.
+        return _MarkerScanOutcome.UNUSABLE
+    # #113 review, round 7, finding 2: S_ISREG alone can be True for a
+    # non-name-surrogate reparse point (the exact OneDrive-placeholder
+    # class _windows_raw_file_attributes exists to catch) - its
+    # underlying-type bit still reads as a regular file even though it
+    # is a reparse point. The round 5 fix wired this signal into
+    # _is_reparse_or_symlink for DIRECTORY ancestry, but never into this
+    # marker classifier, so a marker leaf could still read PRESENT for
+    # exactly the input class this scan exists to unify. Executed and
+    # confirmed: the helper correctly says reparse, this classifier said
+    # PRESENT anyway, and a consumer-level prune then deleted the
+    # generation. A failed lookup propagates UNUSABLE (finding 4), never
+    # a silent fall-through to "the ordinary check found nothing."
+    try:
+        windows_attributes = _windows_raw_file_attributes(path)
+    except _RawAttributeLookupFailed:
+        return _MarkerScanOutcome.UNUSABLE
+    if windows_attributes is not None and bool(
+        windows_attributes & _WIN32_FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        return _MarkerScanOutcome.UNUSABLE
+    return _MarkerScanOutcome.PRESENT
+
+
+def _owned_committed_generations(
+    roots: tuple[Path, ...],
+    agent_leaf: str,
+) -> tuple[list[tuple[str, Path]], int, int, bool]:
+    """Return (candidates, observed_count, max_sequence, uncertain).
+
+    ``candidates`` is the deletion-eligible pool - positively-committed
+    generations only, exactly as before. ``observed_count`` is a
+    SEPARATE, wider count: every generation-shaped directory this scan
+    actually found, whether or not its commit status could be
+    confirmed. These two numbers must not be conflated (#113 review,
+    round 5, finding #7): the safety bound that decides whether pruning
+    is even attempted this cycle must be checked against how many
+    generations physically exist, not against how many happened to
+    qualify for deletion. Round 4's fix correctly excluded an ambiguous
+    generation from ``candidates`` (right, for deletion), but the caller
+    then also used ``len(candidates)`` for the bound - so the ambiguous
+    generation vanished from BOTH numbers, undercounting the bound the
+    same way undercounting a sequence value was already known to be
+    dangerous. Executed and confirmed: 13 physical generations against a
+    bound of 12, one genuinely ambiguous, survived by luck (12 <= 12)
+    rather than by the bound correctly seeing 13.
+    """
+    candidates: list[tuple[str, Path]] = []
+    observed_count = 0
+    max_sequence = 0
+    uncertain = False
+    for root in roots:
+        agent_dir = root / agent_leaf
+        try:
+            agent_outcome = _scan_path(agent_dir)
+            if agent_outcome is not _PathScanOutcome.PLAIN_DIRECTORY:
+                uncertain = uncertain or agent_outcome is _PathScanOutcome.UNUSABLE
+                continue
+            for generation in agent_dir.iterdir():
+                if not _GENERATION_NAME_RE.fullmatch(generation.name):
+                    continue
+                generation_outcome = _scan_path(generation)
+                if generation_outcome is not _PathScanOutcome.PLAIN_DIRECTORY:
+                    if generation_outcome is _PathScanOutcome.UNUSABLE:
+                        # Detected SOMETHING generation-shaped that could
+                        # not be fully confirmed - still counts toward
+                        # the physical population the bound must see,
+                        # even though it can never be a deletion
+                        # candidate. A genuinely ABSENT result (a
+                        # same-cycle TOCTOU vanish between iterdir() and
+                        # this probe) does not - it truly is not there.
+                        observed_count += 1
+                        uncertain = True
+                    continue
+                observed_count += 1
+                committed_marker = _scan_marker(generation / ".committed")
+                if committed_marker is _MarkerScanOutcome.UNUSABLE:
+                    # Cannot confirm committed one way or the other.
+                    # Counting this generation's ambiguity toward the
+                    # safety bound is conservative and fine; resolving the
+                    # ambiguity AS committed is not - that makes an
+                    # unconfirmed, possibly still-pending generation
+                    # DELETION-ELIGIBLE the moment the bound is crossed.
+                    # Deletion needs positive proof of commitment, never a
+                    # permissive resolution of an unknown (#113 review,
+                    # round 4: reviewer-1's reproduction did exactly this
+                    # - 13 generations, the oldest genuinely pending with
+                    # captured stdout, only its .committed probe
+                    # unreadable, and prune deleted it once the bound was
+                    # crossed). Treat it the same as genuinely not
+                    # committed - excluded from `candidates`, never a
+                    # prune candidate - but still flag the whole scan
+                    # uncertain (it was already counted in
+                    # observed_count above, regardless of commit status).
+                    uncertain = True
+                committed = committed_marker is _MarkerScanOutcome.PRESENT
+                sequence, sequence_uncertain = _read_wrapper_log_sequence(
+                    generation,
+                    committed=committed,
+                )
+                uncertain = uncertain or sequence_uncertain
+                if sequence is not None:
+                    max_sequence = max(max_sequence, sequence)
+                if not committed:
+                    continue
+                sort_key = (
+                    f"1-{sequence:020d}-{generation.name}"
+                    if sequence is not None
+                    else f"0-{generation.name}"
+                )
+                candidates.append((sort_key, generation))
+        except OSError:
+            uncertain = True
+    return candidates, observed_count, max_sequence, uncertain
+
+
+def _write_restrictive_text(path: Path, text: str) -> None:
+    opener = _restrictive_file_opener if os.name != "nt" else None
+    with open(str(path), "x", encoding="utf-8", opener=opener) as stream:
+        stream.write(text)
+
+
+class WrapperLogAllocationFailed(OSError):
+    """Every candidate wrapper-log root was rejected; carries why each was.
+
+    ``_allocate_wrapper_log_targets`` previously returned ``None`` on total
+    failure, discarding every candidate's own ``OSError`` along the way. That
+    collapsed "could not allocate anywhere, and here is why" into a bare
+    "did not allocate" - the caller (and anyone reading logs afterward) had
+    no way to distinguish a transient permission problem from, say, a path
+    long enough to exceed Windows' legacy MAX_PATH. This carries the reason
+    for every attempt so total failure is diagnosable instead of silent.
+    """
+
+    def __init__(self, attempts: tuple[tuple[Path, str], ...]) -> None:
+        self.attempts = attempts
+        if attempts:
+            detail = "; ".join(f"{root}: {reason}" for root, reason in attempts)
+        else:
+            detail = "no candidate wrapper log root was available"
+        super().__init__(f"no writable wrapper log root ({detail})")
+
+
+def _allocate_wrapper_log_targets(
+    project_root: Path,
+    agent: str,
+    environ: Mapping[str, str],
+) -> _AllocatedWrapperLogTargets:
+    roots = wrapper_log_root_candidates(project_root, environ=environ)
+    agent_leaf = _wrapper_log_agent_leaf(agent)
+    _candidates, _observed_count, max_sequence, uncertain = _owned_committed_generations(
+        roots,
+        agent_leaf,
+    )
+    sequence = max_sequence + 1
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")[:-3] + "Z"
+    attempts: list[tuple[Path, str]] = []
+    for root in roots:
+        generation_dir: Path | None = None
+        try:
+            agent_dir = _prepare_agent_log_dir(root, agent_leaf)
+            generation_dir = agent_dir / f"{stamp}-{secrets.token_hex(16)}"
+            generation_dir.mkdir(mode=0o700)
+            # Routed through the shared classifier (#113 review, round 5
+            # sweep) - same reasoning as _prepare_agent_log_dir's
+            # post-creation checks: behavior is unchanged, only the raise
+            # site's message text differs.
+            if _scan_path(generation_dir) is not _PathScanOutcome.PLAIN_DIRECTORY:
+                raise OSError(
+                    f"unsafe wrapper log generation directory: {generation_dir}"
+                )
+            stdout_path = generation_dir / "stdout.log"
+            stderr_path = generation_dir / "stderr.log"
+            _write_restrictive_text(stdout_path, "")
+            _write_restrictive_text(stderr_path, "")
+            _write_restrictive_text(generation_dir / ".pending", "")
+            try:
+                _write_restrictive_text(
+                    generation_dir / ".sequence",
+                    str(sequence),
+                )
+            except OSError:
+                uncertain = True
+                with contextlib.suppress(OSError):
+                    _write_restrictive_text(
+                        generation_dir / ".sequence-failed",
+                        "",
+                    )
+            if uncertain:
+                with contextlib.suppress(OSError):
+                    _write_restrictive_text(
+                        generation_dir / ".sequence-uncertain",
+                        "",
+                    )
+            _harden_posix_log_paths(stdout_path, stderr_path)
+            # Match the generated launcher's evidence-first ordering: this
+            # pending generation proves a destination accepted creation, so it
+            # is safe to trim only *prior* committed evidence now. It is not
+            # itself eligible until the wrapper holds its lifetime lock and
+            # confirms after both tees are live.
+            _prune_wrapper_log_generations(
+                roots,
+                agent_leaf,
+                sequence_uncertain=uncertain,
+            )
+            return _AllocatedWrapperLogTargets(
+                root=root.resolve(),
+                generation_dir=generation_dir.resolve(),
+                stdout_path=stdout_path.resolve(),
+                stderr_path=stderr_path.resolve(),
+                roots=roots,
+                agent_leaf=agent_leaf,
+                sequence_uncertain=uncertain,
+                rejected_attempts=tuple(attempts),
+            )
+        except OSError as exc:
+            attempts.append((root, str(exc)))
+            # The ancestry probe itself can raise OSError (the candidate
+            # became inaccessible or disconnected after its generation
+            # directory was created but before allocation finished). That
+            # must not escape this handler: an unsuppressed second error
+            # here would abort the whole candidate loop and disable capture
+            # entirely, rather than just this one candidate (#113 review).
+            # An uncheckable partial directory is unsafe to delete, so
+            # leave it in place and still continue to the next candidate.
+            if generation_dir is not None:
+                with contextlib.suppress(OSError):
+                    if not _has_reparse_or_symlink_component(generation_dir):
+                        shutil.rmtree(generation_dir)
+    raise WrapperLogAllocationFailed(tuple(attempts))
+
+
+def _prune_wrapper_log_generations(
+    roots: tuple[Path, ...],
+    agent_leaf: str,
+    *,
+    sequence_uncertain: bool = False,
+) -> None:
+    candidates, observed_count, _max_sequence, uncertain = _owned_committed_generations(
+        roots,
+        agent_leaf,
+    )
+    safety_bound = max(
+        WRAPPER_LOG_GENERATIONS * 3,
+        WRAPPER_LOG_GENERATIONS + 2,
+    )
+    uncertain = uncertain or sequence_uncertain
+    # The bound must be checked against how many generations PHYSICALLY
+    # exist (observed_count), not how many happen to qualify for
+    # deletion (len(candidates)) - #113 review, round 5, finding #7.
+    # These can differ: an ambiguous generation is correctly excluded
+    # from candidates (never deletion-eligible) but must still count
+    # toward the bound, or the bound silently shrinks by exactly the
+    # generations it exists to protect.
+    if uncertain and observed_count <= safety_bound:
+        return
+    for _sort_key, generation in sorted(candidates)[:-WRAPPER_LOG_GENERATIONS]:
+        if _has_reparse_or_symlink_component(generation):
+            continue
+        with _guard_wrapper_log_prune(generation) as prunable:
+            if not prunable:
+                continue
+            with contextlib.suppress(OSError):
+                shutil.rmtree(generation)
+
+
+def _wrapper_log_location_path(state_dir: Path, agent: str) -> Path:
+    from agenttalk.store import validate_agent_name
+
+    safe_agent = validate_agent_name(agent)
+    return (
+        state_dir
+        / "wrapper-log-locations"
+        / f"{_wrapper_log_agent_leaf(safe_agent)}.json"
+    )
+
+
+def _record_wrapper_log_location(
+    project_root: Path,
+    agent: str,
+    installation: WrapperLogInstallation,
+) -> None:
+    if not installation.confirmed or installation.generation_dir is None:
+        return
+    store_dir = project_root / ".agenttalk"
+    # Routed through the shared classifier (#113 review, round 5 sweep) -
+    # a real behavior change: only a CONFIRMED absence of config.json
+    # should skip writing the location record. The prior .is_file()
+    # swallowed an unreadable-but-present config.json into "not a
+    # store," silently losing forensic capability for this launch; an
+    # actual write failure is still safely handled by the except clause
+    # below.
+    if _scan_marker(store_dir / "config.json") is _MarkerScanOutcome.ABSENT:
+        return
+    try:
+        path = _wrapper_log_location_path(store_dir / "state", agent)
+        payload = {
+            "schema_version": _LOCATION_SCHEMA_VERSION,
+            "agent": agent,
+            "root": str(installation.root),
+            "generation_dir": str(installation.generation_dir),
+            "stdout": str(installation.stdout_path),
+            "stderr": str(installation.stderr_path),
+            "wrapper_pid": os.getpid(),
+            "observed_at": _utc_iso(datetime.now(timezone.utc).timestamp()),
+        }
+        _atomic.write_text(
+            path,
+            json.dumps(payload, indent=2, sort_keys=True),
+        )
+    except (OSError, ValueError):
+        pass
+
+
+def record_wrapper_log_location(
+    project_root: Path,
+    agent: str,
+    installation: WrapperLogInstallation,
+) -> None:
+    """Record the accepted destination after authoritative root discovery.
+
+    Capture can begin from a provisional, non-fallible root hint before the
+    wrapper performs project discovery.  Once discovery succeeds, publish the
+    already-accepted generation under the authoritative project's state
+    directory without making diagnostics a new failure mode.
+    """
+    try:
+        diagnostic_project = _diagnostic_project_root(project_root)
+    except (OSError, RuntimeError):
+        return
+    _record_wrapper_log_location(diagnostic_project, agent, installation)
+
+
+def read_wrapper_log_location(state_dir: Path, agent: str) -> dict[str, object]:
+    """Read the last wrapper-recorded location without recomputing candidates."""
+    absent = {
+        "status": "absent",
+        "root": None,
+        "generation_dir": None,
+        "stdout": None,
+        "stderr": None,
+    }
+    try:
+        path = _wrapper_log_location_path(state_dir, agent)
+    except ValueError:
+        return {**absent, "status": "invalid", "error": "unsafe_agent"}
+    # #113 review, round 5: _scan_marker deliberately has no ancestry
+    # check (reviewer-1's own guidance in round 4 - a generation-relative
+    # marker lives inside a generation directory whose ancestry the
+    # RETENTION scan already validates via _scan_path, so re-validating
+    # per marker would be redundant there). This location record does
+    # NOT live inside a pre-validated generation directory - it lives
+    # under state_dir, which nothing else in this read path validates.
+    # A junctioned ancestor anywhere under state_dir would otherwise let
+    # this function read and confidently report content from wherever
+    # that redirect actually points. Validated explicitly, once, here -
+    # not folded into _scan_marker itself, since the marker's OTHER
+    # callers correctly do not need it.
+    try:
+        if _has_reparse_or_symlink_component(path):
+            return {**absent, "status": "unusable"}
+    except OSError:
+        return {**absent, "status": "unusable"}
+    location_marker = _scan_marker(path)
+    if location_marker is _MarkerScanOutcome.ABSENT:
+        return absent
+    if location_marker is _MarkerScanOutcome.UNUSABLE:
+        # Cannot confirm the record is genuinely absent, so this must not
+        # read the same as one - a caller falling back on "absent" would
+        # incorrectly refuse a lookup a readable filesystem would have
+        # answered (#113 review, round 3).
+        return {**absent, "status": "unusable"}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("location is not an object")
+        if payload.get("schema_version") != _LOCATION_SCHEMA_VERSION:
+            raise ValueError("unsupported schema")
+        if payload.get("agent") != agent:
+            raise ValueError("agent mismatch")
+        paths = {
+            name: Path(str(payload[name])).resolve()
+            for name in ("root", "generation_dir", "stdout", "stderr")
+            if isinstance(payload.get(name), str) and payload[name]
+        }
+        if set(paths) != {"root", "generation_dir", "stdout", "stderr"}:
+            raise ValueError("missing path")
+        generation = paths["generation_dir"]
+        if generation.parent.name != _wrapper_log_agent_leaf(agent):
+            raise ValueError("agent directory mismatch")
+        if generation.parent.parent != paths["root"]:
+            raise ValueError("root mismatch")
+        if paths["stdout"] != generation / "stdout.log":
+            raise ValueError("stdout mismatch")
+        if paths["stderr"] != generation / "stderr.log":
+            raise ValueError("stderr mismatch")
+        # Found during the round-3 sweep, not itself cited: the same
+        # exists()-family swallow one level below the top-level check
+        # above. A generation/stdout/stderr this cannot read is not
+        # confirmed gone (stale) any more than it is confirmed present
+        # (observed) - report "unusable" rather than picking either
+        # confident answer from an unreadable probe.
+        #
+        # Round 4 correction: these three expect DIFFERENT object kinds -
+        # generation must be a directory, stdout/stderr must be plain
+        # files - so this must classify each through the type-aware
+        # classifier for its own kind, not the presence-only marker
+        # probe. A presence-only check would report "observed" for a
+        # directory sitting where stdout.log belongs, exactly the
+        # under-specified-PRESENT defect just fixed in _scan_marker
+        # itself (#113 review, round 4).
+        generation_outcome = _scan_path(generation)
+        stdout_outcome = _scan_marker(paths["stdout"])
+        stderr_outcome = _scan_marker(paths["stderr"])
+        if (
+            generation_outcome is _PathScanOutcome.PLAIN_DIRECTORY
+            and stdout_outcome is _MarkerScanOutcome.PRESENT
+            and stderr_outcome is _MarkerScanOutcome.PRESENT
+        ):
+            status = "observed"
+        elif (
+            generation_outcome is _PathScanOutcome.UNUSABLE
+            or stdout_outcome is _MarkerScanOutcome.UNUSABLE
+            or stderr_outcome is _MarkerScanOutcome.UNUSABLE
+        ):
+            status = "unusable"
+        else:
+            status = "stale"
+        return {
+            "status": status,
+            "root": str(paths["root"]),
+            "generation_dir": str(generation),
+            "stdout": str(paths["stdout"]),
+            "stderr": str(paths["stderr"]),
+            "wrapper_pid": payload.get("wrapper_pid"),
+            "observed_at": payload.get("observed_at"),
+        }
+    except OSError as exc:
+        # #113 review, round 5, finding #13: a read denial or a
+        # path-resolution failure occurring past the top-level probe
+        # (e.g. a race on read_text(), or an unresolvable ancestor in
+        # one of the stored paths) means "could not read/resolve," not
+        # "content is malformed" - the same distinction the docs already
+        # promise for the top-level check. Only the FIRST probe was
+        # classifying OSError this way; this closes the gap so the
+        # public contract holds end to end, not just at the first site.
+        return {
+            **absent,
+            "status": "unusable",
+            "error": type(exc).__name__,
+        }
+    except (
+        KeyError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        return {
+            **absent,
+            "status": "invalid",
+            "error": type(exc).__name__,
+        }
+# endregion wrapper-log-retention
+
+
 class BoundedStreamTee:
     """Text stream that bounds the inherited redirect and keeps a newest-output ring.
 
@@ -242,12 +1427,14 @@ class BoundedStreamTee:
         max_bytes: int = WRAPPER_LOG_MAX_BYTES,
         segment_count: int = WRAPPER_LOG_SEGMENT_COUNT,
         resume: bool = False,
+        mirror: TextIO | None = None,
     ) -> None:
         if max_bytes < _MIN_MAX_BYTES or max_bytes > _MAX_MAX_BYTES:
             raise ValueError("max_bytes is outside the supported bound")
         if segment_count < _MIN_SEGMENTS or segment_count > _MAX_SEGMENTS:
             raise ValueError("segment_count is outside the supported bound")
         self._original = original
+        self._mirror = mirror
         self.base_path = Path(base_path)
         self.max_bytes = int(max_bytes)
         self.segment_count = int(segment_count)
@@ -373,21 +1560,26 @@ class BoundedStreamTee:
 
     @property
     def encoding(self) -> str:
-        return getattr(self._original, "encoding", None) or "utf-8"
+        source = self._mirror if self._mirror is not None else self._original
+        return getattr(source, "encoding", None) or "utf-8"
 
     @property
     def errors(self) -> str:
-        return getattr(self._original, "errors", None) or "replace"
+        source = self._mirror if self._mirror is not None else self._original
+        return getattr(source, "errors", None) or "replace"
 
     @property
     def closed(self) -> bool:
         return self._closed
 
     def isatty(self) -> bool:
-        return False
+        if self._mirror is None:
+            return False
+        return bool(self._mirror.isatty())
 
     def fileno(self) -> int:
-        return self._original.fileno()
+        source = self._mirror if self._mirror is not None else self._original
+        return source.fileno()
 
     def writable(self) -> bool:
         return not self._closed
@@ -561,6 +1753,9 @@ class BoundedStreamTee:
                             self._tail.close()
                     self._tail = None
             self._write_original(text, bounded=True)
+            if self._mirror is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._mirror.write(text)
         return len(text)
 
     def writelines(self, lines) -> None:
@@ -571,6 +1766,9 @@ class BoundedStreamTee:
         with self._lock:
             with contextlib.suppress(OSError, ValueError):
                 self._original.flush()
+            if self._mirror is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._mirror.flush()
             if self._tail is not None:
                 with contextlib.suppress(OSError, ValueError):
                     self._tail.flush()
@@ -597,6 +1795,7 @@ class BoundedStreamTee:
 # a normal exit is inert rather than something that could leak behavior into
 # unrelated later code.
 _LAST_STDERR_LOG_CONFIG: tuple[str, int, int] | None = None
+_LAST_ACTIVE_GENERATION_LOCK: _ActiveGenerationLock | None = None
 
 
 @contextlib.contextmanager
@@ -604,19 +1803,98 @@ def installed_standard_streams_from_environment(
     environ: Mapping[str, str] | None = None,
     *,
     expected_nonce: str | None = None,
-) -> Iterator[None]:
-    """Install bounded stdout/stderr mirrors only for supervisor-marked wrappers."""
-    global _LAST_STDERR_LOG_CONFIG
+    project_root: str | os.PathLike[str] | None = None,
+    agent: str | None = None,
+) -> Iterator[WrapperLogInstallation]:
+    """Install wrapper-owned bounded capture, reusing authenticated targets.
+
+    A generated supervisor can supply already-open redirect targets through its
+    nonce-authenticated environment. Every other ``wrap`` launch allocates its
+    own generation and mirrors the original console while writing the bounded
+    files. Allocation and the location record are fail-soft diagnostics.
+    """
+    global _LAST_ACTIVE_GENERATION_LOCK, _LAST_STDERR_LOG_CONFIG
     env = os.environ if environ is None else environ
-    if not _authenticated_environment(env, expected_nonce):
-        yield
+    authenticated = _authenticated_environment(env, expected_nonce)
+    allocated: _AllocatedWrapperLogTargets | None = None
+    diagnostic_project: Path | None = None
+    owned_streams = contextlib.ExitStack()
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    if project_root is not None:
+        try:
+            diagnostic_project = _diagnostic_project_root(project_root)
+        except (OSError, RuntimeError):
+            diagnostic_project = None
+    if authenticated:
+        stdout_raw = env.get(ENV_STDOUT_PATH)
+        stderr_raw = env.get(ENV_STDERR_PATH)
+        if not stdout_raw or not stderr_raw:
+            yield WrapperLogInstallation(False)
+            return
+        stdout_path = Path(stdout_raw).resolve()
+        stderr_path = Path(stderr_raw).resolve()
+        stdout_base = original_stdout
+        stderr_base = original_stderr
+        stdout_mirror = None
+        stderr_mirror = None
+    elif diagnostic_project is not None and agent:
+        allocation_failure_reason: str | None = None
+        try:
+            allocated = _allocate_wrapper_log_targets(
+                diagnostic_project,
+                str(agent),
+                env,
+            )
+        except WrapperLogAllocationFailed as exc:
+            allocated = None
+            allocation_failure_reason = str(exc)
+        except (OSError, RuntimeError) as exc:
+            allocated = None
+            allocation_failure_reason = str(exc)
+        if allocated is None:
+            yield WrapperLogInstallation(
+                False,
+                disabled_reason=allocation_failure_reason,
+            )
+            return
+        stdout_path = allocated.stdout_path
+        stderr_path = allocated.stderr_path
+        opener = _restrictive_file_opener if os.name != "nt" else None
+        try:
+            stdout_base = owned_streams.enter_context(
+                open(
+                    str(stdout_path),
+                    "a",
+                    encoding="utf-8",
+                    errors="replace",
+                    buffering=1,
+                    opener=opener,
+                )
+            )
+            stderr_base = owned_streams.enter_context(
+                open(
+                    str(stderr_path),
+                    "a",
+                    encoding="utf-8",
+                    errors="replace",
+                    buffering=1,
+                    opener=opener,
+                )
+            )
+        except OSError:
+            owned_streams.close()
+            with contextlib.suppress(OSError):
+                shutil.rmtree(allocated.generation_dir)
+            yield WrapperLogInstallation(False)
+            return
+        stdout_mirror = original_stdout
+        stderr_mirror = original_stderr
+    else:
+        yield WrapperLogInstallation(False)
         return
-    stdout_path = env.get(ENV_STDOUT_PATH)
-    stderr_path = env.get(ENV_STDERR_PATH)
-    if not stdout_path or not stderr_path:
-        yield
-        return
-    _harden_posix_log_paths(Path(stdout_path), Path(stderr_path))
+
+    _harden_posix_log_paths(stdout_path, stderr_path)
     max_bytes = _bounded_int(
         env.get(ENV_MAX_BYTES),
         default=WRAPPER_LOG_MAX_BYTES,
@@ -629,23 +1907,23 @@ def installed_standard_streams_from_environment(
         minimum=_MIN_SEGMENTS,
         maximum=_MAX_SEGMENTS,
     )
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
     stdout = BoundedStreamTee(
-        original_stdout,
+        stdout_base,
         stdout_path,
         max_bytes=max_bytes,
         segment_count=segment_count,
+        mirror=stdout_mirror,
     )
     stderr = BoundedStreamTee(
-        original_stderr,
+        stderr_base,
         stderr_path,
         max_bytes=max_bytes,
         segment_count=segment_count,
+        mirror=stderr_mirror,
     )
     sys.stdout = stdout
     sys.stderr = stderr
-    _LAST_STDERR_LOG_CONFIG = (stderr_path, max_bytes, segment_count)
+    _LAST_STDERR_LOG_CONFIG = (str(stderr_path), max_bytes, segment_count)
     # Round 23: this is the ONE moment that proves - by evidence, not by a
     # pre-launch guess - that this launch actually reaches cmd_wrap and
     # installs its streams: authentication has already succeeded and both
@@ -654,17 +1932,63 @@ def installed_standard_streams_from_environment(
     # supervisor's commit decision is now the wrapper's own report instead
     # of a prediction about argv grammar, quoting, cwd, interpreter, or
     # timing it can never fully replicate.
-    _confirm_wrapper_log_generation(Path(stderr_path).parent)
+    generation_dir = stderr_path.parent
+    active_lock = _acquire_active_generation_lock(generation_dir)
+    confirmed = bool(
+        active_lock is not None
+        and _confirm_wrapper_log_generation(generation_dir)
+    )
+    root = generation_dir.parent.parent
+    installation = WrapperLogInstallation(
+        True,
+        confirmed=confirmed,
+        root=root,
+        generation_dir=generation_dir,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        rejected_attempts=(
+            allocated.rejected_attempts if allocated is not None else ()
+        ),
+        allocated_via_fallback_search=allocated is not None,
+    )
+    if diagnostic_project is not None and agent:
+        _record_wrapper_log_location(
+            diagnostic_project,
+            str(agent),
+            installation,
+        )
+    escaped = False
     try:
-        yield
+        yield installation
+    except BaseException:
+        escaped = True
+        raise
     finally:
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         stdout.close()
         stderr.close()
+        owned_streams.close()
+        if active_lock is not None:
+            if escaped:
+                # The real __main__ boundary appends one final bounded traceback
+                # after this context unwinds. Keep deletion blocked until that
+                # append completes; a caught exception merely leaves an OS-held
+                # diagnostic lock until process exit, which is fail-safe.
+                _LAST_ACTIVE_GENERATION_LOCK = active_lock
+            else:
+                with contextlib.suppress(OSError):
+                    _release_active_generation_lock(active_lock)
+                if allocated is not None and confirmed:
+                    with contextlib.suppress(OSError):
+                        _prune_wrapper_log_generations(
+                            allocated.roots,
+                            allocated.agent_leaf,
+                            sequence_uncertain=allocated.sequence_uncertain,
+                        )
 
 
-def _confirm_wrapper_log_generation(generation_dir: Path) -> None:
+def _confirm_wrapper_log_generation(generation_dir: Path) -> bool:
     """Mark a wrapper log generation committed from INSIDE the wrapper
     process itself, mirroring supervisor.py's own .pending/.committed
     marker pair (New-WrapperLogPendingMarker / the marker half of what was
@@ -675,8 +1999,9 @@ def _confirm_wrapper_log_generation(generation_dir: Path) -> None:
     try:
         (generation_dir / ".committed").write_bytes(b"")
         (generation_dir / ".pending").unlink(missing_ok=True)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def print_bounded_uncaught_exception() -> None:
@@ -698,28 +2023,35 @@ def print_bounded_uncaught_exception() -> None:
     tail-ring mechanism instead; a manual run with no wrapper log installed
     prints normally, unchanged.
     """
+    global _LAST_ACTIVE_GENERATION_LOCK
     config = _LAST_STDERR_LOG_CONFIG
-    if config is None:
-        traceback.print_exc(file=sys.stderr)
-        return
-    stderr_path, max_bytes, segment_count = config
     try:
-        tee = BoundedStreamTee(
-            io.StringIO(),
-            stderr_path,
-            max_bytes=max_bytes,
-            segment_count=segment_count,
-            resume=True,
-        )
-        try:
-            traceback.print_exc(file=tee)
-        finally:
-            tee.close()
-    except Exception:
-        # Best-effort: a failure bounding this redundant second copy must
-        # not swallow the crash itself.
-        with contextlib.suppress(Exception):
+        if config is None:
             traceback.print_exc(file=sys.stderr)
+            return
+        stderr_path, max_bytes, segment_count = config
+        try:
+            tee = BoundedStreamTee(
+                io.StringIO(),
+                stderr_path,
+                max_bytes=max_bytes,
+                segment_count=segment_count,
+                resume=True,
+            )
+            try:
+                traceback.print_exc(file=tee)
+            finally:
+                tee.close()
+        except Exception:
+            # Best-effort: a failure bounding this redundant second copy must
+            # not swallow the crash itself.
+            with contextlib.suppress(Exception):
+                traceback.print_exc(file=sys.stderr)
+    finally:
+        if _LAST_ACTIVE_GENERATION_LOCK is not None:
+            with contextlib.suppress(OSError):
+                _release_active_generation_lock(_LAST_ACTIVE_GENERATION_LOCK)
+            _LAST_ACTIVE_GENERATION_LOCK = None
 
 
 def _utc_iso(epoch: float) -> str:

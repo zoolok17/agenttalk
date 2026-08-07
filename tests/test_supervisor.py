@@ -29,6 +29,7 @@ from agenttalk import (
     ephemeral as eph,
     health as hm,
     supervisor as sup,
+    wrapper_logs as wlogs,
     wrapper_runtime as wrt,
 )
 from agenttalk.store import Store, _process_alive
@@ -708,6 +709,177 @@ def test_supervisor_report_surfaces_kill_switch_and_mutations_refuse(
     assert rc == 0
     report = json.loads(capsys.readouterr().out)
     assert report["kill_switch_active"] is True
+
+
+def test_report_for_active_agent_resolves_wrapper_log_unmarked_as_retired(
+    tmp_path: Path, capsys,
+) -> None:
+    """The other side of the same check (reviewer-1 executed both): an
+    agent that IS in the active roster must resolve its wrapper-log
+    location exactly as before, and must not be marked "retired" - the
+    fallback path is for a roster miss only, not a shortcut that fires on
+    every lookup."""
+    s = _team(tmp_path, agents="lead,worker")
+
+    root = tmp_path / "wrapper-logs-root"
+    agent_leaf = wlogs._wrapper_log_agent_leaf("worker")
+    generation = root / agent_leaf / f"20260804T120001000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    stdout_path = generation / "stdout.log"
+    stderr_path = generation / "stderr.log"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+
+    location_path = wlogs._wrapper_log_location_path(s.state_dir, "worker")
+    location_path.parent.mkdir(parents=True, exist_ok=True)
+    location_path.write_text(
+        json.dumps({
+            "schema_version": wlogs._LOCATION_SCHEMA_VERSION,
+            "agent": "worker",
+            "root": str(root),
+            "generation_dir": str(generation),
+            "stdout": str(stdout_path),
+            "stderr": str(stderr_path),
+            "wrapper_pid": 4242,
+            "observed_at": "2026-08-04T12:00:01Z",
+        }),
+        encoding="utf-8",
+    )
+
+    rc = _run(
+        ["supervise", "--report", "--now", str(NOW), "--for", "worker"],
+        tmp_path,
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    selected = report["agents"]["worker"]
+    assert "retired" not in selected
+    assert selected["wrapper_log"]["status"] == "observed"
+
+
+def test_report_for_agent_resolves_wrapper_log_after_ephemeral_retirement(
+    tmp_path: Path, capsys,
+) -> None:
+    """#113 review: archive_ephemeral_request(..., retire=True) drops an
+    ephemeral identity from the active roster build_report() iterates over,
+    but its wrapper-log location record and generation are not removed -
+    only its live-roster membership. `supervise --report --for <agent>`
+    must still resolve that record for crash forensics after a timed-out
+    or completed ephemeral run, not answer "unknown agent" while the logs
+    it is asking about sit on disk.
+
+    Round 3 correction: this must exercise a GENUINELY retired identity
+    via the store's own tombstone list (retire_agent), not merely a
+    location record written for a name that was never registered at all -
+    the original version of this test and the code shared the same wrong
+    assumption (that a location record alone proves a retired identity),
+    so it passed without proving the thing it claimed to."""
+    s = _team(tmp_path, agents="lead,worker,retired-reviewer")
+    retired = "retired-reviewer"
+    s.retire_agent(retired)
+
+    root = tmp_path / "wrapper-logs-root"
+    agent_leaf = wlogs._wrapper_log_agent_leaf(retired)
+    generation = (
+        root / agent_leaf
+        / f"20260804T120001000Z-{1:032x}"
+    )
+    generation.mkdir(parents=True)
+    stdout_path = generation / "stdout.log"
+    stderr_path = generation / "stderr.log"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+
+    location_path = wlogs._wrapper_log_location_path(s.state_dir, retired)
+    location_path.parent.mkdir(parents=True, exist_ok=True)
+    location_path.write_text(
+        json.dumps({
+            "schema_version": wlogs._LOCATION_SCHEMA_VERSION,
+            "agent": retired,
+            "root": str(root),
+            "generation_dir": str(generation),
+            "stdout": str(stdout_path),
+            "stderr": str(stderr_path),
+            "wrapper_pid": 4242,
+            "observed_at": "2026-08-04T12:00:01Z",
+        }),
+        encoding="utf-8",
+    )
+
+    rc = _run(
+        ["supervise", "--report", "--now", str(NOW), "--for", retired],
+        tmp_path,
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["selected_agent"] == retired
+    selected = report["agents"][retired]
+    assert selected["retired"] is True
+    assert selected["wrapper_log"]["status"] == "observed"
+    assert selected["wrapper_log"]["generation_dir"] == str(generation)
+
+
+def test_report_for_agent_still_refuses_a_genuinely_unknown_agent(
+    tmp_path: Path,
+) -> None:
+    """The other side of the same check: an agent with neither active-roster
+    membership nor any recorded wrapper-log location must still refuse -
+    the fix must not turn every unrecognized name into a silent, empty
+    'retired' row."""
+    _team(tmp_path, agents="lead,worker")
+
+    rc = _run(
+        ["supervise", "--report", "--now", str(NOW), "--for", "never-existed"],
+        tmp_path,
+    )
+
+    assert rc == 2
+
+
+def test_report_for_agent_refuses_a_never_registered_name_even_with_a_stray_record(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 3: the specific gap reviewer-1 found - a name
+    that was NEVER in the active roster and was NEVER retired must still
+    refuse, even when a location record happens to exist for it (e.g. a
+    stray or malformed file, or a name that was simply typo'd into a
+    prior write). A location record is evidence of a recorded path, not
+    evidence that a name is a retired identity - only the store's own
+    tombstone list establishes that."""
+    s = _team(tmp_path, agents="lead,worker")
+    stray = "never-registered"
+
+    root = tmp_path / "wrapper-logs-root"
+    agent_leaf = wlogs._wrapper_log_agent_leaf(stray)
+    generation = root / agent_leaf / f"20260804T120001000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    (generation / "stdout.log").write_text("", encoding="utf-8")
+    (generation / "stderr.log").write_text("", encoding="utf-8")
+    location_path = wlogs._wrapper_log_location_path(s.state_dir, stray)
+    location_path.parent.mkdir(parents=True, exist_ok=True)
+    location_path.write_text(
+        json.dumps({
+            "schema_version": wlogs._LOCATION_SCHEMA_VERSION,
+            "agent": stray,
+            "root": str(root),
+            "generation_dir": str(generation),
+            "stdout": str(generation / "stdout.log"),
+            "stderr": str(generation / "stderr.log"),
+            "wrapper_pid": 4242,
+            "observed_at": "2026-08-04T12:00:01Z",
+        }),
+        encoding="utf-8",
+    )
+    assert stray not in s.retired_agents()
+
+    rc = _run(
+        ["supervise", "--report", "--now", str(NOW), "--for", stray],
+        tmp_path,
+    )
+
+    assert rc == 2
 
 
 def test_ps_template_kill_switch_guards_mutating_boundaries() -> None:
@@ -5902,6 +6074,367 @@ def test_ps_wrapper_log_prune_bound_recovers_from_persistent_uncertainty(
     )
 
 
+_WRAPPER_LOG_SEQUENCE_AGREEMENT_TABLE = (
+    pytest.param("valid", "5", False, False, 5, 4, True, id="valid"),
+    pytest.param(
+        "bare-legacy",
+        None,
+        False,
+        False,
+        4,
+        4,
+        False,
+        id="bare-legacy-absent",
+    ),
+    pytest.param(
+        "missing-after-write-failure",
+        None,
+        True,
+        True,
+        4,
+        5,
+        True,
+        id="missing-with-failure-marker",
+    ),
+    pytest.param(
+        "corrupt-text",
+        "not-a-sequence",
+        False,
+        True,
+        4,
+        5,
+        True,
+        id="corrupt-text",
+    ),
+    pytest.param("empty", "", False, True, 4, 5, True, id="empty"),
+    pytest.param("zero", "0", False, True, 4, 5, True, id="zero"),
+    pytest.param("negative", "-1", False, True, 4, 5, True, id="negative"),
+    pytest.param(
+        "int64-overflow",
+        str(2**63),
+        False,
+        True,
+        4,
+        5,
+        True,
+        id="int64-overflow",
+    ),
+)
+
+
+def _write_wrapper_log_sequence_agreement_fixture(
+    tmp_path: Path,
+    *,
+    sequence_text: str | None,
+    sequence_failed: bool,
+) -> tuple[Path, str, Path]:
+    """Build four ordered records plus one lexically-newest scenario record."""
+    root = tmp_path / "wrapper-logs"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    agent_dir = root / agent_leaf
+    agent_dir.mkdir(parents=True)
+    for sequence in range(1, 5):
+        generation = agent_dir / (
+            f"20260804T00000000{sequence}Z-{sequence:032x}"
+        )
+        generation.mkdir()
+        (generation / ".committed").write_text("", encoding="utf-8")
+        (generation / ".sequence").write_text(
+            str(sequence),
+            encoding="utf-8",
+        )
+    newest = agent_dir / "20260804T000000005Z-00000000000000000000000000000005"
+    newest.mkdir()
+    (newest / ".committed").write_text("", encoding="utf-8")
+    if sequence_text is not None:
+        (newest / ".sequence").write_text(sequence_text, encoding="utf-8")
+    if sequence_failed:
+        (newest / ".sequence-failed").write_text("", encoding="utf-8")
+    return root, agent_leaf, newest
+
+
+@pytest.mark.parametrize(
+    (
+        "_scenario",
+        "sequence_text",
+        "sequence_failed",
+        "expected_uncertain",
+        "expected_max_sequence",
+        "expected_survivor_count",
+        "expected_newest_exists",
+    ),
+    _WRAPPER_LOG_SEQUENCE_AGREEMENT_TABLE,
+)
+def test_python_wrapper_log_sequence_contract_controls_retention(
+    tmp_path: Path,
+    _scenario: str,
+    sequence_text: str | None,
+    sequence_failed: bool,
+    expected_uncertain: bool,
+    expected_max_sequence: int,
+    expected_survivor_count: int,
+    expected_newest_exists: bool,
+) -> None:
+    """Python must preserve present-invalid evidence but prune bare legacy."""
+    root, agent_leaf, newest = _write_wrapper_log_sequence_agreement_fixture(
+        tmp_path,
+        sequence_text=sequence_text,
+        sequence_failed=sequence_failed,
+    )
+
+    owned, _observed_count, max_sequence, uncertain = wlogs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+    assert len(owned) == 5
+    assert max_sequence == expected_max_sequence
+    assert uncertain is expected_uncertain
+
+    wlogs._prune_wrapper_log_generations((root,), agent_leaf)
+
+    assert len(tuple((root / agent_leaf).iterdir())) == expected_survivor_count
+    assert newest.exists() is expected_newest_exists
+
+
+@pytest.mark.parametrize(
+    (
+        "_scenario",
+        "sequence_text",
+        "sequence_failed",
+        "expected_uncertain",
+        "expected_max_sequence",
+        "expected_survivor_count",
+        "expected_newest_exists",
+    ),
+    _WRAPPER_LOG_SEQUENCE_AGREEMENT_TABLE,
+)
+def test_generated_powershell_wrapper_log_sequence_contract_controls_retention(
+    tmp_path: Path,
+    _scenario: str,
+    sequence_text: str | None,
+    sequence_failed: bool,
+    expected_uncertain: bool,
+    expected_max_sequence: int,
+    expected_survivor_count: int,
+    expected_newest_exists: bool,
+) -> None:
+    """The real generated helpers must implement the same persisted contract."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    root, agent_leaf, newest = _write_wrapper_log_sequence_agreement_fixture(
+        tmp_path,
+        sequence_text=sequence_text,
+        sequence_failed=sequence_failed,
+    )
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / "sequence-contract.json"
+    script = tmp_path / "sequence-contract.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            "$WrapperLogGenerations = 4",
+            helpers,
+            f"$roots = @({_pslit(str(root))})",
+            f"$agentLeaf = {_pslit(agent_leaf)}",
+            "$scan = Get-NextWrapperLogSequence $roots $agentLeaf",
+            "Invoke-WrapperLogRetentionPrune $agentLeaf $roots ([bool]$scan.uncertain)",
+            f"$agentDir = Join-Path {_pslit(str(root))} $agentLeaf",
+            "$survivorCount = @(Get-ChildItem -LiteralPath $agentDir -Directory).Count",
+            "@{ uncertain = [bool]$scan.uncertain; "
+            "next_sequence = [string]$scan.next_sequence; "
+            "survivor_count = $survivorCount; "
+            f"newest_exists = (Test-Path -LiteralPath {_pslit(str(newest))}) }} | "
+            "ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "uncertain": expected_uncertain,
+        "next_sequence": str(expected_max_sequence + 1),
+        "survivor_count": expected_survivor_count,
+        "newest_exists": expected_newest_exists,
+    }
+
+
+def test_generated_powershell_prune_propagates_late_sequence_corruption(
+    tmp_path: Path,
+) -> None:
+    """A record changing after the sequence scan must still stop pruning."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    root, agent_leaf, newest = _write_wrapper_log_sequence_agreement_fixture(
+        tmp_path,
+        sequence_text="5",
+        sequence_failed=False,
+    )
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / "late-sequence-corruption.json"
+    script = tmp_path / "late-sequence-corruption.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            "$WrapperLogGenerations = 4",
+            helpers,
+            f"$roots = @({_pslit(str(root))})",
+            f"$agentLeaf = {_pslit(agent_leaf)}",
+            "$scan = Get-NextWrapperLogSequence $roots $agentLeaf",
+            f"Set-Content -LiteralPath {_pslit(str(newest / '.sequence'))} "
+            "-Value 'corrupt-after-scan' -Encoding utf8",
+            "Invoke-WrapperLogRetentionPrune $agentLeaf $roots ([bool]$scan.uncertain)",
+            f"$agentDir = Join-Path {_pslit(str(root))} $agentLeaf",
+            "@{ scan_uncertain = [bool]$scan.uncertain; "
+            "survivor_count = @(Get-ChildItem -LiteralPath $agentDir -Directory).Count; "
+            f"newest_exists = (Test-Path -LiteralPath {_pslit(str(newest))}) }} | "
+            "ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "scan_uncertain": False,
+        "survivor_count": 5,
+        "newest_exists": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "sequence_record_kind",
+    [
+        pytest.param("directory", id="non-file"),
+        pytest.param(
+            "junction",
+            marks=pytest.mark.skipif(
+                os.name != "nt",
+                reason="Windows junction parity case",
+            ),
+            id="windows-reparse-point",
+        ),
+    ],
+)
+def test_python_and_generated_powershell_fail_closed_on_unsafe_sequence_record(
+    tmp_path: Path,
+    sequence_record_kind: str,
+) -> None:
+    """Both launch paths must preserve evidence for a non-plain record."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    root, agent_leaf, newest = _write_wrapper_log_sequence_agreement_fixture(
+        tmp_path,
+        sequence_text=None,
+        sequence_failed=False,
+    )
+    sequence_path = newest / ".sequence"
+    if sequence_record_kind == "directory":
+        sequence_path.mkdir()
+    else:
+        target = tmp_path / "sequence-junction-target"
+        target.mkdir()
+        create_script = tmp_path / "create-sequence-junction.ps1"
+        create_script.write_text(
+            "param([string]$Link, [string]$Target)\n"
+            "New-Item -ItemType Junction -Path $Link -Target $Target | Out-Null\n",
+            encoding="utf-8-sig",
+        )
+        created = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-File",
+                str(create_script),
+                str(sequence_path),
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert created.returncode == 0, f"{created.stdout}{created.stderr}"
+
+    owned, _observed_count, max_sequence, uncertain = wlogs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+    assert len(owned) == 5
+    assert max_sequence == 4
+    assert uncertain is True
+    wlogs._prune_wrapper_log_generations((root,), agent_leaf)
+    assert newest.exists()
+
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    result_path = tmp_path / f"unsafe-sequence-{sequence_record_kind}.json"
+    script = tmp_path / f"unsafe-sequence-{sequence_record_kind}.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            "$WrapperLogGenerations = 4",
+            helpers,
+            f"$roots = @({_pslit(str(root))})",
+            f"$agentLeaf = {_pslit(agent_leaf)}",
+            f"$record = Read-WrapperLogSequenceRecord {_pslit(str(newest))} $true",
+            "$scan = Get-NextWrapperLogSequence $roots $agentLeaf",
+            "Invoke-WrapperLogRetentionPrune $agentLeaf $roots ([bool]$scan.uncertain)",
+            f"$agentDir = Join-Path {_pslit(str(root))} $agentLeaf",
+            "@{ state = [string]$record.state; "
+            "uncertain = [bool]$scan.uncertain; "
+            "survivor_count = @(Get-ChildItem -LiteralPath $agentDir -Directory).Count; "
+            f"newest_exists = (Test-Path -LiteralPath {_pslit(str(newest))}) }} | "
+            "ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {
+        "state": "present-invalid",
+        "uncertain": True,
+        "survivor_count": 5,
+        "newest_exists": True,
+    }
+
+
 def test_ps_wrapper_log_sequence_write_failure_marks_uncertain_and_defers_prune(
     tmp_path: Path,
 ) -> None:
@@ -6082,6 +6615,733 @@ def test_ps_wrapper_log_sequence_uncertainty_persists_to_the_next_launch(
     assert payload["survivorCount"] == 5, (
         "pruning should still be deferred at G5's commit since ordering "
         "remains unreliable while G4's missing sequence is unresolved"
+    )
+
+
+def test_ps_read_wrapper_log_sequence_record_honors_persisted_uncertainty_marker(
+    tmp_path: Path,
+) -> None:
+    """#113 review comment #5, PowerShell side: mirrors
+    test_read_wrapper_log_sequence_honors_persisted_uncertainty_marker in
+    test_wrapper_logs.py. A .sequence-uncertain marker means THIS
+    generation's own sequence number may already be lower than the true
+    prior maximum - that fact must survive a later launch seeing a
+    perfectly well-formed .sequence file, or the marker is written and
+    never consulted."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / ".sequence").write_text("5", encoding="utf-8")
+    (generation / ".sequence-uncertain").write_bytes(b"")
+    result_path = tmp_path / "ps-sequence-marker.json"
+    script = tmp_path / "ps-sequence-marker.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            f"$record = Read-WrapperLogSequenceRecord {_pslit(str(generation))} $true",
+            "@{ sequence = $record.sequence; uncertain = [bool]$record.uncertain; "
+            "state = [string]$record.state } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["sequence"] == 5
+    assert payload["state"] == "present-valid"
+    assert payload["uncertain"] is True
+
+
+def test_ps_wrapper_log_marker_presence_distinguishes_absent_from_present(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 3, PowerShell side: Test-WrapperLogMarkerPresence
+    replaces the Test-Path calls in Read-WrapperLogSequenceRecord and
+    Get-NextWrapperLogSequence that swallowed an unreadable marker into a
+    confident absence (mirrors _scan_marker in wrapper_logs.py). This is a
+    wiring/sanity check for the confirmed-present and confirmed-absent
+    ends; the 'unusable' branch itself is exercised by an executed
+    reproduction in test_ps_unreadable_sequence_uncertain_marker_returns_unusable
+    and its neighbours below, using a real cmdlet-shadowing seam (round
+    3's note claiming no such seam existed was wrong - see those tests).
+    """
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    present = tmp_path / "present-marker"
+    present.write_bytes(b"")
+    absent = tmp_path / "absent-marker"
+    result_path = tmp_path / "ps-marker-presence.json"
+    script = tmp_path / "ps-marker-presence.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            f"$present = Test-WrapperLogMarkerPresence {_pslit(str(present))}",
+            f"$absent = Test-WrapperLogMarkerPresence {_pslit(str(absent))}",
+            "@{ present = $present; absent = $absent } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["present"] == "present"
+    assert payload["absent"] == "absent"
+
+
+def _ps_shadow_get_item_denying(poisoned_path: str) -> list[str]:
+    """PS lines shadowing the unqualified Get-Item cmdlet for exactly one
+    path: functions resolve before cmdlets in PowerShell's command lookup
+    order, so an unqualified `Get-Item` call inside the generated helpers
+    (how Test-WrapperLogMarkerPresence calls it) hits this shadow, while
+    `Microsoft.PowerShell.Management\\Get-Item` - the fully-qualified
+    provider form - bypasses it entirely, which is how the shadow
+    delegates for every other path without recursing into itself. This
+    is the seam that disproves round 3's "no monkeypatch seam" claim."""
+    return [
+        f"$PoisonedPath = {_pslit(poisoned_path)}",
+        "function Get-Item {",
+        "  [CmdletBinding()]",
+        "  param([Parameter(Mandatory=$true)][string]$LiteralPath, [switch]$Force)",
+        "  if ($LiteralPath -eq $PoisonedPath) {",
+        "    throw [System.UnauthorizedAccessException]::new(",
+        "      \"simulated access denied: $PoisonedPath\")",
+        "  }",
+        "  Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath "
+        "-Force:$Force -ErrorAction Stop",
+        "}",
+    ]
+
+
+def _ps_shadow_access_denied(poisoned_path: str) -> list[str]:
+    """Like _ps_shadow_get_item_denying, but also shadows Test-Path for
+    the same poisoned path - Test-Path never throws even on real
+    access-denied, it silently returns $false, which is exactly what
+    made the pre-fix `$agentDirExists = Test-Path ...` bug invisible.
+    A real access-denied condition affects both cmdlets consistently
+    (Get-Item throws, Test-Path returns false); shadowing only one of
+    them does not reproduce that - it must be both to discriminate a
+    genuine fix from a reverted one."""
+    lines = _ps_shadow_get_item_denying(poisoned_path)
+    lines += [
+        "function Test-Path {",
+        "  [CmdletBinding()]",
+        "  param([string]$LiteralPath, [string]$PathType)",
+        "  if ($LiteralPath -eq $PoisonedPath) { return $false }",
+        "  if ($PSBoundParameters.ContainsKey('PathType')) {",
+        "    return (Microsoft.PowerShell.Management\\Test-Path "
+        "-LiteralPath $LiteralPath -PathType $PathType)",
+        "  }",
+        "  return (Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath)",
+        "}",
+    ]
+    return lines
+
+
+def _ps_shadow_get_childitem_denying(poisoned_path: str) -> list[str]:
+    """Shadow the unqualified Get-ChildItem cmdlet for exactly one
+    -LiteralPath, throwing for it while delegating every other call to
+    the fully-qualified provider form - same seam as
+    _ps_shadow_get_item_denying, for a directory LISTING failure rather
+    than a single-item stat."""
+    return [
+        f"$PoisonedListingPath = {_pslit(poisoned_path)}",
+        "function Get-ChildItem {",
+        "  [CmdletBinding()]",
+        "  param([string]$LiteralPath, [switch]$Directory)",
+        "  if ($LiteralPath -eq $PoisonedListingPath) {",
+        "    throw [System.UnauthorizedAccessException]::new(",
+        "      \"simulated access denied: $PoisonedListingPath\")",
+        "  }",
+        "  Microsoft.PowerShell.Management\\Get-ChildItem "
+        "-LiteralPath $LiteralPath -Directory:$Directory -ErrorAction Stop",
+        "}",
+    ]
+
+
+def test_ps_unreadable_sequence_uncertain_marker_returns_unusable(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 4 correction: an executed reproduction of the
+    branch round 3 claimed had no monkeypatch seam - see
+    _ps_shadow_get_item_denying. A physically present `.sequence-uncertain`
+    marker whose OWN readability is poisoned must still mark the
+    generation uncertain, exactly like the Python-side test of the same
+    name."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / ".sequence").write_text("5", encoding="utf-8")
+    marker = generation / ".sequence-uncertain"
+    marker.write_bytes(b"")
+    result_path = tmp_path / "ps-shadow-sequence-uncertain.json"
+    script = tmp_path / "ps-shadow-sequence-uncertain.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            *_ps_shadow_get_item_denying(str(marker)),
+            f"$record = Read-WrapperLogSequenceRecord {_pslit(str(generation))} $true",
+            "@{ sequence = $record.sequence; uncertain = [bool]$record.uncertain; "
+            "state = [string]$record.state } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["sequence"] == 5
+    assert payload["uncertain"] is True
+
+
+def test_ps_unreadable_sequence_failed_marker_produces_write_failed_state(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 4 correction, second branch: `.sequence` is
+    genuinely absent and only `.sequence-failed` exists, but its OWN
+    readability is poisoned. Cannot confirm this is a legacy generation
+    that predates the marker system, so it must fail toward the
+    write-failed/uncertain state, not the legacy/certain one."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    marker = generation / ".sequence-failed"
+    marker.write_bytes(b"")
+    result_path = tmp_path / "ps-shadow-sequence-failed.json"
+    script = tmp_path / "ps-shadow-sequence-failed.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            *_ps_shadow_get_item_denying(str(marker)),
+            f"$record = Read-WrapperLogSequenceRecord {_pslit(str(generation))} $true",
+            "@{ sequence = $record.sequence; uncertain = [bool]$record.uncertain; "
+            "state = [string]$record.state } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["sequence"] is None
+    assert payload["state"] == "missing-write-failed"
+    assert payload["uncertain"] is True
+
+
+def test_ps_unreadable_committed_marker_retains_sequence_and_marks_uncertain(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 4 correction, third branch: Get-NextWrapperLogSequence
+    must still count a generation's real `.sequence` value toward the
+    true maximum even when its `.committed` probe itself is unreadable,
+    and must flag the scan uncertain rather than silently understating
+    the next sequence value."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    root = tmp_path / "logs"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    generation = root / agent_leaf / f"20260804T120001000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    (generation / ".sequence").write_text("9", encoding="utf-8")
+    marker = generation / ".committed"
+    marker.write_bytes(b"")
+    result_path = tmp_path / "ps-shadow-committed.json"
+    script = tmp_path / "ps-shadow-committed.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            *_ps_shadow_get_item_denying(str(marker)),
+            f"$result = Get-NextWrapperLogSequence @({_pslit(str(root))}) {_pslit(agent_leaf)}",
+            "@{ next_sequence = $result.next_sequence; "
+            "uncertain = [bool]$result.uncertain } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["next_sequence"] == 10
+    assert payload["uncertain"] is True
+
+
+def test_ps_hidden_agent_directory_marks_next_sequence_uncertain(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 5, finding #15: Get-NextWrapperLogSequence used
+    to test the candidate agent directory's existence with a raw
+    Test-Path, which swallows access-denied into $false exactly like an
+    agent directory that never existed - so a hidden agent directory
+    holding a real higher committed sequence was silently skipped
+    without ever marking the scan uncertain. Two roots: one with visible
+    generations 1-5, one whose agent directory itself cannot be read.
+    next_sequence legitimately cannot recover the hidden root's true
+    maximum - but it MUST come back uncertain, not confidently wrong."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    visible_root = tmp_path / "visible"
+    hidden_root = tmp_path / "hidden"
+    visible_agent_dir = visible_root / agent_leaf
+    hidden_agent_dir = hidden_root / agent_leaf
+    for sequence in range(1, 6):
+        generation = visible_agent_dir / f"2026080{sequence}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+    hidden_generation = hidden_agent_dir / f"20260801T130000000Z-{100:032x}"
+    hidden_generation.mkdir(parents=True)
+    (hidden_generation / ".sequence").write_text("100", encoding="utf-8")
+    (hidden_generation / ".committed").write_bytes(b"")
+
+    result_path = tmp_path / "ps-hidden-agent-dir.json"
+    script = tmp_path / "ps-hidden-agent-dir.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            *_ps_shadow_access_denied(str(hidden_agent_dir)),
+            f"$result = Get-NextWrapperLogSequence "
+            f"@({_pslit(str(visible_root))}, {_pslit(str(hidden_root))}) "
+            f"{_pslit(agent_leaf)}",
+            "@{ next_sequence = $result.next_sequence; "
+            "uncertain = [bool]$result.uncertain } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["next_sequence"] == 6
+    assert payload["uncertain"] is True
+
+
+def test_ps_listing_failure_during_prune_rescan_marks_uncertain_not_warns_only(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 5, finding #17: a directory listing that fails
+    PARTWAY through Invoke-WrapperLogRetentionPrune's own destructive
+    rescan used to only Write-Warning - neither aborting nor marking
+    $sequenceUncertain - so pruning proceeded on a silently incomplete
+    view. A scan that succeeded once (at allocation time) does not stay
+    true.
+
+    Two roots, matching the shape that actually makes this dangerous: a
+    GOOD root whose listing succeeds normally (contributing real,
+    over-quota generations to $owned - a single-root, listing-fails-
+    outright test would leave $owned empty either way, which protects
+    everything for the wrong reason and would not have caught this).
+    A SEPARATE root's listing fails entirely. The good root's own
+    generations must still survive: the whole cycle's view is
+    incomplete, not just the failed root's, so treating the failure as
+    merely "skip that root and prune the rest normally" is exactly the
+    bug - $sequenceUncertain must protect the good root's generations
+    too."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    good_root = tmp_path / "good"
+    bad_root = tmp_path / "bad"
+    good_agent_dir = good_root / agent_leaf
+    bad_agent_dir = bad_root / agent_leaf
+    generations = []
+    for sequence in range(1, sup.WRAPPER_LOG_GENERATIONS + 2):
+        generation = good_agent_dir / f"2026080{sequence}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+    bad_agent_dir.mkdir(parents=True)
+
+    result_path = tmp_path / "ps-listing-failure.json"
+    script = tmp_path / "ps-listing-failure.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            *_ps_shadow_get_childitem_denying(str(bad_agent_dir)),
+            f"Invoke-WrapperLogRetentionPrune {_pslit(agent_leaf)} "
+            f"@({_pslit(str(good_root))}, {_pslit(str(bad_root))}) $false",
+            # Fully-qualified form deliberately - the unqualified
+            # Get-ChildItem is shadowed above (for $bad_agent_dir, but
+            # queried here for $good_agent_dir regardless, to bypass the
+            # shadow function's own definition entirely for this
+            # verification step).
+            "@{ survivorCount = @("
+            "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath "
+            f"{_pslit(str(good_agent_dir))} -Directory "
+            "-ErrorAction SilentlyContinue).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["survivorCount"] == len(generations), (
+        "pruning ran on an incomplete view instead of being protected by "
+        "$sequenceUncertain"
+    )
+
+
+def test_ps_hidden_agent_dir_at_the_resolver_call_marks_prune_uncertain(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 7, finding 1 (BLOCKING): the destructive prune's
+    OWN `if ($null -eq $agentDir) { continue }` - the call to the
+    agent-directory resolver, one step earlier than finding #17's
+    listing-failure catch - never asked WHY $agentDir was null. Null
+    means "genuinely absent, nothing to miss" and "exists but could not
+    be resolved" alike. #15's and #17's controls both genuinely
+    discriminate (this file's own two tests above prove it) but neither
+    reaches THIS earlier exit. Two roots: a GOOD root with real
+    over-quota generations, a HIDDEN root whose agent directory exists
+    but is access-denied at the exact call the resolver itself makes.
+    The good root's generations must survive - the whole cycle's view is
+    incomplete, not just the hidden root's."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    good_root = tmp_path / "good"
+    hidden_root = tmp_path / "hidden"
+    good_agent_dir = good_root / agent_leaf
+    hidden_agent_dir = hidden_root / agent_leaf
+    generations = []
+    for sequence in range(1, sup.WRAPPER_LOG_GENERATIONS + 2):
+        generation = good_agent_dir / f"2026080{sequence}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+    hidden_agent_dir.mkdir(parents=True)
+
+    result_path = tmp_path / "ps-hidden-resolver.json"
+    script = tmp_path / "ps-hidden-resolver.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            *_ps_shadow_access_denied(str(hidden_agent_dir)),
+            f"Invoke-WrapperLogRetentionPrune {_pslit(agent_leaf)} "
+            f"@({_pslit(str(good_root))}, {_pslit(str(hidden_root))}) $false",
+            "@{ survivorCount = @("
+            "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath "
+            f"{_pslit(str(good_agent_dir))} -Directory "
+            "-ErrorAction SilentlyContinue).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["survivorCount"] == len(generations), (
+        "the good root's generations were pruned toward quota while the "
+        "hidden root's inaccessibility was silently treated as absence, "
+        "not uncertainty"
+    )
+
+
+def test_ps_stale_presence_snapshot_taken_before_resolver_does_not_suppress_uncertainty(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 9, finding 1: round 7's own fix combined two
+    OBSERVATIONS of the same path taken at different times - a presence
+    check BEFORE calling the resolver, trusted to interpret a null the
+    resolver returns LATER. reviewer-1 injected exactly this transition:
+    the agent directory reads as genuinely absent at the moment of the
+    pre-check, then becomes access-denied by the time the resolver's own
+    internal probe runs. A pre-check that was correct when taken is
+    stale by the time it is used.
+
+    A single hidden root whose agent-directory path answers its FIRST
+    probe (whichever cmdlet asks first) as absent, and its SECOND and
+    every later probe as access-denied - modelling the real transition,
+    not just a permanently-hidden directory (that scenario is already
+    covered by the test above). Under the OLD ordering (presence check
+    first), the pre-check's Get-Item call is probe #1 and sees the
+    stale 'absent' answer; the resolver's Test-Path call is probe #2
+    and returns false either way (Test-Path cannot distinguish absent
+    from denied), so the pre-check's stale 'absent' verdict survives
+    unquestioned and $sequenceUncertain is never set. Under the FIXED
+    ordering (resolver first, presence check only after its null),
+    the resolver's Test-Path call is probe #1 (still just false), and
+    the presence check's Get-Item call is probe #2 - now landing AFTER
+    the transition, correctly observing 'unusable'. A GOOD root with
+    real over-quota generations must survive either way - the whole
+    cycle's view is incomplete, not just the hidden root's."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    good_root = tmp_path / "good"
+    hidden_root = tmp_path / "hidden"
+    good_agent_dir = good_root / agent_leaf
+    hidden_agent_dir = hidden_root / agent_leaf
+    generations = []
+    for sequence in range(1, sup.WRAPPER_LOG_GENERATIONS + 2):
+        generation = good_agent_dir / f"2026080{sequence}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+    hidden_agent_dir.mkdir(parents=True)
+
+    transition_shadow = [
+        f"$PoisonedTransitionPath = {_pslit(str(hidden_agent_dir))}",
+        "$TransitionProbeCount = 0",
+        "function Get-Item {",
+        "  [CmdletBinding()]",
+        "  param([Parameter(Mandatory=$true)][string]$LiteralPath, [switch]$Force)",
+        "  if ($LiteralPath -eq $PoisonedTransitionPath) {",
+        "    $script:TransitionProbeCount++",
+        "    if ($script:TransitionProbeCount -eq 1) {",
+        "      throw [System.Management.Automation.ItemNotFoundException]::new(",
+        "        \"simulated absent: $PoisonedTransitionPath\")",
+        "    }",
+        "    throw [System.UnauthorizedAccessException]::new(",
+        "      \"simulated access denied: $PoisonedTransitionPath\")",
+        "  }",
+        "  Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath "
+        "-Force:$Force -ErrorAction Stop",
+        "}",
+        "function Test-Path {",
+        "  [CmdletBinding()]",
+        "  param([string]$LiteralPath, [string]$PathType)",
+        "  if ($LiteralPath -eq $PoisonedTransitionPath) {",
+        "    $script:TransitionProbeCount++",
+        "    return $false",
+        "  }",
+        "  if ($PSBoundParameters.ContainsKey('PathType')) {",
+        "    return (Microsoft.PowerShell.Management\\Test-Path "
+        "-LiteralPath $LiteralPath -PathType $PathType)",
+        "  }",
+        "  return (Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath)",
+        "}",
+    ]
+
+    result_path = tmp_path / "ps-stale-presence.json"
+    script = tmp_path / "ps-stale-presence.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            *transition_shadow,
+            f"Invoke-WrapperLogRetentionPrune {_pslit(agent_leaf)} "
+            f"@({_pslit(str(good_root))}, {_pslit(str(hidden_root))}) $false",
+            "@{ survivorCount = @("
+            "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath "
+            f"{_pslit(str(good_agent_dir))} -Directory "
+            "-ErrorAction SilentlyContinue).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["survivorCount"] == len(generations), (
+        "the presence check's answer was taken before the resolver's own "
+        "call observed a DIFFERENT, later state for the same path - a "
+        "stale snapshot suppressed uncertainty instead of a fresh "
+        "observation taken after the resolver's null"
+    )
+
+
+def test_ps_uncertain_bound_check_uses_observed_count_not_owned_count(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 7, finding 3: port of the Python-side #7 fix
+    (candidates/observed split) to Invoke-WrapperLogRetentionPrune -
+    round 4 built the safety-valve bound check but coupled it to
+    $owned.Count, the same conflation #7 fixed on the Python side. A
+    pending (uncommitted) generation is never a candidate and so never
+    reaches $owned, but it is still a real generation-shaped directory
+    that the bound exists to protect against runaway accumulation of.
+
+    12 committed generations (the deletion-eligible pool) plus 1
+    pending one = 13 physically observed. With WRAPPER_LOG_GENERATIONS=4
+    the bound is Max(4*3, 4+2) = 12. $owned.Count is exactly 12 - at
+    the old code's bound, so it skips pruning entirely and all 13
+    directories survive untouched (the executed report's "13 physical
+    generations, bound 4" - the exact number reported does not match
+    the real formula, but the shape - an off-by-the-uncommitted-one
+    undercount silently disabling the safety valve - is the same
+    defect either way, and this reproduces it against the real bound).
+    The fix counts every physical generation found ($observedCount=13),
+    correctly exceeds the bound, and prunes anyway: 4 committed
+    generations survive (the configured quota) plus the 1 pending one
+    (never deletion-eligible, always preserved) = 5."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    root = tmp_path / "root"
+    agent_dir = root / agent_leaf
+    for sequence in range(1, 13):
+        generation = agent_dir / f"202608{sequence:02d}T120000000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+    pending = agent_dir / "20260813T120000000Z-{:032x}".format(13)
+    pending.mkdir(parents=True)
+
+    result_path = tmp_path / "ps-observed-bound.json"
+    script = tmp_path / "ps-observed-bound.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            f"Invoke-WrapperLogRetentionPrune {_pslit(agent_leaf)} "
+            f"@({_pslit(str(root))}) $true",
+            "@{ survivorCount = @("
+            "Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath "
+            f"{_pslit(str(agent_dir))} -Directory "
+            "-ErrorAction SilentlyContinue).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["survivorCount"] == sup.WRAPPER_LOG_GENERATIONS + 1, (
+        "the safety-valve bound compared against $owned.Count (12, "
+        "excluding the pending generation) instead of every physically "
+        "observed generation (13), so it stayed at-or-under bound and "
+        "skipped pruning entirely instead of enforcing the quota"
     )
 
 
@@ -6330,6 +7590,73 @@ def test_ps_failed_launch_generations_never_evict_prior_evidence(
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
     payload = json.loads(out.read_text(encoding="utf-8-sig"))
     assert payload == {"count": 1, "evidence": "dead-wrapper-evidence"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="generated supervisor is Windows-only")
+def test_ps_retention_preserves_generation_locked_by_direct_python_wrapper(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region wrapper-log-helpers"):
+        sup.PS_TEMPLATE.index("# endregion wrapper-log-helpers")
+    ]
+    root = tmp_path / "primary"
+    fallback = tmp_path / "fallback"
+    parent_fallback = tmp_path / "parent-fallback"
+    agent_leaf = _wrapper_log_agent_dir("worker")
+    generations: list[Path] = []
+    for sequence in range(1, sup.WRAPPER_LOG_GENERATIONS + 2):
+        generation = (
+            root
+            / agent_leaf
+            / f"20260804T12000{sequence}000Z-{sequence:032x}"
+        )
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        generations.append(generation)
+
+    active = generations[0]
+    active_lock = wlogs._acquire_active_generation_lock(active)
+    assert active_lock is not None
+    out = tmp_path / "active-retention.json"
+    script = tmp_path / "active-retention.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$WrapperLogRoot = {_pslit(str(root))}",
+            f"$WrapperLogFallbackRoot = {_pslit(str(fallback))}",
+            f"$WrapperLogParentFallbackRoot = {_pslit(str(parent_fallback))}",
+            f"$WrapperLogGenerations = {sup.WRAPPER_LOG_GENERATIONS}",
+            helpers,
+            "Invoke-WrapperLogRetentionPrune 'worker' "
+            "@($WrapperLogRoot, $WrapperLogFallbackRoot, "
+            "$WrapperLogParentFallbackRoot) $false",
+            f"@{{ active_exists = (Test-Path -LiteralPath {_pslit(str(active))}); "
+            f"count = @(Get-ChildItem -LiteralPath {_pslit(str(root / agent_leaf))} "
+            "-Directory).Count } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(out))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    try:
+        result = subprocess.run(
+            [shell, "-NoProfile", "-File", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        wlogs._release_active_generation_lock(active_lock)
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    assert json.loads(out.read_text(encoding="utf-8-sig")) == {
+        "active_exists": True,
+        "count": sup.WRAPPER_LOG_GENERATIONS + 1,
+    }
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows locked-file retention")
