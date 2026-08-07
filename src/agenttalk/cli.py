@@ -12845,6 +12845,13 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             expected_sha256=args.supervisor_config_sha256,
         )
     except sup.SupervisorPersistenceError as exc:
+        if args.supervisor_config_sha256 is None:
+            # Preserve the public usage-error contract for a corrupt project
+            # config.  SupervisorPersistenceError is a ValueError, so the
+            # top-level CLI reports this as exit 2 just as it did before the
+            # optional PowerShell byte binding was added.  Only a supplied
+            # binding that cannot be honored is a runtime HOLD (exit 3).
+            raise
         sys.stderr.write(f"agenttalk supervise: {exc}\n")
         return 3
     now = args.now if args.now is not None else time.time()

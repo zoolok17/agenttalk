@@ -976,6 +976,31 @@ def test_supervise_rejects_non_object_project_config_without_emitting_plan(
     assert "supervisor config must be a JSON object" in captured.err
 
 
+def test_supervise_plan_holds_when_accepted_config_bytes_change(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _team(tmp_path)
+    config_path = s.dir / "supervisor.json"
+    accepted = json.dumps(_CONFIG).encode("utf-8")
+    accepted_sha256 = hashlib.sha256(accepted).hexdigest()
+    config_path.write_bytes(accepted + b"\n")
+    state_file = s.dir / "supervisor-state.json"
+    state_file.write_text(
+        json.dumps({"agents": {"worker": {}}}), encoding="utf-8",
+    )
+
+    rc = _run([
+        "supervise", "--plan", "--state-file", str(state_file),
+        "--supervisor-config-sha256", accepted_sha256,
+        "--now", str(NOW),
+    ], tmp_path)
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert captured.out == ""
+    assert "changed after PowerShell accepted it" in captured.err
+
+
 def test_supervise_report_recovers_backup_without_rewriting_corrupt_primary(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
