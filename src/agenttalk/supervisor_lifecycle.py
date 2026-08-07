@@ -13,7 +13,8 @@ import ctypes
 import json
 import os
 import re
-import subprocess
+# Used only for TimeoutExpired while managing a caller-owned process (task #107).
+import subprocess  # nosec B404
 import tempfile
 import time
 from ctypes import wintypes
