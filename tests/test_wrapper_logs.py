@@ -324,6 +324,50 @@ def test_wrapper_log_location_uses_hashed_windows_safe_agent_files(
     assert not any(path.name in {"worker.json", "worker..json", "NUL.json"} for path in observed.values())
 
 
+def test_unreadable_location_record_reports_unusable_not_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review, round 3: read_wrapper_log_location's top-level
+    `if not path.exists(): return absent` flattened an unreadable record
+    into a confident absence before its own downstream error handling
+    ever got a chance to run. A caller (e.g. cli.py's retired-agent
+    fallback) that treats "absent" as "nothing to report" would
+    incorrectly refuse a lookup a readable filesystem would have
+    answered."""
+    project = tmp_path / "project"
+    store = Store(project)
+    store.init(["worker"])
+    root = tmp_path / "logs"
+    generation = root / wrapper_logs._wrapper_log_agent_leaf("worker") / f"20260804T120000000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    stdout = generation / "stdout.log"
+    stderr = generation / "stderr.log"
+    stdout.write_text("out", encoding="utf-8")
+    stderr.write_text("err", encoding="utf-8")
+    wrapper_logs._record_wrapper_log_location(
+        project,
+        "worker",
+        wrapper_logs.WrapperLogInstallation(
+            True,
+            confirmed=True,
+            root=root,
+            generation_dir=generation,
+            stdout_path=stdout,
+            stderr_path=stderr,
+        ),
+    )
+    location_path = wrapper_logs._wrapper_log_location_path(store.state_dir, "worker")
+    assert location_path.is_file()
+
+    _poison_lstat(monkeypatch, location_path)
+
+    result = wrapper_logs.read_wrapper_log_location(store.state_dir, "worker")
+
+    assert result["status"] == "unusable"
+    assert result["generation_dir"] is None
+
+
 def test_supervise_plan_never_probes_wrapper_log_filesystem(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -793,6 +837,42 @@ def test_scan_marks_retention_uncertain_not_absent_at_every_depth(
     assert uncertain is True
 
 
+def test_unreadable_committed_marker_is_counted_not_dropped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review, round 3: a physically present `.committed` marker
+    that cannot be read must not collapse to "not committed" - reviewer-1
+    measured that exact collapse producing owned_count 0 for a generation
+    that was genuinely committed. Excluding it from `owned` entirely would
+    make it invisible to the size-based safety bound without ever costing
+    it a place in the count, so the fix fails toward treating an unusable
+    `.committed` probe as committed (counted, subject to the same
+    uncertain-aware safety bound as any other ambiguous generation) and
+    flags the whole scan uncertain."""
+    root = tmp_path / "logs"
+    root.mkdir()
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    agent_dir = root / agent_leaf
+    agent_dir.mkdir()
+    generation = agent_dir / f"20260804T120001000Z-{1:032x}"
+    generation.mkdir()
+    (generation / ".sequence").write_text("9", encoding="utf-8")
+    committed_marker = generation / ".committed"
+    committed_marker.write_bytes(b"")
+
+    _poison_lstat(monkeypatch, committed_marker)
+
+    owned, max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+
+    assert owned == [(f"1-{9:020d}-{generation.name}", generation)]
+    assert max_sequence == 9
+    assert uncertain is True
+
+
 def test_genuinely_absent_agent_dir_is_not_flagged_uncertain(tmp_path: Path) -> None:
     """The other side of the same check: a root this agent has truly never
     used (no agent_dir at all) must still read as a plain, confident
@@ -867,6 +947,47 @@ def test_allocator_continues_to_next_candidate_when_cleanup_probe_itself_fails(
     assert targets.stderr_path.is_file()
     poisoned_agent_dir = poisoned_root / wrapper_logs._wrapper_log_agent_leaf("worker")
     assert len(list(poisoned_agent_dir.iterdir())) == 1
+
+
+def test_collapsed_marker_cannot_prune_data_it_could_not_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The terminal-behaviour control the round-3 review demanded:
+    asserting `uncertain is True` at the scan consumer is not enough,
+    because the flag is not what protects data - the prune's own
+    early-return on `uncertain` is. This drives the exact shape
+    reviewer-1 reproduced: WRAPPER_LOG_GENERATIONS + 1 committed
+    generations (5, with a keep count of 4), the OLDEST one genuinely
+    marked `.sequence-uncertain`, and ONLY that marker's readability
+    poisoned. If an unreadable marker still collapses to "no marker" here,
+    the prune runs unprotected and deletes exactly the generation
+    uncertainty was raised to protect - reviewer-1 measured this as five
+    generations becoming four. Assert the generation still EXISTS after
+    the collapse mutation, not merely that a flag was set.
+    """
+    root = tmp_path / "logs"
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    generations: list[Path] = []
+    for sequence in range(1, wrapper_logs.WRAPPER_LOG_GENERATIONS + 2):
+        generation = root / agent_leaf / f"20260804T12000{sequence}000Z-{sequence:032x}"
+        generation.mkdir(parents=True)
+        (generation / ".sequence").write_text(str(sequence), encoding="utf-8")
+        (generation / ".committed").write_bytes(b"")
+        (generation / "stdout.log").write_bytes(b"")
+        (generation / "stderr.log").write_bytes(b"")
+        generations.append(generation)
+    oldest = generations[0]
+    uncertainty_marker = oldest / ".sequence-uncertain"
+    uncertainty_marker.write_bytes(b"")
+
+    _poison_lstat(monkeypatch, uncertainty_marker)
+
+    wrapper_logs._prune_wrapper_log_generations((root,), agent_leaf)
+
+    assert oldest.is_dir(), (
+        "prune deleted the generation its own uncertainty marker existed to protect"
+    )
 
 
 def test_prune_preserves_newest_generation_when_its_sequence_is_corrupt(

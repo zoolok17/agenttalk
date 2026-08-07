@@ -12677,12 +12677,6 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 sys.stderr.write(f"agenttalk supervise --report: {exc}\n")
                 return 2
             selected = report.get("agents", {}).get(agent)
-            # This is intentionally report-only. build_report() also feeds
-            # every supervisor --plan poll; resolving and probing an external
-            # diagnostic root must never enter that liveness/launch loop.
-            from .wrapper_logs import read_wrapper_log_location
-
-            wrapper_log = read_wrapper_log_location(store.state_dir, agent)
             if selected is None:
                 # archive_ephemeral_request(..., retire=True) drops an
                 # ephemeral identity from the active roster build_report()
@@ -12691,9 +12685,12 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 # Crash forensics after a timed-out or completed ephemeral
                 # run needs exactly this case to still resolve, not "unknown
                 # agent" while the logs it is asking about sit on disk
-                # (#113 review). Only refuse when there is truly nothing to
-                # return either way.
-                if wrapper_log.get("status") == "absent":
+                # (#113 review). Establish retirement from the STORE's own
+                # tombstone list, not from whether a location file happens
+                # to exist - a name that was never registered at all must
+                # not be dignified with an identity claim just because a
+                # stray record exists for it (#113 review, round 3).
+                if agent not in store.retired_agents():
                     sys.stderr.write(
                         f"agenttalk supervise --report: unknown agent {agent!r}\n"
                     )
@@ -12701,7 +12698,12 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 selected = {"retired": True}
                 report.setdefault("agents", {})[agent] = selected
             report["selected_agent"] = agent
-            selected["wrapper_log"] = wrapper_log
+            # This is intentionally report-only. build_report() also feeds
+            # every supervisor --plan poll; resolving and probing an external
+            # diagnostic root must never enter that liveness/launch loop.
+            from .wrapper_logs import read_wrapper_log_location
+
+            selected["wrapper_log"] = read_wrapper_log_location(store.state_dir, agent)
         print(json.dumps(report, indent=2))
         return 0
     if args.bootstrap_check:

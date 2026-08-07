@@ -680,15 +680,27 @@ def _read_wrapper_log_sequence(
     generation as confidently ordered, exactly the silent-uncertainty
     pattern #113 raised the marker to prevent in the first place.
     """
-    marker_uncertain = committed and (generation / ".sequence-uncertain").exists()
+    # Only a CONFIRMED absence of `.sequence-uncertain` clears this - a
+    # present OR unusable (unreadable) marker both mean this generation
+    # cannot be trusted as confidently ordered (#113 review, round 3: the
+    # prior `.exists()` form swallowed an unreadable marker into a
+    # confident "no marker", indistinguishable from a generation that was
+    # never marked uncertain at all).
+    marker_uncertain = committed and (
+        _scan_marker(generation / ".sequence-uncertain") is not _MarkerScanOutcome.ABSENT
+    )
     sequence_path = generation / ".sequence"
     try:
         sequence_info = sequence_path.lstat()
     except FileNotFoundError:
+        # Cannot confirm `.sequence-failed` is genuinely absent -> cannot
+        # confirm this is a legacy generation that predates the marker
+        # system, so fail toward the state that reports uncertain (#113
+        # review, round 3).
         state = (
-            "missing-write-failed"
-            if (generation / ".sequence-failed").exists()
-            else "missing-legacy"
+            "missing-legacy"
+            if _scan_marker(generation / ".sequence-failed") is _MarkerScanOutcome.ABSENT
+            else "missing-write-failed"
         )
         return None, bool(
             marker_uncertain or (committed and _SEQUENCE_UNCERTAINTY_BY_STATE[state])
@@ -783,6 +795,33 @@ def _scan_path(path: Path) -> _PathScanOutcome:
     return _PathScanOutcome.PLAIN_DIRECTORY
 
 
+class _MarkerScanOutcome(enum.Enum):
+    """The closed outcomes for a marker FILE probe - the same discipline
+    as ``_PathScanOutcome``, extended honestly for files rather than
+    reusing the directory-shaped enum (a marker file needs no
+    reparse/symlink-ancestry validation the way a retention-critical
+    directory does, so a distinct, narrower outcome type is the honest
+    fit, not a bolted-on boolean at the file level - #113 review, round
+    3). ``ABSENT`` only for ``FileNotFoundError``; ``UNUSABLE`` for
+    anything else this cannot positively confirm either way. A marker
+    that cannot be read is not a marker that is not there.
+    """
+
+    ABSENT = "absent"
+    PRESENT = "present"
+    UNUSABLE = "unusable"
+
+
+def _scan_marker(path: Path) -> _MarkerScanOutcome:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return _MarkerScanOutcome.ABSENT
+    except OSError:
+        return _MarkerScanOutcome.UNUSABLE
+    return _MarkerScanOutcome.PRESENT
+
+
 def _owned_committed_generations(
     roots: tuple[Path, ...],
     agent_leaf: str,
@@ -806,7 +845,19 @@ def _owned_committed_generations(
                         uncertain or generation_outcome is _PathScanOutcome.UNUSABLE
                     )
                     continue
-                committed = (generation / ".committed").exists()
+                committed_marker = _scan_marker(generation / ".committed")
+                if committed_marker is _MarkerScanOutcome.UNUSABLE:
+                    # Cannot confirm committed one way or the other. Fail
+                    # toward TREATING it as committed - excluding it here
+                    # would make it invisible to the size-based safety
+                    # bound below without ever costing it a place in
+                    # `owned`, which is a worse blind spot than including
+                    # an uncertain candidate the bound already exists to
+                    # protect (#113 review, round 3: this exact swallow
+                    # produced owned_count 0 for a physically present
+                    # committed generation).
+                    uncertain = True
+                committed = committed_marker is not _MarkerScanOutcome.ABSENT
                 sequence, sequence_uncertain = _read_wrapper_log_sequence(
                     generation,
                     committed=committed,
@@ -1042,8 +1093,15 @@ def read_wrapper_log_location(state_dir: Path, agent: str) -> dict[str, object]:
         path = _wrapper_log_location_path(state_dir, agent)
     except ValueError:
         return {**absent, "status": "invalid", "error": "unsafe_agent"}
-    if not path.exists():
+    location_marker = _scan_marker(path)
+    if location_marker is _MarkerScanOutcome.ABSENT:
         return absent
+    if location_marker is _MarkerScanOutcome.UNUSABLE:
+        # Cannot confirm the record is genuinely absent, so this must not
+        # read the same as one - a caller falling back on "absent" would
+        # incorrectly refuse a lookup a readable filesystem would have
+        # answered (#113 review, round 3).
+        return {**absent, "status": "unusable"}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
@@ -1068,13 +1126,22 @@ def read_wrapper_log_location(state_dir: Path, agent: str) -> dict[str, object]:
             raise ValueError("stdout mismatch")
         if paths["stderr"] != generation / "stderr.log":
             raise ValueError("stderr mismatch")
-        status = (
-            "observed"
-            if generation.is_dir()
-            and paths["stdout"].is_file()
-            and paths["stderr"].is_file()
-            else "stale"
-        )
+        # Found during the round-3 sweep, not itself cited: the same
+        # exists()-family swallow one level below the top-level check
+        # above. A generation/stdout/stderr this cannot read is not
+        # confirmed gone (stale) any more than it is confirmed present
+        # (observed) - report "unusable" rather than picking either
+        # confident answer from an unreadable probe.
+        generation_marker = _scan_marker(generation)
+        stdout_marker = _scan_marker(paths["stdout"])
+        stderr_marker = _scan_marker(paths["stderr"])
+        markers = (generation_marker, stdout_marker, stderr_marker)
+        if all(marker is _MarkerScanOutcome.PRESENT for marker in markers):
+            status = "observed"
+        elif any(marker is _MarkerScanOutcome.UNUSABLE for marker in markers):
+            status = "unusable"
+        else:
+            status = "stale"
         return {
             "status": status,
             "root": str(paths["root"]),

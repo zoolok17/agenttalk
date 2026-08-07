@@ -11296,6 +11296,22 @@ function Protect-WrapperLogPaths(
     return $false
   }
 }
+function Test-WrapperLogMarkerPresence([string]$path) {
+  # Closed three outcomes mirroring _scan_marker in wrapper_logs.py: only a
+  # confirmed missing item is 'absent'; anything else this cannot tell is
+  # 'unusable', never a confident 'absent' - Test-Path swallows
+  # access-denied/disconnected into $false exactly like Python's
+  # .exists() does. A marker that cannot be read is not a marker that is
+  # not there (#113 review, round 3).
+  try {
+    Get-Item -LiteralPath $path -Force -ErrorAction Stop | Out-Null
+    return 'present'
+  } catch [System.Management.Automation.ItemNotFoundException] {
+    return 'absent'
+  } catch {
+    return 'unusable'
+  }
+}
 function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
   # .sequence-uncertain records that THIS generation's own sequence number
   # may already be lower than the true prior maximum, because the
@@ -11303,17 +11319,24 @@ function Read-WrapperLogSequenceRecord([string]$generation, [bool]$committed) {
   # belongs to the generation permanently, independent of whether
   # .sequence later reads back as perfectly well-formed - mirrors
   # _read_wrapper_log_sequence in wrapper_logs.py; keep both in sync.
+  # Only a CONFIRMED absence clears this - present OR unusable both mean
+  # this generation cannot be trusted as confidently ordered (#113 review,
+  # round 3: Test-Path swallowed an unreadable marker into a confident
+  # "no marker", indistinguishable from one that was never raised at all).
   $markerUncertain = $committed -and
-    (Test-Path -LiteralPath (Join-Path $generation '.sequence-uncertain'))
+    ((Test-WrapperLogMarkerPresence (Join-Path $generation '.sequence-uncertain')) -ne 'absent')
   $seqFile = Join-Path $generation '.sequence'
   $sequenceEntry = $null
   try {
     $sequenceEntry = Get-Item -LiteralPath $seqFile -Force -ErrorAction Stop
   } catch [System.Management.Automation.ItemNotFoundException] {
-    $state = if (Test-Path -LiteralPath (Join-Path $generation '.sequence-failed')) {
-      'missing-write-failed'
-    } else {
+    # Cannot confirm .sequence-failed is genuinely absent -> cannot confirm
+    # this is a legacy generation that predates the marker system, so fail
+    # toward the state that reports uncertain (#113 review, round 3).
+    $state = if ((Test-WrapperLogMarkerPresence (Join-Path $generation '.sequence-failed')) -eq 'absent') {
       'missing-legacy'
+    } else {
+      'missing-write-failed'
     }
     return [pscustomobject]@{
       sequence = $null
@@ -11392,7 +11415,17 @@ function Get-NextWrapperLogSequence([string[]]$roots, [string]$name) {
       foreach ($existing in @(
         Get-ChildItem -LiteralPath $scanAgentDir -Directory -ErrorAction Stop
       )) {
-        $committed = Test-Path -LiteralPath (Join-Path $existing.FullName '.committed')
+        $committedMarker = Test-WrapperLogMarkerPresence (Join-Path $existing.FullName '.committed')
+        if ($committedMarker -eq 'unusable') {
+          # Cannot confirm committed one way or the other - fail toward
+          # TREATING it as committed so its sequence still counts toward
+          # the true maximum, and flag this cycle uncertain rather than
+          # silently letting a swallowed .committed probe understate the
+          # next sequence value (#113 review, round 3; mirrors the
+          # _owned_committed_generations fix in wrapper_logs.py).
+          $uncertain = $true
+        }
+        $committed = $committedMarker -ne 'absent'
         # One state policy is rendered from wrapper_logs.py and consumed by
         # both languages: a bare missing record is legacy-compatible, a
         # write-failed missing record is uncertain, and every present record

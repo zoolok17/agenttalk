@@ -767,9 +767,17 @@ def test_report_for_agent_resolves_wrapper_log_after_ephemeral_retirement(
     only its live-roster membership. `supervise --report --for <agent>`
     must still resolve that record for crash forensics after a timed-out
     or completed ephemeral run, not answer "unknown agent" while the logs
-    it is asking about sit on disk."""
-    s = _team(tmp_path, agents="lead,worker")
+    it is asking about sit on disk.
+
+    Round 3 correction: this must exercise a GENUINELY retired identity
+    via the store's own tombstone list (retire_agent), not merely a
+    location record written for a name that was never registered at all -
+    the original version of this test and the code shared the same wrong
+    assumption (that a location record alone proves a retired identity),
+    so it passed without proving the thing it claimed to."""
+    s = _team(tmp_path, agents="lead,worker,retired-reviewer")
     retired = "retired-reviewer"
+    s.retire_agent(retired)
 
     root = tmp_path / "wrapper-logs-root"
     agent_leaf = wlogs._wrapper_log_agent_leaf(retired)
@@ -824,6 +832,50 @@ def test_report_for_agent_still_refuses_a_genuinely_unknown_agent(
 
     rc = _run(
         ["supervise", "--report", "--now", str(NOW), "--for", "never-existed"],
+        tmp_path,
+    )
+
+    assert rc == 2
+
+
+def test_report_for_agent_refuses_a_never_registered_name_even_with_a_stray_record(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 3: the specific gap reviewer-1 found - a name
+    that was NEVER in the active roster and was NEVER retired must still
+    refuse, even when a location record happens to exist for it (e.g. a
+    stray or malformed file, or a name that was simply typo'd into a
+    prior write). A location record is evidence of a recorded path, not
+    evidence that a name is a retired identity - only the store's own
+    tombstone list establishes that."""
+    s = _team(tmp_path, agents="lead,worker")
+    stray = "never-registered"
+
+    root = tmp_path / "wrapper-logs-root"
+    agent_leaf = wlogs._wrapper_log_agent_leaf(stray)
+    generation = root / agent_leaf / f"20260804T120001000Z-{1:032x}"
+    generation.mkdir(parents=True)
+    (generation / "stdout.log").write_text("", encoding="utf-8")
+    (generation / "stderr.log").write_text("", encoding="utf-8")
+    location_path = wlogs._wrapper_log_location_path(s.state_dir, stray)
+    location_path.parent.mkdir(parents=True, exist_ok=True)
+    location_path.write_text(
+        json.dumps({
+            "schema_version": wlogs._LOCATION_SCHEMA_VERSION,
+            "agent": stray,
+            "root": str(root),
+            "generation_dir": str(generation),
+            "stdout": str(generation / "stdout.log"),
+            "stderr": str(generation / "stderr.log"),
+            "wrapper_pid": 4242,
+            "observed_at": "2026-08-04T12:00:01Z",
+        }),
+        encoding="utf-8",
+    )
+    assert stray not in s.retired_agents()
+
+    rc = _run(
+        ["supervise", "--report", "--now", str(NOW), "--for", stray],
         tmp_path,
     )
 
@@ -6613,6 +6665,63 @@ def test_ps_read_wrapper_log_sequence_record_honors_persisted_uncertainty_marker
     assert payload["sequence"] == 5
     assert payload["state"] == "present-valid"
     assert payload["uncertain"] is True
+
+
+def test_ps_wrapper_log_marker_presence_distinguishes_absent_from_present(
+    tmp_path: Path,
+) -> None:
+    """#113 review, round 3, PowerShell side: Test-WrapperLogMarkerPresence
+    replaces the Test-Path calls in Read-WrapperLogSequenceRecord and
+    Get-NextWrapperLogSequence that swallowed an unreadable marker into a
+    confident absence (mirrors _scan_marker in wrapper_logs.py). This is a
+    wiring/sanity check for the confirmed-present and confirmed-absent
+    ends, not a reproduction of the OSError-swallowing case itself: unlike
+    the Python side (where Path.stat/lstat can be monkeypatched directly),
+    a real-condition repro of an unreadable-but-present file needs an
+    actual unreadable filesystem entry in a separate PowerShell process,
+    and the ACL-based attempt already tried for the equivalent Python
+    directory case was abandoned as unreliable on this environment (see
+    test_inaccessible_agent_dir_marks_retention_uncertain_not_absent's
+    docstring) - the same limitation applies here, more sharply, since
+    there is no monkeypatch seam available at all. The 'unusable' branch
+    is verified by direct mirroring of the tested-and-verified Python
+    implementation, not by an executed PowerShell failing-first test.
+    """
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[
+        ps.index("# region wrapper-log-helpers"):
+        ps.index("# endregion wrapper-log-helpers")
+    ]
+    present = tmp_path / "present-marker"
+    present.write_bytes(b"")
+    absent = tmp_path / "absent-marker"
+    result_path = tmp_path / "ps-marker-presence.json"
+    script = tmp_path / "ps-marker-presence.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            f"$present = Test-WrapperLogMarkerPresence {_pslit(str(present))}",
+            f"$absent = Test-WrapperLogMarkerPresence {_pslit(str(absent))}",
+            "@{ present = $present; absent = $absent } | ConvertTo-Json | "
+            f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["present"] == "present"
+    assert payload["absent"] == "absent"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows platform detection")
