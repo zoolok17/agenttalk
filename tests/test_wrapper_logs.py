@@ -789,6 +789,114 @@ def test_genuinely_absent_agent_dir_is_not_flagged_uncertain(tmp_path: Path) -> 
     assert uncertain is False
 
 
+def test_inaccessible_generation_marks_retention_uncertain_not_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same bug as test_inaccessible_agent_dir_marks_retention_uncertain_not_absent,
+    one level down (#113 review, third instance of the same class): the
+    agent_dir itself enumerates fine, but one specific generation inside it
+    cannot be stat'ed (read without search permission, in the review's
+    example). Path.is_dir() swallows that into a confident False exactly
+    like Path.exists() did for the agent_dir - a hidden high sequence would
+    be replaced by a low fallback sequence, and once access returns,
+    retention could rank and delete the genuinely newer generation. Both
+    levels must go through the same non-swallowing predicate so a third
+    level cannot regress independently."""
+    root = tmp_path / "logs"
+    root.mkdir()
+    agent_leaf = wrapper_logs._wrapper_log_agent_leaf("worker")
+    agent_dir = root / agent_leaf
+    agent_dir.mkdir()
+    blocked = agent_dir / f"20260804T120001000Z-{1:032x}"
+    blocked.mkdir()
+
+    real_stat = Path.stat
+    real_lstat = Path.lstat
+
+    def _not_ready() -> OSError:
+        err = OSError("drive not ready")
+        err.winerror = 21
+        return err
+
+    def denied_stat(self: Path, *args: object, **kwargs: object):
+        if self == blocked:
+            raise _not_ready()
+        return real_stat(self, *args, **kwargs)
+
+    def denied_lstat(self: Path, *args: object, **kwargs: object):
+        if self == blocked:
+            raise _not_ready()
+        return real_lstat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied_stat)
+    monkeypatch.setattr(Path, "lstat", denied_lstat)
+
+    owned, _max_sequence, uncertain = wrapper_logs._owned_committed_generations(
+        (root,),
+        agent_leaf,
+    )
+
+    assert owned == []
+    assert uncertain is True
+
+
+def test_allocator_continues_to_next_candidate_when_cleanup_probe_itself_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#113 review: the cleanup-time ancestry probe inside the allocator's
+    exception handler can itself raise OSError (the candidate became
+    inaccessible or disconnected after its generation directory was
+    created but before allocation finished). Unsuppressed, that second
+    error escaped the candidate loop entirely and disabled capture, rather
+    than treating one uncheckable partial directory as unsafe to delete
+    and continuing to the next candidate root."""
+    configured_base = tmp_path / "configured"
+    home_base = tmp_path / "home"
+    configured_base.mkdir()
+    home_base.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    env = {
+        "LOCALAPPDATA": str(configured_base),
+        "USERPROFILE": str(home_base),
+        "HOME": str(home_base),
+    }
+    roots = wrapper_logs.wrapper_log_root_candidates(project, environ=env)
+    assert len(roots) >= 2
+    poisoned_root = roots[0].resolve()
+
+    real_reparse_check = wrapper_logs._has_reparse_or_symlink_component
+
+    def failing_reparse_check(path: Path):
+        try:
+            rel = Path(path).resolve().relative_to(poisoned_root)
+        except ValueError:
+            return real_reparse_check(path)
+        # 0 parts = poisoned_root itself, 1 part = its agent_leaf dir - both
+        # legitimate _prepare_agent_log_dir ancestry checks that must keep
+        # working so the candidate can be created in the first place. 2+
+        # parts is the generation directory itself: the level this probe
+        # cannot tell about, both when validating the freshly created
+        # directory and again from the cleanup handler.
+        if len(rel.parts) >= 2:
+            raise OSError("cannot probe ancestry: disconnected")
+        return real_reparse_check(path)
+
+    monkeypatch.setattr(
+        wrapper_logs, "_has_reparse_or_symlink_component", failing_reparse_check
+    )
+
+    targets = wrapper_logs._allocate_wrapper_log_targets(project, "worker", env)
+
+    assert targets.root != poisoned_root
+    assert targets.stdout_path.is_file()
+    assert targets.stderr_path.is_file()
+    poisoned_agent_dir = poisoned_root / wrapper_logs._wrapper_log_agent_leaf("worker")
+    assert len(list(poisoned_agent_dir.iterdir())) == 1
+
+
 def test_prune_preserves_newest_generation_when_its_sequence_is_corrupt(
     tmp_path: Path,
 ) -> None:

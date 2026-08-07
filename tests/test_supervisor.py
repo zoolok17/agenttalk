@@ -711,6 +711,78 @@ def test_supervisor_report_surfaces_kill_switch_and_mutations_refuse(
     assert report["kill_switch_active"] is True
 
 
+def test_report_for_agent_resolves_wrapper_log_after_ephemeral_retirement(
+    tmp_path: Path, capsys,
+) -> None:
+    """#113 review: archive_ephemeral_request(..., retire=True) drops an
+    ephemeral identity from the active roster build_report() iterates over,
+    but its wrapper-log location record and generation are not removed -
+    only its live-roster membership. `supervise --report --for <agent>`
+    must still resolve that record for crash forensics after a timed-out
+    or completed ephemeral run, not answer "unknown agent" while the logs
+    it is asking about sit on disk."""
+    s = _team(tmp_path, agents="lead,worker")
+    retired = "retired-reviewer"
+
+    root = tmp_path / "wrapper-logs-root"
+    agent_leaf = wlogs._wrapper_log_agent_leaf(retired)
+    generation = (
+        root / agent_leaf
+        / f"20260804T120001000Z-{1:032x}"
+    )
+    generation.mkdir(parents=True)
+    stdout_path = generation / "stdout.log"
+    stderr_path = generation / "stderr.log"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+
+    location_path = wlogs._wrapper_log_location_path(s.state_dir, retired)
+    location_path.parent.mkdir(parents=True, exist_ok=True)
+    location_path.write_text(
+        json.dumps({
+            "schema_version": wlogs._LOCATION_SCHEMA_VERSION,
+            "agent": retired,
+            "root": str(root),
+            "generation_dir": str(generation),
+            "stdout": str(stdout_path),
+            "stderr": str(stderr_path),
+            "wrapper_pid": 4242,
+            "observed_at": "2026-08-04T12:00:01Z",
+        }),
+        encoding="utf-8",
+    )
+
+    rc = _run(
+        ["supervise", "--report", "--now", str(NOW), "--for", retired],
+        tmp_path,
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["selected_agent"] == retired
+    selected = report["agents"][retired]
+    assert selected["retired"] is True
+    assert selected["wrapper_log"]["status"] == "observed"
+    assert selected["wrapper_log"]["generation_dir"] == str(generation)
+
+
+def test_report_for_agent_still_refuses_a_genuinely_unknown_agent(
+    tmp_path: Path,
+) -> None:
+    """The other side of the same check: an agent with neither active-roster
+    membership nor any recorded wrapper-log location must still refuse -
+    the fix must not turn every unrecognized name into a silent, empty
+    'retired' row."""
+    _team(tmp_path, agents="lead,worker")
+
+    rc = _run(
+        ["supervise", "--report", "--now", str(NOW), "--for", "never-existed"],
+        tmp_path,
+    )
+
+    assert rc == 2
+
+
 def test_ps_template_kill_switch_guards_mutating_boundaries() -> None:
     ps = sup.PS_TEMPLATE
     assert "$KillSwitchPath" in ps

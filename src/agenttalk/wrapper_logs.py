@@ -721,6 +721,49 @@ def _read_wrapper_log_sequence(
     )
 
 
+def _scan_plain_directory(path: Path) -> tuple[bool, bool]:
+    """Classify `path` for this scan via the raw, non-swallowing lstat()
+    primitive: is it a plain directory, and is that ambiguous?
+
+    Returns ``(is_plain_dir, uncertain)``. ``Path.exists()``/``.is_dir()``
+    are boolean wrappers that SWALLOW OSError into a confident False - only
+    some error codes on 3.10 (e.g. a disconnected/not-ready volume), but ANY
+    OSError on 3.14+ (``Path.exists()`` there delegates to
+    ``os.path.exists()``, whose own implementation is a bare
+    ``except (OSError, ValueError)``). A temporarily unreadable entry would
+    then read exactly like one that never existed - a confident "no"
+    instead of "unknown" - and this scan's whole caller-visible contract is
+    that ambiguity becomes `uncertain`, never silence (#113 review).
+    ``lstat()`` is the raw primitive: only ``FileNotFoundError`` means
+    genuinely absent; anything else (permission denied, a disconnected
+    volume, an entry that exists but is not a directory, or a
+    reparse/symlink component anywhere in its ancestry) means "could not
+    positively confirm a plain directory," which this scan is required to
+    treat the same way ambiguity is treated everywhere else in it.
+
+    Every level of this scan (the agent directory, each generation inside
+    it, and any level added later) is required to go through this ONE
+    predicate rather than hand-roll its own ``is_dir()``/``exists()`` check,
+    so a new level cannot reintroduce this class independently (#113
+    review, third instance of the same bug at a second level of the same
+    scan).
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False, False
+    except OSError:
+        return False, True
+    if not stat.S_ISDIR(info.st_mode):
+        return False, True
+    try:
+        if _has_reparse_or_symlink_component(path):
+            return False, True
+    except OSError:
+        return False, True
+    return True, False
+
+
 def _owned_committed_generations(
     roots: tuple[Path, ...],
     agent_leaf: str,
@@ -731,35 +774,16 @@ def _owned_committed_generations(
     for root in roots:
         agent_dir = root / agent_leaf
         try:
-            # Path.exists()/is_dir() are boolean wrappers that SWALLOW OSError
-            # into False on some runtimes - only some error codes on 3.10
-            # (e.g. a disconnected/not-ready volume), but ANY OSError on 3.14+
-            # (Path.exists() there delegates to os.path.exists(), whose own
-            # implementation is a bare except (OSError, ValueError)). A
-            # temporarily unreadable agent_dir would then read exactly like
-            # one this agent has never used - a confident "no" instead of
-            # "unknown" - and this function's whole caller-visible contract
-            # is that ambiguity becomes `uncertain`, not silence (#113
-            # review). lstat() is the raw, non-swallowing primitive: only
-            # FileNotFoundError means genuinely absent; anything else means
-            # "could not tell," so it takes the same branch as the sibling
-            # non-directory/reparse case two lines below.
-            try:
-                agent_lstat = agent_dir.lstat()
-            except FileNotFoundError:
-                continue
-            if (
-                not stat.S_ISDIR(agent_lstat.st_mode)
-                or _has_reparse_or_symlink_component(agent_dir)
-            ):
-                uncertain = True
+            agent_is_dir, agent_uncertain = _scan_plain_directory(agent_dir)
+            if not agent_is_dir:
+                uncertain = uncertain or agent_uncertain
                 continue
             for generation in agent_dir.iterdir():
-                if (
-                    not _GENERATION_NAME_RE.fullmatch(generation.name)
-                    or not generation.is_dir()
-                    or _has_reparse_or_symlink_component(generation)
-                ):
+                if not _GENERATION_NAME_RE.fullmatch(generation.name):
+                    continue
+                generation_is_dir, generation_uncertain = _scan_plain_directory(generation)
+                if not generation_is_dir:
+                    uncertain = uncertain or generation_uncertain
                     continue
                 committed = (generation / ".committed").exists()
                 sequence, sequence_uncertain = _read_wrapper_log_sequence(
@@ -882,12 +906,18 @@ def _allocate_wrapper_log_targets(
             )
         except OSError as exc:
             attempts.append((root, str(exc)))
-            if (
-                generation_dir is not None
-                and not _has_reparse_or_symlink_component(generation_dir)
-            ):
+            # The ancestry probe itself can raise OSError (the candidate
+            # became inaccessible or disconnected after its generation
+            # directory was created but before allocation finished). That
+            # must not escape this handler: an unsuppressed second error
+            # here would abort the whole candidate loop and disable capture
+            # entirely, rather than just this one candidate (#113 review).
+            # An uncheckable partial directory is unsafe to delete, so
+            # leave it in place and still continue to the next candidate.
+            if generation_dir is not None:
                 with contextlib.suppress(OSError):
-                    shutil.rmtree(generation_dir)
+                    if not _has_reparse_or_symlink_component(generation_dir):
+                        shutil.rmtree(generation_dir)
     raise WrapperLogAllocationFailed(tuple(attempts))
 
 
