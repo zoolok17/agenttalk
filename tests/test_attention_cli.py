@@ -608,6 +608,7 @@ def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
         json.dumps({
             "agents": {
                 "beta": {
+                    "wrapped": True,
                     "cwd": str(tmp_path / "worker cwd"),
                     "launch": {
                         "windows_file": r"C:\Python\python.exe",
