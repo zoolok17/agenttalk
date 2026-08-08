@@ -2267,6 +2267,18 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
     one argument, nothing needs quoting)."""
     cli = cfg_agent.get("cli", "claude")
     if bool(cfg_agent.get("wrapped", False)):
+        launch = cfg_agent.get("launch")
+        loop_mode = False
+        if isinstance(launch, dict) and isinstance(
+            launch.get("windows_args"), list
+        ):
+            _dispatches_wrap, _wrapped_agent, loop_mode = (
+                _configured_wrap_binding(
+                    launch.get("windows_file"),
+                    launch["windows_args"],
+                    launch.get("module_args_from"),
+                )
+            )
         # WRAPPED: launched THROUGH `agenttalk wrap --loop` with a FIXED argv (no
         # {SESSION_ARGS} splice point). The wrapper owns session continuity
         # end-to-end - it persists + reloads the codex thread_id / claude
@@ -2274,7 +2286,8 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
         # restart re-runs the identical wrap argv and the loop reload-resumes). So
         # there is NO fresh/resume branch and NO session tokens to inject here.
         return {"cli": cli, "launch_mode": "wrap", "session_id": None,
-                "resume_mode": "wrap", "session_args": []}
+                "resume_mode": "wrap", "session_args": [],
+                "wrapped_loop_mode": loop_mode}
     session_id = st.get("session_id") or None
     # codex review (impl r1 MAJOR): resume must mean "reached readiness once".
     # For codex, drive it ONLY from resume_available - legacy `launched` is set at
@@ -4505,19 +4518,19 @@ def _configured_wrap_binding(
     executable: object,
     args: Sequence[object],
     module_args_from: object = None,
-) -> tuple[bool, str | None]:
-    """Return whether argv dispatches to wrap and its closed agent binding."""
+) -> tuple[bool, str | None, bool]:
+    """Return wrap dispatch, closed agent binding, and positional loop mode."""
     if (
         not isinstance(executable, str)
         or not all(isinstance(value, str) for value in args)
     ):
-        return False, None
+        return False, None, False
     tokens = list(args)
     executable_stem = _token_stem(executable)
     if executable_stem in {"python", "python3", "py"}:
         flag_index = _resolve_module_flag_index(tokens, module_args_from)
         if flag_index < 0:
-            return False, None
+            return False, None, False
         index = flag_index + 2
     elif executable.replace("\\", "/").rsplit("/", 1)[-1].casefold() in {
         "agenttalk",
@@ -4527,39 +4540,40 @@ def _configured_wrap_binding(
     }:
         index = 0
     else:
-        return False, None
+        return False, None, False
     root_seen = False
     while index < len(tokens):
         argument = tokens[index]
         if argument in {"--root", "--supervisor-launch-nonce"}:
             if index + 1 >= len(tokens):
-                return False, None
+                return False, None, False
             option_value = tokens[index + 1]
             if not option_value or option_value.startswith("-"):
-                return False, None
+                return False, None, False
             if argument == "--root":
                 if root_seen:
-                    return False, None
+                    return False, None, False
                 root_seen = True
             index += 2
             continue
         if argument.startswith(("--root=", "--supervisor-launch-nonce=")):
             option_value = argument.partition("=")[2]
             if not option_value or option_value.startswith("-"):
-                return False, None
+                return False, None, False
             if argument.startswith("--root="):
                 if root_seen:
-                    return False, None
+                    return False, None, False
                 root_seen = True
             index += 1
             continue
         if argument != "wrap":
-            return False, None
+            return False, None, False
         index += 1
         break
     else:
-        return False, None
+        return False, None, False
     targets: list[str] = []
+    loop_mode = False
     tail_found = False
     tail_has_command = False
     while index < len(tokens):
@@ -4572,12 +4586,14 @@ def _configured_wrap_binding(
                 and not tokens[index + 1].startswith("-")
             )
             break
+        if argument == "--loop":
+            loop_mode = True
         if argument in _WRAP_VALUE_OPTIONS:
             if index + 1 >= len(tokens):
-                return True, None
+                return True, None, loop_mode
             option_value = tokens[index + 1]
             if not option_value or option_value.startswith("-"):
-                return True, None
+                return True, None, loop_mode
             if argument == "--for":
                 targets.append(option_value)
             index += 2
@@ -4585,14 +4601,14 @@ def _configured_wrap_binding(
         if argument.startswith("--for="):
             targets.append(argument.removeprefix("--for="))
         elif not argument.startswith("-"):
-            return True, None
+            return True, None, loop_mode
         index += 1
     if not tail_found or not tail_has_command or len(targets) != 1:
-        return True, None
+        return True, None, loop_mode
     try:
-        return True, validate_agent_name(targets[0])
+        return True, validate_agent_name(targets[0]), loop_mode
     except (TypeError, ValueError):
-        return True, None
+        return True, None, loop_mode
 
 
 def _configured_ephemeral_wrap_binding(
@@ -4606,7 +4622,7 @@ def _configured_ephemeral_wrap_binding(
     lane_id: str | None,
 ) -> bool:
     """Validate one closed, post-substitution ephemeral wrapper command."""
-    dispatches_wrap, wrapped_agent = _configured_wrap_binding(
+    dispatches_wrap, wrapped_agent, _loop_mode = _configured_wrap_binding(
         executable,
         args,
         module_args_from,
@@ -5290,7 +5306,7 @@ def configured_detached_launch(
         if normalized_args is None:
             return None, "the configured launch root arguments are invalid"
         args = normalized_args
-    dispatches_wrap, wrapped_agent = _configured_wrap_binding(
+    dispatches_wrap, wrapped_agent, loop_mode = _configured_wrap_binding(
         executable,
         args,
         launch.get("module_args_from"),
@@ -5300,6 +5316,8 @@ def configured_detached_launch(
         or (dispatches_wrap and wrapped_agent != agent)
     ):
         return None, "the configured wrapped launch is not bound to this agent"
+    if dispatches_wrap and not loop_mode:
+        return None, "the configured wrapped launch is missing --loop"
     if dispatches_wrap and row.get("cli") == "codex":
         tail_index = args.index("--")
         child_args = args[tail_index + 2:]
@@ -8292,8 +8310,9 @@ def bootstrap_check(store: Store, *, now_epoch: float,
 
             dispatches_wrap = False
             arg_for = None
+            loop_mode = False
             if isinstance(windows_args, list):
-                dispatches_wrap, arg_for = _configured_wrap_binding(
+                dispatches_wrap, arg_for, loop_mode = _configured_wrap_binding(
                     windows_file,
                     windows_args,
                     launch.get("module_args_from"),
@@ -8324,7 +8343,7 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                         agent=name,
                         suggestion="add --root {ROOT} before wrap in windows_args",
                     )
-                if "--loop" not in windows_args:
+                if not loop_mode:
                     _bootstrap_add(
                         checks, "supervisor_wrapped_missing_loop", "error",
                         "wrapped launch is missing --loop",
@@ -13957,6 +13976,15 @@ function Launch($name, $plan, $codexHome) {
         Test-AgenttalkWrapAgentBinding $file $argv $name $moduleArgsFrom))) {
     Write-Warning (
       "supervisor: {0}: CONFIG ERROR - wrapped launch is not bound to this agent; NOT launching (fail closed)" -f
+      $name)
+    return $null
+  }
+  # The Python planner derives this positional fact from the exact config bytes
+  # accepted by the poll.  Do not reparse the child tail here: a child executable
+  # may legitimately receive its own '--loop' token after the wrapper delimiter.
+  if ([bool]$a.wrapped -and $plan.wrapped_loop_mode -ne $true) {
+    Write-Warning (
+      "supervisor: {0}: CONFIG ERROR - wrapped launch is missing --loop; NOT launching (fail closed)" -f
       $name)
     return $null
   }

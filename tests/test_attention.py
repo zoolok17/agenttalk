@@ -899,6 +899,50 @@ def test_configured_wrapped_launch_rejects_cross_agent_binding(
 
 
 @pytest.mark.parametrize(
+    "windows_args",
+    [
+        [
+            "-m", "agenttalk", "--root", "{ROOT}", "wrap",
+            "--for", "worker", "--", "codex.exe",
+        ],
+        [
+            "-m", "agenttalk", "--root", "{ROOT}", "wrap",
+            "--for", "worker", "--", "codex.exe", "--loop",
+        ],
+    ],
+    ids=["missing-loop", "loop-only-in-child-tail"],
+)
+def test_configured_wrapped_launch_requires_loop_before_child_tail(
+    windows_args: list[str],
+) -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "wrapped": True,
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": windows_args,
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert item["configured_launch_unavailable"] == (
+        "the configured wrapped launch is missing --loop"
+    )
+    assert "run the configured argv below" not in item["recommendation"]
+
+
+@pytest.mark.parametrize(
     ("windows_file", "windows_args"),
     [
         (

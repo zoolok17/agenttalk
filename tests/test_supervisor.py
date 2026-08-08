@@ -2924,6 +2924,39 @@ def test_supervise_bootstrap_check_accepts_wrapped_claude_and_codex(
     assert ("Ramanujan", "claude") in by_agent_cli
 
 
+@pytest.mark.parametrize(
+    "child_tail_contains_loop",
+    [False, True],
+    ids=["missing-loop", "loop-only-in-child-tail"],
+)
+def test_supervise_bootstrap_check_requires_loop_before_child_tail(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    child_tail_contains_loop: bool,
+) -> None:
+    s = _team(tmp_path, "Polaris,Zeno")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    for name in ("Polaris", "Zeno"):
+        s.write_heartbeat(name)
+    wrapped = _wrapped_supervisor_agent("Zeno", "codex")
+    windows_args = wrapped["launch"]["windows_args"]
+    windows_args.remove("--loop")
+    if child_tail_contains_loop:
+        windows_args.append("--loop")
+    _write_supervisor_config(s, {"Zeno": wrapped})
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert any(
+        check["id"] == "supervisor_wrapped_missing_loop"
+        and check.get("agent") == "Zeno"
+        for check in payload["checks"]
+    )
+
+
 def test_supervise_bootstrap_check_validates_module_args_from(
     tmp_path: Path, capsys: pytest.CaptureFixture,
 ) -> None:
@@ -4631,7 +4664,8 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "$cfg.agents | Add-Member -NotePropertyName 'reviewer' -NotePropertyValue $agentConfig",
         "$plan = [pscustomobject]@{",
         "  launch_mode = 'wrap'; session_id = $null; session_args = @();",
-        "  window_style = 'Hidden'; window_style_warning = $null",
+        "  window_style = 'Hidden'; window_style_warning = $null;",
+        "  wrapped_loop_mode = $true",
         "}",
         "$null = Launch 'reviewer' $plan $null",
         "$null = Launch-Spec 'reviewer' $spec $null",
@@ -7815,7 +7849,8 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "$cfg.agents | Add-Member -NotePropertyName 'reviewer' -NotePropertyValue $agentConfig",
             "$plan = [pscustomobject]@{",
             "  launch_mode = 'wrap'; session_id = $null; session_args = @();",
-            "  window_style = 'Hidden'; window_style_warning = $null",
+            "  window_style = 'Hidden'; window_style_warning = $null;",
+            "  wrapped_loop_mode = $true",
             "}",
             "$names = @(",
             "  'AGENTTALK_ROOT', 'AGENTTALK_PY', 'PYTHONPATH',",
@@ -8340,6 +8375,138 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     assert data["unbuffered_undeclared_wrap"] is False
 
 
+@pytest.mark.parametrize(
+    "shell",
+    _windows_powershell_hosts(),
+    ids=lambda value: Path(value).stem if value else "unavailable",
+)
+def test_ps_regular_wrapped_launch_requires_planned_loop_mode(
+    tmp_path: Path,
+    shell: str | None,
+) -> None:
+    if shell is None:
+        return
+    case_args = [
+        (
+            "loop-before-tail",
+            [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--loop",
+                "--", "codex.exe",
+            ],
+            True,
+        ),
+        (
+            "missing-loop",
+            [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--",
+                "codex.exe",
+            ],
+            False,
+        ),
+        (
+            "loop-only-in-child-tail",
+            [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--",
+                "codex.exe", "--loop",
+            ],
+            False,
+        ),
+    ]
+    cases = []
+    for label, windows_args, expected_spawn in case_args:
+        agent = {
+            "backend_profile": None,
+            "cli": "codex",
+            "wrapped": True,
+            "cwd": str(tmp_path),
+            "env": None,
+            "launch": {
+                "windows_file": "python.exe",
+                "windows_args": windows_args,
+            },
+        }
+        cases.append({
+            "label": label,
+            "agent": agent,
+            "plan": sup._launch_detail({}, agent),
+            "expected_spawn": expected_spawn,
+        })
+
+    helpers = _exec_helpers(tmp_path)
+    launchers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# Console action log")
+    ]
+    out = tmp_path / "wrapped-loop-admission.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        "$AgenttalkPython = 'python.exe'",
+        "$SrcOnPyPath = $false",
+        "$WrapperLogEnvKeys = @()",
+        helpers,
+        "$script:spawned = $false",
+        "$script:warnings = @()",
+        "function Write-Warning { param([string]$Message) "
+        "$script:warnings += $Message }",
+        "function New-WrapperLogTargets($name, $nonce) { return $null }",
+        "function Discard-PendingWrapperLogTargets($targets) {}",
+        "function Quote-Arg([string]$arg) { return $arg }",
+        "function Proc-Start($id) { return '1' }",
+        "function Start-WrapperProcess($startArgs) {",
+        "  $script:spawned = $true",
+        "  return [pscustomobject]@{",
+        "    Process = [pscustomobject]@{ Id = 4242 }",
+        "    Redirected = $false",
+        "  }",
+        "}",
+        launchers,
+        f"$cases = ({_pslit(json.dumps(cases))} | ConvertFrom-Json)",
+        "$rows = @()",
+        "foreach ($case in @($cases)) {",
+        "  $script:spawned = $false",
+        "  $script:warnings = @()",
+        "  $cfg = [pscustomobject]@{ agents = [pscustomobject]@{ "
+        "worker = $case.agent } }",
+        "  $result = Launch 'worker' $case.plan $null",
+        "  $rows += [pscustomobject]@{",
+        "    label = $case.label",
+        "    spawned = $script:spawned",
+        "    returned = ($null -ne $result)",
+        "    warnings = @($script:warnings)",
+        "  }",
+        "}",
+        "$rows | ConvertTo-Json -Depth 6 | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    script = tmp_path / "wrapped-loop-admission.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    rows = {
+        row["label"]: row
+        for row in json.loads(out.read_text(encoding="utf-8-sig"))
+    }
+    for label, _windows_args, expected_spawn in case_args:
+        row = rows[label]
+        assert row["spawned"] is expected_spawn, row
+        assert row["returned"] is expected_spawn, row
+        if expected_spawn:
+            assert row["warnings"] == [], row
+        else:
+            assert row["warnings"] == [
+                "supervisor: worker: CONFIG ERROR - wrapped launch is missing "
+                "--loop; NOT launching (fail closed)"
+            ], row
+
+
 def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
     tmp_path: Path,
 ) -> None:
@@ -8401,7 +8568,8 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         launchers,
         "function Invoke-RegularCase("
         "[string]$label, [string]$file, [object[]]$argv, "
-        "[object]$wrapped, [string]$mode, $moduleArgsFrom = $null) {",
+        "[object]$wrapped, [string]$mode, $moduleArgsFrom = $null, "
+        "[bool]$wrappedLoopMode = $false) {",
         "  $script:caseName = $label",
         "  $agent = [pscustomobject]@{",
         "    backend_profile = $null",
@@ -8423,6 +8591,7 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "    window_style_warning = $null",
         "    session_id = $null",
         "    session_args = @()",
+        "    wrapped_loop_mode = $wrappedLoopMode",
         "  }",
         "  $null = Launch 'worker' $plan $null",
         "}",
@@ -8491,7 +8660,8 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "$env:AGENTTALK_WRAPPER_LOG_NONCE = 'ambient-nonce'",
         "$env:AGENTTALK_WRAPPER_STDOUT_LOG = 'ambient-stdout'",
         "Invoke-RegularCase 'regular_python_wrap' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--','codex.exe') $true 'wrap'",
+        "@('-m','agenttalk','wrap','--for','worker','--loop','--','codex.exe') "
+        "$true 'wrap' $null $true",
         # Round 23: these no longer get a special not-logged answer - the
         # supervisor stopped predicting whether argparse would actually
         # reach cmd_wrap (that probe is deleted; see Launch's own comment).
@@ -8503,11 +8673,14 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         # never .committed, and is preserved rather than evicting real
         # evidence (see New-WrapperLogTargets/Invoke-WrapperLogRetentionPrune).
         "Invoke-RegularCase 'regular_wrap_help' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--help','--','codex.exe') $true 'wrap'",
+        "@('-m','agenttalk','wrap','--for','worker','--loop','--help','--','codex.exe') "
+        "$true 'wrap' $null $true",
         "Invoke-RegularCase 'regular_wrap_invalid_flag' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--nonexistent-flag','--','codex.exe') $true 'wrap'",
+        "@('-m','agenttalk','wrap','--for','worker','--loop','--nonexistent-flag','--','codex.exe') "
+        "$true 'wrap' $null $true",
         "Invoke-RegularCase 'regular_unbuffered_wrap' 'python.exe' "
-        "@('-u','-m','agenttalk','wrap','--for','worker','--','codex.exe') $true 'wrap' 1",
+        "@('-u','-m','agenttalk','wrap','--for','worker','--loop','--','codex.exe') "
+        "$true 'wrap' 1 $true",
         "Invoke-RegularCase 'regular_xoption_wrap' 'python.exe' "
         "@('-X','utf8','-m','agenttalk','wrap','--for','worker') $true 'wrap' 2",
         "Invoke-RegularCase 'regular_no_args' 'python.exe' @() $true 'wrap'",
@@ -8520,7 +8693,8 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "Invoke-RegularCase 'regular_not_wrapped' 'python.exe' "
         "@('-m','agenttalk','wrap','--for','worker','--','codex.exe') $false 'wrap'",
         "Invoke-RegularCase 'regular_not_wrap_mode' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--','codex.exe') $true 'fresh'",
+        "@('-m','agenttalk','wrap','--for','worker','--loop','--','codex.exe') "
+        "$true 'fresh' $null $true",
         "Invoke-RegularCase 'regular_wrong_agent' 'python.exe' "
         "@('-m','agenttalk','wrap','--for','other','--','codex.exe') $true 'wrap'",
         "Invoke-RegularCase 'regular_duplicate_agent' 'python.exe' "
@@ -8556,7 +8730,8 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "Invoke-RegularCase 'regular_invalid_global_value' 'python.exe' "
         "@('-m','agenttalk','--root','--','wrap','--for','worker','--','codex.exe') $true 'wrap'",
         "Invoke-RegularCase 'regular_wrong_root' 'python.exe' "
-        "@('-m','agenttalk','--root','D:\\other','wrap','--for','worker','--','codex.exe') $true 'wrap'",
+        "@('-m','agenttalk','--root','D:\\other','wrap','--for','worker','--loop','--','codex.exe') "
+        "$true 'wrap' $null $true",
         "Invoke-RegularCase 'regular_duplicate_root' 'python.exe' "
         "@('-m','agenttalk','--root','D:\\one','--root=D:\\two','wrap','--for','worker','--','codex.exe') $true 'wrap'",
         "Invoke-EphemeralCase 'ephemeral_python_wrap' 'python.exe' "
@@ -9046,10 +9221,11 @@ def test_ps_launch_discards_targets_when_fallback_is_unredirected(
         "$agent = [pscustomobject]@{ backend_profile = $null; wrapped = $true; "
         "cwd = $Root; env = $null; launch = [pscustomobject]@{ "
         "windows_file = 'python.exe'; windows_args = @('-m','agenttalk','wrap',"
-        "'--for','worker','--','codex.exe') } }",
+        "'--for','worker','--loop','--','codex.exe') } }",
         "$cfg = [pscustomobject]@{ agents = [pscustomobject]@{ worker = $agent } }",
         "$plan = [pscustomobject]@{ launch_mode = 'wrap'; window_style = 'Hidden'; "
-        "window_style_warning = $null; session_id = $null; session_args = @() }",
+        "window_style_warning = $null; session_id = $null; session_args = @(); "
+        "wrapped_loop_mode = $true }",
         "$out = Launch 'worker' $plan $null",
         f"$agentDir = Join-Path {_pslit(str(log_root))} {_pslit(agent_leaf)}",
         "$dirs = if (Test-Path -LiteralPath $agentDir) { "
@@ -11479,6 +11655,49 @@ def test_wrapped_launch_detail_has_no_session_args() -> None:
                                {"cli": cli_name, "wrapped": True})
         assert d["launch_mode"] == "wrap" and d["resume_mode"] == "wrap"
         assert d["session_args"] == [] and d["session_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("windows_args", "expected"),
+    [
+        (
+            [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--loop",
+                "--", "codex.exe",
+            ],
+            True,
+        ),
+        (
+            [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--",
+                "codex.exe",
+            ],
+            False,
+        ),
+        (
+            [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--",
+                "codex.exe", "--loop",
+            ],
+            False,
+        ),
+    ],
+    ids=["loop-before-tail", "missing-loop", "loop-only-in-child-tail"],
+)
+def test_wrapped_launch_detail_carries_positional_loop_admission(
+    windows_args: list[str],
+    expected: bool,
+) -> None:
+    detail = sup._launch_detail({}, {
+        "cli": "codex",
+        "wrapped": True,
+        "launch": {
+            "windows_file": "python.exe",
+            "windows_args": windows_args,
+        },
+    })
+
+    assert detail["wrapped_loop_mode"] is expected
 
 
 def test_wrapped_restart_on_stale_without_hook() -> None:
