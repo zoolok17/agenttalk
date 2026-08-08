@@ -163,6 +163,8 @@ def test_ps_template_claims_instance_drains_and_releases_under_brake() -> None:
     assert "'supervise', '--release-instance'" in ps
     assert "supervise --launch-barrier" in ps
     assert "'--pid-start', $SupervisorStart" in ps
+    assert "function Supervisor-InstanceIdentityArgs" in ps
+    assert ps.count("(Supervisor-InstanceIdentityArgs)") == 4
     assert "Assert-ActionsEnabled 'drain-intents'" in ps
     assert "finally" in ps
 

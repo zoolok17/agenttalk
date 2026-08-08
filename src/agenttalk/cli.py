@@ -26,6 +26,7 @@ from pathlib import Path
 
 from agenttalk import __version__
 from agenttalk import avatars as avatar_mod
+from agenttalk import store as store_mod
 from agenttalk.display import render
 from agenttalk.store import (
     COMPOSING_INTENT_STALE_SECONDS,
@@ -12472,6 +12473,13 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                              "--request-id <rid>, --terminal-state <state>, and "
                              "--state-file <path>\n")
             return 2
+        if not args.instance_token or args.pid is None:
+            sys.stderr.write(
+                "agenttalk supervise --archive-launch-request: "
+                "supervisor_owner_identity_missing: need the live supervisor "
+                "--instance-token and --pid identity\n"
+            )
+            return 3
         completion = None
         if args.completion_json:
             try:
@@ -12484,21 +12492,75 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 sys.stderr.write("agenttalk supervise --archive-launch-request: "
                                  "--completion-json must be a JSON object\n")
                 return 2
-        state = _read_state()
         try:
-            sup.archive_ephemeral_request(
-                store, state, args.request_id,
-                terminal_state=args.terminal_state,
-                reason=args.reason or "",
-                now_epoch=(args.now if args.now is not None else time.time()),
-                completion=completion,
-            )
-        except eph.EphemeralError as exc:
+            with store._supervisor_lifecycle_lock():
+                marker_status, instance, marker_detail = (
+                    store._read_supervisor_instance_strict_locked()
+                )
+                if marker_status != "valid" or not isinstance(instance, dict):
+                    sys.stderr.write(
+                        "agenttalk supervise --archive-launch-request: "
+                        f"supervisor_owner_marker_{marker_status}: "
+                        f"{marker_detail or 'no live supervisor identity is available'}\n"
+                    )
+                    return 3
+                if (
+                    instance.get("token") != args.instance_token
+                    or instance.get("pid") != args.pid
+                    or instance.get("pid_start") != args.pid_start
+                ):
+                    sys.stderr.write(
+                        "agenttalk supervise --archive-launch-request: "
+                        "supervisor_owner_identity_mismatch: supplied "
+                        "token/pid/start did not match the supervisor marker\n"
+                    )
+                    return 3
+                owner_status = store_mod._probe_owner_identity(
+                    instance.get("pid"),
+                    instance.get("pid_start"),
+                )
+                refusal_code = {
+                    store_mod.OWNER_IDENTITY_DEAD: "supervisor_owner_dead",
+                    store_mod.OWNER_IDENTITY_PID_REUSED: "supervisor_owner_pid_reused",
+                    store_mod.OWNER_IDENTITY_UNKNOWN: "supervisor_owner_liveness_unknown",
+                    store_mod.OWNER_IDENTITY_START_UNMATCHABLE:
+                        "supervisor_owner_start_unmatchable",
+                }.get(owner_status)
+                if owner_status != store_mod.OWNER_IDENTITY_ALIVE:
+                    sys.stderr.write(
+                        "agenttalk supervise --archive-launch-request: "
+                        f"{refusal_code or 'supervisor_owner_probe_invalid'}: "
+                        "positive supervisor owner identity was not proven\n"
+                    )
+                    return 3
+                marker_status_after, instance_after, marker_detail_after = (
+                    store._read_supervisor_instance_strict_locked()
+                )
+                if marker_status_after != "valid" or instance_after != instance:
+                    detail_suffix = (
+                        f": {marker_detail_after}" if marker_detail_after else ""
+                    )
+                    sys.stderr.write(
+                        "agenttalk supervise --archive-launch-request: "
+                        "supervisor_owner_marker_changed: marker changed during "
+                        f"owner verification{detail_suffix}\n"
+                    )
+                    return 3
+                state = _read_state()
+                sup.archive_ephemeral_request(
+                    store, state, args.request_id,
+                    terminal_state=args.terminal_state,
+                    reason=args.reason or "",
+                    now_epoch=(args.now if args.now is not None else time.time()),
+                    completion=completion,
+                )
+                _write_state(state)
+        except (OSError, ValueError, eph.EphemeralError,
+                sup.SupervisorPersistenceError) as exc:
             sys.stderr.write(
                 f"agenttalk supervise --archive-launch-request: {exc}\n"
             )
             return 3
-        _write_state(state)
         return 0
 
     if args.launch_barrier:
@@ -14470,10 +14532,11 @@ def build_parser() -> argparse.ArgumentParser:
                                      "(default 'bypassPermissions').")
     psup.add_argument("--cli", help="(--record-launch) the agent CLI ('claude'|'codex').")
     psup.add_argument("--pid", type=int, default=None,
-                      help="(--record-launch) the LAUNCHER process id from Start-Process.")
+                      help="Launcher pid for record-launch, or live supervisor pid "
+                           "for instance-bound mutations.")
     psup.add_argument("--pid-start", dest="pid_start", default=None,
-                      help="(--record-launch) the launcher process start-time "
-                           "(anti-pid-reuse guard).")
+                      help="Process start-time for record-launch or live-supervisor "
+                           "anti-pid-reuse checks.")
     psup.add_argument("--pwsh",
                       help="Absolute pwsh.exe path (terminal explicit selection; no fallback).")
     psup.add_argument("--artifact-boundary", dest="artifact_boundary",
@@ -14520,7 +14583,8 @@ def build_parser() -> argparse.ArgumentParser:
              "recording the attended reset.",
     )
     psup.add_argument("--instance-token", dest="instance_token",
-                      help="(--release-instance/--drain-intents) supervisor instance token.")
+                      help="(--release-instance/--drain-intents/"
+                           "--archive-launch-request) supervisor instance token.")
     psup.add_argument("--max-per-tick", dest="max_per_tick", type=int, default=25,
                       help="(--drain-intents) maximum queued intents to claim in one tick.")
     psup.add_argument("--session-id", dest="session_id",
