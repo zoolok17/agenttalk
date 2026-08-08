@@ -55,6 +55,7 @@ from agenttalk import gates as gate_mod
 from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
 from agenttalk import lead_loop_runtime
+from agenttalk import launch_admission
 from agenttalk import onboarding as ob
 from agenttalk import signing as _signing
 from agenttalk import threads as th
@@ -10763,7 +10764,15 @@ def _resolves_to_cmd_wrap(argv: list[str]) -> bool:
             args = parser.parse_args(argv)
     except SystemExit:
         return False
-    return getattr(args, "func", None) is cmd_wrap
+    if getattr(args, "func", None) is not cmd_wrap:
+        return False
+    # The actual parser now uses launch_admission's canonical wrap grammar.
+    # Normalize the namespace through the same typed boundary as supervisor
+    # admission, but deliberately retain this probe's narrower contract: it
+    # answers whether argparse DISPATCHES to cmd_wrap, before runtime-shape
+    # validation performed inside that command.
+    launch_admission.wrap_invocation_from_namespace(args)
+    return True
 
 
 def cmd_internal_check_wrap_dispatch(args: argparse.Namespace) -> int:
@@ -10949,29 +10958,12 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
     lifecycle_log = getattr(args, "_wrapper_lifecycle_log", None)
     if lifecycle_log is not None:
         lifecycle_log.agent = agent
-    argv = list(args.cmd or [])
-    if argv and argv[0] == "--":
-        argv = argv[1:]
-    if not argv:
-        sys.stderr.write("agenttalk wrap: a launch command is required after `--`\n")
+    parsed_wrap = launch_admission.validate_standalone_wrap(args)
+    if isinstance(parsed_wrap, launch_admission.WrapRefusal):
+        sys.stderr.write(f"{parsed_wrap.message}\n")
         return 2
-    if args.cli not in ("codex", "claude"):
-        sys.stderr.write(f"agenttalk wrap: no wrapper adapter for cli {args.cli!r}\n")
-        return 2
-    if args.one_shot and not args.loop:
-        sys.stderr.write("agenttalk wrap: --one-shot requires --loop\n")
-        return 2
-    if args.one_shot and not args.to_request:
-        sys.stderr.write("agenttalk wrap: --one-shot requires --to-request <id>\n")
-        return 2
-    lead_loop = getattr(args, "lead_loop", False)
-    if lead_loop and not args.loop:
-        sys.stderr.write("agenttalk wrap: --lead-loop requires --loop\n")
-        return 2
-    if lead_loop and args.one_shot:
-        sys.stderr.write("agenttalk wrap: --lead-loop is a continuous controller; "
-                         "it cannot be combined with --one-shot\n")
-        return 2
+    argv = list(parsed_wrap.child_argv)
+    lead_loop = parsed_wrap.lead_loop
     # v0.75.0: model/effort injection + fingerprinting live in the --loop path only
     # (D2). Warn (don't fail) so an operator's --model/--effort isn't silently dropped
     # on the non-loop one-shot `wrap` path.
@@ -12887,6 +12879,11 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             snapshot = _read_snapshot_file(args.snapshot_file)
         plan = sup.plan_actions(report, _read_state(), config,
                                 now_epoch=now, snapshot=snapshot)
+        sup.attach_regular_launch_admissions(
+            plan,
+            config,
+            root=store.root,
+        )
         print(json.dumps(plan, indent=2))
         if getattr(args, "record_events", False):
             with contextlib.suppress(Exception):
@@ -13080,12 +13077,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="File-backed message bus for two agent CLIs.",
     )
     p.add_argument("--version", action="version", version=f"agenttalk {__version__}")
-    p.add_argument("--root",
-                   help="Project root. Resolution precedence: this flag > "
-                        "$AGENTTALK_ROOT > walk up from CWD looking for "
-                        ".agenttalk/. A pinned root (flag or env) that has no "
-                        "store fails loudly — it never falls back to the walk.")
-    p.add_argument("--supervisor-launch-nonce", help=argparse.SUPPRESS)
+    launch_admission.add_agenttalk_launch_arguments(p)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pdev = sub.add_parser(
@@ -14508,60 +14500,7 @@ def build_parser() -> argparse.ArgumentParser:
              "Codex (`codex exec --json`) and Claude (`stream-json`) structured "
              "streams are supported.",
     )
-    pwrap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
-    pwrap.add_argument("--cli", default="codex",
-                       help="Which CLI is being wrapped: 'codex' (codex exec "
-                            "--json) or 'claude' (stream-json).")
-    pwrap.add_argument("--from", dest="sender",
-                       help="Identity recorded as the degraded-restart requester "
-                            "(default: the wrapped agent).")
-    pwrap.add_argument("--lane-id",
-                       help="Run the wrapped child from the provisioned lane worktree.")
-    pwrap.add_argument("--min-interval", dest="min_interval", type=float, default=5.0,
-                       help="Throttle: stamp heartbeat at most once per this many "
-                            "seconds (default 5).")
-    pwrap.add_argument("--no-render", dest="no_render", action="store_true",
-                       help="Do not echo the agent's output to this console.")
-    pwrap.add_argument("--model", dest="model", default=None,
-                       help="(--loop) Override the per-agent supervisor.json model for "
-                            "the wrapped child (flag > per-agent config). Injected as a "
-                            "bare token; an explicit model in the launch tail still wins.")
-    pwrap.add_argument("--effort", dest="effort", default=None,
-                       help="(--loop) Override the per-agent reasoning_effort (flag > "
-                            "per-agent config). codex {minimal,low,medium,high,xhigh}; "
-                            "claude {low,medium,high,xhigh,max}. Invalid values are "
-                            "dropped with a warning; a launch-tail value still wins.")
-    pwrap.add_argument("--loop", action="store_true",
-                       help="Run as the long-running SUPERVISED wrapper: own the "
-                            "idle bus-wait + heartbeat and drive the CLI one turn "
-                            "per inbound message (design C). Opt-in; manual "
-                            "/agenttalk.listen stays the default.")
-    pwrap.add_argument("--lead-loop", dest="lead_loop", action="store_true",
-                       help="With --loop, run as the managed lead-loop CONTROLLER: "
-                            "acquire a renewable team-mailbox LEASE (the agent must be "
-                            "a configured managed-lead-loop identity) so an external "
-                            "consumer cannot race the bus; renew it on every heartbeat; "
-                            "a valid human release/end stands it down without relaunch.")
-    pwrap.add_argument("--one-shot", dest="one_shot", action="store_true",
-                       help="With --loop, exit after one successful turn.")
-    pwrap.add_argument("--to-request", dest="to_request",
-                       help="With --one-shot, only drive the matching request_id.")
-    pwrap.add_argument("--dead-letter-max-attempts", dest="dead_letter_max_attempts",
-                       type=int, default=None,
-                       help="(--loop) Auto-dead-letter a POISON message after this many "
-                            "deterministic failures (default 3, or supervisor.json "
-                            "dead_letter.max_attempts; 0 disables - debug only).")
-    pwrap.add_argument("--dead-letter-escalate-after", dest="dead_letter_escalate_after",
-                       type=int, default=None,
-                       help="(--loop) High-attempt backstop: escalate to the operator at "
-                            "this many attempts on one message; ambiguous/unknown repeated "
-                            "failures also dead-letter here (default 20, or supervisor.json "
-                            "dead_letter.escalate_after_attempts; 0 disables).")
-    pwrap.add_argument("cmd", nargs=argparse.REMAINDER,
-                       help="-- followed by the BASE launch command (the per-turn "
-                            "session/stream args are appended), e.g. `-- codex -a "
-                            "never -s workspace-write` (loop) or `-- codex ... exec "
-                            "--json \"...\"` (one-shot).")
+    launch_admission.add_wrap_arguments(pwrap)
     pwrap.set_defaults(func=cmd_wrap)
 
     pcheckwrap = sub.add_parser(

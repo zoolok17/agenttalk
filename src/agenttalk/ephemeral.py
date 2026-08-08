@@ -523,55 +523,41 @@ def validate_launch_request(
                 f"{sorted(SUPPORTED_WRAPPER_CLIS)}"
             )
         raw_env = profile.get("env", {})
-        if not isinstance(raw_env, dict):
-            errors.append(
-                f"profile {marker.get('profile')!r} env must be an object"
-            )
-        else:
-            seen_env_keys: list[str] = []
-            for key, value in raw_env.items():
-                if (
-                    not isinstance(key, str)
-                    or not key
-                    or "=" in key
-                    or any(
-                        ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
-                        for char in key
-                    )
-                ):
-                    errors.append(
-                        f"profile {marker.get('profile')!r} env contains an "
-                        "invalid variable name"
-                    )
-                    continue
-                if any(
-                    _windows_environment_names_equal(key, previous)
-                    for previous in seen_env_keys
-                ):
-                    errors.append(
-                        f"profile {marker.get('profile')!r} env contains "
-                        "case-insensitive duplicate variable names"
-                    )
-                seen_env_keys.append(key)
-                if any(
-                    _windows_environment_names_equal(key, reserved)
-                    for reserved in _SUPERVISOR_OWNED_ENV_KEYS
-                ):
-                    errors.append(
-                        f"profile {marker.get('profile')!r} env cannot override "
-                        f"supervisor-owned variable {key!r}"
-                    )
-                if (
-                    not isinstance(value, str)
-                    or any(
-                        char == "\x00" or 0xD800 <= ord(char) <= 0xDFFF
-                        for char in value
-                    )
-                ):
-                    errors.append(
-                        f"profile {marker.get('profile')!r} env variable "
-                        f"{key!r} must have a valid string value"
-                    )
+        # Shared with regular launch admission. Reserved-name ownership and the
+        # ephemeral path's legacy control-name refusal are explicit overlays;
+        # syntax, Unicode preservation, the Windows comparer, and collision
+        # rules are one implementation.
+        from agenttalk import supervisor as _sup
+
+        for issue in _sup._configured_environment_issues(  # noqa: SLF001
+            raw_env,
+            reserved_names=_SUPERVISOR_OWNED_ENV_KEYS,
+            forbid_control_names=True,
+        ):
+            if issue.code == "not_object":
+                errors.append(
+                    f"profile {marker.get('profile')!r} env must be an object"
+                )
+            elif issue.code == "invalid_name":
+                errors.append(
+                    f"profile {marker.get('profile')!r} env contains an "
+                    "invalid variable name"
+                )
+            elif issue.code == "duplicate_name":
+                errors.append(
+                    f"profile {marker.get('profile')!r} env contains "
+                    "case-insensitive duplicate variable names"
+                )
+            elif issue.code == "reserved_name":
+                errors.append(
+                    f"profile {marker.get('profile')!r} env cannot override "
+                    f"supervisor-owned variable {issue.name!r}"
+                )
+            else:
+                errors.append(
+                    f"profile {marker.get('profile')!r} env variable "
+                    f"{issue.name!r} must have a valid string value"
+                )
     skill = marker.get("skill")
     if eph["allowed_skills"] and skill not in eph["allowed_skills"]:
         errors.append(f"skill {skill!r} is not allowed")

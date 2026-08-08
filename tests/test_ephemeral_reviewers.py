@@ -166,7 +166,7 @@ def _wrapper_row(
         "command_line": (
             "python -m agenttalk "
             f"--supervisor-launch-nonce {SUPERVISOR_NONCE} "
-            f"--root {TEST_ROOT} wrap --for {agent} --loop"
+            f"--root {TEST_ROOT} wrap --for {agent} --loop -- codex.exe"
         ),
         "start_time": start,
         "start_filetime": None,
@@ -250,6 +250,69 @@ def test_prepare_launch_request_rejects_unsupported_wrapper_cli_before_effects(
     marker = s.read_launch_request(request_id)
     assert marker is not None
     assert marker["state"] == eph.STATE_QUEUED
+
+
+def test_standalone_one_turn_wrap_still_reaches_the_real_parser() -> None:
+    assert cli._resolves_to_cmd_wrap([  # noqa: SLF001
+        "--root", TEST_ROOT, "wrap", "--for", "dev", "--",
+        "codex.exe", "review this",
+    ])
+
+
+def test_launch_admission_accepts_ephemeral_loop_one_shot_mode(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+
+    errors, profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        _cfg(),
+    )
+
+    assert errors == []
+    assert profile is not None
+
+
+def test_launch_admission_accepts_omitted_default_wrapper_cli(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    args = cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["launch"]["windows_args"]
+    cli_index = args.index("--cli")
+    del args[cli_index:cli_index + 2]
+
+    errors, profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert errors == []
+    assert profile is not None
+
+
+def test_launch_admission_rejects_unknown_pre_tail_wrapper_option(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    args = cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["launch"]["windows_args"]
+    args.insert(args.index("--"), "--unknown-wrapper-option")
+
+    errors, profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert profile is not None
+    assert any("exact agenttalk wrap --loop --one-shot" in error for error in errors)
 
 
 @pytest.mark.parametrize(
@@ -395,6 +458,76 @@ def test_launch_admission_preserves_windows_distinct_unicode_environment_names(
     )
 
     assert errors == []
+
+
+def test_launch_admission_rejects_environment_name_with_equals(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["env"] = {"BAD=NAME": "value"}
+
+    errors, profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert profile is not None
+    assert any("invalid variable name" in error for error in errors)
+
+
+def test_launch_admission_preserves_empty_child_argument(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    args = cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["launch"]["windows_args"]
+    args.extend(["alpha", "", "omega"])
+
+    errors, profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert errors == []
+    assert profile is not None
+
+
+@pytest.mark.parametrize(
+    "empty_position",
+    ["executable", "required-option-value", "child-executable"],
+)
+def test_launch_admission_rejects_empty_required_launch_token(
+    tmp_path: Path,
+    empty_position: str,
+) -> None:
+    s = _store(tmp_path)
+    cfg = _cfg()
+    launch = cfg["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]["launch"]
+    args = launch["windows_args"]
+    if empty_position == "executable":
+        launch["windows_file"] = ""
+    elif empty_position == "required-option-value":
+        args[args.index("--for") + 1] = ""
+    else:
+        args[args.index("--") + 1] = ""
+
+    errors, profile = eph.validate_launch_request(
+        _marker(),
+        s.load_config(),
+        cfg,
+    )
+
+    assert profile is not None
+    assert errors
 
 
 def test_validate_launch_request_rejects_module_args_from_the_resolver_would_reject(
@@ -779,6 +912,20 @@ def test_prepare_launch_request_resolves_ephemeral_window_style(tmp_path: Path) 
 
     assert spec["window_style"] == "Minimized"
     assert spec["window_style_warning"] is None
+    admission = spec["launch_admission"]
+    assert frozenset(admission) == {
+        "schema_version", "status", "population", "agent", "cli",
+        "wrapped", "windows_file", "argv", "cwd", "module_args_from",
+        "wrapper_dispatch", "nonce_insert_at", "child_argv",
+    }
+    assert admission["schema_version"] == 1
+    assert admission["status"] == "accepted"
+    assert admission["population"] == "ephemeral"
+    assert admission["agent"] == spec["agent"]
+    assert admission["wrapped"] is True
+    assert admission["wrapper_dispatch"] is True
+    assert admission["argv"] == spec["launch"]["windows_args"]
+    assert admission["child_argv"] == [sys.executable]
 
 
 def test_prepare_launch_request_binds_final_spec_without_persisting_env_secrets(

@@ -29,6 +29,7 @@ from agenttalk import (
     cli,
     ephemeral as eph,
     health as hm,
+    launch_admission,
     supervisor as sup,
     wrapper_runtime as wrt,
 )
@@ -2950,108 +2951,108 @@ def test_supervise_bootstrap_check_requires_loop_before_child_tail(
 
     assert rc == 2
     payload = json.loads(capsys.readouterr().out)
-    assert any(
-        check["id"] == "supervisor_wrapped_missing_loop"
-        and check.get("agent") == "Zeno"
+    check = next(
+        check
         for check in payload["checks"]
+        if check["id"] == "supervisor_agent_launch_admission_refused"
+        and check.get("agent") == "Zeno"
     )
+    assert "requires --loop before the child delimiter" in check["detail"]
 
 
-def test_supervise_bootstrap_check_validates_module_args_from(
-    tmp_path: Path, capsys: pytest.CaptureFixture,
+def test_supervise_bootstrap_check_rejects_environment_name_with_equals(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
 ) -> None:
-    # PR 98 connector re-review: [int]$moduleArgsFrom is a direct cast at the
-    # PowerShell call site under $ErrorActionPreference = 'Stop' - a typo
-    # like "1x" there throws and takes the whole supervisor poll down
-    # instead of just disabling nonce injection for that one agent. The
-    # bootstrap validator is the loud, load-time check that catches both a
-    # wrong-typed and an out-of-range value BEFORE either ever reaches that
-    # cast, with the offending agent named.
-    s = _team(tmp_path, "Polaris,Zeno,Ramanujan")
+    s = _team(tmp_path, "Polaris,Zeno")
     s.set_role("Polaris", "lead")
     s.set_operator_facing("Polaris")
-    for name in ("Polaris", "Zeno", "Ramanujan"):
+    for name in ("Polaris", "Zeno"):
         s.write_heartbeat(name)
-    bad_type = _wrapped_supervisor_agent("Zeno", "codex")
-    bad_type["launch"]["module_args_from"] = "1x"
-    out_of_range = _wrapped_supervisor_agent("Ramanujan", "claude")
-    out_of_range["launch"]["module_args_from"] = 99
-    _write_supervisor_config(s, {"Zeno": bad_type, "Ramanujan": out_of_range})
+    wrapped = _wrapped_supervisor_agent("Zeno", "codex")
+    wrapped["env"] = {"BAD=NAME": "value"}
+    _write_supervisor_config(s, {"Zeno": wrapped})
 
     rc = _run(["supervise", "--bootstrap-check"], tmp_path)
 
     assert rc == 2
     payload = json.loads(capsys.readouterr().out)
-    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
-    assert ("supervisor_agent_launch_module_args_from_invalid", "Zeno") in by_id_agent
-    assert ("supervisor_agent_launch_module_args_from_out_of_range", "Ramanujan") in by_id_agent
+    check = next(
+        item
+        for item in payload["checks"]
+        if item["id"] == "supervisor_agent_environment_invalid"
+        and item.get("agent") == "Zeno"
+    )
+    assert check["facts"]["issues"] == ["invalid_name"]
 
-    valid = _wrapped_supervisor_agent("Zeno", "codex")
-    valid["launch"]["windows_args"].insert(0, "-u")
-    valid["launch"]["module_args_from"] = 1
-    _write_supervisor_config(s, {"Zeno": valid})
+    wrapped["env"] = {"TAB\tNAME": "value"}
+    _write_supervisor_config(s, {"Zeno": wrapped})
     rc = _run(["supervise", "--bootstrap-check"], tmp_path)
     payload = json.loads(capsys.readouterr().out)
-    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
-    assert ("supervisor_agent_launch_module_args_from_valid", "Zeno") in by_id_agent
+    assert rc == 0
+    assert not [
+        item
+        for item in payload["checks"]
+        if item["id"] == "supervisor_agent_environment_invalid"
+    ]
 
-    # PR 98 connector, round 9 - the seam again, in the validator: an
-    # IN-RANGE module_args_from that points at the WRONG token used to
-    # report valid, even though the runtime resolver rejects it - nonce
-    # injection, bounded logging, and launcher attribution all silently
-    # disabled on a config the validator called clean. windows_args
-    # ['-u', '-Xutf8', '-m', 'agenttalk', ...] with module_args_from=1
-    # points at '-Xutf8', not '-m' - in range, but the wrong token.
+
+def test_supervise_bootstrap_check_consumes_shared_typed_admission(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path, "Polaris,Zeno")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    for name in ("Polaris", "Zeno"):
+        s.write_heartbeat(name)
+
+    invalid = []
+    bad_type = _wrapped_supervisor_agent("Zeno", "codex")
+    bad_type["launch"]["module_args_from"] = "1x"
+    invalid.append(bad_type)
+    out_of_range = _wrapped_supervisor_agent("Zeno", "codex")
+    out_of_range["launch"]["module_args_from"] = 99
+    invalid.append(out_of_range)
     wrong_token = _wrapped_supervisor_agent("Zeno", "codex")
     wrong_token["launch"]["windows_args"][0:0] = ["-u", "-Xutf8"]
     wrong_token["launch"]["module_args_from"] = 1
-    _write_supervisor_config(s, {"Zeno": wrong_token})
-    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
-    assert rc == 2
-    payload = json.loads(capsys.readouterr().out)
-    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
-    assert ("supervisor_agent_launch_module_args_from_wrong_token", "Zeno") in by_id_agent
-
-    # Same shape, different cause: an in-range module_args_from whose
-    # declared prefix contains a token outside the allowlist (never a
-    # real interpreter flag) must also be refused, not just a wrong
-    # position.
+    invalid.append(wrong_token)
     disallowed_prefix = _wrapped_supervisor_agent("Zeno", "codex")
     disallowed_prefix["launch"]["windows_args"].insert(0, "-Z")
     disallowed_prefix["launch"]["module_args_from"] = 1
-    _write_supervisor_config(s, {"Zeno": disallowed_prefix})
-    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
-    assert rc == 2
-    payload = json.loads(capsys.readouterr().out)
-    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
-    assert ("supervisor_agent_launch_module_args_from_wrong_token", "Zeno") in by_id_agent
-
-    # Round 14 connector finding, the fourth instance of the same class:
-    # module_args_from ABSENT (not merely present-and-wrong) while
-    # windows_args carries an undeclared prefix. The runtime resolver
-    # defaults an absent field to offset 0 and rejects this exact
-    # invocation - the validator must too, rather than skipping the
-    # resolver call entirely whenever the field is unset.
+    invalid.append(disallowed_prefix)
     absent_with_prefix = _wrapped_supervisor_agent("Zeno", "codex")
     absent_with_prefix["launch"]["windows_args"].insert(0, "-u")
-    assert "module_args_from" not in absent_with_prefix["launch"]
-    _write_supervisor_config(s, {"Zeno": absent_with_prefix})
-    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
-    assert rc == 2
-    payload = json.loads(capsys.readouterr().out)
-    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
-    assert ("supervisor_agent_launch_module_args_from_wrong_token", "Zeno") in by_id_agent
+    invalid.append(absent_with_prefix)
 
-    # And the companion positive: absent module_args_from with a genuinely
-    # plain, undeclared windows_args (no prefix at all) must still report
-    # valid - the fix must not turn every ordinary launch into an error.
-    plain_no_prefix = _wrapped_supervisor_agent("Zeno", "codex")
-    assert "module_args_from" not in plain_no_prefix["launch"]
-    _write_supervisor_config(s, {"Zeno": plain_no_prefix})
-    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
-    payload = json.loads(capsys.readouterr().out)
-    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
-    assert ("supervisor_agent_launch_module_args_from_valid", "Zeno") in by_id_agent
+    for configured in invalid:
+        _write_supervisor_config(s, {"Zeno": configured})
+        rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 2
+        assert any(
+            check["id"] == "supervisor_agent_launch_admission_refused"
+            and check.get("agent") == "Zeno"
+            for check in payload["checks"]
+        )
+
+    valid_prefix = _wrapped_supervisor_agent("Zeno", "codex")
+    valid_prefix["launch"]["windows_args"].insert(0, "-u")
+    valid_prefix["launch"]["module_args_from"] = 1
+    for configured in (
+        valid_prefix,
+        _wrapped_supervisor_agent("Zeno", "codex"),
+    ):
+        _write_supervisor_config(s, {"Zeno": configured})
+        rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert any(
+            check["id"] == "supervisor_agent_launch_admission_valid"
+            and check.get("agent") == "Zeno"
+            for check in payload["checks"]
+        )
 
 
 def test_supervise_bootstrap_check_accepts_the_filled_manual_archetype_scaffold(
@@ -3095,11 +3096,11 @@ def test_supervise_bootstrap_check_accepts_the_filled_manual_archetype_scaffold(
     rc = _run(["supervise", "--bootstrap-check"], tmp_path)
 
     payload = json.loads(capsys.readouterr().out)
-    by_id_agent = {(c["id"], c.get("agent")) for c in payload["checks"]}
-    assert not any(
-        cid.startswith("supervisor_agent_launch_module_args_from")
-        for cid, agent in by_id_agent if agent == "Deneb"
-    ), by_id_agent
+    assert any(
+        check["id"] == "supervisor_agent_launch_admission_valid"
+        and check.get("agent") == "Deneb"
+        for check in payload["checks"]
+    )
     assert rc == 0
 
 
@@ -3262,7 +3263,7 @@ def test_supervise_bootstrap_check_errors_on_stale_managed_agent(
     )
 
 
-def test_supervise_bootstrap_check_requires_explicit_root_for_wrapped_claude_and_codex(
+def test_supervise_bootstrap_check_uses_shared_root_normalization(
     tmp_path: Path, capsys: pytest.CaptureFixture,
 ) -> None:
     s = _team(tmp_path, "Polaris,Cygnus,Altair")
@@ -3284,11 +3285,42 @@ def test_supervise_bootstrap_check_requires_explicit_root_for_wrapped_claude_and
 
     assert rc == 2
     payload = json.loads(capsys.readouterr().out)
-    missing_root_agents = {
+    refused_agents = {
         c.get("agent") for c in payload["checks"]
-        if c["id"] == "supervisor_wrapped_missing_root"
+        if c["id"] == "supervisor_agent_launch_admission_refused"
     }
-    assert missing_root_agents == {"Cygnus", "Altair"}
+    valid_agents = {
+        c.get("agent") for c in payload["checks"]
+        if c["id"] == "supervisor_agent_launch_admission_valid"
+    }
+    assert refused_agents == {"Cygnus"}
+    assert "Altair" in valid_agents
+
+
+def test_supervise_bootstrap_accepts_shared_parser_root_abbreviation_and_tail(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path, "Polaris,Zeno")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    for name in ("Polaris", "Zeno"):
+        s.write_heartbeat(name)
+    wrapped = _wrapped_supervisor_agent("Zeno", "codex")
+    args = wrapped["launch"]["windows_args"]
+    args[args.index("--root")] = "--roo"
+    args.remove("--")
+    _write_supervisor_config(s, {"Zeno": wrapped})
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert any(
+        check["id"] == "supervisor_agent_launch_admission_valid"
+        and check.get("agent") == "Zeno"
+        for check in payload["checks"]
+    )
 
 
 def test_plan_emits_windows_sandbox_and_perm_mode() -> None:
@@ -3350,14 +3382,16 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     assert "& $AgenttalkPython -m agenttalk --version" in codex_branch
     assert "& $file sandbox" not in codex_branch             # no codex sandbox probe
     assert "-P :workspace" not in codex_branch               # the drift-prone flag is gone
-    # Phase C: a WRAPPED agent ($file is python, not the CLI) is preflighted BEFORE
-    # the codex branch and validates the python wrapper, NOT the codex sandbox.
+    # Phase C: a WRAPPED agent is preflighted before the codex branch using the
+    # dispatch form carried by the typed artifact, never as the child CLI.
     wrap_branch = pf[pf.index("$plan.launch_mode -eq 'wrap'"):ci]
     # round 24 connector finding: the wrapped probe must carry the SAME
     # declared prefix tokens the real launch uses, not a fixed
     # `-m agenttalk --version` stand-in - see
     # test_preflight_wrapped_smoke_test_uses_the_configured_prefix.
     assert "& $file @prefixTokens -m agenttalk --version" in wrap_branch
+    assert "& $file --version" in wrap_branch
+    assert "$null -eq $admission.module_args_from" in wrap_branch
     assert "Test-WrappedBaseCli" in wrap_branch
     assert "& $file sandbox" not in wrap_branch    # never treats $file as the codex CLI
 
@@ -4593,6 +4627,21 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         sup.PS_TEMPLATE.index("# Console action log")
     ]
     output = tmp_path / "literal-environment.json"
+    launch_argv = [
+        "-m", "agenttalk", "--root", str(tmp_path), "wrap", "--for",
+        "reviewer", "--cli", "codex", "--loop", "--one-shot",
+        "--to-request", "lr-env", "--", "codex.exe",
+    ]
+    regular_admission = _accepted_launch_artifact(
+        population="regular", agent="reviewer", cli="codex",
+        windows_file="python.exe", argv=launch_argv, cwd=str(tmp_path),
+        wrapped=True, module_args_from=0, nonce_insert_at=2,
+        child_argv=["codex.exe"],
+    )
+    ephemeral_admission = {
+        **regular_admission,
+        "population": "ephemeral",
+    }
     harness = "\n".join([
         "$ErrorActionPreference = 'Stop'",
         f"$Root = {_pslit(str(tmp_path))}",
@@ -4633,6 +4682,8 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; Redirected = $false }",
         "}",
         launchers,
+        f"$regularAdmission = ({_pslit(json.dumps(regular_admission))} | ConvertFrom-Json)",
+        f"$ephemeralAdmission = ({_pslit(json.dumps(ephemeral_admission))} | ConvertFrom-Json)",
         "$env:AGENTTALK_P1A_A = 'old-a'",
         "$env:AGENTTALK_P1A_B = 'old-b'",
         "$env:AGENTTALK_PYTHON = 'controller-only'",
@@ -4649,6 +4700,7 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "$spec = [pscustomobject]@{",
         "  cli = 'codex'; cwd = $Root; env = $profileEnv;",
         "  window_style = 'Hidden'; window_style_warning = $null;",
+        "  launch_admission = $ephemeralAdmission;",
         "  launch = [pscustomobject]@{",
         "    windows_file = 'python.exe';",
         "    windows_args = @('-m','agenttalk','--root',$Root,'wrap','--for',"
@@ -4665,7 +4717,7 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "$plan = [pscustomobject]@{",
         "  launch_mode = 'wrap'; session_id = $null; session_args = @();",
         "  window_style = 'Hidden'; window_style_warning = $null;",
-        "  wrapped_loop_mode = $true",
+        "  launch_admission = $regularAdmission",
         "}",
         "$null = Launch 'reviewer' $plan $null",
         "$null = Launch-Spec 'reviewer' $spec $null",
@@ -6294,8 +6346,9 @@ def test_ps_template_prepares_redirects_for_regular_and_ephemeral_launches() -> 
         assert block.index("CompareStringOrdinal(") < block.index(
             "$applied['AGENTTALK_WRAPPER_LOG_NONCE']"
         )
-        assert "Test-AgenttalkWrapInvocation" in block
-    assert "[bool]$a.wrapped" in regular
+        assert "Add-SupervisorLaunchNonceAt" in block
+        assert "[bool]$admission.wrapper_dispatch" in block
+    assert "Test-AgenttalkWrapInvocation" not in sup.PS_TEMPLATE
     assert "$plan.launch_mode -eq 'wrap'" in regular
 
 
@@ -7736,8 +7789,47 @@ def _exec_helpers(tmp_path: Path) -> str:
     assert _run(["supervise", "--init"], tmp_path) == 0
     text = (s.dir / "supervisor.ps1").read_text(encoding="utf-8-sig")
     block = text[text.index("# region exec-helpers"):text.index("# endregion exec-helpers")]
+    admission = text[
+        text.index("# region launch-admission-helpers"):
+        text.index("# endregion launch-admission-helpers")
+    ]
     assert "function Stop-Tree" in block and "function Seed-CodexHome" in block
-    return "function Assert-ActionsEnabled([string]$what) { return $true }\n" + block
+    return (
+        "function Assert-ActionsEnabled([string]$what) { return $true }\n"
+        + block
+        + "\n"
+        + admission
+    )
+
+
+def _accepted_launch_artifact(
+    *,
+    population: str,
+    agent: str,
+    cli: str,
+    windows_file: str,
+    argv: list[str],
+    cwd: str,
+    wrapped: bool,
+    module_args_from: int | None = None,
+    nonce_insert_at: int | None = None,
+    child_argv: list[str] | None = None,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "status": "accepted",
+        "population": population,
+        "agent": agent,
+        "cli": cli,
+        "wrapped": wrapped,
+        "windows_file": windows_file,
+        "argv": argv,
+        "cwd": cwd,
+        "module_args_from": module_args_from,
+        "wrapper_dispatch": wrapped,
+        "nonce_insert_at": nonce_insert_at if wrapped else None,
+        "child_argv": list(child_argv or []) if wrapped else [],
+    }
 
 
 # Round 23: Complete-WrapperLogTargets is gone - marking a generation
@@ -7791,6 +7883,21 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
     ]
     output = tmp_path / "environment-rollback.json"
     script = tmp_path / "environment-rollback.ps1"
+    launch_argv = [
+        "-m", "agenttalk", "--root", str(tmp_path), "wrap", "--for",
+        "reviewer", "--cli", "codex", "--loop", "--one-shot",
+        "--to-request", "lr-rollback", "--", "codex.exe",
+    ]
+    regular_admission = _accepted_launch_artifact(
+        population="regular", agent="reviewer", cli="codex",
+        windows_file="python.exe", argv=launch_argv, cwd=str(tmp_path),
+        wrapped=True, module_args_from=0, nonce_insert_at=2,
+        child_argv=["codex.exe"],
+    )
+    ephemeral_admission = {
+        **regular_admission,
+        "population": "ephemeral",
+    }
     invoke = (
         "$null = Launch 'reviewer' $plan $null"
         if launcher == "Launch"
@@ -7826,6 +7933,8 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; Redirected = $false }",
             "}",
             launchers,
+            f"$regularAdmission = ({_pslit(json.dumps(regular_admission))} | ConvertFrom-Json)",
+            f"$ephemeralAdmission = ({_pslit(json.dumps(ephemeral_admission))} | ConvertFrom-Json)",
             "$profileEnv = [pscustomobject]@{",
             "  AGENTTALK_FAILURE_PRESENT = 'during-present';",
             "  AGENTTALK_FAILURE_ABSENT = 'during-absent';",
@@ -7834,6 +7943,7 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "$spec = [pscustomobject]@{",
             "  cli = 'codex'; cwd = $Root; env = $profileEnv;",
             "  window_style = 'Hidden'; window_style_warning = $null;",
+            "  launch_admission = $ephemeralAdmission;",
             "  launch = [pscustomobject]@{",
             "    windows_file = 'python.exe';",
             "    windows_args = @('-m','agenttalk','--root',$Root,'wrap','--for',",
@@ -7850,7 +7960,7 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "$plan = [pscustomobject]@{",
             "  launch_mode = 'wrap'; session_id = $null; session_args = @();",
             "  window_style = 'Hidden'; window_style_warning = $null;",
-            "  wrapped_loop_mode = $true",
+            "  launch_admission = $regularAdmission",
             "}",
             "$names = @(",
             "  'AGENTTALK_ROOT', 'AGENTTALK_PY', 'PYTHONPATH',",
@@ -7956,15 +8066,9 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
     assert payload["after"] == payload["before"]
 
 
-# Shared test data for the cross-language agreement contract (PR 98
-# connector, the seam finding): PowerShell's
-# Test-AgenttalkAllowedInterpreterPrefixToken and Python's
-# supervisor._allowed_interpreter_prefix_token must classify every one of
-# these identically. ONE table, consumed by both
-# test_supervisor_allowed_interpreter_prefix_token_is_exhaustive
-# (PowerShell only) and test_python_and_powershell_prefix_allowlists_agree
-# (both, side by side) - not two independently maintained lists that could
-# themselves drift apart.
+# Exhaustive policy data for the one remaining interpreter-prefix resolver.
+# Generated PowerShell no longer re-parses this grammar; it consumes the typed
+# admission artifact and its producer-owned module/nonce positions.
 _PREFIX_TOKEN_AGREEMENT_TABLE: list[tuple[str, bool]] = [
     # allowed: this project's actual needs (I2, 5th-leak-round allowlist)
     ("-u", True), ("-I", True), ("-S", True), ("-B", True), ("-E", True), ("-P", True),
@@ -8050,329 +8154,97 @@ def _pick_pwsh_anywhere() -> str | None:
     return shutil.which("pwsh")
 
 
-def test_supervisor_allowed_interpreter_prefix_token_is_exhaustive(tmp_path: Path) -> None:
-    """I2, 5th leak (PR 98 connector re-review of 0c3179d): --version/-V/-h/
-    -?/--help* run NO program at all - CPython prints and exits before ever
-    reaching -m - which the prior REJECT list (closed over "which tokens
-    change execution mode") could never catch: refusing NO-program tokens
-    is a different property than refusing WRONG-program tokens, and a
-    reject list accepts anything it does not specifically know is
-    dangerous. Inverted to an ALLOW list:
-    Test-AgenttalkAllowedInterpreterPrefixToken is now the single, named,
-    checked source of truth for which prefix tokens are accepted -
-    enumerate the accepted set directly here (so a missed member fails a
-    test), and assert a sample of terminating options, execution-mode
-    tokens, and invented spellings are all refused."""
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    _PREFIX_TOKEN_AGREEMENT_TABLE,
+)
+def test_python_interpreter_prefix_allowlist_is_exhaustive(
+    token: str,
+    expected: bool,
+) -> None:
+    assert sup._allowed_interpreter_prefix_token(token) is expected  # noqa: SLF001
+
+
+def test_supervisor_launch_nonce_injection_consumes_typed_position(
+    tmp_path: Path,
+) -> None:
     shell = _pick_powershell()
     if not shell:
         return
     helpers = _exec_helpers(tmp_path)
-    out = tmp_path / "allowed_prefix_tokens.json"
-    allowed = [tok for tok, expected in _PREFIX_TOKEN_AGREEMENT_TABLE if expected]
-    refused = [tok for tok, expected in _PREFIX_TOKEN_AGREEMENT_TABLE if not expected]
-    harness = "\n".join([
-        "$ErrorActionPreference = 'Stop'",
-        helpers,
-        "$allowed = @(" + ",".join(_pslit(t) for t in allowed) + ")",
-        "$refused = @(" + ",".join(_pslit(t) for t in refused) + ")",
-        "$allowedResults = @($allowed | ForEach-Object { "
-        "Test-AgenttalkAllowedInterpreterPrefixToken $_ })",
-        "$refusedResults = @($refused | ForEach-Object { "
-        "Test-AgenttalkAllowedInterpreterPrefixToken $_ })",
-        "@{ allowed = $allowedResults; refused = $refusedResults } | "
-        "ConvertTo-Json -Depth 3 | "
-        f"Set-Content {_pslit(str(out))} -Encoding utf8",
-    ])
-    script = tmp_path / "allowed-prefix-tokens.ps1"
-    script.write_text(harness, encoding="utf-8-sig")
+    python_artifact = _accepted_launch_artifact(
+        population="regular", agent="worker", cli="codex",
+        windows_file="python.exe",
+        argv=[
+            "-u", "-m", "agenttalk", "--root", "R", "wrap", "--for",
+            "worker", "--loop", "--", "codex.exe", "", "tail",
+        ],
+        cwd="R", wrapped=True, module_args_from=1, nonce_insert_at=3,
+        child_argv=["codex.exe", "", "tail"],
+    )
+    direct_artifact = _accepted_launch_artifact(
+        population="regular", agent="worker", cli="codex",
+        windows_file="agenttalk.exe",
+        argv=[
+            "--root", "R", "wrap", "--for", "worker", "--loop", "--",
+            "codex.exe",
+        ],
+        cwd="R", wrapped=True, nonce_insert_at=0,
+        child_argv=["codex.exe"],
+    )
+    manual_artifact = _accepted_launch_artifact(
+        population="regular", agent="manual", cli="codex",
+        windows_file="codex.exe", argv=["exec", "review"], cwd="R",
+        wrapped=False,
+    )
+    payload = {
+        "python": python_artifact,
+        "direct": direct_artifact,
+        "manual": manual_artifact,
+    }
+    out = tmp_path / "typed-nonce-injection.json"
+    script = tmp_path / "typed-nonce-injection.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            f"$payload = ({_pslit(json.dumps(payload))} | ConvertFrom-Json)",
+            f"$nonce = {_pslit(SUPERVISOR_NONCE)}",
+            "$python = Add-SupervisorLaunchNonceAt $payload.python $nonce",
+            "$direct = Add-SupervisorLaunchNonceAt $payload.direct $nonce",
+            "$manual = Add-SupervisorLaunchNonceAt $payload.manual $nonce",
+            "[pscustomobject]@{",
+            "  python = $python",
+            "  direct = $direct",
+            "  manual = $manual",
+            "} | ConvertTo-Json -Depth 7 | ",
+            f"  Set-Content {_pslit(str(out))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
     result = subprocess.run(
         [shell, "-NoProfile", "-File", str(script)],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
+
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
     data = json.loads(out.read_text(encoding="utf-8-sig"))
-    assert data["allowed"] == [True] * len(allowed), data
-    assert data["refused"] == [False] * len(refused), data
-
-
-def test_python_and_powershell_prefix_allowlists_agree(tmp_path: Path) -> None:
-    """PR 98 connector, the seam finding: this argv grammar is implemented
-    TWICE - PowerShell's Test-AgenttalkAllowedInterpreterPrefixToken (used
-    at launch time) and Python's supervisor._allowed_interpreter_prefix_token
-    (used to re-parse an observed, live process's command line for
-    launcher attribution) - and a denylist-to-allowlist inversion on one
-    side is not complete until the other agrees. Unifying them is not
-    practical (one lives in an embedded PowerShell string template, the
-    other in ordinary Python; neither can call the other), so this drives
-    BOTH real implementations over the SAME shared table and asserts they
-    classify every entry identically. Python's side is consumed via its
-    actual module-level function - not redefined here, which would just be
-    a third copy of the grammar - so a real drift in either implementation
-    fails this test, not a future round.
-
-    Uses _pick_pwsh_anywhere (not the Windows-only _pick_powershell):
-    Test-AgenttalkAllowedInterpreterPrefixToken is pure string/array logic
-    with no OS-specific call in it, and pwsh is confirmed present on
-    ubuntu-latest and macos-latest runners too, so this agreement contract
-    is enforced on every CI leg, not just Windows."""
-    shell = _pick_pwsh_anywhere()
-    if not shell:
-        return
-    helpers = _exec_helpers(tmp_path)
-    out = tmp_path / "prefix_agreement.json"
-    tokens = [token for token, _expected in _PREFIX_TOKEN_AGREEMENT_TABLE]
-    harness = "\n".join([
-        "$ErrorActionPreference = 'Stop'",
-        helpers,
-        "$tokens = @(" + ",".join(_pslit(t) for t in tokens) + ")",
-        "$results = @($tokens | ForEach-Object { "
-        "Test-AgenttalkAllowedInterpreterPrefixToken $_ })",
-        "@{ results = $results } | ConvertTo-Json -Depth 3 | "
-        f"Set-Content {_pslit(str(out))} -Encoding utf8",
-    ])
-    script = tmp_path / "prefix-agreement.ps1"
-    script.write_text(harness, encoding="utf-8-sig")
-    result = subprocess.run(
-        [shell, "-NoProfile", "-File", str(script)],
-        capture_output=True, text=True, timeout=120,
-    )
-    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
-    data = json.loads(out.read_text(encoding="utf-8-sig"))
-    ps_results = data["results"]
-    assert len(ps_results) == len(tokens)
-    for (token, expected), ps_accept in zip(
-        _PREFIX_TOKEN_AGREEMENT_TABLE, ps_results, strict=True,
-    ):
-        py_accept = sup._allowed_interpreter_prefix_token(token)
-        assert py_accept == expected, (
-            f"Python classifies {token!r} as {py_accept}, expected {expected}"
-        )
-        assert ps_accept == expected, (
-            f"PowerShell classifies {token!r} as {ps_accept}, expected {expected}"
-        )
-        assert py_accept == ps_accept, (
-            f"Python and PowerShell DISAGREE on {token!r}: "
-            f"Python={py_accept}, PowerShell={ps_accept}"
-        )
-
-
-def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> None:
-    shell = _pick_powershell()
-    if not shell:
-        return
-    helpers = _exec_helpers(tmp_path)
-    out = tmp_path / "nonce_injection.json"
-    harness = "\n".join([
-        "$ErrorActionPreference = 'Stop'",
-        helpers,
-        f"$nonce = {_pslit(SUPERVISOR_NONCE)}",
-        "$py = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','R','wrap') $nonce",
-        "$console = Add-SupervisorLaunchNonce 'agenttalk.exe' @('--root','R','wrap') $nonce",
-        "$wait = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','R','wait') $nonce",
-        # PR 98 connector, supervisor.py:6483's class: argparse rejects
-        # 'WRAP' as an unrecognized subcommand - it must not be treated as
-        # 'wrap' here either, or the capability is granted to a launch the
-        # real CLI never actually executes.
-        "$upperCaseWrap = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-m','agenttalk','--root','R','WRAP') $nonce",
-        "$rootNamedWrap = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','wrap','wait') $nonce",
-        "$scriptPrefix = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('helper.py','-m','agenttalk','--root','R','wrap') $nonce",
-        "$commandPrefix = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-c','pass','-m','agenttalk','--root','R','wrap') $nonce",
-        # I2, mechanism change: the boundary between an interpreter-option
-        # prefix and the canonical module invocation is now a DECLARED FACT
-        # (module_args_from), not something inferred from the tokens. Two
-        # independent attempts to bound CPython's own grammar from argv text
-        # alone (a safe-flag allowlist, then an inverted unsafe-shape
-        # denylist) both leaked - -u/-X/-P undetected by the first, attached
-        # -c'...' forms and separate-value flags like --check-hash-based-pycs
-        # undetected by the second. Declaring the index sidesteps needing to
-        # recognize ANY interpreter flag, safe or unsafe, at all.
-        "$unbufferedDeclared = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-u','-m','agenttalk','--root','R','wrap') $nonce 1",
-        "$unbufferedUndeclared = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-u','-m','agenttalk','--root','R','wrap') $nonce",
-        "$xOptionDeclared = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-X','utf8','-m','agenttalk','--root','R','wrap') $nonce 2",
-        "$xAttachedDeclared = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-Xutf8','-m','agenttalk','--root','R','wrap') $nonce 1",
-        "$futureFlagDeclared = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-P','-m','agenttalk','--root','R','wrap') $nonce 1",
-        "$genericUnknownFlagDeclared = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-Z','-m','agenttalk','--root','R','wrap') $nonce 1",
-        "$attachedCommandDeclared = Add-SupervisorLaunchNonce 'python.exe' "
-        "@(\"-cprint(1)\",'-m','agenttalk','--root','R','wrap') $nonce 1",
-        # I2, 4th leak (connector re-review of 943cc28): a literal bare '-'
-        # (CPython's documented stdin dispatch) passed the old prefix
-        # filter - it starts with '-', so it matched none of -m/-c/--/bare.
-        "$bareStdinDeclared = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-','-m','agenttalk','--root','R','wrap') $nonce 1",
-        # Same round: module_args_from is operator-declared config, not
-        # argv - a malformed value ("1x") must fail soft (return -1) rather
-        # than throw under $ErrorActionPreference = 'Stop' and take the
-        # whole poll down over one agent's typo.
-        "$malformedDeclared = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-u','-m','agenttalk','--root','R','wrap') $nonce '1x'",
-        # Same round: PowerShell's default -eq is case-INSENSITIVE, so the
-        # position check itself must be case-sensitive too, not just the
-        # prefix allowlist - CPython's -m is not -M, and the module name it
-        # passes to the import system is exact. '-M','AGENTTALK' must not
-        # be treated as '-m','agenttalk'.
-        "$wrongCaseModule = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-M','AGENTTALK','--root','R','wrap') $nonce",
-        "$declaredOutOfRange = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-m','agenttalk','--root','R','wrap') $nonce 99",
-        "$optionTerminator = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('--','-m','agenttalk','--root','R','wrap') $nonce",
-        "$duplicate = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-m','agenttalk','--supervisor-launch-nonce','old','wrap') $nonce",
-        "$duplicateEq = Add-SupervisorLaunchNonce 'python.exe' "
-        "@('-m','agenttalk','--supervisor-launch-nonce=old','wrap') $nonce",
-        "$native = Add-SupervisorLaunchNonce 'codex.exe' @('exec') $nonce",
-        "@{ py = $py; console = $console; native = $native; "
-        "duplicate = $duplicate; duplicate_eq = $duplicateEq; "
-        "unbuffered_declared = $unbufferedDeclared; "
-        "unbuffered_undeclared = $unbufferedUndeclared; "
-        "x_option_declared = $xOptionDeclared; "
-        "x_attached_declared = $xAttachedDeclared; "
-        "future_flag_declared = $futureFlagDeclared; "
-        "generic_unknown_flag_declared = $genericUnknownFlagDeclared; "
-        "attached_command_declared = $attachedCommandDeclared; "
-        "bare_stdin_declared = $bareStdinDeclared; "
-        "malformed_declared = $malformedDeclared; "
-        "wrong_case_module = $wrongCaseModule; "
-        "declared_out_of_range = $declaredOutOfRange; "
-        "option_terminator = $optionTerminator; "
-        "py_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $py.argv $py); "
-        "console_wrap = (Test-AgenttalkWrapInvocation 'agenttalk.exe' $console.argv $console); "
-        "wait_wrap = (Test-AgenttalkWrapInvocation 'python.exe' $wait.argv $wait); "
-        "upper_case_wrap = $upperCaseWrap; "
-        "upper_case_wrap_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
-        "$upperCaseWrap.argv $upperCaseWrap); "
-        "script_prefix = $scriptPrefix; "
-        "script_prefix_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
-        "$scriptPrefix.argv $scriptPrefix); "
-        "command_prefix = $commandPrefix; "
-        "command_prefix_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
-        "$commandPrefix.argv $commandPrefix); "
-        "root_value_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
-        "$rootNamedWrap.argv $rootNamedWrap); "
-        "unbuffered_declared_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
-        "$unbufferedDeclared.argv $unbufferedDeclared 1); "
-        "unbuffered_undeclared_wrap = (Test-AgenttalkWrapInvocation 'python.exe' "
-        "$unbufferedUndeclared.argv $unbufferedUndeclared) } | ConvertTo-Json -Depth 6 | "
-        f"Set-Content {_pslit(str(out))} -Encoding utf8",
-    ])
-    hp = tmp_path / "nonce_injection.ps1"
-    hp.write_text(harness, encoding="utf-8-sig")
-    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
-                         capture_output=True, text=True, timeout=120)
-    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
-    data = json.loads(out.read_text(encoding="utf-8-sig"))
-    assert data["py"]["injected"] is True
-    assert data["py"]["argv"] == [
-        "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
-        "--root", "R", "wrap",
+    assert data["python"]["injected"] is True
+    assert data["python"]["argv"] == [
+        "-u", "-m", "agenttalk", "--supervisor-launch-nonce",
+        SUPERVISOR_NONCE, "--root", "R", "wrap", "--for", "worker",
+        "--loop", "--", "codex.exe", "", "tail",
     ]
-    assert data["console"]["injected"] is True
-    assert data["console"]["argv"] == [
-        "--supervisor-launch-nonce", SUPERVISOR_NONCE, "--root", "R", "wrap",
+    assert data["direct"]["injected"] is True
+    assert data["direct"]["argv"][:2] == [
+        "--supervisor-launch-nonce", SUPERVISOR_NONCE,
     ]
-    assert data["native"]["injected"] is False
-    assert data["native"]["missing_reason"] == "unsupported_launch_argv"
-    assert data["duplicate"]["injected"] is False
-    assert data["duplicate"]["missing_reason"] == "reserved_launch_nonce_present"
-    assert data["duplicate_eq"]["injected"] is False
-    assert data["duplicate_eq"]["missing_reason"] == "reserved_launch_nonce_present"
-    assert data["py_wrap"] is True
-    assert data["console_wrap"] is True
-    assert data["wait_wrap"] is False
-    # 'WRAP' is not 'wrap' to argparse - nonce injection succeeds (it does
-    # not care about the subcommand), but the wrap-invocation check itself
-    # must refuse it, exactly like the connector's supervisor.py:6483 finding.
-    assert data["upper_case_wrap"]["injected"] is True
-    assert data["upper_case_wrap_wrap"] is False
-    assert data["root_value_wrap"] is False
-    assert data["script_prefix"]["injected"] is False
-    assert data["script_prefix_wrap"] is False
-    assert data["command_prefix"]["injected"] is False
-    assert data["command_prefix_wrap"] is False
-    # I2, mechanism change (2 leaked attempts at re-deriving CPython's own
-    # option grammar from argv text: a safe-flag allowlist missed -u, -X,
-    # -P; the inverted unsafe-shape scan that replaced it missed attached
-    # -c'...' forms and separate-value flags). module_args_from is now a
-    # DECLARED fact from supervisor.json, not inferred - so -u/-X/-P/an
-    # arbitrary never-real flag/an attached -c form are all accepted when
-    # declared, with NO per-flag logic anywhere, and all REJECTED when not
-    # declared (proving inference is genuinely gone, not just widened).
-    assert data["unbuffered_declared"]["injected"] is True
-    assert data["unbuffered_declared"]["argv"] == [
-        "-u", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
-        "--root", "R", "wrap",
-    ]
-    assert data["unbuffered_undeclared"]["injected"] is False
-    assert data["unbuffered_undeclared"]["missing_reason"] == "unsupported_launch_argv"
-    # I2, FINAL gap: a bare/non-dash token in the declared prefix (here,
-    # -X's separate-token value "utf8") is CPython's third execution-mode
-    # dispatch too - a positional token makes CPython run it as a script
-    # and never reach -m, exactly like -c/-m do. It cannot be told apart
-    # from a genuine script-path hijack without re-solving "which flags
-    # consume a value" (round 4, deliberately not solved here), so it is
-    # refused. The attached form (x_attached_declared, below) is the
-    # supported way to declare a value-taking flag in the prefix.
-    assert data["x_option_declared"]["injected"] is False
-    assert data["x_option_declared"]["missing_reason"] == "unsupported_launch_argv"
-    assert data["x_attached_declared"]["injected"] is True
-    assert data["x_attached_declared"]["argv"] == [
-        "-Xutf8", "-m", "agenttalk", "--supervisor-launch-nonce",
-        SUPERVISOR_NONCE, "--root", "R", "wrap",
-    ]
-    assert data["future_flag_declared"]["injected"] is True
-    assert data["future_flag_declared"]["argv"] == [
-        "-P", "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
-        "--root", "R", "wrap",
-    ]
-    # I2, 5th leak: the mechanism inverted from a reject list to an allow
-    # list this round - an unrecognized flag is refused by default now,
-    # not accepted by default. -Z was never a real CPython flag; it is not
-    # on the allowlist, so it is refused like any other unrecognized token.
-    assert data["generic_unknown_flag_declared"]["injected"] is False
-    assert data["generic_unknown_flag_declared"]["missing_reason"] == "unsupported_launch_argv"
-    # I2, FINAL gap: declaring WHERE '-m agenttalk' sits proves the position,
-    # not that CPython ever reaches it. An attached -c'...' form in the
-    # declared prefix dispatches command-mode before scanning gets to the
-    # declared index, and the position check alone would still pass. The
-    # prefix must also contain no execution-mode token - this is refused.
-    assert data["attached_command_declared"]["injected"] is False
-    assert data["attached_command_declared"]["missing_reason"] == "unsupported_launch_argv"
-    # I2, 4th leak: '-' is CPython's documented stdin dispatch, not "a
-    # dash-prefixed non-execution-mode flag" - refused like -c/-m/--.
-    assert data["bare_stdin_declared"]["injected"] is False
-    assert data["bare_stdin_declared"]["missing_reason"] == "unsupported_launch_argv"
-    # A malformed module_args_from ("1x") fails soft to "not recognized"
-    # rather than throwing and taking the whole supervisor poll down.
-    assert data["malformed_declared"]["injected"] is False
-    assert data["malformed_declared"]["missing_reason"] == "unsupported_launch_argv"
-    # PowerShell's default -eq is case-insensitive; '-M','AGENTTALK' is not
-    # '-m','agenttalk' to CPython and must not be treated as if it were.
-    assert data["wrong_case_module"]["injected"] is False
-    assert data["wrong_case_module"]["missing_reason"] == "unsupported_launch_argv"
-    # A declared index that doesn't actually land on '-m agenttalk' (here,
-    # out of range) still fails closed - the declaration is verified, not
-    # blindly trusted.
-    assert data["declared_out_of_range"]["injected"] is False
-    assert data["declared_out_of_range"]["missing_reason"] == "unsupported_launch_argv"
-    # Without a declared index, a shape that determines execution mode is
-    # still correctly rejected too (index 0 is '--', never '-m') - not
-    # because it is specially recognized as unsafe anymore, but because it
-    # simply isn't '-m agenttalk' at the (default) position checked.
-    assert data["option_terminator"]["injected"] is False
-    assert data["option_terminator"]["missing_reason"] == "unsupported_launch_argv"
-    # The logging-eligibility helper must honor the SAME declared index as
-    # nonce injection - this is I1's third face again if it doesn't.
-    assert data["unbuffered_declared_wrap"] is True
-    assert data["unbuffered_undeclared_wrap"] is False
+    assert data["manual"]["injected"] is False
+    assert data["manual"]["argv"] == ["exec", "review"]
+    assert data["manual"]["missing_reason"] == "unsupported_launch_argv"
 
 
 @pytest.mark.parametrize(
@@ -8380,7 +8252,7 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     _windows_powershell_hosts(),
     ids=lambda value: Path(value).stem if value else "unavailable",
 )
-def test_ps_regular_wrapped_launch_requires_planned_loop_mode(
+def test_ps_regular_wrapped_launch_consumes_planned_loop_admission(
     tmp_path: Path,
     shell: str | None,
 ) -> None:
@@ -8425,10 +8297,26 @@ def test_ps_regular_wrapped_launch_requires_planned_loop_mode(
                 "windows_args": windows_args,
             },
         }
+        plan = {
+            "agents": {
+                "worker": {
+                    "action": sup.RELAUNCH,
+                    "launch_mode": "wrap",
+                    "session_args": [],
+                    "window_style": "Hidden",
+                    "window_style_warning": None,
+                },
+            },
+        }
+        sup.attach_regular_launch_admissions(
+            plan,
+            {"agents": {"worker": agent}},
+            root=tmp_path,
+        )
         cases.append({
             "label": label,
             "agent": agent,
-            "plan": sup._launch_detail({}, agent),
+            "plan": plan["agents"]["worker"],
             "expected_spawn": expected_spawn,
         })
 
@@ -8501,15 +8389,1281 @@ def test_ps_regular_wrapped_launch_requires_planned_loop_mode(
         if expected_spawn:
             assert row["warnings"] == [], row
         else:
-            assert row["warnings"] == [
-                "supervisor: worker: CONFIG ERROR - wrapped launch is missing "
-                "--loop; NOT launching (fail closed)"
-            ], row
+            warning = "\n".join(row["warnings"])
+            assert "launch admission refused" in warning, row
+            assert "wrapped launch requires --loop before the child delimiter" in warning, row
 
 
-def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
+def test_regular_plan_finalizer_emits_typed_normalized_argv(
     tmp_path: Path,
 ) -> None:
+    root = str(tmp_path)
+    row = {
+        "cli": "codex",
+        "wrapped": True,
+        "cwd": root,
+        "env": {"TAB\tNAME": "preserved"},
+        "launch": {
+            "windows_file": "python.exe",
+            "module_args_from": 0,
+            "windows_args": [
+                "-m", "agenttalk", "--root", "{ROOT}", "wrap",
+                "--for", "worker", "--cli", "codex", "--loop", "--",
+                "codex.exe", "alpha", "", "omega",
+            ],
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    result = sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=root,
+    )
+
+    artifact = result["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["population"] == "regular"
+    assert artifact["argv"] == [
+        "-m", "agenttalk", "--root", root, "wrap",
+        "--for", "worker", "--cli", "codex", "--loop", "--",
+        "codex.exe", "alpha", "", "omega",
+    ]
+    assert artifact["child_argv"] == ["codex.exe", "alpha", "", "omega"]
+    assert artifact["nonce_insert_at"] == 2
+
+
+def test_regular_plan_finalizer_binds_or_refuses_claude_session_identity(
+    tmp_path: Path,
+) -> None:
+    row = {
+        "cli": "claude",
+        "wrapped": False,
+        "cwd": str(tmp_path),
+        "launch": {
+            "windows_file": "claude.exe",
+            "windows_args": ["{SESSION_ARGS}"],
+        },
+    }
+
+    fresh_detail = sup._launch_detail({}, row)
+    fresh_plan = {
+        "agents": {"worker": {"action": sup.RELAUNCH, **fresh_detail}},
+    }
+    minted: list[str] = []
+
+    def mint() -> str:
+        minted.append("session-fresh")
+        return minted[-1]
+
+    sup.attach_regular_launch_admissions(
+        fresh_plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+        session_id_factory=mint,
+    )
+    fresh = fresh_plan["agents"]["worker"]
+    assert minted == ["session-fresh"]
+    assert fresh["session_id"] == "session-fresh"
+    assert fresh["launch_admission"]["status"] == "accepted"
+    assert "session-fresh" in fresh["launch_admission"]["argv"]
+    assert "{SESSION_ID}" not in fresh["launch_admission"]["argv"]
+
+    resume_detail = sup._launch_detail(
+        {"session_id": "session-existing", "resume_available": True},
+        row,
+    )
+    resume_plan = {
+        "agents": {"worker": {"action": sup.RELAUNCH, **resume_detail}},
+    }
+    sup.attach_regular_launch_admissions(
+        resume_plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+        session_id_factory=lambda: pytest.fail("resume must not mint a session id"),
+    )
+    resume = resume_plan["agents"]["worker"]
+    assert resume["launch_admission"]["status"] == "accepted"
+    assert "session-existing" in resume["launch_admission"]["argv"]
+
+    legacy_detail = sup._launch_detail({"launched": True}, row)
+    legacy_plan = {
+        "agents": {"worker": {"action": sup.RELAUNCH, **legacy_detail}},
+    }
+    sup.attach_regular_launch_admissions(
+        legacy_plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+        session_id_factory=lambda: pytest.fail("resume must not mint a session id"),
+    )
+    legacy = legacy_plan["agents"]["worker"]["launch_admission"]
+    assert legacy["status"] == "refused"
+    assert "session identity is unavailable" in legacy["reason"]
+    assert "argv" not in legacy
+
+
+def test_regular_plan_finalizer_preserves_literal_session_prompt_text(
+    tmp_path: Path,
+) -> None:
+    prompt = "Replace: explain the literal {AGENT} marker"
+    row = {
+        "cli": "claude",
+        "wrapped": False,
+        "cwd": str(tmp_path),
+        "launch": {
+            "windows_file": "claude.exe",
+            "windows_args": ["{SESSION_ARGS}"],
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "fresh",
+                "session_args": ["-p", prompt],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["argv"] == ["-p", prompt]
+
+
+@pytest.mark.parametrize(
+    ("workspace_args", "accepted"),
+    [
+        (["--add-dir=-foo"], True),
+        (["--add-dir", "-foo"], False),
+        (["--add-dir="], False),
+        (["--add-dir", ""], False),
+    ],
+    ids=[
+        "inline-option-like-value", "separate-option-like-value",
+        "empty-inline-value", "empty-separate-value",
+    ],
+)
+def test_regular_codex_workspace_option_matches_real_value_forms(
+    tmp_path: Path,
+    workspace_args: list[str],
+    accepted: bool,
+) -> None:
+    row = {
+        "cli": "codex",
+        "wrapped": True,
+        "cwd": str(tmp_path),
+        "launch": {
+            "windows_file": "python.exe",
+            "windows_args": [
+                "-m", "agenttalk", "wrap", "--for", "worker", "--loop",
+                "--", "codex.exe", *workspace_args,
+            ],
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert (artifact["status"] == "accepted") is accepted
+    if accepted:
+        assert artifact["child_argv"][-1] == "--add-dir=-foo"
+    else:
+        assert "workspace arguments are invalid" in artifact["reason"]
+
+
+def test_regular_plan_finalizer_preserves_argparse_last_occurrence(
+    tmp_path: Path,
+) -> None:
+    """The shared seam must not reject a launch the real parser accepts."""
+    args = [
+        "-m", "agenttalk", "wrap", "--for", "other", "--for", "worker",
+        "--cli", "claude", "--cli", "codex", "--loop", "--",
+        "codex.exe",
+    ]
+    row = {
+        "cli": "codex",
+        "wrapped": True,
+        "cwd": str(tmp_path),
+        "launch": {
+            "windows_file": "python.exe",
+            "windows_args": args,
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["argv"] == [
+        "-m", "agenttalk", "--root", str(tmp_path), *args[2:],
+    ]
+    assert artifact["module_args_from"] == 0
+
+
+@pytest.mark.parametrize(
+    "command_args",
+    [
+        ["-O", "-m", "agenttalk"],
+        ["-W", "default", "-m", "agenttalk"],
+        ["-uWdefault", "-m", "agenttalk"],
+        ["-X", "utf8", "-m", "agenttalk"],
+        ["-uXutf8", "-m", "agenttalk"],
+        ["-im", "agenttalk"],
+        ["-Omagenttalk"],
+    ],
+    ids=[
+        "optimization", "separate-warning", "clustered-warning",
+        "separate-xoption", "clustered-xoption", "clustered-module",
+        "attached-clustered-module",
+    ],
+)
+def test_python_selector_finds_agenttalk_after_real_interpreter_prefixes(
+    command_args: list[str],
+) -> None:
+    tail = ["wrap", "--for", "worker", "--loop", "--", "codex.exe"]
+
+    assert launch_admission.python_agenttalk_module_argv(
+        [*command_args, *tail],
+        program_kind="python",
+    ) == tuple(tail)
+
+
+@pytest.mark.parametrize(
+    "command_args",
+    [
+        ["-V", "-m", "agenttalk", "wrap"],
+        ["--help", "-m", "agenttalk", "wrap"],
+        ["-c", "print('ok')", "-m", "agenttalk", "wrap"],
+        ["helper.py", "-m", "agenttalk", "wrap"],
+        ["--", "-m", "agenttalk", "wrap"],
+        ["-", "-m", "agenttalk", "wrap"],
+    ],
+    ids=["version", "help", "command", "script", "delimiter", "stdin"],
+)
+def test_python_selector_stops_after_non_module_execution_target(
+    command_args: list[str],
+) -> None:
+    assert launch_admission.python_agenttalk_module_argv(
+        command_args,
+        program_kind="python",
+    ) is None
+
+
+def test_python_selector_accepts_py_launcher_selector() -> None:
+    tail = ("wrap", "--for", "worker", "--loop", "--", "codex.exe")
+
+    assert launch_admission.python_agenttalk_module_argv(
+        ["-3.14-64", "-m", "agenttalk", *tail],
+        program_kind="py",
+    ) == tail
+
+
+@pytest.mark.parametrize("listing_option", ["-0", "--list", "--list-paths"])
+def test_python_selector_stops_at_py_launcher_listing(
+    listing_option: str,
+) -> None:
+    assert launch_admission.python_agenttalk_module_argv(
+        [listing_option, "-m", "agenttalk", "wrap"],
+        program_kind="py",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "configured_root",
+    [
+        ["--roo", "D:/configured"],
+        ["--roo=D:/configured"],
+    ],
+)
+def test_regular_plan_finalizer_canonicalizes_valid_root_abbreviations(
+    tmp_path: Path,
+    configured_root: list[str],
+) -> None:
+    root = str(tmp_path)
+    row = {
+        "cli": "codex",
+        "wrapped": True,
+        "cwd": root,
+        "launch": {
+            "windows_file": "python.exe",
+            "module_args_from": 0,
+            "windows_args": [
+                "-m", "agenttalk", *configured_root, "wrap", "--for",
+                "worker", "--loop", "--", "codex.exe",
+            ],
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=root,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    argv = artifact["argv"]
+    root_tokens = [
+        argument
+        for argument in argv
+        if argument == "--root" or argument.startswith("--root=")
+    ]
+    assert len(root_tokens) == 1
+    if root_tokens[0] == "--root":
+        assert argv[argv.index("--root") + 1] == root
+    else:
+        assert root_tokens[0] == f"--root={root}"
+    assert not any(argument.startswith("--roo") and not argument.startswith("--root") for argument in argv)
+
+
+@pytest.mark.parametrize("configured_root", [[], ["--root", "D:/stale"]])
+def test_regular_plan_finalizer_pins_root_before_global_delimiter(
+    tmp_path: Path,
+    configured_root: list[str],
+) -> None:
+    root = str(tmp_path)
+    row = {
+        "cli": "codex",
+        "wrapped": True,
+        "cwd": root,
+        "launch": {
+            "windows_file": "python.exe",
+            "windows_args": [
+                "-m", "agenttalk", *configured_root, "--", "wrap", "--for",
+                "worker", "--loop", "--", "codex.exe",
+            ],
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=root,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    delimiter = artifact["argv"].index("--")
+    assert artifact["argv"][delimiter - 2:delimiter] == ["--root", root]
+
+
+def test_regular_plan_finalizer_does_not_invent_transport_bounds(
+    tmp_path: Path,
+) -> None:
+    """The shared seam models execution, not the old display-only bounds."""
+    root = str(tmp_path)
+    long_argument = "x" * 5000
+    child_arguments = [f"arg-{index}" for index in range(300)]
+    row = {
+        "cli": "codex",
+        "wrapped": True,
+        "cwd": root,
+        "env": {"N" * 5000: "preserved"},
+        "launch": {
+            "windows_file": "python.exe",
+            "module_args_from": 0,
+            "windows_args": [
+                "-m", "agenttalk", "--root", root, "wrap", "--for",
+                "worker", "--loop", "--", "codex.exe", long_argument,
+                "tab\targument", "line-one\nline-two", *child_arguments,
+            ],
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=root,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["child_argv"] == [
+        "codex.exe", long_argument, "tab\targument", "line-one\nline-two",
+        *child_arguments,
+    ]
+
+
+@pytest.mark.parametrize("irrelevant_index", [99, "junk", -1, True])
+def test_regular_manual_launch_discards_irrelevant_module_index(
+    tmp_path: Path,
+    irrelevant_index: object,
+) -> None:
+    row = {
+        "cli": "codex",
+        "wrapped": False,
+        "cwd": str(tmp_path),
+        "launch": {
+            "windows_file": "python.exe",
+            "windows_args": ["helper.py", "review"],
+            "module_args_from": irrelevant_index,
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "fresh",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["module_args_from"] is None
+
+
+def test_regular_empty_cwd_keeps_legacy_root_fallback(tmp_path: Path) -> None:
+    row = {
+        "cli": "codex",
+        "wrapped": False,
+        "cwd": "",
+        "launch": {
+            "windows_file": "codex.exe",
+            "windows_args": ["exec", "review"],
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "fresh",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["cwd"] == str(tmp_path)
+
+
+def test_regular_console_entry_wrap_discards_irrelevant_module_index(
+    tmp_path: Path,
+) -> None:
+    row = {
+        "cli": "codex",
+        "wrapped": True,
+        "cwd": str(tmp_path),
+        "launch": {
+            "windows_file": "agenttalk.exe",
+            "windows_args": [
+                "--root", str(tmp_path), "wrap", "--for", "worker",
+                "--loop", "--", "codex.exe",
+            ],
+            "module_args_from": 1,
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["module_args_from"] is None
+    assert artifact["nonce_insert_at"] == 0
+
+
+@pytest.mark.parametrize(
+    ("windows_file", "windows_args", "module_args_from"),
+    [
+        (
+            "agenttalk.exe",
+            ["wrap", "--unknown-wrapper-option", "--", "codex.exe"],
+            None,
+        ),
+        (
+            "python.exe",
+            [
+                "-m", "agenttalk", "wrap", "--unknown-wrapper-option",
+                "--", "codex.exe",
+            ],
+            0,
+        ),
+        (
+            "python.exe",
+            [
+                "-m", "agenttalk", "wrap", "--loop", "--for", "worker",
+                "--", "codex.exe",
+            ],
+            "bogus",
+        ),
+        (
+            "python.exe",
+            [
+                "-u", "-m", "agenttalk", "wrap", "--loop", "--for",
+                "worker", "--", "codex.exe",
+            ],
+            None,
+        ),
+        (
+            "python.exe",
+            [
+                "-O", "-m", "agenttalk", "wrap", "--loop", "--for",
+                "worker", "--", "codex.exe",
+            ],
+            None,
+        ),
+        (
+            "python.exe",
+            [
+                "-uWdefault", "-im", "agenttalk", "wrap", "--loop",
+                "--for", "worker", "--", "codex.exe",
+            ],
+            None,
+        ),
+        (
+            "py.exe",
+            [
+                "-3.14", "-m", "agenttalk", "wrap", "--loop", "--for",
+                "worker", "--", "codex.exe",
+            ],
+            None,
+        ),
+        (
+            "agenttalk.exe",
+            ["--", "wrap", "--unknown-wrapper-option", "--", "codex.exe"],
+            None,
+        ),
+    ],
+)
+def test_regular_manual_declaration_cannot_hide_a_refused_wrap_attempt(
+    tmp_path: Path,
+    windows_file: str,
+    windows_args: list[str],
+    module_args_from: object,
+) -> None:
+    row = {
+        "cli": "codex",
+        "wrapped": False,
+        "cwd": str(tmp_path),
+        "launch": {
+            "windows_file": windows_file,
+            "windows_args": windows_args,
+            "module_args_from": module_args_from,
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "fresh",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "refused"
+    assert (
+        "unrecognized arguments: --unknown-wrapper-option" in artifact["reason"]
+        or "wrapped launch declaration is missing" in artifact["reason"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("windows_file", "windows_args", "module_args_from"),
+    [
+        ("agenttalk.exe", ["send", "--to", "lead", "-m", "hello"], None),
+        (
+            "python.exe",
+            ["-m", "agenttalk", "send", "--to", "lead", "-m", "hello"],
+            0,
+        ),
+        (
+            "python.exe",
+            ["-u", "-m", "agenttalk", "send", "--to", "lead", "-m", "hello"],
+            "bogus",
+        ),
+        (
+            "python.exe",
+            ["-V", "-m", "agenttalk", "wrap", "--for", "worker"],
+            None,
+        ),
+        (
+            "python.exe",
+            ["helper.py", "-m", "agenttalk", "wrap", "--for", "worker"],
+            None,
+        ),
+    ],
+)
+def test_regular_manual_agenttalk_non_wrap_command_remains_valid(
+    tmp_path: Path,
+    windows_file: str,
+    windows_args: list[str],
+    module_args_from: object,
+) -> None:
+    row = {
+        "cli": "codex",
+        "wrapped": False,
+        "cwd": str(tmp_path),
+        "launch": {
+            "windows_file": windows_file,
+            "windows_args": windows_args,
+            "module_args_from": module_args_from,
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "fresh",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["wrapper_dispatch"] is False
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("unknown-wrapper-option", "unrecognized arguments: --mystery"),
+        ("cli-mismatch", "cli does not match"),
+        ("invalid-environment-name", "launch environment is invalid"),
+    ],
+)
+def test_regular_plan_finalizer_refuses_shared_admission_failures(
+    tmp_path: Path,
+    case: str,
+    reason: str,
+) -> None:
+    args = [
+        "-m", "agenttalk", "--root", "{ROOT}", "wrap",
+        "--for", "worker", "--cli", "codex", "--loop", "--",
+        "codex.exe",
+    ]
+    row = {
+        "cli": "codex",
+        "wrapped": True,
+        "cwd": str(tmp_path),
+        "env": {},
+        "launch": {
+            "windows_file": "python.exe",
+            "module_args_from": 0,
+            "windows_args": args,
+        },
+    }
+    if case == "unknown-wrapper-option":
+        args.insert(args.index("--loop"), "--mystery")
+    elif case == "cli-mismatch":
+        row["cli"] = "claude"
+    else:
+        row["env"] = {"BAD=NAME": "value"}
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert frozenset(artifact) == {
+        "schema_version", "status", "population", "agent", "reason",
+    }
+    assert artifact["status"] == "refused"
+    assert reason in artifact["reason"]
+
+
+def _launch_admission_runtime_blocks(tmp_path: Path) -> tuple[str, str, str]:
+    helpers = _exec_helpers(tmp_path)
+    quote_arg = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("# region quote-arg"):
+        sup.PS_TEMPLATE.index("# endregion quote-arg")
+    ]
+    launchers = sup.PS_TEMPLATE[
+        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# Console action log")
+    ]
+    return helpers, quote_arg, launchers
+
+
+@pytest.mark.parametrize(
+    "shell",
+    _windows_powershell_hosts(),
+    ids=lambda value: Path(value).stem if value else "unavailable",
+)
+def test_launchers_consume_accepted_admission_argv_without_dropping_empty_argument(
+    tmp_path: Path,
+    shell: str | None,
+) -> None:
+    """The typed artifact, not a second reconstruction, is executed.
+
+    Both populations carry a middle empty child argument.  The exact shipped
+    Quote-Arg path must serialize it as ``\"\"``; filtering the argv before
+    quoting or making Quote-Arg reject empty strings makes this control fail.
+    """
+    if shell is None:
+        pytest.skip("Windows PowerShell hosts are unavailable")
+    helpers, quote_arg, launchers = _launch_admission_runtime_blocks(tmp_path)
+    cwd = str(tmp_path)
+    launch_root = "R"
+    regular_argv = [
+        "-m", "agenttalk", "--root", launch_root, "wrap", "--for", "worker",
+        "--cli", "codex", "--loop", "--", "codex.exe", "alpha", "", "omega",
+    ]
+    ephemeral_argv = [
+        "-m", "agenttalk", "--root", launch_root, "wrap", "--for", "reviewer",
+        "--cli", "codex", "--from", "reviewer", "--loop", "--one-shot",
+        "--to-request", "R1",
+        "--", "codex.exe", "alpha", "", "omega",
+    ]
+    regular_config = {
+        "agents": {
+            "worker": {
+                "cli": "codex",
+                "wrapped": True,
+                "cwd": cwd,
+                "launch": {
+                    "windows_file": "python.exe",
+                    "windows_args": regular_argv,
+                    "module_args_from": 0,
+                },
+            },
+        },
+    }
+    regular_plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+    sup.attach_regular_launch_admissions(
+        regular_plan,
+        regular_config,
+        root=launch_root,
+    )
+    regular_artifact = regular_plan["agents"]["worker"]["launch_admission"]
+    assert regular_artifact["status"] == "accepted"
+    ephemeral_row = {
+        "cli": "codex",
+        "wrapped": True,
+        "cwd": cwd,
+        "launch": {
+            "windows_file": "python.exe",
+            "windows_args": ephemeral_argv,
+            "module_args_from": 0,
+        },
+    }
+    ephemeral_candidate, ephemeral_problem = sup._effective_launch_candidate(  # noqa: SLF001
+        ephemeral_row,
+        population="ephemeral",
+        agent="reviewer",
+        root=launch_root,
+        request_id="R1",
+    )
+    assert ephemeral_problem is None
+    assert ephemeral_candidate is not None
+    manual_plan = {
+        "agents": {
+            "manual": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "fresh",
+                "session_args": [],
+            },
+        },
+    }
+    manual_config = {
+        "agents": {
+            "manual": {
+                "cli": "codex",
+                "wrapped": False,
+                "cwd": cwd,
+                "launch": {
+                    "windows_file": "configured.exe",
+                    "windows_args": ["alpha", "", "omega"],
+                    "module_args_from": 99,
+                },
+            },
+        },
+    }
+    sup.attach_regular_launch_admissions(
+        manual_plan,
+        manual_config,
+        root=launch_root,
+    )
+    manual_artifact = manual_plan["agents"]["manual"]["launch_admission"]
+    assert manual_artifact["status"] == "accepted"
+    assert manual_artifact["module_args_from"] is None
+    payload = {
+        "regular": regular_artifact,
+        "ephemeral": ephemeral_candidate.artifact(),
+        "manual": manual_artifact,
+    }
+    output = tmp_path / "accepted-launch-admissions.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(launch_root)}",
+        "$AgenttalkPython = 'python.exe'",
+        "$SrcOnPyPath = $false",
+        "$WrapperLogMaxBytes = 1024",
+        "$WrapperLogSegments = 2",
+        "$WrapperLogEnvKeys = @()",
+        helpers,
+        quote_arg,
+        "$script:rows = @()",
+        "$script:caseName = $null",
+        "function Write-Warning { param([string]$Message) throw $Message }",
+        "function New-WrapperLogTargets($name, $nonce) { return $null }",
+        "function Discard-PendingWrapperLogTargets($targets) {}",
+        "function Proc-Start($id) { return '1' }",
+        "function Start-WrapperProcess($startArgs) {",
+        "  $script:rows += [pscustomobject]@{",
+        "    name = $script:caseName",
+        "    file = [string]$startArgs.FilePath",
+        "    cwd = [string]$startArgs.WorkingDirectory",
+        "    argument_line = [string]$startArgs.ArgumentList",
+        "  }",
+        "  return [pscustomobject]@{",
+        "    Process = [pscustomobject]@{ Id = 4242 }",
+        "    Redirected = $false",
+        "  }",
+        "}",
+        launchers,
+        f"$payload = ({_pslit(json.dumps(payload))} | ConvertFrom-Json)",
+        "$cfg = [pscustomobject]@{ agents = [pscustomobject]@{",
+        "  worker = [pscustomobject]@{ backend_profile = $null; env = $null }",
+        "  manual = [pscustomobject]@{ backend_profile = $null; env = $null }",
+        "} }",
+        "$plan = [pscustomobject]@{",
+        "  launch_mode = 'wrap'",
+        "  window_style = 'Hidden'",
+        "  window_style_warning = $null",
+        "  launch_admission = $payload.regular",
+        "}",
+        "$script:caseName = 'regular'",
+        "$regularResult = Launch 'worker' $plan $null",
+        "$spec = [pscustomobject]@{",
+        "  env = $null",
+        "  window_style = 'Hidden'",
+        "  window_style_warning = $null",
+        "  launch_admission = $payload.ephemeral",
+        "}",
+        "$script:caseName = 'ephemeral'",
+        "$ephemeralResult = Launch-Spec 'reviewer' $spec $null",
+        "$manualPlan = [pscustomobject]@{",
+        "  window_style = 'Hidden'",
+        "  window_style_warning = $null",
+        "  launch_admission = $payload.manual",
+        "}",
+        "$script:caseName = 'manual'",
+        "$manualResult = Launch 'manual' $manualPlan $null",
+        "[pscustomobject]@{",
+        "  rows = $script:rows",
+        "  regular_returned = ($null -ne $regularResult)",
+        "  ephemeral_returned = ($null -ne $ephemeralResult)",
+        "  manual_returned = ($null -ne $manualResult)",
+        "} | ConvertTo-Json -Depth 8 | "
+        f"Set-Content {_pslit(str(output))} -Encoding utf8",
+    ])
+    script = tmp_path / "accepted-launch-admissions.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    data = json.loads(output.read_text(encoding="utf-8-sig"))
+    assert data["regular_returned"] is True
+    assert data["ephemeral_returned"] is True
+    assert data["manual_returned"] is True
+    rows = {row["name"]: row for row in data["rows"]}
+    for name, admitted_argv in (
+        ("regular", regular_argv),
+        ("ephemeral", ephemeral_argv),
+    ):
+        row = rows[name]
+        assert row["file"] == "python.exe", row
+        assert row["cwd"] == cwd, row
+        serialized = row["argument_line"].split(" ")
+        assert serialized[:3] == [
+            "-m", "agenttalk", "--supervisor-launch-nonce",
+        ], row
+        assert re.fullmatch(r"[0-9a-f]{32}", serialized[3]), row
+        expected = [token if token else '\"\"' for token in admitted_argv]
+        assert serialized[4:] == expected[2:], row
+    manual_row = rows["manual"]
+    assert manual_row["file"] == "configured.exe"
+    assert manual_row["cwd"] == cwd
+    assert manual_row["argument_line"].split(" ") == ["alpha", '\"\"', "omega"]
+
+
+@pytest.mark.parametrize(
+    "shell",
+    _windows_powershell_hosts(),
+    ids=lambda value: Path(value).stem if value else "unavailable",
+)
+def test_launchers_refuse_unusable_admission_before_environment_or_spawn(
+    tmp_path: Path,
+    shell: str | None,
+) -> None:
+    """Missing, old, refused, and malformed artifacts fail before effects."""
+    if shell is None:
+        pytest.skip("Windows PowerShell hosts are unavailable")
+    helpers, quote_arg, launchers = _launch_admission_runtime_blocks(tmp_path)
+    cwd = str(tmp_path)
+    launch_root = "R"
+    accepted = {
+        "schema_version": 1,
+        "status": "accepted",
+        "population": "regular",
+        "agent": "worker",
+        "cli": "codex",
+        "wrapped": False,
+        "windows_file": "configured.exe",
+        "argv": ["configured", "launch"],
+        "cwd": cwd,
+        "module_args_from": None,
+        "wrapper_dispatch": False,
+        "nonce_insert_at": None,
+        "child_argv": [],
+    }
+    invalid_cases = [
+        {"label": "missing", "present": False, "admission": None},
+        {
+            "label": "old",
+            "present": True,
+            "admission": {**accepted, "schema_version": 0},
+        },
+        {
+            "label": "refused",
+            "present": True,
+            "admission": {
+                "schema_version": 1,
+                "status": "refused",
+                "population": "regular",
+                "agent": "worker",
+                "reason": "closed parser refused unknown option --mystery",
+            },
+        },
+        {
+            "label": "malformed",
+            "present": True,
+            "admission": {**accepted, "argv": "not-an-array"},
+        },
+    ]
+    output = tmp_path / "refused-launch-admissions.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(launch_root)}",
+        "$AgenttalkPython = 'python.exe'",
+        "$SrcOnPyPath = $false",
+        "$WrapperLogMaxBytes = 1024",
+        "$WrapperLogSegments = 2",
+        "$WrapperLogEnvKeys = @()",
+        helpers,
+        quote_arg,
+        "$script:rows = @()",
+        "$script:spawnCount = 0",
+        "$script:logTargetCount = 0",
+        "$script:envMutationCount = 0",
+        "$script:warnings = @()",
+        "function Write-Warning { param([string]$Message) "
+        "$script:warnings += $Message }",
+        "function Set-Item { param([string]$LiteralPath, [object]$Value) "
+        "$script:envMutationCount += 1 }",
+        "function New-WrapperLogTargets($name, $nonce) {",
+        "  $script:logTargetCount += 1",
+        "  return [pscustomobject]@{ stdout = 'stdout'; stderr = 'stderr' }",
+        "}",
+        "function Discard-PendingWrapperLogTargets($targets) {}",
+        "function Proc-Start($id) { return '1' }",
+        "function Start-WrapperProcess($startArgs) {",
+        "  $script:spawnCount += 1",
+        "  return [pscustomobject]@{",
+        "    Process = [pscustomobject]@{ Id = 4242 }",
+        "    Redirected = $false",
+        "  }",
+        "}",
+        launchers,
+        f"$cases = ({_pslit(json.dumps(invalid_cases))} | ConvertFrom-Json)",
+        "foreach ($population in @('regular','ephemeral')) {",
+        "  foreach ($case in @($cases)) {",
+        "    $script:spawnCount = 0",
+        "    $script:logTargetCount = 0",
+        "    $script:envMutationCount = 0",
+        "    $script:warnings = @()",
+        "    if ($population -ceq 'regular') {",
+        "      $cfg = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
+        "[pscustomobject]@{",
+        "        backend_profile = $null; cli = 'codex'; wrapped = $false;",
+        "        cwd = $Root; env = $null;",
+        "        launch = [pscustomobject]@{ windows_file = 'configured.exe'; "
+        "windows_args = @('configured','launch') }",
+        "      } } }",
+        "      $carrier = [pscustomobject]@{ launch_mode = 'fresh'; "
+        "window_style = 'Hidden'; window_style_warning = $null; "
+        "session_id = $null; session_args = @() }",
+        "      if ($case.present) { $carrier | Add-Member launch_admission "
+        "$case.admission -Force }",
+        "      $result = Launch 'worker' $carrier $null",
+        "    } else {",
+        "      $carrier = [pscustomobject]@{",
+        "        cli = 'codex'; cwd = $Root; env = $null;",
+        "        window_style = 'Hidden'; window_style_warning = $null;",
+        "        launch = [pscustomobject]@{",
+        "          windows_file = 'python.exe';",
+        "          windows_args = @('-m','agenttalk','--root',$Root,'wrap',",
+        "            '--for','reviewer','--cli','codex','--loop','--one-shot',",
+        "            '--to-request','R1','--','codex.exe')",
+        "        }",
+        "      }",
+        "      if ($case.present) {",
+        "        $ephemeralAdmission = $case.admission | Select-Object *",
+        "        $ephemeralAdmission.population = 'ephemeral'",
+        "        $ephemeralAdmission.agent = 'reviewer'",
+        "        $carrier | Add-Member launch_admission $ephemeralAdmission -Force",
+        "      }",
+        "      $result = Launch-Spec 'reviewer' $carrier $null",
+        "    }",
+        "    $script:rows += [pscustomobject]@{",
+        "      population = $population",
+        "      label = $case.label",
+        "      returned = ($null -ne $result)",
+        "      spawn_count = $script:spawnCount",
+        "      log_target_count = $script:logTargetCount",
+        "      env_mutation_count = $script:envMutationCount",
+        "      warnings = @($script:warnings)",
+        "    }",
+        "  }",
+        "}",
+        "$script:rows | ConvertTo-Json -Depth 8 | "
+        f"Set-Content {_pslit(str(output))} -Encoding utf8",
+    ])
+    script = tmp_path / "refused-launch-admissions.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    rows = json.loads(output.read_text(encoding="utf-8-sig"))
+    assert len(rows) == 8
+    for row in rows:
+        assert row["returned"] is False, row
+        assert row["spawn_count"] == 0, row
+        assert row["log_target_count"] == 0, row
+        assert row["env_mutation_count"] == 0, row
+        warnings = "\n".join(row["warnings"])
+        assert "launch admission" in warnings.casefold(), row
+        assert "not launching" in warnings.casefold(), row
+        if row["label"] == "refused":
+            assert "closed parser refused unknown option --mystery" in warnings, row
+
+
+@pytest.mark.parametrize(
+    "shell",
+    _windows_powershell_hosts(),
+    ids=lambda value: Path(value).stem if value else "unavailable",
+)
+def test_launch_admission_resolver_rejects_type_coercion_and_shape_drift(
+    tmp_path: Path,
+    shell: str | None,
+) -> None:
+    if shell is None:
+        pytest.skip("Windows PowerShell hosts are unavailable")
+    helpers = _exec_helpers(tmp_path)
+    accepted = _accepted_launch_artifact(
+        population="regular", agent="worker", cli="codex",
+        windows_file="configured.exe", argv=["alpha", "beta"],
+        cwd=str(tmp_path), wrapped=False,
+    )
+    refused = {
+        "schema_version": 1,
+        "status": "refused",
+        "population": "regular",
+        "agent": "worker",
+        "reason": "named refusal",
+    }
+    cases = {
+        "boolean-schema": {**accepted, "schema_version": True},
+        "numeric-status": {**accepted, "status": 7},
+        "numeric-population": {**accepted, "population": 7},
+        "numeric-agent": {**accepted, "agent": 7},
+        "numeric-cli": {**accepted, "cli": 7},
+        "numeric-executable": {**accepted, "windows_file": 7},
+        "numeric-cwd": {**accepted, "cwd": 7},
+        "numeric-refusal-reason": {**refused, "reason": 7},
+        "manual-module-index": {**accepted, "module_args_from": 0},
+        "extra-property": {**accepted, "unexpected": True},
+        "missing-property": {
+            key: value
+            for key, value in accepted.items()
+            if key != "child_argv"
+        },
+    }
+    out = tmp_path / "launch-admission-types.json"
+    script = tmp_path / "launch-admission-types.ps1"
+    script.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            helpers,
+            "$script:warnings = @()",
+            "function Write-Warning { param([string]$Message) "
+            "$script:warnings += $Message }",
+            f"$cases = ({_pslit(json.dumps(cases))} | ConvertFrom-Json)",
+            "$rows = @()",
+            "foreach ($property in $cases.PSObject.Properties) {",
+            "  $script:warnings = @()",
+            "  $result = Resolve-LaunchAdmission $property.Value 'worker' 'regular'",
+            "  $rows += [pscustomobject]@{",
+            "    name = $property.Name",
+            "    accepted = ($null -ne $result)",
+            "    warnings = @($script:warnings)",
+            "  }",
+            "}",
+            "$rows | ConvertTo-Json -Depth 5 | ",
+            f"  Set-Content {_pslit(str(out))} -Encoding utf8",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    rows = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert {row["name"] for row in rows} == set(cases)
+    for row in rows:
+        assert row["accepted"] is False, row
+        assert "not launching" in "\n".join(row["warnings"]).casefold(), row
+
+
+def test_supervisor_wrapper_logging_is_driven_by_typed_admission(
+    tmp_path: Path,
+) -> None:
+    """Only an accepted wrapper-dispatch artifact receives bounded logs."""
     shell = _pick_powershell()
     if not shell:
         return
@@ -8518,29 +9672,72 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         sup.PS_TEMPLATE.index("function Launch($name"):
         sup.PS_TEMPLATE.index("# Console action log")
     ]
-    out = tmp_path / "wrapper-logging-scope.json"
-    fake_stdout = tmp_path / "stdout.log"
-    fake_stderr = tmp_path / "stderr.log"
+    root = str(tmp_path)
+    wrapped_argv = [
+        "-m", "agenttalk", "--root", root, "wrap", "--for", "worker",
+        "--cli", "codex", "--loop", "--", "codex.exe",
+    ]
+    regular = _accepted_launch_artifact(
+        population="regular", agent="worker", cli="codex",
+        windows_file="python.exe", argv=wrapped_argv, cwd=root,
+        wrapped=True, module_args_from=0, nonce_insert_at=2,
+        child_argv=["codex.exe"],
+    )
+    manual = _accepted_launch_artifact(
+        population="regular", agent="manual", cli="codex",
+        windows_file="codex.exe", argv=["exec", "review"], cwd=root,
+        wrapped=False,
+    )
+    ephemeral = _accepted_launch_artifact(
+        population="ephemeral", agent="reviewer", cli="codex",
+        windows_file="python.exe",
+        argv=[
+            "-m", "agenttalk", "--root", root, "wrap", "--for", "reviewer",
+            "--cli", "codex", "--from", "reviewer", "--loop", "--one-shot",
+            "--to-request", "R1", "--", "codex.exe",
+        ],
+        cwd=root, wrapped=True, module_args_from=0, nonce_insert_at=2,
+        child_argv=["codex.exe"],
+    )
+    refused = {
+        "schema_version": 1,
+        "status": "refused",
+        "population": "ephemeral",
+        "agent": "blocked",
+        "reason": "closed parser refused an unknown wrapper option",
+    }
+    payload = {
+        "regular": regular,
+        "manual": manual,
+        "ephemeral": ephemeral,
+        "refused": refused,
+    }
+    out = tmp_path / "wrapper-logging-admission.json"
     harness = "\n".join([
         "$ErrorActionPreference = 'Stop'",
-        f"$Root = {_pslit(str(tmp_path))}",
+        f"$Root = {_pslit(root)}",
         "$AgenttalkPython = 'python.exe'",
         "$SrcOnPyPath = $false",
         f"$WrapperLogMaxBytes = {sup.WRAPPER_LOG_MAX_BYTES}",
         f"$WrapperLogSegments = {sup.WRAPPER_LOG_SEGMENT_COUNT}",
-        "$WrapperLogEnvKeys = @("
-        "'AGENTTALK_WRAPPER_STDOUT_LOG',"
-        "'AGENTTALK_WRAPPER_STDERR_LOG',"
-        "'AGENTTALK_WRAPPER_LOG_MAX_BYTES',"
-        "'AGENTTALK_WRAPPER_LOG_SEGMENTS',"
-        "'AGENTTALK_WRAPPER_LOG_NONCE')",
+        "$WrapperLogEnvKeys = @(",
+        "  'AGENTTALK_WRAPPER_STDOUT_LOG',",
+        "  'AGENTTALK_WRAPPER_STDERR_LOG',",
+        "  'AGENTTALK_WRAPPER_LOG_MAX_BYTES',",
+        "  'AGENTTALK_WRAPPER_LOG_SEGMENTS',",
+        "  'AGENTTALK_WRAPPER_LOG_NONCE')",
         helpers,
         "$script:rows = @()",
         "$script:caseName = $null",
+        "$script:targetCount = 0",
+        "$script:warnings = @()",
+        "function Write-Warning { param([string]$Message) "
+        "$script:warnings += $Message }",
         "function New-WrapperLogTargets($name, $nonce) {",
+        "  $script:targetCount += 1",
         "  return [pscustomobject]@{",
-        f"    stdout = {_pslit(str(fake_stdout))}",
-        f"    stderr = {_pslit(str(fake_stderr))}",
+        f"    stdout = {_pslit(str(tmp_path / 'stdout.log'))}",
+        f"    stderr = {_pslit(str(tmp_path / 'stderr.log'))}",
         f"    generation_dir = {_pslit(str(tmp_path / 'generation'))}",
         "    agent_name = $name",
         "  }",
@@ -8553,223 +9750,56 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
         "    name = $script:caseName",
         "    stdout_redirect = $startArgs.ContainsKey('RedirectStandardOutput')",
         "    stderr_redirect = $startArgs.ContainsKey('RedirectStandardError')",
-        "    nonce = [Environment]::GetEnvironmentVariable("
-        "'AGENTTALK_WRAPPER_LOG_NONCE')",
-        "    stdout_capability = [Environment]::GetEnvironmentVariable("
-        "'AGENTTALK_WRAPPER_STDOUT_LOG')",
-        "    has_argument_list = $startArgs.ContainsKey('ArgumentList')",
-        "    argument_line = [string]$startArgs.ArgumentList",
+        "    nonce = [Environment]::GetEnvironmentVariable(",
+        "      'AGENTTALK_WRAPPER_LOG_NONCE')",
         "  }",
-        "  return [pscustomobject]@{ "
-        "Process = [pscustomobject]@{ Id = 4242 }; Redirected = "
-        "($startArgs.ContainsKey('RedirectStandardOutput') -and "
-        "$startArgs.ContainsKey('RedirectStandardError')) }",
+        "  return [pscustomobject]@{",
+        "    Process = [pscustomobject]@{ Id = 4242 }",
+        "    Redirected = $startArgs.ContainsKey('RedirectStandardOutput')",
+        "  }",
         "}",
         launchers,
-        "function Invoke-RegularCase("
-        "[string]$label, [string]$file, [object[]]$argv, "
-        "[object]$wrapped, [string]$mode, $moduleArgsFrom = $null, "
-        "[bool]$wrappedLoopMode = $false) {",
-        "  $script:caseName = $label",
-        "  $agent = [pscustomobject]@{",
-        "    backend_profile = $null",
-        "    wrapped = $wrapped",
-        "    cwd = $Root",
-        "    env = $null",
-        "    launch = [pscustomobject]@{",
-        "      windows_file = $file",
-        "      windows_args = @($argv)",
-        "      module_args_from = $moduleArgsFrom",
-        "    }",
-        "  }",
-        "  $script:cfg = [pscustomobject]@{",
-        "    agents = [pscustomobject]@{ worker = $agent }",
-        "  }",
-        "  $plan = [pscustomobject]@{",
-        "    launch_mode = $mode",
-        "    window_style = 'Hidden'",
-        "    window_style_warning = $null",
-        "    session_id = $null",
-        "    session_args = @()",
-        "    wrapped_loop_mode = $wrappedLoopMode",
-        "  }",
-        "  $null = Launch 'worker' $plan $null",
-        "}",
-        "function Invoke-RegularArgBoundaryCase([string]$label, [string]$shape) {",
-        "  $script:caseName = $label",
-        "  $launch = [pscustomobject]@{",
-        "    windows_file = 'dummy.exe'",
-        "    module_args_from = $null",
-        "  }",
-        "  $wrapped = $false",
-        "  $mode = 'fresh'",
-        "  if ($shape -eq 'absent') {",
-        "    $wrapped = $true",
-        "    $mode = 'wrap'",
-        "  } elseif ($shape -eq 'malformed') {",
-        "    $wrapped = $true",
-        "    $mode = 'wrap'",
-        "    $launch | Add-Member -NotePropertyName windows_args "
-        "-NotePropertyValue 'not-an-array'",
-        "  } elseif ($shape -eq 'valid-empty') {",
-        "    $launch | Add-Member -NotePropertyName windows_args "
-        "-NotePropertyValue @()",
-        "  } elseif ($shape -eq 'one') {",
-        "    $launch | Add-Member -NotePropertyName windows_args "
-        "-NotePropertyValue @('alpha')",
-        "  } elseif ($shape -eq 'many') {",
-        "    $launch | Add-Member -NotePropertyName windows_args "
-        "-NotePropertyValue @('alpha','beta')",
-        "  } else {",
-        "    throw ('unknown boundary shape: ' + $shape)",
-        "  }",
-        "  $agent = [pscustomobject]@{",
-        "    backend_profile = $null",
-        "    wrapped = $wrapped",
-        "    cwd = $Root",
-        "    env = $null",
-        "    launch = $launch",
-        "  }",
-        "  $script:cfg = [pscustomobject]@{",
-        "    agents = [pscustomobject]@{ worker = $agent }",
-        "  }",
-        "  $plan = [pscustomobject]@{",
-        "    launch_mode = $mode",
-        "    window_style = 'Hidden'",
-        "    window_style_warning = $null",
-        "    session_id = $null",
-        "    session_args = @()",
-        "  }",
-        "  $null = Launch 'worker' $plan $null",
-        "}",
-        "function Invoke-EphemeralCase("
-        "[string]$label, [string]$file, [object[]]$argv) {",
-        "  $script:caseName = $label",
-        "  $spec = [pscustomobject]@{",
-        "    cwd = $Root",
-        "    env = $null",
-        "    window_style = 'Hidden'",
-        "    window_style_warning = $null",
-        "    launch = [pscustomobject]@{",
-        "      windows_file = $file",
-        "      windows_args = @($argv)",
-        "    }",
-        "  }",
-        "  $null = Launch-Spec 'reviewer' $spec $null",
-        "}",
-        "$env:AGENTTALK_WRAPPER_LOG_NONCE = 'ambient-nonce'",
-        "$env:AGENTTALK_WRAPPER_STDOUT_LOG = 'ambient-stdout'",
-        "Invoke-RegularCase 'regular_python_wrap' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--loop','--','codex.exe') "
-        "$true 'wrap' $null $true",
-        # Round 23: these no longer get a special not-logged answer - the
-        # supervisor stopped predicting whether argparse would actually
-        # reach cmd_wrap (that probe is deleted; see Launch's own comment).
-        # $shouldLog only checks that the token is literally 'wrap', so
-        # logging IS set up for these too; whether the wrapper ever
-        # confirms the generation is now entirely up to what actually
-        # happens when it runs - --help/a parse-invalid tail both exit
-        # before ever authenticating, so the generation stays .pending,
-        # never .committed, and is preserved rather than evicting real
-        # evidence (see New-WrapperLogTargets/Invoke-WrapperLogRetentionPrune).
-        "Invoke-RegularCase 'regular_wrap_help' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--loop','--help','--','codex.exe') "
-        "$true 'wrap' $null $true",
-        "Invoke-RegularCase 'regular_wrap_invalid_flag' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--loop','--nonexistent-flag','--','codex.exe') "
-        "$true 'wrap' $null $true",
-        "Invoke-RegularCase 'regular_unbuffered_wrap' 'python.exe' "
-        "@('-u','-m','agenttalk','wrap','--for','worker','--loop','--','codex.exe') "
-        "$true 'wrap' 1 $true",
-        "Invoke-RegularCase 'regular_xoption_wrap' 'python.exe' "
-        "@('-X','utf8','-m','agenttalk','wrap','--for','worker') $true 'wrap' 2",
-        "Invoke-RegularCase 'regular_no_args' 'python.exe' @() $true 'wrap'",
-        "Invoke-RegularCase 'regular_script_prefix' 'python.exe' "
-        "@('helper.py','-m','agenttalk','wrap') $true 'wrap'",
-        "Invoke-RegularCase 'regular_command_prefix' 'python.exe' "
-        "@('-c','pass','-m','agenttalk','wrap') $true 'wrap'",
-        "Invoke-RegularCase 'regular_wait' 'python.exe' "
-        "@('-m','agenttalk','wait') $true 'wrap'",
-        "Invoke-RegularCase 'regular_not_wrapped' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--','codex.exe') $false 'wrap'",
-        "Invoke-RegularCase 'regular_not_wrap_mode' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--loop','--','codex.exe') "
-        "$true 'fresh' $null $true",
-        "Invoke-RegularCase 'regular_wrong_agent' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','other','--','codex.exe') $true 'wrap'",
-        "Invoke-RegularCase 'regular_duplicate_agent' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--for','other','--','codex.exe') $true 'wrap'",
-        "Invoke-RegularCase 'regular_truthy_wrong_agent' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','other','--','codex.exe') 'true' 'wrap'",
-        "Invoke-RegularCase 'regular_non_agenttalk_entry' 'codex.exe' "
-        "@('wrap','--for','worker') $true 'wrap'",
-        "Invoke-RegularCase 'regular_python_without_module' 'python.exe' "
-        "@('wrap','--for','worker') $true 'wrap'",
-        "Invoke-RegularCase 'regular_for_in_remainder' 'python.exe' "
-        "@('-m','agenttalk','wrap','codex.exe','--for','worker') $true 'wrap'",
-        "Invoke-RegularCase 'regular_false_wrap_dispatch' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','other','--','codex.exe') $false 'wrap'",
-        "Invoke-RegularCase 'regular_manual_literal_wrap' 'codex.exe' "
-        "@('--mode','wrap','--literal') $false 'fresh'",
-        "Invoke-RegularCase 'regular_manual_no_args' 'dummy.exe' @() $false 'fresh'",
-        "Invoke-RegularArgBoundaryCase 'args_absent' 'absent'",
-        "Invoke-RegularArgBoundaryCase 'args_malformed' 'malformed'",
-        "Invoke-RegularArgBoundaryCase 'args_valid_empty' 'valid-empty'",
-        "Invoke-RegularArgBoundaryCase 'args_one' 'one'",
-        "Invoke-RegularArgBoundaryCase 'args_many' 'many'",
-        "Invoke-RegularCase 'regular_empty_cli_tail' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--') $true 'wrap'",
-        "Invoke-RegularCase 'regular_option_cli_tail' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--','--bad') $true 'wrap'",
-        "Invoke-RegularCase 'regular_positional_before_tail' 'python.exe' "
-        "@('-m','agenttalk','wrap','codex.exe','--for','worker','--','codex.exe') $true 'wrap'",
-        "Invoke-RegularCase 'regular_option_as_value' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--model','--loop','--','codex.exe') $true 'wrap'",
-        "Invoke-RegularCase 'regular_empty_option_value' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','worker','--model','','--','codex.exe') $true 'wrap'",
-        "Invoke-RegularCase 'regular_invalid_global_value' 'python.exe' "
-        "@('-m','agenttalk','--root','--','wrap','--for','worker','--','codex.exe') $true 'wrap'",
-        "Invoke-RegularCase 'regular_wrong_root' 'python.exe' "
-        "@('-m','agenttalk','--root','D:\\other','wrap','--for','worker','--loop','--','codex.exe') "
-        "$true 'wrap' $null $true",
-        "Invoke-RegularCase 'regular_duplicate_root' 'python.exe' "
-        "@('-m','agenttalk','--root','D:\\one','--root=D:\\two','wrap','--for','worker','--','codex.exe') $true 'wrap'",
-        "Invoke-EphemeralCase 'ephemeral_python_wrap' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','reviewer','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_console_wrap' 'agenttalk.exe' "
-        "@('wrap','--for','reviewer','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_wrong_agent' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','other','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_duplicate_agent' 'agenttalk.exe' "
-        "@('wrap','--for','reviewer','--for','other','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_for_in_remainder' 'python.exe' "
-        "@('-m','agenttalk','wrap','codex.exe','--for','reviewer')",
-        "Invoke-EphemeralCase 'ephemeral_empty_cli_tail' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','reviewer','--')",
-        "Invoke-EphemeralCase 'ephemeral_option_cli_tail' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','reviewer','--','--bad')",
-        "Invoke-EphemeralCase 'ephemeral_positional_before_tail' 'python.exe' "
-        "@('-m','agenttalk','wrap','codex.exe','--for','reviewer','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_option_as_value' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','reviewer','--model','--loop','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_empty_option_value' 'python.exe' "
-        "@('-m','agenttalk','wrap','--for','reviewer','--model','','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_invalid_global_value' 'python.exe' "
-        "@('-m','agenttalk','--root','--','wrap','--for','reviewer','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_wrong_root' 'python.exe' "
-        "@('-m','agenttalk','--root','D:\\other','wrap','--for','reviewer','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_duplicate_root' 'python.exe' "
-        "@('-m','agenttalk','--root','D:\\one','--root=D:\\two','wrap','--for','reviewer','--','codex.exe')",
-        "Invoke-EphemeralCase 'ephemeral_no_args' 'python.exe' @()",
-        "Invoke-EphemeralCase 'ephemeral_script_prefix' 'python.exe' "
-        "@('helper.py','-m','agenttalk','wrap')",
-        "Invoke-EphemeralCase 'ephemeral_command_prefix' 'python.exe' "
-        "@('-c','pass','-m','agenttalk','wrap')",
-        "Invoke-EphemeralCase 'ephemeral_wait' 'agenttalk.exe' @('wait')",
-        "$script:rows | ConvertTo-Json -Depth 5 | "
-        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+        f"$payload = ({_pslit(json.dumps(payload))} | ConvertFrom-Json)",
+        "$cfg = [pscustomobject]@{ agents = [pscustomobject]@{",
+        "  worker = [pscustomobject]@{ backend_profile = $null; env = $null }",
+        "  manual = [pscustomobject]@{ backend_profile = $null; env = $null }",
+        "} }",
+        "$script:caseName = 'regular'",
+        "$null = Launch 'worker' ([pscustomobject]@{",
+        "  launch_admission = $payload.regular",
+        "  launch_mode = 'wrap'",
+        "  window_style = 'Hidden'",
+        "  window_style_warning = $null",
+        "}) $null",
+        "$script:caseName = 'manual'",
+        "$null = Launch 'manual' ([pscustomobject]@{",
+        "  launch_admission = $payload.manual",
+        "  launch_mode = 'fresh'",
+        "  window_style = 'Hidden'",
+        "  window_style_warning = $null",
+        "}) $null",
+        "$script:caseName = 'ephemeral'",
+        "$null = Launch-Spec 'reviewer' ([pscustomobject]@{",
+        "  launch_admission = $payload.ephemeral",
+        "  env = $null",
+        "  window_style = 'Hidden'",
+        "  window_style_warning = $null",
+        "}) $null",
+        "$script:caseName = 'refused'",
+        "$null = Launch-Spec 'blocked' ([pscustomobject]@{",
+        "  launch_admission = $payload.refused",
+        "  env = $null",
+        "  window_style = 'Hidden'",
+        "  window_style_warning = $null",
+        "}) $null",
+        "[pscustomobject]@{",
+        "  rows = $script:rows",
+        "  target_count = $script:targetCount",
+        "  warnings = $script:warnings",
+        "} | ConvertTo-Json -Depth 6 | ",
+        f"  Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
-    script = tmp_path / "wrapper-logging-scope.ps1"
+    script = tmp_path / "wrapper-logging-admission.ps1"
     script.write_text(harness, encoding="utf-8-sig")
 
     result = subprocess.run(
@@ -8780,68 +9810,21 @@ def test_supervisor_wrapper_logging_scope_matrix_drives_both_launchers(
     )
 
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
-    rows = json.loads(out.read_text(encoding="utf-8-sig"))
-    # Finding A (PR 98 connector re-review, head 6495534): the nonce-injection
-    # fix for `-u`/`-X utf8` was applied to Add-SupervisorLaunchNonce but not
-    # to Test-AgenttalkWrapInvocation, so a valid `python -u -m agenttalk
-    # wrap` config got a nonce but no bounded log generation at all -
-    # regular_unbuffered_wrap drives that decision through the REAL Launch
-    # function, not just the nonce helper directly.
-    #
-    # I2, FINAL gap: regular_xoption_wrap's prefix ('-X','utf8', declared
-    # index 2) is now REFUSED, not logged - "utf8" is a bare/non-dash token,
-    # indistinguishable from a script-path execution-mode hijack without
-    # re-solving "which flags consume a value" (round 4, not solved here).
-    # See test_supervisor_launch_nonce_injection_powershell_helper's
-    # x_option_declared case for the same call.
-    expected_logged = {
-        "regular_python_wrap",
-        "regular_wrap_help",
-        "regular_wrap_invalid_flag",
-        "regular_unbuffered_wrap",
-        "regular_wrong_root",
-        "ephemeral_python_wrap",
-        "ephemeral_console_wrap",
-        "ephemeral_wrong_root",
-    }
-    assert {row["name"] for row in rows} == {
-        "regular_python_wrap",
-        "regular_wrap_help",
-        "regular_wrap_invalid_flag",
-        "regular_unbuffered_wrap",
-        "regular_not_wrap_mode",
-        "regular_wrong_root",
-        "regular_manual_literal_wrap",
-        "regular_manual_no_args",
-        "args_valid_empty",
-        "args_one",
-        "args_many",
-        "ephemeral_python_wrap",
-        "ephemeral_console_wrap",
-        "ephemeral_wrong_root",
-    }
-    for row in rows:
-        should_log = row["name"] in expected_logged
-        assert row["stdout_redirect"] is should_log, row
-        assert row["stderr_redirect"] is should_log, row
-        assert bool(row["nonce"]) is should_log, row
-        assert bool(row["stdout_capability"]) is should_log, row
-        if row["name"] in {"regular_wrong_root", "ephemeral_wrong_root"}:
-            assert str(tmp_path) in row["argument_line"], row
-            assert r"D:\other" not in row["argument_line"], row
-        if row["name"] == "regular_manual_literal_wrap":
-            assert row["argument_line"] == "--mode wrap --literal"
-        if row["name"] == "regular_manual_no_args":
-            assert row["argument_line"] == ""
-            assert row["has_argument_list"] is False
-    boundary = {row["name"]: row for row in rows if row["name"].startswith("args_")}
-    assert set(boundary) == {"args_valid_empty", "args_one", "args_many"}
-    assert boundary["args_valid_empty"]["has_argument_list"] is False
-    assert boundary["args_valid_empty"]["argument_line"] == ""
-    assert boundary["args_one"]["has_argument_list"] is True
-    assert boundary["args_one"]["argument_line"] == "alpha"
-    assert boundary["args_many"]["has_argument_list"] is True
-    assert boundary["args_many"]["argument_line"] == "alpha beta"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
+    rows = {row["name"]: row for row in data["rows"]}
+    assert set(rows) == {"regular", "manual", "ephemeral"}
+    assert rows["regular"]["stdout_redirect"] is True
+    assert rows["regular"]["stderr_redirect"] is True
+    assert re.fullmatch(r"[0-9a-f]{32}", rows["regular"]["nonce"])
+    assert rows["ephemeral"]["stdout_redirect"] is True
+    assert rows["ephemeral"]["stderr_redirect"] is True
+    assert re.fullmatch(r"[0-9a-f]{32}", rows["ephemeral"]["nonce"])
+    assert rows["manual"]["stdout_redirect"] is False
+    assert rows["manual"]["stderr_redirect"] is False
+    assert rows["manual"]["nonce"] is None
+    assert data["target_count"] == 2
+    warnings = "\n".join(data["warnings"])
+    assert "closed parser refused an unknown wrapper option" in warnings
 
 
 def test_ps_start_wrapper_process_fallback_strips_logging_env_vars(
@@ -9184,10 +10167,8 @@ def test_ps_launch_discards_targets_when_fallback_is_unredirected(
     if not shell:
         return
     ps = sup.PS_TEMPLATE
-    # One contiguous slice: exec-helpers (argv parsing, nonce injection) through
-    # Launch/Launch-Spec themselves - Resolve-AgenttalkModuleFlagIndex,
-    # Add-SupervisorLaunchNonce, and Test-AgenttalkWrapInvocation all live in
-    # exec-helpers, BEFORE the wrapper-log-helpers region starts.
+    # One contiguous slice: typed admission helpers through Launch/Launch-Spec,
+    # before the console-action region starts.
     helpers = ps[
         ps.index("# region exec-helpers"):
         ps.index("# Console action log")
@@ -9195,6 +10176,16 @@ def test_ps_launch_discards_targets_when_fallback_is_unredirected(
     log_root = tmp_path / "logs"
     agent_leaf = _wrapper_log_agent_dir("worker")
     result_path = tmp_path / "fallback-commit.json"
+    launch_argv = [
+        "-m", "agenttalk", "--root", str(tmp_path), "wrap", "--for",
+        "worker", "--cli", "codex", "--loop", "--", "codex.exe",
+    ]
+    admission = _accepted_launch_artifact(
+        population="regular", agent="worker", cli="codex",
+        windows_file="python.exe", argv=launch_argv, cwd=str(tmp_path),
+        wrapped=True, module_args_from=0, nonce_insert_at=2,
+        child_argv=["codex.exe"],
+    )
     rows: list[str] = [
         "$ErrorActionPreference = 'Stop'",
         f"$Root = {_pslit(str(tmp_path))}",
@@ -9223,9 +10214,10 @@ def test_ps_launch_discards_targets_when_fallback_is_unredirected(
         "windows_file = 'python.exe'; windows_args = @('-m','agenttalk','wrap',"
         "'--for','worker','--loop','--','codex.exe') } }",
         "$cfg = [pscustomobject]@{ agents = [pscustomobject]@{ worker = $agent } }",
+        f"$admission = ({_pslit(json.dumps(admission))} | ConvertFrom-Json)",
         "$plan = [pscustomobject]@{ launch_mode = 'wrap'; window_style = 'Hidden'; "
         "window_style_warning = $null; session_id = $null; session_args = @(); "
-        "wrapped_loop_mode = $true }",
+        "launch_admission = $admission }",
         "$out = Launch 'worker' $plan $null",
         f"$agentDir = Join-Path {_pslit(str(log_root))} {_pslit(agent_leaf)}",
         "$dirs = if (Test-Path -LiteralPath $agentDir) { "
@@ -9257,71 +10249,6 @@ def test_ps_launch_discards_targets_when_fallback_is_unredirected(
     )
 
 
-def test_wrapped_launch_helper_pins_root_before_wrap_for_legacy_configs(tmp_path: Path) -> None:
-    shell = _pick_powershell()
-    if not shell:
-        return
-    helpers = _exec_helpers(tmp_path)
-    out = tmp_path / "wrap_root.json"
-    harness = "\n".join([
-        "$ErrorActionPreference = 'Stop'",
-        f"$Root = {_pslit(str(tmp_path))}",
-        helpers,
-        "$legacyPy = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','wrap',"
-        "'--for','Cygnus','--cli','codex','--loop','--','codex.exe')",
-        "$legacyConsole = Ensure-AgenttalkWrapRootArg @('wrap','--for',"
-        "'Altair','--cli','codex','--loop','--','codex.exe')",
-        "$alreadyRooted = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','--root','R','wrap','--for','Vega','--loop')",
-        "$alreadyRootedInline = Ensure-AgenttalkWrapRootArg "
-        "@('-m','agenttalk','--root=R','wrap','--for','Vega','--loop')",
-        "$duplicateRoot = Ensure-AgenttalkWrapRootArg "
-        "@('-m','agenttalk','--root','R','--root=R2','wrap','--for','Vega','--loop')",
-        "$nonWrap = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','wait','--for','Cygnus')",
-        # Case-sensitivity sweep (PR 98 connector, supervisor.py:6483's
-        # class): argparse would reject 'WRAP'/'--ROOT' as unrecognized -
-        # this helper must not treat them as the real 'wrap'/'--root'
-        # either, or it backfills --root into argv the CLI would refuse.
-        "$upperCaseWrap = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','WRAP','--for','Cygnus')",
-        "$upperCaseRootAlreadyPresent = Ensure-AgenttalkWrapRootArg "
-        "@('-m','agenttalk','--ROOT','R','wrap','--for','Vega')",
-        "@{ legacyPy = $legacyPy; legacyConsole = $legacyConsole; "
-        "alreadyRooted = $alreadyRooted; nonWrap = $nonWrap; "
-        "alreadyRootedInline = $alreadyRootedInline; duplicateRoot = $duplicateRoot; "
-        "upperCaseWrap = $upperCaseWrap; "
-        "upperCaseRootAlreadyPresent = $upperCaseRootAlreadyPresent } | ConvertTo-Json -Depth 6 | "
-        f"Set-Content {_pslit(str(out))} -Encoding utf8",
-    ])
-    hp = tmp_path / "wrap_root.ps1"
-    hp.write_text(harness, encoding="utf-8-sig")
-    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
-                         capture_output=True, text=True, timeout=120)
-    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
-    data = json.loads(out.read_text(encoding="utf-8-sig"))
-    assert data["legacyPy"][:5] == ["-m", "agenttalk", "--root", str(tmp_path), "wrap"]
-    assert data["legacyConsole"][:3] == ["--root", str(tmp_path), "wrap"]
-    assert data["alreadyRooted"][:5] == [
-        "-m", "agenttalk", "--root", str(tmp_path), "wrap",
-    ]
-    assert data["alreadyRootedInline"][:4] == [
-        "-m", "agenttalk", f"--root={tmp_path}", "wrap",
-    ]
-    assert data["duplicateRoot"] is None
-    assert data["nonWrap"] == ["-m", "agenttalk", "wait", "--for", "Cygnus"]
-    # 'WRAP' is not 'wrap' to argparse - no insertion point is found, so
-    # the argv passes through unchanged (not backfilled as if it matched).
-    assert data["upperCaseWrap"] == ["-m", "agenttalk", "WRAP", "--for", "Cygnus"]
-    # '--ROOT' is not '--root' to argparse either - the scan does not
-    # recognize it as already having a root, but it also does not
-    # mis-detect the literal lowercase 'wrap' three tokens later as
-    # something to insert before without a root, since one search finds
-    # 'wrap' as the insertion point and inserts --root before it
-    # regardless of the (unrecognized) '--ROOT' token earlier - proving
-    # the '--ROOT' token was correctly NOT treated as already covering it.
-    assert data["upperCaseRootAlreadyPresent"][:6] == [
-        "-m", "agenttalk", "--ROOT", "R", "--root", str(tmp_path),
-    ]
-
-
 def test_launch_rechecks_kill_switch_after_branch_guard(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
@@ -9333,6 +10260,13 @@ def test_launch_rechecks_kill_switch_after_branch_guard(tmp_path: Path) -> None:
     start = text.index("function Launch($name")
     end = text.index("function Launch-Spec", start)
     launch_fn = text[start:end]
+    admission_helpers = text[
+        text.index("# region launch-admission-helpers"):start
+    ]
+    admission = _accepted_launch_artifact(
+        population="regular", agent="worker", cli="codex",
+        windows_file="dummy.exe", argv=[], cwd=str(tmp_path), wrapped=False,
+    )
     out = tmp_path / "launch_guard.json"
     harness = "\n".join([
         "$ErrorActionPreference = 'Stop'",
@@ -9348,9 +10282,11 @@ def test_launch_rechecks_kill_switch_after_branch_guard(tmp_path: Path) -> None:
         "$AgenttalkPython = 'python'; $SrcOnPyPath = $false",
         "$branchOk = Assert-ActionsEnabled 'branch guard'",
         "New-Item -ItemType File -Force -Path $KillSwitchPath | Out-Null",
+        admission_helpers,
         launch_fn,
+        f"$admission = ({_pslit(json.dumps(admission))} | ConvertFrom-Json)",
         "$plan = [pscustomobject]@{ session_id = $null; session_args = @(); "
-        "launch_mode = 'fresh' }",
+        "launch_mode = 'fresh'; launch_admission = $admission }",
         "$res = Launch 'worker' $plan $null",
         f"@{{ branchOk = $branchOk; resultIsNull = ($null -eq $res); "
         f"killExists = (Test-Path $KillSwitchPath) }} | ConvertTo-Json | "
@@ -11655,49 +12591,6 @@ def test_wrapped_launch_detail_has_no_session_args() -> None:
                                {"cli": cli_name, "wrapped": True})
         assert d["launch_mode"] == "wrap" and d["resume_mode"] == "wrap"
         assert d["session_args"] == [] and d["session_id"] is None
-
-
-@pytest.mark.parametrize(
-    ("windows_args", "expected"),
-    [
-        (
-            [
-                "-m", "agenttalk", "wrap", "--for", "worker", "--loop",
-                "--", "codex.exe",
-            ],
-            True,
-        ),
-        (
-            [
-                "-m", "agenttalk", "wrap", "--for", "worker", "--",
-                "codex.exe",
-            ],
-            False,
-        ),
-        (
-            [
-                "-m", "agenttalk", "wrap", "--for", "worker", "--",
-                "codex.exe", "--loop",
-            ],
-            False,
-        ),
-    ],
-    ids=["loop-before-tail", "missing-loop", "loop-only-in-child-tail"],
-)
-def test_wrapped_launch_detail_carries_positional_loop_admission(
-    windows_args: list[str],
-    expected: bool,
-) -> None:
-    detail = sup._launch_detail({}, {
-        "cli": "codex",
-        "wrapped": True,
-        "launch": {
-            "windows_file": "python.exe",
-            "windows_args": windows_args,
-        },
-    })
-
-    assert detail["wrapped_loop_mode"] is expected
 
 
 def test_wrapped_restart_on_stale_without_hook() -> None:
@@ -15308,6 +16201,20 @@ def test_process_ownership_parse_agenttalk_wrap_fail_closed_matrix() -> None:
     )
     assert sup.parse_agenttalk_wrap_invocation(
         good_nonce, sup._root_key(TEST_ROOT), "worker") is True
+    last_wins = (
+        f"python -m agenttalk --roo {TEST_ROOT} wrap --fo other "
+        "--for worker --loo -- codex"
+    )
+    assert sup.parse_agenttalk_wrap_invocation(
+        last_wins,
+        sup._root_key(TEST_ROOT),
+        "worker",
+    ) is True
+    assert sup.parse_agenttalk_wrap_invocation(
+        last_wins,
+        sup._root_key(TEST_ROOT),
+        "other",
+    ) is False
     assert sup.parse_agenttalk_wait_invocation(
         f"python -m agenttalk --supervisor-launch-nonce {SUPERVISOR_NONCE} "
         f"--root {TEST_ROOT} wait --for worker",
@@ -15365,8 +16272,7 @@ def test_process_ownership_parse_agenttalk_wrap_accepts_declared_prefix() -> Non
     ) is True
     # A declared boundary that does not actually hold '-m agenttalk' must
     # still fail closed - the declaration is verified, not blindly
-    # trusted, matching Resolve-AgenttalkModuleFlagIndex's own position
-    # check on the PowerShell side.
+    # trusted; the shared Python resolver verifies the declared position.
     assert sup.parse_agenttalk_wrap_invocation(
         command_line, root_key, "worker", 99,
     ) is False
@@ -18612,77 +19518,147 @@ def _stub_cmd(path: Path, log: Path) -> None:
     path.write_text(f'@echo off\r\n>>"{log}" echo %*\r\nexit /b 0\r\n', encoding="utf-8")
 
 
-def test_preflight_wrapped_codex_validates_python_not_codex_sandbox(tmp_path: Path) -> None:
-    """reviewer-1 P1 (RUNTIME): for a wrapped agent windows_file is PYTHON, not the
-    CLI, so Preflight must smoke-test `& $file -m agenttalk --version` and NOT
-    `& $file sandbox ...` - otherwise `python.exe sandbox` exits nonzero and the
-    wrapped:true launch fails closed before Launch(). Drives the EXACT shipped
-    Preflight (extracted from the generated .ps1)."""
+def test_preflight_wrapped_codex_validates_python_not_codex_sandbox(
+    tmp_path: Path,
+) -> None:
+    """Wrapped preflight consumes the admitted child and wrapper prefix."""
     shell = _pick_powershell()
     if not shell:
         return
-    helpers = _exec_helpers(tmp_path)        # includes function Preflight
+    helpers = _exec_helpers(tmp_path)
     wlog, clog = tmp_path / "wrap.log", tmp_path / "codex.log"
-    wstub, cstub = tmp_path / "pywrap.cmd", tmp_path / "codexcli.cmd"
+    wstub, cstub = tmp_path / "python.cmd", tmp_path / "codexcli.cmd"
     native_codex = tmp_path / "codex.exe"
     _stub_cmd(wstub, wlog)
     _stub_cmd(cstub, clog)
     native_codex.write_text("", encoding="utf-8")
+    plan = {
+        "agents": {
+            "wrapped-codex": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"wrapped-codex": {
+            "cli": "codex",
+            "wrapped": True,
+            "cwd": str(tmp_path),
+            "launch": {
+                "windows_file": str(wstub),
+                # Omitted module_args_from legitimately means index zero.
+                "windows_args": [
+                    "-m", "agenttalk", "wrap", "--for", "wrapped-codex",
+                    "--loop", "--", str(native_codex),
+                ],
+            },
+        }}},
+        root=tmp_path,
+    )
+    admission = plan["agents"]["wrapped-codex"]["launch_admission"]
+    assert admission["status"] == "accepted"
+    assert admission["module_args_from"] == 0
     out = tmp_path / "pf.json"
-    preamble = [
+    harness = "\n".join([
+        helpers,
         f"$Root = {_pslit(str(tmp_path))}",
         "$SrcOnPyPath = $false",
         f"$AgenttalkPython = {_pslit(str(wstub))}",
-        (
-            "$cfg = @{ agents = @{ 'wrapped-codex' = @{ launch = @{ "
-            f"windows_args = @('-m','agenttalk','wrap','--loop','--',{_pslit(str(native_codex))}) "
-            "} } } }"
-        ),
-    ]
-    harness = "\n".join([
-        helpers, *preamble,
-        # wrapped codex: $file is the python wrapper stub; launch_mode 'wrap'
-        f"$wrapOk = Preflight 'wrapped-codex' (@{{ cli='codex'; launch_mode='wrap' }}) {_pslit(str(wstub))} $null",
-        # non-wrapped codex (0.31.1): must NOT call `$file sandbox ...` - it runs the
-        # AGENTTALK_PY gate, so the $file stub is never invoked as a codex CLI
-        # (its log stays empty / has no 'sandbox').
-        f"$codexOk = Preflight 'plain-codex' (@{{ cli='codex'; launch_mode='resume' }}) {_pslit(str(cstub))} $null",
-        # only the return values via JSON; the stubs logged their argv to files we
-        # read directly in Python (Get-Content -Raw decorates the string, which
-        # ConvertTo-Json then mangles into an object).
+        f"$admission = ({_pslit(json.dumps(admission))} | ConvertFrom-Json)",
+        "$prefixTokens = Get-LaunchAdmissionPrefixTokens $admission",
+        f"$wrapOk = Preflight 'wrapped-codex' "
+        "([pscustomobject]@{ cli='codex'; launch_mode='wrap' }) "
+        f"{_pslit(str(wstub))} $null $prefixTokens $admission",
+        f"$codexOk = Preflight 'plain-codex' "
+        "([pscustomobject]@{ cli='codex'; launch_mode='resume' }) "
+        f"{_pslit(str(cstub))} $null",
         "@{ wrapOk=$wrapOk; codexOk=$codexOk } | ConvertTo-Json | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
-    hp = tmp_path / "pf_harness.ps1"
-    hp.write_text(harness, encoding="utf-8-sig")
-    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
-                         capture_output=True, text=True, timeout=120)
-    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
-    d = json.loads(out.read_text(encoding="utf-8-sig"))
+    script = tmp_path / "pf_harness.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
     wrap_args = wlog.read_text(encoding="utf-8") if wlog.exists() else ""
     codex_args = clog.read_text(encoding="utf-8") if clog.exists() else ""
-    # wrapped codex: preflight PASSES, ran `-m agenttalk --version`, NEVER `sandbox`
-    assert d["wrapOk"] is True
+    assert data["wrapOk"] is True
     assert "-m agenttalk --version" in wrap_args
     assert "sandbox" not in wrap_args
-    # non-wrapped codex (0.31.1): the drift-prone `$file sandbox ...` probe is GONE -
-    # the $file stub is never invoked, so its log has no 'sandbox'. (codexOk depends
-    # on the ambient python having agenttalk importable, so it is not asserted.)
     assert "sandbox" not in codex_args
 
 
-def test_preflight_wrapped_smoke_test_uses_the_configured_prefix(tmp_path: Path) -> None:
-    """Round 24 connector finding: Preflight used to smoke-test a fixed
-    `-m agenttalk --version` regardless of the agent's declared
-    launch.module_args_from prefix - so an allowed -E/-I/-S that breaks the
-    REAL launch's import (on a source checkout resolving agenttalk via
-    injected PYTHONPATH) went undetected, because Preflight never used the
-    prefix it was supposed to be validating. Drives Resolve-
-    AgenttalkLaunchPrefixTokens (the extraction) and Preflight (the
-    consumer) together against a config declaring an -E prefix, and checks
-    the stub's OWN logged argv - not just Preflight's return value - so a
-    regression back to the fixed-invocation shape fails this test even if
-    it happens to still return $true."""
+@pytest.mark.parametrize("shell", _windows_powershell_hosts())
+def test_preflight_wrapped_console_entry_uses_direct_version_probe(
+    tmp_path: Path,
+    shell: str | None,
+) -> None:
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    entry_log = tmp_path / "agenttalk-entry.log"
+    entry = tmp_path / "agenttalk.cmd"
+    _stub_cmd(entry, entry_log)
+    pinned = tmp_path / "python.cmd"
+    _stub_cmd(pinned, tmp_path / "pinned-python.log")
+    child = tmp_path / "claude.exe"
+    child.write_text("", encoding="utf-8")
+    admission = _accepted_launch_artifact(
+        population="regular", agent="wrapped", cli="claude",
+        windows_file=str(entry),
+        argv=[
+            "wrap", "--for", "wrapped", "--cli", "claude", "--loop",
+            "--", str(child),
+        ],
+        cwd=str(tmp_path), wrapped=True, module_args_from=None,
+        nonce_insert_at=0, child_argv=[str(child)],
+    )
+    out = tmp_path / "pf-console.json"
+    harness = "\n".join([
+        helpers,
+        f"$Root = {_pslit(str(tmp_path))}",
+        "$SrcOnPyPath = $false",
+        f"$AgenttalkPython = {_pslit(str(pinned))}",
+        f"$admission = ({_pslit(json.dumps(admission))} | ConvertFrom-Json)",
+        "$prefixTokens = Get-LaunchAdmissionPrefixTokens $admission",
+        f"$ok = Preflight 'wrapped' "
+        "([pscustomobject]@{ cli='claude'; launch_mode='wrap' }) "
+        f"{_pslit(str(entry))} $null $prefixTokens $admission",
+        "[pscustomobject]@{ ok=$ok; prefixTokens=@($prefixTokens) } | "
+        "ConvertTo-Json -Depth 3 | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    script = tmp_path / "pf-console.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
+    args = entry_log.read_text(encoding="utf-8")
+    assert data == {"ok": True, "prefixTokens": []}
+    assert "--version" in args
+    assert "-m agenttalk" not in args
+
+
+def test_preflight_wrapped_smoke_test_uses_admitted_prefix(
+    tmp_path: Path,
+) -> None:
     shell = _pick_powershell()
     if not shell:
         return
@@ -18690,83 +19666,49 @@ def test_preflight_wrapped_smoke_test_uses_the_configured_prefix(tmp_path: Path)
     wlog = tmp_path / "wrap.log"
     wstub = tmp_path / "pywrap.cmd"
     _stub_cmd(wstub, wlog)
-    native_cli = tmp_path / "claude.exe"      # Test-WrappedBaseCli needs a real tail
+    native_cli = tmp_path / "claude.exe"
     native_cli.write_text("", encoding="utf-8")
+    admission = _accepted_launch_artifact(
+        population="regular", agent="wrapped", cli="claude",
+        windows_file=str(wstub),
+        argv=[
+            "-E", "-m", "agenttalk", "wrap", "--for", "wrapped", "--cli",
+            "claude", "--loop", "--", str(native_cli),
+        ],
+        cwd=str(tmp_path), wrapped=True, module_args_from=1,
+        nonce_insert_at=3, child_argv=[str(native_cli)],
+    )
     out = tmp_path / "pf_prefix.json"
-    preamble = [
+    harness = "\n".join([
+        helpers,
         f"$Root = {_pslit(str(tmp_path))}",
         "$SrcOnPyPath = $false",
         f"$AgenttalkPython = {_pslit(str(wstub))}",
-        (
-            # Test-WrappedBaseCli reads $cfg.agents.$name from OUTER SCOPE
-            # (not a Preflight parameter) - $a must be the SAME object so
-            # both it and Resolve-AgenttalkLaunchPrefixTokens see one
-            # config, not two independently-typed ones.
-            "$cfg = @{ agents = @{ 'wrapped' = @{ launch = @{ "
-            "windows_args = @('-E','-m','agenttalk','wrap','--loop','--',"
-            f"{_pslit(str(native_cli))}" "); module_args_from = 1 } } } }"
-        ),
-        "$a = $cfg.agents.'wrapped'",
-    ]
-    harness = "\n".join([
-        helpers, *preamble,
-        "$prefixTokens = Resolve-AgenttalkLaunchPrefixTokens $a",
-        f"$wrapOk = Preflight 'wrapped' (@{{ cli='claude'; launch_mode='wrap' }}) "
-        f"{_pslit(str(wstub))} $null $prefixTokens",
-        "@{ wrapOk=$wrapOk; prefixTokens=$prefixTokens } | ConvertTo-Json | "
+        f"$admission = ({_pslit(json.dumps(admission))} | ConvertFrom-Json)",
+        "$prefixTokens = Get-LaunchAdmissionPrefixTokens $admission",
+        f"$wrapOk = Preflight 'wrapped' "
+        "([pscustomobject]@{ cli='claude'; launch_mode='wrap' }) "
+        f"{_pslit(str(wstub))} $null $prefixTokens $admission",
+        "[pscustomobject]@{ wrapOk=$wrapOk; prefixTokens=@($prefixTokens) } | "
+        "ConvertTo-Json -Depth 3 | "
         f"Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
-    hp = tmp_path / "pf_prefix_harness.ps1"
-    hp.write_text(harness, encoding="utf-8-sig")
-    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
-                         capture_output=True, text=True, timeout=120)
-    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
-    d = json.loads(out.read_text(encoding="utf-8-sig"))
+    script = tmp_path / "pf_prefix_harness.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
     wrap_args = wlog.read_text(encoding="utf-8") if wlog.exists() else ""
-    assert d["wrapOk"] is True
-    assert d["prefixTokens"] == ["-E"]
-    # THE property under test: the stub actually SAW -E ahead of -m agenttalk,
-    # not just that Preflight returned true.
+    assert data["wrapOk"] is True
+    assert data["prefixTokens"] == ["-E"]
     assert "-E -m agenttalk --version" in wrap_args
-
-
-def test_resolve_agenttalk_launch_prefix_tokens_fails_closed_on_bad_declaration(
-    tmp_path: Path,
-) -> None:
-    """The other half of the property: a module_args_from that does not
-    resolve against windows_args (out of range, or pointing at a token this
-    project does not affirmatively allow) must come back $null, not an
-    empty/no-prefix fallback - a caller silently falling back to no prefix
-    would just reintroduce the exact fidelity gap this function exists to
-    close."""
-    shell = _pick_powershell()
-    if not shell:
-        return
-    helpers = _exec_helpers(tmp_path)
-    out = tmp_path / "resolve_prefix.json"
-    harness = "\n".join([
-        helpers,
-        # out of range
-        "$a1 = @{ launch = @{ windows_args = @('-m','agenttalk'); module_args_from = 5 } }",
-        # module_args_from points past a token this allowlist refuses (-O strips asserts)
-        "$a2 = @{ launch = @{ windows_args = @('-O','-m','agenttalk'); module_args_from = 1 } }",
-        # the ordinary, overwhelmingly common case: no declared prefix at all
-        "$a3 = @{ launch = @{ windows_args = @('-m','agenttalk') } }",
-        "$r1 = Resolve-AgenttalkLaunchPrefixTokens $a1",
-        "$r2 = Resolve-AgenttalkLaunchPrefixTokens $a2",
-        "$r3 = Resolve-AgenttalkLaunchPrefixTokens $a3",
-        "@{ r1=$r1; r2=$r2; r3=$r3 } | ConvertTo-Json | "
-        f"Set-Content {_pslit(str(out))} -Encoding utf8",
-    ])
-    hp = tmp_path / "resolve_prefix_harness.ps1"
-    hp.write_text(harness, encoding="utf-8-sig")
-    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
-                         capture_output=True, text=True, timeout=120)
-    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
-    d = json.loads(out.read_text(encoding="utf-8-sig"))
-    assert d["r1"] is None
-    assert d["r2"] is None
-    assert d["r3"] == []
 
 
 # ----------------------------------------- WP2: lead-loop controller exit-marker rules
