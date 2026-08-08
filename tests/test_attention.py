@@ -1541,6 +1541,40 @@ def test_ephemeral_hold_accepts_equivalent_cwd_or_environment_edit(
     assert "configured_launch_unavailable" not in item
 
 
+def test_ephemeral_hold_rejects_case_only_environment_name_edit(
+    tmp_path: Path,
+) -> None:
+    request_id, agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    prepared_name = "CaseProbe"
+    current_name = "caseprobe"
+    profile["env"] = {prepared_name: "same-value"}
+    _refresh_ephemeral_launch_binding(row, marker, config, agent)
+
+    profile["env"] = {current_name: "same-value"}
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        launch_deliveries={
+            request_id: _ephemeral_attention_delivery(row),
+        },
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert item["configured_launch_unavailable"] == (
+        "the prepared effective launch binding no longer matches the current "
+        "request and reconstructed launch-effective projection"
+    )
+
+
 @pytest.mark.parametrize("placeholder", ["{ROOT}", "{AGENT}"])
 def test_ephemeral_hold_rejects_equivalent_launch_mapping_edit(
     tmp_path: Path,
@@ -1818,14 +1852,15 @@ def test_ephemeral_hold_does_not_claim_or_bind_ambient_environment(
     environment = admitted["configured_launch"]["environment"]
     assert "effective_environment_sha256" not in environment
     note = admitted["configured_launch"]["environment_note"]
-    assert "Re-prepare after editing the configured profile" in note
-    assert (
-        "configured launch mapping or reconstructed launch-effective projection "
-        "no longer matches"
-    ) in note
-    assert "equivalent-looking edits are not guaranteed to remain valid" in note
-    assert "environment the child actually receives is not verified" in note
-    assert "neither ambient nor configured values are guaranteed" in note
+    assert note == (
+        "Re-prepare after editing the configured profile. Recovery emits a "
+        "named refusal rather than a command when the configured launch mapping "
+        "or reconstructed launch-effective projection no longer matches; "
+        "equivalent-looking edits are not guaranteed to remain valid. The "
+        "environment the child actually receives is not verified and must be "
+        "reviewed by the operator; neither ambient nor configured values are "
+        "guaranteed to be delivered."
+    )
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-drift-is-not-bound")
     still_admitted = att.process_tree_hold_items(

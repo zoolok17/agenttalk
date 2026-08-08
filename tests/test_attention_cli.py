@@ -979,14 +979,15 @@ def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
     assert cli_item["source_hash"] == web_item["source_hash"]
     assert cli_item["configured_launch"]["cwd"] == workspace
     note = cli_item["configured_launch"]["environment_note"]
-    assert "Re-prepare after editing the configured profile" in note
-    assert (
-        "configured launch mapping or reconstructed launch-effective projection "
-        "no longer matches"
-    ) in note
-    assert "equivalent-looking edits are not guaranteed to remain valid" in note
-    assert "environment the child actually receives is not verified" in note
-    assert "neither ambient nor configured values are guaranteed" in note
+    assert note == (
+        "Re-prepare after editing the configured profile. Recovery emits a "
+        "named refusal rather than a command when the configured launch mapping "
+        "or reconstructed launch-effective projection no longer matches; "
+        "equivalent-looking edits are not guaranteed to remain valid. The "
+        "environment the child actually receives is not verified and must be "
+        "reviewed by the operator; neither ambient nor configured values are "
+        "guaranteed to be delivered."
+    )
     argv = cli_item["configured_launch"]["argv"]
     assert argv[argv.index("--for") + 1] == agent
     assert argv[argv.index("--to-request") + 1] == request_id
