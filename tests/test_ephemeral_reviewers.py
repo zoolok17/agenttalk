@@ -851,13 +851,24 @@ def test_cli_archive_launch_request_with_stale_pid_refuses_without_effects(
     assert agent not in s.retired_agents()
 
 
-def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path) -> None:
+def test_cli_archive_launch_request_preserves_completion_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     request_id = "lr-cli-archive"
     s, agent, state_path = _prepared_cli_archive_fixture(
         tmp_path,
         request_id=request_id,
     )
+    # Darwin has no native start locator; this success path requires a strong marker.
+    pid_start = "2026-08-08T00:00:00Z"
+    monkeypatch.setattr(
+        store_mod,
+        "_process_start_token",
+        lambda pid: pid_start if pid == os.getpid() else None,
+    )
     instance = _claim_current_supervisor(s)
+    assert instance["pid_start"] == pid_start
     completion = {
         "status": eph.COMPLETION_REJECTED,
         "terminal": True,
