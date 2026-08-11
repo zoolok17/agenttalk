@@ -2782,7 +2782,9 @@ def test_admitted_reset_is_emitted_as_exact_argv_bound_to_item_hash() -> None:
                 "agent": "worker",
                 "actor": "lead",
                 "verified_launch_nonce": "12345678-1234-4234-8234-123456789abc",
-                "reason": "all recorded process identities independently verified stopped",
+                "reason": (
+                    "all recorded process identities independently verified stopped"
+                ),
             },
         },
     }
@@ -2948,6 +2950,67 @@ def test_process_tree_unknown_is_visible_retryable_and_has_no_remedy() -> None:
     assert "configured_launch" not in item
     assert "scripted_remedy" not in item
     assert item["source_refs"][0]["reason_code"] == "command_line_unreadable"
+
+
+def test_process_tree_unknown_shows_independently_admitted_configured_reset() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_old_observation",
+        observed_count=4,
+    )
+    state["agents"]["worker"]["wrapper_recognition"] = {
+        "status": "unknown",
+        "reason_code": "command_line_unreadable",
+    }
+    nonce = "12345678-1234-4234-8234-123456789abc"
+    reset_admissions = {
+        "evaluated": True,
+        "admissions": {
+            "worker": {
+                "mode": "configured_reset",
+                "agent": "worker",
+                "actor": "lead",
+                "verified_launch_nonce": nonce,
+                "reason": "all recorded process identities independently verified stopped",
+            },
+        },
+    }
+
+    item = att.process_tree_hold_items(
+        state,
+        root="C:/repo",
+        reset_admissions=reset_admissions,
+    )[0]
+
+    assert item["status"] == "unknown"
+    assert item["human_can_unblock_now"] is True
+    assert item["operator_argv"][0:4] == [
+        "agenttalk",
+        "--root",
+        "C:/repo",
+        "supervise",
+    ]
+    assert "attended scripted remedy argv" in item["recommendation"]
+    assert "configured_launch" not in item
+
+    blocked = att.process_tree_hold_items(
+        state,
+        root="C:/repo",
+        reset_admissions={
+            "evaluated": True,
+            "admissions": {},
+            "blocked_admissions": {
+                "worker": {
+                    "mode": "configured_reset",
+                    "agent": "worker",
+                    "missing_precondition": "supervisor_kill_switch_absent",
+                },
+            },
+        },
+    )[0]
+    assert blocked["human_can_unblock_now"] is True
+    assert "operator_argv" not in blocked
+    assert ".agenttalk/supervisor.kill" in blocked["recommendation"]
 
 
 def test_ephemeral_process_tree_hold_without_tree_is_operator_visible() -> None:

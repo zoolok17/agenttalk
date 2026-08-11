@@ -10275,7 +10275,12 @@ def process_tree_ownership_reset_evidence(
                 f"request {request_id!r} and agent {agent!r}"
             )
 
-    if _wrapper_recognition_is_unknown(entry):
+    # A configured attended reset derives no authority from the current
+    # recognition observation.  Its independent contract below binds the
+    # persisted tree to the strict runtime record, root, generation, and nonce;
+    # the CLI separately proves every recorded identity is gone.  Ephemeral
+    # retirement has a different contract and keeps the UNKNOWN veto.
+    if request_id is not None and _wrapper_recognition_is_unknown(entry):
         raise ValueError(
             "wrapper recognition is unknown and retryable; ownership cannot be reset"
         )
@@ -10541,8 +10546,6 @@ def evaluate_process_tree_reset_admissions(
     if isinstance(agents, dict) and configured_audit_valid:
         for raw_agent, entry in sorted(agents.items()):
             if not isinstance(entry, dict):
-                continue
-            if _wrapper_recognition_is_unknown(entry):
                 continue
             tree = entry.get("owned_process_tree")
             if not (
@@ -10823,12 +10826,6 @@ def reset_process_tree_ownership_after_attended_teardown(
     """
     agent = validate_agent_name(agent)
     acknowledged_by = validate_agent_name(acknowledged_by)
-    agents = state.get("agents") if isinstance(state, dict) else None
-    current_entry = agents.get(agent) if isinstance(agents, dict) else None
-    if _wrapper_recognition_is_unknown(current_entry):
-        raise ValueError(
-            "wrapper recognition is unknown and retryable; ownership cannot be reset"
-        )
     if (
         not isinstance(hold_source_hash, str)
         or re.fullmatch(r"[0-9a-f]{64}", hold_source_hash) is None
@@ -10900,6 +10897,7 @@ def reset_process_tree_ownership_after_attended_teardown(
         "owned_process_tree",
         "legacy_process_evidence",
         "process_tree_hold_reason",
+        "wrapper_recognition",
         "runtime_wrapper_generation",
         "runtime_turn_generation",
         "runtime_phase",

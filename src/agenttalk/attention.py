@@ -1001,7 +1001,12 @@ def process_tree_hold_items(
             )
             else None
         )
-        remedy = None if recognition_unknown else admissions.get(identity)
+        remedy = admissions.get(identity)
+        if recognition_unknown and request_id is not None:
+            # Ephemeral retirement keeps UNKNOWN as an absolute hold.  A
+            # configured reset may instead be admitted by its independent
+            # strict runtime/tree and stopped-identity evidence.
+            remedy = None
         remedy_mode = None
         remedy_identity = None
         remedy_blocker = None
@@ -1066,7 +1071,9 @@ def process_tree_hold_items(
                     ],
                     "reason": reason,
                 }
-        blocker = None if recognition_unknown else blocked_admissions.get(identity)
+        blocker = blocked_admissions.get(identity)
+        if recognition_unknown and request_id is not None:
+            blocker = None
         if remedy_mode is None and isinstance(blocker, dict):
             expected_common = {
                 "mode",
@@ -1098,12 +1105,7 @@ def process_tree_hold_items(
                     "request_id": request_id,
                     "missing_precondition": "supervisor_kill_switch_absent",
                 }
-        if recognition_unknown:
-            recommendation = (
-                "Agenttalk will retry recognition on the next supervisor poll; "
-                "this observation admits no scripted reset or detached launch."
-            )
-        elif remedy_mode is not None and operator_root is not None:
+        if remedy_mode is not None and operator_root is not None:
             recommendation = (
                 "The attended scripted remedy argv below is currently admitted; "
                 "the command rechecks every precondition before it changes state."
@@ -1118,6 +1120,11 @@ def process_tree_hold_items(
                 "no scripted remedy applies in this state: "
                 ".agenttalk/supervisor.kill is absent. Create it while the "
                 "supervisor remains stopped."
+            )
+        elif recognition_unknown:
+            recommendation = (
+                "Agenttalk will retry recognition on the next supervisor poll; "
+                "this observation admits no scripted reset or detached launch."
             )
         elif admissions_evaluated:
             recommendation = "no scripted remedy applies in this state."
@@ -1193,7 +1200,14 @@ def process_tree_hold_items(
                     "wrapper_recognition": wrapper_recognition,
                 }),
             },
-            human_can_unblock_now=not recognition_unknown,
+            human_can_unblock_now=(
+                not recognition_unknown
+                or remedy_mode == "configured_reset"
+                or (
+                    isinstance(remedy_blocker, dict)
+                    and remedy_blocker.get("mode") == "configured_reset"
+                )
+            ),
             fields={
                 "status": status,
                 "reason_code": reason_code,

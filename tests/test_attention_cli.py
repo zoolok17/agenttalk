@@ -618,6 +618,7 @@ def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
         json.dumps({
             "agents": {
                 "beta": {
+                    "cli": "codex",
                     "wrapped": True,
                     "cwd": str(tmp_path / "worker cwd"),
                     "launch": {

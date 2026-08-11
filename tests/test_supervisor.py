@@ -14911,30 +14911,95 @@ def test_process_tree_reset_evidence_preserves_exact_filetime(
     ]
 
 
-def test_process_tree_unknown_cannot_admit_or_execute_attended_reset(
+def test_process_tree_unknown_admits_configured_attended_reset_with_independent_evidence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    state["agents"]["worker"]["wrapper_recognition"] = {
+        "status": "unknown",
+        "reason_code": "command_line_unreadable",
+    }
+    sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
+    def identity_gone(_pid, _start, _filetime=None) -> bool:
+        return True
+    monkeypatch.setattr(cli, "_owner_identity_gone", identity_gone)
+    monkeypatch.setattr(cli.time, "time", lambda: NOW)
+
+    blocked = sup.evaluate_process_tree_reset_admissions(
+        store,
+        state,
+        actor="lead",
+        now_epoch=NOW,
+        identity_gone=identity_gone,
+    )
+    assert blocked["blocked_admissions"]["worker"] == {
+        "mode": "configured_reset",
+        "agent": "worker",
+        "missing_precondition": "supervisor_kill_switch_absent",
+    }
+
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    admissions = sup.evaluate_process_tree_reset_admissions(
+        store,
+        state,
+        actor="lead",
+        now_epoch=NOW,
+        identity_gone=identity_gone,
+    )
+    assert admissions["admissions"]["worker"]["mode"] == "configured_reset"
+
+    item = _current_configured_reset_item(
+        store,
+        state,
+        identity_gone=identity_gone,
+    )
+    assert cli.main(item["operator_argv"][1:]) == 0
+    persisted = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    assert "wrapper_recognition" not in persisted["agents"]["worker"]
+    assert persisted["agents"]["worker"]["owned_process_tree_pending"] is True
+
+
+@pytest.mark.parametrize("blocked_by", ["live_identity", "generation_mismatch"])
+def test_process_tree_unknown_attended_reset_still_requires_independent_evidence(
+    tmp_path: Path,
+    blocked_by: str,
 ) -> None:
     store = _team(tmp_path)
     store.set_role("lead", "lead")
     store.set_operator_facing("lead")
     state, _source_hash = _write_attended_process_tree_reset_fixture(store)
     (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
-    state["agents"]["worker"]["wrapper_recognition"] = {
+    entry = state["agents"]["worker"]
+    entry["wrapper_recognition"] = {
         "status": "unknown",
         "reason_code": "command_line_unreadable",
     }
+    identities_gone = blocked_by != "live_identity"
+    if blocked_by == "generation_mismatch":
+        entry["runtime_wrapper_generation"] = "wrapper-other"
 
     admissions = sup.evaluate_process_tree_reset_admissions(
         store,
         state,
         actor="lead",
         now_epoch=NOW,
-        identity_gone=lambda _pid, _start, _filetime=None: True,
+        identity_gone=(
+            lambda _pid, _start, _filetime=None: identities_gone
+        ),
     )
     assert admissions["admissions"] == {}
 
     before = json.loads(json.dumps(state))
-    with pytest.raises(ValueError, match="recognition is unknown and retryable"):
+    expected_error = (
+        "every recorded pid/start identity"
+        if blocked_by == "live_identity"
+        else "does not agree on a valid root, generation"
+    )
+    with pytest.raises(ValueError, match=expected_error):
         sup.reset_process_tree_ownership_after_attended_teardown(
             state,
             "worker",
@@ -14943,11 +15008,40 @@ def test_process_tree_unknown_cannot_admit_or_execute_attended_reset(
             verified_launch_nonce=SUPERVISOR_NONCE,
             expected_root=store.root,
             runtime_record=_wrapper_runtime_view()["record"],
-            recorded_identities_gone=True,
-            reason="must not disown an unknown observation",
+            recorded_identities_gone=identities_gone,
+            reason="independent reset evidence remains incomplete",
             now_epoch=NOW,
         )
     assert state == before
+
+
+def test_process_tree_unknown_ephemeral_reset_evidence_remains_refused() -> None:
+    request_id = "lr-unknown"
+    state = {
+        "ephemeral_reviewers": {
+            "active": {
+                request_id: {
+                    "request_id": request_id,
+                    "agent": "reviewer",
+                    "wrapper_recognition": {
+                        "status": "unknown",
+                        "reason_code": "command_line_unreadable",
+                    },
+                },
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="recognition is unknown and retryable"):
+        sup.process_tree_ownership_reset_evidence(
+            state,
+            "reviewer",
+            request_id=request_id,
+            expected_root=TEST_ROOT,
+            verified_launch_nonce=SUPERVISOR_NONCE,
+            runtime_record={},
+            now_epoch=NOW,
+        )
 
 
 def test_live_supervisor_hides_reset_remedy_and_rejects_previously_admitted_argv(
@@ -15512,10 +15606,10 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
     )
     adoption = sup.plan_actions(
         fresh_report,
-        {"agents": {"worker": plan["next_state"]}},
+        replacement_state,
         config,
         now_epoch=NOW + 2,
-        snapshot=[],
+        snapshot=[replacement_row],
     )["agents"]["worker"]
     assert adoption["action"] == sup.WARN_ONLY
     assert adoption["state"] == "PROCESS_TREE_INVALID"
