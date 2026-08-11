@@ -3323,6 +3323,33 @@ def test_supervise_bootstrap_accepts_shared_parser_root_abbreviation_and_tail(
     )
 
 
+@pytest.mark.parametrize("loop_option", ["--lo", "--loo"])
+def test_supervise_bootstrap_check_accepts_loop_abbreviations(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    loop_option: str,
+) -> None:
+    store = _team(tmp_path, "Polaris,Zeno")
+    store.set_role("Polaris", "lead")
+    store.set_operator_facing("Polaris")
+    for name in ("Polaris", "Zeno"):
+        store.write_heartbeat(name)
+    wrapped = _wrapped_supervisor_agent("Zeno", "codex")
+    args = wrapped["launch"]["windows_args"]
+    args[args.index("--loop")] = loop_option
+    _write_supervisor_config(store, {"Zeno": wrapped})
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert any(
+        check["id"] == "supervisor_agent_launch_admission_valid"
+        and check.get("agent") == "Zeno"
+        for check in payload["checks"]
+    )
+
+
 def test_plan_emits_windows_sandbox_and_perm_mode() -> None:
     cfg = {"agents": {"worker": {"cli": "codex", "auto_restart": True,
                                  "windows_sandbox": "elevated"}},
@@ -5665,6 +5692,14 @@ def test_generated_ps1_two_polls_do_not_duplicate_launch_after_postspawn_content
             ")",
             "$ErrorActionPreference = 'Stop'",
             "$script:InjectedStateLock = $null",
+            "function Get-CimInstance {",
+            "  [CmdletBinding()]",
+            "  param(",
+            "    [Parameter(Position=0)][string]$ClassName,",
+            "    [string]$Filter",
+            "  )",
+            "  return @()",
+            "}",
             "function Start-Process {",
             "  [CmdletBinding()]",
             "  param(",
@@ -5741,6 +5776,7 @@ def test_generated_ps1_two_polls_do_not_duplicate_launch_after_postspawn_content
         )
         first_output = f"{first.stdout}{first.stderr}"
         assert first.returncode == 0, first_output
+        assert lock_ready.exists(), first_output
         assert lock_ready.read_text(encoding="utf-8") == "ready"
         assert (
             "state write failed this poll" in first_output
@@ -8441,6 +8477,51 @@ def test_regular_plan_finalizer_emits_typed_normalized_argv(
     assert artifact["nonce_insert_at"] == 2
 
 
+@pytest.mark.parametrize("loop_option", ["--lo", "--loo"])
+def test_regular_plan_finalizer_accepts_loop_abbreviations(
+    tmp_path: Path,
+    loop_option: str,
+) -> None:
+    root = str(tmp_path)
+    args = [
+        "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "worker",
+        "--cli", "codex", loop_option, "--", "codex.exe",
+    ]
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {
+            "agents": {
+                "worker": {
+                    "cli": "codex",
+                    "wrapped": True,
+                    "cwd": root,
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": args,
+                        "module_args_from": 0,
+                    },
+                },
+            },
+        },
+        root=root,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["argv"][-3:] == [loop_option, "--", "codex.exe"]
+    assert artifact["child_argv"] == ["codex.exe"]
+
+
 def test_regular_plan_finalizer_binds_or_refuses_claude_session_identity(
     tmp_path: Path,
 ) -> None:
@@ -9126,6 +9207,7 @@ def test_regular_manual_agenttalk_non_wrap_command_remains_valid(
     ("case", "reason"),
     [
         ("unknown-wrapper-option", "unrecognized arguments: --mystery"),
+        ("missing-child", "a launch command is required after `--`"),
         ("cli-mismatch", "cli does not match"),
         ("invalid-environment-name", "launch environment is invalid"),
     ],
@@ -9153,6 +9235,8 @@ def test_regular_plan_finalizer_refuses_shared_admission_failures(
     }
     if case == "unknown-wrapper-option":
         args.insert(args.index("--loop"), "--mystery")
+    elif case == "missing-child":
+        del args[args.index("--"):]
     elif case == "cli-mismatch":
         row["cli"] = "claude"
     else:
@@ -9199,9 +9283,11 @@ def _launch_admission_runtime_blocks(tmp_path: Path) -> tuple[str, str, str]:
     _windows_powershell_hosts(),
     ids=lambda value: Path(value).stem if value else "unavailable",
 )
+@pytest.mark.parametrize("loop_option", ["--lo", "--loo"])
 def test_launchers_consume_accepted_admission_argv_without_dropping_empty_argument(
     tmp_path: Path,
     shell: str | None,
+    loop_option: str,
 ) -> None:
     """The typed artifact, not a second reconstruction, is executed.
 
@@ -9216,11 +9302,11 @@ def test_launchers_consume_accepted_admission_argv_without_dropping_empty_argume
     launch_root = "R"
     regular_argv = [
         "-m", "agenttalk", "--root", launch_root, "wrap", "--for", "worker",
-        "--cli", "codex", "--loop", "--", "codex.exe", "alpha", "", "omega",
+        "--cli", "codex", loop_option, "--", "codex.exe", "alpha", "", "omega",
     ]
     ephemeral_argv = [
         "-m", "agenttalk", "--root", launch_root, "wrap", "--for", "reviewer",
-        "--cli", "codex", "--from", "reviewer", "--loop", "--one-shot",
+        "--cli", "codex", "--from", "reviewer", loop_option, "--one-shot",
         "--to-request", "R1",
         "--", "codex.exe", "alpha", "", "omega",
     ]
@@ -10466,7 +10552,7 @@ def _wrap_snap(*, cli="codex", launcher_pid=WRAP_LAUNCHER_PID,
          "command_line": (
              "python -m agenttalk "
              f"--supervisor-launch-nonce {SUPERVISOR_NONCE} "
-             f"--root {root} wrap --for worker --cli {cli} --loop"
+             f"--root {root} wrap --for worker --cli {cli} --loop -- {name}"
          ),
          "start_time": WRAP_START,
          "start_filetime": _ps_filetime(500000)},
@@ -13049,7 +13135,7 @@ def _wrap_cmd(*, root: str = TEST_ROOT, agent: str = "worker",
     return (
         "python -m agenttalk "
         f"--supervisor-launch-nonce {nonce} "
-        f"--root {root} wrap --for {agent} --loop"
+        f"--root {root} wrap --for {agent} --loop -- codex"
     )
 
 
@@ -14484,7 +14570,7 @@ def test_owned_process_tree_wrapper_exit_with_live_prior_leaf_is_hold() -> None:
     )
 
 
-def test_owned_process_tree_first_generation_adoption_holds_orphan_child() -> None:
+def test_owned_process_tree_unrecognized_generation_holds_orphan_child() -> None:
     child = _proc(
         WRAP_CHILD_PID,
         WRAP_LAUNCHER_PID,
@@ -14515,8 +14601,9 @@ def test_owned_process_tree_first_generation_adoption_holds_orphan_child() -> No
     assert adoption["state"] == "PROCESS_TREE_INVALID"
     assert adoption["kill_targets"] == []
     assert adoption["next_state"]["owned_process_tree"]["reason_code"] == (
-        "process_tree_invalid_generation_adoption_pending"
+        "process_tree_invalid_wrapper_absent_live_descendant"
     )
+    assert adoption["next_state"]["runtime_wrapper_generation"] is None
 
     absent = _plan_wrap(
         report,
@@ -14532,7 +14619,7 @@ def test_owned_process_tree_first_generation_adoption_holds_orphan_child() -> No
     )
 
 
-def test_owned_process_tree_generation_adoption_holds_without_visible_roots() -> None:
+def test_owned_process_tree_unrecognized_generation_does_not_adopt_before_relaunch() -> None:
     report = _report(
         heartbeat_stale=True,
         wrapper_runtime=_wrapper_runtime_view(
@@ -14551,12 +14638,10 @@ def test_owned_process_tree_generation_adoption_holds_without_visible_roots() ->
 
     adoption = _plan_wrap(report, state, snapshot=[])
 
-    assert adoption["action"] == sup.WARN_ONLY
+    assert adoption["action"] == sup.STUCK_RECOVER
+    assert adoption["state"] == "STUCK_OR_DEAD"
     assert adoption["kill_targets"] == []
-    assert adoption["next_state"]["owned_process_tree"]["reason_code"] == (
-        "process_tree_invalid_generation_adoption_pending"
-    )
-    assert adoption["next_state"]["runtime_wrapper_generation"] == "wrapper-2"
+    assert adoption["next_state"]["runtime_wrapper_generation"] == "wrapper-1"
 
 
 def test_owned_process_tree_adopted_generation_missing_record_holds_deep_orphan() -> None:
@@ -14824,6 +14909,45 @@ def test_process_tree_reset_evidence_preserves_exact_filetime(
         (row["pid"], row["start"], row.get("start_filetime"))
         for row in tree_entries
     ]
+
+
+def test_process_tree_unknown_cannot_admit_or_execute_attended_reset(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state, _source_hash = _write_attended_process_tree_reset_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state["agents"]["worker"]["wrapper_recognition"] = {
+        "status": "unknown",
+        "reason_code": "command_line_unreadable",
+    }
+
+    admissions = sup.evaluate_process_tree_reset_admissions(
+        store,
+        state,
+        actor="lead",
+        now_epoch=NOW,
+        identity_gone=lambda _pid, _start, _filetime=None: True,
+    )
+    assert admissions["admissions"] == {}
+
+    before = json.loads(json.dumps(state))
+    with pytest.raises(ValueError, match="recognition is unknown and retryable"):
+        sup.reset_process_tree_ownership_after_attended_teardown(
+            state,
+            "worker",
+            hold_source_hash="a" * 64,
+            acknowledged_by="lead",
+            verified_launch_nonce=SUPERVISOR_NONCE,
+            expected_root=store.root,
+            runtime_record=_wrapper_runtime_view()["record"],
+            recorded_identities_gone=True,
+            reason="must not disown an unknown observation",
+            now_epoch=NOW,
+        )
+    assert state == before
 
 
 def test_live_supervisor_hides_reset_remedy_and_rejects_previously_admitted_argv(
@@ -15355,7 +15479,7 @@ def test_attended_process_tree_reset_retires_stale_runtime_before_relaunch_plan(
             "python -m agenttalk "
             f"--supervisor-launch-nonce {OTHER_NONCE} "
             f"--root {store.root.resolve()} "
-            "wrap --for worker --cli codex --loop"
+            "wrap --for worker --cli codex --loop -- codex"
         ),
         "start_time": replacement_start,
         "start_filetime": _ps_filetime(990000),
@@ -15695,7 +15819,7 @@ def test_owned_process_tree_strict_generation_and_utc_matrix() -> None:
     assert validate(naive_refreshed_at) is None
 
 
-def test_owned_process_tree_unreadable_live_wrapper_nonce_is_hold() -> None:
+def test_owned_process_tree_unreadable_live_wrapper_is_retryable_unknown() -> None:
     snapshot = _wrap_snap()
     first = _owned_tree_plan(snapshot, request_id="rr-wrapper-proof-prior")
     unreadable_wrapper = dict(snapshot[0])
@@ -15718,10 +15842,104 @@ def test_owned_process_tree_unreadable_live_wrapper_nonce_is_hold() -> None:
     )
 
     assert second["action"] == sup.WARN_ONLY
-    assert second["state"] == "PROCESS_TREE_INVALID"
+    assert second["state"] == "PROCESS_TREE_UNKNOWN"
     assert second["kill_targets"] == []
-    assert second["next_state"]["owned_process_tree"]["reason_code"] == (
-        "process_tree_invalid_wrapper_attribution_ambiguous"
+    assert second["clear_marker"] is None
+    assert "rr-wrapper-proof-lost" not in second["next_state"]["consumed_rids"]
+    assert second["next_state"]["owned_process_tree"] == (
+        first["next_state"]["owned_process_tree"]
+    )
+    assert second["next_state"]["wrapper_recognition"] == {
+        "status": "unknown",
+        "reason_code": "command_line_unreadable",
+    }
+
+    third = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-wrapper-proof-lost"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 2,
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                progress_sequence=3,
+            ),
+        ),
+        {"agents": {"worker": second["next_state"]}},
+        now=NOW + 2,
+        snapshot=snapshot,
+    )
+
+    assert third["action"] == sup.RELAUNCH
+    assert third["state"] == "MANUAL_RESTART"
+    assert third["kill_targets"]
+    assert "wrapper_recognition" not in third["next_state"]
+
+
+def test_owned_process_tree_snapshot_unavailable_is_retryable_unknown() -> None:
+    snapshot = _wrap_snap()
+    first = _owned_tree_plan(snapshot, request_id="rr-snapshot-prior")
+
+    second = sup.plan_actions(
+        _report(
+            restart_request=_auth_marker("rr-snapshot-retry"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 1,
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+                progress_sequence=2,
+            ),
+        ),
+        {"agents": {"worker": first["next_state"]}},
+        _WRAP_CONFIG,
+        now_epoch=NOW + 1,
+        snapshot=None,
+    )["agents"]["worker"]
+
+    assert second["action"] == sup.WARN_ONLY
+    assert second["state"] == "PROCESS_TREE_UNKNOWN"
+    assert second["kill_targets"] == []
+    assert second["next_state"]["owned_process_tree"] == (
+        first["next_state"]["owned_process_tree"]
+    )
+    assert second["next_state"]["wrapper_recognition"] == {
+        "status": "unknown",
+        "reason_code": "snapshot_unavailable",
+    }
+
+
+def test_owned_process_tree_unknown_cannot_adopt_new_runtime_generation() -> None:
+    snapshot = _wrap_snap()
+    first = _owned_tree_plan(snapshot, request_id="rr-generation-prior")
+    unreadable_wrapper = dict(snapshot[0])
+    unreadable_wrapper["command_line"] = None
+
+    second = _plan_wrap(
+        _report(
+            restart_request=_auth_marker("rr-generation-hold"),
+            wrapper_runtime=_wrapper_runtime_view(
+                phase="active",
+                now=NOW + 1,
+                wrapper_generation="wrapper-2",
+                turn_generation=2,
+                progress_sequence=9,
+                launcher_pid=WRAP_CHILD_PID,
+                launcher_start=WRAP_CHILD_START,
+            ),
+        ),
+        {"agents": {"worker": first["next_state"]}},
+        now=NOW + 1,
+        snapshot=[unreadable_wrapper, snapshot[1]],
+    )
+
+    assert second["state"] == "PROCESS_TREE_UNKNOWN"
+    assert second["kill_targets"] == []
+    assert second["next_state"]["runtime_wrapper_generation"] == "wrapper-1"
+    assert second["next_state"]["runtime_turn_generation"] == 1
+    assert second["next_state"]["runtime_progress_sequence"] == 0
+    assert second["next_state"]["owned_process_tree"] == (
+        first["next_state"]["owned_process_tree"]
     )
 
 
@@ -16155,7 +16373,13 @@ def test_process_ownership_branch_cuts_same_root_foreign_shell_and_generic_cli()
         _proc(10, 1, "python.exe", _wrap_cmd(), _ps_iso(100000)),
         _proc(11, 10, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wait --for other", _ps_iso(200000)),
         _proc(12, 10, "python.exe", f"python -m agenttalk --root {TEST_ROOT} send --to worker -m hi", _ps_iso(210000)),
-        _proc(13, 10, "python.exe", "python -m agenttalk --root D:\\other wrap --for worker --loop", _ps_iso(220000)),
+        _proc(
+            13,
+            10,
+            "python.exe",
+            "python -m agenttalk --root D:\\other wrap --for worker --loop -- codex",
+            _ps_iso(220000),
+        ),
         _proc(14, 10, "python.exe", f"python -m agenttalk --root {TEST_ROOT} frob", _ps_iso(230000)),
         _proc(15, 10, "cmd.exe", "cmd.exe /c something", _ps_iso(240000)),
     ]
@@ -16228,8 +16452,8 @@ def test_process_ownership_parse_agenttalk_wrap_fail_closed_matrix() -> None:
         f"python -m agenttalk --root {TEST_ROOT} wrap --supervisor-launch-nonce {SUPERVISOR_NONCE} --for worker --loop",
         f"python -m agenttalk --root {TEST_ROOT} wrap --for worker -- --loop",
         f"python -m agenttalk --root \"{TEST_ROOT} wrap --for worker --loop",
-        "python -m agenttalk --root D:\\other wrap --for worker --loop",
-        f"python -m agenttalk --root {TEST_ROOT} wrap --for other --loop",
+        "python -m agenttalk --root D:\\other wrap --for worker --loop -- codex",
+        f"python -m agenttalk --root {TEST_ROOT} wrap --for other --loop -- codex",
         f"python -m agenttalk --root {TEST_ROOT} wrap --for worker",
         f"python -m agenttalk --root {TEST_ROOT} wrap --for worker -- codex --loop",
         f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop "
@@ -16243,6 +16467,171 @@ def test_process_ownership_parse_agenttalk_wrap_fail_closed_matrix() -> None:
         sup._root_key(TEST_ROOT),
         "worker",
     ) is False
+
+
+@pytest.mark.parametrize(
+    ("command_line", "status", "reason_code"),
+    [
+        (None, sup.WrapRecognitionStatus.UNKNOWN, "command_line_unreadable"),
+        ("   ", sup.WrapRecognitionStatus.UNKNOWN, "command_line_unreadable"),
+        (
+            f'python -m agenttalk --root "{TEST_ROOT} wrap --for worker --loop',
+            sup.WrapRecognitionStatus.UNKNOWN,
+            "command_line_tokenization_failed",
+        ),
+        (
+            "python -m agenttalk --root",
+            sup.WrapRecognitionStatus.UNKNOWN,
+            "wrapper_parse_error",
+        ),
+        (
+            "python -m agenttalk --supervisor-launch-nonce",
+            sup.WrapRecognitionStatus.UNKNOWN,
+            "wrapper_parse_error",
+        ),
+        (
+            f"python -m agenttalk --supervisor-launch-nonce= --root {TEST_ROOT} "
+            "wrap --for worker --loop -- codex",
+            sup.WrapRecognitionStatus.UNKNOWN,
+            "empty_wrapper_option_value",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
+            sup.WrapRecognitionStatus.UNKNOWN,
+            "child_command_missing",
+        ),
+        (
+            "python -m agenttalk wrap --for worker --loop -- codex",
+            sup.WrapRecognitionStatus.UNKNOWN,
+            "root_identity_missing",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wrap --loop -- codex",
+            sup.WrapRecognitionStatus.UNKNOWN,
+            "agent_identity_missing",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} status",
+            sup.WrapRecognitionStatus.NOT_MATCHED,
+            "subcommand_mismatch",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} init",
+            sup.WrapRecognitionStatus.NOT_MATCHED,
+            "subcommand_mismatch",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wra",
+            sup.WrapRecognitionStatus.UNKNOWN,
+            "wrapper_parse_error",
+        ),
+        (
+            "python -m agenttalk --root D:\\other wrap --for worker "
+            "--cli codex --loop -- codex",
+            sup.WrapRecognitionStatus.NOT_MATCHED,
+            "root_mismatch",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for other "
+            "--cli codex --loop -- codex",
+            sup.WrapRecognitionStatus.NOT_MATCHED,
+            "agent_mismatch",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker "
+            "--cli claude --loop -- claude",
+            sup.WrapRecognitionStatus.NOT_MATCHED,
+            "cli_mismatch",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker "
+            "--cli gemini --loop -- gemini",
+            sup.WrapRecognitionStatus.NOT_MATCHED,
+            "cli_mismatch",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker "
+            "--loop -- codex",
+            sup.WrapRecognitionStatus.MATCHED,
+            "matched",
+        ),
+    ],
+)
+def test_process_ownership_wrap_recognition_distinguishes_unknown_and_foreign(
+    command_line: object,
+    status: sup.WrapRecognitionStatus,
+    reason_code: str,
+) -> None:
+    recognition = sup.recognize_agenttalk_wrap_invocation(
+        command_line,
+        sup._root_key(TEST_ROOT),
+        "worker",
+        "codex",
+    )
+
+    assert recognition.status is status
+    assert recognition.reason_code == reason_code
+
+
+def test_process_ownership_known_subcommands_match_the_real_cli_parser() -> None:
+    parser = cli.build_parser()
+    command_choices = next(
+        action.choices
+        for action in parser._actions
+        if action.dest == "cmd" and isinstance(action.choices, dict)
+    )
+
+    assert sup._AGENTTALK_SUBCOMMANDS == frozenset(command_choices)
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_loop", "expected_one_shot", "expected_cli"),
+    [
+        (
+            ["wrap", "--for", "worker", "--", "codex"],
+            False,
+            False,
+            "codex",
+        ),
+        (
+            [
+                "wrap", "--for", "reviewer", "--cli", "codex", "--loop",
+                "--one-shot", "--to-request", "R1", "--", "codex",
+            ],
+            True,
+            True,
+            "codex",
+        ),
+        (
+            ["wrap", "--for", "worker", "--loop", "--", "codex"],
+            True,
+            False,
+            "codex",
+        ),
+    ],
+)
+def test_shared_wrap_admission_keeps_complete_positive_shapes(
+    argv: list[str],
+    expected_loop: bool,
+    expected_one_shot: bool,
+    expected_cli: str,
+) -> None:
+    parsed = launch_admission.parse_agenttalk_wrap_command(argv)
+
+    assert isinstance(parsed, launch_admission.WrapInvocation)
+    assert parsed.loop is expected_loop
+    assert parsed.one_shot is expected_one_shot
+    assert parsed.cli == expected_cli
+    assert parsed.child_argv == ("codex",)
+
+
+def test_shared_wrap_admission_stays_strict_when_child_is_missing() -> None:
+    parsed = launch_admission.parse_agenttalk_wrap_command(
+        ["wrap", "--for", "worker", "--loop"]
+    )
+
+    assert isinstance(parsed, launch_admission.WrapRefusal)
+    assert parsed.code == "child_command_missing"
 
 
 def test_process_ownership_parse_agenttalk_wrap_accepts_declared_prefix() -> None:
@@ -16335,7 +16724,7 @@ def test_process_ownership_declared_prefix_does_not_leak_into_other_agents_branc
     snap = [
         _proc(10, 1, "python.exe",
               f"python -Xutf8 -m agenttalk --supervisor-launch-nonce {SUPERVISOR_NONCE} "
-              f"--root {TEST_ROOT} wrap --for worker --loop",
+              f"--root {TEST_ROOT} wrap --for worker --loop -- codex",
               launcher_start),
         _proc(11, 10, "python.exe",
               f"python -m agenttalk --root {TEST_ROOT} wait --for other",
@@ -16354,7 +16743,13 @@ def test_process_ownership_declared_prefix_does_not_leak_into_other_agents_branc
 
 def test_process_ownership_launcher_pid_reuse_cannot_be_rescued_by_wrap_text() -> None:
     snap = [
-        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(200000)),
+        _proc(
+            10,
+            1,
+            "python.exe",
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop -- codex",
+            _ps_iso(200000),
+        ),
     ]
     p = sup.plan_actions(
         _ownership_report(),
@@ -16386,9 +16781,13 @@ def _launcher_plan(command_line: str | None, *, name: str = "python.exe",
 def test_process_ownership_confirmed_launcher_requires_branch_clean_wrapper_nonce() -> None:
     legitimate = [
         _wrap_cmd(),
-        f"python -m agenttalk --root {TEST_ROOT} --supervisor-launch-nonce {SUPERVISOR_NONCE} wrap --for worker --loop",
-        f"python -m agenttalk --supervisor-launch-nonce={SUPERVISOR_NONCE} --root {TEST_ROOT} wrap --for worker --loop",
-        f"agenttalk --supervisor-launch-nonce {SUPERVISOR_NONCE} --root {TEST_ROOT} wrap --for worker --loop",
+        "python -m agenttalk "
+        f"--root {TEST_ROOT} --supervisor-launch-nonce {SUPERVISOR_NONCE} "
+        "wrap --for worker --loop -- codex",
+        "python -m agenttalk "
+        f"--supervisor-launch-nonce={SUPERVISOR_NONCE} --root {TEST_ROOT} "
+        "wrap --for worker --loop -- codex",
+        f"agenttalk --supervisor-launch-nonce {SUPERVISOR_NONCE} --root {TEST_ROOT} wrap --for worker --loop -- codex",
     ]
     for command_line in legitimate:
         name = "agenttalk.exe" if command_line.startswith("agenttalk ") else "python.exe"
@@ -16415,33 +16814,45 @@ def test_process_ownership_launcher_nonce_blocks_generic_and_unreadable_collisio
     assert unreadable["diagnostics"]["launcher_nonce_cmdline_unreadable"] == 1
 
 
+@pytest.mark.parametrize(
+    "state_over",
+    [
+        {
+            "launcher_nonce_injected": False,
+            "launcher_nonce_missing_reason": "unsupported_launch_argv",
+        },
+        {"launcher_nonce": "BAD"},
+    ],
+    ids=["missing-stored-nonce", "malformed-stored-nonce"],
+)
+def test_process_ownership_unreadable_row_dominates_bad_stored_nonce_state(
+    state_over: dict,
+) -> None:
+    plan = _launcher_plan(None, state_over=state_over)
+
+    assert plan["kill_targets"] == []
+    assert plan["diagnostics"]["launcher_nonce_cmdline_unreadable"] == 1
+    assert plan["diagnostics"].get("launcher_nonce_missing_state", 0) == 0
+    assert plan["diagnostics"].get("launcher_nonce_malformed", 0) == 0
+
+
 def test_process_ownership_launcher_nonce_fail_closed_matrix() -> None:
     cases = [
         (
-            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop -- codex",
             "launcher_nonce_absent",
         ),
         (_wrap_cmd(nonce=OTHER_NONCE), "launcher_nonce_mismatch"),
         (
-            f"python -m agenttalk --supervisor-launch-nonce short --root {TEST_ROOT} wrap --for worker --loop",
+            f"python -m agenttalk --supervisor-launch-nonce short --root {TEST_ROOT} wrap --for worker --loop -- codex",
             "launcher_nonce_malformed",
         ),
         (
             "python -m agenttalk "
             f"--supervisor-launch-nonce {SUPERVISOR_NONCE} "
             f"--supervisor-launch-nonce {OTHER_NONCE} "
-            f"--root {TEST_ROOT} wrap --for worker --loop",
+            f"--root {TEST_ROOT} wrap --for worker --loop -- codex",
             "launcher_nonce_duplicate",
-        ),
-        (
-            f"python -m agenttalk --root {TEST_ROOT} wrap "
-            f"--supervisor-launch-nonce {SUPERVISOR_NONCE} --for worker --loop",
-            "launcher_nonce_after_subcommand_or_tail",
-        ),
-        (
-            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop "
-            f"-- codex --supervisor-launch-nonce {SUPERVISOR_NONCE}",
-            "launcher_nonce_after_subcommand_or_tail",
         ),
     ]
     for command_line, counter in cases:
@@ -16450,9 +16861,41 @@ def test_process_ownership_launcher_nonce_fail_closed_matrix() -> None:
         assert p["diagnostics"][counter] == 1
 
 
+@pytest.mark.parametrize(
+    "command_line",
+    [
+        f"python -m agenttalk --supervisor-launch-nonce short --root {TEST_ROOT} "
+        "wrap --for worker --loop",
+        "python -m agenttalk "
+        f"--supervisor-launch-nonce {SUPERVISOR_NONCE} "
+        f"--supervisor-launch-nonce {OTHER_NONCE} --root {TEST_ROOT} "
+        "wrap --for worker --loop",
+        f"python -m agenttalk --root {TEST_ROOT} wrap "
+        f"--supervisor-launch-nonce {SUPERVISOR_NONCE} --for worker --loop -- codex",
+    ],
+)
+def test_process_ownership_incomplete_or_misplaced_nonce_observation_is_unknown(
+    command_line: str,
+) -> None:
+    plan = _launcher_plan(command_line)
+
+    assert plan["kill_targets"] == []
+    assert plan["diagnostics"]["launcher_wrap_observation_unknown"] == 1
+
+
+def test_process_ownership_child_tail_nonce_is_readable_contradiction() -> None:
+    plan = _launcher_plan(
+        f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop "
+        f"-- codex --supervisor-launch-nonce {SUPERVISOR_NONCE}",
+    )
+
+    assert plan["kill_targets"] == []
+    assert plan["diagnostics"]["launcher_nonce_after_subcommand_or_tail"] == 1
+
+
 def test_process_ownership_pre_upgrade_launcher_without_nonce_is_cleanup_miss_not_cross_kill() -> None:
     p = _launcher_plan(
-        f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
+        f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop -- codex",
         state_over={"launcher_nonce_injected": False},
     )
     assert p["kill_targets"] == []
@@ -16772,6 +17215,53 @@ def test_ephemeral_owned_process_view_reconstructs_declared_module_args_from(
         None, entry, {}, NOW, root_key=sup._root_key(TEST_ROOT),
     )
     assert captured["cfg_agent"]["launch"]["module_args_from"] == 1
+
+
+def test_ephemeral_owned_process_view_retries_unknown_without_teardown_authority() -> None:
+    snapshot = _wrap_snap()
+    first = _owned_tree_plan(snapshot, request_id="rr-ephemeral-prior")
+    entry = json.loads(json.dumps(first["next_state"]))
+    entry.update({"request_id": "R1", "agent": "worker", "cli": "codex"})
+    unreadable_wrapper = dict(snapshot[0])
+    unreadable_wrapper["command_line"] = None
+    report_entry = {
+        "wrapper_runtime": _wrapper_runtime_view(
+            phase="active",
+            now=NOW + 1,
+            launcher_pid=WRAP_CHILD_PID,
+            launcher_start=WRAP_CHILD_START,
+            progress_sequence=2,
+        ),
+    }
+
+    held_entry, held_liveness, complete = sup._ephemeral_owned_process_view(
+        [unreadable_wrapper, snapshot[1]],
+        entry,
+        report_entry,
+        NOW + 1,
+        root_key=sup._root_key(TEST_ROOT),
+    )
+
+    assert complete is False
+    assert held_liveness["kill_targets"] == []
+    assert held_entry["owned_process_tree"] == entry["owned_process_tree"]
+    assert held_entry["wrapper_recognition"] == {
+        "status": "unknown",
+        "reason_code": "command_line_unreadable",
+    }
+
+    retried_entry, retried_liveness, complete = sup._ephemeral_owned_process_view(
+        snapshot,
+        held_entry,
+        report_entry,
+        NOW + 2,
+        root_key=sup._root_key(TEST_ROOT),
+    )
+
+    assert complete is True
+    assert retried_liveness["owned_process_tree_refreshed"] is True
+    assert "wrapper_recognition" not in retried_entry
+    assert "process_tree_hold_reason" not in retried_entry
 
 
 def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> None:
@@ -17139,7 +17629,7 @@ def test_process_ownership_stale_launcher_prior_does_not_rescue_row_without_nonc
     snap = [
         _proc(
             10, 1, "python.exe",
-            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop -- codex",
             _ps_iso(100000),
         )
     ]
@@ -18172,7 +18662,7 @@ def test_ephemeral_teardown_ready_when_wrapped_liveness_reports_refreshed_absent
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The other half of finding 4, isolating _ephemeral_owned_process_view's
-    OWN consumption of the flag (unchanged by this fix) via the same
+    consumption of both refreshed-tree and matched-recognition authority via the same
     fake-_wrapped_liveness pattern the existing module_args_from
     reconstruction test uses - so a regression in either the producer
     (_wrapped_liveness, tested above) or this consumer is caught
@@ -18183,6 +18673,7 @@ def test_ephemeral_teardown_ready_when_wrapped_liveness_reports_refreshed_absent
             "kill_targets": [],
             "owned_process_tree": {"status": "absent", "reason_code": "process_tree_absent"},
             "owned_process_tree_refreshed": True,
+            "wrapper_recognition": {"status": "matched", "reason_code": "matched"},
             "child_reason": "test_absent",
         }
 
@@ -19118,7 +19609,7 @@ def test_launch_barrier_same_agent_wait_survivor_blocks_replacement() -> None:
 def test_launch_barrier_clear_snapshot_allows_replacement() -> None:
     snap = [
         _proc(44, 1, "python.exe",
-              f"python -m agenttalk --root {TEST_ROOT} wrap --for other --loop",
+              f"python -m agenttalk --root {TEST_ROOT} wrap --for other --loop -- codex",
               _ps_iso(440000)),
     ]
     result = sup.evaluate_launch_barrier(

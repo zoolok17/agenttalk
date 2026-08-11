@@ -5142,6 +5142,7 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
                 "agents": {
                     "alpha": {
                         "wrapped": True,
+                        "cli": "codex",
                         "cwd": str(tmp_path / "alpha cwd"),
                     "launch": {
                         "windows_file": r"C:\Python\python.exe",

@@ -2078,6 +2078,71 @@ def _make_preupgrade_pruned_allocation_fixture(
     sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
 
 
+def test_unknown_ephemeral_recognition_cannot_admit_stage_or_finish_archive(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.set_operator_facing("lead")
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    marker = store.read_launch_request(request_id)
+    assert marker is not None
+    unknown = {
+        "status": "unknown",
+        "reason_code": "command_line_unreadable",
+    }
+    entry["wrapper_recognition"] = unknown
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+
+    admissions = sup.evaluate_process_tree_reset_admissions(
+        store,
+        state,
+        actor="lead",
+        now_epoch=NOW,
+        identity_gone=lambda _pid, _start, _filetime=None: True,
+    )
+    assert f"ephemeral:{request_id}" not in admissions["admissions"]
+    with pytest.raises(ValueError, match="recognition is unknown and retryable"):
+        sup.stage_attended_ephemeral_archive(
+            state,
+            request_id,
+            agent=agent,
+            launch_marker=marker,
+            held_terminal=entry["held_terminal"],
+            hold_source_hash=source_hash,
+            acknowledged_by="lead",
+            verification_mode="operator_attested",
+            verified_launch_nonce=None,
+            verified_identity_count=0,
+            reason="operator verified the terminal request can be archived",
+            now_epoch=NOW,
+        )
+
+    entry.pop("wrapper_recognition")
+    sup.stage_attended_ephemeral_archive(
+        state,
+        request_id,
+        agent=agent,
+        launch_marker=marker,
+        held_terminal=entry["held_terminal"],
+        hold_source_hash=source_hash,
+        acknowledged_by="lead",
+        verification_mode="operator_attested",
+        verified_launch_nonce=None,
+        verified_identity_count=0,
+        reason="operator verified the terminal request can be archived",
+        now_epoch=NOW,
+    )
+    entry["wrapper_recognition"] = unknown
+    with pytest.raises(ValueError, match="recognition is unknown and retryable"):
+        sup.finish_attended_ephemeral_archive(store, state, request_id)
+
+    assert store.read_launch_request(request_id) == marker
+    assert not (store.launch_requests_archive_dir / f"{request_id}.json").exists()
+    assert agent in store.load_config()["agents"]
+
+
 def _write_misbound_agent_ephemeral_hold_fixture(
     store: Store,
     *,

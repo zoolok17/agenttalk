@@ -80,7 +80,7 @@ def _bound_idle_runtime(store: Store, *, now_epoch: float = NOW) -> tuple[dict, 
         "command_line": (
             "python -m agenttalk "
             f"--supervisor-launch-nonce {nonce} "
-            f"--root {store.root} wrap --for beta --cli claude --loop"
+            f"--root {store.root} wrap --for beta --cli claude --loop -- claude"
         ),
         "start_time": wrapper_start,
         "start_filetime": str(

@@ -601,8 +601,16 @@ def parse_wrap_command(command_args: Sequence[str]) -> WrapParseResult:
     return validate_standalone_wrap(args)
 
 
-def parse_agenttalk_wrap_command(own_argv: Sequence[str]) -> WrapParseResult:
-    """Parse argv after the interpreter prefix through the closed CLI grammar.
+def parse_observed_agenttalk_wrap_command(
+    own_argv: Sequence[str],
+) -> WrapParseResult:
+    """Parse observed argv through the real grammar without admitting it.
+
+    Recognition must distinguish an incomplete observation from a complete
+    invocation that contradicts the expected identity.  It therefore needs the
+    grammar-resolved values before the admission-only completeness checks run.
+    Callers must still apply :func:`validate_standalone_wrap` before treating
+    this syntax result as a complete launch.
 
     Global launch options and the ``wrap`` subcommand are parsed together, so a
     caller never has to scan for global option values or guess where wrapper
@@ -626,9 +634,16 @@ def parse_agenttalk_wrap_command(own_argv: Sequence[str]) -> WrapParseResult:
             "help requested" if exc.status == 0 else "invalid wrapper arguments"
         )
         return WrapRefusal(code, f"agenttalk wrap: {detail}")
-    return validate_standalone_wrap(
-        wrap_invocation_from_namespace(args, agenttalk_argv=own_argv)
-    )
+    return wrap_invocation_from_namespace(args, agenttalk_argv=own_argv)
+
+
+def parse_agenttalk_wrap_command(own_argv: Sequence[str]) -> WrapParseResult:
+    """Strictly admit argv after the interpreter prefix as a wrapper launch."""
+
+    parsed = parse_observed_agenttalk_wrap_command(own_argv)
+    if isinstance(parsed, WrapRefusal):
+        return parsed
+    return validate_standalone_wrap(parsed)
 
 
 def apply_supervisor_policy(

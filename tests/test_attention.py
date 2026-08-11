@@ -1045,6 +1045,41 @@ def test_configured_wrapped_launch_accepts_omitted_default_cli() -> None:
     assert "configured_launch_unavailable" not in item
 
 
+@pytest.mark.parametrize("loop_option", ["--lo", "--loo"])
+def test_configured_wrapped_launch_projects_loop_abbreviations(
+    loop_option: str,
+) -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "wrapped": True,
+                    "cli": "codex",
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": [
+                            "-m", "agenttalk", "wrap", "--for", "worker",
+                            loop_option, "--", "codex.exe",
+                        ],
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert item["configured_launch"]["argv"][-3:] == [
+        loop_option,
+        "--",
+        "codex.exe",
+    ]
+
+
 @pytest.mark.parametrize(
     ("windows_file", "windows_args", "expected_reason"),
     [
@@ -2863,11 +2898,17 @@ def test_restart_marker_reads_are_limited_to_valid_configured_holds() -> None:
             "complete": {
                 "owned_process_tree": {"status": "complete"},
             },
+            "unknown": {
+                "wrapper_recognition": {
+                    "status": "unknown",
+                    "reason_code": "command_line_unreadable",
+                },
+            },
             r"..\outside": held,
         },
     }
 
-    assert att.configured_process_tree_hold_agents(state) == ["held"]
+    assert att.configured_process_tree_hold_agents(state) == ["held", "unknown"]
 
 
 def test_process_tree_hold_projection_ignores_a_complete_record() -> None:
@@ -2883,6 +2924,30 @@ def test_process_tree_hold_projection_ignores_a_complete_record() -> None:
         observed_count=4,
     )
     assert att.process_tree_hold_items(complete) == []
+
+
+def test_process_tree_unknown_is_visible_retryable_and_has_no_remedy() -> None:
+    state = _process_tree_state(
+        status="invalid",
+        reason_code="process_tree_invalid_old_observation",
+        observed_count=4,
+    )
+    state["agents"]["worker"]["wrapper_recognition"] = {
+        "status": "unknown",
+        "reason_code": "command_line_unreadable",
+    }
+
+    item = att.process_tree_hold_items(
+        state,
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert item["human_can_unblock_now"] is False
+    assert "next supervisor poll" in item["recommendation"]
+    assert item["status"] == "unknown"
+    assert "configured_launch" not in item
+    assert "scripted_remedy" not in item
+    assert item["source_refs"][0]["reason_code"] == "command_line_unreadable"
 
 
 def test_ephemeral_process_tree_hold_without_tree_is_operator_visible() -> None:

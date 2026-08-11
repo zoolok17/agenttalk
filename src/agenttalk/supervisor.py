@@ -38,6 +38,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Iterable, Sequence
 
@@ -81,6 +82,31 @@ EPHEMERAL_COMPLETE = eph.ACTION_COMPLETE
 EPHEMERAL_TIMEOUT = eph.ACTION_TIMEOUT
 EPHEMERAL_FAILED = eph.ACTION_FAILED
 EPHEMERAL_JANITOR = eph.ACTION_JANITOR
+
+
+class WrapRecognitionStatus(str, Enum):
+    """What one live command-line observation proves about a wrapper."""
+
+    MATCHED = "matched"
+    NOT_MATCHED = "not_matched"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class WrapRecognition:
+    """Typed wrapper identity result; UNKNOWN is never identity authority."""
+
+    status: WrapRecognitionStatus
+    reason_code: str
+    invocation: launch_admission_mod.WrapInvocation | None = None
+
+
+def _wrapper_recognition_is_unknown(entry: object) -> bool:
+    recognition = entry.get("wrapper_recognition") if isinstance(entry, dict) else None
+    return bool(
+        isinstance(recognition, dict)
+        and recognition.get("status") == WrapRecognitionStatus.UNKNOWN.value
+    )
 
 # Default cadence knobs (config overrides these).
 _DEFAULTS = {
@@ -702,7 +728,16 @@ _ATTRIBUTION_MODEL = "process_ownership_v1"
 _PROVENANCE_TTL_SECONDS = 3600.0
 _SUPERVISOR_LAUNCH_NONCE_ARG = "--supervisor-launch-nonce"
 _SUPERVISOR_LAUNCH_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
-_AGENTTALK_SUBCOMMANDS = {"wrap", "wait", "send", "status", "supervise"}
+_AGENTTALK_SUBCOMMANDS = frozenset(
+    "dev-gate init status supervisor threads roster avatar domain send "
+    "await-cancel composing rescind check gate close lane relay knowledge "
+    "onboarding barrier prune escalate attention propose broadcast recv drain "
+    "compact wait ack sync whoami transcript end release heartbeat checkpoint "
+    "request-restart commit-gate request-launch wrap "
+    "_internal-check-wrap-dispatch dead-letter managed-lead-loop supervise "
+    "deadman reply tail start serve dashboard reset doctor gateway hmac-init "
+    "capacity install-skills codex-config".split()
+)
 _LAUNCHER_DERIVED_PRIOR_SOURCES = {"launch_child_provenance"}
 _DIAGNOSTIC_COUNTERS = (
     "equal_start_edge",
@@ -729,6 +764,7 @@ _DIAGNOSTIC_COUNTERS = (
     "launcher_nonce_duplicate",
     "launcher_nonce_after_subcommand_or_tail",
     "launcher_wrap_parse_failed",
+    "launcher_wrap_observation_unknown",
     "excluded_live_descendant_unaccounted",
 )
 
@@ -1797,6 +1833,7 @@ def restart_request_progress(
     if is_unusable_restart_request(marker):
         blocked = decision_state in {
             "PROCESS_TREE_INVALID",
+            "PROCESS_TREE_UNKNOWN",
             "PROCESS_TREE_TRUNCATED",
         }
         return {
@@ -1846,6 +1883,7 @@ def restart_request_progress(
         and not completed
         and decision_state in {
             "PROCESS_TREE_INVALID",
+            "PROCESS_TREE_UNKNOWN",
             "PROCESS_TREE_TRUNCATED",
         }
     )
@@ -4286,20 +4324,31 @@ def _is_shell_host(row: dict | None) -> bool:
     return _image_stem(row or {}) in _SHELL_HOSTS
 
 
-def _split_command_line(command_line: object) -> list[str] | None:
+def _split_observed_command_line(
+    command_line: object,
+) -> tuple[list[str] | None, str | None]:
+    """Tokenize one OS observation and retain why no tokens were available."""
+
     if not isinstance(command_line, str) or not command_line.strip():
-        return None
+        return None, "command_line_unreadable"
     try:
         raw = shlex.split(command_line, posix=False)
     except ValueError:
-        return None
+        return None, "command_line_tokenization_failed"
     out: list[str] = []
     for token in raw:
         if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
             token = token[1:-1]
         if token:
             out.append(token)
-    return out or None
+    if not out:
+        return None, "command_line_unreadable"
+    return out, None
+
+
+def _split_command_line(command_line: object) -> list[str] | None:
+    tokens, _reason = _split_observed_command_line(command_line)
+    return tokens
 
 
 def _token_stem(token: str) -> str:
@@ -4404,6 +4453,11 @@ def process_tree_operator_gap(
         return (
             "Agenttalk could not establish a complete owned process tree: "
             f"the poll observed {observed} identities over the safe cap {limit}."
+        )
+    if status == "unknown":
+        return (
+            "Agenttalk could not read enough of the current wrapper observation "
+            "to determine whether it matches this agent; the next poll will retry."
         )
     if isinstance(reason_code, str):
         for suffix, explanation in _PROCESS_TREE_OPERATOR_GAPS:
@@ -5855,7 +5909,9 @@ def _parse_supervisor_launch_nonce(
         if arg == _SUPERVISOR_LAUNCH_NONCE_ARG or arg.startswith(
                 _SUPERVISOR_LAUNCH_NONCE_ARG + "="):
             value, i_next = _option_value(argv, i)
-            if value is None or not _valid_launch_nonce(value):
+            if value is None or value == "":
+                return None, "launcher_nonce_value_missing"
+            if not _valid_launch_nonce(value):
                 return None, "launcher_nonce_malformed"
             if nonce is not None:
                 return None, "launcher_nonce_duplicate"
@@ -5903,12 +5959,15 @@ def _parsed_observed_wrap_invocation(
     command_line: object,
     module_args_from: object = None,
 ) -> launch_admission_mod.WrapInvocation | None:
-    """Parse an observed wrapper with the same closed grammar as admission."""
+    """Return only a complete observed wrapper; never relax admission rules."""
 
     argv = _agenttalk_argv(command_line, module_args_from)
     if argv is None:
         return None
-    parsed = launch_admission_mod.parse_agenttalk_wrap_command(argv)
+    parsed = launch_admission_mod.parse_observed_agenttalk_wrap_command(argv)
+    if not isinstance(parsed, launch_admission_mod.WrapInvocation):
+        return None
+    parsed = launch_admission_mod.validate_standalone_wrap(parsed)
     if not isinstance(parsed, launch_admission_mod.WrapInvocation):
         return None
     if _has_option_token(list(parsed.child_argv), _SUPERVISOR_LAUNCH_NONCE_ARG):
@@ -5916,19 +5975,159 @@ def _parsed_observed_wrap_invocation(
     return parsed
 
 
+def recognize_agenttalk_wrap_invocation(
+    command_line: object,
+    root_key: str | None,
+    agent: str,
+    cli: str | None = None,
+    module_args_from: object = None,
+) -> WrapRecognition:
+    """Recognize one observed wrapper without converting missing evidence to no.
+
+    Admission and recognition share argparse's exact option resolution, but
+    only admission treats an incomplete parse as a permanent refusal.  A live
+    observation can be missing or truncated, so incomplete evidence is UNKNOWN
+    and must be retried.  Only a complete positive identity proof is MATCHED.
+
+    WMI supplies no truncation provenance.  Once a non-null observation is
+    syntactically complete, this layer cannot prove whether later source text
+    was omitted after capture; it classifies only the evidence it received.
+    """
+
+    tokens, split_reason = _split_observed_command_line(command_line)
+    if tokens is None:
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            split_reason or "command_line_unreadable",
+        )
+
+    first = _token_stem(tokens[0])
+    if first in _SHELL_HOSTS:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "shell_host",
+        )
+    if first in {"python", "python3", "py"}:
+        rel_index = _resolve_module_flag_index(tokens[1:], module_args_from)
+        if rel_index < 0:
+            incomplete_selector = tokens[-1] == "-m" or (
+                len(tokens) >= 2
+                and tokens[-2] == "-m"
+                and tokens[-1] == "agenttalk"
+            )
+            return WrapRecognition(
+                (
+                    WrapRecognitionStatus.UNKNOWN
+                    if incomplete_selector
+                    else WrapRecognitionStatus.NOT_MATCHED
+                ),
+                (
+                    "command_line_incomplete"
+                    if incomplete_selector
+                    else "not_agenttalk_invocation"
+                ),
+            )
+        argv = tokens[1 + rel_index + 2:]
+    elif first == "agenttalk":
+        argv = tokens[1:]
+    else:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "not_agenttalk_invocation",
+        )
+
+    subcommand = launch_admission_mod.agenttalk_launch_subcommand(argv)
+    if subcommand in _AGENTTALK_SUBCOMMANDS and subcommand != "wrap":
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "subcommand_mismatch",
+        )
+    parsed = launch_admission_mod.parse_observed_agenttalk_wrap_command(argv)
+    if isinstance(parsed, launch_admission_mod.WrapRefusal):
+        return WrapRecognition(WrapRecognitionStatus.UNKNOWN, parsed.code)
+    if any(
+        isinstance(occurrence.value, str) and occurrence.value == ""
+        for occurrence in parsed.option_occurrences
+    ):
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "empty_wrapper_option_value",
+        )
+    if not parsed.child_argv:
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "child_command_missing",
+        )
+    if parsed.child_argv[0] == "":
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "child_executable_empty",
+        )
+    if not isinstance(parsed.root, str) or not parsed.root:
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "root_identity_missing",
+            parsed,
+        )
+    if not _same_root(parsed.root, root_key):
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "root_mismatch",
+            parsed,
+        )
+    if not isinstance(parsed.agent, str) or not parsed.agent:
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "agent_identity_missing",
+            parsed,
+        )
+    if parsed.agent != agent:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "agent_mismatch",
+            parsed,
+        )
+    if cli is not None and parsed.cli != cli:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "cli_mismatch",
+            parsed,
+        )
+    if not parsed.loop:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "mode_mismatch",
+            parsed,
+        )
+    complete = launch_admission_mod.validate_standalone_wrap(parsed)
+    if isinstance(complete, launch_admission_mod.WrapRefusal):
+        return WrapRecognition(WrapRecognitionStatus.UNKNOWN, complete.code)
+    if _has_option_token(list(complete.child_argv), _SUPERVISOR_LAUNCH_NONCE_ARG):
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "child_dispatch_mismatch",
+            complete,
+        )
+    return WrapRecognition(WrapRecognitionStatus.MATCHED, "matched", complete)
+
+
 def parse_agenttalk_wrap_invocation(command_line: object, root_key: str | None,
-                                    agent: str, module_args_from: object = None) -> bool:
-    parsed = _parsed_observed_wrap_invocation(command_line, module_args_from)
-    return bool(
-        parsed is not None
-        and _same_root(parsed.root, root_key)
-        and parsed.agent == agent
-        and parsed.loop
-    )
+                                    agent: str, module_args_from: object = None,
+                                    *, cli: str | None = None) -> bool:
+    """Compatibility predicate for non-authoritative discovery callers."""
+
+    return recognize_agenttalk_wrap_invocation(
+        command_line,
+        root_key,
+        agent,
+        cli,
+        module_args_from,
+    ).status is WrapRecognitionStatus.MATCHED
 
 
 def _row_branch_reason(row: dict, root_key: str | None, agent: str,
-                        module_args_from: object = None) -> str | None:
+                       module_args_from: object = None,
+                       *, cli: str | None = None) -> str | None:
     if _is_shell_host(row):
         return "shell_boundary"
     parsed_wrap = _parsed_observed_wrap_invocation(
@@ -5943,6 +6142,8 @@ def _row_branch_reason(row: dict, root_key: str | None, agent: str,
             return None
         if parsed_wrap.agent != agent:
             return "same_root_other_agent_branch"
+        if cli is not None and parsed_wrap.cli != cli:
+            return "unknown_root_cli"
         return None if parsed_wrap.loop else "unknown_root_cli"
     inv = _agenttalk_invocation(row.get("command_line"), root_key, module_args_from)
     if not inv:
@@ -6001,17 +6202,71 @@ def _is_confirmed_launcher(
     st: dict,
     root_key: str | None,
     agent: str,
+    cli: str | None,
     diagnostics: dict[str, int],
     module_args_from: object = None,
-) -> tuple[bool, dict | None]:
+) -> tuple[WrapRecognition, dict | None]:
     pid = st.get("launcher_pid")
     start = st.get("launcher_start")
     if not _pid_alive_guarded(idx, pid, start):
-        return False, None
-    branch = _row_branch_reason(row, root_key, agent, module_args_from)
-    if branch is not None:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "launcher_identity_not_live",
+        ), None
+    command_line = row.get("command_line")
+    recognition = recognize_agenttalk_wrap_invocation(
+        command_line,
+        root_key,
+        agent,
+        cli,
+        module_args_from,
+    )
+    actual, nonce_reason = _parse_supervisor_launch_nonce(
+        command_line,
+        module_args_from,
+    )
+    nonce_contradictions = {
+        "launcher_nonce_malformed",
+        "launcher_nonce_duplicate",
+        "launcher_nonce_after_subcommand_or_tail",
+    }
+    if recognition.status is WrapRecognitionStatus.UNKNOWN:
+        _bump(
+            diagnostics,
+            (
+                "launcher_nonce_cmdline_unreadable"
+                if recognition.reason_code == "command_line_unreadable"
+                else "launcher_wrap_observation_unknown"
+            ),
+        )
+        return recognition, None
+    if nonce_reason in nonce_contradictions:
+        _bump(diagnostics, nonce_reason)
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            nonce_reason,
+            recognition.invocation,
+        ), None
+    if recognition.status is WrapRecognitionStatus.NOT_MATCHED:
+        if st.get("launcher_nonce_injected") is not True:
+            _bump(
+                diagnostics,
+                (
+                    "launcher_nonce_unsupported_argv"
+                    if (
+                        st.get("launcher_nonce_injected") is False
+                        and st.get("launcher_nonce_missing_reason")
+                        == "unsupported_launch_argv"
+                    )
+                    else "launcher_nonce_missing_state"
+                ),
+            )
+        elif not _valid_launch_nonce(st.get("launcher_nonce")):
+            _bump(diagnostics, "launcher_nonce_malformed")
         _bump(diagnostics, "foreign_launcher_suppressed")
-        return False, None
+        if recognition.reason_code == "not_agenttalk_invocation":
+            _bump(diagnostics, "launcher_wrap_parse_failed")
+        return recognition, None
     if st.get("launcher_nonce_injected") is not True:
         if (
             st.get("launcher_nonce_injected") is False
@@ -6020,34 +6275,34 @@ def _is_confirmed_launcher(
             _bump(diagnostics, "launcher_nonce_unsupported_argv")
         else:
             _bump(diagnostics, "launcher_nonce_missing_state")
-        return False, None
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "launcher_nonce_missing_state",
+            recognition.invocation,
+        ), None
     expected = st.get("launcher_nonce")
     if not _valid_launch_nonce(expected):
         _bump(diagnostics, "launcher_nonce_malformed")
-        return False, None
-    command_line = row.get("command_line")
-    if not isinstance(command_line, str) or not command_line.strip():
-        _bump(diagnostics, "launcher_nonce_cmdline_unreadable")
-        return False, None
-    actual, nonce_reason = _parse_supervisor_launch_nonce(command_line, module_args_from)
-    if nonce_reason in {
-        "launcher_nonce_malformed",
-        "launcher_nonce_duplicate",
-        "launcher_nonce_after_subcommand_or_tail",
-        "launcher_wrap_parse_failed",
-    }:
-        _bump(diagnostics, nonce_reason)
-        return False, None
-    if not parse_agenttalk_wrap_invocation(command_line, root_key, agent, module_args_from):
-        _bump(diagnostics, "launcher_wrap_parse_failed")
-        return False, None
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "launcher_nonce_malformed",
+            recognition.invocation,
+        ), None
     if nonce_reason == "launcher_nonce_absent":
         _bump(diagnostics, "launcher_nonce_absent")
-        return False, None
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            nonce_reason,
+            recognition.invocation,
+        ), None
     if actual != expected:
         _bump(diagnostics, "launcher_nonce_mismatch")
-        return False, None
-    return True, {"pid": pid, "start": start, "nonce": expected}
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "launcher_nonce_mismatch",
+            recognition.invocation,
+        ), None
+    return recognition, {"pid": pid, "start": start, "nonce": expected}
 
 
 def _record_target(targets: dict[int, dict], row: dict, reason: str,
@@ -6083,7 +6338,9 @@ def _is_expected_seed_row(row: dict, cfg_agent: dict, agent: str,
     # only, so it must not be applied here (see _strict_child_edge).
     if parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
         return True
-    if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+    if parse_agenttalk_wrap_invocation(
+        row.get("command_line"), root_key, agent, cli=cfg_agent.get("cli")
+    ):
         return True
     name = _image_stem(row)
     cli = cfg_agent.get("cli")
@@ -6228,14 +6485,14 @@ def _children_map(idx: dict[int, dict]) -> dict[int, list[int]]:
 
 
 def _strict_child_edge(parent: dict, child: dict, *,
-                       root_key: str | None, agent: str,
+                       root_key: str | None, agent: str, cli: str | None,
                        diagnostics: dict[str, int]) -> bool:
     if child.get("parent_pid") != parent.get("pid"):
         return False
     # child is an arbitrary descendant, never the confirmed launcher itself -
     # it made no declaration of its own, so it is parsed by its own argv
     # shape (module_args_from=None), not this agent's declared prefix.
-    branch = _row_branch_reason(child, root_key, agent)
+    branch = _row_branch_reason(child, root_key, agent, cli=cli)
     if branch is not None:
         _bump(diagnostics, branch)
         return False
@@ -6270,7 +6527,9 @@ def _root_wait_brain(idx: dict[int, dict], wait_row: dict, cfg_agent: dict,
         if not isinstance(pid, int) or pid in seen:
             return best
         seen.add(pid)
-        branch = _row_branch_reason(parent, root_key, agent)
+        branch = _row_branch_reason(
+            parent, root_key, agent, cli=cfg_agent.get("cli")
+        )
         if branch is not None:
             _bump(diagnostics, branch)
             return best
@@ -6369,10 +6628,20 @@ def _attribution(
     if launcher_mismatch:
         _bump(diagnostics, "pid_reuse_suppressed")
     if isinstance(launcher_row, dict):
-        confirmed_launcher, launcher_source = _is_confirmed_launcher(
-            idx, launcher_row, st, root_key, agent, diagnostics, module_args_from)
+        launcher_recognition, launcher_source = _is_confirmed_launcher(
+            idx,
+            launcher_row,
+            st,
+            root_key,
+            agent,
+            cfg_agent.get("cli"),
+            diagnostics,
+            module_args_from,
+        )
+        confirmed_launcher = (
+            launcher_recognition.status is WrapRecognitionStatus.MATCHED
+        )
     if confirmed_launcher:
-        confirmed_launcher = True
         _record_target(targets_by_pid, launcher_row, "confirmed_launcher",
                        seed_descendants=True, launcher_source=launcher_source)
         seed_pids.add(launcher_pid)
@@ -6388,11 +6657,15 @@ def _attribution(
             continue
         # row is an arbitrary snapshot entry, not the confirmed launcher -
         # parse it by its own argv shape, not this agent's declared prefix.
-        branch = _row_branch_reason(row, root_key, agent)
+        branch = _row_branch_reason(
+            row, root_key, agent, cli=cfg_agent.get("cli")
+        )
         if branch is not None:
             _bump(diagnostics, branch)
             continue
-        if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+        if parse_agenttalk_wrap_invocation(
+            row.get("command_line"), root_key, agent, cli=cfg_agent.get("cli")
+        ):
             _record_target(targets_by_pid, row, "own_wrapper", seed_descendants=True)
             seed_pids.add(pid)
         elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
@@ -6507,8 +6780,14 @@ def _attribution(
             child = idx.get(child_pid)
             if not isinstance(child, dict):
                 continue
-            if not _strict_child_edge(parent, child, root_key=root_key,
-                                      agent=agent, diagnostics=diagnostics):
+            if not _strict_child_edge(
+                parent,
+                child,
+                root_key=root_key,
+                agent=agent,
+                cli=cfg_agent.get("cli"),
+                diagnostics=diagnostics,
+            ):
                 continue
             child_launcher_source = seed_launcher_sources.get(parent_pid)
             _record_target(targets_by_pid, child, "live_chain_descendant",
@@ -6727,6 +7006,18 @@ def evaluate_launch_barrier(
         active = eph_root.get("active") if isinstance(eph_root, dict) else None
         candidate = active.get(request_id) if isinstance(active, dict) else None
         st = candidate if isinstance(candidate, dict) else {}
+    config_agents = config.get("agents") if isinstance(config, dict) else None
+    config_agent = (
+        config_agents.get(agent)
+        if isinstance(config_agents, dict)
+        and isinstance(config_agents.get(agent), dict)
+        else {}
+    )
+    expected_cli = (
+        st.get("cli")
+        if request_id is not None and isinstance(st.get("cli"), str)
+        else config_agent.get("cli")
+    )
     if snapshot is None:
         blocked = request_id is not None or _prior_wrapper_may_be_alive(st)
         return {
@@ -6935,7 +7226,9 @@ def evaluate_launch_barrier(
             kind = "state_launcher"
         # row is an arbitrary post-kill survivor, not a confirmed launcher -
         # parsed by its own argv shape, not this agent's declared prefix.
-        elif parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+        elif parse_agenttalk_wrap_invocation(
+            row.get("command_line"), root_key, agent, cli=expected_cli
+        ):
             kind = "own_wrapper"
         elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
             kind = "own_wait"
@@ -7050,7 +7343,9 @@ def capture_launch_child_provenance(
         # row is a child of the confirmed launcher, but its OWN argv shape
         # was never declared - the launcher's declared prefix describes the
         # launcher, not its children, so it does not apply here either.
-        branch = _row_branch_reason(row, root_key, agent)
+        branch = _row_branch_reason(
+            row, root_key, agent, cli=cfg_agent.get("cli")
+        )
         if branch is not None:
             _bump(diagnostics, branch)
             continue
@@ -7507,6 +7802,18 @@ def _wrapped_liveness(
     }
     verified_wrapper_generation: str | None = None
 
+    def _recognition_unknown(reason_code: str) -> dict:
+        """Hold this poll without rewriting the last ownership certificate."""
+
+        base["wrapper_recognition"] = {
+            "status": WrapRecognitionStatus.UNKNOWN.value,
+            "reason_code": reason_code,
+        }
+        base["child_reason"] = reason_code
+        base["kill_targets"] = []
+        base["owned_process_tree_refreshed"] = False
+        return base
+
     if has_revoked_runtime and revoked_runtime is None:
         # This marker is the atomic attended-reset boundary that makes an old
         # runtime file non-authoritative. Schema drift must therefore HOLD
@@ -7526,6 +7833,9 @@ def _wrapped_liveness(
             "process_tree_invalid_runtime_revocation_record"
         )
         return base
+
+    if snapshot is None:
+        return _recognition_unknown("snapshot_unavailable")
 
     def _unverified_owned_process_may_exist() -> bool:
         """Conservatively detect ownership-shaped live evidence without a tree."""
@@ -7729,34 +8039,6 @@ def _wrapped_liveness(
             "root_identity_unavailable",
             hold_reason="process_tree_invalid_root_identity_unavailable",
         )
-    wrapper_generation = record.get("wrapper_generation")
-    if wrapper_generation != st.get("runtime_wrapper_generation"):
-        # A new wrapper generation supersedes any prior tree, but adoption is a
-        # fail-closed poll rather than a relaunch-authority gap. The next poll
-        # may replace this one specific transition marker only after it binds
-        # the live wrapper and derives a complete current tree.
-        base["owned_process_tree"] = _invalid_owned_process_tree_record(
-            agent=agent,
-            root_key=root_key,
-            wrapper_generation=wrapper_generation,
-            launch_nonce=(
-                st.get("launcher_nonce")
-                if _valid_launch_nonce(st.get("launcher_nonce"))
-                else None
-            ),
-            now_epoch=now_epoch,
-            reason_code="process_tree_invalid_generation_adoption_pending",
-        )
-        base["owned_process_tree_error"] = (
-            "process_tree_invalid_generation_adoption_pending"
-        )
-        base["child_reason"] = "wrapper_generation_mismatch"
-        return base
-    if snapshot is None:
-        return _current_proof_failed(
-            "snapshot_unavailable",
-            hold_reason="process_tree_invalid_snapshot_unavailable",
-        )
     idx, excluded_pids = _snap_index_and_excluded(snapshot)
     wrapper_pid = record.get("wrapper_pid")
     wrapper_start = record.get("wrapper_start")
@@ -7797,21 +8079,51 @@ def _wrapped_liveness(
             "wrapper_identity_ambiguous",
             hold_reason="process_tree_invalid_wrapper_identity_ambiguous",
         )
-    wrapper_attributed, _launcher_source = _is_confirmed_launcher(
+    wrapper_recognition, _launcher_source = _is_confirmed_launcher(
         idx,
         wrapper_row,
         st,
         root_key,
         agent,
+        cfg_agent.get("cli"),
         diagnostics,
         _module_args_from(cfg_agent),
     )
-    if not wrapper_attributed:
+    if wrapper_recognition.status is WrapRecognitionStatus.UNKNOWN:
+        return _recognition_unknown(wrapper_recognition.reason_code)
+    if wrapper_recognition.status is WrapRecognitionStatus.NOT_MATCHED:
         return _current_proof_failed(
-            "wrapper_attribution_ambiguous",
-            hold_reason="process_tree_invalid_wrapper_attribution_ambiguous",
+            "wrapper_attribution_not_matched",
+            hold_reason="process_tree_invalid_wrapper_attribution_not_matched",
         )
+    base["wrapper_recognition"] = {
+        "status": WrapRecognitionStatus.MATCHED.value,
+        "reason_code": wrapper_recognition.reason_code,
+    }
     base["wrapper_state"] = "alive"
+
+    wrapper_generation = record.get("wrapper_generation")
+    if wrapper_generation != st.get("runtime_wrapper_generation"):
+        # Generation adoption is permitted only after current command-line
+        # recognition MATCHED. An unreadable observation above preserves the
+        # prior generation and retries instead of manufacturing authority.
+        base["owned_process_tree"] = _invalid_owned_process_tree_record(
+            agent=agent,
+            root_key=root_key,
+            wrapper_generation=wrapper_generation,
+            launch_nonce=(
+                st.get("launcher_nonce")
+                if _valid_launch_nonce(st.get("launcher_nonce"))
+                else None
+            ),
+            now_epoch=now_epoch,
+            reason_code="process_tree_invalid_generation_adoption_pending",
+        )
+        base["owned_process_tree_error"] = (
+            "process_tree_invalid_generation_adoption_pending"
+        )
+        base["child_reason"] = "wrapper_generation_mismatch"
+        return base
 
     phase = record.get("phase")
     candidate = None
@@ -8663,6 +8975,17 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         liveness.get("runtime_status") == runtime_obs.STATUS_VALID
         and runtime_record is not None
     )
+    wrapper_recognition = (
+        liveness.get("wrapper_recognition")
+        if isinstance(liveness.get("wrapper_recognition"), dict)
+        else None
+    )
+    runtime_state_authoritative = bool(
+        runtime_valid
+        and wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.MATCHED.value
+    )
     runtime_wrapper_generation = (
         runtime_record.get("wrapper_generation") if runtime_valid else None
     )
@@ -8676,7 +8999,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     prior_wrapper_generation = st.get("runtime_wrapper_generation")
     prior_turn_generation = st.get("runtime_turn_generation")
     same_runtime_turn = bool(
-        runtime_valid
+        runtime_state_authoritative
         and runtime_wrapper_generation == prior_wrapper_generation
         and runtime_turn_generation == prior_turn_generation
     )
@@ -8689,7 +9012,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         float(progress_seen_epoch)
     ):
         progress_seen_epoch = now_epoch
-    if runtime_valid:
+    if runtime_state_authoritative:
         if not same_runtime_turn:
             initial_progress_age = liveness.get("runtime_progress_age_seconds")
             progress_seen_epoch = (
@@ -8720,7 +9043,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         # are still reset below, so UNKNOWN itself never advances kill authority.
         sequence_regressed = st.get("runtime_sequence_regressed") is True
 
-    if runtime_valid:
+    if runtime_state_authoritative:
         next_wrapper_generation = runtime_wrapper_generation
         next_turn_generation = runtime_turn_generation
         next_runtime_phase = runtime_phase
@@ -8788,6 +9111,12 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         )
     if liveness.get("owned_process_tree_pending") is True:
         nxt["owned_process_tree_pending"] = True
+    if (
+        wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.UNKNOWN.value
+    ):
+        nxt["wrapper_recognition"] = copy.deepcopy(wrapper_recognition)
 
     def _relaunch_state() -> None:
         nf = fails + 1
@@ -8889,6 +9218,28 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         elif fails and (now_epoch - float(healthy_since)) >= reset_after:
             nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
         return _result(NONE, state=state, reason=reason)
+
+    if (
+        wrapped
+        and wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.UNKNOWN.value
+    ):
+        notify = now_epoch - last_warn >= suspect_interval
+        if notify:
+            nxt["last_warn_epoch"] = now_epoch
+        reason_code = wrapper_recognition.get("reason_code")
+        return _result(
+            WARN_ONLY,
+            state="PROCESS_TREE_UNKNOWN",
+            notify=notify,
+            reason=(
+                "The current wrapper identity observation is incomplete or "
+                f"unreadable ({reason_code}); it will be re-observed on the "
+                "next poll. This observation authorizes neither adoption nor "
+                "teardown, disowning, or relaunch."
+            ),
+        )
 
     # A partial wrapped tree is evidence, never teardown authority. This check
     # precedes even an authorized restart marker: Stop-Tree cannot safely reap
@@ -9545,10 +9896,18 @@ def _ephemeral_owned_process_view(
     )
     next_entry["managed_pids"] = []
     runtime_record = liveness.get("runtime_record")
+    wrapper_recognition = (
+        liveness.get("wrapper_recognition")
+        if isinstance(liveness.get("wrapper_recognition"), dict)
+        else None
+    )
     if (
         liveness.get("runtime_status") == runtime_obs.STATUS_VALID
         and isinstance(runtime_record, dict)
         and isinstance(runtime_record.get("wrapper_generation"), str)
+        and wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.MATCHED.value
     ):
         next_entry["runtime_wrapper_generation"] = runtime_record[
             "wrapper_generation"
@@ -9567,16 +9926,31 @@ def _ephemeral_owned_process_view(
         next_entry["owned_process_tree_pending"] = True
     else:
         next_entry.pop("owned_process_tree_pending", None)
+    if (
+        wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.UNKNOWN.value
+    ):
+        next_entry["wrapper_recognition"] = copy.deepcopy(wrapper_recognition)
+    else:
+        next_entry.pop("wrapper_recognition", None)
     complete = bool(
         isinstance(tree, dict)
         and tree.get("status") in {"complete", "absent"}
         and liveness.get("owned_process_tree_refreshed") is True
+        and wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.MATCHED.value
     )
     if complete:
         next_entry.pop("process_tree_hold_reason", None)
     else:
         next_entry["process_tree_hold_reason"] = (
-            tree.get("reason_code")
+            wrapper_recognition.get("reason_code")
+            if wrapper_recognition is not None
+            and wrapper_recognition.get("status")
+            == WrapRecognitionStatus.UNKNOWN.value
+            else tree.get("reason_code")
             if isinstance(tree, dict)
             else liveness.get("child_reason")
         ) or "process_tree_authority_unavailable"
@@ -9901,6 +10275,11 @@ def process_tree_ownership_reset_evidence(
                 f"request {request_id!r} and agent {agent!r}"
             )
 
+    if _wrapper_recognition_is_unknown(entry):
+        raise ValueError(
+            "wrapper recognition is unknown and retryable; ownership cannot be reset"
+        )
+
     raw_tree = entry.get("owned_process_tree")
     if not isinstance(raw_tree, dict) or raw_tree.get("status") not in {
         "invalid",
@@ -10163,6 +10542,8 @@ def evaluate_process_tree_reset_admissions(
         for raw_agent, entry in sorted(agents.items()):
             if not isinstance(entry, dict):
                 continue
+            if _wrapper_recognition_is_unknown(entry):
+                continue
             tree = entry.get("owned_process_tree")
             if not (
                 isinstance(tree, dict)
@@ -10228,6 +10609,8 @@ def evaluate_process_tree_reset_admissions(
     if isinstance(active, dict) and ephemeral_identity_context_valid:
         for request_id, entry in sorted(active.items()):
             if not isinstance(entry, dict) or not eph.is_safe_id(request_id):
+                continue
+            if _wrapper_recognition_is_unknown(entry):
                 continue
             try:
                 agent = validate_agent_name(entry.get("agent"))
@@ -10440,6 +10823,12 @@ def reset_process_tree_ownership_after_attended_teardown(
     """
     agent = validate_agent_name(agent)
     acknowledged_by = validate_agent_name(acknowledged_by)
+    agents = state.get("agents") if isinstance(state, dict) else None
+    current_entry = agents.get(agent) if isinstance(agents, dict) else None
+    if _wrapper_recognition_is_unknown(current_entry):
+        raise ValueError(
+            "wrapper recognition is unknown and retryable; ownership cannot be reset"
+        )
     if (
         not isinstance(hold_source_hash, str)
         or re.fullmatch(r"[0-9a-f]{64}", hold_source_hash) is None
@@ -11374,6 +11763,12 @@ def stage_attended_ephemeral_archive(
     now_epoch: float,
 ) -> dict:
     """Persist all authority and payload needed for an idempotent retry."""
+    root = eph.ensure_state(state)
+    active_entry = root["active"].get(request_id)
+    if _wrapper_recognition_is_unknown(active_entry):
+        raise ValueError(
+            "wrapper recognition is unknown and retryable; request cannot be archived"
+        )
     terminal = eph.validate_held_terminal(held_terminal)
     if terminal is None:
         raise ValueError("ephemeral HOLD has no valid terminal disposition")
@@ -11416,7 +11811,6 @@ def stage_attended_ephemeral_archive(
         "terminal": terminal,
         "archive_payload": payload,
     })
-    root = eph.ensure_state(state)
     pending = root.setdefault("attended_archive_pending", {})
     if not isinstance(pending, dict) or len(pending) > 64:
         raise ValueError("attended ephemeral archive journals are malformed")
@@ -11447,6 +11841,10 @@ def finish_attended_ephemeral_archive(
     root = eph.ensure_state(state)
     active = root["active"]
     entry = active.get(request_id)
+    if _wrapper_recognition_is_unknown(entry):
+        raise ValueError(
+            "wrapper recognition is unknown and retryable; request cannot be archived"
+        )
     if not _active_ephemeral_hold_matches_archive(entry, record, request_id):
         raise ValueError(
             "active ephemeral HOLD changed after its attended archive was staged"

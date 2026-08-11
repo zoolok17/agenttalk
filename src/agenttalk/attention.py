@@ -700,10 +700,16 @@ def configured_process_tree_hold_agents(state: dict) -> list[str]:
         if not isinstance(row, dict):
             continue
         tree = row.get("owned_process_tree")
-        if not (
+        recognition = row.get("wrapper_recognition")
+        process_tree_hold = bool(
             isinstance(tree, dict)
             and tree.get("status") in {"invalid", "truncated"}
-        ):
+        )
+        recognition_hold = bool(
+            isinstance(recognition, dict)
+            and recognition.get("status") == "unknown"
+        )
+        if not process_tree_hold and not recognition_hold:
             continue
         try:
             held.append(validate_agent_name(raw_agent))
@@ -867,8 +873,19 @@ def process_tree_hold_items(
     ) -> None:
         tree = row.get("owned_process_tree")
         tree_record = tree if isinstance(tree, dict) else {}
-        status = tree_record.get("status")
+        wrapper_recognition = (
+            row.get("wrapper_recognition")
+            if isinstance(row.get("wrapper_recognition"), dict)
+            else None
+        )
+        recognition_unknown = bool(
+            wrapper_recognition is not None
+            and wrapper_recognition.get("status") == "unknown"
+        )
+        status = "unknown" if recognition_unknown else tree_record.get("status")
         hold_reason = row.get("process_tree_hold_reason")
+        if recognition_unknown:
+            hold_reason = wrapper_recognition.get("reason_code")
         if (
             status not in {"truncated", "invalid"}
             and request_id is not None
@@ -880,11 +897,15 @@ def process_tree_hold_items(
             status = "invalid"
             if not eph.is_safe_reason(hold_reason, max_length=256):
                 hold_reason = "process_tree_hold_reason_invalid"
-        if status not in {"truncated", "invalid"}:
+        if status not in {"truncated", "invalid", "unknown"}:
             return
         observed = tree_record.get("observed_count")
         limit = tree_record.get("limit")
-        reason_code = tree_record.get("reason_code") or hold_reason
+        reason_code = (
+            hold_reason
+            if recognition_unknown
+            else tree_record.get("reason_code") or hold_reason
+        )
         if not eph.is_safe_reason(reason_code, max_length=256):
             reason_code = "process_tree_hold_reason_invalid"
         display_observed = (
@@ -917,30 +938,34 @@ def process_tree_hold_items(
             f"{gap} Automatic teardown and relaunch are refused because a "
             "partial action could strand descendants or start a duplicate agent."
         )
-        launch, launch_problem = supervisor_mod.configured_detached_launch(
-            supervisor_config,
-            agent,
-            root=root,
-            store_config=store_config,
-            request_id=request_id,
-            request_entry=(row if request_id is not None else None),
-            request_marker=(
-                launch_requests.get(request_id)
-                if request_id is not None
-                and isinstance(launch_requests, dict)
-                and isinstance(launch_requests.get(request_id), dict)
-                else None
-            ),
-            request_delivery=(
-                launch_deliveries.get(request_id)
-                if request_id is not None
-                and isinstance(launch_deliveries, dict)
-                and isinstance(launch_deliveries.get(request_id), dict)
-                else None
-            ),
-            lane_workspaces=lane_workspaces,
-            now_epoch=projection_epoch,
-        )
+        if recognition_unknown:
+            launch = None
+            launch_problem = "current wrapper recognition is unknown and retryable"
+        else:
+            launch, launch_problem = supervisor_mod.configured_detached_launch(
+                supervisor_config,
+                agent,
+                root=root,
+                store_config=store_config,
+                request_id=request_id,
+                request_entry=(row if request_id is not None else None),
+                request_marker=(
+                    launch_requests.get(request_id)
+                    if request_id is not None
+                    and isinstance(launch_requests, dict)
+                    and isinstance(launch_requests.get(request_id), dict)
+                    else None
+                ),
+                request_delivery=(
+                    launch_deliveries.get(request_id)
+                    if request_id is not None
+                    and isinstance(launch_deliveries, dict)
+                    and isinstance(launch_deliveries.get(request_id), dict)
+                    else None
+                ),
+                lane_workspaces=lane_workspaces,
+                now_epoch=projection_epoch,
+            )
         marker = (
             restart_requests.get(agent)
             if isinstance(restart_requests, dict)
@@ -953,6 +978,8 @@ def process_tree_hold_items(
             decision_state=(
                 "PROCESS_TREE_TRUNCATED"
                 if status == "truncated"
+                else "PROCESS_TREE_UNKNOWN"
+                if status == "unknown"
                 else "PROCESS_TREE_INVALID"
             ),
         )
@@ -974,7 +1001,7 @@ def process_tree_hold_items(
             )
             else None
         )
-        remedy = admissions.get(identity)
+        remedy = None if recognition_unknown else admissions.get(identity)
         remedy_mode = None
         remedy_identity = None
         remedy_blocker = None
@@ -1039,7 +1066,7 @@ def process_tree_hold_items(
                     ],
                     "reason": reason,
                 }
-        blocker = blocked_admissions.get(identity)
+        blocker = None if recognition_unknown else blocked_admissions.get(identity)
         if remedy_mode is None and isinstance(blocker, dict):
             expected_common = {
                 "mode",
@@ -1071,7 +1098,12 @@ def process_tree_hold_items(
                     "request_id": request_id,
                     "missing_precondition": "supervisor_kill_switch_absent",
                 }
-        if remedy_mode is not None and operator_root is not None:
+        if recognition_unknown:
+            recommendation = (
+                "Agenttalk will retry recognition on the next supervisor poll; "
+                "this observation admits no scripted reset or detached launch."
+            )
+        elif remedy_mode is not None and operator_root is not None:
             recommendation = (
                 "The attended scripted remedy argv below is currently admitted; "
                 "the command rechecks every precondition before it changes state."
@@ -1106,7 +1138,9 @@ def process_tree_hold_items(
                 " A restart request is blocked by this refusal and is not "
                 "pending progress."
             )
-        if launch is not None:
+        if recognition_unknown:
+            pass
+        elif launch is not None:
             recommendation += (
                 " After independently verifying the prior agent processes are "
                 "stopped, review the unverified launch-environment guidance and "
@@ -1156,10 +1190,13 @@ def process_tree_hold_items(
                     "brain_start": row.get("brain_start"),
                     "managed_pids": row.get("managed_pids"),
                     "held_terminal": row.get("held_terminal"),
+                    "wrapper_recognition": wrapper_recognition,
                 }),
             },
-            human_can_unblock_now=True,
+            human_can_unblock_now=not recognition_unknown,
             fields={
+                "status": status,
+                "reason_code": reason_code,
                 "why_it_matters": summary,
                 "recommendation": recommendation,
                 "risk_if_ignored": (
