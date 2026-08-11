@@ -710,7 +710,7 @@ def _claim_current_supervisor(store: Store) -> dict:
 @pytest.mark.parametrize(
     ("pid", "liveness", "recorded_start", "expected"),
     [
-        (123, store_mod.PROC_ALIVE, None, "alive"),
+        (123, store_mod.PROC_ALIVE, None, "start_unmatchable"),
         (123, store_mod.PROC_DEAD, "2026-08-08T00:00:00Z", "dead"),
         (123, store_mod.PROC_UNKNOWN, "2026-08-08T00:00:00Z", "unknown"),
         (True, store_mod.PROC_ALIVE, None, "unknown"),
@@ -732,6 +732,17 @@ def test_probe_owner_identity_short_circuits_without_start_observation(
     monkeypatch.setattr(store_mod, "_process_start_token", unexpected_start_observation)
 
     assert store_mod._probe_owner_identity(pid, recorded_start) == expected
+
+
+def test_probe_owner_identity_refuses_missing_start_without_pid_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_pid_probe(_pid: object) -> str:
+        raise AssertionError("an unbound pid cannot prove recorded process identity")
+
+    monkeypatch.setattr(store_mod, "_process_liveness", unexpected_pid_probe)
+
+    assert store_mod._probe_owner_identity(123, None) == "start_unmatchable"
 
 
 @pytest.mark.parametrize(
@@ -784,7 +795,7 @@ def test_probe_owner_identity_classifies_start_identity(
 
 def test_probe_owner_identity_confirms_current_process() -> None:
     pid = os.getpid()
-    assert store_mod._probe_owner_identity(pid, None) == "alive"
+    assert store_mod._probe_owner_identity(pid, None) == "start_unmatchable"
     observed_start = store_mod._process_start_token(pid)
     if observed_start is not None:
         assert store_mod._probe_owner_identity(pid, observed_start) == "alive"
@@ -819,7 +830,10 @@ def test_cli_archive_launch_request_with_stale_pid_refuses_without_effects(
         tmp_path,
         request_id=request_id,
     )
-    instance = s.claim_supervisor_instance(pid=2 ** 31 - 1, pid_start=None)
+    instance = s.claim_supervisor_instance(
+        pid=2 ** 31 - 1,
+        pid_start="2026-08-08T00:00:00Z",
+    )
     assert instance is not None
     before = _archive_effect_bytes(s, request_id, state_path)
 
@@ -870,32 +884,55 @@ def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path
     assert agent in s.retired_agents()
 
 
-def test_cli_archive_launch_request_allows_live_owner_without_start_token(
+@pytest.mark.parametrize(
+    ("supplied_start", "reason_code"),
+    [
+        (None, "supervisor_owner_start_unmatchable"),
+        ("2026-08-08T00:00:00Z", "supervisor_owner_identity_mismatch"),
+    ],
+    ids=["omitted-start", "forged-start"],
+)
+def test_cli_archive_launch_request_refuses_reused_live_pid_with_null_start_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    supplied_start: str | None,
+    reason_code: str,
 ) -> None:
-    request_id = "lr-cli-live-no-start"
+    request_id = f"lr-cli-null-start-{supplied_start is not None}"
     s, agent, state_path = _prepared_cli_archive_fixture(
         tmp_path,
         request_id=request_id,
     )
-    instance = s.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    reused_pid = os.getpid()
+    assert store_mod._process_liveness(reused_pid) == store_mod.PROC_ALIVE
+    instance = s.claim_supervisor_instance(pid=reused_pid, pid_start=None)
     assert instance is not None
+    supplied = {**instance, "pid_start": supplied_start}
+    before = _archive_effect_bytes(s, request_id, state_path)
 
-    def unexpected_start_observation(_pid: object) -> str:
-        raise AssertionError("an absent recorded start must use pid liveness only")
+    def unexpected_pid_probe(_pid: object) -> str:
+        raise AssertionError("a null-start identity must refuse before probing the pid")
 
-    monkeypatch.setattr(store_mod, "_process_start_token", unexpected_start_observation)
+    monkeypatch.setattr(store_mod, "_process_liveness", unexpected_pid_probe)
 
-    assert cli.main(_archive_cli_args(
+    def unexpected_state_load(_path: Path) -> dict:
+        raise AssertionError("null-start refusal must precede state load")
+
+    monkeypatch.setattr(sup, "load_supervisor_state", unexpected_state_load)
+
+    rc = cli.main(_archive_cli_args(
         tmp_path,
         request_id,
         state_path,
-        instance=instance,
-    )) == 0
-    assert not (s.launch_requests_dir / f"{request_id}.json").exists()
-    assert (s.launch_requests_archive_dir / f"{request_id}.json").exists()
-    assert agent in s.retired_agents()
+        instance=supplied,
+    ))
+
+    assert rc == 3
+    assert reason_code in capsys.readouterr().err
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
 
 
 @pytest.mark.parametrize("identity_break", ["token", "pid", "pid_start"])

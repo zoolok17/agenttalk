@@ -28,6 +28,7 @@ from agenttalk import (
     cli,
     ephemeral as eph,
     health as hm,
+    store as store_mod,
     supervisor as sup,
     wrapper_runtime as wrt,
 )
@@ -185,6 +186,26 @@ def test_supervise_drain_intents_manual_claims_and_releases_instance(tmp_path: P
     s.write_intent("send", {"target": "worker", "body": "hello"})
 
     rc = _run(["supervise", "--drain-intents", "--pid", "123", "--pid-start", "start"], tmp_path)
+
+    assert rc == 0
+    assert s.read_supervisor_instance() is None
+    assert s.messages_for("worker")[0].body == "hello"
+
+
+def test_supervise_drain_intents_without_pid_start_keeps_generic_claim_supported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path)
+    s.set_role("lead", "lead")
+    s.write_intent("send", {"target": "worker", "body": "hello"})
+
+    def unexpected_archive_probe(*_args: object) -> str:
+        raise AssertionError("generic claim/release must not use archive admission")
+
+    monkeypatch.setattr(store_mod, "_probe_owner_identity", unexpected_archive_probe)
+
+    rc = _run(["supervise", "--drain-intents", "--pid", "123"], tmp_path)
 
     assert rc == 0
     assert s.read_supervisor_instance() is None

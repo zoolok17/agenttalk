@@ -7268,11 +7268,14 @@ def _probe_owner_identity(pid: object, recorded_pid_start: object = None) -> str
 
     Unlike :func:`_owner_identity_gone`, this is an admission probe: UNKNOWN
     and an unobservable start identity are refusals, not alternate ways to
-    spell "alive".  An omitted start token retains compatibility, but only
-    after the operating system has positively confirmed the pid is running.
+    spell "alive".  An omitted start token is unmatchable without probing the
+    pid: liveness alone cannot prove that the running process is the recorded
+    owner rather than a later process that reused its number.
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return OWNER_IDENTITY_UNKNOWN
+    if recorded_pid_start is None:
+        return OWNER_IDENTITY_START_UNMATCHABLE
     try:
         liveness = _process_liveness(pid)
     except Exception:  # noqa: BLE001 - a failed authority probe is UNKNOWN
@@ -7281,8 +7284,6 @@ def _probe_owner_identity(pid: object, recorded_pid_start: object = None) -> str
         return OWNER_IDENTITY_DEAD
     if liveness != PROC_ALIVE:
         return OWNER_IDENTITY_UNKNOWN
-    if recorded_pid_start is None:
-        return OWNER_IDENTITY_ALIVE
     try:
         observed_pid_start = _process_start_token(pid)
     except Exception:  # noqa: BLE001 - live pid, but its start cannot be matched
