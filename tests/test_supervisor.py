@@ -8847,7 +8847,7 @@ def test_regular_plan_finalizer_canonicalizes_valid_root_abbreviations(
 
 
 @pytest.mark.parametrize("configured_root", [[], ["--root", "D:/stale"]])
-def test_regular_plan_finalizer_pins_root_before_global_delimiter(
+def test_regular_plan_finalizer_pins_root_before_wrap_subcommand(
     tmp_path: Path,
     configured_root: list[str],
 ) -> None:
@@ -8859,7 +8859,7 @@ def test_regular_plan_finalizer_pins_root_before_global_delimiter(
         "launch": {
             "windows_file": "python.exe",
             "windows_args": [
-                "-m", "agenttalk", *configured_root, "--", "wrap", "--for",
+                "-m", "agenttalk", *configured_root, "wrap", "--for",
                 "worker", "--loop", "--", "codex.exe",
             ],
         },
@@ -8882,8 +8882,11 @@ def test_regular_plan_finalizer_pins_root_before_global_delimiter(
 
     artifact = plan["agents"]["worker"]["launch_admission"]
     assert artifact["status"] == "accepted"
-    delimiter = artifact["argv"].index("--")
-    assert artifact["argv"][delimiter - 2:delimiter] == ["--root", root]
+    argv = artifact["argv"]
+    wrap_index = argv.index("wrap")
+    child_delimiter = argv.index("--", wrap_index)
+    assert argv[wrap_index - 2:wrap_index] == ["--root", root]
+    assert argv[child_delimiter + 1:] == ["codex.exe"]
 
 
 def test_regular_plan_finalizer_does_not_invent_transport_bounds(
