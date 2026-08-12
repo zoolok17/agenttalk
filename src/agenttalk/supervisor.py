@@ -11908,6 +11908,10 @@ def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,
     marker = store.read_launch_request(request_id)
     root = eph.ensure_state(state)
     entry = root["active"].get(request_id)
+    if _wrapper_recognition_is_unknown(entry):
+        raise ValueError(
+            "wrapper recognition is unknown and retryable; request cannot be archived"
+        )
     entry = entry if isinstance(entry, dict) else {}
     agent = entry.get("agent") or (marker or {}).get("agent")
     retire_error = None

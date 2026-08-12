@@ -1772,3 +1772,27 @@ def test_owner_identity_two_argument_call_stays_compatible(
         321,
         "linux:12345678-1234-1234-1234-123456789abc:1",
     ) is True
+
+
+def test_owner_identity_unknown_is_not_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        store_mod,
+        "_process_liveness",
+        lambda _pid: store_mod.PROC_UNKNOWN,
+    )
+
+    def unexpected_start_observation(_pid: object) -> str:
+        raise AssertionError("an unknown owner must not grant teardown authority")
+
+    monkeypatch.setattr(
+        store_mod,
+        "_process_start_token",
+        unexpected_start_observation,
+    )
+
+    assert store_mod._owner_identity_gone(
+        321,
+        "linux:12345678-1234-1234-1234-123456789abc:1",
+    ) is False

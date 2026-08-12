@@ -1534,6 +1534,54 @@ def test_probe_owner_identity_confirms_current_process() -> None:
         assert store_mod._probe_owner_identity(pid, observed_start) == "alive"
 
 
+def test_cli_archive_launch_request_unknown_recognition_refuses_live_owner_without_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_id = "lr-cli-unknown-recognition"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    state = sup.load_supervisor_state(state_path)
+    state["ephemeral_reviewers"]["active"][request_id][
+        "wrapper_recognition"
+    ] = {
+        "status": sup.WrapRecognitionStatus.UNKNOWN.value,
+        "reason_code": "snapshot_unavailable",
+    }
+    sup.save_supervisor_state(state_path, state)
+    if store_mod._process_start_token(os.getpid()) is None:
+        # Darwin has no native start locator. Keep the real liveness and owner
+        # classifier while supplying the comparable start observation it lacks.
+        pid_start = "2026-08-08T00:00:00Z"
+        monkeypatch.setattr(
+            store_mod,
+            "_process_start_token",
+            lambda pid: pid_start if pid == os.getpid() else None,
+        )
+    instance = _claim_current_supervisor(s)
+    assert store_mod._probe_owner_identity(
+        instance["pid"],
+        instance["pid_start"],
+    ) == store_mod.OWNER_IDENTITY_ALIVE
+    before = _archive_effect_bytes(s, request_id, state_path)
+
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+    ))
+
+    assert rc == 3
+    assert "recognition is unknown and retryable" in capsys.readouterr().err
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
+
+
 def test_cli_archive_launch_request_without_owner_identity_refuses_without_effects(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
