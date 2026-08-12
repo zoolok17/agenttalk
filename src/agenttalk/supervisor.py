@@ -12669,6 +12669,26 @@ function Restore-AgenttalkEnvironment($saved) {
     }
   }
 }
+function Set-AgenttalkEnvironmentMapEntry($entries, [string]$name, $value) {
+  # PowerShell's string comparers do not model the Win32 environment-name
+  # identity consistently across 5.1 and 7. Collapse aliases with the same
+  # native comparison used at the process-environment boundary so one native
+  # variable is saved, mutated, and restored exactly once.
+  $target = $name
+  $found = $false
+  foreach ($candidate in @($entries.Keys)) {
+    $comparison = [AgenttalkSupervisorNativeV3]::CompareStringOrdinal(
+      [string]$candidate, -1, $name, -1, $true)
+    if ($comparison -notin @(0, 2)) { continue }
+    if (-not $found) {
+      $target = [string]$candidate
+      $found = $true
+    } else {
+      $null = $entries.Remove($candidate)
+    }
+  }
+  $entries[$target] = $value
+}
 function Open-AgenttalkProcessHandle($procId) {
   if (-not $procId) { return $null }
   # SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION. The
@@ -14129,7 +14149,11 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
   # switch: this value feeds the same -WindowStyle enum parameter, whose
   # .NET binding is inherently case-insensitive on the fallback path.
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
-  if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
+  if ($a.env) {
+    foreach ($k in $a.env.PSObject.Properties.Name) {
+      Set-AgenttalkEnvironmentMapEntry $applied $k $a.env.$k
+    }
+  }
   foreach ($reserved in $WrapperLogEnvKeys) {
     foreach ($candidate in @($applied.Keys)) {
       $comparison = [AgenttalkSupervisorNativeV3]::CompareStringOrdinal(
@@ -14240,11 +14264,15 @@ function Launch-Spec($name, $spec, $codexHome, $acceptedAdmission = $null) {
   # switch: this value feeds the same -WindowStyle enum parameter, whose
   # .NET binding is inherently case-insensitive on the fallback path.
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
-  if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }
+  if ($spec.env) {
+    foreach ($k in $spec.env.PSObject.Properties.Name) {
+      Set-AgenttalkEnvironmentMapEntry $applied $k $spec.env.$k
+    }
+  }
   # Launch-Spec bypasses the project shim, so its interpreter selector is not
   # part of this ephemeral child's configured environment. Other launch paths
   # may preserve an inherited AGENTTALK_PYTHON value.
-  $applied['AGENTTALK_PYTHON'] = $null
+  Set-AgenttalkEnvironmentMapEntry $applied 'AGENTTALK_PYTHON' $null
   foreach ($reserved in $WrapperLogEnvKeys) {
     foreach ($candidate in @($applied.Keys)) {
       $comparison = [AgenttalkSupervisorNativeV3]::CompareStringOrdinal(

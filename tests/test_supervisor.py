@@ -8018,7 +8018,7 @@ def _pslit(v: str) -> str:
 @pytest.mark.parametrize("launcher", ["Launch", "Launch-Spec"])
 @pytest.mark.parametrize(
     "failure_mode",
-    ["second-before-write", "empty-after-write"],
+    ["second-before-write", "empty-after-write", "post-application-case-alias"],
 )
 def test_launch_environment_apply_failure_restores_parent_without_spawn(
     tmp_path: Path,
@@ -8059,6 +8059,7 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
         "\n".join([
             "$ErrorActionPreference = 'Stop'",
             f"$Root = {_pslit(str(tmp_path))}",
+            f"$failureMode = {_pslit(failure_mode)}",
             "$AgenttalkPython = 'python.exe'",
             "$SrcOnPyPath = $true",
             "$WrapperLogMaxBytes = 1024",
@@ -8080,8 +8081,16 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "function Proc-Start($id) { return '1' }",
             "function Quote-Arg([string]$arg) { return $arg }",
             "$script:spawnCount = 0",
+            "$script:applicationNames = @()",
+            "$script:rootDuringSpawn = $null",
             "function Start-WrapperProcess($startArgs) {",
             "  $script:spawnCount += 1",
+            "  if ($failureMode -eq 'post-application-case-alias') {",
+            "    $script:rootDuringSpawn = [Environment]::GetEnvironmentVariable(",
+            "      'AGENTTALK_ROOT', 'Process')",
+            "    $script:injected = $true",
+            "    throw 'injected failure after environment application'",
+            "  }",
             "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; Redirected = $false }",
             "}",
             launchers,
@@ -8091,6 +8100,10 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "  AGENTTALK_FAILURE_PRESENT = 'during-present';",
             "  AGENTTALK_FAILURE_ABSENT = 'during-absent';",
             "  AGENTTALK_FAILURE_EMPTY = 'during-empty'",
+            "}",
+            "if ($failureMode -eq 'post-application-case-alias') {",
+            "  $profileEnv | Add-Member -NotePropertyName 'agenttalk_root' "
+            "-NotePropertyValue 'during-case-alias'",
             "}",
             "$spec = [pscustomobject]@{",
             "  cli = 'codex'; cwd = $Root; env = $profileEnv;",
@@ -8145,13 +8158,16 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "  return $snapshot",
             "}",
             "$before = Get-EnvironmentSnapshot",
-            f"$failureMode = {_pslit(failure_mode)}",
             "$script:environmentOperation = 0",
             "$script:injected = $false",
             "function Set-Item {",
             "  [CmdletBinding()] param([string]$LiteralPath, $Value)",
             "  if ($LiteralPath -like 'Env:*') {",
             "    $script:environmentOperation += 1",
+            "    if ($failureMode -eq 'post-application-case-alias' -and",
+            "        $script:spawnCount -eq 0) {",
+            "      $script:applicationNames += $LiteralPath.Substring(4)",
+            "    }",
             "    if (-not $script:injected -and",
             "        $failureMode -eq 'empty-after-write' -and",
             "        $LiteralPath -eq 'Env:AGENTTALK_FAILURE_EMPTY') {",
@@ -8172,6 +8188,10 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "  [CmdletBinding()] param([string]$LiteralPath)",
             "  if ($LiteralPath -like 'Env:*') {",
             "    $script:environmentOperation += 1",
+            "    if ($failureMode -eq 'post-application-case-alias' -and",
+            "        $script:spawnCount -eq 0) {",
+            "      $script:applicationNames += $LiteralPath.Substring(4)",
+            "    }",
             "    if (-not $script:injected -and",
             "        $failureMode -eq 'second-before-write' -and",
             "        $script:environmentOperation -eq 2) {",
@@ -8191,6 +8211,8 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "[pscustomobject]@{",
             "  injected = $script:injected; caught = $caught;",
             "  spawn_count = $script:spawnCount; discard_count = $script:discardCount;",
+            "  application_names = @($script:applicationNames);",
+            "  root_during_spawn = $script:rootDuringSpawn;",
             "  before = $before; after = $after",
             "} | ConvertTo-Json -Depth 5 | ",
             f"  Set-Content {_pslit(str(output))} -Encoding utf8",
@@ -8213,9 +8235,20 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
     }
     assert payload["injected"] is True
     assert payload["caught"] is True
-    assert payload["spawn_count"] == 0
+    expected_spawn_count = (
+        1 if failure_mode == "post-application-case-alias" else 0
+    )
+    assert payload["spawn_count"] == expected_spawn_count
     assert payload["discard_count"] == 1
     assert payload["after"] == payload["before"]
+    if failure_mode == "post-application-case-alias":
+        root_mutations = [
+            name
+            for name in payload["application_names"]
+            if name.casefold() == "agenttalk_root"
+        ]
+        assert root_mutations == ["AGENTTALK_ROOT"]
+        assert payload["root_during_spawn"] == "during-case-alias"
 
 
 # Exhaustive policy data for the one remaining interpreter-prefix resolver.
