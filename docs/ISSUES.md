@@ -24,8 +24,11 @@ its reconstructed launch-effective projection. Re-prepare after editing the
 configured profile. Recovery emits a named refusal rather than a command when
 the configured launch mapping or reconstructed launch-effective projection no
 longer matches; equivalent-looking edits are not guaranteed to remain valid.
-Recovery does not verify the environment the child actually receives, and the
-operator surfaces state that limitation explicitly.
+Recovery binds resolved executable paths, not the contents at those paths. An
+in-place replacement at one of those paths is not detected, so a recovery command may
+name a binary whose contents have changed since preparation. Recovery also does
+not verify the environment the child actually receives, and the operator surfaces
+state both limitations explicitly.
 
 **Why.** Three implementations that appeared internally consistent failed at
 the real process boundary. The tested preferred PowerShell 7 host dropped
@@ -47,11 +50,12 @@ bound to an exact inherited or effective child environment.
 
 **What.** Detached recovery compares the prepared and current configured launch
 mappings by raw equality, then binds the reconstructed launch-effective
-projection. Placeholder substitution happens before hashing, so replacing a
-configured working-directory or environment-value placeholder with its resolved
-literal remains valid. An equivalent edit inside the raw launch mapping refuses.
-The existing Windows environment-name comparer considers case variants equal,
-but the binding hashes their spelling and refuses the edit. OS-equivalent working
+projection, including resolved executable paths but not executable contents.
+Placeholder substitution happens before hashing, so replacing a configured
+working-directory or environment-value placeholder with its resolved literal
+remains valid. An equivalent edit inside the raw launch mapping refuses. The
+existing Windows environment-name comparer considers case variants equal, but
+the binding hashes their spelling and refuses the edit. OS-equivalent working
 directory aliases are likewise not normalized before hashing.
 
 **Why.** The current behavior fails closed, but equivalent-looking profile edits

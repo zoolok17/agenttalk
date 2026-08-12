@@ -610,9 +610,12 @@ substitutions, including argv and working directory. Re-prepare after editing th
 configured profile. Recovery emits a named refusal rather than a command when
 the configured launch mapping or reconstructed launch-effective projection no
 longer matches; equivalent-looking edits are not guaranteed to remain valid.
-The listed environment is guidance only: agenttalk does not verify the
-environment that the child actually receives, so the operator must review both
-ambient and configured values before launching it.
+Recovery binds resolved executable paths, not the contents at those paths. An
+in-place replacement at one of those paths is not detected, so a recovery command may
+name a binary whose contents have changed since preparation. The listed
+environment is guidance only: agenttalk does not verify the environment that the
+child actually receives, so the operator must review both ambient and configured
+values before launching it.
 
 Freshness is bounded against clock error: a heartbeat farther in the future
 than the configured allowance cannot make an agent healthy. The monitor's

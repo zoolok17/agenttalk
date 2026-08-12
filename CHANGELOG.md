@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of argv when the
   configured launch mapping or reconstructed launch-effective projection no
   longer matches; equivalent-looking edits are not guaranteed to remain valid.
+  Recovery binds resolved executable paths, not the contents at those paths.
+  An in-place replacement at one of those paths is not detected, so a recovery
+  command may name a binary whose contents have changed since preparation.
   The displayed environment is guidance only: the environment the child receives
   is not verified and must be reviewed by the operator.
 

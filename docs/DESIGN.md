@@ -348,9 +348,12 @@ two parallel ownership concepts.
   the configured profile. Recovery emits a named refusal instead of a command
   when the configured launch mapping or reconstructed
   launch-effective projection no longer matches; equivalent-looking edits are
-  not guaranteed to remain valid. Environment metadata is deliberately advisory:
-  it neither binds the ambient environment nor proves what the child receives,
-  and the operator-facing text says so explicitly.
+  not guaranteed to remain valid. Recovery binds resolved executable paths, not
+  the contents at those paths. An in-place replacement at one of those paths is
+  not detected, so a recovery command may name a binary whose contents have changed
+  since preparation. Environment metadata is deliberately advisory: it neither
+  binds the ambient environment nor proves what the child receives, and the
+  operator-facing text says so explicitly.
 
 ### 4.7 Supporting modules
 - `signing.py` — optional HMAC message signing (constant-time, length-floored);
