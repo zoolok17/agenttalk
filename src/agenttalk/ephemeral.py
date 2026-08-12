@@ -8,10 +8,15 @@ classify the typed review-result evidence that completes a request.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+import os
 import re
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 SCHEMA_VERSION = 1
 REQUEST_KIND = "request-launch"
@@ -53,6 +58,56 @@ _COMPLETION_STATUSES = frozenset({
 _SAFE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
 _SAFE_AGENT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+SUPPORTED_WRAPPER_CLIS = frozenset({"claude", "codex"})
+_EFFECTIVE_LAUNCH_BINDING_VERSION = 3
+_EFFECTIVE_LAUNCH_BINDING_MAX_BYTES = 1024 * 1024
+_REVIEW_REQUEST_BINDING_FIELDS = (
+    "id",
+    "ts",
+    "from",
+    "to",
+    "kind",
+    "subject",
+    "body",
+    "meta",
+)
+_SUPERVISOR_OWNED_ENV_KEYS = frozenset({
+    "agenttalk_root",
+    "agenttalk_self",
+    "agenttalk_py",
+    "agenttalk_python",
+    "agenttalk_shim_active",
+    "agenttalk_shim_parent_pythonpath",
+    "agenttalk_shim_parent_pythonpath_absent",
+    "pythonpath",
+    "codex_home",
+    "agenttalk_no_child_window",
+    "agenttalk_wrapper_stdout_log",
+    "agenttalk_wrapper_stderr_log",
+    "agenttalk_wrapper_log_max_bytes",
+    "agenttalk_wrapper_log_segments",
+    "agenttalk_wrapper_log_nonce",
+})
+_IMMUTABLE_REQUEST_BINDING_FIELDS = (
+    "schema_version",
+    "kind",
+    "request_id",
+    "requested_by",
+    "profile",
+    "skill",
+    "prompt",
+    "scope",
+    "role",
+    "groups",
+    "timeout_seconds",
+    "close_feed",
+    "agent",
+    "review_request_msg_id",
+    "lane_id",
+    "workspace_path",
+    "claimed_by",
+)
 
 
 class EphemeralError(ValueError):
@@ -75,6 +130,125 @@ def is_full_sha(value: object) -> bool:
     return isinstance(value, str) and bool(_FULL_SHA_RE.match(value))
 
 
+def is_safe_reason(value: object, *, max_length: int = 500) -> bool:
+    """Return whether persisted operator prose is bounded and UTF-8 encodable."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= max_length
+        and not any(
+            ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
+            for char in value
+        )
+    )
+
+
+def _bounded_canonical_sha256(value: object) -> str:
+    """Hash one bounded, type-preserving canonical JSON projection."""
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise EphemeralError(
+            "effective launch binding contains non-canonical JSON evidence"
+        ) from exc
+    if len(encoded) > _EFFECTIVE_LAUNCH_BINDING_MAX_BYTES:
+        raise EphemeralError(
+            "effective launch binding exceeds the bounded canonical size"
+        )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def effective_launch_request_digest(marker: dict) -> str:
+    """Hash the presence-preserving immutable request projection."""
+    if not isinstance(marker, dict):
+        raise EphemeralError("effective launch request evidence is unavailable")
+    request_projection = {
+        field: (
+            {"present": True, "value": marker[field]}
+            if field in marker
+            else {"present": False}
+        )
+        for field in _IMMUTABLE_REQUEST_BINDING_FIELDS
+    }
+    return _bounded_canonical_sha256(request_projection)
+
+
+def effective_review_request_digest(message: object) -> str:
+    """Hash the exact durable one-shot input consumed by the wrapper."""
+    if hasattr(message, "to_dict"):
+        message = message.to_dict()
+    if (
+        not isinstance(message, dict)
+        or any(field not in message for field in _REVIEW_REQUEST_BINDING_FIELDS)
+    ):
+        raise EphemeralError("prepared review-request evidence is unavailable")
+    projection = {
+        field: message[field]
+        for field in _REVIEW_REQUEST_BINDING_FIELDS
+    }
+    return _bounded_canonical_sha256(projection)
+
+
+def make_effective_launch_binding(
+    marker: dict,
+    spec: dict,
+    *,
+    review_request_sha256: str,
+) -> dict:
+    """Bind immutable request evidence to the prepared launch specification.
+
+    Field presence is explicit so an absent optional value never hashes as an
+    explicitly persisted null. The specification binds configured environment
+    guidance, but not the ambient environment or what the child ultimately
+    receives.
+    """
+    if not isinstance(spec, dict):
+        raise EphemeralError("effective launch spec evidence is unavailable")
+    if (
+        not isinstance(review_request_sha256, str)
+        or not _SHA256_RE.fullmatch(review_request_sha256)
+    ):
+        raise EphemeralError("prepared review-request digest is invalid")
+    return {
+        "schema_version": _EFFECTIVE_LAUNCH_BINDING_VERSION,
+        "algorithm": "sha256",
+        "request_sha256": effective_launch_request_digest(marker),
+        "launch_sha256": _bounded_canonical_sha256(spec),
+        "review_request_sha256": review_request_sha256,
+    }
+
+
+def validate_effective_launch_binding(value: object) -> dict | None:
+    """Return one closed prepared-launch binding, or ``None``."""
+    if not isinstance(value, dict) or frozenset(value) != {
+        "schema_version",
+        "algorithm",
+        "request_sha256",
+        "launch_sha256",
+        "review_request_sha256",
+    }:
+        return None
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != _EFFECTIVE_LAUNCH_BINDING_VERSION
+        or value.get("algorithm") != "sha256"
+        or not isinstance(value.get("request_sha256"), str)
+        or not _SHA256_RE.fullmatch(value["request_sha256"])
+        or not isinstance(value.get("launch_sha256"), str)
+        or not _SHA256_RE.fullmatch(value["launch_sha256"])
+        or not isinstance(value.get("review_request_sha256"), str)
+        or not _SHA256_RE.fullmatch(value["review_request_sha256"])
+    ):
+        return None
+    return dict(value)
+
+
 def make_held_terminal(
     terminal_state: object,
     reason: object,
@@ -83,12 +257,7 @@ def make_held_terminal(
     """Return bounded terminal facts safe to persist in supervisor state."""
     if terminal_state not in TERMINAL_STATES:
         raise EphemeralError("held terminal state is invalid")
-    if (
-        not isinstance(reason, str)
-        or not reason
-        or len(reason) > 500
-        or any(ord(char) < 32 for char in reason)
-    ):
+    if not is_safe_reason(reason):
         raise EphemeralError(
             "held terminal reason must be a non-empty single line of at most "
             "500 characters"
@@ -166,7 +335,10 @@ def _positive_int(value: object, default: int) -> int:
     if isinstance(value, bool):
         return default
     if isinstance(value, (int, float)) and value > 0:
-        return int(value)
+        try:
+            return int(value)
+        except (OverflowError, ValueError):
+            return default
     return default
 
 
@@ -225,6 +397,11 @@ def validate_marker(marker: object) -> list[str]:
     prompt = marker.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         errors.append("prompt is required")
+    else:
+        try:
+            prompt.encode("utf-8")
+        except UnicodeEncodeError:
+            errors.append("prompt must be valid UTF-8")
     scope = marker.get("scope")
     if not isinstance(scope, dict):
         errors.append("scope is required")
@@ -249,8 +426,16 @@ def validate_marker(marker: object) -> list[str]:
         except Exception:
             errors.append("lane_id must be a valid lane id when present")
     timeout = marker.get("timeout_seconds")
-    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0):
-        errors.append("timeout_seconds must be positive when present")
+    if timeout is not None:
+        invalid_timeout = (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        )
+        if isinstance(timeout, float) and not math.isfinite(timeout):
+            invalid_timeout = True
+        if invalid_timeout:
+            errors.append("timeout_seconds must be finite and positive when present")
     close_feed = marker.get("close_feed")
     if isinstance(close_feed, dict) and close_feed.get("mode") == "counted_signoff":
         errors.append("counted_signoff mode is not implemented for evidence-only ephemeral reviewers")
@@ -278,6 +463,37 @@ def strict_authority(store_cfg: dict, requested_by: str, *, require_authorized_l
     return False, "multiple leads are configured; launch authority is ambiguous"
 
 
+def _windows_environment_names_equal(left: str, right: str) -> bool:
+    """Match the ordinal, case-insensitive comparer used by Windows env blocks."""
+    if left == right:
+        return True
+    if os.name != "nt":
+        # Non-Windows hosts never apply this launch environment. Preserve every
+        # non-ASCII spelling; still catch the ASCII case aliases used by config.
+        def ascii_fold(value: str) -> str:
+            return "".join(
+                char.lower() if char.isascii() else char
+                for char in value
+            )
+
+        return ascii_fold(left) == ascii_fold(right)
+    import ctypes
+
+    compare = ctypes.WinDLL("kernel32", use_last_error=True).CompareStringOrdinal
+    compare.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    compare.restype = ctypes.c_int
+    result = compare(left, -1, right, -1, True)
+    # Valid environment names cannot make this call fail. If the platform does
+    # fail to compare them, treat the pair as ambiguous and refuse it.
+    return result in {0, 2}
+
+
 def validate_launch_request(
     marker: object,
     store_cfg: dict,
@@ -299,6 +515,49 @@ def validate_launch_request(
     profile = profile_config(eph, marker.get("profile", ""))
     if profile is None:
         errors.append(f"profile {marker.get('profile')!r} is not allowed")
+    else:
+        profile_cli = profile.get("cli", "codex")
+        if profile_cli not in SUPPORTED_WRAPPER_CLIS:
+            errors.append(
+                f"profile {marker.get('profile')!r} cli must be one of "
+                f"{sorted(SUPPORTED_WRAPPER_CLIS)}"
+            )
+        raw_env = profile.get("env", {})
+        # Shared with regular launch admission. Reserved-name ownership and the
+        # ephemeral path's legacy control-name refusal are explicit overlays;
+        # syntax, Unicode preservation, the Windows comparer, and collision
+        # rules are one implementation.
+        from agenttalk import supervisor as _sup
+
+        for issue in _sup._configured_environment_issues(  # noqa: SLF001
+            raw_env,
+            reserved_names=_SUPERVISOR_OWNED_ENV_KEYS,
+            forbid_control_names=True,
+        ):
+            if issue.code == "not_object":
+                errors.append(
+                    f"profile {marker.get('profile')!r} env must be an object"
+                )
+            elif issue.code == "invalid_name":
+                errors.append(
+                    f"profile {marker.get('profile')!r} env contains an "
+                    "invalid variable name"
+                )
+            elif issue.code == "duplicate_name":
+                errors.append(
+                    f"profile {marker.get('profile')!r} env contains "
+                    "case-insensitive duplicate variable names"
+                )
+            elif issue.code == "reserved_name":
+                errors.append(
+                    f"profile {marker.get('profile')!r} env cannot override "
+                    f"supervisor-owned variable {issue.name!r}"
+                )
+            else:
+                errors.append(
+                    f"profile {marker.get('profile')!r} env variable "
+                    f"{issue.name!r} must have a valid string value"
+                )
     skill = marker.get("skill")
     if eph["allowed_skills"] and skill not in eph["allowed_skills"]:
         errors.append(f"skill {skill!r} is not allowed")
@@ -339,13 +598,13 @@ def validate_launch_request(
     # pattern already used above for lanes) resolves it cleanly since both
     # modules are fully loaded by the time this function actually runs.
     if profile is not None:
+        from agenttalk import supervisor as _sup
+
         launch = _as_dict(profile.get("launch"))
         windows_file = launch.get("windows_file")
         windows_args = launch.get("windows_args")
         module_args_from = launch.get("module_args_from")
         if isinstance(windows_args, list):
-            from agenttalk import supervisor as _sup
-
             if _sup._token_stem(windows_file) in {"python", "python3", "py"}:
                 if module_args_from is not None and (
                     not isinstance(module_args_from, int)
@@ -365,6 +624,44 @@ def validate_launch_request(
                         "the persisted entry would leave the reviewer stuck in "
                         "process_tree_hold with no teardown authority"
                     )
+        validation_agent = "ephemeral-validation"
+        validation_spec = launch_spec(marker, profile, validation_agent)
+        validation_cwd = validation_spec.get("cwd")
+        try:
+            validation_cwd_is_absolute = (
+                isinstance(validation_cwd, str)
+                and bool(validation_cwd)
+                and len(validation_cwd) <= 4096
+                and not any(
+                    ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
+                    for char in validation_cwd
+                )
+                and Path(validation_cwd).is_absolute()
+            )
+        except (OSError, ValueError):
+            validation_cwd_is_absolute = False
+        if (
+            validation_cwd is not None
+            and not validation_cwd_is_absolute
+        ):
+            errors.append(
+                f"profile {marker.get('profile')!r} cwd must be an absolute "
+                "path when configured"
+            )
+        validation_launch = _as_dict(validation_spec.get("launch"))
+        if not _sup._configured_ephemeral_wrap_binding(
+            validation_launch.get("windows_file"),
+            validation_launch.get("windows_args", []),
+            validation_launch.get("module_args_from"),
+            agent=validation_agent,
+            request_id=marker["request_id"],
+            cli=validation_spec["cli"],
+            lane_id=marker.get("lane_id"),
+        ):
+            errors.append(
+                f"profile {marker.get('profile')!r} launch must be one exact "
+                "agenttalk wrap --loop --one-shot command bound to this request"
+            )
     return errors, profile
 
 
@@ -391,17 +688,39 @@ def capacity_errors(state: dict, supervisor_config: dict | None, now_epoch: floa
     return errors
 
 
-def choose_agent_name(request_id: str, active_names: list[str], retired_names: list[str]) -> str:
+def _agent_name_base(request_id: str) -> str:
     seed = re.sub(r"[^A-Za-z0-9_.-]", "-", request_id)
     seed = seed[:48].strip(".-") or uuid.uuid4().hex[:12]
-    base = f"adversary-{seed}"
+    return f"adversary-{seed}"
+
+
+def _agent_name_candidate(base: str, ordinal: int) -> str:
+    if ordinal == 1:
+        return base[:64]
+    suffix = f"-{ordinal}"
+    return base[:64 - len(suffix)] + suffix
+
+
+def agent_name_matches_request(request_id: object, agent: object) -> bool:
+    """Whether an agent is one this request's allocator could have minted."""
+    if (
+        not isinstance(request_id, str)
+        or not is_safe_id(request_id)
+        or not isinstance(agent, str)
+    ):
+        return False
+    base = _agent_name_base(request_id)
+    return any(
+        agent == _agent_name_candidate(base, ordinal)
+        for ordinal in range(1, 1000)
+    )
+
+
+def choose_agent_name(request_id: str, active_names: list[str], retired_names: list[str]) -> str:
+    base = _agent_name_base(request_id)
     seen = {x.casefold() for x in [*active_names, *retired_names]}
-    name = base[:64]
-    if name.casefold() not in seen and _SAFE_AGENT_RE.match(name):
-        return name
-    for i in range(2, 1000):
-        suffix = f"-{i}"
-        name = (base[:64 - len(suffix)] + suffix)
+    for ordinal in range(1, 1000):
+        name = _agent_name_candidate(base, ordinal)
         if name.casefold() not in seen and _SAFE_AGENT_RE.match(name):
             return name
     raise EphemeralError("could not allocate a unique adversary identity")
@@ -430,7 +749,13 @@ def review_request_body(marker: dict, agent: str) -> str:
     )
 
 
-def launch_spec(marker: dict, profile: dict, agent: str) -> dict:
+def launch_spec(
+    marker: dict,
+    profile: dict,
+    agent: str,
+    *,
+    root: str | Path | None = None,
+) -> dict:
     launch = _as_dict(profile.get("launch"))
     args = launch.get("windows_args")
     args = list(args) if isinstance(args, list) else []
@@ -441,6 +766,9 @@ def launch_spec(marker: dict, profile: dict, agent: str) -> dict:
         "{SKILL}": str(marker.get("skill", "")),
         "{PROFILE}": str(marker.get("profile", "")),
     }
+    root_text = str(Path(root).resolve()) if root is not None else None
+    if root_text is not None:
+        repl["{ROOT}"] = root_text
 
     def sub(value: object) -> object:
         if not isinstance(value, str):
@@ -450,9 +778,14 @@ def launch_spec(marker: dict, profile: dict, agent: str) -> dict:
         return value
 
     env = _as_dict(profile.get("env"))
-    env = {str(k): str(sub(v)) for k, v in env.items() if isinstance(k, str)}
-    env.setdefault("AGENTTALK_SELF", agent)
-    return {
+    env = {
+        key: str(sub(value))
+        for key, value in env.items()
+        if isinstance(key, str)
+        and not _windows_environment_names_equal(key, "AGENTTALK_SELF")
+    }
+    env["AGENTTALK_SELF"] = agent
+    spec = {
         "request_id": request_id,
         "agent": agent,
         "profile": marker.get("profile"),
@@ -470,13 +803,100 @@ def launch_spec(marker: dict, profile: dict, agent: str) -> dict:
             "windows_file": sub(launch.get("windows_file", "")),
             "windows_args": [sub(x) for x in args],
         },
-        "cwd": sub(profile.get("cwd")) if isinstance(profile.get("cwd"), str) else None,
+        "cwd": (
+            sub(profile.get("cwd"))
+            if isinstance(profile.get("cwd"), str)
+            else root_text
+        ),
         "env": env,
         "windows_sandbox": profile.get("windows_sandbox", "unelevated"),
         "codex_home_isolation": bool(profile.get("codex_home_isolation", True)),
         "lane_id": marker.get("lane_id"),
         "workspace_path": marker.get("workspace_path"),
     }
+    workspace_path = marker.get("workspace_path")
+    launch_spec = spec["launch"]
+    launch_args = list(launch_spec.get("windows_args") or [])
+    try:
+        tail_index = launch_args.index("--")
+    except ValueError:
+        tail_index = -1
+    lane_id = marker.get("lane_id")
+    if tail_index >= 0:
+        bindings = [
+            ("--for", agent),
+            ("--cli", spec["cli"]),
+            ("--to-request", request_id),
+        ]
+        if isinstance(lane_id, str) and lane_id:
+            bindings.append(("--lane-id", lane_id))
+        binding_options = {"--for", "--cli", "--to-request", "--lane-id"}
+        binding_prefixes = tuple(f"{option}=" for option in binding_options)
+        wrapper_args: list[str] = []
+        index = 0
+        while index < tail_index:
+            argument = launch_args[index]
+            if isinstance(argument, str) and argument in binding_options:
+                index += 1
+                if (
+                    index < tail_index
+                    and isinstance(launch_args[index], str)
+                    and launch_args[index]
+                    and not launch_args[index].startswith("-")
+                ):
+                    index += 1
+                continue
+            if isinstance(argument, str) and argument.startswith(binding_prefixes):
+                index += 1
+                continue
+            wrapper_args.append(argument)
+            index += 1
+        canonical_bindings = [
+            token
+            for option, value in bindings
+            for token in (option, value)
+        ]
+        launch_args = [
+            *wrapper_args,
+            *canonical_bindings,
+            *launch_args[tail_index:],
+        ]
+        tail_index = len(wrapper_args) + len(canonical_bindings)
+    if isinstance(workspace_path, str) and workspace_path:
+        spec["cwd"] = workspace_path
+        if (
+            spec["cli"] == "codex"
+            and tail_index >= 0
+            and tail_index + 1 < len(launch_args)
+        ):
+            child_args_start = tail_index + 2
+            child_args: list[object] = []
+            index = child_args_start
+            while index < len(launch_args):
+                argument = launch_args[index]
+                if argument == "--add-dir":
+                    index += 1
+                    if (
+                        index < len(launch_args)
+                        and isinstance(launch_args[index], str)
+                        and launch_args[index]
+                        and not launch_args[index].startswith("-")
+                    ):
+                        index += 1
+                    continue
+                if isinstance(argument, str) and argument.startswith("--add-dir="):
+                    index += 1
+                    continue
+                child_args.append(argument)
+                index += 1
+            launch_args = [
+                *launch_args[:child_args_start],
+                "--add-dir",
+                workspace_path,
+                *child_args,
+            ]
+    launch_spec["windows_args"] = launch_args
+    return spec
 
 
 def classify_review_result(messages: list, *, request_id: str, agent: str, requester: str) -> dict:
@@ -567,7 +987,13 @@ def ensure_state(state: dict) -> dict:
 def record_prepared(state: dict, *, request_id: str, agent: str, requested_by: str,
                     profile: str, timeout_seconds: int, now_epoch: float,
                     review_request_id: str, cli: str = "codex",
-                    launch: dict | None = None) -> dict:
+                    launch: dict | None = None,
+                    effective_launch_binding: dict) -> dict:
+    launch_binding = validate_effective_launch_binding(
+        effective_launch_binding
+    )
+    if launch_binding is None:
+        raise EphemeralError("prepared effective launch binding is invalid")
     root = ensure_state(state)
     root["active"][request_id] = {
         "request_id": request_id,
@@ -590,13 +1016,21 @@ def record_prepared(state: dict, *, request_id: str, agent: str, requested_by: s
         "timeout_seconds": int(timeout_seconds),
         "deadline_epoch": now_epoch + int(timeout_seconds),
         "review_request_id": review_request_id,
+        # Version the allocation proof so a compatibility path for request
+        # rows pruned by older releases can never weaken newly prepared work.
+        "identity_binding_version": 1,
+        "effective_launch_binding": launch_binding,
         "auto_restart": False,
     }
+    active_request_ids = set(root["active"])
     hist = [
         item for item in root["launch_history"]
         if isinstance(item, dict)
         and isinstance(item.get("at_epoch"), (int, float))
-        and now_epoch - float(item["at_epoch"]) <= 86400
+        and (
+            item.get("request_id") in active_request_ids
+            or now_epoch - float(item["at_epoch"]) <= 86400
+        )
     ]
     hist.append({"request_id": request_id, "agent": agent, "at_epoch": now_epoch})
     root["launch_history"] = hist

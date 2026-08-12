@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from agenttalk.store import validate_agent_name
+from agenttalk.store import _windows_filetime_ticks, validate_agent_name
 
 SCHEMA_VERSION = 2
 LEGACY_SCHEMA_VERSION = 1
@@ -154,10 +154,7 @@ def _positive_pid(value: object, *, field: str, optional: bool = False) -> int |
 
 
 def _filetime(value: object, *, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or re.fullmatch(r"[1-9][0-9]{0,19}", value) is None
-    ):
+    if _windows_filetime_ticks(value) is None:
         raise RuntimeRecordError(f"{field} must be positive decimal FILETIME ticks")
     return value
 

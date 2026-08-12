@@ -17,6 +17,75 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ---
 
+## P1 · PLANNED — exact child-environment proof across supported PowerShell hosts (2026-08-07)
+
+**What.** Active ephemeral recovery currently binds the prepared request and
+its reconstructed launch-effective projection. Re-prepare after editing the
+configured profile. Recovery emits a named refusal rather than a command when
+the configured launch mapping or reconstructed launch-effective projection no
+longer matches; equivalent-looking edits are not guaranteed to remain valid.
+Recovery binds resolved executable paths, not the contents at those paths. An
+in-place replacement at one of those paths is not detected, so a recovery command may
+name a binary whose contents have changed since preparation. Its emitted working
+directory is always absolute: without a lane it is the admitted profile or
+project-root value; with a lane it is the bound lane workspace and may differ from
+the profile value. Recovery also does not verify the environment the child actually
+receives, and the operator surfaces state the cwd guarantee and both limitations
+explicitly. Regular process-tree-HOLD recovery is separate: it has no prepared
+request or effective binding to compare, emits a relative configured working
+directory unchanged, and does not check that an absolute working directory exists.
+
+**Why.** Three implementations that appeared internally consistent failed at
+the real process boundary. The tested preferred PowerShell 7 host dropped
+hidden per-drive entries between the parent and native child, while Windows
+PowerShell 5.1 cannot represent an admitted empty-string value through its
+environment provider even though the Windows process environment can.
+Capture-and-digest agreement inside the parent therefore does not prove child
+delivery.
+
+**Disposition.** `PLANNED`. Any future design must cross a real native child
+boundary on both supported PowerShell editions and cover hidden entries, empty
+values, Unicode-distinct names, collision behavior, configured overrides, and
+restoration. Until that evidence exists, do not describe the detached remedy as
+bound to an exact inherited or effective child environment.
+
+---
+
+## P2 · PLANNED — normalized configured-profile binding in detached recovery (2026-08-07)
+
+**What.** Active ephemeral recovery compares the prepared and current configured launch
+mappings by raw equality, then binds the reconstructed launch-effective
+projection, including resolved executable paths but not executable contents.
+Environment-value substitution happens before hashing, so replacing a configured
+environment-value placeholder with its resolved literal remains valid. A configured
+`{ROOT}` working-directory placeholder is different: unless the request already
+carries an absolute bound workspace, initial preparation validates the profile before
+providing a root or looking up a lane, so the value remains relative and is refused.
+Task #179 tracks this safe over-refusal. An equivalent edit inside the raw launch
+mapping refuses. The existing Windows environment-name comparer considers case
+variants equal, but the binding hashes their spelling and refuses the edit.
+OS-equivalent working directory aliases are likewise not normalized before hashing.
+
+The emitted working directory is always absolute: without a lane it is the
+admitted profile or project-root value; with a lane it is the bound lane workspace
+and may differ from the configured profile value.
+
+**Why.** The current behavior fails closed, but equivalent-looking profile edits
+do not share one tolerance rule. A public equivalence promise would therefore be
+stronger than the implementation and could mislead an operator about whether
+re-preparation is required.
+
+**Disposition.** `PLANNED`. If recovery is to tolerate equivalent edits, hash a
+normalized configured-profile projection rather than its spelling, while
+retaining full current admission and refusal on real drift. Preserve the existing
+environment placeholder-to-literal tolerance, and cover configured environment-name
+case variants, OS-equivalent working-directory aliases, the `{ROOT}` cwd refusal
+tracked in task #179, launch-mapping equivalence, and real drift at the consumer.
+Until then, operators should re-prepare after any profile edit and no surface should
+promise that an equivalent-looking edit remains valid.
+
+---
+
 ## P2 · KNOWN LIMITATION — PowerShell artifact launch/refresh residuals (2026-07-15)
 
 **What.** v0.78.0 validates the selected PowerShell Core host at claim time and

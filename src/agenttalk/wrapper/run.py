@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 from datetime import datetime, timezone
 
 from agenttalk import health as health_model
+from agenttalk import launch_admission
 from agenttalk.redaction import normalize_child_output_tail
 from agenttalk.store import LEAD_LOOP_LEASE_ENV
 
@@ -135,12 +136,6 @@ _PYTHON_VERSIONED_BASENAME_RE = re.compile(
 _POWERSHELL_COMMAND_TOKENS = frozenset({"pwsh", "pwsh.exe", "powershell", "powershell.exe"})
 _CMD_COMMAND_TOKENS = frozenset({"cmd", "cmd.exe"})
 _POSIX_SHELL_COMMAND_TOKENS = frozenset({"sh", "sh.exe", "bash", "bash.exe"})
-_PYTHON_SEPARATED_VALUE_OPTIONS = frozenset({"-X", "-W", "-Q", "--check-hash-based-pycs"})
-_PYTHON_TERMINATING_OPTIONS = frozenset({
-    "-?", "-h", "--help", "--help-all", "--help-env", "--help-xoptions", "-V", "--version",
-})
-_PYTHON_FLAG_CHARS = frozenset("bBdEiIOPqRsSuvx")
-_PY_LAUNCHER_SELECTOR_RE = re.compile(r"^-(?:0|32|64|\d+(?:\.\d+)?(?:-(?:32|64))?)$")
 _REQUIRED_BUS_WRITE_VERBS = frozenset({"reply", "send", "escalate"})
 _BEST_EFFORT_BUS_VERBS = frozenset({"composing"})
 _CHECK_BUS_VERBS = frozenset({"check"})
@@ -339,28 +334,6 @@ def _drop_shell_call_prefix(tokens: list[str]) -> list[str]:
     return tokens
 
 
-def _is_python_attached_value_option(arg: str) -> bool:
-    return (
-        (arg.startswith("-X") and arg != "-X")
-        or (arg.startswith("-W") and arg != "-W")
-        or (arg.startswith("-Q") and arg != "-Q")
-        or arg.startswith("--check-hash-based-pycs=")
-    )
-
-
-def _is_python_flag_cluster(arg: str) -> bool:
-    return (
-        len(arg) > 1
-        and arg.startswith("-")
-        and not arg.startswith("--")
-        and all(ch in _PYTHON_FLAG_CHARS for ch in arg[1:])
-    )
-
-
-def _is_py_launcher_selector(arg: str) -> bool:
-    return _PY_LAUNCHER_SELECTOR_RE.match(arg) is not None or arg.startswith("-V:")
-
-
 def _bus_command_verb_after_agenttalk(args: list[str]) -> str | None:
     idx = 0
     while idx < len(args):
@@ -391,47 +364,13 @@ def _bus_command_verb_after_agenttalk(args: list[str]) -> str | None:
 
 
 def _python_module_agenttalk_verb(args: list[str], program_kind: str) -> str | None:
-    # Scan only until Python's execution target is known. "-m agenttalk" counts
-    # before any target; "-m" after a script, "-c", "--", or stdin belongs to
-    # that target and must not classify a normal Python command as a bus write.
-    # Unknown dash-options fail open instead of scanning past them to a later "-m".
-    idx = 0
-    while idx < len(args):
-        arg = _clean_argument_token(args[idx])
-        if arg == "-m":
-            if idx + 1 >= len(args):
-                return None
-            if _clean_argument_token(args[idx + 1]).casefold() != "agenttalk":
-                return None
-            return _bus_command_verb_after_agenttalk(args[idx + 2:])
-        if arg.startswith("-m") and arg != "-m":
-            if arg[2:].casefold() != "agenttalk":
-                return None
-            return _bus_command_verb_after_agenttalk(args[idx + 1:])
-        if arg == "-c" or (arg.startswith("-c") and arg != "-c"):
-            return None
-        if arg in _PYTHON_TERMINATING_OPTIONS:
-            return None
-        if arg in ("--", "-"):
-            return None
-        if program_kind == "py" and _is_py_launcher_selector(arg):
-            idx += 1
-            continue
-        if arg in _PYTHON_SEPARATED_VALUE_OPTIONS:
-            if idx + 1 >= len(args):
-                return None
-            idx += 2
-            continue
-        if _is_python_attached_value_option(arg):
-            idx += 1
-            continue
-        if _is_python_flag_cluster(arg):
-            idx += 1
-            continue
-        if arg.startswith("-"):
-            return None
+    module_argv = launch_admission.python_agenttalk_module_argv(
+        [_clean_argument_token(argument) for argument in args],
+        program_kind=program_kind,
+    )
+    if module_argv is None:
         return None
-    return None
+    return _bus_command_verb_after_agenttalk(list(module_argv))
 
 
 def _launcher_payload_tokens(program: str, args: list[str]) -> list[str] | None:

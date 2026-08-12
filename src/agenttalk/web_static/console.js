@@ -1876,6 +1876,49 @@
     if (item.recommendation && !(actionSession.enabled && item.answerable)) {
       body.appendChild(el('div', 'tc-attn-detail', item.recommendation));
     }
+    var restartRequest = item.restart_request;
+    if (restartRequest && typeof restartRequest === 'object'
+        && restartRequest.state === 'blocked_by_process_tree_hold'
+        && restartRequest.pending_progress === false) {
+      var blockedRestartText =
+        'A restart request is blocked by this refusal and is not pending progress.';
+      if (typeof item.recommendation !== 'string'
+          || !item.recommendation.includes(blockedRestartText)) {
+        body.appendChild(el(
+          'div', 'tc-attn-detail tc-attn-restart', blockedRestartText));
+      }
+    }
+    if (item.configured_launch && Array.isArray(item.configured_launch.argv)) {
+      body.appendChild(el('div', 'tc-attn-detail', 'Configured detached launch'));
+      var launchArgv = el(
+        'code', 'tc-attn-detail', JSON.stringify(item.configured_launch.argv));
+      launchArgv.setAttribute('aria-label', 'Configured detached launch argv');
+      body.appendChild(launchArgv);
+      if (item.configured_launch.cwd) {
+        body.appendChild(el(
+          'div', 'tc-attn-detail', 'Working directory: ' + item.configured_launch.cwd));
+      }
+      if (item.configured_launch.environment) {
+        body.appendChild(el(
+          'code', 'tc-attn-detail',
+          'Launch environment guidance (child value not verified): ' +
+            JSON.stringify(item.configured_launch.environment)));
+      }
+      if (item.configured_launch.environment_note) {
+        body.appendChild(el(
+          'div', 'tc-attn-detail', item.configured_launch.environment_note));
+      }
+    } else if (item.configured_launch_unavailable) {
+      body.appendChild(el(
+        'div', 'tc-attn-detail',
+        'Configured detached launch unavailable: ' + item.configured_launch_unavailable));
+    }
+    if (Array.isArray(item.operator_argv)) {
+      var remedyArgv = el(
+        'code', 'tc-attn-detail', JSON.stringify(item.operator_argv));
+      remedyArgv.setAttribute('aria-label', 'Currently admitted remedy argv');
+      body.appendChild(remedyArgv);
+    }
     if (item.operator_command) {
       var command = el('code', 'tc-attn-detail', item.operator_command);
       command.setAttribute('aria-label', 'Operator command');

@@ -56,6 +56,7 @@ from agenttalk import gates as gate_mod
 from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
 from agenttalk import lead_loop_runtime
+from agenttalk import launch_admission
 from agenttalk import onboarding as ob
 from agenttalk import signing as _signing
 from agenttalk import threads as th
@@ -1355,6 +1356,11 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         flags = []
         if rr.get("pending"):
             flags.append(f"restart_by={rr.get('requested_by') or '?'}")
+        elif rr.get("blocked"):
+            flags.append(
+                "restart_blocked=process_tree_hold"
+                f" requested_by={rr.get('requested_by') or '?'}"
+            )
         hold = item.get("config_blocked_hold")
         if isinstance(hold, dict) and hold.get("present"):
             flags.append("config_blocked")
@@ -6242,7 +6248,51 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
     # supervisor-owned process-tree HOLDs are global: they must remain visible
     # even when no liaison/sole lead can be resolved.
     try:
-        items += A.process_tree_hold_items(_read_supervisor_state(store))
+        supervisor_state = _read_supervisor_state(store)
+        try:
+            supervisor_config = _load_supervisor_config(store)
+        except Exception:  # noqa: BLE001 - the HOLD must survive bad config
+            supervisor_config = None
+        try:
+            store_config = store.load_config()
+        except Exception:  # noqa: BLE001 - fail closed without blanking the HOLD
+            store_config = None
+        restart_requests: dict[str, dict] = {}
+        for name in A.configured_process_tree_hold_agents(supervisor_state):
+            try:
+                marker = store.read_restart_request(name)
+            except Exception:  # noqa: BLE001 - optional context, not the signal
+                marker = None
+            if isinstance(marker, dict):
+                restart_requests[name] = marker
+        reset_admissions = sup.evaluate_process_tree_reset_admissions(
+            store,
+            supervisor_state,
+            actor=for_agent,
+            identity_gone=_owner_identity_gone,
+        )
+        launch_requests = sup.active_ephemeral_launch_markers(
+            store,
+            supervisor_state,
+        )
+        launch_deliveries = sup.active_ephemeral_one_shot_deliveries(
+            store,
+            supervisor_state,
+            launch_requests,
+        )
+        lane_workspaces = sup.active_ephemeral_lane_workspaces(store)
+        items += A.process_tree_hold_items(
+            supervisor_state,
+            supervisor_config=supervisor_config,
+            store_config=store_config,
+            root=store.root,
+            restart_requests=restart_requests,
+            launch_requests=launch_requests,
+            launch_deliveries=launch_deliveries,
+            lane_workspaces=lane_workspaces,
+            reset_admissions=reset_admissions,
+            now_epoch=time.time(),
+        )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
     # dead-letter (ALL; build_queue hides resolved via the resolve_dead_letter disposition)
@@ -6473,6 +6523,30 @@ def _print_attention(rows: list[dict], summary: dict, for_agent: str | None,
         print(line)
         if it.get("recommendation"):
             print(f"           rec: {it['recommendation']}")
+        operator_argv = it.get("operator_argv")
+        if (
+            isinstance(operator_argv, list)
+            and all(isinstance(token, str) for token in operator_argv)
+        ):
+            print(
+                "           currently admitted remedy argv: "
+                + json.dumps(operator_argv, ensure_ascii=False)
+            )
+        launch = it.get("configured_launch")
+        if isinstance(launch, dict) and isinstance(launch.get("argv"), list):
+            print(
+                "           configured detached launch argv: "
+                + json.dumps(launch["argv"], ensure_ascii=False)
+            )
+            print(f"           configured launch cwd: {launch.get('cwd') or '(none)'}")
+            if isinstance(launch.get("environment"), dict):
+                print(
+                    "           configured launch environment guidance "
+                    "(child value not verified): "
+                    + json.dumps(launch["environment"], ensure_ascii=False)
+                )
+            if launch.get("environment_note"):
+                print(f"           configured launch note: {launch['environment_note']}")
         for w in it.get("warnings", []):
             print(f"           ! {w}")
         print(f"           id: {it['item_id']}")
@@ -9558,8 +9632,19 @@ def cmd_release(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_supervisor_config(store: Store) -> dict:
-    return sup.load_supervisor_config(store.dir / "supervisor.json")
+def _load_supervisor_config(
+    store: Store,
+    *,
+    expected_sha256: str | None = None,
+    require_powershell_transport: bool = False,
+) -> dict:
+    return sup.load_supervisor_config(
+        store.dir / "supervisor.json",
+        expected_sha256=expected_sha256,
+        powershell_transport_store=(
+            store if require_powershell_transport else None
+        ),
+    )
 
 
 def cmd_heartbeat(args: argparse.Namespace) -> int:
@@ -9829,8 +9914,30 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
     }
     store.write_restart_request(agent, marker)
     extra = " (force-protected)" if args.force_protected else ""
-    print(f"request-restart: queued restart of {agent!r} [{rid}]{extra} — the "
-          f"supervisor will relaunch it.")
+    blocked = False
+    try:
+        supervisor_state = _read_supervisor_state(store)
+        row = (supervisor_state.get("agents") or {}).get(agent)
+        tree = row.get("owned_process_tree") if isinstance(row, dict) else None
+        blocked = bool(
+            isinstance(tree, dict)
+            and tree.get("status") in {"invalid", "truncated"}
+        )
+    except Exception:  # noqa: BLE001 - acknowledgement must not promise progress
+        blocked = False
+    if blocked:
+        print(
+            f"request-restart: recorded request for {agent!r} [{rid}]{extra}, "
+            "but automatic recovery is currently refused by a process-tree "
+            "HOLD. This request is blocked, not pending progress; see "
+            "`agenttalk attention`."
+        )
+    else:
+        print(
+            f"request-restart: queued request for {agent!r} [{rid}]{extra} "
+            "for supervisor assessment; recording the request does not establish "
+            "that relaunch is currently admissible."
+        )
     return 0
 
 
@@ -10658,7 +10765,15 @@ def _resolves_to_cmd_wrap(argv: list[str]) -> bool:
             args = parser.parse_args(argv)
     except SystemExit:
         return False
-    return getattr(args, "func", None) is cmd_wrap
+    if getattr(args, "func", None) is not cmd_wrap:
+        return False
+    # The actual parser now uses launch_admission's canonical wrap grammar.
+    # Normalize the namespace through the same typed boundary as supervisor
+    # admission, but deliberately retain this probe's narrower contract: it
+    # answers whether argparse DISPATCHES to cmd_wrap, before runtime-shape
+    # validation performed inside that command.
+    launch_admission.wrap_invocation_from_namespace(args)
+    return True
 
 
 def cmd_internal_check_wrap_dispatch(args: argparse.Namespace) -> int:
@@ -10844,29 +10959,12 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
     lifecycle_log = getattr(args, "_wrapper_lifecycle_log", None)
     if lifecycle_log is not None:
         lifecycle_log.agent = agent
-    argv = list(args.cmd or [])
-    if argv and argv[0] == "--":
-        argv = argv[1:]
-    if not argv:
-        sys.stderr.write("agenttalk wrap: a launch command is required after `--`\n")
+    parsed_wrap = launch_admission.validate_standalone_wrap(args)
+    if isinstance(parsed_wrap, launch_admission.WrapRefusal):
+        sys.stderr.write(f"{parsed_wrap.message}\n")
         return 2
-    if args.cli not in ("codex", "claude"):
-        sys.stderr.write(f"agenttalk wrap: no wrapper adapter for cli {args.cli!r}\n")
-        return 2
-    if args.one_shot and not args.loop:
-        sys.stderr.write("agenttalk wrap: --one-shot requires --loop\n")
-        return 2
-    if args.one_shot and not args.to_request:
-        sys.stderr.write("agenttalk wrap: --one-shot requires --to-request <id>\n")
-        return 2
-    lead_loop = getattr(args, "lead_loop", False)
-    if lead_loop and not args.loop:
-        sys.stderr.write("agenttalk wrap: --lead-loop requires --loop\n")
-        return 2
-    if lead_loop and args.one_shot:
-        sys.stderr.write("agenttalk wrap: --lead-loop is a continuous controller; "
-                         "it cannot be combined with --one-shot\n")
-        return 2
+    argv = list(parsed_wrap.child_argv)
+    lead_loop = parsed_wrap.lead_loop
     # v0.75.0: model/effort injection + fingerprinting live in the --loop path only
     # (D2). Warn (don't fail) so an operator's --model/--effort isn't silently dropped
     # on the non-loop one-shot `wrap` path.
@@ -12105,11 +12203,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             )
             return 2
         attended_reason = args.reason.strip()
-        if (
-            not attended_reason
-            or len(attended_reason) > 500
-            or any(ord(char) < 32 for char in attended_reason)
-        ):
+        if not eph.is_safe_reason(attended_reason):
             sys.stderr.write(
                 "agenttalk supervise --reset-process-tree-ownership: "
                 "--reason must be a non-empty single line of at most "
@@ -12162,8 +12256,52 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                     state = sup.load_supervisor_state(state_path)
                     from agenttalk import attention as A
 
+                    try:
+                        supervisor_config = _load_supervisor_config(store)
+                    except Exception:  # noqa: BLE001 - match attention fail-closed view
+                        supervisor_config = None
+                    try:
+                        store_config = store.load_config()
+                    except Exception:  # noqa: BLE001 - match attention fail-closed view
+                        store_config = None
+                    restart_requests: dict[str, dict] = {}
+                    if configured_reset:
+                        try:
+                            restart_marker = store.read_restart_request(args.agent)
+                        except Exception:  # noqa: BLE001 - optional projection context
+                            restart_marker = None
+                        if isinstance(restart_marker, dict):
+                            restart_requests[args.agent] = restart_marker
+                    reset_admissions = sup.evaluate_process_tree_reset_admissions(
+                        store,
+                        state,
+                        actor=actor,
+                        now_epoch=now,
+                        identity_gone=_owner_identity_gone,
+                    )
+                    launch_requests = sup.active_ephemeral_launch_markers(
+                        store,
+                        state,
+                    )
+                    launch_deliveries = sup.active_ephemeral_one_shot_deliveries(
+                        store,
+                        state,
+                        launch_requests,
+                    )
+                    lane_workspaces = sup.active_ephemeral_lane_workspaces(store)
                     current_items = []
-                    for item in A.process_tree_hold_items(state):
+                    for item in A.process_tree_hold_items(
+                        state,
+                        supervisor_config=supervisor_config,
+                        store_config=store_config,
+                        root=store.root,
+                        restart_requests=restart_requests,
+                        launch_requests=launch_requests,
+                        launch_deliveries=launch_deliveries,
+                        lane_workspaces=lane_workspaces,
+                        reset_admissions=reset_admissions,
+                        now_epoch=now,
+                    ):
                         refs = item.get("source_refs")
                         if not (
                             isinstance(refs, list)
@@ -12280,10 +12418,11 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                             # to equal the original acknowledger: a durable
                             # retry must survive legitimate liaison turnover,
                             # while the journal keeps the original audit fact.
+                            # The current item hash already binds the current
+                            # actor; only immutable staged arguments must still
+                            # equal the journal.
                             if (
-                                pending["hold_source_hash"]
-                                != args.hold_source_hash
-                                or pending["reason"] != attended_reason
+                                pending["reason"] != attended_reason
                                 or pending["verified_launch_nonce"]
                                 != args.verified_launch_nonce
                             ):
@@ -12428,20 +12567,65 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         return 0
 
     if args.prepare_launch_request:
-        if not args.request_id or not args.state_file:
+        if (
+            not args.request_id
+            or not args.state_file
+            or args.launch_agenttalk_python is None
+            or args.launch_src_on_pythonpath is None
+            or args.supervisor_config_sha256 is None
+        ):
             sys.stderr.write("agenttalk supervise --prepare-launch-request: need "
-                             "--request-id <rid> and --state-file <path>\n")
+                             "--request-id <rid>, --state-file <path>, "
+                             "--launch-agenttalk-python <path>, and "
+                             "--launch-src-on-pythonpath true|false, and a "
+                             "PowerShell-accepted supervisor config SHA-256\n")
             return 2
-        state = _read_state()
-        config = _load_supervisor_config(store)
+        state_path = store.dir / "supervisor-state.json"
+        try:
+            selected_state_path = Path(args.state_file).resolve()
+            official_state_path = state_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            sys.stderr.write(
+                "agenttalk supervise --prepare-launch-request: state path "
+                f"could not be resolved: {exc}\n"
+            )
+            return 2
+        if selected_state_path != official_state_path:
+            sys.stderr.write(
+                "agenttalk supervise --prepare-launch-request: --state-file "
+                "must be the official .agenttalk/supervisor-state.json\n"
+            )
+            return 2
+        try:
+            config = _load_supervisor_config(
+                store,
+                expected_sha256=args.supervisor_config_sha256,
+                require_powershell_transport=True,
+            )
+        except sup.SupervisorPersistenceError as exc:
+            sys.stderr.write(
+                "agenttalk supervise --prepare-launch-request: "
+                f"{exc}\n"
+            )
+            return 3
+        state = sup.load_supervisor_state(state_path)
         now = args.now if args.now is not None else time.time()
         try:
-            spec = sup.prepare_launch_request(store, state, config, args.request_id,
-                                              now_epoch=now)
+            spec = sup.prepare_launch_request(
+                store,
+                state,
+                config,
+                args.request_id,
+                now_epoch=now,
+                launch_agenttalk_python=args.launch_agenttalk_python,
+                launch_src_on_pythonpath=(
+                    args.launch_src_on_pythonpath == "true"
+                ),
+            )
         except eph.EphemeralError as e:
             sys.stderr.write(f"agenttalk supervise --prepare-launch-request: {e}\n")
             return 3
-        _write_state(state)
+        sup.save_supervisor_state(state_path, state)
         print(json.dumps(spec, indent=2))
         return 0
 
@@ -12472,6 +12656,22 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --archive-launch-request: need "
                              "--request-id <rid>, --terminal-state <state>, and "
                              "--state-file <path>\n")
+            return 2
+        state_path = store.dir / "supervisor-state.json"
+        try:
+            selected_state_path = Path(args.state_file).resolve()
+            official_state_path = state_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            sys.stderr.write(
+                "agenttalk supervise --archive-launch-request: state path "
+                f"could not be resolved: {exc}\n"
+            )
+            return 2
+        if selected_state_path != official_state_path:
+            sys.stderr.write(
+                "agenttalk supervise --archive-launch-request: --state-file "
+                "must be the official .agenttalk/supervisor-state.json\n"
+            )
             return 2
         if not args.instance_token or args.pid is None:
             sys.stderr.write(
@@ -12546,7 +12746,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                         f"owner verification{detail_suffix}\n"
                     )
                     return 3
-                state = _read_state()
+                state = sup.load_supervisor_state(state_path)
                 sup.archive_ephemeral_request(
                     store, state, args.request_id,
                     terminal_state=args.terminal_state,
@@ -12554,7 +12754,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                     now_epoch=(args.now if args.now is not None else time.time()),
                     completion=completion,
                 )
-                _write_state(state)
+                sup.save_supervisor_state(state_path, state)
         except (OSError, ValueError, eph.EphemeralError,
                 sup.SupervisorPersistenceError) as exc:
             sys.stderr.write(
@@ -12568,8 +12768,15 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --launch-barrier: need --for "
                              "<agent> and --state-file <path>\n")
             return 2
+        try:
+            config = _load_supervisor_config(
+                store,
+                expected_sha256=args.supervisor_config_sha256,
+            )
+        except sup.SupervisorPersistenceError as exc:
+            sys.stderr.write(f"agenttalk supervise --launch-barrier: {exc}\n")
+            return 3
         state = _read_state()
-        config = _load_supervisor_config(store)
         now = args.now if args.now is not None else time.time()
         result = sup.evaluate_launch_barrier(
             _read_snapshot_file(args.snapshot_file),
@@ -12612,13 +12819,23 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                              "<agent> and --state-file <path>\n")
             return 2
         state = _read_state()
-        rl_cfg = _load_supervisor_config(store)
-        grace = rl_cfg.get("launch_grace_seconds")
-        grace = float(grace) if isinstance(grace, (int, float)) else None
-        cfg_agent = {}
-        if isinstance(rl_cfg.get("agents"), dict):
-            raw_cfg_agent = rl_cfg["agents"].get(args.agent)
-            cfg_agent = raw_cfg_agent if isinstance(raw_cfg_agent, dict) else {}
+        state_agents = state.get("agents")
+        state_agent = (
+            state_agents.get(args.agent)
+            if isinstance(state_agents, dict)
+            else None
+        )
+        try:
+            grace, cfg_agent = sup.decode_launch_record_context(
+                state_agent.get("pending_launch_record")
+                if isinstance(state_agent, dict)
+                else None,
+                agent=args.agent,
+                cli=args.cli or "claude",
+            )
+        except ValueError as exc:
+            sys.stderr.write(f"agenttalk supervise --record-launch: {exc}\n")
+            return 3
         sup.record_launch(state, args.agent, cli=args.cli or "claude",
                           pid=args.pid, pid_start=args.pid_start,
                           now_epoch=(args.now if args.now is not None else time.time()),
@@ -12631,6 +12848,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                           launcher_nonce_injected=bool(args.launcher_nonce_injected),
                           launcher_nonce_source=args.launcher_nonce_source,
                           launcher_nonce_missing_reason=args.launcher_nonce_missing_reason)
+        state["agents"][args.agent].pop("pending_launch_record", None)
         _write_state(state)
         return 0
     if args.clear_restart:
@@ -12651,7 +12869,21 @@ def cmd_supervise(args: argparse.Namespace) -> int:
               else f"no matching restart-request for {args.agent!r} "
                    f"[{args.request_id}] (already cleared or superseded)")
         return 0
-    config = _load_supervisor_config(store)
+    try:
+        config = _load_supervisor_config(
+            store,
+            expected_sha256=args.supervisor_config_sha256,
+        )
+    except sup.SupervisorPersistenceError as exc:
+        if args.supervisor_config_sha256 is None:
+            # Preserve the public usage-error contract for a corrupt project
+            # config.  SupervisorPersistenceError is a ValueError, so the
+            # top-level CLI reports this as exit 2 just as it did before the
+            # optional PowerShell byte binding was added.  Only a supplied
+            # binding that cannot be honored is a runtime HOLD (exit 3).
+            raise
+        sys.stderr.write(f"agenttalk supervise: {exc}\n")
+        return 3
     now = args.now if args.now is not None else time.time()
     stuck = config.get("stuck_after_seconds")
     stuck = float(stuck) if isinstance(stuck, (int, float)) else None
@@ -12684,6 +12916,11 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             snapshot = _read_snapshot_file(args.snapshot_file)
         plan = sup.plan_actions(report, _read_state(), config,
                                 now_epoch=now, snapshot=snapshot)
+        sup.attach_regular_launch_admissions(
+            plan,
+            config,
+            root=store.root,
+        )
         print(json.dumps(plan, indent=2))
         if getattr(args, "record_events", False):
             with contextlib.suppress(Exception):
@@ -12877,12 +13114,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="File-backed message bus for two agent CLIs.",
     )
     p.add_argument("--version", action="version", version=f"agenttalk {__version__}")
-    p.add_argument("--root",
-                   help="Project root. Resolution precedence: this flag > "
-                        "$AGENTTALK_ROOT > walk up from CWD looking for "
-                        ".agenttalk/. A pinned root (flag or env) that has no "
-                        "store fails loudly — it never falls back to the walk.")
-    p.add_argument("--supervisor-launch-nonce", help=argparse.SUPPRESS)
+    launch_admission.add_agenttalk_launch_arguments(p)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pdev = sub.add_parser(
@@ -14305,60 +14537,7 @@ def build_parser() -> argparse.ArgumentParser:
              "Codex (`codex exec --json`) and Claude (`stream-json`) structured "
              "streams are supported.",
     )
-    pwrap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
-    pwrap.add_argument("--cli", default="codex",
-                       help="Which CLI is being wrapped: 'codex' (codex exec "
-                            "--json) or 'claude' (stream-json).")
-    pwrap.add_argument("--from", dest="sender",
-                       help="Identity recorded as the degraded-restart requester "
-                            "(default: the wrapped agent).")
-    pwrap.add_argument("--lane-id",
-                       help="Run the wrapped child from the provisioned lane worktree.")
-    pwrap.add_argument("--min-interval", dest="min_interval", type=float, default=5.0,
-                       help="Throttle: stamp heartbeat at most once per this many "
-                            "seconds (default 5).")
-    pwrap.add_argument("--no-render", dest="no_render", action="store_true",
-                       help="Do not echo the agent's output to this console.")
-    pwrap.add_argument("--model", dest="model", default=None,
-                       help="(--loop) Override the per-agent supervisor.json model for "
-                            "the wrapped child (flag > per-agent config). Injected as a "
-                            "bare token; an explicit model in the launch tail still wins.")
-    pwrap.add_argument("--effort", dest="effort", default=None,
-                       help="(--loop) Override the per-agent reasoning_effort (flag > "
-                            "per-agent config). codex {minimal,low,medium,high,xhigh}; "
-                            "claude {low,medium,high,xhigh,max}. Invalid values are "
-                            "dropped with a warning; a launch-tail value still wins.")
-    pwrap.add_argument("--loop", action="store_true",
-                       help="Run as the long-running SUPERVISED wrapper: own the "
-                            "idle bus-wait + heartbeat and drive the CLI one turn "
-                            "per inbound message (design C). Opt-in; manual "
-                            "/agenttalk.listen stays the default.")
-    pwrap.add_argument("--lead-loop", dest="lead_loop", action="store_true",
-                       help="With --loop, run as the managed lead-loop CONTROLLER: "
-                            "acquire a renewable team-mailbox LEASE (the agent must be "
-                            "a configured managed-lead-loop identity) so an external "
-                            "consumer cannot race the bus; renew it on every heartbeat; "
-                            "a valid human release/end stands it down without relaunch.")
-    pwrap.add_argument("--one-shot", dest="one_shot", action="store_true",
-                       help="With --loop, exit after one successful turn.")
-    pwrap.add_argument("--to-request", dest="to_request",
-                       help="With --one-shot, only drive the matching request_id.")
-    pwrap.add_argument("--dead-letter-max-attempts", dest="dead_letter_max_attempts",
-                       type=int, default=None,
-                       help="(--loop) Auto-dead-letter a POISON message after this many "
-                            "deterministic failures (default 3, or supervisor.json "
-                            "dead_letter.max_attempts; 0 disables - debug only).")
-    pwrap.add_argument("--dead-letter-escalate-after", dest="dead_letter_escalate_after",
-                       type=int, default=None,
-                       help="(--loop) High-attempt backstop: escalate to the operator at "
-                            "this many attempts on one message; ambiguous/unknown repeated "
-                            "failures also dead-letter here (default 20, or supervisor.json "
-                            "dead_letter.escalate_after_attempts; 0 disables).")
-    pwrap.add_argument("cmd", nargs=argparse.REMAINDER,
-                       help="-- followed by the BASE launch command (the per-turn "
-                            "session/stream args are appended), e.g. `-- codex -a "
-                            "never -s workspace-write` (loop) or `-- codex ... exec "
-                            "--json \"...\"` (one-shot).")
+    launch_admission.add_wrap_arguments(pwrap)
     pwrap.set_defaults(func=cmd_wrap)
 
     pcheckwrap = sub.add_parser(
@@ -14486,6 +14665,19 @@ def build_parser() -> argparse.ArgumentParser:
                       action="store_true",
                       help="(script use) Claim an ephemeral launch request, roster "
                            "the temp identity, and print its launch spec.")
+    psup.add_argument(
+        "--launch-agenttalk-python",
+        help="(script use) Running supervisor's exact AGENTTALK_PY value.",
+    )
+    psup.add_argument(
+        "--launch-src-on-pythonpath",
+        choices=("true", "false"),
+        help="(script use) Whether the running supervisor prepends <root>/src.",
+    )
+    psup.add_argument(
+        "--supervisor-config-sha256",
+        help=argparse.SUPPRESS,
+    )
     gsup.add_argument("--record-ephemeral-launch", dest="record_ephemeral_launch",
                       action="store_true",
                       help="(script use) Record ephemeral launch pid/deadline.")
@@ -14532,11 +14724,11 @@ def build_parser() -> argparse.ArgumentParser:
                                      "(default 'bypassPermissions').")
     psup.add_argument("--cli", help="(--record-launch) the agent CLI ('claude'|'codex').")
     psup.add_argument("--pid", type=int, default=None,
-                      help="Launcher pid for record-launch, or live supervisor pid "
-                           "for instance-bound mutations.")
+                       help="Process id for record-launch or live-supervisor "
+                            "identity checks.")
     psup.add_argument("--pid-start", dest="pid_start", default=None,
-                      help="Process start-time for record-launch or live-supervisor "
-                           "anti-pid-reuse checks.")
+                       help="Process start-time for record-launch or live-supervisor "
+                            "anti-pid-reuse checks.")
     psup.add_argument("--pwsh",
                       help="Absolute pwsh.exe path (terminal explicit selection; no fallback).")
     psup.add_argument("--artifact-boundary", dest="artifact_boundary",
@@ -14583,8 +14775,8 @@ def build_parser() -> argparse.ArgumentParser:
              "recording the attended reset.",
     )
     psup.add_argument("--instance-token", dest="instance_token",
-                      help="(--release-instance/--drain-intents/"
-                           "--archive-launch-request) supervisor instance token.")
+                       help="(--release-instance/--drain-intents/"
+                            "--archive-launch-request) supervisor instance token.")
     psup.add_argument("--max-per-tick", dest="max_per_tick", type=int, default=25,
                       help="(--drain-intents) maximum queued intents to claim in one tick.")
     psup.add_argument("--session-id", dest="session_id",

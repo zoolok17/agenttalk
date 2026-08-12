@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Detached refusal guidance now states each recovery population's enforceable
+  boundary.** For an active ephemeral request, re-prepare after editing the
+  configured profile. Recovery emits a named refusal instead of argv when
+  the configured launch mapping or reconstructed launch-effective projection no
+  longer matches; equivalent-looking edits are not guaranteed to remain valid.
+  For active ephemeral recovery, the emitted working directory is always absolute: the
+  admitted profile or project-root value without a lane, and the bound lane
+  workspace with one. The lane workspace may differ from the profile value. It
+  binds resolved executable paths, not the contents
+  at those paths: an in-place replacement is not detected, so a recovery command
+  may name a binary whose contents changed since preparation. Regular
+  process-tree-HOLD recovery has no prepared request or effective binding to
+  compare. It emits a relative configured working directory unchanged, so run the
+  command from the same base the supervisor used or the agent can start in the
+  wrong directory. An absolute working directory has no such base hazard, but
+  regular recovery does not check that it exists. The displayed environment is
+  guidance only: the environment the child receives is not verified and must be
+  reviewed by the operator.
+
+### Fixed
+
+- **A failed environment application no longer leaves the supervisor process
+  mutated.** Both supported PowerShell launch paths arm exact ordinal
+  restoration before the first mutation and refuse to spawn after an apply
+  failure.
+- **Launch-record context rejects DEL and C1 control characters** at both the
+  producer and decoder boundary.
+
+### Known limitations
+
+- PowerShell 7 can drop hidden per-drive entries across the native child
+  boundary, and Windows PowerShell 5.1 cannot faithfully carry an admitted
+  empty value through its environment provider. Exact child-environment proof
+  is therefore deferred; capture-only tests are not sufficient evidence.
+
 ## [0.81.0] - 2026-08-02
 
 Theme: **the supervisor knows what it owns, and says so when it cannot.** 0.80.0 deferred three
@@ -1736,14 +1773,16 @@ changes.
 - **Doctor L4 visibility for supervised Codex launches.** A new advisory
   `supervised_codex` check resolves each configured Codex agent's launch (base CLI
   + pinned interpreter) and runs timeout-bounded, exception-safe probes against an
-  env that mirrors the *actual* launch — per-agent `agent.env` overlaid on the
+  env projection built for launch — per-agent `agent.env` overlaid on the
   managed pins, with case-insensitive collision detection on the critical launch
   keys (`AGENTTALK_PY`/`CODEX_HOME`/`PYTHONPATH`/`AGENTTALK_ROOT`), matching the
-  Windows PowerShell launcher. It reports OK only when the env mirror is genuinely
-  full and every required probe passes; a drifted/broken override or a failed probe
-  is `WARN` (never a false OK, never a silent `None`). A separate read-only
-  `config_blocked_holds` check surfaces parked agents with remediation. Advisory
-  (OK/WARN only, no ERROR).
+  Windows PowerShell launch inputs. It reports OK only when that configured
+  projection is complete and every required probe passes; a drifted/broken
+  override or a failed probe is `WARN` (never a silent `None`). This is
+  configuration/preflight evidence, not proof of the exact environment delivered
+  across the native child boundary; see the Unreleased known limitation. A
+  separate read-only `config_blocked_holds` check surfaces parked agents with
+  remediation. Advisory (OK/WARN only, no ERROR).
 
 ### Fixed
 

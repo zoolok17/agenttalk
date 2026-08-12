@@ -30,18 +30,31 @@ import math
 import os
 import re
 import shlex
+import shutil
+import subprocess  # nosec B404 - list2cmdline formats argv; no process is launched
 import sys
 import tempfile
 import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Callable, Iterable
+from enum import Enum
+from pathlib import Path, PureWindowsPath
+from typing import Callable, Iterable, Sequence
 
 from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk import ephemeral as eph
 from agenttalk import health as health_model
 from agenttalk import lanes as lane_mod
-from agenttalk.store import Store, _process_alive, validate_agent_name
+from agenttalk import launch_admission as launch_admission_mod
+from agenttalk.store import (
+    Store,
+    _owner_identity_gone,
+    _process_alive,
+    _windows_filetime_ticks,
+    is_unusable_restart_request,
+    validate_agent_name,
+)
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle as lifecycle
 from agenttalk import wrapper_runtime as runtime_obs
@@ -69,6 +82,31 @@ EPHEMERAL_COMPLETE = eph.ACTION_COMPLETE
 EPHEMERAL_TIMEOUT = eph.ACTION_TIMEOUT
 EPHEMERAL_FAILED = eph.ACTION_FAILED
 EPHEMERAL_JANITOR = eph.ACTION_JANITOR
+
+
+class WrapRecognitionStatus(str, Enum):
+    """What one live command-line observation proves about a wrapper."""
+
+    MATCHED = "matched"
+    NOT_MATCHED = "not_matched"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class WrapRecognition:
+    """Typed wrapper identity result; UNKNOWN is never identity authority."""
+
+    status: WrapRecognitionStatus
+    reason_code: str
+    invocation: launch_admission_mod.WrapInvocation | None = None
+
+
+def _wrapper_recognition_is_unknown(entry: object) -> bool:
+    recognition = entry.get("wrapper_recognition") if isinstance(entry, dict) else None
+    return bool(
+        isinstance(recognition, dict)
+        and recognition.get("status") == WrapRecognitionStatus.UNKNOWN.value
+    )
 
 # Default cadence knobs (config overrides these).
 _DEFAULTS = {
@@ -123,6 +161,34 @@ _COORDINATION_MAX_DIAGNOSTICS = 20
 _COORDINATION_AVAILABILITY_FIELDS = frozenset({
     "schema_version", "updated_at_epoch", "agents",
 })
+
+_PROCESS_TREE_OPERATOR_GAPS = (
+    (
+        "generation_adoption_pending",
+        "Agenttalk could not establish that the current wrapper generation "
+        "has adopted this agent's process tree.",
+    ),
+    (
+        "legacy_managed_pids",
+        "Agenttalk could not establish complete current ownership from legacy "
+        "PID records, which do not carry the current generation's parent graph.",
+    ),
+    (
+        "exact_start_filetime_unavailable",
+        "Agenttalk could not establish exact process lifetime identities, so "
+        "it cannot exclude PID reuse.",
+    ),
+    (
+        "post_kill_owned_descendant_edge_survived",
+        "Agenttalk could not establish that every owned descendant ended after "
+        "the attempted teardown.",
+    ),
+    (
+        "wrapper_state_mismatch",
+        "Agenttalk could not establish that the reported wrapper identity agrees "
+        "with the supervisor's recorded launcher.",
+    ),
+)
 _COORDINATION_AVAILABILITY_ROW_FIELDS = frozenset({
     "state",
     "subtype",
@@ -321,13 +387,17 @@ def _read_supervisor_state_copy(path: Path, *, source: str) -> tuple[dict | None
 
 def _supervisor_json_text(value: dict, *, source: str) -> str:
     try:
-        return json.dumps(
+        text = json.dumps(
             value,
             ensure_ascii=False,
             sort_keys=True,
             indent=2,
             allow_nan=False,
         ) + "\n"
+        # Match the atomic writer's UTF-8 stream contract here, before a temp
+        # file exists and before any caller can treat the state as persistable.
+        text.encode("utf-8")
+        return text
     except (TypeError, ValueError) as exc:
         raise SupervisorPersistenceError(
             f"{source} is not JSON serializable: {type(exc).__name__}"
@@ -438,11 +508,110 @@ def save_supervisor_state(path: Path, state: dict) -> None:
     _atomic_write_supervisor_json(path, state, source="supervisor state")
 
 
-def load_supervisor_config(path: Path) -> dict:
-    """Load supervisor.json as a BOM-tolerant JSON object."""
+_POWERSHELL_CONFIG_TRANSPORT_PROBE = r"""
+$ErrorActionPreference = 'Stop'
+$stdin = [Console]::OpenStandardInput()
+$buffer = [IO.MemoryStream]::new()
+try {
+  $stdin.CopyTo($buffer)
+  $bytes = $buffer.ToArray()
+} finally {
+  $buffer.Dispose()
+}
+$strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+$text = $strictUtf8.GetString($bytes)
+if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) {
+  $text = $text.Substring(1)
+}
+$value = $text | ConvertFrom-Json
+if (($null -eq $value) -or
+    (($value -isnot [System.Management.Automation.PSCustomObject]) -and
+     ($value -isnot [hashtable]))) {
+  throw 'supervisor config must be a JSON object'
+}
+$agents = $value.PSObject.Properties['agents']
+if (($null -eq $agents) -or ($null -eq $agents.Value) -or
+    (($agents.Value -isnot [System.Management.Automation.PSCustomObject]) -and
+     ($agents.Value -isnot [hashtable]))) {
+  throw 'supervisor config agents must be a JSON object'
+}
+"""
+
+
+def _validate_powershell_config_transport(store: Store, raw: bytes) -> None:
+    """Require the selected PowerShell to accept the exact bound JSON bytes."""
+    if os.name != "nt":
+        # Generated PowerShell supervision is Windows-only. Cross-platform
+        # planner/unit consumers still exercise the deterministic Python side.
+        return
+    try:
+        with lifecycle.selected_host_for_spawn(store) as selected:
+            result = subprocess.run(  # noqa: S603  # nosec B603
+                [
+                    str(selected["path"]),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    _POWERSHELL_CONFIG_TRANSPORT_PROBE,
+                ],
+                input=raw,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+    except (OSError, subprocess.TimeoutExpired, lifecycle.SupervisorLifecycleError) as exc:
+        raise SupervisorPersistenceError(
+            "selected PowerShell could not validate the supervisor config transport"
+        ) from exc
+    if result.returncode != 0:
+        raise SupervisorPersistenceError(
+            "supervisor config was not accepted by the selected PowerShell transport"
+        )
+
+
+def load_supervisor_config(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    powershell_transport_store: Store | None = None,
+) -> dict:
+    """Load supervisor.json, optionally bound to an accepted byte snapshot."""
     path = Path(path)
     if not path.exists():
+        if expected_sha256 is not None:
+            raise SupervisorPersistenceError(
+                "supervisor config is unavailable or changed after PowerShell accepted it"
+            )
         return {}
+    if expected_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise SupervisorPersistenceError(
+                "PowerShell-accepted supervisor config SHA-256 is invalid"
+            )
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise SupervisorPersistenceError(
+                "supervisor config is unavailable or changed after PowerShell accepted it"
+            ) from exc
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise SupervisorPersistenceError(
+                "supervisor config changed after PowerShell accepted it"
+            )
+        if powershell_transport_store is not None:
+            _validate_powershell_config_transport(powershell_transport_store, raw)
+        try:
+            value = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise SupervisorPersistenceError(
+                f"supervisor config is unreadable or invalid: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise SupervisorPersistenceError("supervisor config must be a JSON object")
+        return value
     return _read_supervisor_json(path, source="supervisor config")
 
 
@@ -559,7 +728,16 @@ _ATTRIBUTION_MODEL = "process_ownership_v1"
 _PROVENANCE_TTL_SECONDS = 3600.0
 _SUPERVISOR_LAUNCH_NONCE_ARG = "--supervisor-launch-nonce"
 _SUPERVISOR_LAUNCH_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
-_AGENTTALK_SUBCOMMANDS = {"wrap", "wait", "send", "status", "supervise"}
+_AGENTTALK_SUBCOMMANDS = frozenset(
+    "dev-gate init status supervisor threads roster avatar domain send "
+    "await-cancel composing rescind check gate close lane relay knowledge "
+    "onboarding barrier prune escalate attention propose broadcast recv drain "
+    "compact wait ack sync whoami transcript end release heartbeat checkpoint "
+    "request-restart commit-gate request-launch wrap "
+    "_internal-check-wrap-dispatch dead-letter managed-lead-loop supervise "
+    "deadman reply tail start serve dashboard reset doctor gateway hmac-init "
+    "capacity install-skills codex-config".split()
+)
 _LAUNCHER_DERIVED_PRIOR_SOURCES = {"launch_child_provenance"}
 _DIAGNOSTIC_COUNTERS = (
     "equal_start_edge",
@@ -586,6 +764,7 @@ _DIAGNOSTIC_COUNTERS = (
     "launcher_nonce_duplicate",
     "launcher_nonce_after_subcommand_or_tail",
     "launcher_wrap_parse_failed",
+    "launcher_wrap_observation_unknown",
     "excluded_live_descendant_unaccounted",
 )
 
@@ -1086,6 +1265,8 @@ def record_coordination_availability_observation(
 def _restart_request_with_live_authority(store: Store, marker: dict | None) -> dict | None:
     if not isinstance(marker, dict):
         return marker
+    if is_unusable_restart_request(marker):
+        return dict(marker)
     out = dict(marker)
     authority = resolve_restart_request_authority(
         store,
@@ -1641,6 +1822,88 @@ def _assessment_health(rpt: dict, lead_liveness: dict | None) -> dict:
     }
 
 
+def restart_request_progress(
+    state_row: dict,
+    marker: dict | None,
+    *,
+    decision_state: str | None = None,
+    clear_marker: str | None = None,
+) -> dict:
+    """Classify one restart request without borrowing another request's state."""
+    if is_unusable_restart_request(marker):
+        blocked = decision_state in {
+            "PROCESS_TREE_INVALID",
+            "PROCESS_TREE_UNKNOWN",
+            "PROCESS_TREE_TRUNCATED",
+        }
+        return {
+            "present": True,
+            "pending": False,
+            "blocked": blocked,
+            "state": "blocked_by_process_tree_hold" if blocked else "unknown",
+            "request_id": None,
+            "unavailable": True,
+        }
+    persisted_state = state_row.get("restart_request_state")
+    persisted_request_id = state_row.get("pending_restart_request_id")
+    current_request_id = (
+        marker.get("request_id") if isinstance(marker, dict) else None
+    )
+    request_id = (
+        current_request_id
+        if isinstance(current_request_id, str) and current_request_id
+        else persisted_request_id
+    )
+    present = bool(
+        isinstance(marker, dict)
+        or (
+            isinstance(persisted_request_id, str)
+            and persisted_state in {
+                "applied_pending_readiness",
+                "readiness_seen",
+            }
+        )
+    )
+    completed = bool(
+        present
+        and isinstance(request_id, str)
+        and (
+            (
+                persisted_state == "readiness_seen"
+                and persisted_request_id == request_id
+            )
+            or (
+                clear_marker == request_id
+                and persisted_request_id in {None, request_id}
+            )
+        )
+    )
+    blocked = bool(
+        present
+        and not completed
+        and decision_state in {
+            "PROCESS_TREE_INVALID",
+            "PROCESS_TREE_UNKNOWN",
+            "PROCESS_TREE_TRUNCATED",
+        }
+    )
+    return {
+        "present": present,
+        "pending": present and not blocked and not completed,
+        "blocked": blocked,
+        "state": (
+            "readiness_seen"
+            if completed
+            else "blocked_by_process_tree_hold"
+            if blocked
+            else "pending"
+            if present
+            else "absent"
+        ),
+        "request_id": request_id if isinstance(request_id, str) else None,
+    }
+
+
 def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
                                 operator_facing: str | None = None,
                                 lead_liveness_stale_after_seconds: float =
@@ -1668,6 +1931,23 @@ def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
     rr = rpt.get("restart_request") if isinstance(rpt.get("restart_request"), dict) else None
     hold = rpt.get("config_blocked_hold") if isinstance(
         rpt.get("config_blocked_hold"), dict) else None
+    next_state = (
+        plan.get("next_state")
+        if isinstance(plan, dict) and isinstance(plan.get("next_state"), dict)
+        else {}
+    )
+    restart = restart_request_progress(
+        next_state,
+        rr,
+        decision_state=(
+            decision.get("state") if isinstance(decision, dict) else None
+        ),
+        clear_marker=(
+            plan.get("clear_marker")
+            if isinstance(plan, dict) and plan.get("action") == CLEAR_MARKER
+            else None
+        ),
+    )
     return {
         "name": name,
         "role": rpt.get("role"),
@@ -1684,9 +1964,12 @@ def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
             "deadline_epoch": rpt.get("waiting_deadline_epoch"),
         },
         "restart_request": {
-            "pending": rr is not None,
-            "request_id": rr.get("request_id") if rr else None,
-            "requested_by": rr.get("requested_by") if rr else None,
+            **restart,
+            "requested_by": (
+                rr.get("requested_by")
+                if rr
+                else next_state.get("restart_requested_by")
+            ),
         },
         "config_blocked_hold": {
             "present": hold is not None,
@@ -1724,6 +2007,8 @@ def _redacted_observation_value(value: object) -> object:
 def _redacted_restart_request(marker: object) -> dict | None:
     if not isinstance(marker, dict):
         return None
+    if is_unusable_restart_request(marker):
+        return {"unavailable": True}
     out: dict[str, object] = {}
     for key in (
         "request_id",
@@ -2048,6 +2333,119 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
                                          perm_mode=perm_mode)}
 
 
+_LAUNCH_RECORD_CONTEXT_SCHEMA = 1
+_LAUNCH_RECORD_BRAIN_PATTERN_MAX_BYTES = 4096
+_LAUNCH_RECORD_CONTEXT_MAX_BYTES = 8192
+
+
+def _valid_launch_record_brain_pattern(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or any(
+            ord(character) < 32
+            or 0x7F <= ord(character) <= 0x9F
+            or 0xD800 <= ord(character) <= 0xDFFF
+               for character in value)
+    ):
+        return False
+    try:
+        return len(value.encode("utf-8")) <= _LAUNCH_RECORD_BRAIN_PATTERN_MAX_BYTES
+    except UnicodeError:
+        return False
+
+
+def _valid_launch_record_context_size(value: object) -> bool:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, UnicodeError, ValueError):
+        return False
+    return len(encoded) <= _LAUNCH_RECORD_CONTEXT_MAX_BYTES
+
+
+def _launch_record_context(
+    *,
+    agent: str,
+    cli: str,
+    grace_seconds: float,
+    wrapped: bool,
+    brain_pattern: str,
+) -> dict:
+    """Return byte-bounded accepted-config facts needed after process spawn.
+
+    The generated executor persists this value in the reserved next-state before
+    launching. It deliberately excludes cwd/environment values while avoiding a
+    second read of mutable ``supervisor.json`` after ``Start-Process`` succeeds.
+    """
+    if not _valid_launch_record_brain_pattern(brain_pattern):
+        raise ValueError("accepted launch record brain pattern is invalid")
+    context = {
+        "schema_version": _LAUNCH_RECORD_CONTEXT_SCHEMA,
+        "agent": agent,
+        "cli": cli,
+        "grace_seconds": grace_seconds,
+        "wrapped": wrapped,
+        "brain_pattern": brain_pattern,
+    }
+    if not _valid_launch_record_context_size(context):
+        raise ValueError("accepted launch record context is too large")
+    return context
+
+
+def decode_launch_record_context(
+    value: object,
+    *,
+    agent: str,
+    cli: str,
+) -> tuple[float, dict]:
+    """Validate one plan-produced launch-record context, failing closed."""
+    if value is None:
+        raise ValueError("accepted launch record context is missing")
+    if not isinstance(value, dict):
+        raise ValueError("accepted launch record context must be an object")
+    if not _valid_launch_record_context_size(value):
+        raise ValueError("accepted launch record context is too large")
+    if set(value) != {
+        "schema_version",
+        "agent",
+        "cli",
+        "grace_seconds",
+        "wrapped",
+        "brain_pattern",
+    }:
+        raise ValueError("accepted launch record context fields are invalid")
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != _LAUNCH_RECORD_CONTEXT_SCHEMA
+        or value.get("agent") != agent
+        or value.get("cli") != cli
+    ):
+        raise ValueError("accepted launch record context identity does not match")
+    grace = value.get("grace_seconds")
+    if (
+        not isinstance(grace, (int, float))
+        or isinstance(grace, bool)
+        or not math.isfinite(float(grace))
+        or float(grace) < 0
+    ):
+        raise ValueError("accepted launch record grace is invalid")
+    wrapped = value.get("wrapped")
+    brain_pattern = value.get("brain_pattern")
+    if not isinstance(wrapped, bool) or not _valid_launch_record_brain_pattern(
+        brain_pattern
+    ):
+        raise ValueError("accepted launch record agent projection is invalid")
+    return float(grace), {
+        "cli": cli,
+        "wrapped": wrapped,
+        "brain_pattern": brain_pattern,
+    }
+
+
 # ---- process-snapshot interpretation (PURE; testable from synthetic rows) ---
 #
 # The .ps1 executor captures a Win32_Process snapshot each poll and hands it to
@@ -2224,20 +2622,16 @@ def _start_of(row: dict | None):
 
 def _filetime_of(row: dict | None) -> str | None:
     value = (row or {}).get("start_filetime")
-    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,19}", value):
-        return value
-    return None
+    return value if _windows_filetime_ticks(value) is not None else None
 
 
 def _filetime_start_token(value: object) -> str | None:
     """Render exact Windows creation ticks as a comparable ISO start token."""
-    if (
-        not isinstance(value, str)
-        or re.fullmatch(r"[1-9][0-9]{0,19}", value) is None
-    ):
+    ticks = _windows_filetime_ticks(value)
+    if ticks is None:
         return None
     try:
-        seconds = (int(value) / 10_000_000.0) - 11_644_473_600
+        seconds = (ticks / 10_000_000.0) - 11_644_473_600
         return datetime.fromtimestamp(seconds, timezone.utc).isoformat(
             timespec="microseconds"
         ).replace("+00:00", "Z")
@@ -2280,11 +2674,9 @@ def _exact_start_order_key_values(
         # Linux's boot-id/start-ticks token is already exact. Ignore any stale
         # FILETIME-shaped field rather than changing the token's platform.
         return key
-    if (
-        isinstance(start_filetime, str)
-        and re.fullmatch(r"[1-9][0-9]{0,19}", start_filetime)
-    ):
-        return ("win32-filetime", int(start_filetime))
+    ticks = _windows_filetime_ticks(start_filetime)
+    if ticks is not None:
+        return ("win32-filetime", ticks)
     return None
 
 
@@ -2738,10 +3130,7 @@ def _valid_owned_process_tree(
             or start_key is None
             or (
                 start_filetime is not None
-                and (
-                    not isinstance(start_filetime, str)
-                    or re.fullmatch(r"[1-9][0-9]{0,19}", start_filetime) is None
-                )
+                and _windows_filetime_ticks(start_filetime) is None
             )
             or (
                 status in {"complete", "absent"}
@@ -3935,35 +4324,40 @@ def _is_shell_host(row: dict | None) -> bool:
     return _image_stem(row or {}) in _SHELL_HOSTS
 
 
-def _split_command_line(command_line: object) -> list[str] | None:
+def _split_observed_command_line(
+    command_line: object,
+) -> tuple[list[str] | None, str | None]:
+    """Tokenize one OS observation and retain why no tokens were available."""
+
     if not isinstance(command_line, str) or not command_line.strip():
-        return None
+        return None, "command_line_unreadable"
     try:
         raw = shlex.split(command_line, posix=False)
     except ValueError:
-        return None
+        return None, "command_line_tokenization_failed"
     out: list[str] = []
     for token in raw:
         if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
             token = token[1:-1]
         if token:
             out.append(token)
-    return out or None
+    if not out:
+        return None, "command_line_unreadable"
+    return out, None
+
+
+def _split_command_line(command_line: object) -> list[str] | None:
+    tokens, _reason = _split_observed_command_line(command_line)
+    return tokens
 
 
 def _token_stem(token: str) -> str:
     return _image_stem(token)
 
 
-# PR 98 connector, the seam finding: this grammar is implemented TWICE (here
-# and in PS_TEMPLATE's Test-AgenttalkAllowedInterpreterPrefixToken), and the
-# two implementations must agree - see
-# test_python_and_powershell_prefix_allowlists_agree, which drives both
-# sides through the same shared table. This constant is the single
-# PYTHON-side source of truth the test consumes (not a literal the test
-# redefines); the PowerShell side is the single source of truth for its own
-# language. Each entry's justification lives on the PowerShell function -
-# duplicating the reasoning here would just be a third place to drift.
+# Python interpreter prefixes admitted for a supervised ``-m agenttalk``
+# launch.  The generated executor consumes the resulting typed admission
+# artifact; it no longer carries a second copy of this grammar.
 _ALLOWED_INTERPRETER_PREFIX_FLAGS = frozenset(
     {"-u", "-I", "-S", "-B", "-E", "-P", "-b", "-bb"}
 )
@@ -4009,13 +4403,13 @@ def _module_args_from(cfg_agent: object) -> object:
 def _resolve_module_flag_index(
     tokens_after_exe: list[str], module_args_from: object,
 ) -> int:
-    """Python-side mirror of Resolve-AgenttalkModuleFlagIndex: given the
-    argv tokens AFTER the interpreter executable and a declared
+    """Resolve a declared Python ``-m agenttalk`` dispatch boundary.
+
+    Given the argv tokens AFTER the interpreter executable and a declared
     module_args_from, return the index that holds '-m' (with 'agenttalk'
     immediately after) if every prefix token before it is on the
     allowlist, or -1 otherwise. A malformed module_args_from fails closed
-    (-1) rather than raising, matching the PowerShell side's own
-    fail-soft cast.
+    (-1) rather than raising.
 
     Shared by _agenttalk_argv (parses an OBSERVED command line at
     attribution time) and bootstrap_check (validates a DECLARED config
@@ -4045,6 +4439,1389 @@ def _resolve_module_flag_index(
             and tokens_after_exe[offset + 1] == "agenttalk"):
         return offset
     return -1
+
+
+def process_tree_operator_gap(
+    *,
+    status: object,
+    reason_code: object,
+    observed: object = None,
+    limit: object = None,
+) -> str:
+    """Describe missing ownership evidence without exposing an internal predicate."""
+    if status == "truncated":
+        return (
+            "Agenttalk could not establish a complete owned process tree: "
+            f"the poll observed {observed} identities over the safe cap {limit}."
+        )
+    if status == "unknown":
+        return (
+            "Agenttalk could not read enough of the current wrapper observation "
+            "to determine whether it matches this agent; the next poll will retry."
+        )
+    if isinstance(reason_code, str):
+        for suffix, explanation in _PROCESS_TREE_OPERATOR_GAPS:
+            if reason_code.endswith(suffix):
+                return explanation
+    return (
+        "Agenttalk could not establish complete current ownership of this "
+        "agent's process tree."
+    )
+
+
+def _ensure_agenttalk_wrap_root_arg(
+    argv: list[str],
+    module_args_from: object,
+    root: str,
+) -> list[str] | None:
+    """Normalize a configured wrapper root before typed launch admission.
+
+    A legacy configured wrapper may rely on ``AGENTTALK_ROOT`` and omit the
+    parser-visible ``--root``.  A detached recovery must advertise the same
+    normalized argv the generated executor uses, not the stale literal array.
+    """
+    args = list(argv)
+    if not args:
+        return args
+    flag_index = _resolve_module_flag_index(args, module_args_from)
+    scan = flag_index + 2 if flag_index >= 0 else 0
+    root_value_index = -1
+    root_inline = False
+    wrap_index = -1
+    root_insert_at = -1
+    index = scan
+    while index < len(args):
+        argument = args[index]
+        if argument == "--":
+            if index + 1 < len(args) and args[index + 1] == "wrap":
+                wrap_index = index + 1
+                root_insert_at = index
+            break
+        global_option = launch_admission_mod.resolve_agenttalk_launch_option(
+            argument
+        )
+        if global_option == "--root" and "=" not in argument:
+            if root_value_index >= 0 or index + 1 >= len(args):
+                return None
+            value = args[index + 1]
+            if not value or value.startswith("-"):
+                return None
+            root_value_index = index + 1
+            index += 2
+            continue
+        if global_option == "--root" and "=" in argument:
+            if root_value_index >= 0:
+                return None
+            if not argument.partition("=")[2]:
+                return None
+            root_value_index = index
+            root_inline = True
+            index += 1
+            continue
+        if global_option == "--supervisor-launch-nonce" and "=" not in argument:
+            index += 2
+            continue
+        if global_option == "--supervisor-launch-nonce" and "=" in argument:
+            index += 1
+            continue
+        if argument == "wrap":
+            wrap_index = index
+            root_insert_at = index
+            break
+        index += 1
+    if wrap_index < 0:
+        return args
+    if root_value_index >= 0:
+        if root_inline:
+            args[root_value_index] = f"--root={root}"
+        else:
+            args[root_value_index - 1] = "--root"
+            args[root_value_index] = root
+        return args
+    return [
+        *args[:root_insert_at],
+        "--root",
+        root,
+        *args[root_insert_at:],
+    ]
+
+
+_LAUNCH_ADMISSION_SCHEMA_VERSION = 1
+_LAUNCH_ADMISSION_POPULATIONS = frozenset({"regular", "ephemeral"})
+
+
+@dataclass(frozen=True)
+class EffectiveLaunchCandidate:
+    """One post-substitution launch shape shared by every launch consumer.
+
+    The candidate is constructed only after field validation and wrapper
+    admission have succeeded.  Its argv is therefore the exact base argv that
+    recovery renders and the generated executor consumes; PowerShell may add
+    only the supervisor-owned nonce at ``nonce_insert_at``.
+    """
+
+    population: str
+    agent: str
+    cli: str
+    wrapped: bool
+    windows_file: str
+    argv: tuple[str, ...]
+    cwd: str
+    module_args_from: int | None
+    wrapper_dispatch: bool
+    nonce_insert_at: int | None
+    child_argv: tuple[str, ...]
+    environment_keys: tuple[str, ...]
+
+    def artifact(self) -> dict:
+        return {
+            "schema_version": _LAUNCH_ADMISSION_SCHEMA_VERSION,
+            "status": "accepted",
+            "population": self.population,
+            "agent": self.agent,
+            "cli": self.cli,
+            "wrapped": self.wrapped,
+            "windows_file": self.windows_file,
+            "argv": list(self.argv),
+            "cwd": self.cwd,
+            "module_args_from": self.module_args_from,
+            "wrapper_dispatch": self.wrapper_dispatch,
+            "nonce_insert_at": self.nonce_insert_at,
+            "child_argv": list(self.child_argv),
+        }
+
+
+@dataclass(frozen=True)
+class _EnvironmentIssue:
+    code: str
+    name: str | None = None
+
+
+def _configured_environment_issues(
+    raw_environment: object,
+    *,
+    reserved_names: Iterable[str] = (),
+    forbid_control_names: bool = False,
+) -> tuple[_EnvironmentIssue, ...]:
+    """Validate one configured environment with the Windows name comparer.
+
+    Syntax and comparer rules are shared by regular and ephemeral candidates.
+    Population-specific ownership and legacy control-name rules are explicit
+    policy overlays rather than a second validator.
+    """
+    if raw_environment is None:
+        return ()
+    if not isinstance(raw_environment, dict):
+        return (_EnvironmentIssue("not_object"),)
+    issues: list[_EnvironmentIssue] = []
+    seen_names: list[str] = []
+    reserved = tuple(reserved_names)
+    for name, value in raw_environment.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or "=" in name
+            or any(
+                character == "\x00"
+                or 0xD800 <= ord(character) <= 0xDFFF
+                or (forbid_control_names and ord(character) < 32)
+                for character in name
+            )
+        ):
+            issues.append(_EnvironmentIssue("invalid_name"))
+            continue
+        if any(
+            eph._windows_environment_names_equal(name, previous)  # noqa: SLF001
+            for previous in seen_names
+        ):
+            issues.append(_EnvironmentIssue("duplicate_name", name))
+        seen_names.append(name)
+        if any(
+            eph._windows_environment_names_equal(name, reserved_name)  # noqa: SLF001
+            for reserved_name in reserved
+        ):
+            issues.append(_EnvironmentIssue("reserved_name", name))
+        if (
+            not isinstance(value, str)
+            or any(
+                character == "\x00"
+                or 0xD800 <= ord(character) <= 0xDFFF
+                for character in value
+            )
+        ):
+            issues.append(_EnvironmentIssue("invalid_value", name))
+    return tuple(issues)
+
+
+def _launch_admission_refusal(
+    *,
+    population: str,
+    agent: str,
+    reason: str,
+) -> dict:
+    return {
+        "schema_version": _LAUNCH_ADMISSION_SCHEMA_VERSION,
+        "status": "refused",
+        "population": population,
+        "agent": agent,
+        "reason": reason,
+    }
+
+
+def _valid_launch_token(value: object, *, allow_empty: bool) -> str | None:
+    if (
+        not isinstance(value, str)
+        or (not allow_empty and not value)
+        or any(
+            character == "\x00"
+            or 0xD800 <= ord(character) <= 0xDFFF
+            for character in value
+        )
+    ):
+        return None
+    return value
+
+
+def _effective_launch_candidate(
+    row: object,
+    *,
+    population: str,
+    agent: str,
+    root: str | Path | None,
+    session_args: Sequence[object] | None = None,
+    request_id: str | None = None,
+    lane_id: str | None = None,
+) -> tuple[EffectiveLaunchCandidate | None, str | None]:
+    """Build and admit one post-substitution launch candidate.
+
+    Population-specific substitution happens before this returns.  Every
+    projection and executor consumes the resulting argv rather than rebuilding
+    it from the raw profile.  ``session_args=None`` means the caller cannot
+    project dynamic session arguments; an explicit empty sequence remains a
+    known-empty substitution.
+    """
+    if population not in _LAUNCH_ADMISSION_POPULATIONS:
+        return None, "the configured launch population is invalid"
+    if not isinstance(row, dict):
+        return None, "the configured launch entry is invalid"
+    try:
+        validated_agent = validate_agent_name(agent)
+    except (TypeError, ValueError):
+        return None, "the configured launch agent is invalid"
+    default_cli = "codex" if population == "ephemeral" else "claude"
+    cli = row.get("cli", default_cli)
+    if not isinstance(cli, str) or cli not in {"claude", "codex"}:
+        return None, "the configured launch cli is invalid"
+    # Ephemeral launch specs are intrinsically supervised one-shot wrappers;
+    # unlike regular agent rows, their persisted shape has no redundant
+    # ``wrapped`` flag.  Keep that population contract explicit here.
+    wrapped = (
+        True if population == "ephemeral" else bool(row.get("wrapped", False))
+    )
+    launch = row.get("launch")
+    if not isinstance(launch, dict):
+        return None, "the agent's supervisor.json launch entry is invalid"
+    windows_file = _valid_launch_token(
+        launch.get("windows_file"),
+        allow_empty=False,
+    )
+    if windows_file is None:
+        return None, "the configured launch executable is not runnable"
+    if _configured_launch_has_unresolved_placeholder(windows_file):
+        return None, (
+            "the configured launch executable contains an unresolved placeholder"
+        )
+    raw_args = launch.get("windows_args")
+    if not isinstance(raw_args, list):
+        return None, "the configured launch argument list is invalid"
+    normalized_session_args: list[str] = []
+    if session_args is not None:
+        for value in session_args:
+            token = _valid_launch_token(value, allow_empty=True)
+            if token is None:
+                return None, "the configured launch session argument list is invalid"
+            if token == "{SESSION_ID}":  # noqa: S105  # nosec B105 - substitution placeholder, not a secret
+                return None, (
+                    "the configured launch session identity is unavailable"
+                )
+            normalized_session_args.append(token)
+
+    root_text = (
+        _valid_launch_token(str(root), allow_empty=False)
+        if root is not None
+        else None
+    )
+    if root is not None and root_text is None:
+        return None, "the configured launch root is unavailable"
+    raw_cwd = row.get("cwd")
+    if raw_cwd is None or (population == "regular" and raw_cwd == ""):
+        cwd = root_text
+        cwd_token = ""  # nosec B105 - launch placeholder, not a secret
+    else:
+        cwd = _valid_launch_token(raw_cwd, allow_empty=False)
+        cwd_token = cwd or ""
+    if cwd is None:
+        return None, "the configured launch working directory is unavailable"
+    if (
+        isinstance(raw_cwd, str)
+        and raw_cwd
+        and _configured_launch_has_unresolved_placeholder(raw_cwd)
+    ):
+        return None, (
+            "the configured launch working directory contains an unresolved "
+            "placeholder"
+        )
+
+    argv: list[str] = []
+    for raw_value in raw_args:
+        if raw_value == "{SESSION_ARGS}":
+            if session_args is None:
+                return None, (
+                    "the configured launch session arguments are unavailable"
+                )
+            argv.extend(normalized_session_args)
+            continue
+        argument = _valid_launch_token(raw_value, allow_empty=True)
+        if argument is None:
+            return None, "the configured launch argument list is not runnable"
+        unresolved_probe = argument.replace("{ROOT}", "").replace("<cwd>", "")
+        if _configured_launch_has_unresolved_placeholder(unresolved_probe):
+            return None, (
+                "the configured launch argument list contains an unresolved "
+                "placeholder"
+            )
+        if "{ROOT}" in argument:
+            if root_text is None:
+                return None, "the configured argv needs a root that is unavailable"
+            argument = argument.replace("{ROOT}", root_text)
+        argument = argument.replace("<cwd>", cwd_token)
+        argv.append(argument)
+    module_args_from = launch.get("module_args_from")
+    python_module_dispatch = _token_stem(windows_file) in {
+        "python", "python3", "py",
+    }
+    if wrapped and python_module_dispatch and module_args_from is not None and (
+        type(module_args_from) is not int or module_args_from < 0
+    ):
+        return None, "the configured launch module_args_from is invalid"
+    if wrapped:
+        if root_text is None:
+            return None, "the configured wrapped launch root is unavailable"
+        normalized = _ensure_agenttalk_wrap_root_arg(
+            argv,
+            module_args_from,
+            root_text,
+        )
+        if normalized is None:
+            return None, "the configured launch root arguments are invalid"
+        argv = normalized
+
+    environment = row.get("env")
+    environment_issues = _configured_environment_issues(
+        environment,
+        forbid_control_names=(population == "ephemeral"),
+    )
+    if environment_issues:
+        return None, "the configured launch environment is invalid"
+    environment_keys = tuple(sorted(environment)) if isinstance(environment, dict) else ()
+
+    parsed_wrap, own_argv, nonce_insert_at = _configured_wrap_parse(
+        windows_file,
+        argv,
+        module_args_from,
+    )
+    if wrapped:
+        policy = launch_admission_mod.SupervisorWrapPolicy(
+            name=(
+                "ephemeral one-shot launch"
+                if population == "ephemeral"
+                else "regular supervised launch"
+            ),
+            require_loop=True,
+            require_one_shot=(population == "ephemeral"),
+            forbid_one_shot=(population == "regular"),
+            forbid_lead_loop=(population == "ephemeral"),
+            expected_agent=validated_agent,
+            expected_sender=(validated_agent if population == "ephemeral" else None),
+            expected_cli=str(cli),
+            expected_request_id=request_id,
+            expected_lane_id=lane_id,
+            require_exact_lane=(population == "ephemeral"),
+        )
+        parsed_wrap = launch_admission_mod.apply_supervisor_policy(
+            parsed_wrap,
+            policy,
+        )
+        if isinstance(parsed_wrap, launch_admission_mod.WrapRefusal):
+            return None, parsed_wrap.message
+        if nonce_insert_at is None:
+            return None, "the configured wrapped launch nonce position is unavailable"
+        wrapper_dispatch = True
+        child_argv = parsed_wrap.child_argv
+        if cli == "codex" and _codex_child_workspace_args_invalid(child_argv):
+            return None, "the configured Codex workspace arguments are invalid"
+    else:
+        # A syntactically accepted wrap invocation cannot be declared manual;
+        # it would give process attribution and execution two different modes.
+        if isinstance(parsed_wrap, launch_admission_mod.WrapInvocation):
+            return None, "the configured wrapped launch declaration is missing"
+        classified_own_argv = own_argv
+        if classified_own_argv is None and python_module_dispatch:
+            classified_own_argv = launch_admission_mod.python_agenttalk_module_argv(
+                argv,
+                program_kind=("py" if _token_stem(windows_file) == "py" else "python"),
+            )
+        if (
+            classified_own_argv is not None
+            and launch_admission_mod.agenttalk_launch_subcommand(
+                classified_own_argv
+            )
+            == "wrap"
+        ):
+            return None, "the configured wrapped launch declaration is missing"
+        wrapper_dispatch = False
+        nonce_insert_at = None
+        child_argv = ()
+
+    effective_module_args_from = (
+        _resolve_module_flag_index(argv, module_args_from)
+        if wrapped and python_module_dispatch
+        else None
+    )
+    return (
+        EffectiveLaunchCandidate(
+            population=population,
+            agent=validated_agent,
+            cli=str(cli),
+            wrapped=wrapped,
+            windows_file=windows_file,
+            argv=tuple(argv),
+            cwd=cwd,
+            module_args_from=effective_module_args_from,
+            wrapper_dispatch=wrapper_dispatch,
+            nonce_insert_at=nonce_insert_at,
+            child_argv=tuple(child_argv),
+            environment_keys=environment_keys,
+        ),
+        None,
+    )
+
+
+def _codex_child_workspace_args_invalid(child_argv: Sequence[str]) -> bool:
+    """Reject only malformed values for the supported Codex workspace option."""
+
+    for index, argument in enumerate(child_argv[1:]):
+        if argument == "--add-dir":
+            value_index = index + 2
+            if (
+                value_index >= len(child_argv)
+                or not child_argv[value_index]
+                or child_argv[value_index].startswith("-")
+            ):
+                return True
+        elif argument.startswith("--add-dir="):
+            value = argument.partition("=")[2]
+            if not value:
+                return True
+    return False
+
+
+def _configured_wrap_parse(
+    executable: object,
+    args: Sequence[object],
+    module_args_from: object = None,
+) -> tuple[
+    launch_admission_mod.WrapParseResult,
+    tuple[str, ...] | None,
+    int | None,
+]:
+    """Return the one shared wrapper parse plus its nonce insertion point."""
+    if (
+        not isinstance(executable, str)
+        or not all(isinstance(value, str) for value in args)
+    ):
+        return (
+            launch_admission_mod.WrapRefusal(
+                "launch_tokens_invalid",
+                "configured launch executable or argument token is invalid",
+            ),
+            None,
+            None,
+        )
+    tokens = list(args)
+    executable_stem = _token_stem(executable)
+    if executable_stem in {"python", "python3", "py"}:
+        flag_index = _resolve_module_flag_index(tokens, module_args_from)
+        if flag_index < 0:
+            return (
+                launch_admission_mod.WrapRefusal(
+                    "module_prefix_invalid",
+                    "configured Python launch does not resolve to -m agenttalk",
+                ),
+                None,
+                None,
+            )
+        own_index = flag_index + 2
+    elif executable.replace("\\", "/").rsplit("/", 1)[-1].casefold() in {
+        "agenttalk",
+        "agenttalk.exe",
+        "agenttalk.cmd",
+        "agenttalk.bat",
+    }:
+        own_index = 0
+    else:
+        return (
+            launch_admission_mod.WrapRefusal(
+                "not_agenttalk_launch",
+                "configured executable does not dispatch agenttalk",
+            ),
+            None,
+            None,
+        )
+    own_argv = tuple(tokens[own_index:])
+    return (
+        launch_admission_mod.parse_agenttalk_wrap_command(own_argv),
+        own_argv,
+        own_index,
+    )
+
+
+def _configured_ephemeral_wrap_binding(
+    executable: object,
+    args: Sequence[object],
+    module_args_from: object,
+    *,
+    agent: str,
+    request_id: str,
+    cli: str,
+    lane_id: str | None,
+) -> bool:
+    """Validate one closed, post-substitution ephemeral wrapper command."""
+    result, _own_argv, _nonce_insert_at = _configured_wrap_parse(
+        executable,
+        args,
+        module_args_from,
+    )
+    admitted = launch_admission_mod.apply_supervisor_policy(
+        result,
+        launch_admission_mod.SupervisorWrapPolicy(
+            name="ephemeral one-shot launch",
+            require_loop=True,
+            require_one_shot=True,
+            forbid_lead_loop=True,
+            expected_agent=agent,
+            expected_sender=agent,
+            expected_cli=cli,
+            expected_request_id=request_id,
+            expected_lane_id=lane_id,
+            require_exact_lane=True,
+        ),
+    )
+    return isinstance(admitted, launch_admission_mod.WrapInvocation)
+
+
+def _ephemeral_recovery_environment(
+    root: str | Path,
+    spec: dict,
+    agent: str,
+    *,
+    launch_agenttalk_python: str | None = None,
+    launch_src_on_pythonpath: bool | None = None,
+) -> dict:
+    """Return launch-environment guidance for operator review."""
+    root_path = Path(root).resolve()
+    if launch_agenttalk_python is None:
+        try:
+            agenttalk_python = _baked_python_pin(
+                (root_path / ".agenttalk" / "bin" / "agenttalk.cmd").read_bytes()
+            )
+        except (ArtifactValidationError, OSError) as exc:
+            raise eph.EphemeralError(
+                "the prepared agenttalk Python pin is unavailable"
+            ) from exc
+    elif (
+        not isinstance(launch_agenttalk_python, str)
+        or not launch_agenttalk_python
+        or any(ord(ch) < 32 or 0xD800 <= ord(ch) <= 0xDFFF
+               for ch in launch_agenttalk_python)
+    ):
+        raise eph.EphemeralError(
+            "the running supervisor's agenttalk Python pin is invalid"
+        )
+    else:
+        agenttalk_python = launch_agenttalk_python
+    src_path = root_path / "src"
+    src_on_pythonpath = (
+        (src_path / "agenttalk" / "__init__.py").is_file()
+        if launch_src_on_pythonpath is None
+        else launch_src_on_pythonpath
+    )
+    codex_home = None
+    if spec.get("cli") == "codex" and bool(spec.get("codex_home_isolation")):
+        codex_home = str(root_path / ".agenttalk" / "codex-home" / agent)
+    return {
+        "AGENTTALK_ROOT": str(root_path),
+        "AGENTTALK_PY": agenttalk_python,
+        "PYTHONPATH_prepend": str(src_path) if src_on_pythonpath else None,
+        "CODEX_HOME": codex_home,
+        "AGENTTALK_NO_CHILD_WINDOW": (
+            "1"
+            if str(spec.get("window_style", "Hidden")).casefold() == "hidden"
+            else None
+        ),
+    }
+
+
+def _normalize_ephemeral_launch_root(
+    spec: dict,
+    root: str | Path,
+) -> None:
+    """Bind the exact effective project root into a prepared launch spec."""
+    launch = spec.get("launch")
+    if not isinstance(launch, dict):
+        raise eph.EphemeralError("the prepared launch mapping is unavailable")
+    args = launch.get("windows_args")
+    if not isinstance(args, list):
+        raise eph.EphemeralError("the prepared launch arguments are unavailable")
+    normalized = _ensure_agenttalk_wrap_root_arg(
+        args,
+        launch.get("module_args_from"),
+        str(Path(root).resolve()),
+    )
+    if normalized is None:
+        raise eph.EphemeralError("the prepared launch root arguments are invalid")
+    launch["windows_args"] = normalized
+
+
+def _effective_windows_env_value(
+    configured: dict,
+    name: str,
+) -> str | None:
+    folded = name.casefold()
+    for key, value in configured.items():
+        if isinstance(key, str) and key.casefold() == folded:
+            return value if isinstance(value, str) else None
+    for key, value in os.environ.items():
+        if key.casefold() == folded:
+            return value
+    return None
+
+
+def _resolve_configured_executable(
+    executable: str,
+    *,
+    relative_base: str,
+    configured_env: dict,
+) -> Path | None:
+    """Resolve one Windows launch token against cwd/PATH/PATHEXT."""
+    candidate = Path(executable)
+    if not candidate.is_absolute():
+        # This projection models Windows argv even when its deterministic tests
+        # run on POSIX, where a backslash is otherwise treated as a filename.
+        windows_candidate = PureWindowsPath(executable)
+        if windows_candidate.is_absolute():
+            return None
+        candidate = Path(*windows_candidate.parts)
+    if candidate.is_absolute():
+        return candidate if candidate.is_file() else None
+    has_path = "/" in executable or "\\" in executable
+    if has_path:
+        relative = Path(relative_base) / candidate
+        return relative if relative.is_file() else None
+    path_value = _effective_windows_env_value(configured_env, "PATH")
+    found = shutil.which(executable, path=path_value)
+    if found and Path(found).is_file():
+        return Path(found)
+    search_dirs = [Path(relative_base)]
+    if path_value:
+        search_dirs.extend(
+            Path(part.strip('"'))
+            for part in path_value.split(os.pathsep)
+            if part.strip('"')
+        )
+    suffixes = [""]
+    if not candidate.suffix:
+        pathext = (
+            _effective_windows_env_value(configured_env, "PATHEXT")
+            or ".COM;.EXE;.BAT;.CMD"
+        )
+        suffixes.extend(
+            ext if ext.startswith(".") else f".{ext}"
+            for ext in pathext.split(";")
+            if ext
+        )
+    for directory in search_dirs:
+        if not directory.is_absolute():
+            directory = Path(relative_base) / directory
+        for suffix in suffixes:
+            resolved = directory / f"{executable}{suffix}"
+            if resolved.is_file():
+                return resolved
+    return None
+
+
+def _pin_ephemeral_launch_executables(
+    spec: dict,
+    root: str | Path,
+) -> None:
+    """Resolve and pin both process layers before hashing or launching."""
+    launch = spec.get("launch")
+    cwd = spec.get("cwd")
+    configured_env = spec.get("env")
+    if (
+        not isinstance(launch, dict)
+        or not isinstance(cwd, str)
+        or not Path(cwd).is_dir()
+        or not isinstance(configured_env, dict)
+    ):
+        raise eph.EphemeralError(
+            "the prepared launch working directory is unavailable"
+        )
+    executable = launch.get("windows_file")
+    args = launch.get("windows_args")
+    if not isinstance(executable, str) or not isinstance(args, list):
+        raise eph.EphemeralError("the prepared launch command is unavailable")
+    outer = _resolve_configured_executable(
+        executable,
+        relative_base=cwd,
+        configured_env=configured_env,
+    )
+    if outer is None:
+        raise eph.EphemeralError(
+            "the prepared launch executable cannot be resolved"
+        )
+    try:
+        delimiter = args.index("--")
+    except ValueError as exc:
+        raise eph.EphemeralError(
+            "the prepared wrapped launch has no child executable"
+        ) from exc
+    child = args[delimiter + 1] if delimiter + 1 < len(args) else None
+    cli = str(spec.get("cli", ""))
+    if cli == "codex":
+        child = _effective_windows_env_value(
+            configured_env,
+            "AGENTTALK_CODEX",
+        ) or child
+    if not isinstance(child, str) or not child:
+        raise eph.EphemeralError(
+            "the prepared wrapped child executable is unavailable"
+        )
+    child_path = _resolve_configured_executable(
+        child,
+        relative_base=cwd,
+        configured_env=configured_env,
+    )
+    if child_path is None:
+        raise eph.EphemeralError(
+            "the prepared wrapped child executable cannot be resolved"
+        )
+    from agenttalk.wrapper import run as wrapper_run
+
+    if wrapper_run._is_windows_shim(child_path):  # noqa: SLF001
+        native = (
+            wrapper_run._resolve_known_npm_codex_shim(child_path)  # noqa: SLF001
+            if cli == "codex"
+            else None
+        )
+        if native is None:
+            raise eph.EphemeralError(
+                "the prepared wrapped child resolves to an unsupported shim"
+            )
+        child_path = native
+    try:
+        launch["windows_file"] = str(outer.resolve(strict=True))
+        pinned_child = str(child_path.resolve(strict=True))
+        args[delimiter + 1] = pinned_child
+        for key in configured_env:
+            if isinstance(key, str) and key.casefold() == "agenttalk_codex":
+                configured_env[key] = pinned_child
+    except OSError as exc:
+        raise eph.EphemeralError(
+            "the prepared launch executable identity is unavailable"
+        ) from exc
+
+
+def _ephemeral_recovery_resources_problem(
+    *,
+    executable: str,
+    args: list[str],
+    cwd: str,
+    configured_env: dict,
+    recovery_environment: dict,
+    cli: str,
+) -> str | None:
+    """Return why the rendered recovery argv or cwd cannot run now."""
+    cwd_path = Path(cwd)
+    if not cwd_path.is_dir():
+        return "the configured launch working directory does not exist"
+    if _resolve_configured_executable(
+        executable,
+        relative_base=cwd,
+        configured_env=configured_env,
+    ) is None:
+        return "the configured launch executable cannot be resolved"
+    try:
+        delimiter = args.index("--")
+    except ValueError:
+        return "the configured wrapped launch has no child executable"
+    child = args[delimiter + 1] if delimiter + 1 < len(args) else None
+    if cli == "codex":
+        child = _effective_windows_env_value(
+            configured_env,
+            "AGENTTALK_CODEX",
+        ) or child
+    child_path = (
+        _resolve_configured_executable(
+            child,
+            relative_base=cwd,
+            configured_env=configured_env,
+        )
+        if isinstance(child, str)
+        else None
+    )
+    if child_path is None:
+        return "the configured wrapped child executable cannot be resolved"
+    from agenttalk.wrapper import run as wrapper_run
+
+    if wrapper_run._is_windows_shim(child_path):  # noqa: SLF001
+        native = (
+            wrapper_run._resolve_known_npm_codex_shim(child_path)  # noqa: SLF001
+            if cli == "codex"
+            else None
+        )
+        if native is None:
+            return "the configured wrapped child resolves to an unsupported shim"
+    agenttalk_python = recovery_environment.get("AGENTTALK_PY")
+    if (
+        not isinstance(agenttalk_python, str)
+        or not Path(agenttalk_python).is_file()
+    ):
+        return "the prepared agenttalk Python executable is unavailable"
+    codex_home = recovery_environment.get("CODEX_HOME")
+    if codex_home is not None:
+        home = Path(codex_home)
+        if not (
+            home.is_dir()
+            and (home / "auth.json").is_file()
+            and (home / "config.toml").is_file()
+            and (home / "skills" / "agenttalk-listen").exists()
+        ):
+            return "the prepared isolated CODEX_HOME is unavailable"
+    return None
+
+
+def configured_detached_launch(
+    supervisor_config: dict | None,
+    agent: str,
+    *,
+    root: str | Path | None,
+    store_config: dict | None = None,
+    request_id: str | None = None,
+    request_entry: dict | None = None,
+    request_marker: dict | None = None,
+    request_delivery: dict | None = None,
+    lane_workspaces: dict[str, str] | None = None,
+    now_epoch: float | None = None,
+) -> tuple[dict | None, str]:
+    """Return one bounded, normalized configured launch argv for display.
+
+    This is recovery information, never launch authority.  Regular agents are
+    reconstructed from static configuration; active ephemeral agents also
+    require their exact durable request entry and marker, current launch
+    admission, and the prepared effective-launch binding.  The returned
+    environment metadata is guidance for operator review; it does not prove the
+    environment values that a detached child will actually receive.
+    """
+    max_token = 4096
+    max_command_line = 32767
+
+    def clean(value: object) -> str | None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > max_token
+            or any(
+                ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
+                for char in value
+            )
+        ):
+            return None
+        return value
+
+    root_text = clean(str(root)) if root is not None else None
+    if root is not None and root_text is None:
+        return None, "the configured launch root is unavailable"
+    recovery_environment: dict | None = None
+    if not isinstance(supervisor_config, dict):
+        return None, "supervisor.json was unavailable"
+    if request_id is None:
+        agents = supervisor_config.get("agents")
+        row = agents.get(agent) if isinstance(agents, dict) else None
+        if not isinstance(row, dict):
+            return None, "the agent has no supervisor.json launch entry"
+    else:
+        if not isinstance(request_entry, dict):
+            return None, "the active ephemeral request entry was unavailable"
+        if not isinstance(request_marker, dict):
+            return None, "the active ephemeral request marker was unavailable"
+        current_epoch = time.time()
+        if now_epoch is not None:
+            if (
+                isinstance(now_epoch, bool)
+                or not isinstance(now_epoch, (int, float))
+                or not math.isfinite(float(now_epoch))
+            ):
+                return None, "the active ephemeral recovery time is unavailable"
+            current_epoch = float(now_epoch)
+        phase = request_entry.get("phase")
+        timeout_seconds = request_entry.get("timeout_seconds")
+        deadline_epoch = request_entry.get("deadline_epoch")
+        lifecycle_epoch = request_entry.get(
+            "prepared_epoch"
+            if phase == eph.STATE_REQUESTED
+            else "launched_epoch"
+        )
+        if (
+            phase not in {eph.STATE_REQUESTED, eph.STATE_LAUNCHED}
+            or "held_terminal" in request_entry
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or timeout_seconds <= 0
+            or isinstance(lifecycle_epoch, bool)
+            or not isinstance(lifecycle_epoch, (int, float))
+            or not math.isfinite(float(lifecycle_epoch))
+            or isinstance(deadline_epoch, bool)
+            or not isinstance(deadline_epoch, (int, float))
+            or not math.isfinite(float(deadline_epoch))
+            or float(deadline_epoch)
+            != float(lifecycle_epoch) + timeout_seconds
+            or float(deadline_epoch) <= current_epoch
+        ):
+            return None, (
+                "the active ephemeral request is no longer eligible for "
+                "detached recovery"
+            )
+        profile_name = request_entry.get("profile")
+        marker_lane = request_marker.get("lane_id")
+        marker_workspace = request_marker.get("workspace_path")
+        marker_scope = request_marker.get("scope")
+        scope_lane = (
+            marker_scope.get("lane_id")
+            if isinstance(marker_scope, dict)
+            else None
+        )
+        if (
+            not eph.is_safe_id(request_id)
+            or request_entry.get("request_id") != request_id
+            or request_marker.get("request_id") != request_id
+            or request_entry.get("agent") != agent
+            or request_marker.get("agent") != agent
+            or request_entry.get("requested_by")
+            != request_marker.get("requested_by")
+            or request_entry.get("review_request_id")
+            != request_marker.get("review_request_msg_id")
+            or not isinstance(profile_name, str)
+            or request_marker.get("profile") != profile_name
+            or request_marker.get("state")
+            not in {eph.STATE_REQUESTED, eph.STATE_LAUNCHED}
+            or bool(eph.validate_marker(request_marker))
+        ):
+            return None, "the active ephemeral request launch binding is invalid"
+        if marker_lane is None:
+            if marker_workspace is not None or scope_lane is not None:
+                return None, "the active ephemeral request launch binding is invalid"
+        else:
+            if (
+                scope_lane != marker_lane
+                or clean(marker_workspace) is None
+                or not marker_workspace.strip()
+                or not Path(marker_workspace).is_absolute()
+            ):
+                return None, "the active ephemeral request launch binding is invalid"
+            if lane_workspaces is None:
+                return None, "the active ephemeral lane registry was unavailable"
+            if lane_workspaces.get(marker_lane) != marker_workspace:
+                return None, "the active ephemeral lane workspace no longer matches"
+        if not isinstance(store_config, dict):
+            return None, "the active ephemeral request launch admission is unavailable"
+        roster = store_config.get("agents")
+        if not isinstance(roster, list) or agent not in roster:
+            return None, "the active ephemeral temporary identity is no longer active"
+        admission_errors, profile = eph.validate_launch_request(
+            request_marker,
+            store_config,
+            supervisor_config,
+        )
+        if admission_errors or profile is None:
+            return None, "the active ephemeral request failed current launch admission"
+        roles = store_config.get("roles")
+        current_role = roles.get(agent) if isinstance(roles, dict) else None
+        groups = store_config.get("groups")
+        current_groups = {
+            group
+            for group, members in (groups.items() if isinstance(groups, dict) else ())
+            if isinstance(members, list) and agent in members
+        }
+        if (
+            current_role != eph.effective_role(request_marker, profile)
+            or current_groups != set(eph.effective_groups(request_marker, profile))
+        ):
+            return None, (
+                "the active ephemeral temporary identity no longer matches "
+                "its prepared role and groups"
+            )
+        profile_cli = (
+            profile.get("cli")
+            if isinstance(profile.get("cli"), str) and profile.get("cli")
+            else "codex"
+        )
+        if (
+            request_entry.get("cli") != profile_cli
+            or not isinstance(request_entry.get("launch"), dict)
+            or request_entry.get("launch") != profile.get("launch")
+        ):
+            return None, "the active ephemeral request profile no longer matches"
+        if root_text is None:
+            return None, "the active ephemeral launch root is unavailable"
+        row = eph.launch_spec(
+            request_marker,
+            profile,
+            agent,
+            root=root_text,
+        )
+        window_style, window_warning = resolve_window_style(
+            supervisor_config,
+            profile,
+        )
+        row["window_style"] = window_style
+        row["window_style_warning"] = window_warning
+        row["review_request_msg_id"] = request_marker.get(
+            "review_request_msg_id"
+        )
+        if row.get("timeout_seconds") != timeout_seconds:
+            return None, (
+                "the active ephemeral request timeout no longer matches "
+                "its prepared lifecycle"
+            )
+        try:
+            _normalize_ephemeral_launch_root(row, root_text)
+            _pin_ephemeral_launch_executables(row, root_text)
+            recovery_environment = _ephemeral_recovery_environment(
+                root_text,
+                row,
+                agent,
+            )
+        except eph.EphemeralError as recovery_error:
+            return None, str(recovery_error)
+        row["recovery_environment"] = recovery_environment
+        launch_candidate, launch_problem = _effective_launch_candidate(
+            row,
+            population="ephemeral",
+            agent=agent,
+            root=root_text,
+            request_id=request_id,
+            lane_id=marker_lane,
+        )
+        if launch_candidate is None:
+            return None, launch_problem or (
+                "the active ephemeral request failed current launch admission"
+            )
+        row["launch_admission"] = launch_candidate.artifact()
+        prepared_binding = eph.validate_effective_launch_binding(
+            request_entry.get("effective_launch_binding")
+        )
+        if prepared_binding is None:
+            return None, "the prepared launch binding is unavailable"
+        delivery_digest = (
+            request_delivery.get("review_request_sha256")
+            if isinstance(request_delivery, dict)
+            else None
+        )
+        if (
+            not isinstance(request_delivery, dict)
+            or frozenset(request_delivery) != {
+                "status",
+                "message_id",
+                "review_request_sha256",
+            }
+            or request_delivery.get("status") != "deliverable"
+            or request_delivery.get("message_id")
+            != request_entry.get("review_request_id")
+            or not isinstance(delivery_digest, str)
+            or delivery_digest
+            != prepared_binding.get("review_request_sha256")
+        ):
+            return None, (
+                "the prepared one-shot review request is not currently "
+                "deliverable"
+            )
+        try:
+            current_binding = eph.make_effective_launch_binding(
+                request_marker,
+                row,
+                review_request_sha256=delivery_digest,
+            )
+        except eph.EphemeralError:
+            return None, "the current effective launch evidence is unavailable"
+        if current_binding != prepared_binding:
+            return None, (
+                "the prepared effective launch binding no longer matches "
+                "the current request and reconstructed launch-effective projection"
+            )
+        row["wrapped"] = True
+    if request_id is None:
+        launch_candidate, launch_problem = _effective_launch_candidate(
+            row,
+            population="regular",
+            agent=agent,
+            root=root_text,
+        )
+        if launch_candidate is None:
+            return None, launch_problem or "the configured launch is unavailable"
+
+    executable = launch_candidate.windows_file
+    args = list(launch_candidate.argv)
+    cwd = launch_candidate.cwd
+    config_env = row.get("env")
+    env_keys = list(launch_candidate.environment_keys)
+    if request_id is not None:
+        if recovery_environment is None:
+            return None, "the configured launch environment is invalid"
+        resource_problem = _ephemeral_recovery_resources_problem(
+            executable=executable,
+            args=args,
+            cwd=cwd,
+            configured_env=(config_env if isinstance(config_env, dict) else {}),
+            recovery_environment=recovery_environment,
+            cli=launch_candidate.cli,
+        )
+        if resource_problem is not None:
+            return None, resource_problem
+        environment = {
+            **recovery_environment,
+            "supervisor_json_env_keys": env_keys,
+        }
+    else:
+        agenttalk_python = None
+        if root_text is not None:
+            try:
+                agenttalk_python = _baked_python_pin(
+                    (Path(root_text) / ".agenttalk" / "bin" / "agenttalk.cmd").read_bytes()
+                )
+            except (ArtifactValidationError, OSError):
+                agenttalk_python = None
+        if agenttalk_python is None and _token_stem(executable) in {
+            "python",
+            "python3",
+            "py",
+        }:
+            agenttalk_python = executable
+        environment = {
+            "AGENTTALK_ROOT": root_text,
+            "AGENTTALK_PY": agenttalk_python,
+            "supervisor_json_env_keys": env_keys,
+        }
+        if root_text is not None and (Path(root_text) / "src" / "agenttalk").is_dir():
+            environment["PYTHONPATH_prepend"] = str(Path(root_text) / "src")
+    rendered = subprocess.list2cmdline([executable, *args])
+    rendered_utf16_units = len(rendered.encode("utf-16-le")) // 2 + 1
+    if rendered_utf16_units > max_command_line:
+        return None, "the configured launch exceeds the runnable command-line bound"
+    return {
+        "source": "supervisor.json",
+        "mode": "detached",
+        "argv": [executable, *args],
+        "cwd": cwd,
+        "environment": environment,
+        "environment_note": (
+            (
+                "Re-prepare after edits. Recovery refuses when the mapping or "
+                "effective binding no longer matches. Executable paths, not bytes, "
+                "are bound. The emitted working directory is always absolute: the "
+                "profile or root value without a lane, the bound workspace with one. "
+                "Child environment is unverified."
+            )
+            if request_id is not None
+            else (
+                "No prepared binding exists to compare. Recreate values; recover null "
+                "AGENTTALK_PY from the artifact; supervisor may add CODEX_HOME/log "
+                "paths. Relative cwd is emitted unchanged: use the supervisor's base "
+                "or the agent may start elsewhere. Absolute has no such base hazard; "
+                "existence is unchecked."
+            )
+        ),
+    }, ""
+
+def active_ephemeral_launch_markers(
+    store: Store,
+    state: dict,
+    *,
+    limit: int = 1024,
+) -> dict[str, dict]:
+    """Read bounded active request markers for the Attention projection.
+
+    Missing, unreadable, or malformed marker files are omitted deliberately:
+    the HOLD remains visible and its configured launch becomes unavailable.
+    """
+    root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    active = root.get("active") if isinstance(root, dict) else None
+    if not isinstance(active, dict):
+        return {}
+    markers: dict[str, dict] = {}
+    request_ids = sorted(
+        request_id for request_id in active if eph.is_safe_id(request_id)
+    )[:limit]
+    for request_id in request_ids:
+        try:
+            marker = store.read_launch_request(request_id)
+        except (OSError, TypeError, ValueError):
+            marker = None
+        if not isinstance(marker, dict):
+            active_path = store.launch_requests_dir / f"{request_id}.json"
+            try:
+                active_path.lstat()
+            except FileNotFoundError:
+                live_marker_absent = True
+            except OSError:
+                live_marker_absent = False
+            else:
+                live_marker_absent = False
+            if live_marker_absent:
+                try:
+                    pending = attended_ephemeral_archive_pending(
+                        state,
+                        request_id,
+                    )
+                except (TypeError, ValueError):
+                    pending = None
+                payload = (
+                    pending.get("archive_payload")
+                    if isinstance(pending, dict)
+                    else None
+                )
+                original = (
+                    payload.get("original")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                marker = original if isinstance(original, dict) else None
+        if isinstance(marker, dict):
+            markers[request_id] = copy.deepcopy(marker)
+    return markers
+
+
+def active_ephemeral_one_shot_deliveries(
+    store: Store,
+    state: dict,
+    launch_requests: dict[str, dict],
+    *,
+    limit: int = 1024,
+) -> dict[str, dict]:
+    """Classify exact one-shot request messages at the runtime receive floor."""
+    root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    active = root.get("active") if isinstance(root, dict) else None
+    if not isinstance(active, dict):
+        return {}
+    deliveries: dict[str, dict] = {}
+    request_ids = sorted(
+        request_id for request_id in active if eph.is_safe_id(request_id)
+    )[:limit]
+    for request_id in request_ids:
+        deliveries[request_id] = {"status": "unavailable"}
+        entry = active.get(request_id)
+        marker = launch_requests.get(request_id)
+        if not isinstance(entry, dict) or not isinstance(marker, dict):
+            continue
+        agent = entry.get("agent")
+        message_id = entry.get("review_request_id")
+        requested_by = entry.get("requested_by")
+        try:
+            agent = validate_agent_name(agent)
+            requested_by = validate_agent_name(requested_by)
+        except (TypeError, ValueError):
+            continue
+        prepared_binding = eph.validate_effective_launch_binding(
+            entry.get("effective_launch_binding")
+        )
+        if (
+            not eph.is_safe_id(message_id)
+            or marker.get("request_id") != request_id
+            or marker.get("agent") != agent
+            or marker.get("requested_by") != requested_by
+            or marker.get("review_request_msg_id") != message_id
+            or prepared_binding is None
+        ):
+            continue
+        try:
+            from agenttalk.wrapper import recv_api as _recv_api
+
+            envelope = _recv_api.poll(
+                store,
+                agent,
+                scoped_request_id=request_id,
+            )
+            record = envelope.get("record")
+            scoped = envelope.get("scoped")
+            review_request_sha256 = eph.effective_review_request_digest(record)
+        except Exception:  # noqa: BLE001 - unavailable is a closed projection fact
+            record = None
+            scoped = None
+            review_request_sha256 = None
+        if (
+            not isinstance(record, dict)
+            or not isinstance(scoped, dict)
+            or scoped.get("closed") is True
+            or scoped.get("superseded") is True
+            or record.get("id") != message_id
+            or record.get("kind") != "review-request"
+            or record.get("from") != requested_by
+            or record.get("to") != agent
+            or record.get("request_id") != request_id
+            or review_request_sha256
+            != prepared_binding.get("review_request_sha256")
+        ):
+            continue
+        deliveries[request_id] = {
+            "status": "deliverable",
+            "message_id": message_id,
+            "review_request_sha256": review_request_sha256,
+        }
+    return deliveries
+
+
+def active_ephemeral_lane_workspaces(store: Store) -> dict[str, str] | None:
+    """Return exact active lane-to-workspace bindings, or unavailable."""
+    try:
+        data = lane_mod.load_lanes(store)
+    except (OSError, TypeError, ValueError, lane_mod.LaneError):
+        return None
+    lanes = data.get("lanes") if isinstance(data, dict) else None
+    if not isinstance(lanes, dict):
+        return None
+    workspaces: dict[str, str] = {}
+    for raw_lane_id, row in lanes.items():
+        if not isinstance(row, dict) or row.get("status") != lane_mod.STATUS_ACTIVE:
+            continue
+        try:
+            lane_id = lane_mod.validate_lane_id(raw_lane_id)
+        except (TypeError, ValueError, lane_mod.LaneError):
+            continue
+        raw_path = row.get("worktree_path")
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or len(raw_path) > 4096
+            or any(
+                ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF
+                for char in raw_path
+            )
+        ):
+            continue
+        workspace = Path(raw_path)
+        if workspace.is_absolute():
+            workspaces[lane_id] = str(workspace)
+    return workspaces
 
 
 def _agenttalk_argv(command_line: object, module_args_from: object = None) -> list[str] | None:
@@ -4138,7 +5915,9 @@ def _parse_supervisor_launch_nonce(
         if arg == _SUPERVISOR_LAUNCH_NONCE_ARG or arg.startswith(
                 _SUPERVISOR_LAUNCH_NONCE_ARG + "="):
             value, i_next = _option_value(argv, i)
-            if value is None or not _valid_launch_nonce(value):
+            if value is None or value == "":
+                return None, "launcher_nonce_value_missing"
+            if not _valid_launch_nonce(value):
                 return None, "launcher_nonce_malformed"
             if nonce is not None:
                 return None, "launcher_nonce_duplicate"
@@ -4182,25 +5961,196 @@ def parse_agenttalk_wait_invocation(command_line: object, root_key: str | None,
     return _agent_option(args, "--for") == agent
 
 
+def _parsed_observed_wrap_invocation(
+    command_line: object,
+    module_args_from: object = None,
+) -> launch_admission_mod.WrapInvocation | None:
+    """Return only a complete observed wrapper; never relax admission rules."""
+
+    argv = _agenttalk_argv(command_line, module_args_from)
+    if argv is None:
+        return None
+    parsed = launch_admission_mod.parse_observed_agenttalk_wrap_command(argv)
+    if not isinstance(parsed, launch_admission_mod.WrapInvocation):
+        return None
+    parsed = launch_admission_mod.validate_standalone_wrap(parsed)
+    if not isinstance(parsed, launch_admission_mod.WrapInvocation):
+        return None
+    if _has_option_token(list(parsed.child_argv), _SUPERVISOR_LAUNCH_NONCE_ARG):
+        return None
+    return parsed
+
+
+def recognize_agenttalk_wrap_invocation(
+    command_line: object,
+    root_key: str | None,
+    agent: str,
+    cli: str | None = None,
+    module_args_from: object = None,
+) -> WrapRecognition:
+    """Recognize one observed wrapper without converting missing evidence to no.
+
+    Admission and recognition share argparse's exact option resolution, but
+    only admission treats an incomplete parse as a permanent refusal.  A live
+    observation can be missing or truncated, so incomplete evidence is UNKNOWN
+    and must be retried.  Only a complete positive identity proof is MATCHED.
+
+    WMI supplies no truncation provenance.  Once a non-null observation is
+    syntactically complete, this layer cannot prove whether later source text
+    was omitted after capture; it classifies only the evidence it received.
+    """
+
+    tokens, split_reason = _split_observed_command_line(command_line)
+    if tokens is None:
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            split_reason or "command_line_unreadable",
+        )
+
+    first = _token_stem(tokens[0])
+    if first in _SHELL_HOSTS:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "shell_host",
+        )
+    if first in {"python", "python3", "py"}:
+        rel_index = _resolve_module_flag_index(tokens[1:], module_args_from)
+        if rel_index < 0:
+            incomplete_selector = tokens[-1] == "-m" or (
+                len(tokens) >= 2
+                and tokens[-2] == "-m"
+                and tokens[-1] == "agenttalk"
+            )
+            return WrapRecognition(
+                (
+                    WrapRecognitionStatus.UNKNOWN
+                    if incomplete_selector
+                    else WrapRecognitionStatus.NOT_MATCHED
+                ),
+                (
+                    "command_line_incomplete"
+                    if incomplete_selector
+                    else "not_agenttalk_invocation"
+                ),
+            )
+        argv = tokens[1 + rel_index + 2:]
+    elif first == "agenttalk":
+        argv = tokens[1:]
+    else:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "not_agenttalk_invocation",
+        )
+
+    subcommand = launch_admission_mod.agenttalk_launch_subcommand(argv)
+    if subcommand in _AGENTTALK_SUBCOMMANDS and subcommand != "wrap":
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "subcommand_mismatch",
+        )
+    parsed = launch_admission_mod.parse_observed_agenttalk_wrap_command(argv)
+    if isinstance(parsed, launch_admission_mod.WrapRefusal):
+        return WrapRecognition(WrapRecognitionStatus.UNKNOWN, parsed.code)
+    if any(
+        isinstance(occurrence.value, str) and occurrence.value == ""
+        for occurrence in parsed.option_occurrences
+    ):
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "empty_wrapper_option_value",
+        )
+    if not parsed.child_argv:
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "child_command_missing",
+        )
+    if parsed.child_argv[0] == "":
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "child_executable_empty",
+        )
+    if not isinstance(parsed.root, str) or not parsed.root:
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "root_identity_missing",
+            parsed,
+        )
+    if not _same_root(parsed.root, root_key):
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "root_mismatch",
+            parsed,
+        )
+    if not isinstance(parsed.agent, str) or not parsed.agent:
+        return WrapRecognition(
+            WrapRecognitionStatus.UNKNOWN,
+            "agent_identity_missing",
+            parsed,
+        )
+    if parsed.agent != agent:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "agent_mismatch",
+            parsed,
+        )
+    if cli is not None and parsed.cli != cli:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "cli_mismatch",
+            parsed,
+        )
+    if not parsed.loop:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "mode_mismatch",
+            parsed,
+        )
+    complete = launch_admission_mod.validate_standalone_wrap(parsed)
+    if isinstance(complete, launch_admission_mod.WrapRefusal):
+        return WrapRecognition(WrapRecognitionStatus.UNKNOWN, complete.code)
+    if _has_option_token(list(complete.child_argv), _SUPERVISOR_LAUNCH_NONCE_ARG):
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "child_dispatch_mismatch",
+            complete,
+        )
+    return WrapRecognition(WrapRecognitionStatus.MATCHED, "matched", complete)
+
+
 def parse_agenttalk_wrap_invocation(command_line: object, root_key: str | None,
-                                    agent: str, module_args_from: object = None) -> bool:
-    inv = _agenttalk_invocation(command_line, root_key, module_args_from)
-    if not inv or inv.get("subcommand") != "wrap" or not inv.get("root_match"):
-        return False
-    args = inv.get("args") or []
-    if _has_option_token(args, _SUPERVISOR_LAUNCH_NONCE_ARG):
-        return False
-    agent_value = _agent_option(args, "--for")
-    if agent_value != agent:
-        return False
-    before_tail = args[:args.index("--")] if "--" in args else args
-    return "--loop" in before_tail
+                                    agent: str, module_args_from: object = None,
+                                    *, cli: str | None = None) -> bool:
+    """Compatibility predicate for non-authoritative discovery callers."""
+
+    return recognize_agenttalk_wrap_invocation(
+        command_line,
+        root_key,
+        agent,
+        cli,
+        module_args_from,
+    ).status is WrapRecognitionStatus.MATCHED
 
 
 def _row_branch_reason(row: dict, root_key: str | None, agent: str,
-                        module_args_from: object = None) -> str | None:
+                       module_args_from: object = None,
+                       *, cli: str | None = None) -> str | None:
     if _is_shell_host(row):
         return "shell_boundary"
+    parsed_wrap = _parsed_observed_wrap_invocation(
+        row.get("command_line"),
+        module_args_from,
+    )
+    if parsed_wrap is not None:
+        root_match = _same_root(parsed_wrap.root, root_key)
+        if parsed_wrap.root and not root_match:
+            return "foreign_root_branch"
+        if not root_match:
+            return None
+        if parsed_wrap.agent != agent:
+            return "same_root_other_agent_branch"
+        if cli is not None and parsed_wrap.cli != cli:
+            return "unknown_root_cli"
+        return None if parsed_wrap.loop else "unknown_root_cli"
     inv = _agenttalk_invocation(row.get("command_line"), root_key, module_args_from)
     if not inv:
         return None
@@ -4210,14 +6160,11 @@ def _row_branch_reason(row: dict, root_key: str | None, agent: str,
         return None
     sub = inv.get("subcommand")
     args = inv.get("args") or []
-    if sub in {"wait", "wrap"}:
+    if sub == "wait":
         row_agent = _agent_option(args, "--for")
         if row_agent is not None and row_agent != agent:
             return "same_root_other_agent_branch"
-        if sub == "wait" and row_agent == agent:
-            return None
-        if sub == "wrap" and row_agent == agent and "--loop" in (
-                args[:args.index("--")] if "--" in args else args):
+        if row_agent == agent:
             return None
     return "unknown_root_cli"
 
@@ -4261,17 +6208,71 @@ def _is_confirmed_launcher(
     st: dict,
     root_key: str | None,
     agent: str,
+    cli: str | None,
     diagnostics: dict[str, int],
     module_args_from: object = None,
-) -> tuple[bool, dict | None]:
+) -> tuple[WrapRecognition, dict | None]:
     pid = st.get("launcher_pid")
     start = st.get("launcher_start")
     if not _pid_alive_guarded(idx, pid, start):
-        return False, None
-    branch = _row_branch_reason(row, root_key, agent, module_args_from)
-    if branch is not None:
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "launcher_identity_not_live",
+        ), None
+    command_line = row.get("command_line")
+    recognition = recognize_agenttalk_wrap_invocation(
+        command_line,
+        root_key,
+        agent,
+        cli,
+        module_args_from,
+    )
+    actual, nonce_reason = _parse_supervisor_launch_nonce(
+        command_line,
+        module_args_from,
+    )
+    nonce_contradictions = {
+        "launcher_nonce_malformed",
+        "launcher_nonce_duplicate",
+        "launcher_nonce_after_subcommand_or_tail",
+    }
+    if recognition.status is WrapRecognitionStatus.UNKNOWN:
+        _bump(
+            diagnostics,
+            (
+                "launcher_nonce_cmdline_unreadable"
+                if recognition.reason_code == "command_line_unreadable"
+                else "launcher_wrap_observation_unknown"
+            ),
+        )
+        return recognition, None
+    if nonce_reason in nonce_contradictions:
+        _bump(diagnostics, nonce_reason)
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            nonce_reason,
+            recognition.invocation,
+        ), None
+    if recognition.status is WrapRecognitionStatus.NOT_MATCHED:
+        if st.get("launcher_nonce_injected") is not True:
+            _bump(
+                diagnostics,
+                (
+                    "launcher_nonce_unsupported_argv"
+                    if (
+                        st.get("launcher_nonce_injected") is False
+                        and st.get("launcher_nonce_missing_reason")
+                        == "unsupported_launch_argv"
+                    )
+                    else "launcher_nonce_missing_state"
+                ),
+            )
+        elif not _valid_launch_nonce(st.get("launcher_nonce")):
+            _bump(diagnostics, "launcher_nonce_malformed")
         _bump(diagnostics, "foreign_launcher_suppressed")
-        return False, None
+        if recognition.reason_code == "not_agenttalk_invocation":
+            _bump(diagnostics, "launcher_wrap_parse_failed")
+        return recognition, None
     if st.get("launcher_nonce_injected") is not True:
         if (
             st.get("launcher_nonce_injected") is False
@@ -4280,34 +6281,34 @@ def _is_confirmed_launcher(
             _bump(diagnostics, "launcher_nonce_unsupported_argv")
         else:
             _bump(diagnostics, "launcher_nonce_missing_state")
-        return False, None
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "launcher_nonce_missing_state",
+            recognition.invocation,
+        ), None
     expected = st.get("launcher_nonce")
     if not _valid_launch_nonce(expected):
         _bump(diagnostics, "launcher_nonce_malformed")
-        return False, None
-    command_line = row.get("command_line")
-    if not isinstance(command_line, str) or not command_line.strip():
-        _bump(diagnostics, "launcher_nonce_cmdline_unreadable")
-        return False, None
-    actual, nonce_reason = _parse_supervisor_launch_nonce(command_line, module_args_from)
-    if nonce_reason in {
-        "launcher_nonce_malformed",
-        "launcher_nonce_duplicate",
-        "launcher_nonce_after_subcommand_or_tail",
-        "launcher_wrap_parse_failed",
-    }:
-        _bump(diagnostics, nonce_reason)
-        return False, None
-    if not parse_agenttalk_wrap_invocation(command_line, root_key, agent, module_args_from):
-        _bump(diagnostics, "launcher_wrap_parse_failed")
-        return False, None
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "launcher_nonce_malformed",
+            recognition.invocation,
+        ), None
     if nonce_reason == "launcher_nonce_absent":
         _bump(diagnostics, "launcher_nonce_absent")
-        return False, None
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            nonce_reason,
+            recognition.invocation,
+        ), None
     if actual != expected:
         _bump(diagnostics, "launcher_nonce_mismatch")
-        return False, None
-    return True, {"pid": pid, "start": start, "nonce": expected}
+        return WrapRecognition(
+            WrapRecognitionStatus.NOT_MATCHED,
+            "launcher_nonce_mismatch",
+            recognition.invocation,
+        ), None
+    return recognition, {"pid": pid, "start": start, "nonce": expected}
 
 
 def _record_target(targets: dict[int, dict], row: dict, reason: str,
@@ -4343,7 +6344,9 @@ def _is_expected_seed_row(row: dict, cfg_agent: dict, agent: str,
     # only, so it must not be applied here (see _strict_child_edge).
     if parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
         return True
-    if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+    if parse_agenttalk_wrap_invocation(
+        row.get("command_line"), root_key, agent, cli=cfg_agent.get("cli")
+    ):
         return True
     name = _image_stem(row)
     cli = cfg_agent.get("cli")
@@ -4488,14 +6491,14 @@ def _children_map(idx: dict[int, dict]) -> dict[int, list[int]]:
 
 
 def _strict_child_edge(parent: dict, child: dict, *,
-                       root_key: str | None, agent: str,
+                       root_key: str | None, agent: str, cli: str | None,
                        diagnostics: dict[str, int]) -> bool:
     if child.get("parent_pid") != parent.get("pid"):
         return False
     # child is an arbitrary descendant, never the confirmed launcher itself -
     # it made no declaration of its own, so it is parsed by its own argv
     # shape (module_args_from=None), not this agent's declared prefix.
-    branch = _row_branch_reason(child, root_key, agent)
+    branch = _row_branch_reason(child, root_key, agent, cli=cli)
     if branch is not None:
         _bump(diagnostics, branch)
         return False
@@ -4530,7 +6533,9 @@ def _root_wait_brain(idx: dict[int, dict], wait_row: dict, cfg_agent: dict,
         if not isinstance(pid, int) or pid in seen:
             return best
         seen.add(pid)
-        branch = _row_branch_reason(parent, root_key, agent)
+        branch = _row_branch_reason(
+            parent, root_key, agent, cli=cfg_agent.get("cli")
+        )
         if branch is not None:
             _bump(diagnostics, branch)
             return best
@@ -4629,10 +6634,20 @@ def _attribution(
     if launcher_mismatch:
         _bump(diagnostics, "pid_reuse_suppressed")
     if isinstance(launcher_row, dict):
-        confirmed_launcher, launcher_source = _is_confirmed_launcher(
-            idx, launcher_row, st, root_key, agent, diagnostics, module_args_from)
+        launcher_recognition, launcher_source = _is_confirmed_launcher(
+            idx,
+            launcher_row,
+            st,
+            root_key,
+            agent,
+            cfg_agent.get("cli"),
+            diagnostics,
+            module_args_from,
+        )
+        confirmed_launcher = (
+            launcher_recognition.status is WrapRecognitionStatus.MATCHED
+        )
     if confirmed_launcher:
-        confirmed_launcher = True
         _record_target(targets_by_pid, launcher_row, "confirmed_launcher",
                        seed_descendants=True, launcher_source=launcher_source)
         seed_pids.add(launcher_pid)
@@ -4648,11 +6663,15 @@ def _attribution(
             continue
         # row is an arbitrary snapshot entry, not the confirmed launcher -
         # parse it by its own argv shape, not this agent's declared prefix.
-        branch = _row_branch_reason(row, root_key, agent)
+        branch = _row_branch_reason(
+            row, root_key, agent, cli=cfg_agent.get("cli")
+        )
         if branch is not None:
             _bump(diagnostics, branch)
             continue
-        if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+        if parse_agenttalk_wrap_invocation(
+            row.get("command_line"), root_key, agent, cli=cfg_agent.get("cli")
+        ):
             _record_target(targets_by_pid, row, "own_wrapper", seed_descendants=True)
             seed_pids.add(pid)
         elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
@@ -4767,8 +6786,14 @@ def _attribution(
             child = idx.get(child_pid)
             if not isinstance(child, dict):
                 continue
-            if not _strict_child_edge(parent, child, root_key=root_key,
-                                      agent=agent, diagnostics=diagnostics):
+            if not _strict_child_edge(
+                parent,
+                child,
+                root_key=root_key,
+                agent=agent,
+                cli=cfg_agent.get("cli"),
+                diagnostics=diagnostics,
+            ):
                 continue
             child_launcher_source = seed_launcher_sources.get(parent_pid)
             _record_target(targets_by_pid, child, "live_chain_descendant",
@@ -4987,6 +7012,18 @@ def evaluate_launch_barrier(
         active = eph_root.get("active") if isinstance(eph_root, dict) else None
         candidate = active.get(request_id) if isinstance(active, dict) else None
         st = candidate if isinstance(candidate, dict) else {}
+    config_agents = config.get("agents") if isinstance(config, dict) else None
+    config_agent = (
+        config_agents.get(agent)
+        if isinstance(config_agents, dict)
+        and isinstance(config_agents.get(agent), dict)
+        else {}
+    )
+    expected_cli = (
+        st.get("cli")
+        if request_id is not None and isinstance(st.get("cli"), str)
+        else config_agent.get("cli")
+    )
     if snapshot is None:
         blocked = request_id is not None or _prior_wrapper_may_be_alive(st)
         return {
@@ -5195,7 +7232,9 @@ def evaluate_launch_barrier(
             kind = "state_launcher"
         # row is an arbitrary post-kill survivor, not a confirmed launcher -
         # parsed by its own argv shape, not this agent's declared prefix.
-        elif parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+        elif parse_agenttalk_wrap_invocation(
+            row.get("command_line"), root_key, agent, cli=expected_cli
+        ):
             kind = "own_wrapper"
         elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
             kind = "own_wait"
@@ -5310,7 +7349,9 @@ def capture_launch_child_provenance(
         # row is a child of the confirmed launcher, but its OWN argv shape
         # was never declared - the launcher's declared prefix describes the
         # launcher, not its children, so it does not apply here either.
-        branch = _row_branch_reason(row, root_key, agent)
+        branch = _row_branch_reason(
+            row, root_key, agent, cli=cfg_agent.get("cli")
+        )
         if branch is not None:
             _bump(diagnostics, branch)
             continue
@@ -5767,6 +7808,18 @@ def _wrapped_liveness(
     }
     verified_wrapper_generation: str | None = None
 
+    def _recognition_unknown(reason_code: str) -> dict:
+        """Hold this poll without rewriting the last ownership certificate."""
+
+        base["wrapper_recognition"] = {
+            "status": WrapRecognitionStatus.UNKNOWN.value,
+            "reason_code": reason_code,
+        }
+        base["child_reason"] = reason_code
+        base["kill_targets"] = []
+        base["owned_process_tree_refreshed"] = False
+        return base
+
     if has_revoked_runtime and revoked_runtime is None:
         # This marker is the atomic attended-reset boundary that makes an old
         # runtime file non-authoritative. Schema drift must therefore HOLD
@@ -5786,6 +7839,9 @@ def _wrapped_liveness(
             "process_tree_invalid_runtime_revocation_record"
         )
         return base
+
+    if snapshot is None:
+        return _recognition_unknown("snapshot_unavailable")
 
     def _unverified_owned_process_may_exist() -> bool:
         """Conservatively detect ownership-shaped live evidence without a tree."""
@@ -5989,34 +8045,6 @@ def _wrapped_liveness(
             "root_identity_unavailable",
             hold_reason="process_tree_invalid_root_identity_unavailable",
         )
-    wrapper_generation = record.get("wrapper_generation")
-    if wrapper_generation != st.get("runtime_wrapper_generation"):
-        # A new wrapper generation supersedes any prior tree, but adoption is a
-        # fail-closed poll rather than a relaunch-authority gap. The next poll
-        # may replace this one specific transition marker only after it binds
-        # the live wrapper and derives a complete current tree.
-        base["owned_process_tree"] = _invalid_owned_process_tree_record(
-            agent=agent,
-            root_key=root_key,
-            wrapper_generation=wrapper_generation,
-            launch_nonce=(
-                st.get("launcher_nonce")
-                if _valid_launch_nonce(st.get("launcher_nonce"))
-                else None
-            ),
-            now_epoch=now_epoch,
-            reason_code="process_tree_invalid_generation_adoption_pending",
-        )
-        base["owned_process_tree_error"] = (
-            "process_tree_invalid_generation_adoption_pending"
-        )
-        base["child_reason"] = "wrapper_generation_mismatch"
-        return base
-    if snapshot is None:
-        return _current_proof_failed(
-            "snapshot_unavailable",
-            hold_reason="process_tree_invalid_snapshot_unavailable",
-        )
     idx, excluded_pids = _snap_index_and_excluded(snapshot)
     wrapper_pid = record.get("wrapper_pid")
     wrapper_start = record.get("wrapper_start")
@@ -6057,21 +8085,51 @@ def _wrapped_liveness(
             "wrapper_identity_ambiguous",
             hold_reason="process_tree_invalid_wrapper_identity_ambiguous",
         )
-    wrapper_attributed, _launcher_source = _is_confirmed_launcher(
+    wrapper_recognition, _launcher_source = _is_confirmed_launcher(
         idx,
         wrapper_row,
         st,
         root_key,
         agent,
+        cfg_agent.get("cli"),
         diagnostics,
         _module_args_from(cfg_agent),
     )
-    if not wrapper_attributed:
+    if wrapper_recognition.status is WrapRecognitionStatus.UNKNOWN:
+        return _recognition_unknown(wrapper_recognition.reason_code)
+    if wrapper_recognition.status is WrapRecognitionStatus.NOT_MATCHED:
         return _current_proof_failed(
-            "wrapper_attribution_ambiguous",
-            hold_reason="process_tree_invalid_wrapper_attribution_ambiguous",
+            "wrapper_attribution_not_matched",
+            hold_reason="process_tree_invalid_wrapper_attribution_not_matched",
         )
+    base["wrapper_recognition"] = {
+        "status": WrapRecognitionStatus.MATCHED.value,
+        "reason_code": wrapper_recognition.reason_code,
+    }
     base["wrapper_state"] = "alive"
+
+    wrapper_generation = record.get("wrapper_generation")
+    if wrapper_generation != st.get("runtime_wrapper_generation"):
+        # Generation adoption is permitted only after current command-line
+        # recognition MATCHED. An unreadable observation above preserves the
+        # prior generation and retries instead of manufacturing authority.
+        base["owned_process_tree"] = _invalid_owned_process_tree_record(
+            agent=agent,
+            root_key=root_key,
+            wrapper_generation=wrapper_generation,
+            launch_nonce=(
+                st.get("launcher_nonce")
+                if _valid_launch_nonce(st.get("launcher_nonce"))
+                else None
+            ),
+            now_epoch=now_epoch,
+            reason_code="process_tree_invalid_generation_adoption_pending",
+        )
+        base["owned_process_tree_error"] = (
+            "process_tree_invalid_generation_adoption_pending"
+        )
+        base["child_reason"] = "wrapper_generation_mismatch"
+        return base
 
     phase = record.get("phase")
     candidate = None
@@ -6374,13 +8432,19 @@ def build_report(store: Store, *, now_epoch: float,
     }
 
 
-_BOOTSTRAP_SUPPORTED_CLIS = {"claude", "codex"}
+_BOOTSTRAP_SUPPORTED_CLIS = eph.SUPPORTED_WRAPPER_CLIS
 _BOOTSTRAP_PLACEHOLDER_TOKENS = (
-    "REPLACE",
+    "REPLACE:",
     "REPLACE_WITH_PROJECT_DIR",
-    "AGENT_NAME",
     "{AGENT}",
     "<CWD>",
+)
+_BOOTSTRAP_AGENT_PLACEHOLDER_RE = re.compile(
+    r"\bAGENT_NAME(?:_WRAPPED)?\b",
+)
+_CONFIGURED_LAUNCH_RUNTIME_PLACEHOLDER_RE = re.compile(
+    r"\{(?:ROOT|SESSION_ARGS|SESSION_ID|REQUEST_ID|AGENT|PERM_MODE)\}|<CWD>",
+    re.IGNORECASE,
 )
 
 
@@ -6400,7 +8464,10 @@ def _bootstrap_add(checks: list[dict], check_id: str, status: str, detail: str,
 def _bootstrap_has_placeholder(value: object) -> bool:
     if isinstance(value, str):
         upper = value.upper()
-        return any(token in upper for token in _BOOTSTRAP_PLACEHOLDER_TOKENS)
+        return (
+            any(token in upper for token in _BOOTSTRAP_PLACEHOLDER_TOKENS)
+            or _BOOTSTRAP_AGENT_PLACEHOLDER_RE.search(upper) is not None
+        )
     if isinstance(value, list):
         return any(_bootstrap_has_placeholder(item) for item in value)
     if isinstance(value, dict):
@@ -6408,32 +8475,11 @@ def _bootstrap_has_placeholder(value: object) -> bool:
     return False
 
 
-def _bootstrap_arg_value(args: list, flag: str) -> str | None:
-    for i, item in enumerate(args):
-        if item == flag and i + 1 < len(args) and isinstance(args[i + 1], str):
-            return args[i + 1]
-        if isinstance(item, str) and item.startswith(flag + "="):
-            return item[len(flag) + 1:]
-    return None
-
-
-def _bootstrap_flag_before(args: list, flag: str, before: str) -> bool:
-    try:
-        cut = args.index(before)
-    except ValueError:
-        cut = len(args)
-    head = args[:cut]
-    return flag in head or any(
-        isinstance(item, str) and item.startswith(flag + "=") for item in head
+def _configured_launch_has_unresolved_placeholder(value: str) -> bool:
+    return (
+        _bootstrap_has_placeholder(value)
+        or _CONFIGURED_LAUNCH_RUNTIME_PLACEHOLDER_RE.search(value) is not None
     )
-
-
-def _bootstrap_launch_tail(args: list) -> list:
-    try:
-        cut = args.index("--")
-    except ValueError:
-        return []
-    return args[cut + 1:]
 
 
 def bootstrap_check(store: Store, *, now_epoch: float,
@@ -6525,6 +8571,33 @@ def bootstrap_check(store: Store, *, now_epoch: float,
             _bootstrap_add(checks, "supervisor_agent_cli_supported", "ok",
                            f"{cli_name} agent configured", agent=name,
                            facts={"cli": cli_name})
+
+        environment_issues = _configured_environment_issues(cfg_agent.get("env"))
+        if environment_issues:
+            _bootstrap_add(
+                checks,
+                "supervisor_agent_environment_invalid",
+                "error",
+                "configured environment failed shared launch admission",
+                agent=name,
+                facts={
+                    "issues": [issue.code for issue in environment_issues],
+                    "names": [
+                        issue.name
+                        for issue in environment_issues
+                        if issue.name is not None
+                    ],
+                },
+                suggestion="use distinct valid Windows environment names without '='",
+            )
+        else:
+            _bootstrap_add(
+                checks,
+                "supervisor_agent_environment_valid",
+                "ok",
+                "configured environment passed shared launch admission",
+                agent=name,
+            )
 
         backend_profile = cfg_agent.get("backend_profile")
         if backend_profile is not None:
@@ -6645,163 +8718,37 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                 _bootstrap_add(checks, "supervisor_agent_launch_args_set", "ok",
                                "launch.windows_args is filled", agent=name)
 
-            # Round 16 connector finding: making the resolver delegation run
-            # unconditionally (round 14) also made it run for launches that
-            # are not Python at all - a manual archetype's claude.exe/
-            # codex.exe direct launch, or an agenttalk.exe entry-point
-            # launch - where windows_args never contains '-m'/'agenttalk'
-            # and the whole question of a module boundary is meaningless.
-            # windows_file's stem, not wrapped=true/false, is what actually
-            # decides whether the runtime resolver's own logic ever runs
-            # for this agent (_agenttalk_argv gates on exactly this set) -
-            # so this check must be gated on the SAME set, not removed
-            # back to "only when module_args_from is present" (that would
-            # reopen round 14's absent-prefix gap for genuinely Python
-            # launches). "pythonw" is deliberately NOT in this set: the
-            # runtime does not recognize it either (see _agenttalk_argv),
-            # so a pythonw-launched wrapped agent already gets no
-            # attribution regardless of module_args_from - a real, separate
-            # gap, not something this validator can paper over by silently
-            # accepting it here.
-            if _token_stem(windows_file) in {"python", "python3", "py"}:
-                module_args_from = launch.get("module_args_from")
-                module_args_from_type_or_range_error = False
-                if module_args_from is not None:
-                    if not isinstance(module_args_from, int) or isinstance(module_args_from, bool):
-                        _bootstrap_add(
-                            checks, "supervisor_agent_launch_module_args_from_invalid", "error",
-                            "launch.module_args_from must be an integer",
-                            agent=name,
-                            facts={"module_args_from": module_args_from},
-                            suggestion="set module_args_from to the index of '-m' in windows_args, "
-                                       "or remove it",
-                        )
-                        module_args_from_type_or_range_error = True
-                    elif isinstance(windows_args, list) and not (
-                        0 <= module_args_from < len(windows_args)
-                    ):
-                        _bootstrap_add(
-                            checks, "supervisor_agent_launch_module_args_from_out_of_range", "error",
-                            "launch.module_args_from is out of range for windows_args",
-                            agent=name,
-                            facts={"module_args_from": module_args_from,
-                                   "windows_args_len": len(windows_args)},
-                            suggestion="point module_args_from at the index of '-m' in windows_args",
-                        )
-                        module_args_from_type_or_range_error = True
-                # In-range is necessary but not sufficient (PR 98 connector,
-                # round 9): the validator must accept exactly what the
-                # runtime resolver accepts, no more - an in-range
-                # module_args_from pointing at the wrong token, or a
-                # declared prefix containing a token outside the supported
-                # interpreter-flag allowlist, launches fine (the Python
-                # invocation still runs) while nonce injection, bounded
-                # logging, and launcher attribution are all silently
-                # disabled. Round 14: that includes module_args_from being
-                # ABSENT while windows_args carries an undeclared prefix
-                # (e.g. ["-u", "-m", "agenttalk", ...]) - the resolver
-                # defaults an absent field to offset 0 exactly like this
-                # call does, so skipping the check whenever the field is
-                # merely unset let that exact shape report clean. Run
-                # unconditionally (any type/range error above already
-                # fully explains the config; no need to also run this).
-                # Delegate to the SAME resolver the runtime uses instead of
-                # reimplementing this judgment a third time.
-                if not module_args_from_type_or_range_error and isinstance(windows_args, list):
-                    if _resolve_module_flag_index(
-                        [str(token) for token in windows_args], module_args_from,
-                    ) < 0:
-                        _bootstrap_add(
-                            checks, "supervisor_agent_launch_module_args_from_wrong_token",
-                            "error",
-                            (
-                                "launch.module_args_from is in range but does not point at "
-                                "'-m' 'agenttalk', or its declared prefix contains a token "
-                                "outside the supported interpreter-flag set"
-                                if module_args_from is not None else
-                                "launch.module_args_from is not set and windows_args does "
-                                "not start with '-m' 'agenttalk' - the runtime resolver "
-                                "defaults an absent declaration to offset 0 and will reject "
-                                "this exact invocation the same way"
-                            ),
-                            agent=name,
-                            facts={"module_args_from": module_args_from,
-                                   "windows_args": windows_args},
-                            suggestion="point module_args_from at the index of '-m' in "
-                                       "windows_args, and declare only supported "
-                                       "interpreter flags before it (see "
-                                       "docs/supervisor-tutorial.md)",
-                        )
-                    else:
-                        _bootstrap_add(
-                            checks, "supervisor_agent_launch_module_args_from_valid", "ok",
-                            (
-                                "launch.module_args_from is a valid index"
-                                if module_args_from is not None else
-                                "windows_args resolves as the plain, undeclared "
-                                "'-m' 'agenttalk' form"
-                            ),
-                            agent=name,
-                        )
-
-            if wrapped and isinstance(windows_args, list):
-                if "wrap" not in windows_args:
-                    _bootstrap_add(
-                        checks, "supervisor_wrapped_missing_wrap", "error",
-                        "wrapped=true but launch args do not call agenttalk wrap",
-                        agent=name,
-                    )
-                if not _bootstrap_flag_before(windows_args, "--root", "wrap"):
-                    _bootstrap_add(
-                        checks, "supervisor_wrapped_missing_root", "error",
-                        "wrapped launch does not include an explicit --root before wrap",
-                        agent=name,
-                        suggestion="add --root {ROOT} before wrap in windows_args",
-                    )
-                if "--loop" not in windows_args:
-                    _bootstrap_add(
-                        checks, "supervisor_wrapped_missing_loop", "error",
-                        "wrapped launch is missing --loop",
-                        agent=name,
-                    )
-                if "--" not in windows_args:
-                    _bootstrap_add(
-                        checks, "supervisor_wrapped_missing_cli_tail", "error",
-                        "wrapped launch is missing the -- separator and real CLI tail",
-                        agent=name,
-                    )
-                arg_for = _bootstrap_arg_value(windows_args, "--for")
-                if arg_for != name:
-                    _bootstrap_add(
-                        checks, "supervisor_wrapped_for_mismatch", "error",
-                        "wrapped --for does not match the supervisor agent name",
-                        agent=name,
-                        facts={"wrapped_for": arg_for},
-                        suggestion=f"set --for {name}",
-                    )
-                arg_cli = _bootstrap_arg_value(windows_args, "--cli")
-                if isinstance(cli_name, str) and arg_cli != cli_name:
-                    _bootstrap_add(
-                        checks, "supervisor_wrapped_cli_mismatch", "error",
-                        "wrapped --cli does not match the supervisor agent cli",
-                        agent=name,
-                        facts={"wrapped_cli": arg_cli, "cli": cli_name},
-                        suggestion=f"set --cli {cli_name}",
-                    )
-                tail = _bootstrap_launch_tail(windows_args)
-                if not tail:
-                    _bootstrap_add(
-                        checks, "supervisor_wrapped_cli_tail_empty", "error",
-                        "wrapped launch has no real CLI command after --",
-                        agent=name,
-                    )
-                elif _bootstrap_has_placeholder(tail[0]):
-                    _bootstrap_add(
-                        checks, "supervisor_wrapped_cli_tail_placeholder", "error",
-                        "wrapped launch real CLI tail still contains placeholder text",
-                        agent=name,
-                        suggestion="replace the tail after -- with the real claude.exe or codex.exe command",
-                    )
+            launch_candidate, launch_problem = _effective_launch_candidate(
+                cfg_agent,
+                population="regular",
+                agent=name,
+                root=store.root,
+                session_args=(),
+            )
+            if launch_candidate is None:
+                _bootstrap_add(
+                    checks,
+                    "supervisor_agent_launch_admission_refused",
+                    "error",
+                    launch_problem or "the configured launch was refused",
+                    agent=name,
+                    suggestion=(
+                        "repair the configured launch and rerun bootstrap-check; "
+                        "the same typed admission gates planning and execution"
+                    ),
+                )
+            else:
+                _bootstrap_add(
+                    checks,
+                    "supervisor_agent_launch_admission_valid",
+                    "ok",
+                    "the configured launch produced one typed admission artifact",
+                    agent=name,
+                    facts={
+                        "wrapper_dispatch": launch_candidate.wrapper_dispatch,
+                        "cli": launch_candidate.cli,
+                    },
+                )
 
         rpt = report_agents.get(name) if isinstance(report_agents.get(name), dict) else None
         if rpt is None:
@@ -7035,6 +8982,17 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         liveness.get("runtime_status") == runtime_obs.STATUS_VALID
         and runtime_record is not None
     )
+    wrapper_recognition = (
+        liveness.get("wrapper_recognition")
+        if isinstance(liveness.get("wrapper_recognition"), dict)
+        else None
+    )
+    runtime_state_authoritative = bool(
+        runtime_valid
+        and wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.MATCHED.value
+    )
     runtime_wrapper_generation = (
         runtime_record.get("wrapper_generation") if runtime_valid else None
     )
@@ -7048,7 +9006,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     prior_wrapper_generation = st.get("runtime_wrapper_generation")
     prior_turn_generation = st.get("runtime_turn_generation")
     same_runtime_turn = bool(
-        runtime_valid
+        runtime_state_authoritative
         and runtime_wrapper_generation == prior_wrapper_generation
         and runtime_turn_generation == prior_turn_generation
     )
@@ -7061,7 +9019,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         float(progress_seen_epoch)
     ):
         progress_seen_epoch = now_epoch
-    if runtime_valid:
+    if runtime_state_authoritative:
         if not same_runtime_turn:
             initial_progress_age = liveness.get("runtime_progress_age_seconds")
             progress_seen_epoch = (
@@ -7092,7 +9050,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         # are still reset below, so UNKNOWN itself never advances kill authority.
         sequence_regressed = st.get("runtime_sequence_regressed") is True
 
-    if runtime_valid:
+    if runtime_state_authoritative:
         next_wrapper_generation = runtime_wrapper_generation
         next_turn_generation = runtime_turn_generation
         next_runtime_phase = runtime_phase
@@ -7143,6 +9101,14 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         nxt["revoked_wrapper_runtime"] = copy.deepcopy(
             st.get("revoked_wrapper_runtime")
         )
+    if "pending_launch_record" in st:
+        # This is the only durable copy of the accepted pre-spawn config facts
+        # when a child exists but record-launch has not committed yet. Preserve
+        # even malformed evidence so a later consumer fails closed rather than
+        # silently laundering an incomplete launch into ordinary state.
+        nxt["pending_launch_record"] = copy.deepcopy(
+            st.get("pending_launch_record")
+        )
     if owned_tree is not None:
         nxt["owned_process_tree"] = copy.deepcopy(owned_tree)
     legacy_process_evidence = liveness.get("legacy_process_evidence")
@@ -7152,6 +9118,12 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         )
     if liveness.get("owned_process_tree_pending") is True:
         nxt["owned_process_tree_pending"] = True
+    if (
+        wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.UNKNOWN.value
+    ):
+        nxt["wrapper_recognition"] = copy.deepcopy(wrapper_recognition)
 
     def _relaunch_state() -> None:
         nf = fails + 1
@@ -7225,6 +9197,17 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         if action in (RELAUNCH, STUCK_RECOVER):
             res.update(_launch_detail({**st, "resume_available": resume_available},
                                       cfg_agent, perm_mode=perm_mode))
+            res["record_launch_context"] = _launch_record_context(
+                agent=name,
+                cli=cli_name,
+                grace_seconds=grace_seconds,
+                wrapped=wrapped,
+                brain_pattern=(
+                    _lcfg.get("brain_pattern")
+                    if isinstance(_lcfg.get("brain_pattern"), str)
+                    else ""
+                ),
+            )
             if isinstance(barrier_state, dict):
                 res["barrier_state"] = barrier_state
         return res
@@ -7243,6 +9226,28 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
         return _result(NONE, state=state, reason=reason)
 
+    if (
+        wrapped
+        and wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.UNKNOWN.value
+    ):
+        notify = now_epoch - last_warn >= suspect_interval
+        if notify:
+            nxt["last_warn_epoch"] = now_epoch
+        reason_code = wrapper_recognition.get("reason_code")
+        return _result(
+            WARN_ONLY,
+            state="PROCESS_TREE_UNKNOWN",
+            notify=notify,
+            reason=(
+                "The current wrapper identity observation is incomplete or "
+                f"unreadable ({reason_code}); it will be re-observed on the "
+                "next poll. This observation authorizes neither adoption nor "
+                "teardown, disowning, or relaunch."
+            ),
+        )
+
     # A partial wrapped tree is evidence, never teardown authority. This check
     # precedes even an authorized restart marker: Stop-Tree cannot safely reap
     # an omitted branch, and consuming the marker would hide the operator's
@@ -7256,175 +9261,29 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         notify = now_epoch - last_warn >= suspect_interval
         if notify:
             nxt["last_warn_epoch"] = now_epoch
-        # Task #150: name the remedy. A held state that does not tell the
-        # operator how to leave it is a defect on its own - especially since
-        # the obvious guess (kill the wrapper, expecting the supervisor to
-        # see it absent and relaunch) makes this WORSE, not better: a
-        # wrapper this is still holding for is exempt from this HOLD the
-        # moment it is independently confirmed absent (see
-        # _unverified_owned_process_tree); a wrapper that is still present,
-        # or whose absence this record cannot yet prove on its own, needs
-        # the attended reset.
-        #
-        # Round 2 (connector findings 2 and 3): the FIRST version of this
-        # remedy named --reset-process-tree-ownership unconditionally and
-        # was wrong twice over. (a) --acknowledge-owned-processes-stopped's
-        # own contract already covers "any identities omitted by a
-        # truncated record" - the message must not narrow that to only the
-        # NAMED ones. (b) --reset-process-tree-ownership requires the tree
-        # evidence to carry a real wrapper_generation/launch_nonce that
-        # agrees with a CURRENT, valid runtime record - true for a tree
-        # _owned_process_tree itself walked (non-empty entries), but an
-        # entryless placeholder (_invalid_owned_process_tree_record - schema
-        # drift, a revoked runtime, legacy migration evidence) usually has
-        # no such nonce to agree with, so the command fails for precisely
-        # the case that names it. Naming a remedy that cannot work is worse
-        # than naming none, so the entryless case gets an honest "no
-        # verified one-line fix" message instead of a command that would
-        # frustrate the operator a second time.
-        #
-        # Round 3 (connector finding 6, the same wrong direction again): a
-        # REJECTED candidate is precisely what this record's own entries
-        # never named either, same as a truncated record's omitted ones -
-        # but the reset command's own identity list is built from entries
-        # alone, so it has no way to know about a rejected candidate at
-        # all. The flag's own text only mentions omitted identities; a
-        # nonzero rejected_count needs the same warning stated explicitly,
-        # not folded silently into "every process this record could name".
-        # Round 9 (connector finding, the third instance of the same wrong
-        # direction): the first two rounds each closed the ONE precondition
-        # that had actually bitten - an entryless placeholder's missing
-        # nonce (round 2), a rejected candidate the command's identity list
-        # can't see (round 3) - by patching that specific case, which is
-        # why there was a third: a configured-agent reset ALSO requires
-        # (cli.py, --reset-process-tree-ownership) the CURRENT wrapper
-        # runtime record to read STATUS_VALID, entirely independent of the
-        # tree's own entries/rejected_count. A tree can hold non-empty
-        # entries while the runtime record is exactly what made it invalid
-        # in the first place (process_tree_invalid_runtime_absent/invalid/
-        # record_missing/record_invalid) - the remedy named the command for
-        # precisely that case. One predicate now gates naming the command
-        # at all: this poll's own liveness read of the SAME runtime record
-        # the command re-reads at reset time. It can still go stale between
-        # this poll and when the operator acts - unavoidable from where the
-        # message is produced - but it is never wrong about what THIS poll
-        # already knows, which is what "must never guess" means here.
-        #
-        # Round 10 (connector finding, a fourth instance of the same wrong
-        # direction, this time in the predicate's own precision rather than
-        # a missing precondition): STATUS_VALID only proves the runtime
-        # record parses - a wrapper runtime record can be STATUS_VALID while
-        # its OWN wrapper_pid/wrapper_start disagrees with this state's
-        # stored launcher_pid/launcher_start, which is exactly what sends
-        # _wrapped_liveness down wrapper_state_mismatch
-        # (process_tree_invalid_wrapper_state_mismatch) with a nonempty
-        # inherited tree. process_tree_ownership_reset_evidence rejects that
-        # case on wrapper identity agreement, a DIFFERENT conjunct than
-        # runtime_status - so "one predicate" needed to mean the actual
-        # admission predicate, not one signal that happens to correlate with
-        # it. _wrapper_identity_matches_state is now the single function
-        # both process_tree_ownership_reset_evidence and this check call -
-        # not a second hand-written comparison that could drift from the
-        # first the way runtime_status alone already did once.
-        runtime_record = liveness.get("runtime_record")
-        runtime_currently_valid = (
-            liveness.get("runtime_status") == runtime_obs.STATUS_VALID
-            and isinstance(runtime_record, dict)
-            and _wrapper_identity_matches_state(runtime_record, st)
+        # This live planner can truthfully establish refusal, but it cannot
+        # advertise the attended reset: that command requires the supervisor
+        # singleton to be absent.  The attention projection re-evaluates the
+        # command's complete admission predicate after the supervisor stops.
+        tree_state = (
+            "PROCESS_TREE_TRUNCATED"
+            if tree_status == "truncated"
+            else "PROCESS_TREE_INVALID"
         )
-        has_entries = bool(owned_tree.get("entries"))
-        rejected_count = owned_tree.get("rejected_count")
-        if has_entries and runtime_currently_valid:
-            # Round 4 (connector finding 2, the same wrong direction a third
-            # time): a legacy v2 record predates rejected_count entirely -
-            # missing, not zero, is what keeps it out of absence-promotion
-            # (see the v2-migration fix), but that same "unknown" must warn
-            # here too. Warning only for a known positive integer told the
-            # operator a v2 record excluded nothing, when the truth is the
-            # walk that produced it never even counted - absent must warn
-            # like unknown, not like zero.
-            if isinstance(rejected_count, int) and rejected_count > 0:
-                rejected_clause = (
-                    f" This record also excluded {rejected_count} "
-                    "candidate(s) the walk could not admit (rejected_count) "
-                    "- the reset command's own identity list does not "
-                    "include them, so confirming those specifically gone is "
-                    "on you, not the command."
-                )
-            elif rejected_count is None:
-                rejected_clause = (
-                    " This record predates rejected_count (an older "
-                    "schema) so whether the walk that produced it excluded "
-                    "any candidate is UNKNOWN, not zero - the reset "
-                    "command's own identity list cannot cover an excluded "
-                    "candidate either way, so treat this the same as a "
-                    "nonzero count: confirming anything beyond the named "
-                    "entries gone is on you, not the command."
-                )
-            else:
-                rejected_clause = ""
-            remedy = (
-                "recovery: if every process this record could name is "
-                "confirmed gone - including any omitted by a truncated "
-                "record, which is exactly what --acknowledge-owned-"
-                "processes-stopped attests to -"
-                f"{rejected_clause} run `agenttalk supervise "
-                "--reset-process-tree-ownership` (see --help for the "
-                "required --acknowledge-* flags); do NOT kill the wrapper "
-                "expecting an automatic relaunch - that is only safe once "
-                "this record already reflects the wrapper as absent"
-            )
-        elif has_entries and liveness.get("runtime_status") != runtime_obs.STATUS_VALID:
-            remedy = (
-                "recovery: this record has named identities, but the "
-                "current wrapper runtime record is not valid "
-                f"({liveness.get('runtime_status')}) and --reset-process-"
-                "tree-ownership requires exactly that record to read valid "
-                "before it will act - it will refuse; this needs operator "
-                "investigation of "
-                f"{owned_tree.get('reason_code')} (a valid runtime record "
-                "recovering on its own is what would let a scripted reset "
-                "apply here, not a --acknowledge-* flag)"
-            )
-        elif has_entries:
-            # Round 10: runtime_status is valid but wrapper_identity_matches_state
-            # is not - the record parses, yet its own wrapper pid/start
-            # disagrees with what this state has stored, which is a
-            # separate refusal reason the command checks independently.
-            remedy = (
-                "recovery: this record has named identities and the "
-                "current wrapper runtime record reads valid, but its own "
-                "wrapper identity (pid/start) does not agree with this "
-                "state's stored launcher identity, and --reset-process-"
-                "tree-ownership refuses on exactly that disagreement - it "
-                "will refuse; this needs operator investigation of "
-                f"{owned_tree.get('reason_code')} (the two identities need "
-                "to agree again - on their own, or via an attended reset - "
-                "before a scripted reset can apply here)"
-            )
-        else:
-            remedy = (
-                "recovery: this record has no observed process identities "
-                "to reset against, so --reset-process-tree-ownership will "
-                "refuse it; a new wrapper generation replaces this record "
-                "automatically once adopted - if it does not clear on its "
-                "own, this needs operator investigation of "
-                f"{owned_tree.get('reason_code')}, not a scripted remedy"
-            )
-        if tree_status == "truncated":
-            tree_state = "PROCESS_TREE_TRUNCATED"
-            tree_reason = (
-                f"owned process tree observed {observed} identities over cap "
-                f"{limit}; HOLDING automatic teardown because a partial kill "
-                f"could strand descendants; {remedy}"
-            )
-        else:
-            tree_state = "PROCESS_TREE_INVALID"
-            tree_reason = (
-                "owned process tree failed strict parent/start validation "
-                f"({owned_tree.get('reason_code')}); HOLDING automatic teardown "
-                f"because a partial kill could strand descendants; {remedy}"
-            )
+        gap = process_tree_operator_gap(
+            status=tree_status,
+            reason_code=owned_tree.get("reason_code"),
+            observed=observed,
+            limit=limit,
+        )
+        tree_reason = (
+            f"{gap} Automatic teardown and relaunch are refused because a "
+            "partial action could strand descendants or start a duplicate "
+            "agent. no scripted remedy applies while this supervisor "
+            "instance remains live; run `agenttalk attention` for the "
+            "configured detached launch argv and any remedy admitted after "
+            "the supervisor is stopped."
+        )
         return _result(
             WARN_ONLY,
             state=tree_state,
@@ -8044,10 +9903,18 @@ def _ephemeral_owned_process_view(
     )
     next_entry["managed_pids"] = []
     runtime_record = liveness.get("runtime_record")
+    wrapper_recognition = (
+        liveness.get("wrapper_recognition")
+        if isinstance(liveness.get("wrapper_recognition"), dict)
+        else None
+    )
     if (
         liveness.get("runtime_status") == runtime_obs.STATUS_VALID
         and isinstance(runtime_record, dict)
         and isinstance(runtime_record.get("wrapper_generation"), str)
+        and wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.MATCHED.value
     ):
         next_entry["runtime_wrapper_generation"] = runtime_record[
             "wrapper_generation"
@@ -8066,16 +9933,31 @@ def _ephemeral_owned_process_view(
         next_entry["owned_process_tree_pending"] = True
     else:
         next_entry.pop("owned_process_tree_pending", None)
+    if (
+        wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.UNKNOWN.value
+    ):
+        next_entry["wrapper_recognition"] = copy.deepcopy(wrapper_recognition)
+    else:
+        next_entry.pop("wrapper_recognition", None)
     complete = bool(
         isinstance(tree, dict)
         and tree.get("status") in {"complete", "absent"}
         and liveness.get("owned_process_tree_refreshed") is True
+        and wrapper_recognition is not None
+        and wrapper_recognition.get("status")
+        == WrapRecognitionStatus.MATCHED.value
     )
     if complete:
         next_entry.pop("process_tree_hold_reason", None)
     else:
         next_entry["process_tree_hold_reason"] = (
-            tree.get("reason_code")
+            wrapper_recognition.get("reason_code")
+            if wrapper_recognition is not None
+            and wrapper_recognition.get("status")
+            == WrapRecognitionStatus.UNKNOWN.value
+            else tree.get("reason_code")
             if isinstance(tree, dict)
             else liveness.get("child_reason")
         ) or "process_tree_authority_unavailable"
@@ -8400,6 +10282,16 @@ def process_tree_ownership_reset_evidence(
                 f"request {request_id!r} and agent {agent!r}"
             )
 
+    # A configured attended reset derives no authority from the current
+    # recognition observation.  Its independent contract below binds the
+    # persisted tree to the strict runtime record, root, generation, and nonce;
+    # the CLI separately proves every recorded identity is gone.  Ephemeral
+    # retirement has a different contract and keeps the UNKNOWN veto.
+    if request_id is not None and _wrapper_recognition_is_unknown(entry):
+        raise ValueError(
+            "wrapper recognition is unknown and retryable; ownership cannot be reset"
+        )
+
     raw_tree = entry.get("owned_process_tree")
     if not isinstance(raw_tree, dict) or raw_tree.get("status") not in {
         "invalid",
@@ -8567,6 +10459,318 @@ def process_tree_ownership_reset_evidence(
     }
 
 
+def evaluate_process_tree_reset_admissions(
+    store: Store,
+    state: dict,
+    *,
+    actor: str | None,
+    now_epoch: float | None = None,
+    identity_gone: Callable[[object, object, object], bool] = _owner_identity_gone,
+) -> dict:
+    """Read-only admission check for remedies shown by operator surfaces.
+
+    The returned mapping is keyed exactly like process-tree attention items:
+    configured agents use their agent name and ephemeral requests use
+    ``ephemeral:<request-id>``.  Nothing here mutates authority or state.  The
+    command handler rechecks every predicate under its lifecycle/config locks;
+    this snapshot only decides whether a command may be *shown now*.  A
+    ``blocked_admissions`` row is deliberately non-executable: it can name the
+    absent kill-switch only after every other remedy precondition passed.
+    """
+    admissions: dict[str, dict] = {}
+
+    def context_state() -> str:
+        try:
+            marker_status, _marker, _detail = (
+                store.read_supervisor_instance_strict()
+            )
+            kill_switch = store.supervisor_kill_switch()
+            liaison = store.operator_facing()
+            authorized_actor = liaison if liaison is not None else store.sole_lead()
+        except (OSError, TypeError, ValueError):
+            return "unavailable"
+        if kill_switch is None:
+            return "unavailable"
+        if (
+            marker_status != "absent"
+            or actor is None
+            or actor != authorized_actor
+        ):
+            return "blocked"
+        return "admitted" if kill_switch is True else "kill_switch_absent"
+
+    context = context_state()
+    if context == "unavailable":
+        return {"evaluated": False, "admissions": admissions}
+    if context == "blocked":
+        return {"evaluated": True, "admissions": admissions}
+    try:
+        validated_state = _validate_supervisor_state(
+            state,
+            source="supervisor state remedy admission",
+        )
+        _supervisor_json_text(
+            validated_state,
+            source="supervisor state remedy admission",
+        )
+    except SupervisorPersistenceError:
+        # Every advertised remedy mutates and durably rewrites this object.
+        # If the exact writer contract cannot persist it, no command applies.
+        return {"evaluated": True, "admissions": admissions}
+
+    def archive_destination_admitted(
+        request_id: str,
+        pending: dict | None,
+    ) -> bool:
+        active_path = store.launch_requests_dir / f"{request_id}.json"
+        archive_path = store.launch_requests_archive_dir / f"{request_id}.json"
+        try:
+            marker = store.read_launch_request(request_id)
+            if marker is None and active_path.exists():
+                return False
+            if archive_path.exists():
+                if pending is None:
+                    return False
+                existing = json.loads(
+                    archive_path.read_text(encoding="utf-8-sig")
+                )
+                expected_payload = pending["archive_payload"]
+                if existing != expected_payload:
+                    return False
+                return marker is None or marker == expected_payload["original"]
+            if pending is not None:
+                return marker == pending["archive_payload"]["original"]
+            return True
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+
+    agents = state.get("agents") if isinstance(state, dict) else None
+    try:
+        _validated_process_tree_reset_audit(state)
+        configured_audit_valid = True
+    except (TypeError, ValueError):
+        configured_audit_valid = False
+    if isinstance(agents, dict) and configured_audit_valid:
+        for raw_agent, entry in sorted(agents.items()):
+            if not isinstance(entry, dict):
+                continue
+            tree = entry.get("owned_process_tree")
+            if not (
+                isinstance(tree, dict)
+                and tree.get("status") in {"invalid", "truncated"}
+            ):
+                continue
+            try:
+                agent = validate_agent_name(raw_agent)
+                runtime_view = runtime_obs.read_runtime(
+                    store.state_dir,
+                    agent,
+                    now_epoch=now_epoch,
+                )
+                if runtime_view.get("status") != runtime_obs.STATUS_VALID:
+                    continue
+                nonce = tree.get("launch_nonce")
+                if not isinstance(nonce, str):
+                    continue
+                evidence = process_tree_ownership_reset_evidence(
+                    state,
+                    agent,
+                    expected_root=store.root,
+                    verified_launch_nonce=nonce,
+                    runtime_record=runtime_view["record"],
+                    now_epoch=now_epoch,
+                )
+                if any(
+                    not identity_gone(
+                        row["pid"],
+                        row["start"],
+                        row.get("start_filetime"),
+                    )
+                    for row in evidence["identities"]
+                ):
+                    continue
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                runtime_obs.RuntimeRecordError,
+            ):
+                continue
+            admissions[agent] = {
+                "mode": "configured_reset",
+                "agent": agent,
+                "actor": actor,
+                "verified_launch_nonce": nonce,
+                "reason": "all recorded process identities independently verified stopped",
+            }
+
+    eph_root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    active = eph_root.get("active") if isinstance(eph_root, dict) else None
+    try:
+        config_agents = store.load_config().get("agents")
+        active_agents = set(config_agents) if isinstance(config_agents, list) else set()
+        retired_agents = set(store.retired_agents())
+        ephemeral_identity_context_valid = True
+    except (OSError, TypeError, ValueError):
+        active_agents = set()
+        retired_agents = set()
+        ephemeral_identity_context_valid = False
+    if isinstance(active, dict) and ephemeral_identity_context_valid:
+        for request_id, entry in sorted(active.items()):
+            if not isinstance(entry, dict) or not eph.is_safe_id(request_id):
+                continue
+            if _wrapper_recognition_is_unknown(entry):
+                continue
+            try:
+                agent = validate_agent_name(entry.get("agent"))
+            except (TypeError, ValueError):
+                continue
+            if agent not in active_agents and agent not in retired_agents:
+                continue
+            tree = entry.get("owned_process_tree")
+            has_hold = (
+                isinstance(tree, dict)
+                and tree.get("status") in {"invalid", "truncated"}
+            ) or (
+                "process_tree_hold_reason" in entry
+                and isinstance(entry.get("process_tree_hold_reason"), str)
+            )
+            held_terminal = eph.validate_held_terminal(entry.get("held_terminal"))
+            try:
+                pending = attended_ephemeral_archive_pending(state, request_id)
+            except (TypeError, ValueError):
+                # One corrupt archive journal must not erase configured HOLD
+                # cards, and this request's command would reject the same state.
+                continue
+            if pending is not None:
+                launch_marker = pending["archive_payload"]["original"]
+                if (
+                    _ephemeral_request_identity_matches(
+                        store,
+                        state,
+                        entry,
+                        launch_marker,
+                        request_id,
+                    )
+                    and _active_ephemeral_hold_matches_archive(
+                        entry,
+                        pending,
+                        request_id,
+                    )
+                    and archive_destination_admitted(request_id, pending)
+                ):
+                    admissions[f"ephemeral:{request_id}"] = {
+                        "mode": "ephemeral_archive",
+                        "request_id": request_id,
+                        "actor": actor,
+                        "verification_mode": pending["verification_mode"],
+                        "verified_launch_nonce": pending[
+                            "verified_launch_nonce"
+                        ],
+                        "reason": pending["reason"],
+                    }
+                continue
+            pending_root = (
+                eph_root.get("attended_archive_pending")
+                if isinstance(eph_root, dict)
+                else None
+            )
+            if isinstance(pending_root, dict) and len(pending_root) >= 64:
+                continue
+            try:
+                launch_marker = store.read_launch_request(request_id)
+            except (OSError, TypeError, ValueError):
+                launch_marker = None
+            marker_errors = eph.validate_marker(launch_marker)
+            if not (
+                has_hold
+                and held_terminal is not None
+                and entry.get("request_id") == request_id
+                and entry.get("agent") == agent
+                and not marker_errors
+                and isinstance(launch_marker, dict)
+                and launch_marker.get("request_id") == request_id
+                and launch_marker.get("agent") == agent
+                and launch_marker.get("state") in eph.ACTIVE_STATES
+                and _ephemeral_request_identity_matches(
+                    store,
+                    state,
+                    entry,
+                    launch_marker,
+                    request_id,
+                )
+                and archive_destination_admitted(request_id, None)
+            ):
+                continue
+            try:
+                prospective = copy.deepcopy(state)
+                stage_attended_ephemeral_archive(
+                    prospective,
+                    request_id,
+                    agent=agent,
+                    launch_marker=launch_marker,
+                    held_terminal=held_terminal,
+                    hold_source_hash="0" * 64,
+                    acknowledged_by=actor,
+                    verification_mode="operator_attested",
+                    verified_launch_nonce=None,
+                    verified_identity_count=0,
+                    reason=(
+                        "operator verified the terminal request can be archived"
+                    ),
+                    now_epoch=(
+                        float(now_epoch)
+                        if isinstance(now_epoch, (int, float))
+                        and not isinstance(now_epoch, bool)
+                        and math.isfinite(float(now_epoch))
+                        else time.time()
+                    ),
+                )
+                _supervisor_json_text(
+                    prospective,
+                    source="prospective attended ephemeral archive",
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            admissions[f"ephemeral:{request_id}"] = {
+                "mode": "ephemeral_archive",
+                "request_id": request_id,
+                "actor": actor,
+                "verification_mode": "operator_attested",
+                "verified_launch_nonce": None,
+                "reason": "operator verified the terminal request can be archived",
+            }
+    # Identity probes and marker reads can outlive the context snapshot above.
+    # Recheck every shared command precondition before advertising an argv.
+    context = context_state()
+    if context == "unavailable":
+        return {"evaluated": False, "admissions": {}}
+    if context == "blocked":
+        return {"evaluated": True, "admissions": {}}
+    if context == "kill_switch_absent":
+        blocked_admissions: dict[str, dict] = {}
+        for identity, admission in admissions.items():
+            if admission.get("mode") == "configured_reset":
+                blocked_admissions[identity] = {
+                    "mode": "configured_reset",
+                    "agent": admission["agent"],
+                    "missing_precondition": "supervisor_kill_switch_absent",
+                }
+            elif admission.get("mode") == "ephemeral_archive":
+                blocked_admissions[identity] = {
+                    "mode": "ephemeral_archive",
+                    "request_id": admission["request_id"],
+                    "missing_precondition": "supervisor_kill_switch_absent",
+                }
+        return {
+            "evaluated": True,
+            "admissions": {},
+            "blocked_admissions": blocked_admissions,
+        }
+    return {"evaluated": True, "admissions": admissions}
+
+
 def _validated_process_tree_reset_audit(state: dict) -> list[dict]:
     audit = state.get("process_tree_resets")
     if audit is None:
@@ -8635,11 +10839,7 @@ def reset_process_tree_ownership_after_attended_teardown(
     ):
         raise ValueError("hold source hash must be 64 lowercase hexadecimal characters")
     cleaned_reason = reason.strip() if isinstance(reason, str) else ""
-    if (
-        not cleaned_reason
-        or len(cleaned_reason) > 500
-        or any(ord(char) < 32 for char in cleaned_reason)
-    ):
+    if not eph.is_safe_reason(cleaned_reason):
         raise ValueError("reason must be a non-empty single line of at most 500 characters")
     if recorded_identities_gone is not True:
         raise ValueError("every recorded pid/start identity must be gone or recycled")
@@ -8685,7 +10885,6 @@ def reset_process_tree_ownership_after_attended_teardown(
             else None
         ),
     }
-
     reset_epoch = (
         float(now_epoch)
         if now_epoch is not None
@@ -8705,6 +10904,7 @@ def reset_process_tree_ownership_after_attended_teardown(
         "owned_process_tree",
         "legacy_process_evidence",
         "process_tree_hold_reason",
+        "wrapper_recognition",
         "runtime_wrapper_generation",
         "runtime_turn_generation",
         "runtime_phase",
@@ -8752,6 +10952,86 @@ def reset_process_tree_ownership_after_attended_teardown(
     })
     state["process_tree_resets"] = audit[-64:]
     return state
+
+
+def attach_regular_launch_admissions(
+    plan: dict,
+    config: dict,
+    *,
+    root: str | Path,
+    session_id_factory: Callable[[], str] | None = None,
+) -> dict:
+    """Attach exact typed launch artifacts to executable regular actions.
+
+    ``plan_actions`` stays deterministic.  This transport finalizer runs only
+    after the executor has bound the exact config bytes and project root; it is
+    also the sole place a fresh Claude session id is minted, so PowerShell never
+    reconstructs or mutates the admitted base argv.
+    """
+    if not isinstance(plan, dict) or not isinstance(config, dict):
+        return plan
+    factory = session_id_factory or (lambda: str(uuid.uuid4()))
+    config_agents = config.get("agents")
+    plan_agents = plan.get("agents")
+    if not isinstance(config_agents, dict) or not isinstance(plan_agents, dict):
+        return plan
+    for agent, decision in plan_agents.items():
+        if (
+            not isinstance(decision, dict)
+            or decision.get("action") not in {RELAUNCH, STUCK_RECOVER}
+        ):
+            continue
+        row = config_agents.get(agent)
+        if not isinstance(row, dict):
+            decision["launch_admission"] = _launch_admission_refusal(
+                population="regular",
+                agent=str(agent),
+                reason="the configured launch entry is unavailable",
+            )
+            continue
+        effective_session_args = list(decision.get("session_args") or [])
+        if (
+            decision.get("launch_mode") == "fresh"
+            and "{SESSION_ID}" in effective_session_args
+        ):
+            try:
+                minted_session_id = factory()
+            except Exception as exc:  # noqa: BLE001 - refusal is transport data
+                decision["launch_admission"] = _launch_admission_refusal(
+                    population="regular",
+                    agent=str(agent),
+                    reason=f"fresh session identity could not be minted: {exc}",
+                )
+                continue
+            if _valid_launch_token(minted_session_id, allow_empty=False) is None:
+                decision["launch_admission"] = _launch_admission_refusal(
+                    population="regular",
+                    agent=str(agent),
+                    reason="fresh session identity was invalid",
+                )
+                continue
+            effective_session_args = [
+                minted_session_id if argument == "{SESSION_ID}" else argument
+                for argument in effective_session_args
+            ]
+            decision["session_id"] = minted_session_id
+        candidate, problem = _effective_launch_candidate(
+            row,
+            population="regular",
+            agent=str(agent),
+            root=root,
+            session_args=effective_session_args,
+        )
+        decision["launch_admission"] = (
+            candidate.artifact()
+            if candidate is not None
+            else _launch_admission_refusal(
+                population="regular",
+                agent=str(agent),
+                reason=problem or "configured launch admission was refused",
+            )
+        )
+    return plan
 
 
 def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
@@ -8843,12 +11123,15 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
 
 
 def prepare_launch_request(store: Store, state: dict, config: dict, request_id: str,
-                           *, now_epoch: float, claimed_by: str = "supervisor") -> dict:
+                           *, now_epoch: float, claimed_by: str = "supervisor",
+                           launch_agenttalk_python: str | None = None,
+                           launch_src_on_pythonpath: bool | None = None) -> dict:
     """Claim and prepare one queued ephemeral launch request.
 
     Side effects are deliberately before process launch and are request-id
     checked: claim marker, roster temporary identity, send the review-request,
-    persist active supervisor state, and return a fully substituted launch spec.
+    mutate the supplied active state, and return a fully substituted launch
+    spec. The caller is responsible for durably persisting that state.
     """
     marker0 = store.read_launch_request(request_id)
     if marker0 is None:
@@ -8942,51 +11225,171 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
             ),
         )
         raise
-    store.update_launch_request(request_id, {
+    prepared_updates = {
         "state": eph.STATE_REQUESTED,
         "agent": agent,
         "review_request_msg_id": msg.id,
         "requested_at": eph.utc_now(),
         "requested_at_epoch": now_epoch,
+        "timeout_seconds": timeout,
         "lane_id": lane_id,
         "workspace_path": workspace_path,
-    })
-    eph.record_prepared(
-        state,
-        request_id=request_id,
-        agent=agent,
-        requested_by=marker["requested_by"],
-        profile=str(marker.get("profile", "")),
-        timeout_seconds=timeout,
-        now_epoch=now_epoch,
-        review_request_id=msg.id,
-        cli=(
-            profile.get("cli")
-            if isinstance(profile.get("cli"), str)
-            else "codex"
-        ),
-        launch=(
-            profile.get("launch")
-            if isinstance(profile.get("launch"), dict)
-            else None
-        ),
+        "scope": marker.get("scope"),
+    }
+    expected_marker = {**marker, **prepared_updates}
+    durable_marker = store.update_launch_request(
+        request_id,
+        prepared_updates,
     )
-    spec = eph.launch_spec(marker, profile, agent)
-    if workspace_path:
-        spec["lane_id"] = lane_id
-        spec["workspace_path"] = workspace_path
-        spec["cwd"] = workspace_path
-        if spec.get("cli") == "codex":
-            launch = spec.setdefault("launch", {})
-            args = list(launch.get("windows_args") or [])
-            if not any(args[i] == "--add-dir" and i + 1 < len(args)
-                       and str(args[i + 1]) == workspace_path for i in range(len(args))):
-                args = ["--add-dir", workspace_path, *args]
-            launch["windows_args"] = args
+    if not isinstance(durable_marker, dict):
+        try:
+            store.retire_agent(
+                agent,
+                reason=(
+                    f"ephemeral launch {request_id} failed because its "
+                    "request marker disappeared during preparation"
+                ),
+            )
+        except ValueError:
+            pass
+        raise eph.EphemeralError(
+            f"launch request {request_id!r} disappeared during preparation"
+        )
+    try:
+        durable_errors, durable_profile = eph.validate_launch_request(
+            durable_marker,
+            store.load_config(),
+            config,
+        )
+        expected_request_digest = eph.effective_launch_request_digest(
+            expected_marker
+        )
+        durable_request_digest = eph.effective_launch_request_digest(
+            durable_marker
+        )
+    except (OSError, TypeError, ValueError) as validation_error:
+        durable_errors = [
+            f"durable launch admission was unavailable: {validation_error}"
+        ]
+        durable_profile = None
+        expected_request_digest = None
+        durable_request_digest = None
+    if (
+        durable_errors
+        or durable_profile is None
+        or durable_request_digest != expected_request_digest
+    ):
+        failure_reason = (
+            "; ".join(durable_errors)
+            if durable_errors
+            else "launch request changed during durable preparation"
+        )
+        extra = {"agent": agent}
+        try:
+            store.retire_agent(
+                agent,
+                reason=(
+                    f"ephemeral launch {request_id} failed durable "
+                    "launch admission"
+                ),
+            )
+        except ValueError as cleanup_error:
+            extra["cleanup_error"] = str(cleanup_error)
+        store.archive_launch_request(
+            request_id,
+            eph.terminal_archive(
+                durable_marker,
+                terminal_state=eph.STATE_FAILED,
+                reason=f"failed durable launch admission: {failure_reason}",
+                at_epoch=now_epoch,
+                extra=extra,
+            ),
+        )
+        raise eph.EphemeralError(failure_reason)
+    profile = durable_profile
+    spec = eph.launch_spec(
+        durable_marker,
+        profile,
+        agent,
+        root=store.root,
+    )
     window_style, warning = resolve_window_style(config, profile)
     spec["window_style"] = window_style
     spec["window_style_warning"] = warning
     spec["review_request_msg_id"] = msg.id
+    try:
+        _normalize_ephemeral_launch_root(spec, store.root)
+        _pin_ephemeral_launch_executables(spec, store.root)
+        spec["recovery_environment"] = _ephemeral_recovery_environment(
+            store.root,
+            spec,
+            agent,
+            launch_agenttalk_python=launch_agenttalk_python,
+            launch_src_on_pythonpath=launch_src_on_pythonpath,
+        )
+        launch_candidate, launch_problem = _effective_launch_candidate(
+            spec,
+            population="ephemeral",
+            agent=agent,
+            root=store.root,
+            request_id=request_id,
+            lane_id=lane_id,
+        )
+        if launch_candidate is None:
+            raise eph.EphemeralError(
+                launch_problem or "ephemeral launch admission was refused"
+            )
+        spec["launch_admission"] = launch_candidate.artifact()
+        review_request_sha256 = eph.effective_review_request_digest(msg)
+        effective_launch_binding = eph.make_effective_launch_binding(
+            durable_marker,
+            spec,
+            review_request_sha256=review_request_sha256,
+        )
+        eph.record_prepared(
+            state,
+            request_id=request_id,
+            agent=agent,
+            requested_by=durable_marker["requested_by"],
+            profile=str(durable_marker.get("profile", "")),
+            timeout_seconds=timeout,
+            now_epoch=now_epoch,
+            review_request_id=msg.id,
+            cli=(
+                profile.get("cli")
+                if isinstance(profile.get("cli"), str)
+                else "codex"
+            ),
+            launch=(
+                profile.get("launch")
+                if isinstance(profile.get("launch"), dict)
+                else None
+            ),
+            effective_launch_binding=effective_launch_binding,
+        )
+    except eph.EphemeralError as binding_error:
+        extra = {"agent": agent}
+        try:
+            store.retire_agent(
+                agent,
+                reason=(
+                    f"ephemeral launch {request_id} failed before durable "
+                    "launch binding"
+                ),
+            )
+        except ValueError as cleanup_error:
+            extra["cleanup_error"] = str(cleanup_error)
+        store.archive_launch_request(
+            request_id,
+            eph.terminal_archive(
+                durable_marker,
+                terminal_state=eph.STATE_FAILED,
+                reason=f"failed to bind prepared launch evidence: {binding_error}",
+                at_epoch=now_epoch,
+                extra=extra,
+            ),
+        )
+        raise
     return spec
 
 
@@ -9116,12 +11519,7 @@ def _validate_attended_ephemeral_archive_pending(
     ):
         raise ValueError("attended ephemeral archive timestamp is invalid")
     reason = value.get("reason")
-    if (
-        not isinstance(reason, str)
-        or not reason
-        or len(reason) > 500
-        or any(ord(char) < 32 for char in reason)
-    ):
+    if not eph.is_safe_reason(reason):
         raise ValueError("attended ephemeral archive reason is invalid")
     terminal = eph.validate_held_terminal(value.get("terminal"))
     if terminal is None:
@@ -9175,6 +11573,159 @@ def _validate_attended_ephemeral_archive_pending(
     return copy.deepcopy(value)
 
 
+def _active_ephemeral_hold_matches_archive(
+    entry: object,
+    record: dict,
+    request_id: str,
+) -> bool:
+    """Return whether the live HOLD is exactly the one a journal stages."""
+    return bool(
+        isinstance(entry, dict)
+        and entry.get("request_id") == request_id
+        and entry.get("agent") == record.get("agent")
+        and eph.validate_held_terminal(entry.get("held_terminal"))
+        == record.get("terminal")
+    )
+
+
+def _valid_ephemeral_identity_epoch(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        epoch = float(value)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(epoch) and 0 <= epoch <= 253_402_300_799
+
+
+def _valid_ephemeral_allocation_history(history: list) -> bool:
+    """Return whether every persisted allocation row has a closed shape."""
+    for row in history:
+        if not isinstance(row, dict):
+            return False
+        epoch = row.get("at_epoch")
+        try:
+            validate_agent_name(row.get("agent"))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not eph.is_safe_id(row.get("request_id"))
+            or not _valid_ephemeral_identity_epoch(epoch)
+        ):
+            return False
+    return True
+
+
+def _legacy_pruned_ephemeral_allocation_matches(
+    entry: dict,
+    marker: dict,
+    request_id: str,
+) -> bool:
+    """Recognize only unambiguous pre-version allocation evidence.
+
+    Older releases could prune a still-active request's history row after 24
+    hours.  Require the exact agent shape that the request allocator could
+    have minted; the marker, entry, and original review request then supply
+    the remaining independent durable bindings.
+    """
+    if "identity_binding_version" in entry:
+        return False
+    agent = entry.get("agent")
+    if (
+        not eph.agent_name_matches_request(request_id, agent)
+        or marker.get("claimed_by") != "supervisor"
+        or entry.get("profile") != marker.get("profile")
+    ):
+        return False
+    epochs = (
+        entry.get("prepared_epoch"),
+        marker.get("claimed_at_epoch"),
+        marker.get("requested_at_epoch"),
+    )
+    if not all(_valid_ephemeral_identity_epoch(epoch) for epoch in epochs):
+        return False
+    return float(epochs[0]) == float(epochs[1]) == float(epochs[2])
+
+
+def _ephemeral_request_identity_matches(
+    store: Store,
+    state: dict,
+    entry: object,
+    marker: object,
+    request_id: str,
+) -> bool:
+    """Whether durable request evidence binds one temporary identity exactly."""
+    if not isinstance(entry, dict) or not isinstance(marker, dict):
+        return False
+    root = state.get("ephemeral_reviewers") if isinstance(state, dict) else None
+    history = root.get("launch_history") if isinstance(root, dict) else None
+    agent = entry.get("agent")
+    requested_by = entry.get("requested_by")
+    review_request_id = entry.get("review_request_id")
+    if not (
+        entry.get("request_id") == request_id
+        and marker.get("request_id") == request_id
+        and marker.get("agent") == agent
+        and marker.get("requested_by") == requested_by
+        and marker.get("review_request_msg_id") == review_request_id
+        and isinstance(requested_by, str)
+        and isinstance(review_request_id, str)
+        and eph.agent_name_matches_request(request_id, agent)
+        and marker.get("state") in eph.ACTIVE_STATES
+        and not eph.validate_marker(marker)
+        and isinstance(history, list)
+    ):
+        return False
+    if not _valid_ephemeral_allocation_history(history):
+        return False
+    binding_version_present = "identity_binding_version" in entry
+    binding_version = entry.get("identity_binding_version")
+    if (
+        binding_version_present
+        and (type(binding_version) is not int or binding_version != 1)
+    ):
+        return False
+    allocation_rows = [row for row in history if row.get("agent") == agent]
+    legacy_pruned = not binding_version_present and not allocation_rows and (
+        _legacy_pruned_ephemeral_allocation_matches(
+            entry,
+            marker,
+            request_id,
+        )
+    )
+    if not legacy_pruned and not (
+        allocation_rows
+        and all(row.get("request_id") == request_id for row in allocation_rows)
+    ):
+        return False
+    try:
+        messages = store.valid_messages()
+    except (OSError, TypeError, ValueError):
+        return False
+    return any(
+        message.id == review_request_id
+        and message.kind == "review-request"
+        and message.sender == requested_by
+        and message.recipient == agent
+        and message.meta.get("request_id") == request_id
+        and message.meta.get("ephemeral_request_id") == request_id
+        and message.meta.get("evidence_only") == "true"
+        and message.meta.get("counted_signoff") == "false"
+        and (
+            not legacy_pruned
+            or (
+                message.subject == f"ephemeral review {request_id}"
+                and message.body == eph.review_request_body(marker, agent)
+                and message.meta.get("profile") == marker.get("profile")
+                and message.meta.get("skill") == marker.get("skill")
+                and message.meta.get("revision")
+                == (marker.get("scope") or {}).get("revision")
+            )
+        )
+        for message in messages
+    )
+
+
 def attended_ephemeral_archive_pending(
     state: dict,
     request_id: str,
@@ -9217,6 +11768,12 @@ def stage_attended_ephemeral_archive(
     now_epoch: float,
 ) -> dict:
     """Persist all authority and payload needed for an idempotent retry."""
+    root = eph.ensure_state(state)
+    active_entry = root["active"].get(request_id)
+    if _wrapper_recognition_is_unknown(active_entry):
+        raise ValueError(
+            "wrapper recognition is unknown and retryable; request cannot be archived"
+        )
     terminal = eph.validate_held_terminal(held_terminal)
     if terminal is None:
         raise ValueError("ephemeral HOLD has no valid terminal disposition")
@@ -9259,7 +11816,6 @@ def stage_attended_ephemeral_archive(
         "terminal": terminal,
         "archive_payload": payload,
     })
-    root = eph.ensure_state(state)
     pending = root.setdefault("attended_archive_pending", {})
     if not isinstance(pending, dict) or len(pending) > 64:
         raise ValueError("attended ephemeral archive journals are malformed")
@@ -9290,15 +11846,23 @@ def finish_attended_ephemeral_archive(
     root = eph.ensure_state(state)
     active = root["active"]
     entry = active.get(request_id)
-    if (
-        not isinstance(entry, dict)
-        or entry.get("request_id") != request_id
-        or entry.get("agent") != record["agent"]
-        or eph.validate_held_terminal(entry.get("held_terminal"))
-        != record["terminal"]
-    ):
+    if _wrapper_recognition_is_unknown(entry):
+        raise ValueError(
+            "wrapper recognition is unknown and retryable; request cannot be archived"
+        )
+    if not _active_ephemeral_hold_matches_archive(entry, record, request_id):
         raise ValueError(
             "active ephemeral HOLD changed after its attended archive was staged"
+        )
+    if not _ephemeral_request_identity_matches(
+        store,
+        state,
+        entry,
+        record["archive_payload"]["original"],
+        request_id,
+    ):
+        raise eph.EphemeralError(
+            "ephemeral identity does not match the request"
         )
     if not store.complete_launch_request_archive(
         request_id,
@@ -9351,10 +11915,24 @@ def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,
     marker = store.read_launch_request(request_id)
     root = eph.ensure_state(state)
     entry = root["active"].get(request_id)
+    if _wrapper_recognition_is_unknown(entry):
+        raise ValueError(
+            "wrapper recognition is unknown and retryable; request cannot be archived"
+        )
     entry = entry if isinstance(entry, dict) else {}
     agent = entry.get("agent") or (marker or {}).get("agent")
     retire_error = None
     if retire and isinstance(agent, str):
+        if not _ephemeral_request_identity_matches(
+            store,
+            state,
+            entry,
+            marker,
+            request_id,
+        ):
+            raise eph.EphemeralError(
+                "ephemeral identity does not match the request"
+            )
         try:
             cfg = store.load_config()
             if agent in (cfg.get("agents") or []):
@@ -9462,7 +12040,7 @@ CONFIG_TEMPLATE = """\
         "windows_args": ["{SESSION_ARGS}"],
         "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
-      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor launches the real file directly with the quoted argument line, working directory, and returned PID AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
+      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor launches the real file directly with the quoted argument line, working directory, and returned PID after applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env), then restores the parent. These configured values are not proof of the exact environment a child receives. The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the project shim consumes AGENTTALK_PYTHON when invoked, and a regular launch may inherit an ambient value. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
       "_comment_liveness": "For this MANUAL archetype heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck. The hook runs `agenttalk heartbeat --hook` (soft: it can never block a tool call). For a NON-wrapped codex agent with activity_hook=true, the supervisor adds the GLOBAL --dangerously-bypass-hook-trust to the codex launch: the installed agenttalk hook changes codex's hook-trust hash and would otherwise PROMPT to re-trust on every unattended launch and strand the agent. This bypasses hook-trust for the supervisor's OWN hook, for controlled UNATTENDED supervision only (a wrapped codex does not use the activity hook and is unaffected)."
     },
@@ -9751,7 +12329,13 @@ if ($DryRun) {
 
 try {
 function Read-SupervisorConfig {
-  $value = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+  $bytes = [IO.File]::ReadAllBytes($ConfigPath)
+  $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+  $text = $strictUtf8.GetString($bytes)
+  if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) {
+    $text = $text.Substring(1)
+  }
+  $value = $text | ConvertFrom-Json
   if (($null -eq $value) -or
       (($value -isnot [System.Management.Automation.PSCustomObject]) -and
        ($value -isnot [hashtable]))) {
@@ -9763,9 +12347,19 @@ function Read-SupervisorConfig {
        ($agents.Value -isnot [hashtable]))) {
     throw "supervisor config agents must be a JSON object"
   }
+  $hasher = [Security.Cryptography.SHA256]::Create()
+  try {
+    $script:SupervisorConfigSha256 = (
+      [BitConverter]::ToString($hasher.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+    )
+  } finally {
+    $hasher.Dispose()
+  }
   return $value
 }
+$script:SupervisorConfigSha256 = $null
 $cfg = Read-SupervisorConfig
+$cfgSha256 = $script:SupervisorConfigSha256
 # Baked at `supervise --init`: the Python that runs the bus + whether this is a
 # source checkout (prepend <root>/src to PYTHONPATH) vs a pip install.
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
@@ -9952,12 +12546,23 @@ function Quote-Arg([string]$a) {
 }
 # endregion quote-arg
 # region exec-helpers  (extracted verbatim by the test harness with kill-switch stubs)
-if (-not ('AgenttalkSupervisorNativeV2' -as [type])) {
+if (-not ('AgenttalkSupervisorNativeV3' -as [type])) {
   Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
-public static class AgenttalkSupervisorNativeV2 {
+public static class AgenttalkSupervisorNativeV3 {
+    public sealed class EnvironmentVariableState {
+        public bool Present { get; private set; }
+        public string Value { get; private set; }
+
+        public EnvironmentVariableState(bool present, string value) {
+            Present = present;
+            Value = value;
+        }
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr OpenProcess(
         UInt32 desiredAccess, bool inheritHandle, UInt32 processId);
@@ -9980,15 +12585,110 @@ public static class AgenttalkSupervisorNativeV2 {
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int CompareStringOrdinal(
+        string left, int leftLength, string right, int rightLength,
+        [MarshalAs(UnmanagedType.Bool)] bool ignoreCase);
+
+    [DllImport(
+        "kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true,
+        EntryPoint = "SetEnvironmentVariableW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetEnvironmentVariableNative(
+        string name, string value);
+
+    public static bool SetEmptyEnvironmentVariable(string name) {
+        return SetEnvironmentVariableNative(name, String.Empty);
+    }
+
+    public static bool DeleteEnvironmentVariable(string name) {
+        return SetEnvironmentVariableNative(name, null);
+    }
+
+    [DllImport(
+        "kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true,
+        EntryPoint = "GetEnvironmentVariableW")]
+    private static extern UInt32 GetEnvironmentVariableNative(
+        string name, StringBuilder value, UInt32 size);
+
+    [DllImport("kernel32.dll", EntryPoint = "SetLastError")]
+    private static extern void SetLastErrorNative(UInt32 errorCode);
+
+    public static EnvironmentVariableState ReadEnvironmentVariable(string name) {
+        const int ErrorEnvironmentVariableNotFound = 203;
+        StringBuilder value = new StringBuilder(32768);
+        SetLastErrorNative(0);
+        UInt32 length = GetEnvironmentVariableNative(
+            name, value, (UInt32)value.Capacity);
+        if (length == 0) {
+            int error = Marshal.GetLastWin32Error();
+            if (error == ErrorEnvironmentVariableNotFound) {
+                return new EnvironmentVariableState(false, null);
+            }
+            if (error == 0) {
+                return new EnvironmentVariableState(true, String.Empty);
+            }
+            throw new InvalidOperationException(
+                "GetEnvironmentVariableW failed with error " + error);
+        }
+        if (length >= value.Capacity) {
+            throw new InvalidOperationException(
+                "environment variable exceeds the native value bound");
+        }
+        return new EnvironmentVariableState(
+            true, value.ToString(0, (int)length));
+    }
 }
 '@
+}
+function Restore-AgenttalkEnvironment($saved) {
+  foreach ($k in $saved.Keys) {
+    $prior = $saved[$k]
+    if (-not $prior.Present) {
+      Remove-Item -LiteralPath ("Env:" + $k) -ErrorAction SilentlyContinue
+    } elseif ([string]$prior.Value -eq '') {
+      # Windows PowerShell 5.1's Env: provider turns an empty value into
+      # absence and caches that view. Invalidate the provider view first, then
+      # use the native process-environment boundary for this third state so an
+      # apply failure cannot mutate present-empty to absent on this or the next
+      # launch.
+      Remove-Item -LiteralPath ("Env:" + $k) -ErrorAction SilentlyContinue
+      if (-not [AgenttalkSupervisorNativeV3]::SetEmptyEnvironmentVariable(
+          [string]$k)) {
+        throw "supervisor: failed to restore an empty environment value"
+      }
+    } else {
+      Set-Item -LiteralPath ("Env:" + $k) -Value $prior.Value
+    }
+  }
+}
+function Set-AgenttalkEnvironmentMapEntry($entries, [string]$name, $value) {
+  # PowerShell's string comparers do not model the Win32 environment-name
+  # identity consistently across 5.1 and 7. Collapse aliases with the same
+  # native comparison used at the process-environment boundary so one native
+  # variable is saved, mutated, and restored exactly once.
+  $target = $name
+  $found = $false
+  foreach ($candidate in @($entries.Keys)) {
+    $comparison = [AgenttalkSupervisorNativeV3]::CompareStringOrdinal(
+      [string]$candidate, -1, $name, -1, $true)
+    if ($comparison -notin @(0, 2)) { continue }
+    if (-not $found) {
+      $target = [string]$candidate
+      $found = $true
+    } else {
+      $null = $entries.Remove($candidate)
+    }
+  }
+  $entries[$target] = $value
 }
 function Open-AgenttalkProcessHandle($procId) {
   if (-not $procId) { return $null }
   # SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION. The
   # one returned handle is the identity certificate, destructive capability,
   # and termination-completion signal.
-  $handle = [AgenttalkSupervisorNativeV2]::OpenProcess(
+  $handle = [AgenttalkSupervisorNativeV3]::OpenProcess(
     [uint32]0x101001, $false, [uint32]$procId)
   if ($handle -eq [IntPtr]::Zero) { return $null }
   return $handle
@@ -9999,7 +12699,7 @@ function Get-AgenttalkProcessHandleStartFiletime($handle) {
   [long]$exit = 0
   [long]$kernel = 0
   [long]$user = 0
-  if (-not [AgenttalkSupervisorNativeV2]::GetProcessTimes(
+  if (-not [AgenttalkSupervisorNativeV3]::GetProcessTimes(
       $handle, [ref]$creation, [ref]$exit, [ref]$kernel, [ref]$user)) {
     return $null
   }
@@ -10007,16 +12707,16 @@ function Get-AgenttalkProcessHandleStartFiletime($handle) {
 }
 function Stop-AgenttalkProcessHandle($handle) {
   if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $false }
-  return [AgenttalkSupervisorNativeV2]::TerminateProcess($handle, [uint32]1)
+  return [AgenttalkSupervisorNativeV3]::TerminateProcess($handle, [uint32]1)
 }
 function Wait-AgenttalkProcessHandleExit($handle, $timeoutMilliseconds) {
   if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $false }
-  return [AgenttalkSupervisorNativeV2]::WaitForSingleObject(
+  return [AgenttalkSupervisorNativeV3]::WaitForSingleObject(
     $handle, [uint32]$timeoutMilliseconds) -eq [uint32]0
 }
 function Close-AgenttalkProcessHandle($handle) {
   if ($null -ne $handle -and $handle -ne [IntPtr]::Zero) {
-    [void][AgenttalkSupervisorNativeV2]::CloseHandle($handle)
+    [void][AgenttalkSupervisorNativeV3]::CloseHandle($handle)
   }
 }
 function Proc-Start($procId) {
@@ -10144,301 +12844,6 @@ function Stop-Tree($targets) {
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
-function Test-AgenttalkAllowedInterpreterPrefixToken([string]$token) {
-  # ALLOWLIST, not a reject list. (I2, 5th leak: --version/-V/-h/-?/--help*
-  # ran NO program at all - CPython prints and exits before ever reaching
-  # -m - which a REJECT list closed over "which tokens change execution
-  # mode" can never catch, because refusing NO-program tokens is a
-  # different property than refusing WRONG-program tokens, and a reject
-  # list accepts anything it does not specifically know to be dangerous.
-  # The property that actually matters is "does CPython reach the
-  # declared module", and the only check that can never leak by omission
-  # is refusing everything not affirmatively known-safe.)
-  #
-  # Each entry justified against what THIS project actually needs in a
-  # declared prefix, not "seems safe in the abstract":
-  #   -u  unbuffered stdout/stderr - serves #117 directly: an unbuffered
-  #       child flushes into BoundedStreamTee promptly instead of sitting
-  #       in CPython's own buffer.
-  #   -I  isolated mode (implies -E -P -S) - hardening; does not change
-  #       WHICH module CPython reaches, only what environment it sees
-  #       once there.
-  #   -S  skip implicit 'import site' - hardening. NOTE: can break
-  #       resolving `agenttalk` itself if it is installed via
-  #       site-packages rather than reachable without site processing -
-  #       a launch-configuration footgun for the operator to own, not a
-  #       security bypass of this check.
-  #   -B  never write .pyc files - no execution-mode or security effect.
-  #   -E  ignore PYTHON* environment variables - hardening. NOTE: can
-  #       break a dev checkout relying on PYTHONPATH (SrcOnPyPath) - same
-  #       kind of launch-configuration caveat as -S, not a check gap.
-  #
-  #   ROUND 24 CORRECTION to the -S/-E footgun classification above: the
-  #   original wording ("CPython still reaches -m agenttalk, or fails
-  #   loudly with ModuleNotFoundError") assumed that failure would be
-  #   OBSERVED somewhere before it mattered. The connector proved a third
-  #   outcome that assumption missed: on a source checkout resolving
-  #   `agenttalk` only via injected PYTHONPATH, an allowed -E/-S/-I broke
-  #   the REAL wrapped launch's import while Preflight - which ran a bare
-  #   `-m agenttalk --version` with NO declared prefix - never exercised
-  #   the failure and reported success anyway, so the supervisor relaunched
-  #   a wrapper that exits before cmd_wrap, SILENTLY, in a loop. That is a
-  #   genuinely different failure mode than "fails loudly", not a smaller
-  #   version of it. The footgun classification holds again now that
-  #   Preflight tests the CONFIGURED invocation (see
-  #   Resolve-AgenttalkLaunchPrefixTokens) - CPython really does either
-  #   reach -m agenttalk or fail loudly, because Preflight's own probe
-  #   fails the SAME way the real launch would, before a relaunch loop
-  #   ever starts. That guarantee is now Preflight's job, not an assumption
-  #   this allowlist gets to make on its own: if Preflight is ever called
-  #   without the declared prefix again (a fidelity regression), -S/-E/-I
-  #   silently fail-open the same way, and this classification is wrong
-  #   again. NOTE this guarantee does not extend to ephemeral reviewer
-  #   launches (Launch-Spec) - that path has no Preflight call at all,
-  #   for any prefix or any other misconfiguration, a broader and
-  #   pre-existing gap this round's fix does not close.
-  #   -P  don't prepend a possibly-unsafe path to sys.path - hardening.
-  #   -X  implementation-specific options, ATTACHED form only (e.g.
-  #       -Xutf8) - CPython's own scanner always continues past -X to the
-  #       next token; it never changes or suppresses execution by itself.
-  #       The bare, separate-token form (-X utf8) is refused: a value
-  #       token dangling after a bare -X is indistinguishable from a
-  #       script-path token without knowing -X consumes a value, which is
-  #       exactly the "which flags consume a value" problem this
-  #       mechanism declines to solve (round 4).
-  #   -b  warn (doubled as -bb, error) on str(bytes)/str(bytearray) and
-  #       bytes-vs-str comparisons - diagnostic only, same shape and same
-  #       no-execution-mode-effect as -B; never consumes a value, so it
-  #       needs no attached/separate distinction.
-  #   -W  warning-filter control, ATTACHED form only (e.g. -Wignore) -
-  #       same "CPython's scanner always continues past it" property as
-  #       -X, and the same bare-form refusal for the same reason (a value
-  #       token dangling after a bare -W is indistinguishable from a
-  #       script-path token). NOTE: -Werror is a genuine footgun - any
-  #       warning the launched code triggers becomes a crash instead of a
-  #       log line - a launch-configuration risk for the operator to own,
-  #       the same category as -S's and -E's own NOTE above, not a
-  #       security bypass of this check. ROUND 24 CONNECTOR FINDING,
-  #       PROVEN not reasoned: -W's value grammar is
-  #       action:message:category:module:lineno, and
-  #       warnings._getcategory IMPORTS a non-empty, DOTTED category
-  #       (module, _, klass = category.rpartition('.');
-  #       __import__(module)) before -m agenttalk is ever reached - the
-  #       same before-main, execution-mode-changing property as -X
-  #       presite, just reachable through -W's own attached value instead
-  #       of a sub-option. Confirmed with `PYTHONPATH=. python3
-  #       -Wignore::evil.W -c "..."`: evil's top-level code runs before
-  #       the -c body does. An empty category (no 3rd field, or an empty
-  #       one) or a category with no dot never reaches that import branch
-  #       (empty -> the default Warning class; no dot -> a plain
-  #       attribute lookup on the builtins module, not an import) - the
-  #       refusal below is scoped to exactly the shape that imports.
-  #
-  # Deliberately excluded despite looking superficially safe:
-  #   -O/-OO strips `assert` statements, and this codebase has already
-  #     been bitten once by code that relied on asserts silently
-  #     vanishing under an optimized launch (814b645) - no reason to
-  #     reopen that class here.
-  #   -i (inspect after running) does not bypass -m, but parks the
-  #     process at an interactive prompt afterward instead of exiting -
-  #     a different failure mode this project has no use for.
-  # Anything else - known CPython flag or novel spelling, safe-looking or
-  # not - is refused. An option CPython adds in a future release fails
-  # closed by default instead of shipping.
-  # -ceq/-cstartswith throughout: PowerShell's default -eq is
-  # case-INSENSITIVE, which would silently equate e.g. -i with -I - two
-  # DIFFERENT CPython flags (-i inspects after running; -I is isolated
-  # mode) - and let the deliberately-excluded lowercase form through the
-  # allowlist by accident.
-  if ($token -ceq '-u' -or $token -ceq '-I' -or $token -ceq '-S' -or
-      $token -ceq '-B' -or $token -ceq '-E' -or $token -ceq '-P' -or
-      $token -ceq '-b' -or $token -ceq '-bb') {
-    return $true
-  }
-  if ($token.Length -gt 2 -and (
-      $token.StartsWith('-X', [StringComparison]::Ordinal) -or
-      $token.StartsWith('-W', [StringComparison]::Ordinal)
-  )) {
-    # -X presite=MODULE (debug builds only) imports an arbitrary module
-    # BEFORE site initialization - before anything else CPython does,
-    # including reaching -m agenttalk. Same before-main,
-    # execution-mode-changing property as -c/-m/a bare script path, just
-    # spelled as a -X sub-option instead of its own flag - the ONE
-    # attached -X form this allowlist must still refuse. Surveyed the rest
-    # of CPython's documented -X options for the same property: importtime,
-    # dev, utf8, pycache_prefix, int_max_str_digits, frozen_modules,
-    # faulthandler, showrefcount, tracemalloc, no_debug_ranges,
-    # warn_default_encoding - every one of them only configures behavior or
-    # enables a BUILT-IN diagnostic; none imports operator-supplied code
-    # ahead of anything else. presite is the only one with this shape.
-    if ($token.StartsWith('-X', [StringComparison]::Ordinal) -and
-        $token.Substring(2) -clike 'presite*') {
-      return $false
-    }
-    if ($token.StartsWith('-W', [StringComparison]::Ordinal)) {
-      # See the -W bullet above: refuse only when a category field (the
-      # 3rd colon-separated component of the value) is present AND
-      # dotted - that is the exact shape warnings._getcategory imports.
-      $categoryField = $token.Substring(2).Split(':')
-      if ($categoryField.Count -gt 2 -and $categoryField[2].Contains('.')) {
-        return $false
-      }
-    }
-    return $true
-  }
-  return $false
-}
-function Resolve-AgenttalkModuleFlagIndex([object[]]$argTokens, $moduleArgsFrom = $null) {
-  # THE ONE place that recognizes a `python -m agenttalk` invocation - nonce
-  # injection, the bounded-logging eligibility check, and the legacy --root
-  # backfill all need this SAME recognition, and three independent copies is
-  # exactly how a valid `-u`/`-X` launch silently lost the logging capability
-  # while nonce injection (the one copy that had been patched) kept working.
-  #
-  # I2, mechanism change (2nd attempt at bounding CPython's grammar leaked
-  # too - `-c'...'` attached-command forms, and `--check-hash-based-pycs
-  # always`'s separate value, were both missed by the inverted scan).
-  # `python --help` is not a specification safe to re-derive from argv
-  # text, in either direction (an allowlist of safe flags, or a denylist
-  # of unsafe ones) - CPython's option grammar is larger than either
-  # attempt bounded, and stays a moving target.
-  #
-  # STOPPED INFERRING. The boundary between an interpreter-option prefix
-  # and the canonical module invocation is now a DECLARED FACT -
-  # agents.<name>.launch.module_args_from in supervisor.json, defaulting
-  # to 0 (the overwhelmingly common "no interpreter prefix" case, so every
-  # existing config needs zero changes). Whoever configures a launch with
-  # `-u`/`-X .../-P/...` already knows, at config-authoring time, exactly
-  # how many tokens their own prefix occupies - the supervisor no longer
-  # has to reverse-engineer it from the tokens themselves. All that
-  # remains here is a cheap, exact, grammar-independent sanity check: does
-  # the DECLARED position actually hold the literal tokens '-m' 'agenttalk'?
-  # That check can never leak by omission, because it never has to
-  # recognize a single interpreter flag - safe or unsafe - to do its job.
-  #
-  # Returns the declared index if it holds '-m agenttalk', or -1 otherwise
-  # (including an out-of-range declaration - fail closed on a
-  # misconfigured index rather than guess). NOTE: the parameter is NOT
-  # named $args - PowerShell's automatic $args variable silently shadows a
-  # same-named formal parameter, and the function then sees an empty list
-  # regardless of what the caller passed.
-  #
-  # (I2, FINAL gap - narrower each of five rounds, closed by inversion
-  # this time.) Declaring WHERE '-m agenttalk' sits proves the POSITION,
-  # not that CPython ever REACHES it. Every REJECT-list attempt at this
-  # (which flags are safe / which consume a value / which change
-  # execution mode) accepted anything it did not specifically know to be
-  # dangerous, so each novel prefix shape shipped once before the next
-  # round caught it. This is now an ALLOW list - anything in the prefix
-  # that Test-AgenttalkAllowedInterpreterPrefixToken does not affirmatively
-  # recognize is refused, and that function (not this comment) is the
-  # checked source of truth for which tokens those are.
-  #
-  # module_args_from is an operator-declared config value, not argv - a
-  # malformed one ("1x") must not throw under $ErrorActionPreference =
-  # 'Stop' and take the whole supervisor poll down over one agent's typo;
-  # fail soft to -1 like every other "not recognized" case. The bootstrap
-  # config validator is the loud, load-time check; this is defense in
-  # depth for whatever reaches here anyway.
-  $index = 0
-  if ($null -ne $moduleArgsFrom) {
-    try {
-      $index = [int]$moduleArgsFrom
-    } catch {
-      return -1
-    }
-  }
-  if ($index -lt 0 -or $index -ge $argTokens.Count) { return -1 }
-  for ($p = 0; $p -lt $index; $p++) {
-    if (-not (Test-AgenttalkAllowedInterpreterPrefixToken ([string]$argTokens[$p]))) {
-      return -1
-    }
-  }
-  # Case-sensitive: CPython's own option parsing is case-sensitive (-m is
-  # not -M; PowerShell's default -eq is not), and the module name argument
-  # is an exact string CPython passes to the import system verbatim.
-  if ($index + 1 -lt $argTokens.Count -and
-      [string]$argTokens[$index] -ceq '-m' -and
-      [string]$argTokens[$index + 1] -ceq 'agenttalk') {
-    return $index
-  }
-  return -1
-}
-function Resolve-AgenttalkLaunchPrefixTokens($agentConfig) {
-  # THE tokens Preflight must smoke-test WITH, so it tests the CONFIGURED
-  # invocation rather than a fixed stand-in for it (round 24 connector
-  # finding on supervisor.py:3400's -E/-I/-S justification). Reuses
-  # Resolve-AgenttalkModuleFlagIndex - the SAME resolution every other
-  # module_args_from consumer performs - rather than re-deriving where the
-  # prefix ends. Returns @() for the overwhelmingly common case (no
-  # declared prefix, or module_args_from absent/0), and $null if the
-  # declaration does not resolve (out of range, or a token in the prefix
-  # this project does not affirmatively allow) - the caller's job is to
-  # treat $null as the CONFIG ERROR it is, not silently fall back to no
-  # prefix, which would just reintroduce the exact fidelity gap this
-  # exists to close.
-  #
-  # The leading commas below are load-bearing, not style: PowerShell
-  # UNROLLS an array onto the pipeline on `return`, so a caller assigning
-  # the result of a bare `return @()` sees $null, and a bare
-  # `return @('-E')` sees the SCALAR string '-E', not a one-element array
-  # - which then makes `& $file @prefixTokens ...` splat the STRING's
-  # individual CHARACTERS as separate argv tokens (confirmed empirically:
-  # `-E` became two tokens, `-` and `E`). The unary comma operator wraps
-  # the array as a single pipeline object so it survives `return` intact,
-  # at every length including zero and one.
-  $windowsArgs = @($agentConfig.launch.windows_args)
-  $moduleArgsFrom = $agentConfig.launch.module_args_from
-  $mIdx = Resolve-AgenttalkModuleFlagIndex $windowsArgs $moduleArgsFrom
-  if ($mIdx -lt 0) { return $null }
-  if ($mIdx -eq 0) { return ,@() }
-  return ,@($windowsArgs[0..($mIdx - 1)])
-}
-function Ensure-AgenttalkWrapRootArg($argv, $moduleArgsFrom = $null) {
-  # Older supervisor.json files launched wrappers as:
-  #   python.exe -m agenttalk wrap --for NAME --loop ...
-  # and relied on AGENTTALK_ROOT in the environment. Win32_Process exposes only
-  # the command line, so the planner/barrier could not attribute surviving
-  # wrapper processes to this project. Normalize the argv at the executor
-  # boundary so stale configs become parser-visible without editing config.
-  $args = @($argv)
-  if ($args.Count -eq 0) { return $args }
-  $scan = 0
-  $flagIndex = Resolve-AgenttalkModuleFlagIndex $args $moduleArgsFrom
-  if ($flagIndex -ge 0) { $scan = $flagIndex + 2 }
-  $rootPresent = $false
-  $wrapIndex = -1
-  $i = $scan
-  while ($i -lt $args.Count) {
-    # Case-sensitive throughout: these are the CLI's own global option and
-    # subcommand spellings, and argparse matches them case-sensitively -
-    # PowerShell's default -eq/-like would treat a differently-cased
-    # config token as if it matched, when the real CLI would reject it.
-    $arg = [string]$args[$i]
-    if ($arg -ceq '--') { break }
-    if ($arg -ceq '--root') {
-      $rootPresent = $true
-      $i += 2
-      continue
-    }
-    if ($arg -clike '--root=*') {
-      $rootPresent = $true
-      $i += 1
-      continue
-    }
-    if ($arg -ceq 'wrap') {
-      $wrapIndex = $i
-      break
-    }
-    $i += 1
-  }
-  if ($rootPresent -or $wrapIndex -lt 0) { return $args }
-  $out = @()
-  if ($wrapIndex -gt 0) { $out += $args[0..($wrapIndex - 1)] }
-  $out += @('--root', $Root)
-  $out += $args[$wrapIndex..($args.Count - 1)]
-  return $out
-}
 function Seed-CodexHome($name, $sandbox) {
   if (-not (Assert-ActionsEnabled ("seed-codex-home {0}" -f $name))) { return $null }
   # Provision a per-agent ISOLATED CODEX_HOME so `resume --last` is unambiguous
@@ -10478,15 +12883,15 @@ function Seed-CodexHome($name, $sandbox) {
   if (-not $ok) { Write-Warning ("supervisor: {0}: seeded CODEX_HOME missing auth/config/agenttalk-listen skill - failing closed" -f $name); return $null }
   return $isoHome
 }
-function Test-WrappedBaseCli($name) {
-  $a = $cfg.agents.$name
-  $args = @($a.launch.windows_args)
-  $sep = [array]::IndexOf($args, '--')
-  if ($sep -lt 0 -or ($sep + 1) -ge $args.Count) {
-    Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped launch has no real CLI tail after --; NOT launching (fail closed)" -f $name)
+function Test-WrappedBaseCli($name, $admission) {
+  # Wrapper grammar was admitted in Python. Consume its typed child argv;
+  # never rediscover the delimiter or base executable from raw config here.
+  $childArgv = @($admission.child_argv)
+  if ($childArgv.Count -eq 0) {
+    Write-Warning ("supervisor: {0}: CONFIG ERROR - admitted wrapped launch has no real CLI tail; NOT launching (fail closed)" -f $name)
     return $false
   }
-  $base = [string]$args[$sep + 1]
+  $base = [string]$childArgv[0]
   # Deliberately case-insensitive: this is a FAIL-CLOSED refusal, not a
   # capability grant - matching more spellings of an unfilled scaffold
   # placeholder (REPLACE:/replace:/etc.) only widens what gets refused. A
@@ -10511,147 +12916,7 @@ function Test-WrappedBaseCli($name) {
   }
   return $true
 }
-function File-LeafLower([string]$path) {
-  # Deliberately case-insensitive (pre-lowercased, then compared against
-  # all-lowercase literals wherever this is used): unlike argv/config
-  # tokens the CLI's own argparse matches case-sensitively, an executable
-  # NAME is resolved through the Windows filesystem/PATH, which is itself
-  # case-insensitive - `Python.EXE` and `python.exe` are the same file to
-  # Windows. Sensitizing this would make the supervisor MISS a real
-  # python.exe/agenttalk.exe launch that Windows itself would run fine.
-  try { return ([IO.Path]::GetFileName($path)).ToLowerInvariant() }
-  catch { return ([string]$path).ToLowerInvariant() }
-}
-function File-StemLower([string]$path) {
-  try { return ([IO.Path]::GetFileNameWithoutExtension($path)).ToLowerInvariant() }
-  catch { return ([string]$path).ToLowerInvariant() }
-}
-function Add-SupervisorLaunchNonce($file, $argv, $nonce, $moduleArgsFrom = $null) {
-  $args = @($argv)
-  $unsupported = [pscustomobject]@{
-    argv = $args
-    injected = $false
-    nonce = $null
-    source = $null
-    missing_reason = 'unsupported_launch_argv'
-  }
-  if (-not $nonce) { return $unsupported }
-  foreach ($token in $args) {
-    $text = [string]$token
-    # Case-sensitive: this is the CLI's own reserved global option
-    # spelling, which argparse matches case-sensitively. A differently
-    # cased look-alike is not the real option to argparse either, so
-    # treating it as a collision here would refuse an ordinary token.
-    if ($text -ceq '--supervisor-launch-nonce' -or
-        $text -clike '--supervisor-launch-nonce=*') {
-      # This is a supervisor-owned capability. Accepting an operator-supplied
-      # duplicate would let argparse's last-value-wins behavior desynchronize
-      # the CLI nonce from the logging environment and leave a direct redirect
-      # unbounded.
-      $unsupported.missing_reason = 'reserved_launch_nonce_present'
-      return $unsupported
-    }
-  }
-  $stem = File-StemLower ([string]$file)
-  if ($stem -in @('python','python3','py')) {
-    $i = Resolve-AgenttalkModuleFlagIndex $args $moduleArgsFrom
-    if ($i -ge 0) {
-      # A direct assignment inside a plain `if` STATEMENT preserves the
-      # array type; capturing an if/else USED AS AN EXPRESSION does not -
-      # PowerShell enumerates a one-element array flowing through that
-      # pipeline and collapses it back to a bare scalar, which silently
-      # turns the eventual argv into a single glued-together string.
-      $prefix = @()
-      if ($i -gt 0) { $prefix = @($args[0..($i - 1)]) }
-      $out = @($prefix + @(
-        $args[$i], $args[$i + 1], '--supervisor-launch-nonce', $nonce
-      ))
-      if ($args.Count -gt ($i + 2)) {
-        $out = @($out + @($args[($i + 2)..($args.Count - 1)]))
-      }
-      return [pscustomobject]@{
-        argv = $out
-        injected = $true
-        nonce = $nonce
-        source = 'agenttalk_global_arg'
-        missing_reason = $null
-      }
-    }
-    return $unsupported
-  }
-  $leaf = File-LeafLower ([string]$file)
-  if ($leaf -in @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
-    if ($args.Count -gt 0 -and (File-LeafLower ([string]$args[0])) -in @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
-      return $unsupported
-    }
-    return [pscustomobject]@{
-      argv = @('--supervisor-launch-nonce', $nonce) + $args
-      injected = $true
-      nonce = $nonce
-      source = 'agenttalk_global_arg'
-      missing_reason = $null
-    }
-  }
-  return $unsupported
-}
-function Resolve-AgenttalkOwnArgvIndex($file, [object[]]$argTokens, $moduleArgsFrom = $null) {
-  # Shared by both wrap-eligibility checks below (which token is the
-  # subcommand, and whether the tail from there actually dispatches to
-  # cmd_wrap): the index where agenttalk's OWN argv begins - after `-m
-  # agenttalk` for a python-stem launch, or 0 for a direct agenttalk exe.
-  # Returns -1 if this launch's argv never reaches agenttalk's parser at
-  # all (same fail-closed convention as Resolve-AgenttalkModuleFlagIndex).
-  #
-  # NOTE: the parameter is NOT named $args, same reason as
-  # Resolve-AgenttalkModuleFlagIndex's own note - PowerShell's automatic
-  # $args variable silently shadows a same-named formal parameter, and the
-  # function then sees an empty list regardless of what the caller passed.
-  $stem = File-StemLower ([string]$file)
-  if ($stem -in @('python','python3','py')) {
-    $flagIndex = Resolve-AgenttalkModuleFlagIndex $argTokens $moduleArgsFrom
-    if ($flagIndex -lt 0) { return -1 }
-    return $flagIndex + 2
-  }
-  $leaf = File-LeafLower ([string]$file)
-  if ($leaf -notin @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
-    return -1
-  }
-  return 0
-}
-function Test-AgenttalkWrapInvocation($file, $argv, $nonceResult, $moduleArgsFrom = $null) {
-  if (-not $nonceResult.injected) { return $false }
-  $args = @($argv)
-  $index = Resolve-AgenttalkOwnArgvIndex $file $args $moduleArgsFrom
-  if ($index -lt 0) { return $false }
-  # The CLI has two value-taking global options. The first remaining token is
-  # the subcommand; only a literal `wrap` there may receive the cooperative
-  # byte-bound log capability.
-  #
-  # Case-sensitive throughout this scan: argparse matches its own global
-  # options and subcommands case-sensitively, so a configured "WRAP" (or
-  # "--Root") is invalid argv to the real CLI - it would be rejected as an
-  # unrecognized argument, never reach the wrap subcommand, and never
-  # actually redirect anything. Matching it here as though it WERE 'wrap'
-  # granted the logging capability (nonce injection, generation commit) to
-  # a launch that CPython's own argparse would refuse - the same class of
-  # leak as I2's execution-mode prefix, one call site over.
-  while ($index -lt $args.Count) {
-    $token = [string]$args[$index]
-    if ($token -cin @('--root','--supervisor-launch-nonce')) {
-      if (($index + 1) -ge $args.Count) { return $false }
-      $index += 2
-      continue
-    }
-    if ($token -clike '--root=*' -or
-        $token -clike '--supervisor-launch-nonce=*') {
-      $index += 1
-      continue
-    }
-    return $token -ceq 'wrap'
-  }
-  return $false
-}
-function Preflight($name, $plan, $file, $codexHome, [object[]]$prefixTokens = @()) {
+function Preflight($name, $plan, $file, $codexHome, [object[]]$prefixTokens = @(), $admission = $null) {
   # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
   # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
   # the launch grace in a relaunch loop. Returns $true on success.
@@ -10666,9 +12931,8 @@ function Preflight($name, $plan, $file, $codexHome, [object[]]$prefixTokens = @(
   # -E/-I/-S justification ("CPython still reaches -m OR fails loudly")
   # missed: it can fail SILENTLY, in a process this exact check was
   # supposed to catch before it started looping. $prefixTokens (the
-  # caller's resolved windows_args[0:module_args_from], the SAME
-  # resolution Resolve-AgenttalkModuleFlagIndex performs for every other
-  # consumer of module_args_from - not a second, divergent extraction) is
+  # caller's admitted prefix tokens (the SAME typed launch artifact that
+  # execution consumes, not a second extraction from supervisor.json) are
   # spliced into the wrapped probe below so it tests the CONFIGURED
   # invocation, not a fixed stand-in for it. The $AgenttalkPython probes
   # elsewhere in this function are deliberately left alone: they smoke-test
@@ -10682,15 +12946,20 @@ function Preflight($name, $plan, $file, $codexHome, [object[]]$prefixTokens = @(
     # own Python and PowerShell with no external input path, unlike cli/
     # backend_profile which pass a raw config field through verbatim.
     if ($plan.launch_mode -eq 'wrap') {
-      # WRAPPED agent: $file is the PYTHON wrapper exe (it runs `agenttalk wrap
-      # --loop`), NOT the CLI. Smoke-test both the configured wrapper python and
-      # the pinned AGENTTALK_PY interpreter, then validate that the fixed argv tail
-      # after -- names a real CLI executable instead of a shim.
+      # WRAPPED agent: the typed artifact says whether $file dispatches
+      # agenttalk as a Python module or as the console entry point. Probe that
+      # same dispatch form instead of assuming every admitted wrapper is Python,
+      # then smoke-test the pinned AGENTTALK_PY interpreter and validate the
+      # admitted child executable.
       $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
       if ($codexHome) { $env:CODEX_HOME = $codexHome }
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
       try {
-        & $file @prefixTokens -m agenttalk --version | Out-Null
+        if ($null -eq $admission.module_args_from) {
+          & $file --version | Out-Null
+        } else {
+          & $file @prefixTokens -m agenttalk --version | Out-Null
+        }
         $rc = $LASTEXITCODE
         if ($rc -eq 0) {
           & $AgenttalkPython -m agenttalk --version | Out-Null
@@ -10701,7 +12970,7 @@ function Preflight($name, $plan, $file, $codexHome, [object[]]$prefixTokens = @(
         if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
       }
       if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped preflight (AGENTTALK_PY -m agenttalk --version) exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
-      if (-not (Test-WrappedBaseCli $name)) { return $false }
+      if (-not (Test-WrappedBaseCli $name $admission)) { return $false }
       return $true
     }
     # Case-sensitive: cli is passed through from config verbatim
@@ -11172,7 +13441,7 @@ function Start-WrapperProcess([hashtable]$startArgs) {
     # the operator's visible window goes silent forever once that budget is
     # spent, while still looking healthy otherwise.
     foreach ($key in $WrapperLogEnvKeys) {
-      Remove-Item -Path ("Env:" + $key) -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath ("Env:" + $key) -ErrorAction SilentlyContinue
     }
     return [pscustomobject]@{
       Process = (Start-Process @startArgs)
@@ -11698,7 +13967,136 @@ function Discard-PendingWrapperLogTargets($targets) {
   }
 }
 # endregion wrapper-log-helpers
-function Launch($name, $plan, $codexHome) {
+# region launch-admission-helpers
+function Test-ExactLaunchAdmissionProperties($value, [string[]]$expected) {
+  if ($null -eq $value -or $value -is [string]) { return $false }
+  $actual = @($value.PSObject.Properties.Name)
+  if ($actual.Count -ne $expected.Count) { return $false }
+  foreach ($name in $expected) {
+    if ($actual -cnotcontains $name) { return $false }
+  }
+  return $true
+}
+function Resolve-LaunchAdmission($value, [string]$expectedAgent, [string]$population) {
+  $prefix = "supervisor: {0}: launch admission" -f $expectedAgent
+  if ($null -eq $value -or $value -is [string]) {
+    Write-Warning ("{0} is missing or malformed; NOT launching (fail closed)" -f $prefix)
+    return $null
+  }
+  $schema = $value.schema_version
+  if ((($schema -isnot [int]) -and ($schema -isnot [long])) -or
+      ([long]$schema -ne 1)) {
+    Write-Warning ("{0} has an unsupported schema; NOT launching (fail closed)" -f $prefix)
+    return $null
+  }
+  if ($value.status -is [string] -and $value.status -ceq 'refused') {
+    if (-not (Test-ExactLaunchAdmissionProperties $value @(
+        'schema_version','status','population','agent','reason'))) {
+      Write-Warning ("{0} refusal is malformed; NOT launching (fail closed)" -f $prefix)
+      return $null
+    }
+    $reason = $value.reason
+    if ($reason -isnot [string] -or -not $reason -or
+        $value.population -isnot [string] -or
+        $value.population -cne $population -or
+        $value.agent -isnot [string] -or $value.agent -cne $expectedAgent) {
+      Write-Warning ("{0} refusal identity is malformed; NOT launching (fail closed)" -f $prefix)
+      return $null
+    }
+    Write-Warning ("{0} refused: {1}; NOT launching (fail closed)" -f $prefix, $reason)
+    return $null
+  }
+  if ($value.status -isnot [string] -or $value.status -cne 'accepted' -or
+      -not (Test-ExactLaunchAdmissionProperties $value @(
+        'schema_version','status','population','agent','cli','wrapped',
+        'windows_file','argv','cwd','module_args_from','wrapper_dispatch',
+        'nonce_insert_at','child_argv'))) {
+    Write-Warning ("{0} is not one accepted typed result; NOT launching (fail closed)" -f $prefix)
+    return $null
+  }
+  if ($value.population -isnot [string] -or
+      $value.population -cne $population -or
+      $value.agent -isnot [string] -or $value.agent -cne $expectedAgent -or
+      $value.cli -isnot [string] -or
+      @('codex','claude') -cnotcontains $value.cli -or
+      $value.wrapped -isnot [bool] -or
+      $value.wrapper_dispatch -isnot [bool] -or
+      $value.argv -isnot [object[]] -or
+      $value.child_argv -isnot [object[]] -or
+      $value.windows_file -isnot [string] -or -not $value.windows_file -or
+      $value.cwd -isnot [string] -or -not $value.cwd) {
+    Write-Warning ("{0} fields are malformed; NOT launching (fail closed)" -f $prefix)
+    return $null
+  }
+  foreach ($token in @($value.argv)) {
+    if ($null -eq $token -or $token -isnot [string]) {
+      Write-Warning ("{0} argv is malformed; NOT launching (fail closed)" -f $prefix)
+      return $null
+    }
+  }
+  foreach ($token in @($value.child_argv)) {
+    if ($null -eq $token -or $token -isnot [string]) {
+      Write-Warning ("{0} child argv is malformed; NOT launching (fail closed)" -f $prefix)
+      return $null
+    }
+  }
+  $moduleIndex = $value.module_args_from
+  if ($null -ne $moduleIndex -and
+      ((($moduleIndex -isnot [int]) -and ($moduleIndex -isnot [long])) -or
+       [long]$moduleIndex -lt 0 -or [long]$moduleIndex -ge @($value.argv).Count)) {
+    Write-Warning ("{0} module position is malformed; NOT launching (fail closed)" -f $prefix)
+    return $null
+  }
+  $nonceIndex = $value.nonce_insert_at
+  if ([bool]$value.wrapped) {
+    if (-not [bool]$value.wrapper_dispatch -or
+        @($value.child_argv).Count -eq 0 -or
+        -not ([string]@($value.child_argv)[0]) -or
+        $null -eq $nonceIndex -or
+        ((($nonceIndex -isnot [int]) -and ($nonceIndex -isnot [long])) -or
+         [long]$nonceIndex -lt 0 -or [long]$nonceIndex -gt @($value.argv).Count)) {
+      Write-Warning ("{0} wrapper facts are malformed; NOT launching (fail closed)" -f $prefix)
+      return $null
+    }
+  } elseif ([bool]$value.wrapper_dispatch -or $null -ne $nonceIndex -or
+            $null -ne $moduleIndex -or @($value.child_argv).Count -ne 0) {
+    Write-Warning ("{0} manual-launch facts are malformed; NOT launching (fail closed)" -f $prefix)
+    return $null
+  }
+  return $value
+}
+function Add-SupervisorLaunchNonceAt($admission, [string]$nonce) {
+  $args = @($admission.argv)
+  $unsupported = [pscustomobject]@{
+    argv = $args; injected = $false; nonce = $null; source = $null;
+    missing_reason = 'unsupported_launch_argv'
+  }
+  if (-not $nonce -or $null -eq $admission.nonce_insert_at) { return $unsupported }
+  $index = [int]$admission.nonce_insert_at
+  if ($index -lt 0 -or $index -gt $args.Count) { return $unsupported }
+  $before = @(); if ($index -gt 0) { $before = @($args[0..($index - 1)]) }
+  $after = @(); if ($index -lt $args.Count) { $after = @($args[$index..($args.Count - 1)]) }
+  return [pscustomobject]@{
+    argv = @($before + @('--supervisor-launch-nonce', $nonce) + $after)
+    injected = $true
+    nonce = $nonce
+    source = 'agenttalk_global_arg'
+    missing_reason = $null
+  }
+}
+function Get-LaunchAdmissionPrefixTokens($admission) {
+  if (-not [bool]$admission.wrapper_dispatch) { return ,@() }
+  $index = $admission.module_args_from
+  if ($null -eq $index -or [int]$index -eq 0) { return ,@() }
+  return ,@(@($admission.argv)[0..([int]$index - 1)])
+}
+# endregion launch-admission-helpers
+function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
+  $admission = $acceptedAdmission
+  if ($null -eq $admission) {
+    $admission = Resolve-LaunchAdmission $plan.launch_admission $name 'regular'
+  }
+  if ($null -eq $admission) { return $null }
   if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) { return $null }
   $a = $cfg.agents.$name
   # Case-sensitive, for consistency with the bootstrap validator's own
@@ -11715,75 +14113,47 @@ function Launch($name, $plan, $codexHome) {
       return $null
     }
   }
-  $file = $a.launch.windows_file
-  # Deliberately case-insensitive - see Test-WrappedBaseCli's REPLACE:*
-  # check: a fail-closed refusal only gets safer by matching more
-  # spellings of the unfilled scaffold placeholder.
-  if (-not $file -or $file -like 'REPLACE:*') {
-    Write-Warning "supervisor: agent '$name' has no real launch.windows_file (the agent EXECUTABLE) - fill supervisor.json"; return $null
-  }
+  $file = [string]$admission.windows_file
   $windowStyle = if ($plan.window_style) { [string]$plan.window_style } else { 'Hidden' }
   if ($plan.window_style_warning) { Write-Warning ("supervisor: {0}: {1}" -f $name, $plan.window_style_warning) }
-  # Build the argument array by splicing the session tokens into windows_args
-  # wherever the literal '{SESSION_ARGS}' element appears. Array-element splice
-  # (NOT string interpolation): each token is exactly one argument and nothing
-  # needs quoting. On a FRESH Claude launch a '{SESSION_ID}' token is still
-  # present -> mint + substitute a uuid; Codex has none (it doesn't pin).
-  # Case-sensitive: these placeholder tokens are a supervisor convention
-  # documented and typed by the operator exactly as {SESSION_ID}/
-  # {SESSION_ARGS} - session_args is overridable per-agent config, and a
-  # differently-cased typo should surface as a literal, unsubstituted
-  # argv token (visibly wrong) rather than silently matching anyway.
   $sid = $plan.session_id
-  $tokens = @($plan.session_args)
-  if ($plan.launch_mode -eq 'fresh' -and ($tokens -ccontains '{SESSION_ID}')) {
-    $sid = [guid]::NewGuid().ToString()
-    $tokens = $tokens | ForEach-Object { if ($_ -ceq '{SESSION_ID}') { $sid } else { $_ } }
-  }
-  $argv = @()
-  $cwdToken = if ($a.cwd) { [string]$a.cwd } else { '' }
-  foreach ($x in @($a.launch.windows_args)) {
-    if ($x -ceq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
-  }
-  $moduleArgsFrom = $a.launch.module_args_from
-  $argv = @(Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom)
+  $argv = @($admission.argv)
   $launchNonce = [guid]::NewGuid().ToString('N')
-  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
+  $nonceResult = Add-SupervisorLaunchNonceAt $admission $launchNonce
   $argv = @($nonceResult.argv)
-  # Round 23: no longer a prediction. The supervisor used to ask a probe
-  # whether this argv would reach cmd_wrap before ever starting the real
-  # process - five rounds of fidelity/blast-radius defects (quoting, cwd,
-  # interpreter, timeout, temp resources) later, that probe is deleted.
-  # Test-AgenttalkWrapInvocation stays: it reads the STATIC configured
-  # argv (is the subcommand literally 'wrap'), not runtime behavior, so it
-  # has no fidelity gap - it is an optimization to skip logging setup for
-  # an obviously-non-wrap launch, not a forecast. Whether THIS launch
-  # actually reaches cmd_wrap is now something the wrapper process itself
-  # reports, by evidence, from inside installed_standard_streams_from_
-  # environment - see New-WrapperLogTargets/Invoke-WrapperLogRetentionPrune.
   $shouldLog = (
-    [bool]$a.wrapped -and
+    [bool]$admission.wrapper_dispatch -and
     $plan.launch_mode -eq 'wrap' -and
-    (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom)
+    [bool]$nonceResult.injected
   )
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
   } else { $null }
   # Apply the agent's env, launch the REAL executable directly with -PassThru,
   # then RESTORE the supervisor's own env. The in-sandbox agent reaches the bus
-  # via the explicit AGENTTALK_PY pin; AGENTTALK_PYTHON remains supervisor-only
-  # for the .agenttalk/bin shim.
-  $saved = @{}
-  $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
+  # via the explicit AGENTTALK_PY pin. A regular configured launch otherwise
+  # preserves any inherited AGENTTALK_PYTHON value.
+  $saved = [hashtable]::new([StringComparer]::Ordinal)
+  $applied = [hashtable]::new([StringComparer]::Ordinal)
+  $applied['AGENTTALK_ROOT'] = $Root
+  $applied['AGENTTALK_PY'] = $AgenttalkPython
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
   # Deliberately case-insensitive - see Start-WrapperProcess's own $window
   # switch: this value feeds the same -WindowStyle enum parameter, whose
   # .NET binding is inherently case-insensitive on the fallback path.
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
-  if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
+  if ($a.env) {
+    foreach ($k in $a.env.PSObject.Properties.Name) {
+      Set-AgenttalkEnvironmentMapEntry $applied $k $a.env.$k
+    }
+  }
   foreach ($reserved in $WrapperLogEnvKeys) {
-    $null = $applied.Remove($reserved)
+    foreach ($candidate in @($applied.Keys)) {
+      $comparison = [AgenttalkSupervisorNativeV3]::CompareStringOrdinal(
+        [string]$candidate, -1, $reserved, -1, $true)
+      if ($comparison -in @(0, 2)) { $null = $applied.Remove($candidate) }
+    }
     $applied[$reserved] = $null
   }
   if ($null -ne $logTargets) {
@@ -11794,16 +14164,17 @@ function Launch($name, $plan, $codexHome) {
     $applied['AGENTTALK_WRAPPER_LOG_SEGMENTS'] = [string]$WrapperLogSegments
     $applied['AGENTTALK_WRAPPER_LOG_NONCE'] = $launchNonce
   }
-  foreach ($k in $applied.Keys) {
-    $saved[$k] = [Environment]::GetEnvironmentVariable($k)
-    if ($null -eq $applied[$k]) {
-      Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue
-    } else {
-      Set-Item -Path ("Env:" + $k) -Value $applied[$k]
-    }
-  }
   try {
-    $cwd = if ($a.cwd) { $a.cwd } else { $Root }
+    foreach ($k in $applied.Keys) {
+      $saved[$k] = [AgenttalkSupervisorNativeV3]::ReadEnvironmentVariable(
+        [string]$k)
+      if ($null -eq $applied[$k]) {
+        Remove-Item -LiteralPath ("Env:" + $k) -ErrorAction SilentlyContinue
+      } else {
+        Set-Item -LiteralPath ("Env:" + $k) -Value $applied[$k]
+      }
+    }
+    $cwd = [string]$admission.cwd
     # Quote each token per Windows rules and pass ONE command-line string: a bare
     # array element containing a space would otherwise be split into two args at
     # the Start-Process handoff (so a path/arg WITH SPACES survives as one arg).
@@ -11821,17 +14192,12 @@ function Launch($name, $plan, $codexHome) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
       $startArgs['ArgumentList'] = $argline
     }
-    try {
-      $launch = Start-WrapperProcess $startArgs
-    } catch {
-      Discard-PendingWrapperLogTargets $logTargets
-      throw
-    }
+    $launch = Start-WrapperProcess $startArgs
+  } catch {
+    Discard-PendingWrapperLogTargets $logTargets
+    throw
   } finally {
-    foreach ($k in $saved.Keys) {
-      if ($null -eq $saved[$k]) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
-      else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
-    }
+    Restore-AgenttalkEnvironment $saved
   }
   $proc = $launch.Process
   if ($proc -and $proc.Id) {
@@ -11862,43 +14228,51 @@ function Launch($name, $plan, $codexHome) {
   Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"; return $null
 }
 
-function Launch-Spec($name, $spec, $codexHome) {
-  if (-not (Assert-ActionsEnabled ("launch-spec {0}" -f $name))) { return $null }
-  $file = $spec.launch.windows_file
-  # Deliberately case-insensitive - see Test-WrappedBaseCli's REPLACE:*
-  # check: a fail-closed refusal only gets safer by matching more
-  # spellings of the unfilled scaffold placeholder.
-  if (-not $file -or $file -like 'REPLACE:*') {
-    Write-Warning "supervisor: ephemeral '$name' has no real launch.windows_file - fill supervisor.json ephemeral_reviewers.allowed_profiles"; return $null
+function Launch-Spec($name, $spec, $codexHome, $acceptedAdmission = $null) {
+  $admission = $acceptedAdmission
+  if ($null -eq $admission) {
+    $admission = Resolve-LaunchAdmission $spec.launch_admission $name 'ephemeral'
   }
+  if ($null -eq $admission) { return $null }
+  if (-not (Assert-ActionsEnabled ("launch-spec {0}" -f $name))) { return $null }
+  $file = [string]$admission.windows_file
   $windowStyle = if ($spec.window_style) { [string]$spec.window_style } else { 'Hidden' }
   if ($spec.window_style_warning) { Write-Warning ("supervisor: ephemeral {0}: {1}" -f $name, $spec.window_style_warning) }
-  $specCwdToken = if ($spec.cwd) { [string]$spec.cwd } else { '' }
-  $argv = @($spec.launch.windows_args)
-  $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
-  $moduleArgsFrom = $spec.launch.module_args_from
-  $argv = @(Ensure-AgenttalkWrapRootArg $argv $moduleArgsFrom)
+  $argv = @($admission.argv)
   $launchNonce = [guid]::NewGuid().ToString('N')
-  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce $moduleArgsFrom
+  $nonceResult = Add-SupervisorLaunchNonceAt $admission $launchNonce
   $argv = @($nonceResult.argv)
-  # Round 23: no probe left to predict reachability - see Launch's own
-  # comment for the full reasoning. $shouldLog is now purely the cheap,
-  # non-predictive static check.
-  $shouldLog = (Test-AgenttalkWrapInvocation $file $argv $nonceResult $moduleArgsFrom)
+  $shouldLog = ([bool]$admission.wrapper_dispatch -and [bool]$nonceResult.injected)
   $logTargets = if ($shouldLog) {
     New-WrapperLogTargets $name $launchNonce
   } else { $null }
-  $saved = @{}
-  $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
-  if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+  $saved = [hashtable]::new([StringComparer]::Ordinal)
+  $applied = [hashtable]::new([StringComparer]::Ordinal)
+  $applied['AGENTTALK_ROOT'] = $Root
+  $applied['AGENTTALK_PY'] = $AgenttalkPython
+  if ($SrcOnPyPath) {
+    $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH
+  }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }
   # Deliberately case-insensitive - see Start-WrapperProcess's own $window
   # switch: this value feeds the same -WindowStyle enum parameter, whose
   # .NET binding is inherently case-insensitive on the fallback path.
   if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
-  if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }
+  if ($spec.env) {
+    foreach ($k in $spec.env.PSObject.Properties.Name) {
+      Set-AgenttalkEnvironmentMapEntry $applied $k $spec.env.$k
+    }
+  }
+  # Launch-Spec bypasses the project shim, so its interpreter selector is not
+  # part of this ephemeral child's configured environment. Other launch paths
+  # may preserve an inherited AGENTTALK_PYTHON value.
+  Set-AgenttalkEnvironmentMapEntry $applied 'AGENTTALK_PYTHON' $null
   foreach ($reserved in $WrapperLogEnvKeys) {
-    $null = $applied.Remove($reserved)
+    foreach ($candidate in @($applied.Keys)) {
+      $comparison = [AgenttalkSupervisorNativeV3]::CompareStringOrdinal(
+        [string]$candidate, -1, $reserved, -1, $true)
+      if ($comparison -in @(0, 2)) { $null = $applied.Remove($candidate) }
+    }
     $applied[$reserved] = $null
   }
   if ($null -ne $logTargets) {
@@ -11908,16 +14282,17 @@ function Launch-Spec($name, $spec, $codexHome) {
     $applied['AGENTTALK_WRAPPER_LOG_SEGMENTS'] = [string]$WrapperLogSegments
     $applied['AGENTTALK_WRAPPER_LOG_NONCE'] = $launchNonce
   }
-  foreach ($k in $applied.Keys) {
-    $saved[$k] = [Environment]::GetEnvironmentVariable($k)
-    if ($null -eq $applied[$k]) {
-      Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue
-    } else {
-      Set-Item -Path ("Env:" + $k) -Value $applied[$k]
-    }
-  }
   try {
-    $specCwd = if ($spec.cwd) { $spec.cwd } else { $Root }
+    foreach ($k in $applied.Keys) {
+      $saved[$k] = [AgenttalkSupervisorNativeV3]::ReadEnvironmentVariable(
+        [string]$k)
+      if ($null -eq $applied[$k]) {
+        Remove-Item -LiteralPath ("Env:" + $k) -ErrorAction SilentlyContinue
+      } else {
+        Set-Item -LiteralPath ("Env:" + $k) -Value $applied[$k]
+      }
+    }
+    $specCwd = [string]$admission.cwd
     $startArgs = @{
       FilePath = $file
       WorkingDirectory = $specCwd
@@ -11932,17 +14307,12 @@ function Launch-Spec($name, $spec, $codexHome) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
       $startArgs['ArgumentList'] = $argline
     }
-    try {
-      $launch = Start-WrapperProcess $startArgs
-    } catch {
-      Discard-PendingWrapperLogTargets $logTargets
-      throw
-    }
+    $launch = Start-WrapperProcess $startArgs
+  } catch {
+    Discard-PendingWrapperLogTargets $logTargets
+    throw
   } finally {
-    foreach ($k in $saved.Keys) {
-      if ($null -eq $saved[$k]) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
-      else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
-    }
+    Restore-AgenttalkEnvironment $saved
   }
   $proc = $launch.Process
   if ($proc -and $proc.Id) {
@@ -11971,9 +14341,13 @@ $pollNum = 0
 :supervisorPoll do {
   try {
     $nextCfg = Read-SupervisorConfig
+    $nextCfgSha256 = $script:SupervisorConfigSha256
     $cfg = $nextCfg
+    $cfgSha256 = $nextCfgSha256
   } catch {
-    Write-Warning "supervisor: supervisor.json refresh failed; keeping last-good config"
+    Write-Warning "supervisor: supervisor.json refresh failed; holding this poll"
+    Wait-ForNextPoll $cfg
+    continue supervisorPoll
   }
   $state = Load-State
   if (-not $state.agents) { $state | Add-Member agents ([pscustomobject]@{}) -Force }
@@ -12007,7 +14381,20 @@ $pollNum = 0
   # unambiguous UTC and locale-independent.
   $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
   $eventArgs = @(); if (-not $DryRun) { $eventArgs += @('--record-events') }
-  $plan = (& $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath @snapshotArgs @eventArgs --now $now) | ConvertFrom-Json
+  $planText = & $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath `
+    --supervisor-config-sha256 $cfgSha256 @snapshotArgs @eventArgs --now $now
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "supervisor: plan config binding failed; holding this poll"
+    Wait-ForNextPoll $cfg
+    continue supervisorPoll
+  }
+  try {
+    $plan = $planText | ConvertFrom-Json
+  } catch {
+    Write-Warning "supervisor: plan output was unavailable; holding this poll"
+    Wait-ForNextPoll $cfg
+    continue supervisorPoll
+  }
   $pollNum++; $healthy = 0; $total = 0
   foreach ($name in $plan.agents.PSObject.Properties.Name) {
     $p = $plan.agents.$name
@@ -12040,6 +14427,11 @@ $pollNum = 0
     $lastLogged[$name] = $p.state
     switch ($p.action) {
       { $_ -in 'relaunch','stuck_recover' } {
+        # Validate the exact typed admission before barrier-state writes, tree
+        # teardown, home seeding, preflight, or any other launch effect.
+        $launchAdmission = Resolve-LaunchAdmission `
+          $p.launch_admission $name 'regular'
+        if ($null -eq $launchAdmission) { continue }
         # Persist the freshly revalidated tree before using it. The barrier
         # state deliberately excludes the relaunch transition/marker consume;
         # a crash can lose an action, never its current ownership evidence.
@@ -12063,7 +14455,9 @@ $pollNum = 0
         # to classify process command lines itself.
         $barrierPath = Join-Path $PSScriptRoot ("supervisor-barrier-{0}.json" -f $name)
         Get-ProcSnapshot $barrierPath | Out-Null
-        $barrierText = & $AgenttalkCmd --root $Root supervise --launch-barrier --for $name --state-file $StatePath --snapshot-file $barrierPath @eventArgs --now $now
+        $barrierText = & $AgenttalkCmd --root $Root supervise --launch-barrier `
+          --for $name --state-file $StatePath --snapshot-file $barrierPath `
+          --supervisor-config-sha256 $cfgSha256 @eventArgs --now $now
         $barrier = $null
         try { $barrier = $barrierText | ConvertFrom-Json } catch {}
         if (($null -eq $barrier) -or $barrier.blocked) {
@@ -12112,11 +14506,11 @@ $pollNum = 0
         }
         $a = $cfg.agents.$name
         if ($p.cli -ceq 'claude') {
-          $launchDir = if ($a.cwd) { $a.cwd } else { $Root }
+          $launchDir = [string]$launchAdmission.cwd
           if (-not (Assert-ActionsEnabled ("seed-claude-settings {0}" -f $name))) { continue }
           & $AgenttalkCmd --root $Root supervise --seed-claude-settings --dir $launchDir --mode $p.perm_mode | Out-Null
         }
-        $file = $a.launch.windows_file
+        $file = [string]$launchAdmission.windows_file
         # Round 24: prefix-token resolution only means anything for a
         # WRAPPED launch - Preflight's only branch that consumes
         # $prefixTokens is the one testing $file (the wrapper python) with
@@ -12127,14 +14521,10 @@ $pollNum = 0
         # fail closed on, it is just "no prefix to test here".
         $prefixTokens = @()
         if ($p.launch_mode -eq 'wrap') {
-          $prefixTokens = Resolve-AgenttalkLaunchPrefixTokens $a
-          if ($null -eq $prefixTokens) {
-            Write-Warning ("supervisor: {0}: CONFIG ERROR - launch.module_args_from does not resolve against launch.windows_args; NOT launching (fail closed)" -f $name)
-            $seedOk = $false
-          }
+          $prefixTokens = Get-LaunchAdmissionPrefixTokens $launchAdmission
         }
         if ($seedOk -and -not (Assert-ActionsEnabled ("preflight {0}" -f $name))) { $seedOk = $false }
-        if ($seedOk -and -not (Preflight $name $p $file $homeEnv $prefixTokens)) { $seedOk = $false }
+        if ($seedOk -and -not (Preflight $name $p $file $homeEnv $prefixTokens $launchAdmission)) { $seedOk = $false }
         if (-not $seedOk) {
           Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
           Set-AgentState $state $name $p.next_state
@@ -12143,6 +14533,8 @@ $pollNum = 0
           # launching/grace and consumes a manual restart id, so a failed
           # post-spawn PID record cannot make the next poll launch a second
           # legacy-direct process from the old state.
+          $p.next_state | Add-Member -NotePropertyName pending_launch_record `
+            -NotePropertyValue $p.record_launch_context -Force
           Set-AgentState $state $name $p.next_state
           if (-not (Save-StateForPoll $state)) {
             Wait-ForNextPoll $cfg
@@ -12151,7 +14543,7 @@ $pollNum = 0
           $preLaunchPath = Join-Path $PSScriptRoot ("supervisor-prelaunch-{0}.json" -f $name)
           $postLaunchPath = Join-Path $PSScriptRoot ("supervisor-postlaunch-{0}.json" -f $name)
           Get-ProcSnapshot $preLaunchPath | Out-Null
-          $res = Launch $name $p $homeEnv
+          $res = Launch $name $p $homeEnv $launchAdmission
           if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
           if ($res) {
             # Record the LAUNCHER pid + start (anti-reuse) + open grace via Python
@@ -12176,6 +14568,12 @@ $pollNum = 0
             # Manual restart markers clear on a later readiness-seen plan tick, not on PID return.
             if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
           } else {
+            $p.next_state.PSObject.Properties.Remove('pending_launch_record')
+            Set-AgentState $state $name $p.next_state
+            if (-not (Save-StateForPoll $state)) {
+              Wait-ForNextPoll $cfg
+              continue supervisorPoll
+            }
             Write-Warning ("supervisor: {0}: {1} FAILED (no PID) - keeping marker/state for retry" -f $name, $p.action)
           }
         }
@@ -12212,12 +14610,22 @@ $pollNum = 0
       }
       'ephemeral_launch' {
         if (-not (Assert-ActionsEnabled ("prepare-launch-request {0}" -f $rid))) { continue }
-        $prepText = & $AgenttalkCmd --root $Root supervise --prepare-launch-request --request-id $rid --state-file $StatePath --now $now
+        $prepText = & $AgenttalkCmd --root $Root supervise --prepare-launch-request `
+          --request-id $rid --state-file $StatePath --now $now `
+          --launch-agenttalk-python $AgenttalkPython `
+          --launch-src-on-pythonpath ([string]$SrcOnPyPath).ToLowerInvariant() `
+          --supervisor-config-sha256 $cfgSha256
         if ($LASTEXITCODE -ne 0) {
           Write-Warning ("supervisor: launch-request {0}: prepare failed; will retry/deny on a later poll" -f $rid)
           continue
         }
         $prep = $prepText | ConvertFrom-Json
+        $launchAdmission = Resolve-LaunchAdmission `
+          $prep.launch_admission ([string]$prep.agent) 'ephemeral'
+        if ($null -eq $launchAdmission) {
+          Write-Warning ("supervisor: launch-request {0}: prepared launch admission was refused; holding without launch effects" -f $rid)
+          continue
+        }
         $homeEnv = $null
         # Case-sensitive: same reasoning as Preflight/the poll loop above.
         if (($prep.cli -ceq 'codex') -and $prep.codex_home_isolation) {
@@ -12239,7 +14647,7 @@ $pollNum = 0
         $preLaunchPath = Join-Path $PSScriptRoot ("supervisor-prelaunch-{0}.json" -f $rid)
         $postLaunchPath = Join-Path $PSScriptRoot ("supervisor-postlaunch-{0}.json" -f $rid)
         Get-ProcSnapshot $preLaunchPath | Out-Null
-        $res = Launch-Spec $prep.agent $prep $homeEnv
+        $res = Launch-Spec $prep.agent $prep $homeEnv $launchAdmission
         if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
         if ($res) {
           $extra = @(); if ($res.start) { $extra += @('--pid-start', $res.start) }
@@ -12294,7 +14702,8 @@ $pollNum = 0
         Get-ProcSnapshot $teardownBarrierPath | Out-Null
         $teardownBarrierText = & $AgenttalkCmd --root $Root supervise `
           --launch-barrier --for $p.agent --request-id $rid `
-          --state-file $StatePath --snapshot-file $teardownBarrierPath --now $now
+          --state-file $StatePath --snapshot-file $teardownBarrierPath `
+          --supervisor-config-sha256 $cfgSha256 --now $now
         $teardownBarrier = $null
         try { $teardownBarrier = $teardownBarrierText | ConvertFrom-Json } catch {}
         if (($null -eq $teardownBarrier) -or $teardownBarrier.blocked) {

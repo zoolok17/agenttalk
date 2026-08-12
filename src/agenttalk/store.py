@@ -52,6 +52,22 @@ logger = logging.getLogger(__name__)
 
 DIRNAME = ".agenttalk"
 
+RESTART_REQUEST_READ_STATUS_KEY = "_agenttalk_restart_request_status"
+RESTART_REQUEST_UNUSABLE = "unusable"
+
+
+def unusable_restart_request_marker() -> dict[str, str]:
+    """Return the closed in-memory fact for an existing unusable marker."""
+    return {RESTART_REQUEST_READ_STATUS_KEY: RESTART_REQUEST_UNUSABLE}
+
+
+def is_unusable_restart_request(marker: object) -> bool:
+    """Whether ``marker`` is the Store-owned unusable-marker fact."""
+    return (
+        isinstance(marker, dict)
+        and marker == unusable_restart_request_marker()
+    )
+
 # Capability tokens the RUNNING store code supports. Surfaced by `doctor` so two
 # writers reporting the same --version (e.g. a PYTHONPATH=src build and an
 # installed wheel) are still discriminable — a writer lacking a token here is one
@@ -5861,15 +5877,30 @@ class Store:
                                json.dumps(payload, ensure_ascii=False))
 
     def read_restart_request(self, agent: str) -> dict | None:
-        """Return ``agent``'s restart-request marker, or None if absent/corrupt."""
+        """Return a valid marker, ``None`` when absent, or an unusable fact.
+
+        An existing marker whose request id cannot be trusted must remain
+        distinguishable from absence.  Otherwise a consumer can incorrectly
+        borrow progress persisted for an older request.  The unusable fact is
+        closed and carries none of the untrusted marker fields.
+        """
         p = self.state_dir / f"{agent}.restart-request"
-        if not p.exists():
-            return None
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, ValueError, OSError):
+            raw = p.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
-        return data if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            return unusable_restart_request_marker()
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return unusable_restart_request_marker()
+        if not isinstance(data, dict):
+            return unusable_restart_request_marker()
+        from agenttalk import ephemeral as _eph
+        if not _eph.is_safe_id(data.get("request_id")):
+            return unusable_restart_request_marker()
+        return data
 
     def clear_restart_request(self, agent: str, request_id: str) -> bool:
         """Clear ``agent``'s restart-request marker ONLY if its current
@@ -5880,6 +5911,9 @@ class Store:
         C5b: the read/compare/unlink runs UNDER the config lock so a concurrent
         ``write_restart_request`` cannot replace the marker between the compare and the
         unlink (a stale clearer must never remove a newer request)."""
+        from agenttalk import ephemeral as _eph
+        if not _eph.is_safe_id(request_id):
+            return False
         with self._config_lock():
             marker = self.read_restart_request(agent)
             if not marker or marker.get("request_id") != request_id:
@@ -6979,6 +7013,28 @@ LEAD_LOOP_CADENCE_FAIL_BACKOFF_MAX = 1800.0   # backoff ceiling (s)
 LEAD_LOOP_CADENCE_HEALTH_THRESHOLD = 5        # consecutive failed ticks -> escalate
 #                                               controller-HEALTH (NOT message poison)
 
+_WINDOWS_PID_MAX = (1 << 32) - 1
+_WINDOWS_FILETIME_MAX = (1 << 64) - 1
+
+
+def _valid_pid_value(pid: object) -> bool:
+    return isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+
+
+def _valid_windows_pid_value(pid: object) -> bool:
+    return _valid_pid_value(pid) and pid <= _WINDOWS_PID_MAX
+
+
+def _windows_filetime_ticks(value: object) -> int | None:
+    """Parse one canonical positive unsigned Windows FILETIME value."""
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[1-9][0-9]{0,19}", value) is None
+    ):
+        return None
+    ticks = int(value)
+    return ticks if ticks <= _WINDOWS_FILETIME_MAX else None
+
 
 def _process_alive(pid: int) -> bool:
     """Best-effort, stdlib, fail-quiet liveness check (0.18.0, FR-007).
@@ -6988,9 +7044,11 @@ def _process_alive(pid: int) -> bool:
     duplicate-activation warning errs toward silence rather than a false
     alarm or a crash.
     """
-    if not isinstance(pid, int) or pid <= 0:
+    if not _valid_pid_value(pid):
         return False
     if os.name == "nt":
+        if not _valid_windows_pid_value(pid):
+            return False
         try:
             import ctypes  # stdlib; imported lazily so POSIX never pays for it
             from ctypes import wintypes
@@ -7030,7 +7088,7 @@ def _process_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True  # exists, owned by another user
-    except OSError:
+    except (OSError, OverflowError):
         return False
 
 
@@ -7075,9 +7133,11 @@ def _process_liveness(pid: object) -> str:
     alive => armed, guarded, and not stolen until the lease both expires AND its
     heartbeat goes stale. A non-positive/non-int pid is UNKNOWN (not DEAD): only the
     enumerated OS signals are definitive enough to authorize a steal."""
-    if not isinstance(pid, int) or pid <= 0:
+    if not _valid_pid_value(pid):
         return PROC_UNKNOWN
     if os.name == "nt":
+        if not _valid_windows_pid_value(pid):
+            return PROC_UNKNOWN
         try:
             import ctypes  # stdlib; lazy so POSIX never pays for it
             from ctypes import wintypes
@@ -7117,7 +7177,7 @@ def _process_liveness(pid: object) -> str:
         return PROC_DEAD
     except PermissionError:
         return PROC_ALIVE  # exists, owned by another user
-    except OSError:
+    except (OSError, OverflowError):
         return PROC_UNKNOWN  # uncertain -> never steal
 
 
@@ -7128,9 +7188,11 @@ def _process_start_token(pid: object) -> str | None:
     compare against a previously recorded start. Callers must treat None as
     conservative/possibly-same-process.
     """
-    if not isinstance(pid, int) or pid <= 0:
+    if not _valid_pid_value(pid):
         return None
     if os.name == "nt":
+        if not _valid_windows_pid_value(pid):
+            return None
         try:
             import ctypes  # stdlib; lazy so POSIX never pays for it
             from ctypes import wintypes
@@ -7304,13 +7366,8 @@ def _windows_owner_identity_gone_exact(
     recorded_start_filetime: object,
 ) -> bool:
     """Compare one live Windows process handle with an exact creation FILETIME."""
-    if (
-        not isinstance(pid, int)
-        or isinstance(pid, bool)
-        or pid <= 0
-        or not isinstance(recorded_start_filetime, str)
-        or re.fullmatch(r"[1-9][0-9]{0,19}", recorded_start_filetime) is None
-    ):
+    recorded_ticks = _windows_filetime_ticks(recorded_start_filetime)
+    if not _valid_windows_pid_value(pid) or recorded_ticks is None:
         return False
     try:
         import ctypes  # stdlib; lazy so POSIX never pays for it
@@ -7370,7 +7427,7 @@ def _windows_owner_identity_gone_exact(
             ) | int(creation.dwLowDateTime)
             if creation_ticks <= 0:
                 return False
-            return str(creation_ticks) != recorded_start_filetime
+            return creation_ticks != recorded_ticks
         finally:
             kernel32.CloseHandle(handle)
     except Exception:  # noqa: BLE001 - exact probe ambiguity is never gone

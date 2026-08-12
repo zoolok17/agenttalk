@@ -2369,7 +2369,51 @@ def _collect_web_attention_items(store: Store, roster: list[str],
         state = _supervisor.load_supervisor_state(
             store.dir / "supervisor-state.json"
         )
-        items += A.process_tree_hold_items(state)
+        try:
+            supervisor_config = _supervisor.load_supervisor_config(
+                store.dir / "supervisor.json"
+            )
+        except Exception:  # noqa: BLE001 - the HOLD must survive bad config
+            supervisor_config = None
+        try:
+            store_config = store.load_config()
+        except Exception:  # noqa: BLE001 - fail closed without blanking the HOLD
+            store_config = None
+        restart_requests: dict[str, dict] = {}
+        for name in A.configured_process_tree_hold_agents(state):
+            try:
+                marker = store.read_restart_request(name)
+            except Exception:  # noqa: BLE001 - optional context, not the signal
+                marker = None
+            if isinstance(marker, dict):
+                restart_requests[name] = marker
+        reset_admissions = _supervisor.evaluate_process_tree_reset_admissions(
+            store,
+            state,
+            actor=for_agent,
+        )
+        launch_requests = _supervisor.active_ephemeral_launch_markers(
+            store,
+            state,
+        )
+        launch_deliveries = _supervisor.active_ephemeral_one_shot_deliveries(
+            store,
+            state,
+            launch_requests,
+        )
+        lane_workspaces = _supervisor.active_ephemeral_lane_workspaces(store)
+        items += A.process_tree_hold_items(
+            state,
+            supervisor_config=supervisor_config,
+            store_config=store_config,
+            root=store.root,
+            restart_requests=restart_requests,
+            launch_requests=launch_requests,
+            launch_deliveries=launch_deliveries,
+            lane_workspaces=lane_workspaces,
+            reset_admissions=reset_admissions,
+            now_epoch=time.time(),
+        )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
     try:
@@ -2564,6 +2608,60 @@ def build_attention(desc: RootDescriptor,
                     entry["operator_command"] = _operator_command_str(
                         it.get("operator_command")
                     )
+                operator_argv = it.get("operator_argv")
+                if (
+                    isinstance(operator_argv, list)
+                    and len(operator_argv) <= 32
+                    and all(
+                        isinstance(token, str) and len(token) <= 500
+                        for token in operator_argv
+                    )
+                ):
+                    entry["operator_argv"] = list(operator_argv)
+                launch = it.get("configured_launch")
+                if isinstance(launch, dict):
+                    argv = launch.get("argv")
+                    cwd = launch.get("cwd")
+                    if (
+                        isinstance(argv, list)
+                        and all(isinstance(token, str) for token in argv)
+                        and isinstance(cwd, str)
+                    ):
+                        entry["configured_launch"] = {
+                            "source": "supervisor.json",
+                            "mode": "detached",
+                            "argv": list(argv),
+                            "cwd": cwd,
+                        }
+                        environment = launch.get("environment")
+                        if isinstance(environment, dict):
+                            entry["configured_launch"]["environment"] = {
+                                str(key): value
+                                for key, value in environment.items()
+                                if isinstance(key, str)
+                                and (
+                                    value is None
+                                    or isinstance(value, str)
+                                    or (
+                                        isinstance(value, list)
+                                        and all(isinstance(v, str) for v in value)
+                                    )
+                                )
+                            }
+                        note = launch.get("environment_note")
+                        if isinstance(note, str):
+                            entry["configured_launch"]["environment_note"] = (
+                                _envelope_str(note)
+                            )
+                else:
+                    launch_problem = it.get("configured_launch_unavailable")
+                    if isinstance(launch_problem, str):
+                        launch_problem = _envelope_str(launch_problem)
+                        if launch_problem:
+                            entry["configured_launch_unavailable"] = launch_problem
+                restart_request = it.get("restart_request")
+                if isinstance(restart_request, dict):
+                    entry["restart_request"] = dict(restart_request)
             if actions_enabled:
                 action = _answer_action_for_item(it, for_agent)
                 if action is not None:

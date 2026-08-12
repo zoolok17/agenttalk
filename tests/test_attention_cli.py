@@ -3,10 +3,17 @@ meta.attention (strict CLI validation, exit 2 on malformed, no Store.send reject
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import sys
+import time
 
 import pytest
 
 from agenttalk import cli
+from agenttalk import ephemeral as eph
+from agenttalk import lanes as lane_mod
+from agenttalk import supervisor as supervisor_mod
+from agenttalk import web as web_mod
 from agenttalk.store import Store
 
 
@@ -16,6 +23,11 @@ _DISPOSITION_RACE_LOCK_TIMEOUT = 60.0
 def _team(tmp_path: Path) -> Store:
     s = Store(tmp_path)
     s.init(["beta", "claude"])
+    shim = s.dir / "bin" / "agenttalk.cmd"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes(
+        supervisor_mod.agenttalk_shim(sys.executable).encode("utf-8")
+    )
     s.set_operator_facing("claude")     # so escalate from beta resolves target=claude
     return s
 
@@ -591,3 +603,521 @@ def test_wrapper_config_blocked_notice_coalesced_when_hold_exists(tmp_path: Path
     items = cli._collect_attention_items(s, for_agent="claude", roster=["beta", "claude"])
     assert not [i for i in items if i["source"] == A.SOURCE_NEEDS_OPERATOR]   # twin coalesced
     assert [i for i in items if i["source"] == A.SOURCE_CONFIG_BLOCKED]       # canonical hold row
+
+
+def test_attention_cli_surfaces_refusal_and_configured_detached_launch(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    s = _team(tmp_path)
+    launch_args = [
+        "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "beta",
+        "--loop", "--", r"C:\Program Files\Codex\codex.exe",
+    ]
+    (s.dir / "supervisor.json").write_text(
+        json.dumps({
+            "agents": {
+                "beta": {
+                    "cli": "codex",
+                    "wrapped": True,
+                    "cwd": str(tmp_path / "worker cwd"),
+                    "launch": {
+                        "windows_file": r"C:\Python\python.exe",
+                        "windows_args": launch_args,
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    supervisor_mod.save_supervisor_state(
+        s.dir / "supervisor-state.json",
+        {
+            "agents": {
+                "beta": {
+                    "restart_request_state": "applied_pending_readiness",
+                    "pending_restart_request_id": "rr-held",
+                    "owned_process_tree": {
+                        "schema_version": 2,
+                        "attribution_model": "owned_process_tree_v2",
+                        "agent": "beta",
+                        "root_key": supervisor_mod._root_key(  # noqa: SLF001
+                            str(tmp_path.resolve())
+                        ),
+                        "status": "invalid",
+                        "reason_code": "process_tree_invalid_legacy_managed_pids",
+                        "observed_count": 1,
+                        "recorded_count": 0,
+                        "omitted_count": 1,
+                        "limit": 64,
+                        "truncated": True,
+                        "refreshed_at": "2026-06-01T00:00:00Z",
+                        "wrapper_generation": None,
+                        "launch_nonce": None,
+                        "entries": [],
+                    },
+                },
+                "claude": {
+                    "owned_process_tree": {
+                        "status": "invalid",
+                        "reason_code": (
+                            "process_tree_invalid_wrapper_state_mismatch"
+                        ),
+                        "observed_count": 1,
+                        "limit": 64,
+                        "rejected_count": 2,
+                        "entries": [],
+                    },
+                },
+            },
+        },
+    )
+    s.write_restart_request("beta", {
+        "agent": "beta",
+        "request_id": "rr-held",
+        "requested_by": "claude",
+    })
+
+    assert cli.main([*_root(tmp_path), "attention", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {
+        row["item_id"]
+        for row in payload["items"]
+        if row["source"] == "process_tree_hold"
+    } == {"process_tree_hold:beta", "process_tree_hold:claude"}
+    item = next(
+        row for row in payload["items"]
+        if row["item_id"] == "process_tree_hold:beta"
+    )
+    rejected_item = next(
+        row for row in payload["items"]
+        if row["item_id"] == "process_tree_hold:claude"
+    )
+
+    assert "complete current ownership from legacy PID records" in item["why_it_matters"]
+    assert "UNKNOWN, not zero" in item["recommendation"]
+    assert "Ownership record carries no rejected-candidate accounting" in (
+        item["recommendation"]
+    )
+    assert "Operator must confirm" in item["recommendation"]
+    assert "excludes 2 candidate identities" in rejected_item["recommendation"]
+    assert "outside the reset command's identity list" in (
+        rejected_item["recommendation"]
+    )
+    assert "Operator must confirm" in rejected_item["recommendation"]
+    assert "no scripted remedy applies in this state" in item["recommendation"]
+    assert item["restart_request"]["pending_progress"] is False
+    assert item["configured_launch"]["argv"] == [
+        r"C:\Python\python.exe",
+        *[
+            str(tmp_path) if token == "{ROOT}" else token
+            for token in launch_args
+        ],
+    ]
+    assert item["configured_launch"]["mode"] == "detached"
+    assert "operator_command" not in item
+
+    assert cli.main([*_root(tmp_path), "attention"]) == 0
+    plain = capsys.readouterr().out
+    assert "automatic recovery refused: beta" in plain
+    assert "automatic recovery refused: claude" in plain
+    assert "UNKNOWN, not zero" in plain
+    assert "excludes 2 candidate identities" in plain
+    assert "no scripted remedy applies in this state" in plain
+    assert "configured detached launch argv" in plain
+    assert "configured launch environment guidance (child value not verified)" in plain
+    assert r"C:\\Program Files\\Codex\\codex.exe" in plain
+
+    supervisor_config_path = s.dir / "supervisor.json"
+    supervisor_config = json.loads(
+        supervisor_config_path.read_text(encoding="utf-8")
+    )
+    supervisor_config["agents"]["beta"]["launch"]["windows_args"][-1] = (
+        "AGENT_NAME_WRAPPED"
+    )
+    supervisor_config_path.write_text(
+        json.dumps(supervisor_config),
+        encoding="utf-8",
+    )
+
+    assert cli.main([*_root(tmp_path), "attention", "--json"]) == 0
+    placeholder_payload = json.loads(capsys.readouterr().out)
+    placeholder_item = next(
+        row for row in placeholder_payload["items"]
+        if row["item_id"] == "process_tree_hold:beta"
+    )
+    assert "configured_launch" not in placeholder_item
+    assert "placeholder" in placeholder_item["configured_launch_unavailable"]
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "operator_fact"),
+    [
+        (
+            "process_tree_invalid_generation_adoption_pending",
+            "current wrapper generation has adopted this agent's process tree",
+        ),
+        (
+            "process_tree_invalid_legacy_managed_pids",
+            "complete current ownership from legacy PID records",
+        ),
+        (
+            "process_tree_invalid_exact_start_filetime_unavailable",
+            "exact process lifetime identities",
+        ),
+        (
+            "process_tree_invalid_post_kill_owned_descendant_edge_survived",
+            "every owned descendant ended after the attempted teardown",
+        ),
+        (
+            "process_tree_invalid_wrapper_state_mismatch",
+            "reported wrapper identity agrees with the supervisor's recorded launcher",
+        ),
+    ],
+)
+def test_attention_collector_fail_closed_for_each_field_refusal_reason(
+    tmp_path: Path,
+    reason_code: str,
+    operator_fact: str,
+) -> None:
+    s = _team(tmp_path)
+    launcher_start = f"linux:{'a' * 32}:1"
+    nonce = "12345678-1234-4234-8234-123456789abc"
+    supervisor_mod.save_supervisor_state(
+        s.dir / "supervisor-state.json",
+        {
+            "agents": {
+                "beta": {
+                    "launcher_pid": 100,
+                    "launcher_start": launcher_start,
+                    "launcher_nonce": nonce,
+                    "runtime_wrapper_generation": "wrapper-1",
+                    "owned_process_tree": {
+                        "schema_version": 2,
+                        "attribution_model": "owned_process_tree_v2",
+                        "agent": "beta",
+                        "root_key": "root-1",
+                        "status": "invalid",
+                        "reason_code": reason_code,
+                        "limit": 64,
+                        "observed_count": 1,
+                        "recorded_count": 1,
+                        "omitted_count": 0,
+                        "truncated": False,
+                        "refreshed_at": "2026-06-01T00:00:00Z",
+                        "wrapper_generation": "wrapper-1",
+                        "launch_nonce": nonce,
+                        "entries": [{
+                            "pid": 100,
+                            "start": launcher_start,
+                            "start_filetime": None,
+                            "role": "wrapper",
+                            "parent_pid": 1,
+                            "discovered_at": "2026-06-01T00:00:00Z",
+                        }],
+                    },
+                },
+            },
+        },
+    )
+
+    items = cli._collect_attention_items(  # noqa: SLF001
+        s,
+        for_agent="claude",
+        roster=["beta", "claude"],
+    )
+    hold = next(item for item in items if item["source"] == "process_tree_hold")
+
+    assert operator_fact in hold["why_it_matters"]
+    assert "no scripted remedy applies in this state" in hold["recommendation"]
+    assert "operator_argv" not in hold
+    assert "operator_command" not in hold
+
+
+def _write_effective_launch_bound_ephemeral_hold(
+    tmp_path: Path,
+    *,
+    with_lane: bool,
+    profile_env: dict[str, str] | None = None,
+) -> tuple[Store, str, str, str, Path]:
+    s = _team(tmp_path)
+    request_id = "lr-0123456789ab"
+    configured_cwd = str(tmp_path / "configured cwd")
+    workspace = str(tmp_path / "ephemeral lane") if with_lane else configured_cwd
+    Path(configured_cwd).mkdir()
+    Path(workspace).mkdir(exist_ok=True)
+    if with_lane:
+        lane_mod.save_lanes(s, {
+            "schema_version": lane_mod.SCHEMA_VERSION,
+            "lanes": {
+                "review-lane": {
+                    "status": lane_mod.STATUS_ACTIVE,
+                    "worktree_path": workspace,
+                },
+            },
+        })
+    launch = {
+        "windows_file": sys.executable,
+        "windows_args": [
+            "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for",
+            "{AGENT}", "--cli", "codex", "--loop", "--one-shot",
+            "--to-request", "{REQUEST_ID}", "--", sys.executable,
+        ],
+    }
+    profile = {
+        "cli": "codex",
+        "codex_home_isolation": False,
+        "cwd": configured_cwd,
+        "env": (
+            dict(profile_env)
+            if profile_env is not None
+            else {"BOUND_ENV": "original"}
+        ),
+        "launch": launch,
+    }
+    supervisor_config = {
+        "agents": {},
+        "ephemeral_reviewers": {
+            "enabled": True,
+            # Both values are admitted so the skill-drift case reaches the
+            # immutable binding comparison rather than being stopped by the
+            # independent allowlist check.
+            "allowed_skills": [
+                "review-code",
+                "review-failure-injection",
+            ],
+            "allowed_profiles": {
+                "codex-evidence-reviewer": profile,
+            },
+        },
+    }
+    supervisor_config_path = s.dir / "supervisor.json"
+    supervisor_config_path.write_text(
+        json.dumps(supervisor_config),
+        encoding="utf-8",
+    )
+    marker = {
+        "schema_version": eph.SCHEMA_VERSION,
+        "kind": eph.REQUEST_KIND,
+        "request_id": request_id,
+        "state": eph.STATE_QUEUED,
+        "requested_by": "claude",
+        "profile": "codex-evidence-reviewer",
+        "skill": "review-code",
+        "prompt": "review the diff",
+        "scope": {"revision": "a" * 40, "paths": ["src"]},
+    }
+    if with_lane:
+        marker.update({
+            "lane_id": "review-lane",
+            "workspace_path": workspace,
+        })
+        marker["scope"]["lane_id"] = "review-lane"
+    s.write_launch_request(marker)
+    state: dict = {}
+    now_epoch = time.time()
+    prepared_spec = supervisor_mod.prepare_launch_request(
+        s,
+        state,
+        supervisor_config,
+        request_id,
+        now_epoch=now_epoch,
+    )
+    agent = prepared_spec["agent"]
+    supervisor_mod.record_ephemeral_launch(
+        state,
+        request_id,
+        pid=1234,
+        pid_start="linux:12345678-1234-1234-1234-123456789abc:100",
+        now_epoch=now_epoch,
+        timeout_seconds=prepared_spec["timeout_seconds"],
+    )
+    durable_marker = s.read_launch_request(request_id)
+    assert durable_marker is not None
+    entry = state["ephemeral_reviewers"]["active"][request_id]
+    entry["process_tree_hold_reason"] = (
+        "process_tree_invalid_wrapper_state_mismatch"
+    )
+    entry["owned_process_tree"] = {
+        "status": "invalid",
+        "reason_code": "process_tree_invalid_wrapper_state_mismatch",
+        "observed_count": 1,
+        "limit": 64,
+        "entries": [],
+    }
+    supervisor_mod.save_supervisor_state(
+        s.dir / "supervisor-state.json",
+        state,
+    )
+    return s, request_id, agent, workspace, supervisor_config_path
+
+
+def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
+    tmp_path: Path,
+) -> None:
+    s, request_id, agent, workspace, config_path = (
+        _write_effective_launch_bound_ephemeral_hold(
+            tmp_path,
+            with_lane=True,
+        )
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    profile["cwd"] = "relative configured cwd"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    cli_item = next(
+        item
+        for item in cli._collect_attention_items(  # noqa: SLF001
+            s,
+            for_agent="claude",
+            roster=["beta", "claude"],
+        )
+        if item["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+    web_item = next(
+        item
+        for item in web_mod._collect_web_attention_items(  # noqa: SLF001
+            s,
+            ["beta", "claude"],
+            "claude",
+        )
+        if item["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+
+    assert cli_item["configured_launch"] == web_item["configured_launch"]
+    assert cli_item["source_hash"] == web_item["source_hash"]
+    assert cli_item["configured_launch"]["cwd"] == workspace
+    assert cli_item["configured_launch"]["cwd"] != profile["cwd"]
+    assert Path(cli_item["configured_launch"]["cwd"]).is_absolute()
+    note = cli_item["configured_launch"]["environment_note"]
+    assert note == (
+        "Re-prepare after edits. Recovery refuses when the mapping or effective "
+        "binding no longer matches. Executable paths, not bytes, are bound. The "
+        "emitted working directory is always absolute: the profile or root value "
+        "without a lane, the bound workspace with one. Child environment is "
+        "unverified."
+    )
+    assert "emitted working directory is always absolute" in note
+    assert "bound workspace with one" in note
+    assert web_mod._envelope_str(note) == note  # noqa: SLF001
+    argv = cli_item["configured_launch"]["argv"]
+    assert argv[argv.index("--for") + 1] == agent
+    assert argv[argv.index("--to-request") + 1] == request_id
+    tail_index = argv.index("--")
+    assert argv[tail_index - 2:tail_index] == ["--lane-id", "review-lane"]
+    assert argv[tail_index + 1:tail_index + 4] == [
+        str(Path(sys.executable).resolve()),
+        "--add-dir",
+        workspace,
+    ]
+
+
+def test_attention_recovery_accepts_equivalent_environment_placeholder_edit(
+    tmp_path: Path,
+) -> None:
+    s, request_id, agent, _workspace, config_path = (
+        _write_effective_launch_bound_ephemeral_hold(
+            tmp_path,
+            with_lane=False,
+            profile_env={"BOUND_AGENT": "{AGENT}"},
+        )
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    assert profile["env"] == {"BOUND_AGENT": "{AGENT}"}
+    profile["env"] = {"BOUND_AGENT": agent}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    item = next(
+        row
+        for row in cli._collect_attention_items(  # noqa: SLF001
+            s,
+            for_agent="claude",
+            roster=["beta", "claude"],
+        )
+        if row["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+
+    assert "configured_launch" in item
+    assert "configured_launch_unavailable" not in item
+    assert "BOUND_AGENT" in item["configured_launch"]["environment"][
+        "supervisor_json_env_keys"
+    ]
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "marker_skill",
+        "marker_prompt",
+        "marker_scope",
+        "profile_cwd",
+        "profile_env",
+    ],
+)
+def test_attention_cli_hides_ephemeral_launch_when_effective_binding_drifts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    drift: str,
+) -> None:
+    s, request_id, _agent, _workspace, config_path = (
+        _write_effective_launch_bound_ephemeral_hold(
+            tmp_path,
+            with_lane=False,
+        )
+    )
+    if drift.startswith("marker_"):
+        marker = s.read_launch_request(request_id)
+        assert marker is not None
+        if drift == "marker_skill":
+            marker["skill"] = "review-failure-injection"
+        elif drift == "marker_prompt":
+            marker["prompt"] = "review a different change"
+        else:
+            marker["scope"] = {"revision": "a" * 40, "paths": ["tests"]}
+        s.update_launch_request(request_id, marker)
+    else:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        profile = config["ephemeral_reviewers"]["allowed_profiles"][
+            "codex-evidence-reviewer"
+        ]
+        if drift == "profile_cwd":
+            drifted_cwd = tmp_path / "drifted cwd"
+            drifted_cwd.mkdir()
+            profile["cwd"] = str(drifted_cwd)
+        else:
+            profile["env"] = {"BOUND_ENV": "drifted"}
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert cli.main([*_root(tmp_path), "attention", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    item = next(
+        row
+        for row in payload["items"]
+        if row["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+    web_item = next(
+        row
+        for row in web_mod._collect_web_attention_items(  # noqa: SLF001
+            s,
+            ["beta", "claude"],
+            "claude",
+        )
+        if row["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+
+    assert "configured_launch" not in item
+    assert "configured_launch" not in web_item
+    assert item["configured_launch_unavailable"] == (
+        "the prepared effective launch binding no longer matches the current "
+        "request and reconstructed launch-effective projection"
+    )
+    assert web_item["configured_launch_unavailable"] == item[
+        "configured_launch_unavailable"
+    ]
+    assert web_item["source_hash"] == item["source_hash"]

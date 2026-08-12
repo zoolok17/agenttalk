@@ -3066,7 +3066,7 @@ const root = {
 const payloads = {
   lastState: { roots: [root], _fetchedAt: now },
   attentionData: {
-    count: 3,
+    count: 5,
     items: [
       {
         source: 'escalation',
@@ -3097,10 +3097,58 @@ const payloads = {
         severity: 'high',
         title: 'supervisor process-tree HOLD: codex-test',
         detail: 'Automatic teardown is HOLD because the tree is truncated.',
-        recommendation: 'Inspect and reduce the owned tree before recovery.',
+        recommendation: 'no scripted remedy applies in this state.',
+        configured_launch: {
+          source: 'supervisor.json',
+          mode: 'detached',
+          argv: ['C:\\Python\\python.exe', '-m', 'agenttalk', 'wrap', '--for', 'codex-test'],
+          cwd: 'D:\\work\\demo-root',
+        },
+        restart_request: {
+          request_id: 'rr-progressing',
+          state: 'applied_pending_readiness',
+          pending_progress: true,
+        },
         agent: 'codex-test',
         ts: iso,
         age_seconds: 5,
+      },
+      {
+        source: 'supervisor',
+        source_label: 'SUPERVISOR HOLD',
+        severity: 'high',
+        title: 'supervisor process-tree HOLD: beta',
+        detail: 'Automatic teardown is HOLD because the tree is invalid.',
+        recommendation: (
+          'The identity-accounting warning fills the bounded recommendation. ' + 'x'.repeat(300)
+        ).slice(0, 300),
+        configured_launch_unavailable: 'the agent has no supervisor.json launch entry',
+        restart_request: {
+          request_id: null,
+          state: 'blocked_by_process_tree_hold',
+          pending_progress: false,
+          unavailable: true,
+        },
+        agent: 'beta',
+        ts: iso,
+        age_seconds: 4,
+      },
+      {
+        source: 'supervisor',
+        source_label: 'SUPERVISOR HOLD',
+        severity: 'high',
+        title: 'supervisor process-tree HOLD: gamma',
+        recommendation: (
+          'A restart request is blocked by this refusal and is not pending progress.'
+        ),
+        restart_request: {
+          request_id: 'rr-blocked',
+          state: 'blocked_by_process_tree_hold',
+          pending_progress: false,
+        },
+        agent: 'gamma',
+        ts: iso,
+        age_seconds: 3,
       },
     ],
   },
@@ -3273,7 +3321,12 @@ const cases = [
       'Operator decision needed',
       'Can I publish v0.72.1 now?',
       'stuck-agent',
-      'Inspect and reduce the owned tree before recovery.',
+      'no scripted remedy applies in this state.',
+      'Configured detached launch',
+      'C:\\\\Python\\\\python.exe',
+      'D:\\work\\demo-root',
+      'Configured detached launch unavailable: the agent has no supervisor.json launch entry',
+      'A restart request is blocked by this refusal and is not pending progress.',
     ],
   },
   { view: 'lead-chat', expected: ['Lead chat', 'Direct channel', 'route received'] },
@@ -3331,6 +3384,11 @@ for (const tc of cases) {
     `${tc.view} title missing view: ${document.title}`);
   for (const expected of tc.expected) {
     assert(text.includes(expected), `${tc.view} missing expected text: ${expected}\nrendered: ${text}`);
+  }
+  if (tc.view === 'attention') {
+    const restartLines = main.querySelectorAll('.tc-attn-restart');
+    assert(restartLines.length === 1,
+      `attention: expected exactly one blocked restart line, got ${restartLines.length}`);
   }
   if (tc.view === 'overview') {
     // v0.75.1: the runtime-identity line renders ONLY for agents with a model.
@@ -4132,6 +4190,13 @@ def test_console_js_thread_cache_key_single_source(tmp_path: Path) -> None:
     js = raw.decode("utf-8")
     assert "function threadKey(" in js
     assert "label + ' ' + rid" not in js, "cache key must go through threadKey(), not an ad-hoc build"
+
+
+def test_console_marks_launch_environment_guidance_as_unverified() -> None:
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    source = console_js.read_text(encoding="utf-8")
+
+    assert "Launch environment guidance (child value not verified):" in source
 
 
 def test_dashboard_shell_no_inline_handlers(tmp_path: Path) -> None:
@@ -5060,6 +5125,7 @@ def _attention(base: str) -> dict:
 
 def test_api_attention_surfaces_process_tree_hold_without_liaison(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agenttalk import attention as attention_mod
     from agenttalk import supervisor as supervisor_mod
@@ -5067,6 +5133,27 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
     s = _make_store(tmp_path)
     assert s.operator_facing() is None
     assert s.sole_lead() is None
+    launch_args = [
+        "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "alpha",
+        "--loop", "--", r"C:\Program Files\Codex\codex.exe",
+    ]
+    (s.dir / "supervisor.json").write_text(
+        json.dumps({
+                "agents": {
+                    "alpha": {
+                        "wrapped": True,
+                        "cli": "codex",
+                        "cwd": str(tmp_path / "alpha cwd"),
+                    "launch": {
+                        "windows_file": r"C:\Python\python.exe",
+                        "windows_args": launch_args,
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    assert not (tmp_path / "alpha cwd").exists()
     entries = [
         {
             "pid": 100 + index,
@@ -5095,17 +5182,64 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
                         "status": "truncated",
                         "reason_code": "process_tree_truncated",
                         "limit": 64,
-                        "observed_count": 65,
+                        "observed_count": 1_000_065,
                         "recorded_count": 64,
-                        "omitted_count": 1,
+                        "omitted_count": 1_000_001,
+                        "rejected_count": 1_000_001,
                         "truncated": True,
                         "refreshed_at": "2026-06-01T00:00:00Z",
                         "wrapper_generation": "wrapper-1",
                         "launch_nonce": "12345678-1234-4234-8234-123456789abc",
                         "entries": entries,
                     }
-                }
+                },
+                "beta": {
+                    "owned_process_tree": {
+                        "schema_version": 2,
+                        "attribution_model": "owned_process_tree_v2",
+                        "agent": "beta",
+                        "root_key": supervisor_mod._root_key(  # noqa: SLF001
+                            str(s.root.resolve())
+                        ),
+                        "status": "invalid",
+                        "reason_code": (
+                            "process_tree_invalid_wrapper_state_mismatch"
+                        ),
+                        "observed_count": 1,
+                        "recorded_count": 0,
+                        "omitted_count": 1,
+                        "limit": 64,
+                        "truncated": True,
+                        "refreshed_at": "2026-06-01T00:00:00Z",
+                        "wrapper_generation": None,
+                        "launch_nonce": None,
+                        "entries": [],
+                    },
+                },
             }
+        },
+    )
+    (s.state_dir / "alpha.restart-request").write_text(
+        '{"agent": "alpha"}',
+        encoding="utf-8",
+    )
+    (s.state_dir / "beta.restart-request").write_text(
+        '{"agent": "beta"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        supervisor_mod,
+        "evaluate_process_tree_reset_admissions",
+        lambda *_args, **_kwargs: {
+            "evaluated": True,
+            "admissions": {},
+            "blocked_admissions": {
+                "alpha": {
+                    "mode": "configured_reset",
+                    "agent": "alpha",
+                    "missing_precondition": "supervisor_kill_switch_absent",
+                },
+            },
         },
     )
 
@@ -5131,6 +5265,15 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         item for item in payload["items"]
         if item["id"] == "process_tree_hold:alpha"
     )
+    missing_accounting_wire = next(
+        item for item in payload["items"]
+        if item["id"] == "process_tree_hold:beta"
+    )
+    assert {
+        item["id"]
+        for item in payload["items"]
+        if item["source_label"] == "SUPERVISOR HOLD"
+    } == {"process_tree_hold:alpha", "process_tree_hold:beta"}
     assert wire == {
         "id": internal["item_id"],
         "source": "supervisor",
@@ -5140,18 +5283,93 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         "agent": "alpha",
         "detail": internal["why_it_matters"],
         "recommendation": web._envelope_str(internal["recommendation"]),
-        "operator_command": internal["operator_command"],
+        "configured_launch": internal["configured_launch"],
+        "restart_request": internal["restart_request"],
         "age_seconds": 0.0,
         "human_can_unblock_now": True,
     }
-    assert wire["operator_command"].endswith(
-        '--reason "attended teardown verified"'
+    assert wire["restart_request"] == {
+        "request_id": None,
+        "state": "blocked_by_process_tree_hold",
+        "pending_progress": False,
+        "unavailable": True,
+    }
+    assert wire["configured_launch"] == {
+        "source": "supervisor.json",
+        "mode": "detached",
+        "argv": [
+            r"C:\Python\python.exe",
+            *[
+                str(tmp_path) if token == "{ROOT}" else token
+                for token in launch_args
+            ],
+            ],
+            "cwd": str(tmp_path / "alpha cwd"),
+            "environment": {
+                "AGENTTALK_ROOT": str(tmp_path),
+                "AGENTTALK_PY": r"C:\Python\python.exe",
+                "supervisor_json_env_keys": [],
+            },
+            "environment_note": (
+                "No prepared binding exists to compare. Recreate values; recover null "
+                "AGENTTALK_PY from the artifact; supervisor may add CODEX_HOME/log "
+                "paths. Relative cwd is emitted unchanged: use the supervisor's base "
+                "or the agent may start elsewhere. Absolute has no such base hazard; "
+                "existence is unchecked."
+            ),
+    }
+    assert "no scripted remedy applies in this state" in wire["recommendation"]
+    assert "Operator must confirm" in wire["recommendation"]
+    assert "omits >1,000,000 identities" in wire["recommendation"]
+    assert "excludes >1,000,000 candidates" in wire["recommendation"]
+    assert ".agenttalk/supervisor.kill" in wire["recommendation"]
+    assert "Create it while the supervisor remains stopped" in (
+        wire["recommendation"]
     )
-    assert "LIVE_NONCE" in wire["operator_command"]
-    console_source = (
-        Path(web.__file__).with_name("web_static") / "console.js"
-    ).read_text(encoding="utf-8")
-    assert "item.operator_command" in console_source
+    assert "UNKNOWN, not zero" in missing_accounting_wire["recommendation"]
+    assert "Ownership record carries no rejected-candidate accounting" in (
+        missing_accounting_wire["recommendation"]
+    )
+    assert "Operator must confirm" in missing_accounting_wire["recommendation"]
+    assert "configured_launch" not in missing_accounting_wire
+    assert missing_accounting_wire["configured_launch_unavailable"] == (
+        "the agent has no supervisor.json launch entry"
+    )
+    assert missing_accounting_wire["restart_request"] == {
+        "request_id": None,
+        "state": "blocked_by_process_tree_hold",
+        "pending_progress": False,
+        "unavailable": True,
+    }
+    assert "operator_command" not in wire
+
+    monkeypatch.setattr(
+        supervisor_mod,
+        "evaluate_process_tree_reset_admissions",
+        lambda *_args, **_kwargs: {
+            "evaluated": True,
+            "admissions": {
+                "alpha": {
+                    "mode": "configured_reset",
+                    "agent": "alpha",
+                    "actor": "lead",
+                    "verified_launch_nonce": (
+                        "12345678-1234-4234-8234-123456789abc"
+                    ),
+                    "reason": "all recorded process identities verified stopped",
+                },
+            },
+        },
+    )
+    admitted_payload = web.build_attention(web.RootDescriptor(s, "root"))
+    admitted_wire = next(
+        item
+        for item in admitted_payload["items"]
+        if item["id"] == "process_tree_hold:alpha"
+    )
+    assert admitted_wire["operator_argv"][:4] == [
+        "agenttalk", "--root", str(tmp_path), "supervise",
+    ]
 
 
 def test_api_attention_hides_resolved_dead_letter_and_keeps_unresolved(

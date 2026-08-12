@@ -1323,6 +1323,36 @@ def test_process_alive_basic() -> None:
     assert _process_alive("x") is False           # never raises
 
 
+def test_windows_process_probes_reject_pid_outside_dword_before_openprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = False
+
+    def unexpected_open(*_args: object, **_kwargs: object) -> object:
+        nonlocal opened
+        opened = True
+        raise AssertionError("out-of-range pid reached OpenProcess")
+
+    monkeypatch.setattr(store_mod, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(ctypes, "WinDLL", unexpected_open, raising=False)
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(kernel32=SimpleNamespace(OpenProcess=unexpected_open)),
+        raising=False,
+    )
+
+    oversized_pid = 1 << 100
+    assert store_mod._process_alive(oversized_pid) is False
+    assert store_mod._process_liveness(oversized_pid) == store_mod.PROC_UNKNOWN
+    assert store_mod._process_start_token(oversized_pid) is None
+    assert (
+        store_mod._windows_owner_identity_gone_exact(oversized_pid, "1")
+        is False
+    )
+    assert opened is False
+
+
 def test_foreign_wait_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     s = Store(tmp_path)
     s.init(["alpha", "beta"])
@@ -1608,6 +1638,26 @@ def test_windows_exact_owner_identity_uses_one_handle(
     assert kernel32.times_queries == (1 if exit_code == 259 else 0)
 
 
+def test_windows_exact_owner_identity_rejects_filetime_above_uint64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel32 = _FakeOwnerIdentityKernel32()
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: kernel32,
+        raising=False,
+    )
+    monkeypatch.setattr(store_mod, "os", SimpleNamespace(name="nt"))
+
+    assert store_mod._owner_identity_gone(
+        321,
+        "2026-07-04T07:20:31.500000Z",
+        str(1 << 64),
+    ) is False
+    assert kernel32.opened == []
+
+
 @pytest.mark.parametrize(
     ("handle", "last_error", "exit_query_ok", "times_query_ok", "expected_gone"),
     [
@@ -1722,3 +1772,27 @@ def test_owner_identity_two_argument_call_stays_compatible(
         321,
         "linux:12345678-1234-1234-1234-123456789abc:1",
     ) is True
+
+
+def test_owner_identity_unknown_is_not_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        store_mod,
+        "_process_liveness",
+        lambda _pid: store_mod.PROC_UNKNOWN,
+    )
+
+    def unexpected_start_observation(_pid: object) -> str:
+        raise AssertionError("an unknown owner must not grant teardown authority")
+
+    monkeypatch.setattr(
+        store_mod,
+        "_process_start_token",
+        unexpected_start_observation,
+    )
+
+    assert store_mod._owner_identity_gone(
+        321,
+        "linux:12345678-1234-1234-1234-123456789abc:1",
+    ) is False
