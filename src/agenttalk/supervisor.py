@@ -9731,6 +9731,10 @@ function Supervisor-IdentityArgs {
   if ($SupervisorStart) { $argv += @('--pid-start', $SupervisorStart) }
   return $argv
 }
+function Supervisor-InstanceIdentityArgs {
+  if (-not $InstanceToken) { throw 'supervisor instance token is unavailable' }
+  return @('--instance-token', $InstanceToken) + (Supervisor-IdentityArgs)
+}
 $InstanceToken = $null
 if (Test-Path $KillSwitchPath) { exit 3 }
 if ($DryRun) {
@@ -12198,7 +12202,8 @@ $pollNum = 0
         if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
         $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
           '--request-id', $rid, '--terminal-state', 'denied', '--reason', $p.reason,
-          '--state-file', $StatePath, '--now', [string]$now)
+          '--state-file', $StatePath, '--now', [string]$now) +
+          (Supervisor-InstanceIdentityArgs)
         if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
           Wait-ForNextPoll $cfg
           continue supervisorPoll
@@ -12221,7 +12226,8 @@ $pollNum = 0
             if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
             $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
               '--request-id', $rid, '--terminal-state', 'failed', '--reason',
-              'codex home seed failed', '--state-file', $StatePath, '--now', [string]$now)
+              'codex home seed failed', '--state-file', $StatePath, '--now', [string]$now) +
+              (Supervisor-InstanceIdentityArgs)
             if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
               Wait-ForNextPoll $cfg
               continue supervisorPoll
@@ -12257,7 +12263,8 @@ $pollNum = 0
           if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
           $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
             '--request-id', $rid, '--terminal-state', 'failed', '--reason',
-            'launch returned no pid', '--state-file', $StatePath, '--now', [string]$now)
+            'launch returned no pid', '--state-file', $StatePath, '--now', [string]$now) +
+            (Supervisor-InstanceIdentityArgs)
           if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
             Wait-ForNextPoll $cfg
             continue supervisorPoll
@@ -12324,7 +12331,7 @@ $pollNum = 0
         $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
           '--request-id', $rid, '--terminal-state', $p.terminal_state, '--reason', $p.reason,
           '--completion-json', $completionJson, '--state-file', $StatePath,
-          '--now', [string]$now)
+          '--now', [string]$now) + (Supervisor-InstanceIdentityArgs)
         if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
           Wait-ForNextPoll $cfg
           continue supervisorPoll

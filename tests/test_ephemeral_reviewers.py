@@ -606,25 +606,269 @@ def test_prepare_inactive_lane_worktree_archives_denied_after_claim(tmp_path: Pa
     assert "not active" in archived["reason"]
 
 
-def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path) -> None:
+def _prepared_cli_archive_fixture(
+    tmp_path: Path,
+    *,
+    request_id: str = "lr-cli-archive",
+    lane_id: str | None = None,
+) -> tuple[Store, str, Path]:
     s = _store(tmp_path)
-    agent = "adversary-lr-cli-archive"
-    marker = _marker("lr-cli-archive", state=eph.STATE_REQUESTED, agent=agent)
+    marker = _marker(request_id)
     s.write_launch_request(marker)
-    s.add_agent(agent, role="reviewer", groups=["ephemeral-reviewers"])
-    state_path = tmp_path / "supervisor-state.json"
-    state_path.write_text(json.dumps({
-        "ephemeral_reviewers": {
-            "active": {
-                "lr-cli-archive": {
-                    "request_id": "lr-cli-archive",
-                    "agent": agent,
-                    "requested_by": "lead",
-                    "phase": eph.STATE_LAUNCHED,
-                }
-            }
-        }
-    }), encoding="utf-8")
+    state: dict = {}
+    spec = sup.prepare_launch_request(
+        s,
+        state,
+        _cfg(),
+        request_id,
+        now_epoch=NOW,
+    )
+    if lane_id is not None:
+        marker = s.read_launch_request(request_id)
+        assert marker is not None
+        scope = {**marker["scope"], "lane_id": lane_id}
+        assert s.update_launch_request(
+            request_id,
+            {"lane_id": lane_id, "scope": scope},
+        ) is not None
+    state_path = s.dir / "supervisor-state.json"
+    sup.save_supervisor_state(state_path, state)
+    return s, spec["agent"], state_path
+
+
+def _archive_cli_args(
+    root: Path,
+    request_id: str,
+    state_path: Path,
+    *,
+    instance: dict | None = None,
+    completion: dict | None = None,
+) -> list[str]:
+    args = [
+        "--root", str(root),
+        "supervise",
+        "--archive-launch-request",
+        "--request-id", request_id,
+        "--terminal-state", eph.STATE_COMPLETED,
+        "--reason", "typed review-result status=rejected",
+        "--state-file", str(state_path),
+        "--now", str(NOW + 1),
+    ]
+    if completion is not None:
+        args.extend(["--completion-json", json.dumps(completion)])
+    if instance is not None:
+        args.extend([
+            "--instance-token", instance["token"],
+            "--pid", str(instance["pid"]),
+        ])
+        if instance.get("pid_start") is not None:
+            args.extend(["--pid-start", instance["pid_start"]])
+    return args
+
+
+def _file_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _tree_bytes(path: Path) -> dict[str, bytes]:
+    if not path.exists():
+        return {}
+    return {
+        item.relative_to(path).as_posix(): item.read_bytes()
+        for item in sorted(path.rglob("*"))
+        if item.is_file()
+    }
+
+
+def _archive_effect_bytes(
+    store: Store,
+    request_id: str,
+    state_path: Path,
+) -> dict[str, object]:
+    # config.json is both the active roster and the permanent retirement registry.
+    return {
+        "launch_marker": _file_bytes(store.launch_requests_dir / f"{request_id}.json"),
+        "instance_marker": _file_bytes(store.supervisor_instance_path()),
+        "archive": _tree_bytes(store.launch_requests_archive_dir),
+        "config_and_roster": store.config_path.read_bytes(),
+        "state": state_path.read_bytes(),
+    }
+
+
+def _claim_current_supervisor(store: Store) -> dict:
+    instance = store.claim_supervisor_instance(
+        pid=os.getpid(),
+        pid_start=store_mod._process_start_token(os.getpid()),
+    )
+    assert instance is not None
+    return instance
+
+
+@pytest.mark.parametrize(
+    ("pid", "liveness", "recorded_start", "expected"),
+    [
+        (123, store_mod.PROC_ALIVE, None, "start_unmatchable"),
+        (123, store_mod.PROC_DEAD, "2026-08-08T00:00:00Z", "dead"),
+        (123, store_mod.PROC_UNKNOWN, "2026-08-08T00:00:00Z", "unknown"),
+        (True, store_mod.PROC_ALIVE, None, "unknown"),
+        (0, store_mod.PROC_ALIVE, None, "unknown"),
+    ],
+)
+def test_probe_owner_identity_short_circuits_without_start_observation(
+    monkeypatch: pytest.MonkeyPatch,
+    pid: object,
+    liveness: str,
+    recorded_start: str | None,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(store_mod, "_process_liveness", lambda _pid: liveness)
+
+    def unexpected_start_observation(_pid: object) -> str:
+        raise AssertionError("start observation was not needed")
+
+    monkeypatch.setattr(store_mod, "_process_start_token", unexpected_start_observation)
+
+    assert store_mod._probe_owner_identity(pid, recorded_start) == expected
+
+
+def test_probe_owner_identity_refuses_missing_start_without_pid_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_pid_probe(_pid: object) -> str:
+        raise AssertionError("an unbound pid cannot prove recorded process identity")
+
+    monkeypatch.setattr(store_mod, "_process_liveness", unexpected_pid_probe)
+
+    assert store_mod._probe_owner_identity(123, None) == "start_unmatchable"
+
+
+@pytest.mark.parametrize(
+    ("recorded_start", "observed_start", "expected"),
+    [
+        (
+            "2026-08-08T00:00:00.123456Z",
+            "2026-08-08T02:00:00.123456+02:00",
+            "alive",
+        ),
+        (
+            "2026-08-08T00:00:00Z",
+            "2026-08-08T00:00:01Z",
+            "pid_reused",
+        ),
+        (
+            "linux:12345678-1234-1234-1234-123456789abc:123",
+            "linux:12345678-1234-1234-1234-123456789abc:123",
+            "alive",
+        ),
+        (
+            "linux:12345678-1234-1234-1234-123456789abc:123",
+            "linux:12345678-1234-1234-1234-123456789abc:456",
+            "pid_reused",
+        ),
+        ("2026-08-08T00:00:00Z", None, "start_unmatchable"),
+        ("not-a-start", "not-a-start", "start_unmatchable"),
+        (
+            "2026-08-08T00:00:00Z",
+            "linux:12345678-1234-1234-1234-123456789abc:123",
+            "start_unmatchable",
+        ),
+    ],
+)
+def test_probe_owner_identity_classifies_start_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_start: str,
+    observed_start: str | None,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(
+        store_mod,
+        "_process_liveness",
+        lambda _pid: store_mod.PROC_ALIVE,
+    )
+    monkeypatch.setattr(store_mod, "_process_start_token", lambda _pid: observed_start)
+
+    assert store_mod._probe_owner_identity(123, recorded_start) == expected
+
+
+def test_probe_owner_identity_confirms_current_process() -> None:
+    pid = os.getpid()
+    assert store_mod._probe_owner_identity(pid, None) == "start_unmatchable"
+    observed_start = store_mod._process_start_token(pid)
+    if observed_start is not None:
+        assert store_mod._probe_owner_identity(pid, observed_start) == "alive"
+
+
+def test_cli_archive_launch_request_without_owner_identity_refuses_without_effects(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_id = "lr-cli-no-owner"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    before = _archive_effect_bytes(s, request_id, state_path)
+
+    rc = cli.main(_archive_cli_args(tmp_path, request_id, state_path))
+
+    assert rc == 3
+    assert "supervisor_owner_identity_missing" in capsys.readouterr().err
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
+
+
+def test_cli_archive_launch_request_with_stale_pid_refuses_without_effects(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_id = "lr-cli-stale-owner"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    instance = s.claim_supervisor_instance(
+        pid=2 ** 31 - 1,
+        pid_start="2026-08-08T00:00:00Z",
+    )
+    assert instance is not None
+    before = _archive_effect_bytes(s, request_id, state_path)
+
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+    ))
+
+    assert rc == 3
+    assert "supervisor_owner_dead" in capsys.readouterr().err
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
+
+
+def test_cli_archive_launch_request_preserves_completion_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id = "lr-cli-archive"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    # Darwin has no native start locator; this success path requires a strong marker.
+    pid_start = "2026-08-08T00:00:00Z"
+    monkeypatch.setattr(
+        store_mod,
+        "_process_start_token",
+        lambda pid: pid_start if pid == os.getpid() else None,
+    )
+    instance = _claim_current_supervisor(s)
+    assert instance["pid_start"] == pid_start
     completion = {
         "status": eph.COMPLETION_REJECTED,
         "terminal": True,
@@ -634,25 +878,300 @@ def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path
         "evidence_only": True,
     }
 
-    rc = cli.main([
-        "--root", str(tmp_path),
-        "supervise",
-        "--archive-launch-request",
-        "--request-id", "lr-cli-archive",
-        "--terminal-state", eph.STATE_COMPLETED,
-        "--reason", "typed review-result status=rejected",
-        "--completion-json", json.dumps(completion),
-        "--state-file", str(state_path),
-        "--now", str(NOW + 1),
-    ])
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+        completion=completion,
+    ))
 
     assert rc == 0
     archived = json.loads(
-        (s.launch_requests_archive_dir / "lr-cli-archive.json").read_text(encoding="utf-8"))
+        (s.launch_requests_archive_dir / f"{request_id}.json").read_text(encoding="utf-8"))
     assert archived["completion"] == completion
     saved_state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert "lr-cli-archive" not in saved_state["ephemeral_reviewers"]["active"]
+    assert request_id not in saved_state["ephemeral_reviewers"]["active"]
     assert agent in s.retired_agents()
+
+
+@pytest.mark.parametrize(
+    ("supplied_start", "reason_code"),
+    [
+        (None, "supervisor_owner_start_unmatchable"),
+        ("2026-08-08T00:00:00Z", "supervisor_owner_identity_mismatch"),
+    ],
+    ids=["omitted-start", "forged-start"],
+)
+def test_cli_archive_launch_request_refuses_reused_live_pid_with_null_start_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    supplied_start: str | None,
+    reason_code: str,
+) -> None:
+    request_id = f"lr-cli-null-start-{supplied_start is not None}"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    reused_pid = os.getpid()
+    assert store_mod._process_liveness(reused_pid) == store_mod.PROC_ALIVE
+    instance = s.claim_supervisor_instance(pid=reused_pid, pid_start=None)
+    assert instance is not None
+    supplied = {**instance, "pid_start": supplied_start}
+    before = _archive_effect_bytes(s, request_id, state_path)
+
+    def unexpected_pid_probe(_pid: object) -> str:
+        raise AssertionError("a null-start identity must refuse before probing the pid")
+
+    monkeypatch.setattr(store_mod, "_process_liveness", unexpected_pid_probe)
+
+    def unexpected_state_load(_path: Path) -> dict:
+        raise AssertionError("null-start refusal must precede state load")
+
+    monkeypatch.setattr(sup, "load_supervisor_state", unexpected_state_load)
+
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=supplied,
+    ))
+
+    assert rc == 3
+    assert reason_code in capsys.readouterr().err
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
+
+
+@pytest.mark.parametrize("identity_break", ["token", "pid", "pid_start"])
+def test_cli_archive_launch_request_requires_exact_marker_identity_before_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    identity_break: str,
+) -> None:
+    request_id = f"lr-cli-mismatch-{identity_break.replace('_', '-')}"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    instance = _claim_current_supervisor(s)
+    supplied = dict(instance)
+    if identity_break == "token":
+        supplied["token"] = "0" * 32
+    elif identity_break == "pid":
+        supplied["pid"] += 1
+    else:
+        supplied["pid_start"] = (
+            None
+            if instance.get("pid_start") is not None
+            else "2026-08-08T00:00:00Z"
+        )
+    before = _archive_effect_bytes(s, request_id, state_path)
+
+    def unexpected_probe(*_args) -> str:
+        raise AssertionError("mismatched marker bytes must refuse before probing")
+
+    monkeypatch.setattr(store_mod, "_probe_owner_identity", unexpected_probe)
+
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=supplied,
+    ))
+
+    assert rc == 3
+    assert "supervisor_owner_identity_mismatch" in capsys.readouterr().err
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
+
+
+def test_cli_archive_launch_request_requires_present_instance_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_id = "lr-cli-marker-absent"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    instance = _claim_current_supervisor(s)
+    s.supervisor_instance_path().unlink()
+    before = _archive_effect_bytes(s, request_id, state_path)
+
+    def unexpected_probe(*_args) -> str:
+        raise AssertionError("an absent marker must refuse before probing")
+
+    monkeypatch.setattr(store_mod, "_probe_owner_identity", unexpected_probe)
+
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+    ))
+
+    assert rc == 3
+    assert "supervisor_owner_marker_absent" in capsys.readouterr().err
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
+
+
+@pytest.mark.parametrize(
+    ("probe_result", "reason_code"),
+    [
+        ("dead", "supervisor_owner_dead"),
+        ("pid_reused", "supervisor_owner_pid_reused"),
+        ("unknown", "supervisor_owner_liveness_unknown"),
+        ("start_unmatchable", "supervisor_owner_start_unmatchable"),
+    ],
+)
+def test_cli_archive_launch_request_owner_probe_refusals_change_no_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    probe_result: str,
+    reason_code: str,
+) -> None:
+    request_id = f"lr-cli-{probe_result.replace('_', '-')}"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    instance = _claim_current_supervisor(s)
+    before = _archive_effect_bytes(s, request_id, state_path)
+    monkeypatch.setattr(store_mod, "_probe_owner_identity", lambda *_args: probe_result)
+
+    def unexpected_state_load(_path: Path) -> dict:
+        raise AssertionError("owner proof must precede state load")
+
+    monkeypatch.setattr(sup, "load_supervisor_state", unexpected_state_load)
+
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+    ))
+
+    assert rc == 3
+    assert reason_code in capsys.readouterr().err
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
+
+
+def test_cli_archive_launch_request_rereads_instance_after_owner_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_id = "lr-cli-marker-swap"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    instance = _claim_current_supervisor(s)
+    before = _archive_effect_bytes(s, request_id, state_path)
+    replacement = {**instance, "token": "f" * 32}
+    replacement_bytes = json.dumps(replacement, indent=2, ensure_ascii=False).encode("utf-8")
+
+    def swap_marker_then_confirm_alive(*_args) -> str:
+        s.supervisor_instance_path().write_bytes(replacement_bytes)
+        return "alive"
+
+    monkeypatch.setattr(store_mod, "_probe_owner_identity", swap_marker_then_confirm_alive)
+
+    rc = cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+    ))
+
+    assert rc == 3
+    assert "supervisor_owner_marker_changed" in capsys.readouterr().err
+    after = _archive_effect_bytes(s, request_id, state_path)
+    assert after["instance_marker"] == replacement_bytes
+    assert {key: value for key, value in after.items() if key != "instance_marker"} == {
+        key: value for key, value in before.items() if key != "instance_marker"
+    }
+    assert agent in s.load_config()["agents"]
+    assert agent not in s.retired_agents()
+
+
+def test_archive_liveness_refusal_preserves_owed_review_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id = "lr-cli-owed-result"
+    s, agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+    )
+    instance = _claim_current_supervisor(s)
+    before = _archive_effect_bytes(s, request_id, state_path)
+    monkeypatch.setattr(store_mod, "_probe_owner_identity", lambda *_args: "dead")
+
+    assert cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+    )) == 3
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+
+    message = s.send(
+        sender=agent,
+        recipient="lead",
+        body="no blocking findings",
+        kind="review-result",
+        meta={"request_id": request_id, "status": "approved"},
+    )
+    result = eph.classify_review_result(
+        s.messages_for("lead"),
+        request_id=request_id,
+        agent=agent,
+        requester="lead",
+    )
+    assert result["message_id"] == message.id
+    assert result["status"] == eph.COMPLETION_APPROVED
+    assert result["terminal"] is True
+
+
+def test_archive_liveness_refusal_preserves_lane_busy_fact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id = "lr-cli-lane-busy"
+    lane_id = "busy"
+    s, _agent, state_path = _prepared_cli_archive_fixture(
+        tmp_path,
+        request_id=request_id,
+        lane_id=lane_id,
+    )
+    instance = _claim_current_supervisor(s)
+    before = _archive_effect_bytes(s, request_id, state_path)
+    monkeypatch.setattr(store_mod, "_probe_owner_identity", lambda *_args: "unknown")
+
+    assert cli.main(_archive_cli_args(
+        tmp_path,
+        request_id,
+        state_path,
+        instance=instance,
+    )) == 3
+    assert _archive_effect_bytes(s, request_id, state_path) == before
+    assert cli._lane_worktree_idle(s, {
+        "lane_id": lane_id,
+        "worktree_path": str(tmp_path / "lane-worktree"),
+    }) is False
 
 
 def test_archive_failure_retains_ephemeral_active_state(
