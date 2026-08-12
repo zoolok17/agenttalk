@@ -955,6 +955,71 @@ def test_configured_wrapped_launch_requires_loop_before_child_tail(
     assert "run the configured argv below" not in item["recommendation"]
 
 
+def test_configured_regular_wrapped_launch_rejects_one_shot_mode() -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "cli": "codex",
+                    "wrapped": True,
+                    "launch": {
+                        "windows_file": "python.exe",
+                        "windows_args": [
+                            "-m", "agenttalk", "wrap", "--for", "worker",
+                            "--loop", "--one-shot", "--to-request", "R1",
+                            "--", "codex.exe",
+                        ],
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert "must not use --one-shot" in item[
+        "configured_launch_unavailable"
+    ]
+    assert "run the configured argv below" not in item["recommendation"]
+
+
+@pytest.mark.parametrize("invalid_cli", [[], {}], ids=["array", "object"])
+def test_configured_launch_rejects_non_string_cli(
+    invalid_cli: object,
+) -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "cli": invalid_cli,
+                    "wrapped": False,
+                    "launch": {
+                        "windows_file": "codex.exe",
+                        "windows_args": [],
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert item["configured_launch_unavailable"] == (
+        "the configured launch cli is invalid"
+    )
+    assert "run the configured argv below" not in item["recommendation"]
+
+
 def test_configured_wrapped_launch_rejects_unknown_pre_tail_option() -> None:
     item = att.process_tree_hold_items(
         _process_tree_state(
@@ -1261,6 +1326,35 @@ def test_configured_manual_launch_preserves_literal_wrap_argument() -> None:
     )[0]
 
     assert item["configured_launch"]["argv"] == ["codex.exe", *windows_args]
+
+
+def test_configured_manual_recovery_refuses_unavailable_session_arguments() -> None:
+    item = att.process_tree_hold_items(
+        _process_tree_state(
+            status="invalid",
+            reason_code="process_tree_invalid_wrapper_state_mismatch",
+        ),
+        supervisor_config={
+            "agents": {
+                "worker": {
+                    "cli": "claude",
+                    "wrapped": False,
+                    "launch": {
+                        "windows_file": "claude.exe",
+                        "windows_args": ["{SESSION_ARGS}"],
+                    },
+                },
+            },
+        },
+        root=r"D:\fleet",
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert "configured_launch" not in item
+    assert item["configured_launch_unavailable"] == (
+        "the configured launch session arguments are unavailable"
+    )
+    assert "run the configured argv below" not in item["recommendation"]
 
 
 @pytest.mark.parametrize(

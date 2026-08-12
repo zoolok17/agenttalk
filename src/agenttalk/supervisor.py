@@ -4688,7 +4688,7 @@ def _effective_launch_candidate(
     population: str,
     agent: str,
     root: str | Path | None,
-    session_args: Sequence[object] = (),
+    session_args: Sequence[object] | None = None,
     request_id: str | None = None,
     lane_id: str | None = None,
 ) -> tuple[EffectiveLaunchCandidate | None, str | None]:
@@ -4696,7 +4696,9 @@ def _effective_launch_candidate(
 
     Population-specific substitution happens before this returns.  Every
     projection and executor consumes the resulting argv rather than rebuilding
-    it from the raw profile.
+    it from the raw profile.  ``session_args=None`` means the caller cannot
+    project dynamic session arguments; an explicit empty sequence remains a
+    known-empty substitution.
     """
     if population not in _LAUNCH_ADMISSION_POPULATIONS:
         return None, "the configured launch population is invalid"
@@ -4708,7 +4710,7 @@ def _effective_launch_candidate(
         return None, "the configured launch agent is invalid"
     default_cli = "codex" if population == "ephemeral" else "claude"
     cli = row.get("cli", default_cli)
-    if cli not in {"claude", "codex"}:
+    if not isinstance(cli, str) or cli not in {"claude", "codex"}:
         return None, "the configured launch cli is invalid"
     # Ephemeral launch specs are intrinsically supervised one-shot wrappers;
     # unlike regular agent rows, their persisted shape has no redundant
@@ -4733,15 +4735,16 @@ def _effective_launch_candidate(
     if not isinstance(raw_args, list):
         return None, "the configured launch argument list is invalid"
     normalized_session_args: list[str] = []
-    for value in session_args:
-        token = _valid_launch_token(value, allow_empty=True)
-        if token is None:
-            return None, "the configured launch session argument list is invalid"
-        if token == "{SESSION_ID}":  # noqa: S105  # nosec B105 - substitution placeholder, not a secret
-            return None, (
-                "the configured launch session identity is unavailable"
-            )
-        normalized_session_args.append(token)
+    if session_args is not None:
+        for value in session_args:
+            token = _valid_launch_token(value, allow_empty=True)
+            if token is None:
+                return None, "the configured launch session argument list is invalid"
+            if token == "{SESSION_ID}":  # noqa: S105  # nosec B105 - substitution placeholder, not a secret
+                return None, (
+                    "the configured launch session identity is unavailable"
+                )
+            normalized_session_args.append(token)
 
     root_text = (
         _valid_launch_token(str(root), allow_empty=False)
@@ -4772,6 +4775,10 @@ def _effective_launch_candidate(
     argv: list[str] = []
     for raw_value in raw_args:
         if raw_value == "{SESSION_ARGS}":
+            if session_args is None:
+                return None, (
+                    "the configured launch session arguments are unavailable"
+                )
             argv.extend(normalized_session_args)
             continue
         argument = _valid_launch_token(raw_value, allow_empty=True)
@@ -4832,6 +4839,7 @@ def _effective_launch_candidate(
             ),
             require_loop=True,
             require_one_shot=(population == "ephemeral"),
+            forbid_one_shot=(population == "regular"),
             forbid_lead_loop=(population == "ephemeral"),
             expected_agent=validated_agent,
             expected_sender=(validated_agent if population == "ephemeral" else None),
@@ -8717,6 +8725,7 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                 population="regular",
                 agent=name,
                 root=store.root,
+                session_args=(),
             )
             if launch_candidate is None:
                 _bootstrap_add(

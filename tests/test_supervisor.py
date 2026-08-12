@@ -2983,6 +2983,99 @@ def test_supervise_bootstrap_check_requires_loop_before_child_tail(
     assert "requires --loop before the child delimiter" in check["detail"]
 
 
+@pytest.mark.parametrize("invalid_cli", [[], {}], ids=["array", "object"])
+def test_supervise_bootstrap_check_rejects_non_string_cli_without_crashing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    invalid_cli: object,
+) -> None:
+    store = _team(tmp_path, "Polaris,Zeno")
+    store.set_role("Polaris", "lead")
+    store.set_operator_facing("Polaris")
+    for name in ("Polaris", "Zeno"):
+        store.write_heartbeat(name)
+    manual = _wrapped_supervisor_agent("Zeno", "codex")
+    manual["cli"] = invalid_cli
+    manual["wrapped"] = False
+    manual["launch"] = {
+        "windows_file": "codex.exe",
+        "windows_args": [],
+    }
+    _write_supervisor_config(store, {"Zeno": manual})
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert any(
+        check["id"] == "supervisor_agent_cli_unsupported"
+        and check.get("agent") == "Zeno"
+        for check in payload["checks"]
+    )
+    admission = next(
+        check
+        for check in payload["checks"]
+        if check["id"] == "supervisor_agent_launch_admission_refused"
+        and check.get("agent") == "Zeno"
+    )
+    assert "launch cli is invalid" in admission["detail"]
+
+
+def test_supervise_bootstrap_check_rejects_regular_one_shot_wrapper(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    store = _team(tmp_path, "Polaris,Zeno")
+    store.set_role("Polaris", "lead")
+    store.set_operator_facing("Polaris")
+    for name in ("Polaris", "Zeno"):
+        store.write_heartbeat(name)
+    wrapped = _wrapped_supervisor_agent("Zeno", "codex")
+    args = wrapped["launch"]["windows_args"]
+    delimiter = args.index("--")
+    args[delimiter:delimiter] = ["--one-shot", "--to-request", "R1"]
+    _write_supervisor_config(store, {"Zeno": wrapped})
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    refusal = next(
+        check
+        for check in payload["checks"]
+        if check["id"] == "supervisor_agent_launch_admission_refused"
+        and check.get("agent") == "Zeno"
+    )
+    assert "must not use --one-shot" in refusal["detail"]
+
+
+def test_regular_launch_admission_preserves_child_one_shot_argument(
+    tmp_path: Path,
+) -> None:
+    row = _wrapped_supervisor_agent("worker", "codex")
+    row["cwd"] = str(tmp_path)
+    row["launch"]["windows_args"].append("--one-shot")
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                "launch_mode": "wrap",
+                "session_args": [],
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["child_argv"][-1] == "--one-shot"
+
+
 def test_supervise_bootstrap_check_rejects_environment_name_with_equals(
     tmp_path: Path,
     capsys: pytest.CaptureFixture,
@@ -8612,6 +8705,39 @@ def test_regular_plan_finalizer_binds_or_refuses_claude_session_identity(
     assert legacy["status"] == "refused"
     assert "session identity is unavailable" in legacy["reason"]
     assert "argv" not in legacy
+
+
+def test_regular_plan_finalizer_accepts_explicitly_empty_session_arguments(
+    tmp_path: Path,
+) -> None:
+    row = {
+        "cli": "claude",
+        "wrapped": False,
+        "cwd": str(tmp_path),
+        "session": {"fresh": [], "resume": []},
+        "launch": {
+            "windows_file": "claude.exe",
+            "windows_args": ["{SESSION_ARGS}"],
+        },
+    }
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.RELAUNCH,
+                **sup._launch_detail({}, row),  # noqa: SLF001
+            },
+        },
+    }
+
+    sup.attach_regular_launch_admissions(
+        plan,
+        {"agents": {"worker": row}},
+        root=tmp_path,
+    )
+
+    artifact = plan["agents"]["worker"]["launch_admission"]
+    assert artifact["status"] == "accepted"
+    assert artifact["argv"] == []
 
 
 def test_regular_plan_finalizer_preserves_literal_session_prompt_text(
