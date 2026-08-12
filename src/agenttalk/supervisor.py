@@ -4737,7 +4737,7 @@ def _effective_launch_candidate(
         token = _valid_launch_token(value, allow_empty=True)
         if token is None:
             return None, "the configured launch session argument list is invalid"
-        if token == "{SESSION_ID}":  # noqa: S105 - placeholder, not a secret
+        if token == "{SESSION_ID}":  # noqa: S105  # nosec B105 - substitution placeholder, not a secret
             return None, (
                 "the configured launch session identity is unavailable"
             )
