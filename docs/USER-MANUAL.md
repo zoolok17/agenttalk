@@ -606,13 +606,18 @@ normal fail-closed adoption.
 When Attention shows a configured detached launch for a refusal, an active
 ephemeral launch is bound to its prepared request's reconstructed
 launch-effective projection: the values produced after marker-derived
-substitutions, including argv and working directory. Re-prepare after editing the
-configured profile. Recovery emits a named refusal rather than a command when
-the configured launch mapping or reconstructed launch-effective projection no
+substitutions, including argv and the configured working-directory value.
+Re-prepare after editing the configured profile. Recovery emits a named refusal
+rather than a command when the configured launch mapping or reconstructed
+launch-effective projection no
 longer matches; equivalent-looking edits are not guaranteed to remain valid.
 Recovery binds resolved executable paths, not the contents at those paths. An
 in-place replacement at one of those paths is not detected, so a recovery command may
-name a binary whose contents have changed since preparation. The listed
+name a binary whose contents have changed since preparation. When the configured
+working directory is relative, recovery emits it as-is. Run the command from the
+same base directory the supervisor used; running it from a different location can
+start the agent in the wrong directory. Absolute configured working directories
+are emitted unchanged and have no such caveat. The listed
 environment is guidance only: agenttalk does not verify the environment that the
 child actually receives, so the operator must review both ambient and configured
 values before launching it.

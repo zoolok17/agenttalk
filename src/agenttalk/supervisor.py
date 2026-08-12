@@ -5636,25 +5636,19 @@ def configured_detached_launch(
         "environment": environment,
         "environment_note": (
             (
-                "Re-prepare after editing the configured profile. Recovery "
-                "emits a named refusal rather than a command when the "
-                "configured launch mapping or reconstructed launch-effective "
-                "projection no longer matches; equivalent-looking edits are "
-                "not guaranteed to remain valid. Recovery binds resolved "
-                "executable paths, not the contents at those paths. An in-place "
-                "replacement at one of those paths is not detected, so a recovery "
-                "command may name a binary whose contents have changed since "
-                "preparation. The environment the "
-                "child actually receives is not verified and must be reviewed "
-                "by the operator; neither ambient nor configured values are "
-                "guaranteed to be delivered."
+                "Re-prepare after profile edits; recovery refuses drift. Executable "
+                "paths, not bytes, are bound. Relative working directory is emitted "
+                "as-is: run from the supervisor's base; elsewhere may start the "
+                "agent in the wrong place. Absolute working directory has no "
+                "caveat. Child environment is unverified."
             )
             if request_id is not None
             else (
-                "Reproduce the listed values and any configured per-agent "
-                "values; a null AGENTTALK_PY must be recovered from the "
-                "supervisor artifact, and the supervisor may also supply an "
-                "isolated CODEX_HOME and wrapper-log paths."
+                "Recreate listed/configured values; recover null AGENTTALK_PY from "
+                "supervisor artifact. Supervisor may add CODEX_HOME/log paths. "
+                "Relative working directory is emitted as-is: run from the "
+                "supervisor's base; elsewhere may start the agent in the wrong "
+                "place. Absolute working directory has no caveat."
             )
         ),
     }, ""

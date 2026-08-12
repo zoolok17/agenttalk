@@ -26,9 +26,13 @@ the configured launch mapping or reconstructed launch-effective projection no
 longer matches; equivalent-looking edits are not guaranteed to remain valid.
 Recovery binds resolved executable paths, not the contents at those paths. An
 in-place replacement at one of those paths is not detected, so a recovery command may
-name a binary whose contents have changed since preparation. Recovery also does
-not verify the environment the child actually receives, and the operator surfaces
-state both limitations explicitly.
+name a binary whose contents have changed since preparation. When the configured
+working directory is relative, recovery emits it as-is. Run the command from the
+same base directory the supervisor used; running it from a different location can
+start the agent in the wrong directory. Absolute configured working directories
+are emitted unchanged and have no such caveat. Recovery also does not verify the
+environment the child actually receives, and the operator surfaces state all
+three limitations explicitly.
 
 **Why.** Three implementations that appeared internally consistent failed at
 the real process boundary. The tested preferred PowerShell 7 host dropped
@@ -57,6 +61,11 @@ remains valid. An equivalent edit inside the raw launch mapping refuses. The
 existing Windows environment-name comparer considers case variants equal, but
 the binding hashes their spelling and refuses the edit. OS-equivalent working
 directory aliases are likewise not normalized before hashing.
+
+Separately, a relative configured working directory is emitted as-is, so run the
+recovery command from the same base directory the supervisor used. Running it
+from a different location can start the agent in the wrong directory. Absolute
+configured working directories are emitted unchanged and have no such caveat.
 
 **Why.** The current behavior fails closed, but equivalent-looking profile edits
 do not share one tolerance rule. A public equivalence promise would therefore be

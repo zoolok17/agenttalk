@@ -344,14 +344,18 @@ two parallel ownership concepts.
 - **Detached refusal guidance (v0.82.0):** for an active ephemeral request, the
   displayed argv is bound to the durable prepared request and reconstructed
   launch-effective projection: the values produced after marker-derived
-  substitutions, including argv and working directory. Re-prepare after editing
-  the configured profile. Recovery emits a named refusal instead of a command
-  when the configured launch mapping or reconstructed
+  substitutions, including argv and the configured working-directory value.
+  Re-prepare after editing the configured profile. Recovery emits a named refusal
+  instead of a command when the configured launch mapping or reconstructed
   launch-effective projection no longer matches; equivalent-looking edits are
   not guaranteed to remain valid. Recovery binds resolved executable paths, not
   the contents at those paths. An in-place replacement at one of those paths is
   not detected, so a recovery command may name a binary whose contents have changed
-  since preparation. Environment metadata is deliberately advisory: it neither
+  since preparation. When the configured working directory is relative, recovery
+  emits it as-is. Run the command from the same base directory the supervisor used;
+  running it from a different location can start the agent in the wrong directory.
+  Absolute configured working directories are emitted unchanged and have no such
+  caveat. Environment metadata is deliberately advisory: it neither
   binds the ambient environment nor proves what the child receives, and the
   operator-facing text says so explicitly.
 

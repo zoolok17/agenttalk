@@ -744,9 +744,11 @@ def test_process_tree_refusal_is_operator_visible_with_working_manual_launch(
             "supervisor_json_env_keys": [],
         },
         "environment_note": (
-            "Reproduce the listed values and any configured per-agent values; "
-            "a null AGENTTALK_PY must be recovered from the supervisor artifact, "
-            "and the supervisor may also supply an isolated CODEX_HOME and wrapper-log paths."
+            "Recreate listed/configured values; recover null AGENTTALK_PY from "
+            "supervisor artifact. Supervisor may add CODEX_HOME/log paths. Relative "
+            "working directory is emitted as-is: run from the supervisor's base; "
+            "elsewhere may start the agent in the wrong place. Absolute working "
+            "directory has no caveat."
         ),
     }
     assert item["restart_request"] == {
@@ -2224,18 +2226,20 @@ def test_ephemeral_hold_does_not_claim_or_bind_ambient_environment(
     assert "effective_environment_sha256" not in environment
     note = admitted["configured_launch"]["environment_note"]
     assert note == (
-        "Re-prepare after editing the configured profile. Recovery emits a "
-        "named refusal rather than a command when the configured launch mapping "
-        "or reconstructed launch-effective projection no longer matches; "
-        "equivalent-looking edits are not guaranteed to remain valid. Recovery "
-        "binds resolved executable paths, not the contents at those paths. An "
-        "in-place replacement at one of those paths is not detected, so a recovery "
-        "command may name a binary whose contents have changed since "
-        "preparation. The "
-        "environment the child actually receives is not verified and must be "
-        "reviewed by the operator; neither ambient nor configured values are "
-        "guaranteed to be delivered."
+        "Re-prepare after profile edits; recovery refuses drift. Executable paths, "
+        "not bytes, are bound. Relative working directory is emitted as-is: run from "
+        "the supervisor's base; elsewhere may start the agent in the wrong place. "
+        "Absolute working directory has no caveat. Child environment is unverified."
     )
+    required_limitations = (
+        "Relative working directory is emitted as-is",
+        "run from the supervisor's base",
+        "elsewhere may start the agent in the wrong place",
+        "Absolute working directory has no caveat",
+        "Executable paths, not bytes, are bound",
+        "Child environment is unverified",
+    )
+    assert not [text for text in required_limitations if text not in note]
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-drift-is-not-bound")
     still_admitted = att.process_tree_hold_items(

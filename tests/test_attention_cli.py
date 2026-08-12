@@ -981,18 +981,12 @@ def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
     assert cli_item["configured_launch"]["cwd"] == workspace
     note = cli_item["configured_launch"]["environment_note"]
     assert note == (
-        "Re-prepare after editing the configured profile. Recovery emits a "
-        "named refusal rather than a command when the configured launch mapping "
-        "or reconstructed launch-effective projection no longer matches; "
-        "equivalent-looking edits are not guaranteed to remain valid. Recovery "
-        "binds resolved executable paths, not the contents at those paths. An "
-        "in-place replacement at one of those paths is not detected, so a recovery "
-        "command may name a binary whose contents have changed since "
-        "preparation. The "
-        "environment the child actually receives is not verified and must be "
-        "reviewed by the operator; neither ambient nor configured values are "
-        "guaranteed to be delivered."
+        "Re-prepare after profile edits; recovery refuses drift. Executable paths, "
+        "not bytes, are bound. Relative working directory is emitted as-is: run from "
+        "the supervisor's base; elsewhere may start the agent in the wrong place. "
+        "Absolute working directory has no caveat. Child environment is unverified."
     )
+    assert web_mod._envelope_str(note) == note  # noqa: SLF001
     argv = cli_item["configured_launch"]["argv"]
     assert argv[argv.index("--for") + 1] == agent
     assert argv[argv.index("--to-request") + 1] == request_id

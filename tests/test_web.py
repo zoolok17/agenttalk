@@ -5310,9 +5310,11 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
                 "supervisor_json_env_keys": [],
             },
             "environment_note": (
-                "Reproduce the listed values and any configured per-agent values; "
-                "a null AGENTTALK_PY must be recovered from the supervisor artifact, "
-                "and the supervisor may also supply an isolated CODEX_HOME and wrapper-log paths."
+                "Recreate listed/configured values; recover null AGENTTALK_PY from "
+                "supervisor artifact. Supervisor may add CODEX_HOME/log paths. "
+                "Relative working directory is emitted as-is: run from the "
+                "supervisor's base; elsewhere may start the agent in the wrong "
+                "place. Absolute working directory has no caveat."
             ),
     }
     assert "no scripted remedy applies in this state" in wire["recommendation"]
