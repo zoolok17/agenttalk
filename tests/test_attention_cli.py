@@ -838,6 +838,7 @@ def _write_effective_launch_bound_ephemeral_hold(
     tmp_path: Path,
     *,
     with_lane: bool,
+    profile_env: dict[str, str] | None = None,
 ) -> tuple[Store, str, str, str, Path]:
     s = _team(tmp_path)
     request_id = "lr-0123456789ab"
@@ -867,7 +868,11 @@ def _write_effective_launch_bound_ephemeral_hold(
         "cli": "codex",
         "codex_home_isolation": False,
         "cwd": configured_cwd,
-        "env": {"BOUND_ENV": "original"},
+        "env": (
+            dict(profile_env)
+            if profile_env is not None
+            else {"BOUND_ENV": "original"}
+        ),
         "launch": launch,
     }
     supervisor_config = {
@@ -1007,6 +1012,41 @@ def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
         str(Path(sys.executable).resolve()),
         "--add-dir",
         workspace,
+    ]
+
+
+def test_attention_recovery_accepts_equivalent_environment_placeholder_edit(
+    tmp_path: Path,
+) -> None:
+    s, request_id, agent, _workspace, config_path = (
+        _write_effective_launch_bound_ephemeral_hold(
+            tmp_path,
+            with_lane=False,
+            profile_env={"BOUND_AGENT": "{AGENT}"},
+        )
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    assert profile["env"] == {"BOUND_AGENT": "{AGENT}"}
+    profile["env"] = {"BOUND_AGENT": agent}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    item = next(
+        row
+        for row in cli._collect_attention_items(  # noqa: SLF001
+            s,
+            for_agent="claude",
+            roster=["beta", "claude"],
+        )
+        if row["item_id"] == f"process_tree_hold:ephemeral:{request_id}"
+    )
+
+    assert "configured_launch" in item
+    assert "configured_launch_unavailable" not in item
+    assert "BOUND_AGENT" in item["configured_launch"]["environment"][
+        "supervisor_json_env_keys"
     ]
 
 

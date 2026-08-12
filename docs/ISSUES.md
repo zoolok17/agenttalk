@@ -56,12 +56,15 @@ bound to an exact inherited or effective child environment.
 **What.** Active ephemeral recovery compares the prepared and current configured launch
 mappings by raw equality, then binds the reconstructed launch-effective
 projection, including resolved executable paths but not executable contents.
-Placeholder substitution happens before hashing, so replacing a configured
-working-directory or environment-value placeholder with its resolved literal
-remains valid. An equivalent edit inside the raw launch mapping refuses. The
-existing Windows environment-name comparer considers case variants equal, but
-the binding hashes their spelling and refuses the edit. OS-equivalent working
-directory aliases are likewise not normalized before hashing.
+Environment-value substitution happens before hashing, so replacing a configured
+environment-value placeholder with its resolved literal remains valid. A configured
+`{ROOT}` working-directory placeholder is different: unless the request already
+carries an absolute bound workspace, initial preparation validates the profile before
+providing a root or looking up a lane, so the value remains relative and is refused.
+Task #179 tracks this safe over-refusal. An equivalent edit inside the raw launch
+mapping refuses. The existing Windows environment-name comparer considers case
+variants equal, but the binding hashes their spelling and refuses the edit.
+OS-equivalent working directory aliases are likewise not normalized before hashing.
 
 The emitted working directory is always absolute: without a lane it is the
 admitted profile or project-root value; with a lane it is the bound lane workspace
@@ -74,11 +77,12 @@ re-preparation is required.
 
 **Disposition.** `PLANNED`. If recovery is to tolerate equivalent edits, hash a
 normalized configured-profile projection rather than its spelling, while
-retaining full current admission and refusal on real drift. Cover configured
-environment-name case variants, OS-equivalent working-directory aliases,
-placeholder-to-literal values, launch-mapping equivalence, and real drift at the
-consumer. Until then, operators should re-prepare after any profile edit and no
-surface should promise that an equivalent-looking edit remains valid.
+retaining full current admission and refusal on real drift. Preserve the existing
+environment placeholder-to-literal tolerance, and cover configured environment-name
+case variants, OS-equivalent working-directory aliases, the `{ROOT}` cwd refusal
+tracked in task #179, launch-mapping equivalence, and real drift at the consumer.
+Until then, operators should re-prepare after any profile edit and no surface should
+promise that an equivalent-looking edit remains valid.
 
 ---
 
