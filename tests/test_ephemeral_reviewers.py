@@ -3122,6 +3122,7 @@ def _stage_ephemeral_archive_retry(
     *,
     verification_mode: str,
     verified_launch_nonce: str | None,
+    reason: str = "operator verified the terminal request can be archived",
 ) -> None:
     marker = store.read_launch_request(request_id)
     assert marker is not None
@@ -3137,7 +3138,7 @@ def _stage_ephemeral_archive_retry(
         verification_mode=verification_mode,
         verified_launch_nonce=verified_launch_nonce,
         verified_identity_count=(1 if verification_mode == "strict_identity" else 0),
-        reason="operator verified the terminal request can be archived",
+        reason=reason,
         now_epoch=NOW,
     )
     sup.save_supervisor_state(store.dir / "supervisor-state.json", state)
@@ -3177,6 +3178,36 @@ def test_rendered_strict_identity_ephemeral_retry_argv_executes(
     assert argv[:4] == ["agenttalk", "--root", str(tmp_path), "supervise"]
     assert argv[argv.index("--verified-launch-nonce") + 1] == SUPERVISOR_NONCE
     assert cli.main([*argv[1:], "--now", str(NOW)]) == 0
+
+
+@pytest.mark.parametrize("reason", ["-maintenance", "ordinary maintenance"])
+def test_rendered_ephemeral_retry_reason_is_one_parseable_argv_token(
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    store = _store(tmp_path)
+    request_id, agent, source_hash = _write_attended_ephemeral_hold_fixture(store)
+    (store.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+    _stage_ephemeral_archive_retry(
+        store,
+        state,
+        request_id,
+        agent,
+        source_hash,
+        verification_mode="operator_attested",
+        verified_launch_nonce=None,
+        reason=reason,
+    )
+
+    item = _current_ephemeral_reset_item(store, state, request_id)
+
+    assert f"--reason={reason}" in item["operator_argv"]
+    assert "--reason" not in item["operator_argv"]
+    assert cli.main([*item["operator_argv"][1:], "--now", str(NOW)]) == 0
+    archive_path = store.launch_requests_archive_dir / f"{request_id}.json"
+    archived = json.loads(archive_path.read_text(encoding="utf-8"))
+    assert archived["attended_teardown"]["reason"] == reason
 
 
 def test_staged_ephemeral_terminal_drift_hides_rendered_remedy(

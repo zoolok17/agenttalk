@@ -1279,8 +1279,9 @@ def process_tree_hold_items(
             operator_argv.extend([
                 "--acknowledge-no-live-supervisor",
                 "--acknowledge-owned-processes-stopped",
-                "--reason",
-                remedy["reason"],
+                # Argparse otherwise reads a safe leading-dash reason as an
+                # option instead of this option's value.
+                f"--reason={remedy['reason']}",
                 "--from",
                 remedy["actor"],
             ])
