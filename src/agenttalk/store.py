@@ -7096,6 +7096,11 @@ def _process_alive(pid: int) -> bool:
 PROC_ALIVE = "alive"
 PROC_DEAD = "dead"
 PROC_UNKNOWN = "unknown"
+OWNER_IDENTITY_ALIVE = PROC_ALIVE
+OWNER_IDENTITY_DEAD = PROC_DEAD
+OWNER_IDENTITY_PID_REUSED = "pid_reused"
+OWNER_IDENTITY_UNKNOWN = PROC_UNKNOWN
+OWNER_IDENTITY_START_UNMATCHABLE = "start_unmatchable"
 # Anti-reuse compares should be tight: widening this risks false-matching a
 # recycled pid. Ambiguous tokens already degrade to None and are not stealable.
 _START_TOKEN_COMPARE_TOLERANCE_SECONDS = 0.001
@@ -7309,6 +7314,51 @@ def _start_tokens_same(left: object, right: object) -> bool:
         abs(left_dt.timestamp() - right_dt.timestamp())
         <= _START_TOKEN_COMPARE_TOLERANCE_SECONDS
     )
+
+
+def _start_token_kind(value: object) -> str | None:
+    """Return the comparable start-token family, or None when unusable."""
+    if not isinstance(value, str) or not value:
+        return None
+    if re.fullmatch(r"linux:[0-9a-fA-F-]{32,64}:[0-9]+", value):
+        return "linux"
+    return "iso" if _parse_start_token(value) is not None else None
+
+
+def _probe_owner_identity(pid: object, recorded_pid_start: object = None) -> str:
+    """Positively classify whether ``pid`` is the recorded live process.
+
+    Unlike :func:`_owner_identity_gone`, this is an admission probe: UNKNOWN
+    and an unobservable start identity are refusals, not alternate ways to
+    spell "alive".  An omitted start token is unmatchable without probing the
+    pid: liveness alone cannot prove that the running process is the recorded
+    owner rather than a later process that reused its number.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return OWNER_IDENTITY_UNKNOWN
+    if recorded_pid_start is None:
+        return OWNER_IDENTITY_START_UNMATCHABLE
+    try:
+        liveness = _process_liveness(pid)
+    except Exception:  # noqa: BLE001 - a failed authority probe is UNKNOWN
+        return OWNER_IDENTITY_UNKNOWN
+    if liveness == PROC_DEAD:
+        return OWNER_IDENTITY_DEAD
+    if liveness != PROC_ALIVE:
+        return OWNER_IDENTITY_UNKNOWN
+    try:
+        observed_pid_start = _process_start_token(pid)
+    except Exception:  # noqa: BLE001 - live pid, but its start cannot be matched
+        return OWNER_IDENTITY_START_UNMATCHABLE
+    recorded_kind = _start_token_kind(recorded_pid_start)
+    observed_kind = _start_token_kind(observed_pid_start)
+    if recorded_kind is None or observed_kind != recorded_kind:
+        return OWNER_IDENTITY_START_UNMATCHABLE
+    if _start_tokens_same(observed_pid_start, recorded_pid_start):
+        return OWNER_IDENTITY_ALIVE
+    if _start_tokens_differ(observed_pid_start, recorded_pid_start):
+        return OWNER_IDENTITY_PID_REUSED
+    return OWNER_IDENTITY_START_UNMATCHABLE
 
 
 def _windows_owner_identity_gone_exact(
