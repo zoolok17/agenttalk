@@ -5153,6 +5153,7 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         }),
         encoding="utf-8",
     )
+    assert not (tmp_path / "alpha cwd").exists()
     entries = [
         {
             "pid": 100 + index,
@@ -5310,11 +5311,11 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
                 "supervisor_json_env_keys": [],
             },
             "environment_note": (
-                "Recreate listed/configured values; recover null AGENTTALK_PY from "
-                "supervisor artifact. Supervisor may add CODEX_HOME/log paths. "
-                "Relative working directory is emitted as-is: run from the "
-                "supervisor's base; elsewhere may start the agent in the wrong "
-                "place. Absolute working directory has no caveat."
+                "No prepared binding exists to compare. Recreate values; recover null "
+                "AGENTTALK_PY from the artifact; supervisor may add CODEX_HOME/log "
+                "paths. Relative cwd is emitted unchanged: use the supervisor's base "
+                "or the agent may start elsewhere. Absolute has no such base hazard; "
+                "existence is unchecked."
             ),
     }
     assert "no scripted remedy applies in this state" in wire["recommendation"]

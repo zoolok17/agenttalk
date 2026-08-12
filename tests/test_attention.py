@@ -702,7 +702,7 @@ def test_process_tree_refusal_is_operator_visible_with_working_manual_launch(
                 # positive configured-launch case for this process-tree test.
                 "cli": "codex",
                 "wrapped": True,
-                "cwd": r"D:\work\fleet\worker space",
+                "cwd": "worker space",
                 "launch": {
                     "windows_file": r"C:\Python\python.exe",
                     "windows_args": [
@@ -737,20 +737,25 @@ def test_process_tree_refusal_is_operator_visible_with_working_manual_launch(
             "-m", "agenttalk", "--root", root, "wrap", "--for", "worker",
             "--loop", "--", r"C:\Codex\codex.exe",
         ],
-        "cwd": r"D:\work\fleet\worker space",
+        "cwd": "worker space",
         "environment": {
             "AGENTTALK_ROOT": root,
             "AGENTTALK_PY": r"C:\Python\python.exe",
             "supervisor_json_env_keys": [],
         },
         "environment_note": (
-            "Recreate listed/configured values; recover null AGENTTALK_PY from "
-            "supervisor artifact. Supervisor may add CODEX_HOME/log paths. Relative "
-            "working directory is emitted as-is: run from the supervisor's base; "
-            "elsewhere may start the agent in the wrong place. Absolute working "
-            "directory has no caveat."
+            "No prepared binding exists to compare. Recreate values; recover null "
+            "AGENTTALK_PY from the artifact; supervisor may add CODEX_HOME/log paths. "
+            "Relative cwd is emitted unchanged: use the supervisor's base or the "
+            "agent may start elsewhere. Absolute has no such base hazard; existence "
+            "is unchecked."
         ),
     }
+    note = item["configured_launch"]["environment_note"]
+    assert "No prepared binding exists to compare" in note
+    assert "Relative cwd is emitted unchanged" in note
+    assert "Absolute has no such base hazard" in note
+    assert "existence is unchecked" in note
     assert item["restart_request"] == {
         "request_id": "rr-blocked",
         "state": "blocked_by_process_tree_hold",
@@ -1912,6 +1917,10 @@ def test_ephemeral_hold_accepts_equivalent_cwd_or_environment_edit(
 
     assert "configured_launch" in item
     assert "configured_launch_unavailable" not in item
+    assert (
+        "Recovery refuses when the mapping or effective binding no longer matches"
+        in item["configured_launch"]["environment_note"]
+    )
 
 
 def test_ephemeral_hold_rejects_case_only_environment_name_edit(
@@ -2222,24 +2231,26 @@ def test_ephemeral_hold_does_not_claim_or_bind_ambient_environment(
         **kwargs,
     )[0]
     assert "configured_launch" in admitted
+    assert Path(admitted["configured_launch"]["cwd"]).is_absolute()
     environment = admitted["configured_launch"]["environment"]
     assert "effective_environment_sha256" not in environment
     note = admitted["configured_launch"]["environment_note"]
     assert note == (
-        "Re-prepare after profile edits; recovery refuses drift. Executable paths, "
-        "not bytes, are bound. Relative working directory is emitted as-is: run from "
-        "the supervisor's base; elsewhere may start the agent in the wrong place. "
-        "Absolute working directory has no caveat. Child environment is unverified."
+        "Re-prepare after edits. Recovery refuses when the mapping or effective "
+        "binding no longer matches. Executable paths, not bytes, are bound. The "
+        "emitted working directory is always absolute: the profile or root value "
+        "without a lane, the bound workspace with one. Child environment is "
+        "unverified."
     )
-    required_limitations = (
-        "Relative working directory is emitted as-is",
-        "run from the supervisor's base",
-        "elsewhere may start the agent in the wrong place",
-        "Absolute working directory has no caveat",
+    required_contract = (
+        "Recovery refuses when the mapping or effective binding no longer matches",
+        "emitted working directory is always absolute",
+        "profile or root value without a lane",
+        "bound workspace with one",
         "Executable paths, not bytes, are bound",
         "Child environment is unverified",
     )
-    assert not [text for text in required_limitations if text not in note]
+    assert not [text for text in required_contract if text not in note]
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-drift-is-not-bound")
     still_admitted = att.process_tree_hold_items(
@@ -2310,6 +2321,38 @@ def test_ephemeral_hold_reruns_full_current_launch_admission(
     assert "failed current launch admission" in item[
         "configured_launch_unavailable"
     ]
+
+
+def test_non_lane_ephemeral_hold_refuses_relative_profile_cwd(
+    tmp_path: Path,
+) -> None:
+    request_id, _agent, row, marker, config = (
+        _ephemeral_launch_attention_fixture(tmp_path)
+    )
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    profile["cwd"] = "relative-profile-cwd"
+
+    admission_errors, _profile = eph.validate_launch_request(
+        marker,
+        _ephemeral_attention_store_config(),
+        config,
+    )
+    item = att.process_tree_hold_items(
+        {"ephemeral_reviewers": {"active": {request_id: row}}},
+        store_config=_ephemeral_attention_store_config(),
+        supervisor_config=config,
+        root=config["_test_root"],
+        launch_requests={request_id: marker},
+        reset_admissions=_NO_RESET_ADMITTED,
+    )[0]
+
+    assert any("cwd must be an absolute path" in error for error in admission_errors)
+    assert "configured_launch" not in item
+    assert item["configured_launch_unavailable"] == (
+        "the active ephemeral request failed current launch admission"
+    )
 
 
 def test_ephemeral_hold_rejects_unsupported_current_wrapper_cli(

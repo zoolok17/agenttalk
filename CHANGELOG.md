@@ -9,20 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Detached refusal guidance now states its enforceable boundary.** Re-prepare
-  after editing the configured profile. Recovery emits a named refusal instead
-  of argv when the
-  configured launch mapping or reconstructed launch-effective projection no
+- **Detached refusal guidance now states each recovery population's enforceable
+  boundary.** For an active ephemeral request, re-prepare after editing the
+  configured profile. Recovery emits a named refusal instead of argv when
+  the configured launch mapping or reconstructed launch-effective projection no
   longer matches; equivalent-looking edits are not guaranteed to remain valid.
-  Recovery binds resolved executable paths, not the contents at those paths.
-  An in-place replacement at one of those paths is not detected, so a recovery
-  command may name a binary whose contents have changed since preparation.
-  When the configured working directory is relative, recovery emits it as-is.
-  Run the command from the same base directory the supervisor used; running it
-  from a different location can start the agent in the wrong directory. Absolute
-  configured working directories are emitted unchanged and have no such caveat.
-  The displayed environment is guidance only: the environment the child receives
-  is not verified and must be reviewed by the operator.
+  For active ephemeral recovery, the emitted working directory is always absolute: the
+  admitted profile or project-root value without a lane, and the bound lane
+  workspace with one. The lane workspace may differ from the profile value. It
+  binds resolved executable paths, not the contents
+  at those paths: an in-place replacement is not detected, so a recovery command
+  may name a binary whose contents changed since preparation. Regular
+  process-tree-HOLD recovery has no prepared request or effective binding to
+  compare. It emits a relative configured working directory unchanged, so run the
+  command from the same base the supervisor used or the agent can start in the
+  wrong directory. An absolute working directory has no such base hazard, but
+  regular recovery does not check that it exists. The displayed environment is
+  guidance only: the environment the child receives is not verified and must be
+  reviewed by the operator.
 
 ### Fixed
 

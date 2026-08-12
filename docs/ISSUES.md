@@ -19,20 +19,21 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ## P1 · PLANNED — exact child-environment proof across supported PowerShell hosts (2026-08-07)
 
-**What.** Detached ephemeral recovery currently binds the prepared request and
+**What.** Active ephemeral recovery currently binds the prepared request and
 its reconstructed launch-effective projection. Re-prepare after editing the
 configured profile. Recovery emits a named refusal rather than a command when
 the configured launch mapping or reconstructed launch-effective projection no
 longer matches; equivalent-looking edits are not guaranteed to remain valid.
 Recovery binds resolved executable paths, not the contents at those paths. An
 in-place replacement at one of those paths is not detected, so a recovery command may
-name a binary whose contents have changed since preparation. When the configured
-working directory is relative, recovery emits it as-is. Run the command from the
-same base directory the supervisor used; running it from a different location can
-start the agent in the wrong directory. Absolute configured working directories
-are emitted unchanged and have no such caveat. Recovery also does not verify the
-environment the child actually receives, and the operator surfaces state all
-three limitations explicitly.
+name a binary whose contents have changed since preparation. Its emitted working
+directory is always absolute: without a lane it is the admitted profile or
+project-root value; with a lane it is the bound lane workspace and may differ from
+the profile value. Recovery also does not verify the environment the child actually
+receives, and the operator surfaces state the cwd guarantee and both limitations
+explicitly. Regular process-tree-HOLD recovery is separate: it has no prepared
+request or effective binding to compare, emits a relative configured working
+directory unchanged, and does not check that an absolute working directory exists.
 
 **Why.** Three implementations that appeared internally consistent failed at
 the real process boundary. The tested preferred PowerShell 7 host dropped
@@ -52,7 +53,7 @@ bound to an exact inherited or effective child environment.
 
 ## P2 · PLANNED — normalized configured-profile binding in detached recovery (2026-08-07)
 
-**What.** Detached recovery compares the prepared and current configured launch
+**What.** Active ephemeral recovery compares the prepared and current configured launch
 mappings by raw equality, then binds the reconstructed launch-effective
 projection, including resolved executable paths but not executable contents.
 Placeholder substitution happens before hashing, so replacing a configured
@@ -62,10 +63,9 @@ existing Windows environment-name comparer considers case variants equal, but
 the binding hashes their spelling and refuses the edit. OS-equivalent working
 directory aliases are likewise not normalized before hashing.
 
-Separately, a relative configured working directory is emitted as-is, so run the
-recovery command from the same base directory the supervisor used. Running it
-from a different location can start the agent in the wrong directory. Absolute
-configured working directories are emitted unchanged and have no such caveat.
+The emitted working directory is always absolute: without a lane it is the
+admitted profile or project-root value; with a lane it is the bound lane workspace
+and may differ from the configured profile value.
 
 **Why.** The current behavior fails closed, but equivalent-looking profile edits
 do not share one tolerance rule. A public equivalence promise would therefore be

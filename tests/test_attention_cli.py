@@ -950,12 +950,18 @@ def _write_effective_launch_bound_ephemeral_hold(
 def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
     tmp_path: Path,
 ) -> None:
-    s, request_id, agent, workspace, _config_path = (
+    s, request_id, agent, workspace, config_path = (
         _write_effective_launch_bound_ephemeral_hold(
             tmp_path,
             with_lane=True,
         )
     )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    profile = config["ephemeral_reviewers"]["allowed_profiles"][
+        "codex-evidence-reviewer"
+    ]
+    profile["cwd"] = "relative configured cwd"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
 
     cli_item = next(
         item
@@ -979,13 +985,18 @@ def test_cli_and_web_attention_rebuild_ephemeral_detached_launch(
     assert cli_item["configured_launch"] == web_item["configured_launch"]
     assert cli_item["source_hash"] == web_item["source_hash"]
     assert cli_item["configured_launch"]["cwd"] == workspace
+    assert cli_item["configured_launch"]["cwd"] != profile["cwd"]
+    assert Path(cli_item["configured_launch"]["cwd"]).is_absolute()
     note = cli_item["configured_launch"]["environment_note"]
     assert note == (
-        "Re-prepare after profile edits; recovery refuses drift. Executable paths, "
-        "not bytes, are bound. Relative working directory is emitted as-is: run from "
-        "the supervisor's base; elsewhere may start the agent in the wrong place. "
-        "Absolute working directory has no caveat. Child environment is unverified."
+        "Re-prepare after edits. Recovery refuses when the mapping or effective "
+        "binding no longer matches. Executable paths, not bytes, are bound. The "
+        "emitted working directory is always absolute: the profile or root value "
+        "without a lane, the bound workspace with one. Child environment is "
+        "unverified."
     )
+    assert "emitted working directory is always absolute" in note
+    assert "bound workspace with one" in note
     assert web_mod._envelope_str(note) == note  # noqa: SLF001
     argv = cli_item["configured_launch"]["argv"]
     assert argv[argv.index("--for") + 1] == agent

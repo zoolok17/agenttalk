@@ -342,22 +342,26 @@ two parallel ownership concepts.
   manual-restart request. `doctor` also warns about a stale generated `supervisor.ps1`
   that predates the per-project singleton lock.
 - **Detached refusal guidance (v0.82.0):** for an active ephemeral request, the
-  displayed argv is bound to the durable prepared request and reconstructed
-  launch-effective projection: the values produced after marker-derived
-  substitutions, including argv and the configured working-directory value.
+  displayed argv and working directory are bound to the durable prepared request
+  and reconstructed launch-effective projection: the values produced after
+  marker-derived substitutions.
   Re-prepare after editing the configured profile. Recovery emits a named refusal
   instead of a command when the configured launch mapping or reconstructed
   launch-effective projection no longer matches; equivalent-looking edits are
   not guaranteed to remain valid. Recovery binds resolved executable paths, not
   the contents at those paths. An in-place replacement at one of those paths is
   not detected, so a recovery command may name a binary whose contents have changed
-  since preparation. When the configured working directory is relative, recovery
-  emits it as-is. Run the command from the same base directory the supervisor used;
-  running it from a different location can start the agent in the wrong directory.
-  Absolute configured working directories are emitted unchanged and have no such
-  caveat. Environment metadata is deliberately advisory: it neither
+  since preparation. The emitted working directory is always absolute: without a
+  lane it is the admitted profile or project-root value; with a lane it is the
+  marker-bound lane workspace and may differ from the profile value. Environment
+  metadata is deliberately advisory: it neither
   binds the ambient environment nor proves what the child receives, and the
-  operator-facing text says so explicitly.
+  operator-facing text says so explicitly. Regular process-tree-HOLD recovery is
+  reconstructed from current static configuration and has no prepared request or
+  effective binding to compare. It emits a relative configured working directory
+  unchanged, so running the command from a different base can start the agent in
+  the wrong directory. An absolute working directory has no such base hazard, but
+  regular recovery does not check that it exists.
 
 ### 4.7 Supporting modules
 - `signing.py` — optional HMAC message signing (constant-time, length-floored);

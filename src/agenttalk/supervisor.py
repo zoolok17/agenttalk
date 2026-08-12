@@ -5636,19 +5636,19 @@ def configured_detached_launch(
         "environment": environment,
         "environment_note": (
             (
-                "Re-prepare after profile edits; recovery refuses drift. Executable "
-                "paths, not bytes, are bound. Relative working directory is emitted "
-                "as-is: run from the supervisor's base; elsewhere may start the "
-                "agent in the wrong place. Absolute working directory has no "
-                "caveat. Child environment is unverified."
+                "Re-prepare after edits. Recovery refuses when the mapping or "
+                "effective binding no longer matches. Executable paths, not bytes, "
+                "are bound. The emitted working directory is always absolute: the "
+                "profile or root value without a lane, the bound workspace with one. "
+                "Child environment is unverified."
             )
             if request_id is not None
             else (
-                "Recreate listed/configured values; recover null AGENTTALK_PY from "
-                "supervisor artifact. Supervisor may add CODEX_HOME/log paths. "
-                "Relative working directory is emitted as-is: run from the "
-                "supervisor's base; elsewhere may start the agent in the wrong "
-                "place. Absolute working directory has no caveat."
+                "No prepared binding exists to compare. Recreate values; recover null "
+                "AGENTTALK_PY from the artifact; supervisor may add CODEX_HOME/log "
+                "paths. Relative cwd is emitted unchanged: use the supervisor's base "
+                "or the agent may start elsewhere. Absolute has no such base hazard; "
+                "existence is unchecked."
             )
         ),
     }, ""
