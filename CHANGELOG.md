@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.82.0] - 2026-08-12
+
+Theme: **an agent that cannot start says so, and says what to do about it.**
+
+Two items ship. The first turns a silent indefinite refusal into one operator step. The second is a
+defect this project shipped in v0.36.0 and did not notice: automatic archive could retire a live
+agent without proving it owned it.
+
+The release is also a record of one discipline, because it cost sixteen review rounds to hold: the
+operator-visible text must never promise more than the code enforces. Four separate corrections
+were made to this release's own text after review proved it overclaimed — including two introduced
+while fixing that very problem, and one case where a caveat was stated so broadly that it made an
+enforced guarantee sound unreliable. The text is weaker in places than the first draft claimed, and
+that is the point: every sentence a reviewer could not tie to enforced behaviour was narrowed,
+scoped to the population it actually describes, or removed.
+
+### Added
+
+- **A refused launch now names one actionable operator step instead of failing
+  silently.** Previously a supervised agent whose launch was refused could sit
+  indefinitely with no operator-visible reason: the refusal itself was correct and
+  safe, but nothing said why or what to do, so an agent stayed down until someone
+  noticed and investigated by hand. Attention surfaces now carry the named refusal
+  reason and, when recovery can prove the command right, the exact command that
+  recovers that agent. When it cannot prove the command right it emits a named
+  refusal and NO command, rather than a guess.
+- **Recovery states which population an agent is in, because the two do not share
+  one contract.** Active ephemeral requests and regular process-tree-HOLD agents
+  have materially different guarantees, and every operator-visible surface now
+  scopes its promise to one of them rather than describing both at once. Rows that
+  are unknown, malformed, terminal, or evidence-incomplete inherit neither contract
+  and emit no command at all.
+
 ### Changed
 
 - **Detached refusal guidance now states each recovery population's enforceable
@@ -30,6 +63,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Automatic archive requires live owner proof before it retires an agent.**
+  Shipped since v0.36.0, automatic archive could retire a live agent with no
+  ownership proof at all: an unmatchable or missing recorded start was treated as
+  though the agent were confirmably ours. It now demands a positive owner match,
+  and an unmatchable start is reported as unmatchable rather than as alive.
+  Residual, tracked as task #187 and NOT closed here: the raw archive endpoint can
+  still be driven directly, and this release narrows that path rather than closing
+  it. No wording in this release should be read as claiming that recognition
+  generally gates the raw endpoint, or that archive admission is a closed set.
 - **A failed environment application no longer leaves the supervisor process
   mutated.** Both supported PowerShell launch paths arm exact ordinal
   restoration before the first mutation and refuse to spawn after an apply
