@@ -74,6 +74,12 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
+def _direct_python_executable() -> str:
+    # A copied Windows venv may expose a redirector at sys.executable.  Its
+    # CreateProcess PID is not the interpreter PID that owns the lock (#50).
+    return getattr(sys, "_base_executable", None) or sys.executable
+
+
 def _wait_for_path(path: Path, process: subprocess.Popen, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -91,7 +97,14 @@ def _wait_for_path(path: Path, process: subprocess.Popen, timeout: float = 5.0) 
 
 def _spawn_holder(lock_path: Path, ready: Path, release: Path) -> subprocess.Popen:
     return subprocess.Popen(  # noqa: S603 - exact local interpreter and test script
-        [sys.executable, "-c", _HOLDER_SCRIPT, str(lock_path), str(ready), str(release)],
+        [
+            _direct_python_executable(),
+            "-c",
+            _HOLDER_SCRIPT,
+            str(lock_path),
+            str(ready),
+            str(release),
+        ],
         env=_subprocess_env(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -408,7 +421,13 @@ def test_lifecycle_lock_takes_over_when_retained_holder_exits_with_code_259(
     lock_path = tmp_path / "gateway" / "lifecycle.lock"
     ready = tmp_path / "holder.ready"
     holder = subprocess.Popen(  # noqa: S603 - exact local interpreter and test script
-        [sys.executable, "-c", _EXIT_259_HOLDER_SCRIPT, str(lock_path), str(ready)],
+        [
+            _direct_python_executable(),
+            "-c",
+            _EXIT_259_HOLDER_SCRIPT,
+            str(lock_path),
+            str(ready),
+        ],
         env=_subprocess_env(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
