@@ -8708,6 +8708,11 @@ def cmd_gateway(args: argparse.Namespace) -> int:
             result = service.stop_task(store.root, timeout_seconds=args.timeout)
         elif action == "reconfigure":
             result = service.reconfigure_endpoint(store.root)
+        elif action == "runtime-rebind":
+            result = service.rebind_runtime(
+                store.root,
+                litellm_executable=args.litellm_executable,
+            )
         elif action == "run":
             return service.run_service(store.root)
         elif action == "reconcile":
@@ -15067,6 +15072,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     gw_reconfigure.set_defaults(func=cmd_gateway)
+    gw_runtime_rebind = gwsub.add_parser(
+        "runtime-rebind",
+        help=(
+            "Verify and rebind the LiteLLM runtime "
+            "(ledger/token/task-preserving; the gateway must be stopped first)."
+        ),
+    )
+    gw_runtime_rebind.add_argument("--litellm-executable", required=True)
+    gw_runtime_rebind.set_defaults(func=cmd_gateway)
     gw_reconcile = gwsub.add_parser(
         "reconcile",
         help="Explicitly resolve one uncertain provider attempt.",

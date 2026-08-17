@@ -128,6 +128,87 @@ def test_gateway_cli_initializes_once_and_controls_manual_hold(
     assert canary["expected_micro_eur"] == 960
 
 
+def test_gateway_cli_runtime_rebind_routes_candidate_and_prints_result(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    candidate = tmp_path / "unusual runtime" / "launcher.shim"
+    captured: dict[str, object] = {}
+
+    def fake_rebind(received_root, *, litellm_executable):
+        captured["root"] = received_root
+        captured["litellm_executable"] = litellm_executable
+        return {
+            "runtime_rebound": True,
+            "changed": True,
+            "litellm_executable": str(candidate),
+        }
+
+    monkeypatch.setattr(ovh_gateway_service, "rebind_runtime", fake_rebind)
+
+    rc = cli.main([
+        "--root",
+        str(root),
+        "gateway",
+        "runtime-rebind",
+        "--litellm-executable",
+        str(candidate),
+    ])
+
+    assert rc == 0
+    assert captured == {
+        "root": root.resolve(),
+        "litellm_executable": str(candidate),
+    }
+    result = json.loads(capsys.readouterr().out)
+    assert result["runtime_rebound"] is True
+    assert result["litellm_executable"] == str(candidate)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["litellm_runtime_probe_failed", "litellm_runtime_probe_unknown"],
+)
+def test_gateway_cli_runtime_rebind_surfaces_named_probe_refusal(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    reason,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    candidate = tmp_path / "runtime.exe"
+    refusal = (
+        f"{reason}: retry "
+        f'agenttalk --root "{root.resolve()}" gateway runtime-rebind '
+        f'--litellm-executable "{candidate}"'
+    )
+
+    def refuse_rebind(_root, *, litellm_executable):
+        assert _root == root.resolve()
+        assert litellm_executable == str(candidate)
+        raise ovh_gateway.GatewayConfigError(refusal)
+
+    monkeypatch.setattr(ovh_gateway_service, "rebind_runtime", refuse_rebind)
+
+    rc = cli.main([
+        "--root",
+        str(root),
+        "gateway",
+        "runtime-rebind",
+        "--litellm-executable",
+        str(candidate),
+    ])
+
+    output = capsys.readouterr()
+    assert rc == 2
+    assert output.out == ""
+    assert output.err == f"agenttalk gateway runtime-rebind: {refusal}\n"
+
+
 def test_gateway_cli_rejects_caller_supplied_actual_reconciliation(
     tmp_path,
     capsys,

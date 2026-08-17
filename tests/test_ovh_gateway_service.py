@@ -70,6 +70,19 @@ class RacingInstallCommands(FakeCommands):
         raise GatewayConfigError("concurrent installer won")
 
 
+class FakeRuntimeProbeCommands:
+    def __init__(self, *, returncode: int = 0, error: Exception | None = None) -> None:
+        self.returncode = returncode
+        self.error = error
+        self.calls: list[dict[str, object]] = []
+
+    def run(self, argv, *, cwd, env):
+        self.calls.append({"argv": list(argv), "cwd": cwd, "env": dict(env)})
+        if self.error is not None:
+            raise self.error
+        return subprocess.CompletedProcess(argv, self.returncode)
+
+
 def test_project_task_name_is_canonical_and_collision_resistant(tmp_path) -> None:
     first = project_task_name(tmp_path / "Project")
     same = project_task_name(tmp_path / "Project" / ".." / "Project")
@@ -782,6 +795,396 @@ def _install_for_reconfigure(tmp_path, ledger):
         internal_token_path=internal_token,
     )
     return root, front_token, internal_token
+
+
+def _file_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _install_for_runtime_rebind(tmp_path):
+    root = tmp_path / "project"
+    old_runtime = tmp_path / "old-runtime" / "litellm.exe"
+    old_runtime.parent.mkdir(parents=True)
+    old_runtime.write_bytes(b"old runtime")
+    install_json = tmp_path / "spend" / "install.json"
+    ledger = SpendLedger(tmp_path / "spend" / "ledger.sqlite3", install_json)
+    front_token = tmp_path / "secrets" / "front.txt"
+    internal_token = tmp_path / "secrets" / "internal.txt"
+    initialize_install(
+        root,
+        litellm_executable=old_runtime,
+        opening_micro_eur=580_000,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        ledger=ledger,
+        front_token_path=front_token,
+        internal_token_path=internal_token,
+    )
+    return root, old_runtime, ledger, front_token, internal_token
+
+
+def test_runtime_rebind_changes_only_manifest_executable_and_preserves_install_authorities(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, old_runtime, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = tmp_path / "unusual runtime" / "launcher.shim"
+    candidate.parent.mkdir()
+    candidate.write_bytes(b"capable shim")
+    execute = tmp_path / "agenttalk-python.exe"
+    execute.write_bytes(b"python")
+    commands = FakeCommands()
+    install_task(root, commands=commands, execute=execute, principal="D\\u")
+    identity = expected_task_identity(root, execute=execute, principal="D\\u")
+    registered_before = commands.tasks[identity.task_name]
+    before_files = _file_snapshot(tmp_path)
+    manifest_path = service.install_manifest_path(root)
+    manifest_before = json.loads(manifest_path.read_text(encoding="utf-8"))
+    probe = FakeRuntimeProbeCommands()
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+
+    result = service.rebind_runtime(
+        root,
+        litellm_executable=candidate,
+        probe_commands=probe,
+    )
+
+    manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+    changed_keys = {
+        key
+        for key in manifest_before.keys() | manifest_after.keys()
+        if manifest_before.get(key) != manifest_after.get(key)
+    }
+    manifest_relative = manifest_path.relative_to(tmp_path).as_posix()
+    after_files = _file_snapshot(tmp_path)
+    assert changed_keys == {"litellm_executable"}
+    assert {
+        key: value for key, value in after_files.items() if key != manifest_relative
+    } == {
+        key: value for key, value in before_files.items() if key != manifest_relative
+    }
+    assert commands.tasks[identity.task_name] == registered_before
+    assert manifest_after["litellm_executable"] == str(candidate.resolve())
+    assert manifest_after["litellm_config_sha256"] == hashlib.sha256(
+        litellm_config_path(root).read_bytes()
+    ).hexdigest()
+    assert manifest_after["price_policy_hash"] == price_policy_hash()
+    assert service.load_install_manifest(root) == manifest_after
+    assert result == {
+        "runtime_rebound": True,
+        "changed": True,
+        "litellm_executable": str(candidate.resolve()),
+        "previous_litellm_executable": str(old_runtime.resolve()),
+        "config_sha256": manifest_after["litellm_config_sha256"],
+        "price_policy_hash": manifest_after["price_policy_hash"],
+    }
+    assert probe.calls[0]["argv"] == [str(candidate.resolve()), "--version"]
+    assert probe.calls[0]["cwd"] == str(root.resolve())
+    probe_env = probe.calls[0]["env"]
+    assert probe_env["LITELLM_LOCAL_MODEL_COST_MAP"] == "True"
+    assert "OVH_KEY" not in probe_env
+    assert "LITELLM_MASTER_KEY" not in probe_env
+
+
+def test_runtime_rebind_repairs_missing_outgoing_runtime_without_probing_it(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, old_runtime, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    old_runtime.unlink()
+    candidate = tmp_path / "new-runtime.exe"
+    candidate.write_bytes(b"working")
+    probe = FakeRuntimeProbeCommands()
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+
+    result = service.rebind_runtime(
+        root,
+        litellm_executable=candidate,
+        probe_commands=probe,
+    )
+
+    assert result["runtime_rebound"] is True
+    assert probe.calls[0]["argv"] == [str(candidate.resolve()), "--version"]
+
+
+def test_runtime_rebind_probes_only_candidate_not_unusable_outgoing_runtime(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, old_runtime, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = tmp_path / "working-runtime.exe"
+    candidate.write_bytes(b"working")
+    probe = FakeRuntimeProbeCommands()
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+
+    service.rebind_runtime(
+        root,
+        litellm_executable=candidate,
+        probe_commands=probe,
+    )
+
+    assert old_runtime.is_file()
+    assert [call["argv"] for call in probe.calls] == [
+        [str(candidate.resolve()), "--version"]
+    ]
+
+
+def test_runtime_rebind_refuses_running_gateway_before_candidate_probe(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = tmp_path / "missing-runtime.exe"
+    probe = FakeRuntimeProbeCommands(error=AssertionError("probe must not run"))
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: False)
+    before = _file_snapshot(tmp_path)
+
+    with pytest.raises(GatewayConfigError, match="while the gateway is running; stop it first"):
+        service.rebind_runtime(
+            root,
+            litellm_executable=candidate,
+            probe_commands=probe,
+        )
+
+    assert probe.calls == []
+    assert _file_snapshot(tmp_path) == before
+
+
+def test_runtime_rebind_requires_existing_install_before_candidate_probe(
+    tmp_path,
+) -> None:
+    probe = FakeRuntimeProbeCommands(error=AssertionError("probe must not run"))
+
+    with pytest.raises(GatewayConfigError, match="requires an existing install"):
+        service.rebind_runtime(
+            tmp_path / "project",
+            litellm_executable=tmp_path / "runtime.exe",
+            probe_commands=probe,
+        )
+
+    assert probe.calls == []
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("missing", "litellm_runtime_missing"),
+        ("nonzero", "litellm_runtime_probe_failed"),
+        ("oserror", "litellm_runtime_probe_failed"),
+        ("timeout", "litellm_runtime_probe_unknown"),
+    ],
+)
+def test_runtime_rebind_refuses_candidate_without_mutating_install(
+    tmp_path,
+    monkeypatch,
+    case,
+    expected_reason,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = tmp_path / "candidate-runtime.exe"
+    if case != "missing":
+        candidate.write_bytes(b"candidate")
+    error = None
+    returncode = 0
+    if case == "nonzero":
+        returncode = 1
+    elif case == "oserror":
+        error = OSError("invalid executable")
+    elif case == "timeout":
+        error = subprocess.TimeoutExpired([str(candidate), "--version"], 30)
+    probe = FakeRuntimeProbeCommands(returncode=returncode, error=error)
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    before = _file_snapshot(tmp_path)
+
+    with pytest.raises(GatewayConfigError) as exc_info:
+        service.rebind_runtime(
+            root,
+            litellm_executable=candidate,
+            probe_commands=probe,
+        )
+
+    message = str(exc_info.value)
+    outcome_reasons = {
+        "litellm_runtime_missing",
+        "litellm_runtime_probe_failed",
+        "litellm_runtime_probe_unknown",
+    }
+    assert {reason for reason in outcome_reasons if reason in message} == {
+        expected_reason
+    }
+    assert (
+        f'agenttalk --root "{root.resolve()}" gateway runtime-rebind '
+        "--litellm-executable"
+    ) in message
+    if case == "missing":
+        assert probe.calls == []
+    else:
+        assert [call["argv"] for call in probe.calls] == [
+            [str(candidate.resolve()), "--version"]
+        ]
+    if case == "timeout":
+        assert "retry" in message
+        assert "probe_failed" not in message
+    assert _file_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("corruption", ["config_hash", "price_policy"])
+def test_runtime_rebind_refuses_invalid_bound_manifest_before_probe(
+    tmp_path,
+    monkeypatch,
+    corruption,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = tmp_path / "candidate-runtime.exe"
+    candidate.write_bytes(b"candidate")
+    manifest_path = service.install_manifest_path(root)
+    if corruption == "config_hash":
+        litellm_config_path(root).write_bytes(b"changed outside the manifest")
+        expected = "LiteLLM config hash mismatch"
+    else:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["price_policy_hash"] = "stale"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        expected = "price policy mismatch"
+    probe = FakeRuntimeProbeCommands(error=AssertionError("probe must not run"))
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    before = _file_snapshot(tmp_path)
+
+    with pytest.raises(GatewayConfigError, match=expected):
+        service.rebind_runtime(
+            root,
+            litellm_executable=candidate,
+            probe_commands=probe,
+        )
+
+    assert probe.calls == []
+    assert _file_snapshot(tmp_path) == before
+
+
+def test_runtime_rebind_same_path_reprobes_and_is_byte_idempotent(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, old_runtime, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    probe = FakeRuntimeProbeCommands()
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    before = _file_snapshot(tmp_path)
+
+    result = service.rebind_runtime(
+        root,
+        litellm_executable=old_runtime,
+        probe_commands=probe,
+    )
+
+    assert result["changed"] is False
+    assert probe.calls[0]["argv"] == [str(old_runtime.resolve()), "--version"]
+    assert _file_snapshot(tmp_path) == before
+
+
+def test_runtime_rebind_accepts_successful_probe_without_path_shape_or_output_rules(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = tmp_path / "odd path" / "launcher.with-unfamiliar-suffix"
+    candidate.parent.mkdir()
+    candidate.write_bytes(b"shim")
+    probe = FakeRuntimeProbeCommands(returncode=0)
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+
+    result = service.rebind_runtime(
+        root,
+        litellm_executable=candidate,
+        probe_commands=probe,
+    )
+
+    assert result["litellm_executable"] == str(candidate.resolve())
+
+
+def test_runtime_rebind_accepts_symlinked_launcher_when_host_supports_it(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    target = tmp_path / "runtime-target.exe"
+    target.write_bytes(b"working")
+    candidate = tmp_path / "runtime-link.exe"
+    try:
+        candidate.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"host cannot create a test symlink: {exc}")
+    probe = FakeRuntimeProbeCommands()
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+
+    result = service.rebind_runtime(
+        root,
+        litellm_executable=candidate,
+        probe_commands=probe,
+    )
+
+    assert result["litellm_executable"] == str(target.resolve())
+    assert probe.calls[0]["argv"] == [str(target.resolve()), "--version"]
+
+
+def test_runtime_rebind_keeps_registered_task_bytes_but_run_uses_new_manifest_runtime(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, old_runtime, ledger, front_token, internal_token = _install_for_runtime_rebind(
+        tmp_path
+    )
+    candidate = tmp_path / "new-runtime.exe"
+    candidate.write_bytes(b"working")
+    execute = tmp_path / "agenttalk-python.exe"
+    execute.write_bytes(b"python")
+    commands = FakeCommands()
+    identity = expected_task_identity(root, execute=execute, principal="D\\u")
+    install_task(root, commands=commands, execute=execute, principal="D\\u")
+    registered_before = commands.tasks[identity.task_name]
+    task_xml = service.gateway_state_dir(root) / "task.xml"
+    task_xml_before = task_xml.read_bytes()
+    task_identity_before = task_identity_path(root).read_bytes()
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    service.rebind_runtime(
+        root,
+        litellm_executable=candidate,
+        probe_commands=FakeRuntimeProbeCommands(),
+    )
+    provider_key = tmp_path / "secrets" / "provider.txt"
+    provider_key.write_text("provider-secret\n", encoding="utf-8")
+    monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
+    captured: dict[str, object] = {}
+
+    class SpawnObserved(Exception):
+        pass
+
+    def capture_spawn(argv, **_kwargs):
+        captured["argv"] = list(argv)
+        raise SpawnObserved
+
+    with pytest.raises(SpawnObserved):
+        run_service(
+            root,
+            ledger=ledger,
+            key_path=provider_key,
+            front_token_path=front_token,
+            internal_token_path=internal_token,
+            child_log_path=tmp_path / "litellm.log",
+            popen=capture_spawn,
+        )
+
+    assert captured["argv"][0] == str(candidate.resolve())
+    assert commands.tasks[identity.task_name] == registered_before
+    assert task_xml.read_bytes() == task_xml_before
+    assert task_identity_path(root).read_bytes() == task_identity_before
+    assert "gateway run" in registered_before
+    assert str(old_runtime.resolve()) not in registered_before
+    assert str(candidate.resolve()) not in registered_before
+    assert commands.started == []
+    assert commands.stopped == []
 
 
 def test_reconfigure_rebinds_config_and_manifest_and_preserves_ledger_and_tokens(

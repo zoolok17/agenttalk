@@ -58,6 +58,7 @@ RUNTIME_SCHEMA_VERSION = 2
 DEFAULT_API_BASE = "https://qwen-3-5-397b.endpoints.kepler.ai.cloud.ovh.net/api/openai_compat/v1"
 STOP_TIMEOUT_SECONDS = 30.0
 LITELLM_READINESS_TIMEOUT_SECONDS = 120.0
+LITELLM_RUNTIME_PROBE_TIMEOUT_SECONDS = 120.0
 LITELLM_LOG_MAX_BYTES = 1024 * 1024
 LITELLM_LOG_BACKUP_COUNT = 2
 LITELLM_LOG_RECORD_MAX_BYTES = 64 * 1024
@@ -366,6 +367,29 @@ class TaskCommands:
             raise GatewayConfigError("gateway task stop failed")
 
 
+class RuntimeProbeCommands:
+    """Narrow injectable wrapper around the selected LiteLLM launcher."""
+
+    def run(
+        self,
+        argv: list[str],
+        *,
+        cwd: str,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # nosec B603  # noqa: S603
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=LITELLM_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        )
+
+
 def install_task(
     root: str | os.PathLike[str],
     *,
@@ -547,7 +571,7 @@ def reconfigure_endpoint(root: str | os.PathLike[str]) -> dict:
     }
 
 
-def _safe_gateway_environment(ovh_key: str, internal_token: str) -> dict[str, str]:
+def _base_gateway_environment() -> dict[str, str]:
     allowed = (
         "PATH",
         "SystemRoot",
@@ -560,17 +584,28 @@ def _safe_gateway_environment(ovh_key: str, internal_token: str) -> dict[str, st
     env = {key: os.environ[key] for key in allowed if key in os.environ}
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _runtime_probe_environment() -> dict[str, str]:
+    env = _base_gateway_environment()
+    env["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    return env
+
+
+def _safe_gateway_environment(ovh_key: str, internal_token: str) -> dict[str, str]:
+    env = _base_gateway_environment()
     env["OVH_KEY"] = ovh_key
     env["LITELLM_MASTER_KEY"] = internal_token
     return env
 
 
-def load_install_manifest(root: str | os.PathLike[str]) -> dict:
-    path = install_manifest_path(root)
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise GatewayConfigError("gateway install manifest is unreadable") from exc
+def _validate_install_manifest(
+    root: str | os.PathLike[str],
+    value: object,
+    *,
+    require_litellm_executable: bool,
+) -> dict:
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise GatewayConfigError("gateway install manifest schema mismatch")
     if value.get("price_policy_hash") != price_policy_hash():
@@ -582,16 +617,143 @@ def load_install_manifest(root: str | os.PathLike[str]) -> dict:
     for key, expected in expected_binds.items():
         if value.get(key) != expected:
             raise GatewayConfigError(f"gateway install manifest {key} mismatch")
-    executable = Path(str(value.get("litellm_executable") or "")).resolve()
     config = Path(str(value.get("litellm_config") or "")).resolve()
     if config != litellm_config_path(root).resolve():
         raise GatewayConfigError("gateway install manifest config path mismatch")
-    if not executable.is_file() or not config.is_file():
+    if not config.is_file():
         raise GatewayConfigError("gateway install manifest references a missing artifact")
+    if require_litellm_executable:
+        executable = Path(str(value.get("litellm_executable") or "")).resolve()
+        if not executable.is_file():
+            raise GatewayConfigError("gateway install manifest references a missing artifact")
     digest = hashlib.sha256(config.read_bytes()).hexdigest()
     if digest != value.get("litellm_config_sha256"):
         raise GatewayConfigError("LiteLLM config hash mismatch")
     return value
+
+
+def _read_install_manifest(
+    root: str | os.PathLike[str],
+    *,
+    require_litellm_executable: bool,
+) -> dict:
+    path = install_manifest_path(root)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GatewayConfigError("gateway install manifest is unreadable") from exc
+    return _validate_install_manifest(
+        root,
+        value,
+        require_litellm_executable=require_litellm_executable,
+    )
+
+
+def load_install_manifest(root: str | os.PathLike[str]) -> dict:
+    return _read_install_manifest(root, require_litellm_executable=True)
+
+
+def _runtime_rebind_command(root: Path, executable: Path) -> str:
+    return (
+        f'agenttalk --root "{root}" gateway runtime-rebind --litellm-executable '
+        f'"{executable}"'
+    )
+
+
+def _probe_litellm_runtime(
+    root: Path,
+    executable: Path,
+    commands: RuntimeProbeCommands,
+) -> None:
+    remedy = _runtime_rebind_command(root, executable)
+    try:
+        result = commands.run(
+            [str(executable), "--version"],
+            cwd=str(root),
+            env=_runtime_probe_environment(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GatewayConfigError(
+            "litellm_runtime_probe_unknown: LiteLLM entry-point probe timed out; "
+            f"retry {remedy} after system load drops"
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise GatewayConfigError(
+            "litellm_runtime_probe_failed: LiteLLM entry-point probe could not run; "
+            f"repair or rebuild that runtime, then rerun {remedy}"
+        ) from exc
+    if result.returncode != 0:
+        raise GatewayConfigError(
+            "litellm_runtime_probe_failed: LiteLLM entry-point probe failed "
+            f"with exit {result.returncode}; repair or rebuild that runtime, then rerun {remedy}"
+        )
+
+
+def rebind_runtime(
+    root: str | os.PathLike[str],
+    *,
+    litellm_executable: str | os.PathLike[str],
+    probe_commands: RuntimeProbeCommands | None = None,
+) -> dict:
+    """Verify and rebind the stopped gateway to a replacement LiteLLM runtime."""
+    root = canonical_project_root(root)
+    config_path = litellm_config_path(root)
+    manifest_path = install_manifest_path(root)
+    missing = [path.name for path in (config_path, manifest_path) if not path.exists()]
+    if missing:
+        raise GatewayConfigError(
+            "gateway runtime rebind requires an existing install; missing: "
+            + ", ".join(missing)
+        )
+    if not _both_sockets_free():
+        raise GatewayConfigError(
+            "refusing to rebind runtime while the gateway is running; stop it first"
+        )
+
+    # The outgoing runtime is deliberately exempt: a broken or missing launcher
+    # must never be able to seal off the operation that repairs it. Every other
+    # manifest authority remains mandatory.
+    manifest = _read_install_manifest(
+        root,
+        require_litellm_executable=False,
+    )
+    executable = Path(litellm_executable).resolve()
+    remedy = _runtime_rebind_command(root, executable)
+    if not executable.is_file():
+        raise GatewayConfigError(
+            "litellm_runtime_missing: selected LiteLLM executable is missing or not a file; "
+            f"install or repair it, then rerun {remedy}"
+        )
+    _probe_litellm_runtime(
+        root,
+        executable,
+        probe_commands if probe_commands is not None else RuntimeProbeCommands(),
+    )
+    if not executable.is_file():
+        raise GatewayConfigError(
+            "litellm_runtime_missing: selected LiteLLM executable disappeared during validation; "
+            f"install or repair it, then rerun {remedy}"
+        )
+
+    previous = manifest.get("litellm_executable")
+    next_manifest = dict(manifest)
+    next_manifest["litellm_executable"] = str(executable)
+    _validate_install_manifest(
+        root,
+        next_manifest,
+        require_litellm_executable=True,
+    )
+    changed = previous != str(executable)
+    if changed:
+        _durable_write_json(manifest_path, next_manifest)
+    return {
+        "runtime_rebound": True,
+        "changed": changed,
+        "litellm_executable": str(executable),
+        "previous_litellm_executable": previous if isinstance(previous, str) else None,
+        "config_sha256": next_manifest["litellm_config_sha256"],
+        "price_policy_hash": next_manifest["price_policy_hash"],
+    }
 
 
 def _process_start_token(pid: int) -> str:
