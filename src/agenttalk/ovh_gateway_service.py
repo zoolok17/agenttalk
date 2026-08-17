@@ -652,7 +652,13 @@ class RuntimeProbeCommands:
             raise ValueError("LiteLLM entry-point probe output exceeded the limit")
         if returncode is None:
             raise _RuntimeProbeInfrastructureError("probe result is unavailable")
-        return subprocess.CompletedProcess(argv, returncode, stdout=bytes(output))
+        try:
+            captured_output = bytes(output)
+        except Exception as exc:
+            raise _RuntimeProbeInfrastructureError(
+                f"probe output materialization failed: {exc}"
+            ) from exc
+        return subprocess.CompletedProcess(argv, returncode, stdout=captured_output)
 
 
 def install_task(
@@ -1007,7 +1013,7 @@ def _probe_litellm_runtime(
         ) from exc
     except _RuntimeProbeInfrastructureError as exc:
         raise LiteLLMRuntimeProbeUnknown(
-            "LiteLLM entry-point probe containment or cleanup was inconclusive; "
+            "LiteLLM entry-point probe infrastructure or cleanup was inconclusive; "
             f"retry {remedy} after checking system health"
         ) from exc
     except (OSError, ValueError) as exc:

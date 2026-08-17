@@ -238,6 +238,98 @@ def test_gateway_cli_runtime_rebind_surfaces_named_probe_refusal(
     assert output.err == f"agenttalk gateway runtime-rebind: {refusal}\n"
 
 
+def test_gateway_cli_runtime_rebind_final_probe_copy_failure_is_named_unknown(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    old_runtime = tmp_path / "old-runtime" / "litellm.exe"
+    old_runtime.parent.mkdir()
+    old_runtime.write_bytes(b"old runtime")
+    ledger = SpendLedger(
+        tmp_path / "spend" / "ledger.sqlite3",
+        tmp_path / "spend" / "install.json",
+    )
+    ovh_gateway_service.initialize_install(
+        root,
+        litellm_executable=old_runtime,
+        opening_micro_eur=580_000,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        ledger=ledger,
+        front_token_path=tmp_path / "secrets" / "front.txt",
+        internal_token_path=tmp_path / "secrets" / "internal.txt",
+    )
+
+    runtime_dir = tmp_path / "candidate-runtime"
+    runtime_dir.mkdir()
+    if sys.platform == "win32":
+        candidate = runtime_dir / "litellm.cmd"
+        candidate.write_text(
+            (
+                "@echo off\r\n"
+                'if not "%~1"=="--version" exit /b 2\r\n'
+                'if not "%~2"=="" exit /b 2\r\n'
+                "echo LiteLLM: Current Version = 1.91.3\r\n"
+            ),
+            encoding="utf-8",
+        )
+    else:
+        candidate = runtime_dir / "litellm"
+        candidate.write_text(
+            (
+                "#!/bin/sh\n"
+                '[ "$#" -eq 1 ] && [ "$1" = "--version" ] || exit 2\n'
+                "printf '%s\\n' 'LiteLLM: Current Version = 1.91.3'\n"
+            ),
+            encoding="utf-8",
+        )
+        candidate.chmod(0o755)
+
+    manifest_path = ovh_gateway_service.install_manifest_path(root)
+    manifest_before = manifest_path.read_bytes()
+    copy_attempts: list[bytearray] = []
+    real_bytearray = bytearray
+
+    class FinalCopyFailure(real_bytearray):
+        def __bytes__(self) -> bytes:
+            captured = real_bytearray(self)
+            assert captured.splitlines() == [
+                real_bytearray(b"LiteLLM: Current Version = 1.91.3")
+            ]
+            copy_attempts.append(captured)
+            raise MemoryError("forced final probe output copy failure")
+
+    monkeypatch.setattr(ovh_gateway_service, "_both_sockets_free", lambda: True)
+    monkeypatch.setattr(
+        ovh_gateway_service,
+        "bytearray",
+        FinalCopyFailure,
+        raising=False,
+    )
+
+    rc = cli.main([
+        "--root",
+        str(root),
+        "gateway",
+        "runtime-rebind",
+        "--litellm-executable",
+        str(candidate),
+    ])
+
+    output = capsys.readouterr()
+    assert len(copy_attempts) == 1
+    assert rc == 3
+    assert output.out == ""
+    assert output.err.startswith(
+        "agenttalk gateway runtime-rebind: litellm_runtime_probe_unknown: "
+    )
+    assert "probe infrastructure or cleanup was inconclusive" in output.err
+    assert "retry " in output.err
+    assert manifest_path.read_bytes() == manifest_before
+
+
 @pytest.mark.parametrize(
     ("error_factory", "reason", "expected_rc"),
     [
