@@ -6,6 +6,9 @@ import json
 import os
 import socket
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -71,16 +74,59 @@ class RacingInstallCommands(FakeCommands):
 
 
 class FakeRuntimeProbeCommands:
-    def __init__(self, *, returncode: int = 0, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        returncode: int = 0,
+        error: Exception | None = None,
+        stdout: bytes = b"\r\nLiteLLM: Current Version = 1.91.3\r\n\r\n",
+        side_effect=None,
+    ) -> None:
         self.returncode = returncode
         self.error = error
+        self.stdout = stdout
+        self.side_effect = side_effect
         self.calls: list[dict[str, object]] = []
 
     def run(self, argv, *, cwd, env):
         self.calls.append({"argv": list(argv), "cwd": cwd, "env": dict(env)})
         if self.error is not None:
             raise self.error
-        return subprocess.CompletedProcess(argv, self.returncode)
+        if self.side_effect is not None:
+            self.side_effect()
+        return subprocess.CompletedProcess(argv, self.returncode, stdout=self.stdout)
+
+
+def _write_windows_batch_forwarder(candidate: Path, implementation: Path) -> None:
+    assert candidate.parent.resolve() == implementation.parent.resolve()
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text(
+        f'@echo off\r\n"{sys.executable}" "%~dp0{implementation.name}" %*\r\n',
+        encoding="utf-8",
+    )
+
+
+def _write_windows_litellm_identity_shim(
+    directory: Path,
+    *,
+    suffix: str = ".cmd",
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    implementation = directory / "litellm_identity.py"
+    implementation.write_text(
+        """import sys
+
+if sys.argv[1:] != [\"--version\"]:
+    raise SystemExit(2)
+print()
+print(\"LiteLLM: Current Version = 1.91.3\")
+print()
+""",
+        encoding="utf-8",
+    )
+    candidate = directory / f"litellm{suffix}"
+    _write_windows_batch_forwarder(candidate, implementation)
+    return candidate
 
 
 def test_project_task_name_is_canonical_and_collision_resistant(tmp_path) -> None:
@@ -375,6 +421,123 @@ def test_runner_uses_env_only_secrets_and_can_start_under_manual_hold(
     assert env["LITELLM_MASTER_KEY"] not in logged
     assert "[REDACTED]" in logged
     assert not runtime_marker_path(root).exists()
+
+
+def test_run_service_lock_refusal_preserves_an_existing_runtime_marker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "project"
+    marker = runtime_marker_path(root)
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(b"existing live-owner marker")
+    holder = service.LifecycleLockContended({
+        "pid": os.getpid(),
+        "process_identity": {
+            "scheme": "win32-filetime-v1",
+            "value": "123",
+        },
+        "operation": "run-service-startup",
+        "acquired_at": "2026-08-17T12:00:00.000000Z",
+    })
+
+    class RefusingLock:
+        def __enter__(self):
+            raise service.GatewayLifecycleContended(holder)
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        service,
+        "_gateway_lifecycle_lock",
+        lambda _root, _operation: RefusingLock(),
+    )
+
+    with pytest.raises(service.GatewayLifecycleContended):
+        run_service(root)
+
+    assert marker.read_bytes() == b"existing live-owner marker"
+
+
+def test_run_service_startup_failure_finishes_cleanup_before_releasing_lock(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, _, ledger, front_token, internal_token = _install_for_runtime_rebind(
+        tmp_path
+    )
+    provider_key = tmp_path / "secrets" / "provider.txt"
+    provider_key.write_text("provider-secret\n", encoding="utf-8")
+    cleanup_started = threading.Event()
+    allow_cleanup = threading.Event()
+    runner_error: list[BaseException] = []
+
+    class FakeProcess:
+        pid = os.getpid()
+
+        def __init__(self) -> None:
+            self.stdout = io.StringIO("")
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self) -> None:
+            cleanup_started.set()
+            if not allow_cleanup.wait(timeout=10.0):
+                raise AssertionError("test did not allow startup cleanup")
+            self.alive = False
+
+        def kill(self) -> None:
+            self.alive = False
+
+        def wait(self, timeout=None) -> int:
+            self.alive = False
+            return 0
+
+    class FakeFront:
+        def __init__(self, _config, _ledger) -> None:
+            return
+
+    def fail_startup(_front, _process) -> None:
+        raise GatewayConfigError("injected startup failure")
+
+    def run() -> None:
+        try:
+            run_service(
+                root,
+                ledger=ledger,
+                key_path=provider_key,
+                front_token_path=front_token,
+                internal_token_path=internal_token,
+                child_log_path=tmp_path / "litellm.log",
+                popen=lambda *_args, **_kwargs: FakeProcess(),
+            )
+        except BaseException as exc:  # noqa: BLE001 - asserted across thread boundary
+            runner_error.append(exc)
+
+    monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
+    monkeypatch.setattr(service, "_wait_liveliness", fail_startup)
+    monkeypatch.setattr(service, "GatewayFront", FakeFront)
+    monkeypatch.setattr(service, "GATEWAY_LIFECYCLE_LOCK_TIMEOUT_SECONDS", 0.1)
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    assert cleanup_started.wait(timeout=10.0)
+
+    with pytest.raises(service.GatewayLifecycleContended) as exc_info:
+        with service._gateway_lifecycle_lock(root, "reconfigure"):
+            raise AssertionError("cleanup released the lock too early")
+    assert exc_info.value.holder_operation == "run-service-startup"
+
+    allow_cleanup.set()
+    runner.join(timeout=10.0)
+    assert not runner.is_alive()
+    assert len(runner_error) == 1
+    assert isinstance(runner_error[0], GatewayConfigError)
+    assert "injected startup failure" in str(runner_error[0])
+    with service._gateway_lifecycle_lock(root, "reconfigure"):
+        pass
 
 
 def test_litellm_readiness_allows_cold_start_beyond_thirty_seconds(
@@ -1028,6 +1191,13 @@ def test_runtime_rebind_refuses_candidate_without_mutating_install(
     if case == "timeout":
         assert "retry" in message
         assert "probe_failed" not in message
+        assert type(exc_info.value) is not GatewayConfigError
+        assert exc_info.value.retryable is True
+        assert exc_info.value.reason_code == "litellm_runtime_probe_unknown"
+    elif case in {"nonzero", "oserror"}:
+        assert type(exc_info.value) is not GatewayConfigError
+        assert exc_info.value.retryable is False
+        assert exc_info.value.reason_code == "litellm_runtime_probe_failed"
     assert _file_snapshot(tmp_path) == before
 
 
@@ -1084,7 +1254,7 @@ def test_runtime_rebind_same_path_reprobes_and_is_byte_idempotent(
     assert _file_snapshot(tmp_path) == before
 
 
-def test_runtime_rebind_accepts_successful_probe_without_path_shape_or_output_rules(
+def test_runtime_rebind_accepts_valid_identity_without_path_shape_rules(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1185,6 +1355,345 @@ def test_runtime_rebind_keeps_registered_task_bytes_but_run_uses_new_manifest_ru
     assert str(candidate.resolve()) not in registered_before
     assert commands.started == []
     assert commands.stopped == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher identity boundary")
+def test_runtime_rebind_real_probe_rejects_zero_exit_non_litellm_executable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = Path(os.environ["COMSPEC"])
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    before = _file_snapshot(tmp_path)
+
+    with pytest.raises(GatewayConfigError, match="litellm_runtime_probe_failed"):
+        service.rebind_runtime(root, litellm_executable=candidate)
+
+    assert _file_snapshot(tmp_path) == before
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher identity boundary")
+@pytest.mark.parametrize("suffix", [".cmd", ".bat"])
+def test_runtime_rebind_real_probe_accepts_relative_forwarding_shim_with_odd_path(
+    tmp_path,
+    monkeypatch,
+    suffix,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = _write_windows_litellm_identity_shim(
+        tmp_path / "runtime path & Unicode Ω",
+        suffix=suffix,
+    )
+    monkeypatch.chdir(tmp_path)
+    relative_candidate = candidate.relative_to(tmp_path)
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+
+    result = service.rebind_runtime(
+        root,
+        litellm_executable=relative_candidate,
+    )
+
+    assert result["litellm_executable"] == str(candidate.resolve())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process-tree boundary")
+def test_runtime_rebind_real_probe_timeout_tears_down_candidate_descendants(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    runtime_dir = tmp_path / "timeout runtime"
+    runtime_dir.mkdir()
+    ready = runtime_dir / "child.ready"
+    release = runtime_dir / "child.release"
+    sentinel = runtime_dir / "child.survived"
+    child = runtime_dir / "child.py"
+    child.write_text(
+        """import os
+import sys
+import time
+from pathlib import Path
+
+ready, release, sentinel = map(Path, sys.argv[1:])
+ready.write_text(str(os.getpid()), encoding=\"ascii\")
+while not release.exists():
+    time.sleep(0.02)
+sentinel.write_text(\"survived\", encoding=\"ascii\")
+""",
+        encoding="utf-8",
+    )
+    candidate = runtime_dir / "litellm.cmd"
+    candidate.write_text(
+        (
+            "@echo off\r\n"
+            ">nul ping -n 2 -w 1000 127.0.0.1\r\n"
+            f'start "" /b "{sys.executable}" "{child}" "{ready}" "{release}" "{sentinel}"\r\n'
+            ":wait_ready\r\n"
+            f'if not exist "{ready}" (\r\n'
+            "  >nul ping -n 2 -w 100 127.0.0.1\r\n"
+            "  goto wait_ready\r\n"
+            ")\r\n"
+            ":hang\r\n"
+            ">nul ping -n 2 -w 1000 127.0.0.1\r\n"
+            "goto hang\r\n"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service, "LITELLM_RUNTIME_PROBE_TIMEOUT_SECONDS", 3.0)
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    manifest_before = service.install_manifest_path(root).read_bytes()
+
+    with pytest.raises(GatewayConfigError, match="litellm_runtime_probe_unknown"):
+        service.rebind_runtime(root, litellm_executable=candidate)
+
+    assert ready.is_file(), "fixture never proved that the descendant started"
+    release.write_text("release", encoding="ascii")
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and not sentinel.exists():
+        time.sleep(0.02)
+    assert not sentinel.exists()
+    assert service.install_manifest_path(root).read_bytes() == manifest_before
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher identity boundary")
+def test_runtime_rebind_real_probe_rejects_oversized_untrusted_output(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    runtime_dir = tmp_path / "noisy runtime"
+    runtime_dir.mkdir()
+    implementation = runtime_dir / "noisy.py"
+    implementation.write_text(
+        "print('LiteLLM: Current Version = 1.91.3')\nprint('x' * 4096)\n",
+        encoding="utf-8",
+    )
+    candidate = runtime_dir / "litellm.cmd"
+    _write_windows_batch_forwarder(candidate, implementation)
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+
+    with pytest.raises(GatewayConfigError, match="litellm_runtime_probe_failed"):
+        service.rebind_runtime(root, litellm_executable=candidate)
+
+
+def test_runtime_rebind_compare_and_swap_refuses_candidate_manifest_mutation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = tmp_path / "candidate-runtime.exe"
+    candidate.write_bytes(b"candidate")
+    manifest_path = service.install_manifest_path(root)
+    mutated: dict[str, bytes] = {}
+
+    def mutate_manifest() -> None:
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        value["candidate_touch"] = True
+        manifest_path.write_text(json.dumps(value), encoding="utf-8")
+        mutated["bytes"] = manifest_path.read_bytes()
+
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+
+    with pytest.raises(GatewayConfigError, match="gateway_runtime_manifest_changed"):
+        service.rebind_runtime(
+            root,
+            litellm_executable=candidate,
+            probe_commands=FakeRuntimeProbeCommands(side_effect=mutate_manifest),
+        )
+
+    assert manifest_path.read_bytes() == mutated["bytes"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows subprocess race boundary")
+def test_runtime_rebind_serializes_supported_reconfigure_before_manifest_write(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = _write_windows_litellm_identity_shim(tmp_path / "race runtime")
+    manifest_path = service.install_manifest_path(root)
+    before_candidate_write = threading.Event()
+    release_candidate_write = threading.Event()
+    reconfigure_done = threading.Event()
+    errors: dict[str, BaseException] = {}
+    real_write_json = service._durable_write_json
+
+    def blocking_write(path, value) -> None:
+        if (
+            Path(path) == manifest_path
+            and isinstance(value, dict)
+            and value.get("litellm_executable") == str(candidate.resolve())
+        ):
+            before_candidate_write.set()
+            if not release_candidate_write.wait(timeout=10.0):
+                raise AssertionError("test did not release the rebind manifest write")
+        real_write_json(path, value)
+
+    def do_rebind() -> None:
+        try:
+            service.rebind_runtime(root, litellm_executable=candidate)
+        except BaseException as exc:  # noqa: BLE001 - asserted across the thread boundary
+            errors["rebind"] = exc
+
+    def do_reconfigure() -> None:
+        try:
+            service.reconfigure_endpoint(root)
+        except BaseException as exc:  # noqa: BLE001 - asserted across the thread boundary
+            errors["reconfigure"] = exc
+        finally:
+            reconfigure_done.set()
+
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    monkeypatch.setattr(service, "_durable_write_json", blocking_write)
+    monkeypatch.setattr(service, "DEFAULT_API_BASE", "https://fresh.example/v1")
+    rebind_thread = threading.Thread(target=do_rebind, daemon=True)
+    rebind_thread.start()
+    assert before_candidate_write.wait(timeout=10.0)
+    reconfigure_thread = threading.Thread(target=do_reconfigure, daemon=True)
+    reconfigure_thread.start()
+    interleaved = reconfigure_done.wait(timeout=1.0)
+    release_candidate_write.set()
+    rebind_thread.join(timeout=10.0)
+    reconfigure_thread.join(timeout=10.0)
+
+    assert not rebind_thread.is_alive()
+    assert not reconfigure_thread.is_alive()
+    assert interleaved is False
+    assert errors == {}
+    manifest = service.load_install_manifest(root)
+    assert manifest["litellm_executable"] == str(candidate.resolve())
+    assert manifest["litellm_config_sha256"] == hashlib.sha256(
+        litellm_config_path(root).read_bytes()
+    ).hexdigest()
+
+
+def test_runtime_rebind_waits_for_service_startup_then_refuses_owned_sockets(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root, old_runtime, ledger, front_token, internal_token = _install_for_runtime_rebind(
+        tmp_path
+    )
+    candidate = tmp_path / "candidate-runtime.exe"
+    candidate.write_bytes(b"candidate")
+    provider_key = tmp_path / "secrets" / "provider.txt"
+    provider_key.write_text("provider-secret\n", encoding="utf-8")
+    startup_spawned = threading.Event()
+    allow_bind = threading.Event()
+    sockets_owned = threading.Event()
+    serving = threading.Event()
+    stop_serving = threading.Event()
+    rebind_checked_sockets = threading.Event()
+    results: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+
+    class FakeProcess:
+        pid = os.getpid()
+
+        def __init__(self) -> None:
+            self.stdout = io.StringIO("")
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self) -> None:
+            self.alive = False
+
+        def kill(self) -> None:
+            self.alive = False
+
+        def wait(self, timeout=None):
+            self.alive = False
+            return 0
+
+    class FakeServer:
+        def serve_forever(self, poll_interval=None) -> None:
+            serving.set()
+            if not stop_serving.wait(timeout=10.0):
+                raise AssertionError("test did not stop the fake server")
+
+        def shutdown(self) -> None:
+            stop_serving.set()
+
+        def server_close(self) -> None:
+            return None
+
+    class FakeFront:
+        def __init__(self, _config, _ledger) -> None:
+            pass
+
+        def make_server(self):
+            sockets_owned.set()
+            return FakeServer()
+
+        def drain(self, _timeout) -> None:
+            return None
+
+    def fake_popen(_argv, **_kwargs):
+        startup_spawned.set()
+        return FakeProcess()
+
+    def wait_until_allowed(_front, _process) -> None:
+        if not allow_bind.wait(timeout=10.0):
+            raise AssertionError("test did not allow the service to bind")
+
+    def observed_sockets_free() -> bool:
+        rebind_checked_sockets.set()
+        return not sockets_owned.is_set()
+
+    def do_run() -> None:
+        try:
+            results["run"] = run_service(
+                root,
+                ledger=ledger,
+                key_path=provider_key,
+                front_token_path=front_token,
+                internal_token_path=internal_token,
+                child_log_path=tmp_path / "litellm.log",
+                popen=fake_popen,
+            )
+        except BaseException as exc:  # noqa: BLE001 - asserted across the thread boundary
+            errors["run"] = exc
+
+    def do_rebind() -> None:
+        try:
+            results["rebind"] = service.rebind_runtime(
+                root,
+                litellm_executable=candidate,
+                probe_commands=FakeRuntimeProbeCommands(),
+            )
+        except BaseException as exc:  # noqa: BLE001 - asserted across the thread boundary
+            errors["rebind"] = exc
+
+    monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
+    monkeypatch.setattr(service, "_wait_liveliness", wait_until_allowed)
+    monkeypatch.setattr(service, "GatewayFront", FakeFront)
+    monkeypatch.setattr(service, "_process_start_token", lambda _pid: "start")
+    monkeypatch.setattr(service, "_both_sockets_free", observed_sockets_free)
+    run_thread = threading.Thread(target=do_run, daemon=True)
+    run_thread.start()
+    assert startup_spawned.wait(timeout=10.0)
+    rebind_thread = threading.Thread(target=do_rebind, daemon=True)
+    rebind_thread.start()
+    checked_before_bind = rebind_checked_sockets.wait(timeout=1.0)
+    allow_bind.set()
+    assert serving.wait(timeout=10.0)
+    rebind_thread.join(timeout=10.0)
+    stop_serving.set()
+    run_thread.join(timeout=10.0)
+
+    assert checked_before_bind is False
+    assert not rebind_thread.is_alive()
+    assert not run_thread.is_alive()
+    assert results == {"run": 0}
+    assert isinstance(errors.get("rebind"), GatewayConfigError)
+    assert "while the gateway is running" in str(errors["rebind"])
+    assert "run" not in errors
+    assert service.load_install_manifest(root)["litellm_executable"] == str(
+        old_runtime.resolve()
+    )
 
 
 def test_reconfigure_rebinds_config_and_manifest_and_preserves_ledger_and_tokens(

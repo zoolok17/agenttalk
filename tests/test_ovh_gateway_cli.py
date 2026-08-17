@@ -168,15 +168,43 @@ def test_gateway_cli_runtime_rebind_routes_candidate_and_prints_result(
     assert result["litellm_executable"] == str(candidate)
 
 
+def test_gateway_cli_runtime_rebind_help_states_probe_authority_and_exit_contract(
+    capsys,
+) -> None:
+    for argv in (["gateway", "--help"], ["gateway", "runtime-rebind", "--help"]):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(argv)
+        assert exc_info.value.code == 0
+        rendered = capsys.readouterr().out.casefold()
+        assert "trusted" in rendered
+        assert "filesystem authority" in rendered
+        assert "unsandboxed" in rendered
+        assert "exit 3" in rendered
+        assert "exit 2" in rendered
+
+
 @pytest.mark.parametrize(
-    "reason",
-    ["litellm_runtime_probe_failed", "litellm_runtime_probe_unknown"],
+    ("error_type", "reason", "expected_rc"),
+    [
+        (
+            ovh_gateway_service.LiteLLMRuntimeProbeFailed,
+            "litellm_runtime_probe_failed",
+            2,
+        ),
+        (
+            ovh_gateway_service.LiteLLMRuntimeProbeUnknown,
+            "litellm_runtime_probe_unknown",
+            3,
+        ),
+    ],
 )
 def test_gateway_cli_runtime_rebind_surfaces_named_probe_refusal(
     tmp_path,
     monkeypatch,
     capsys,
+    error_type,
     reason,
+    expected_rc,
 ) -> None:
     root = tmp_path / "project"
     Store(root).init(["lead"])
@@ -190,7 +218,8 @@ def test_gateway_cli_runtime_rebind_surfaces_named_probe_refusal(
     def refuse_rebind(_root, *, litellm_executable):
         assert _root == root.resolve()
         assert litellm_executable == str(candidate)
-        raise ovh_gateway.GatewayConfigError(refusal)
+        message = refusal.removeprefix(f"{reason}: ")
+        raise error_type(message)
 
     monkeypatch.setattr(ovh_gateway_service, "rebind_runtime", refuse_rebind)
 
@@ -204,9 +233,73 @@ def test_gateway_cli_runtime_rebind_surfaces_named_probe_refusal(
     ])
 
     output = capsys.readouterr()
-    assert rc == 2
+    assert rc == expected_rc
     assert output.out == ""
     assert output.err == f"agenttalk gateway runtime-rebind: {refusal}\n"
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "reason", "expected_rc"),
+    [
+        (
+            lambda path: ovh_gateway_service.GatewayLifecycleContended(
+                ovh_gateway_service.LifecycleLockContended({
+                    "pid": 42,
+                    "process_identity": {
+                        "scheme": "win32-filetime-v1",
+                        "value": "123",
+                    },
+                    "operation": "reconfigure",
+                    "acquired_at": "2026-08-17T12:00:00.000000Z",
+                })
+            ),
+            "gateway_lifecycle_contended",
+            2,
+        ),
+        (
+            lambda path: ovh_gateway_service.GatewayLifecycleUnknown(
+                ovh_gateway_service.LifecycleLockUnknown(path, "metadata is corrupt")
+            ),
+            "gateway_lifecycle_unknown",
+            3,
+        ),
+    ],
+)
+def test_gateway_cli_runtime_rebind_surfaces_typed_lifecycle_refusal(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    error_factory,
+    reason,
+    expected_rc,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    candidate = tmp_path / "runtime.exe"
+    refusal = error_factory(root / ".agenttalk" / "gateway" / "lifecycle.lock")
+
+    def refuse_rebind(_root, *, litellm_executable):
+        assert _root == root.resolve()
+        assert litellm_executable == str(candidate)
+        raise refusal
+
+    monkeypatch.setattr(ovh_gateway_service, "rebind_runtime", refuse_rebind)
+
+    rc = cli.main([
+        "--root",
+        str(root),
+        "gateway",
+        "runtime-rebind",
+        "--litellm-executable",
+        str(candidate),
+    ])
+
+    output = capsys.readouterr()
+    assert rc == expected_rc
+    assert output.out == ""
+    assert output.err.startswith(
+        f"agenttalk gateway runtime-rebind: {reason}: "
+    )
 
 
 def test_gateway_cli_rejects_caller_supplied_actual_reconciliation(

@@ -10,6 +10,8 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import re
+import signal
 import socket
 import subprocess  # nosec B404 - fixed schtasks/LiteLLM argv lists; shell is never used
 import sys
@@ -42,6 +44,12 @@ from .ovh_gateway import (
     write_secret_file,
 )
 from .ovh_gateway_front import CONFIG_ERROR_CODE, PUBLIC_ROUTE, FrontConfig, GatewayFront
+from .lifecycle_lock import (
+    CrossProcessLifecycleLock,
+    LifecycleLockContended,
+    LifecycleLockUnknown,
+)
+from .powershell_host import _attach_kill_on_close_job
 from .redaction import redact_diagnostic_text
 
 
@@ -59,6 +67,8 @@ DEFAULT_API_BASE = "https://qwen-3-5-397b.endpoints.kepler.ai.cloud.ovh.net/api/
 STOP_TIMEOUT_SECONDS = 30.0
 LITELLM_READINESS_TIMEOUT_SECONDS = 120.0
 LITELLM_RUNTIME_PROBE_TIMEOUT_SECONDS = 120.0
+LITELLM_RUNTIME_PROBE_OUTPUT_MAX_BYTES = 512
+GATEWAY_LIFECYCLE_LOCK_TIMEOUT_SECONDS = 10.0
 LITELLM_LOG_MAX_BYTES = 1024 * 1024
 LITELLM_LOG_BACKUP_COUNT = 2
 LITELLM_LOG_RECORD_MAX_BYTES = 64 * 1024
@@ -66,6 +76,64 @@ MAX_TASK_RESTARTS = 3
 TASK_RESTART_INTERVAL = "PT1M"
 TASK_PREFIX = "agenttalk-qwen-gateway"
 _TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+_LITELLM_VERSION_LINE = re.compile(
+    rb"LiteLLM: Current Version = [0-9A-Za-z][0-9A-Za-z.!+_-]{0,127}"
+)
+_RUNTIME_PROBE_BOOTSTRAP = """import subprocess
+import sys
+
+if sys.stdin.buffer.read(1) != b"1":
+    raise SystemExit(125)
+result = subprocess.run(sys.argv[1:], stdin=subprocess.DEVNULL, check=False)
+raise SystemExit(result.returncode)
+"""
+
+
+class LiteLLMRuntimeProbeError(GatewayConfigError):
+    """Typed candidate-probe refusal for programmatic callers."""
+
+    reason_code = "litellm_runtime_probe_error"
+    retryable = False
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"{self.reason_code}: {message}")
+
+
+class LiteLLMRuntimeProbeFailed(LiteLLMRuntimeProbeError):
+    reason_code = "litellm_runtime_probe_failed"
+
+
+class LiteLLMRuntimeProbeUnknown(LiteLLMRuntimeProbeError):
+    reason_code = "litellm_runtime_probe_unknown"
+    retryable = True
+
+
+class _RuntimeProbeInfrastructureError(OSError):
+    """The probe could not establish or clean up its observation boundary."""
+
+
+class GatewayLifecycleLockError(GatewayConfigError):
+    """Typed gateway adapter for the generic lifecycle authority."""
+
+    retryable = True
+
+
+class GatewayLifecycleContended(GatewayLifecycleLockError):
+    reason_code = "gateway_lifecycle_contended"
+
+    def __init__(self, cause: LifecycleLockContended) -> None:
+        self.holder_pid = cause.holder_pid
+        self.holder_identity = dict(cause.holder_identity)
+        self.holder_operation = cause.holder_operation
+        self.holder_since = cause.holder_since
+        super().__init__(f"{self.reason_code}: {cause}")
+
+
+class GatewayLifecycleUnknown(GatewayLifecycleLockError):
+    reason_code = "gateway_lifecycle_unknown"
+
+    def __init__(self, cause: LifecycleLockUnknown) -> None:
+        super().__init__(f"{self.reason_code}: {cause}")
 
 
 @dataclass(frozen=True)
@@ -368,7 +436,14 @@ class TaskCommands:
 
 
 class RuntimeProbeCommands:
-    """Narrow injectable wrapper around the selected LiteLLM launcher."""
+    """Run one bounded candidate probe inside an owned process tree."""
+
+    def __init__(self, *, timeout_seconds: float | None = None) -> None:
+        self.timeout_seconds = (
+            LITELLM_RUNTIME_PROBE_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else max(0.0, float(timeout_seconds))
+        )
 
     def run(
         self,
@@ -376,18 +451,142 @@ class RuntimeProbeCommands:
         *,
         cwd: str,
         env: dict[str, str],
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(  # nosec B603  # noqa: S603
-            argv,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-            timeout=LITELLM_RUNTIME_PROBE_TIMEOUT_SECONDS,
-        )
+    ) -> subprocess.CompletedProcess[bytes]:
+        # The trusted bootstrap waits on stdin until containment is attached.
+        # Only then can it spawn the operator-selected candidate, eliminating
+        # the direct-Popen race where a fast shim creates an escaped child
+        # before AssignProcessToJobObject runs.
+        bootstrap_argv = [sys.executable, "-c", _RUNTIME_PROBE_BOOTSTRAP, *argv]
+        popen_kwargs: dict[str, object] = {
+            "cwd": cwd,
+            "env": env,
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        try:
+            process = subprocess.Popen(  # nosec B603  # noqa: S603
+                bootstrap_argv,
+                **popen_kwargs,
+            )
+        except OSError as exc:
+            raise _RuntimeProbeInfrastructureError(
+                f"probe bootstrap could not start: {exc}"
+            ) from exc
+        if process.stdin is None or process.stdout is None:
+            with contextlib.suppress(OSError):
+                process.kill()
+            raise _RuntimeProbeInfrastructureError(
+                "probe bootstrap pipes are unavailable"
+            )
+
+        def close_job() -> None:
+            return None
+        output = bytearray()
+        output_overflow = threading.Event()
+        reader_errors: list[OSError] = []
+
+        def drain_stdout() -> None:
+            try:
+                while chunk := process.stdout.read(4096):
+                    remaining = (
+                        LITELLM_RUNTIME_PROBE_OUTPUT_MAX_BYTES + 1 - len(output)
+                    )
+                    if remaining > 0:
+                        output.extend(chunk[:remaining])
+                    if len(output) > LITELLM_RUNTIME_PROBE_OUTPUT_MAX_BYTES:
+                        output_overflow.set()
+            except OSError as exc:
+                reader_errors.append(exc)
+
+        reader: threading.Thread | None = None
+        returncode: int | None = None
+        timed_out = False
+        infrastructure_error: BaseException | None = None
+        try:
+            try:
+                _, close_job = _attach_kill_on_close_job(process)
+            except OSError as exc:
+                infrastructure_error = _RuntimeProbeInfrastructureError(
+                    f"probe process containment failed: {exc}"
+                )
+            if infrastructure_error is None:
+                reader = threading.Thread(
+                    target=drain_stdout,
+                    daemon=True,
+                    name="agenttalk-litellm-probe-output",
+                )
+                reader.start()
+                try:
+                    process.stdin.write(b"1")
+                    process.stdin.close()
+                except (OSError, ValueError) as exc:
+                    infrastructure_error = _RuntimeProbeInfrastructureError(
+                        f"probe bootstrap gate failed: {exc}"
+                    )
+            if infrastructure_error is None:
+                deadline = time.monotonic() + self.timeout_seconds
+                while returncode is None and not output_overflow.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        break
+                    try:
+                        returncode = process.wait(timeout=min(0.05, remaining))
+                    except subprocess.TimeoutExpired:
+                        continue
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                process.stdin.close()
+            try:
+                close_job()
+            except OSError as exc:
+                infrastructure_error = infrastructure_error or _RuntimeProbeInfrastructureError(
+                    f"probe process containment release failed: {exc}"
+                )
+            if os.name != "nt":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    infrastructure_error = infrastructure_error or _RuntimeProbeInfrastructureError(
+                        f"probe process-group teardown failed: {exc}"
+                    )
+            if process.poll() is None:
+                with contextlib.suppress(OSError):
+                    process.kill()
+            try:
+                process.wait(timeout=5.0)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                infrastructure_error = infrastructure_error or _RuntimeProbeInfrastructureError(
+                    f"probe process reap failed: {exc}"
+                )
+            if reader is not None:
+                reader.join(timeout=5.0)
+                if reader.is_alive():
+                    infrastructure_error = infrastructure_error or _RuntimeProbeInfrastructureError(
+                        "probe output drain did not terminate"
+                    )
+            with contextlib.suppress(OSError):
+                process.stdout.close()
+
+        if infrastructure_error is not None:
+            raise infrastructure_error
+        if reader_errors:
+            raise _RuntimeProbeInfrastructureError(
+                f"probe output capture failed: {reader_errors[0]}"
+            ) from reader_errors[0]
+        if timed_out:
+            raise subprocess.TimeoutExpired(argv, self.timeout_seconds)
+        if output_overflow.is_set():
+            raise ValueError("LiteLLM entry-point probe output exceeded the limit")
+        if returncode is None:
+            raise _RuntimeProbeInfrastructureError("probe result is unavailable")
+        return subprocess.CompletedProcess(argv, returncode, stdout=bytes(output))
 
 
 def install_task(
@@ -427,6 +626,23 @@ def install_task(
     return {"installed": True, "changed": True, **asdict(identity)}
 
 
+@contextlib.contextmanager
+def _gateway_lifecycle_lock(root: Path, operation: str):
+    """Adapt the generic exact-owner lock to gateway refusal vocabulary."""
+    lock = CrossProcessLifecycleLock(
+        gateway_state_dir(root) / "lifecycle.lock",
+        authority="agenttalk-gateway-lifecycle-v1",
+        timeout_seconds=GATEWAY_LIFECYCLE_LOCK_TIMEOUT_SECONDS,
+    )
+    try:
+        with lock.hold(operation):
+            yield
+    except LifecycleLockContended as exc:
+        raise GatewayLifecycleContended(exc) from exc
+    except LifecycleLockUnknown as exc:
+        raise GatewayLifecycleUnknown(exc) from exc
+
+
 def initialize_install(
     root: str | os.PathLike[str],
     *,
@@ -440,6 +656,31 @@ def initialize_install(
 ) -> dict:
     """One-time state setup. It intentionally does not activate a task or key."""
     root = canonical_project_root(root)
+    root.mkdir(parents=True, exist_ok=True)
+    with _gateway_lifecycle_lock(root, "initialize"):
+        return _initialize_install_locked(
+            root,
+            litellm_executable=litellm_executable,
+            opening_micro_eur=opening_micro_eur,
+            opening_evidence=opening_evidence,
+            api_base=api_base,
+            ledger=ledger,
+            front_token_path=front_token_path,
+            internal_token_path=internal_token_path,
+        )
+
+
+def _initialize_install_locked(
+    root: Path,
+    *,
+    litellm_executable: str | os.PathLike[str],
+    opening_micro_eur: int,
+    opening_evidence: str,
+    api_base: str,
+    ledger: SpendLedger | None,
+    front_token_path: Path | None,
+    internal_token_path: Path | None,
+) -> dict:
     if api_base != DEFAULT_API_BASE:
         raise GatewayConfigError("gateway install requires the pinned OVH API base")
     config_path = litellm_config_path(root)
@@ -515,6 +756,11 @@ def reconfigure_endpoint(root: str | os.PathLike[str]) -> dict:
     new endpoint takes effect on the next ``start``.
     """
     root = canonical_project_root(root)
+    with _gateway_lifecycle_lock(root, "reconfigure"):
+        return _reconfigure_endpoint_locked(root)
+
+
+def _reconfigure_endpoint_locked(root: Path) -> dict:
     config_path = litellm_config_path(root)
     manifest_path = install_manifest_path(root)
     missing = [p.name for p in (config_path, manifest_path) if not p.exists()]
@@ -637,15 +883,31 @@ def _read_install_manifest(
     *,
     require_litellm_executable: bool,
 ) -> dict:
+    value, _ = _read_install_manifest_snapshot(
+        root,
+        require_litellm_executable=require_litellm_executable,
+    )
+    return value
+
+
+def _read_install_manifest_snapshot(
+    root: str | os.PathLike[str],
+    *,
+    require_litellm_executable: bool,
+) -> tuple[dict, bytes]:
     path = install_manifest_path(root)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        value = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise GatewayConfigError("gateway install manifest is unreadable") from exc
-    return _validate_install_manifest(
-        root,
-        value,
-        require_litellm_executable=require_litellm_executable,
+    return (
+        _validate_install_manifest(
+            root,
+            value,
+            require_litellm_executable=require_litellm_executable,
+        ),
+        raw,
     )
 
 
@@ -673,19 +935,35 @@ def _probe_litellm_runtime(
             env=_runtime_probe_environment(),
         )
     except subprocess.TimeoutExpired as exc:
-        raise GatewayConfigError(
-            "litellm_runtime_probe_unknown: LiteLLM entry-point probe timed out; "
+        raise LiteLLMRuntimeProbeUnknown(
+            "LiteLLM entry-point probe timed out; "
             f"retry {remedy} after system load drops"
         ) from exc
+    except _RuntimeProbeInfrastructureError as exc:
+        raise LiteLLMRuntimeProbeUnknown(
+            "LiteLLM entry-point probe containment or cleanup was inconclusive; "
+            f"retry {remedy} after checking system health"
+        ) from exc
     except (OSError, ValueError) as exc:
-        raise GatewayConfigError(
-            "litellm_runtime_probe_failed: LiteLLM entry-point probe could not run; "
+        raise LiteLLMRuntimeProbeFailed(
+            "LiteLLM entry-point probe could not establish a valid result; "
             f"repair or rebuild that runtime, then rerun {remedy}"
         ) from exc
     if result.returncode != 0:
-        raise GatewayConfigError(
-            "litellm_runtime_probe_failed: LiteLLM entry-point probe failed "
+        raise LiteLLMRuntimeProbeFailed(
+            "LiteLLM entry-point probe failed "
             f"with exit {result.returncode}; repair or rebuild that runtime, then rerun {remedy}"
+        )
+    output = result.stdout if isinstance(result.stdout, bytes) else b""
+    nonempty_lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if (
+        len(output) > LITELLM_RUNTIME_PROBE_OUTPUT_MAX_BYTES
+        or len(nonempty_lines) != 1
+        or _LITELLM_VERSION_LINE.fullmatch(nonempty_lines[0]) is None
+    ):
+        raise LiteLLMRuntimeProbeFailed(
+            "candidate did not emit the bounded LiteLLM version identity record; "
+            f"repair or rebuild that runtime, then rerun {remedy}"
         )
 
 
@@ -697,6 +975,20 @@ def rebind_runtime(
 ) -> dict:
     """Verify and rebind the stopped gateway to a replacement LiteLLM runtime."""
     root = canonical_project_root(root)
+    with _gateway_lifecycle_lock(root, "runtime-rebind"):
+        return _rebind_runtime_locked(
+            root,
+            litellm_executable=litellm_executable,
+            probe_commands=probe_commands,
+        )
+
+
+def _rebind_runtime_locked(
+    root: Path,
+    *,
+    litellm_executable: str | os.PathLike[str],
+    probe_commands: RuntimeProbeCommands | None,
+) -> dict:
     config_path = litellm_config_path(root)
     manifest_path = install_manifest_path(root)
     missing = [path.name for path in (config_path, manifest_path) if not path.exists()]
@@ -713,7 +1005,7 @@ def rebind_runtime(
     # The outgoing runtime is deliberately exempt: a broken or missing launcher
     # must never be able to seal off the operation that repairs it. Every other
     # manifest authority remains mandatory.
-    manifest = _read_install_manifest(
+    manifest, manifest_snapshot = _read_install_manifest_snapshot(
         root,
         require_litellm_executable=False,
     )
@@ -734,6 +1026,18 @@ def rebind_runtime(
             "litellm_runtime_missing: selected LiteLLM executable disappeared during validation; "
             f"install or repair it, then rerun {remedy}"
         )
+    try:
+        current_manifest = manifest_path.read_bytes()
+    except OSError as exc:
+        raise GatewayConfigError(
+            "gateway_runtime_manifest_changed: install manifest became unreadable "
+            f"during validation; retry {remedy}"
+        ) from exc
+    if current_manifest != manifest_snapshot:
+        raise GatewayConfigError(
+            "gateway_runtime_manifest_changed: install manifest changed during "
+            f"validation; inspect the other writer, then retry {remedy}"
+        )
 
     previous = manifest.get("litellm_executable")
     next_manifest = dict(manifest)
@@ -746,6 +1050,7 @@ def rebind_runtime(
     changed = previous != str(executable)
     if changed:
         _durable_write_json(manifest_path, next_manifest)
+        load_install_manifest(root)
     return {
         "runtime_rebound": True,
         "changed": changed,
@@ -976,48 +1281,63 @@ def run_service(
 ) -> int:
     """Run LiteLLM plus the public front. Called only by the managed task."""
     root = canonical_project_root(root)
-    if not actions_enabled(root):
-        raise GatewayConfigError("gateway.kill is present; actions are disabled")
-    ledger = ledger or SpendLedger()
-    ledger_status = ledger.status()
-    # A watched front must be able to restart under a manual/accounting HOLD;
-    # reserve_for_child remains the paid-transport authority and rejects it.
-    if not ledger_status["child_cap_ready"]:
-        raise LedgerBlocked("child turn cap is not structurally ready")
-    exclusive_bind_probe(PUBLIC_HOST, PUBLIC_PORT)
-    exclusive_bind_probe(INTERNAL_HOST, INTERNAL_PORT)
-    ovh_key = read_secret_file(key_path or default_key_path())
-    front_token = read_secret_file(front_token_path or default_front_token_path())
-    ledger.verify_child_cap_issuer(front_token)
-    internal_token = read_secret_file(internal_token_path or default_internal_token_path())
-    manifest = load_install_manifest(root)
-    configured_executable = str(Path(manifest["litellm_executable"]).resolve())
-    if (
-        litellm_executable is not None
-        and str(Path(litellm_executable).resolve()) != configured_executable
-    ):
-        raise GatewayConfigError("requested LiteLLM executable differs from installed manifest")
-    executable = configured_executable
-    config_path = litellm_config_path(root)
-    if not config_path.is_file():
-        raise GatewayConfigError("LiteLLM config is missing")
-    argv = [
-        executable,
-        "--config",
-        str(config_path),
-        "--host",
-        INTERNAL_HOST,
-        "--port",
-        str(INTERNAL_PORT),
-        "--num_workers",
-        "1",
-    ]
-    log_handler = _open_litellm_log(Path(child_log_path or default_litellm_log_path()))
+    lifecycle = contextlib.ExitStack()
     process = None
     pump_thread = None
     server = None
+    monitor_thread = None
+    log_handler = None
     monitor_stop = threading.Event()
+    marker_written = False
+    marker_snapshot: bytes | None = None
+    startup_release_attempted = False
     try:
+        lifecycle.enter_context(
+            _gateway_lifecycle_lock(root, "run-service-startup")
+        )
+        if not actions_enabled(root):
+            raise GatewayConfigError("gateway.kill is present; actions are disabled")
+        ledger = ledger or SpendLedger()
+        ledger_status = ledger.status()
+        # A watched front must be able to restart under a manual/accounting HOLD;
+        # reserve_for_child remains the paid-transport authority and rejects it.
+        if not ledger_status["child_cap_ready"]:
+            raise LedgerBlocked("child turn cap is not structurally ready")
+        exclusive_bind_probe(PUBLIC_HOST, PUBLIC_PORT)
+        exclusive_bind_probe(INTERNAL_HOST, INTERNAL_PORT)
+        ovh_key = read_secret_file(key_path or default_key_path())
+        front_token = read_secret_file(front_token_path or default_front_token_path())
+        ledger.verify_child_cap_issuer(front_token)
+        internal_token = read_secret_file(
+            internal_token_path or default_internal_token_path()
+        )
+        manifest = load_install_manifest(root)
+        configured_executable = str(Path(manifest["litellm_executable"]).resolve())
+        if (
+            litellm_executable is not None
+            and str(Path(litellm_executable).resolve()) != configured_executable
+        ):
+            raise GatewayConfigError(
+                "requested LiteLLM executable differs from installed manifest"
+            )
+        executable = configured_executable
+        config_path = litellm_config_path(root)
+        if not config_path.is_file():
+            raise GatewayConfigError("LiteLLM config is missing")
+        argv = [
+            executable,
+            "--config",
+            str(config_path),
+            "--host",
+            INTERNAL_HOST,
+            "--port",
+            str(INTERNAL_PORT),
+            "--num_workers",
+            "1",
+        ]
+        log_handler = _open_litellm_log(
+            Path(child_log_path or default_litellm_log_path())
+        )
         process = popen(
             argv,
             cwd=str(root),
@@ -1045,8 +1365,9 @@ def run_service(
         )
         _wait_liveliness(front, process)
         server = front.make_server()
+        marker_path = runtime_marker_path(root)
         _durable_write_json(
-            runtime_marker_path(root),
+            marker_path,
             {
                 "schema_version": RUNTIME_SCHEMA_VERSION,
                 "runner_pid": os.getpid(),
@@ -1059,9 +1380,18 @@ def run_service(
                 "config_sha256": manifest["litellm_config_sha256"],
                 "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
                 "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
-                "front_token_sha256": hashlib.sha256(front_token.encode("utf-8")).hexdigest(),
+                "front_token_sha256": hashlib.sha256(
+                    front_token.encode("utf-8")
+                ).hexdigest(),
             },
         )
+        marker_written = True
+        marker_snapshot = marker_path.read_bytes()
+        # Both sockets are now owned and the runtime marker is durable. A
+        # concurrent writer can observe the running-state refusal, so the
+        # startup transaction no longer needs to hold the lifecycle lock.
+        startup_release_attempted = True
+        lifecycle.close()
 
         def monitor() -> None:
             while not monitor_stop.wait(0.25):
@@ -1077,21 +1407,60 @@ def run_service(
         monitor_thread.join(timeout=2)
         return 0 if process.poll() is None or not actions_enabled(root) else 1
     finally:
+        cleanup_errors: list[BaseException] = []
+
+        def cleanup(action) -> None:
+            try:
+                action()
+            except BaseException as exc:  # noqa: BLE001 - finish all cleanup first
+                cleanup_errors.append(exc)
+
         monitor_stop.set()
         if server is not None:
-            server.server_close()
-        if process is not None and process.poll() is None:
-            process.terminate()
+            cleanup(server.server_close)
+        if process is not None:
             try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+                process_alive = process.poll() is None
+            except BaseException as exc:  # noqa: BLE001 - continue other cleanup
+                cleanup_errors.append(exc)
+                process_alive = False
+            if process_alive:
+                cleanup(process.terminate)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    cleanup(process.kill)
+                    cleanup(lambda: process.wait(timeout=5))
+                except BaseException as exc:  # noqa: BLE001 - continue cleanup
+                    cleanup_errors.append(exc)
+                    cleanup(process.kill)
+                    cleanup(lambda: process.wait(timeout=5))
         if pump_thread is not None:
-            pump_thread.join(timeout=5)
-        log_handler.close()
-        with contextlib.suppress(FileNotFoundError):
-            runtime_marker_path(root).unlink()
+            cleanup(lambda: pump_thread.join(timeout=5))
+        if monitor_thread is not None:
+            cleanup(lambda: monitor_thread.join(timeout=2))
+        if log_handler is not None:
+            cleanup(log_handler.close)
+        if marker_written:
+            marker_path = runtime_marker_path(root)
+
+            def remove_owned_marker() -> None:
+                if not startup_release_attempted:
+                    marker_path.unlink(missing_ok=True)
+                    return
+                try:
+                    current = marker_path.read_bytes()
+                except FileNotFoundError:
+                    return
+                if marker_snapshot is not None and current == marker_snapshot:
+                    marker_path.unlink()
+
+            cleanup(remove_owned_marker)
+        # On startup failure, cleanup completes before another lifecycle
+        # operation can inspect sockets or mutate the manifest.
+        cleanup(lifecycle.close)
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
 
 def stop_task(

@@ -8741,6 +8741,12 @@ def cmd_gateway(args: argparse.Namespace) -> int:
             result = service.gateway_status(store.root)
         else:
             raise ValueError(f"unsupported gateway action {action!r}")
+    except (
+        service.GatewayLifecycleUnknown,
+        service.LiteLLMRuntimeProbeUnknown,
+    ) as exc:
+        sys.stderr.write(f"agenttalk gateway {action}: {exc}\n")
+        return 3
     except (gateway.GatewayError, OSError, ValueError) as exc:
         sys.stderr.write(f"agenttalk gateway {action}: {exc}\n")
         return 2
@@ -15075,11 +15081,21 @@ def build_parser() -> argparse.ArgumentParser:
     gw_runtime_rebind = gwsub.add_parser(
         "runtime-rebind",
         help=(
-            "Verify and rebind the LiteLLM runtime "
-            "(ledger/token/task-preserving; the gateway must be stopped first)."
+            "Probe and rebind a trusted LiteLLM runtime. The unsandboxed candidate "
+            "has your filesystem authority; exit 3 means unknown and exit 2 means refusal."
+        ),
+        description=(
+            "Probe and rebind a trusted LiteLLM runtime while the gateway is stopped. "
+            "The candidate runs unsandboxed with your filesystem authority. AgentTalk "
+            "rewrites only the manifest runtime field. Exit 3 is a retryable unknown "
+            "probe outcome; exit 2 is a determinate refusal."
         ),
     )
-    gw_runtime_rebind.add_argument("--litellm-executable", required=True)
+    gw_runtime_rebind.add_argument(
+        "--litellm-executable",
+        required=True,
+        help="Path to a trusted LiteLLM launcher to execute for the capability probe.",
+    )
     gw_runtime_rebind.set_defaults(func=cmd_gateway)
     gw_reconcile = gwsub.add_parser(
         "reconcile",
