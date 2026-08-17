@@ -128,6 +128,272 @@ def test_gateway_cli_initializes_once_and_controls_manual_hold(
     assert canary["expected_micro_eur"] == 960
 
 
+def test_gateway_cli_runtime_rebind_routes_candidate_and_prints_result(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    candidate = tmp_path / "unusual runtime" / "launcher.shim"
+    captured: dict[str, object] = {}
+
+    def fake_rebind(received_root, *, litellm_executable):
+        captured["root"] = received_root
+        captured["litellm_executable"] = litellm_executable
+        return {
+            "runtime_rebound": True,
+            "changed": True,
+            "litellm_executable": str(candidate),
+        }
+
+    monkeypatch.setattr(ovh_gateway_service, "rebind_runtime", fake_rebind)
+
+    rc = cli.main([
+        "--root",
+        str(root),
+        "gateway",
+        "runtime-rebind",
+        "--litellm-executable",
+        str(candidate),
+    ])
+
+    assert rc == 0
+    assert captured == {
+        "root": root.resolve(),
+        "litellm_executable": str(candidate),
+    }
+    result = json.loads(capsys.readouterr().out)
+    assert result["runtime_rebound"] is True
+    assert result["litellm_executable"] == str(candidate)
+
+
+def test_gateway_cli_runtime_rebind_help_states_probe_authority_and_exit_contract(
+    capsys,
+) -> None:
+    for argv in (["gateway", "--help"], ["gateway", "runtime-rebind", "--help"]):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(argv)
+        assert exc_info.value.code == 0
+        rendered = capsys.readouterr().out.casefold()
+        assert "trusted" in rendered
+        assert "filesystem authority" in rendered
+        assert "unsandboxed" in rendered
+        assert "exit 3" in rendered
+        assert "exit 2" in rendered
+
+
+@pytest.mark.parametrize(
+    ("error_type", "reason", "expected_rc"),
+    [
+        (
+            ovh_gateway_service.LiteLLMRuntimeProbeFailed,
+            "litellm_runtime_probe_failed",
+            2,
+        ),
+        (
+            ovh_gateway_service.LiteLLMRuntimeProbeUnknown,
+            "litellm_runtime_probe_unknown",
+            3,
+        ),
+    ],
+)
+def test_gateway_cli_runtime_rebind_surfaces_named_probe_refusal(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    error_type,
+    reason,
+    expected_rc,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    candidate = tmp_path / "runtime.exe"
+    refusal = (
+        f"{reason}: retry "
+        f'agenttalk --root "{root.resolve()}" gateway runtime-rebind '
+        f'--litellm-executable "{candidate}"'
+    )
+
+    def refuse_rebind(_root, *, litellm_executable):
+        assert _root == root.resolve()
+        assert litellm_executable == str(candidate)
+        message = refusal.removeprefix(f"{reason}: ")
+        raise error_type(message)
+
+    monkeypatch.setattr(ovh_gateway_service, "rebind_runtime", refuse_rebind)
+
+    rc = cli.main([
+        "--root",
+        str(root),
+        "gateway",
+        "runtime-rebind",
+        "--litellm-executable",
+        str(candidate),
+    ])
+
+    output = capsys.readouterr()
+    assert rc == expected_rc
+    assert output.out == ""
+    assert output.err == f"agenttalk gateway runtime-rebind: {refusal}\n"
+
+
+def test_gateway_cli_runtime_rebind_final_probe_copy_failure_is_named_unknown(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    old_runtime = tmp_path / "old-runtime" / "litellm.exe"
+    old_runtime.parent.mkdir()
+    old_runtime.write_bytes(b"old runtime")
+    ledger = SpendLedger(
+        tmp_path / "spend" / "ledger.sqlite3",
+        tmp_path / "spend" / "install.json",
+    )
+    ovh_gateway_service.initialize_install(
+        root,
+        litellm_executable=old_runtime,
+        opening_micro_eur=580_000,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        ledger=ledger,
+        front_token_path=tmp_path / "secrets" / "front.txt",
+        internal_token_path=tmp_path / "secrets" / "internal.txt",
+    )
+
+    runtime_dir = tmp_path / "candidate-runtime"
+    runtime_dir.mkdir()
+    if sys.platform == "win32":
+        candidate = runtime_dir / "litellm.cmd"
+        candidate.write_text(
+            (
+                "@echo off\r\n"
+                'if not "%~1"=="--version" exit /b 2\r\n'
+                'if not "%~2"=="" exit /b 2\r\n'
+                "echo LiteLLM: Current Version = 1.91.3\r\n"
+            ),
+            encoding="utf-8",
+        )
+    else:
+        candidate = runtime_dir / "litellm"
+        candidate.write_text(
+            (
+                "#!/bin/sh\n"
+                '[ "$#" -eq 1 ] && [ "$1" = "--version" ] || exit 2\n'
+                "printf '%s\\n' 'LiteLLM: Current Version = 1.91.3'\n"
+            ),
+            encoding="utf-8",
+        )
+        candidate.chmod(0o755)
+
+    manifest_path = ovh_gateway_service.install_manifest_path(root)
+    manifest_before = manifest_path.read_bytes()
+    copy_attempts: list[bytearray] = []
+    real_bytearray = bytearray
+
+    class FinalCopyFailure(real_bytearray):
+        def __bytes__(self) -> bytes:
+            captured = real_bytearray(self)
+            assert captured.splitlines() == [
+                real_bytearray(b"LiteLLM: Current Version = 1.91.3")
+            ]
+            copy_attempts.append(captured)
+            raise MemoryError("forced final probe output copy failure")
+
+    monkeypatch.setattr(ovh_gateway_service, "_both_sockets_free", lambda: True)
+    monkeypatch.setattr(
+        ovh_gateway_service,
+        "bytearray",
+        FinalCopyFailure,
+        raising=False,
+    )
+
+    rc = cli.main([
+        "--root",
+        str(root),
+        "gateway",
+        "runtime-rebind",
+        "--litellm-executable",
+        str(candidate),
+    ])
+
+    output = capsys.readouterr()
+    assert len(copy_attempts) == 1
+    assert rc == 3
+    assert output.out == ""
+    assert output.err.startswith(
+        "agenttalk gateway runtime-rebind: litellm_runtime_probe_unknown: "
+    )
+    assert "probe infrastructure or cleanup was inconclusive" in output.err
+    assert "retry " in output.err
+    assert manifest_path.read_bytes() == manifest_before
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "reason", "expected_rc"),
+    [
+        (
+            lambda path: ovh_gateway_service.GatewayLifecycleContended(
+                ovh_gateway_service.LifecycleLockContended({
+                    "pid": 42,
+                    "process_identity": {
+                        "scheme": "win32-filetime-v1",
+                        "value": "123",
+                    },
+                    "operation": "reconfigure",
+                    "acquired_at": "2026-08-17T12:00:00.000000Z",
+                })
+            ),
+            "gateway_lifecycle_contended",
+            2,
+        ),
+        (
+            lambda path: ovh_gateway_service.GatewayLifecycleUnknown(
+                ovh_gateway_service.LifecycleLockUnknown(path, "metadata is corrupt")
+            ),
+            "gateway_lifecycle_unknown",
+            3,
+        ),
+    ],
+)
+def test_gateway_cli_runtime_rebind_surfaces_typed_lifecycle_refusal(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    error_factory,
+    reason,
+    expected_rc,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    candidate = tmp_path / "runtime.exe"
+    refusal = error_factory(root / ".agenttalk" / "gateway" / "lifecycle.lock")
+
+    def refuse_rebind(_root, *, litellm_executable):
+        assert _root == root.resolve()
+        assert litellm_executable == str(candidate)
+        raise refusal
+
+    monkeypatch.setattr(ovh_gateway_service, "rebind_runtime", refuse_rebind)
+
+    rc = cli.main([
+        "--root",
+        str(root),
+        "gateway",
+        "runtime-rebind",
+        "--litellm-executable",
+        str(candidate),
+    ])
+
+    output = capsys.readouterr()
+    assert rc == expected_rc
+    assert output.out == ""
+    assert output.err.startswith(
+        f"agenttalk gateway runtime-rebind: {reason}: "
+    )
+
+
 def test_gateway_cli_rejects_caller_supplied_actual_reconciliation(
     tmp_path,
     capsys,
