@@ -37,6 +37,24 @@ with CrossProcessLifecycleLock(
         time.sleep(0.01)
 """
 
+_EXIT_259_HOLDER_SCRIPT = r"""
+import os
+import sys
+from pathlib import Path
+
+from agenttalk.lifecycle_lock import CrossProcessLifecycleLock
+
+lock_path = Path(sys.argv[1])
+ready_path = Path(sys.argv[2])
+with CrossProcessLifecycleLock(
+    lock_path,
+    authority="test-lifecycle-v1",
+    timeout_seconds=2.0,
+).hold("test-holder"):
+    ready_path.write_text("ready\n", encoding="ascii")
+    os._exit(259)
+"""
+
 
 def _lock_api():
     from agenttalk.lifecycle_lock import (
@@ -381,6 +399,40 @@ def test_lifecycle_lock_takes_over_after_exact_holder_dies(tmp_path) -> None:
         _kill_and_reap(holder)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows retained process-handle semantics")
+@pytest.mark.subprocess
+def test_lifecycle_lock_takes_over_when_retained_holder_exits_with_code_259(
+    tmp_path,
+) -> None:
+    CrossProcessLifecycleLock, _, _ = _lock_api()
+    lock_path = tmp_path / "gateway" / "lifecycle.lock"
+    ready = tmp_path / "holder.ready"
+    holder = subprocess.Popen(  # noqa: S603 - exact local interpreter and test script
+        [sys.executable, "-c", _EXIT_259_HOLDER_SCRIPT, str(lock_path), str(ready)],
+        env=_subprocess_env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        _wait_for_path(ready, holder)
+        crashed_owner = _read_record(lock_path)
+        assert holder.wait(timeout=5) == 259
+
+        with CrossProcessLifecycleLock(
+            lock_path,
+            authority=_AUTHORITY,
+            timeout_seconds=1.0,
+        ).hold("exit-259-takeover"):
+            replacement = _read_record(lock_path)
+            assert replacement["generation"] != crashed_owner["generation"]
+            assert replacement["pid"] == os.getpid()
+    finally:
+        _kill_and_reap(holder)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX zombie ownership semantics")
 @pytest.mark.subprocess
 def test_lifecycle_lock_takes_over_from_unreaped_zombie_holder(tmp_path) -> None:
@@ -392,6 +444,7 @@ def test_lifecycle_lock_takes_over_from_unreaped_zombie_holder(tmp_path) -> None
     try:
         _wait_for_path(ready, holder)
         crashed_owner = _read_record(lock_path)
+        assert crashed_owner["process_identity"] == _identity_record(holder.pid)
         holder.kill()
         _wait_for_posix_zombie(holder.pid)
 
@@ -475,6 +528,51 @@ def test_lifecycle_lock_refuses_free_kernel_lock_with_exact_live_owner(
             timeout_seconds=0.1,
         ).hold("must-not-steal"):
             raise AssertionError("exact live ownership must never be stolen")
+
+    assert lock_path.read_bytes() == original
+
+
+def test_lifecycle_lock_refuses_unobservable_recorded_owner_as_unknown(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from agenttalk import lifecycle_lock as lock_module
+
+    CrossProcessLifecycleLock, _, LifecycleLockUnknown = _lock_api()
+    lock_path = tmp_path / "gateway" / "lifecycle.lock"
+    held = {
+        "authority": _AUTHORITY,
+        "schema_version": 1,
+        "state": "held",
+        "generation": "0" * 32,
+        "pid": os.getpid(),
+        "process_identity": _identity_record(os.getpid()),
+        "operation": "unobservable-owner",
+        "acquired_at": "2026-08-17T13:00:00.000000Z",
+    }
+    original = _write_record(lock_path, held)
+    real_observation = lock_module._process_observation
+    observations = 0
+
+    def caller_then_unknown(pid):
+        nonlocal observations
+        observations += 1
+        if observations == 1:
+            return real_observation(pid)
+        return "unknown", None
+
+    monkeypatch.setattr(lock_module, "_process_observation", caller_then_unknown)
+
+    with pytest.raises(
+        LifecycleLockUnknown,
+        match="abandoned holder identity could not be observed exactly",
+    ):
+        with CrossProcessLifecycleLock(
+            lock_path,
+            authority=_AUTHORITY,
+            timeout_seconds=0.1,
+        ).hold("must-not-steal-unknown"):
+            raise AssertionError("unobservable ownership must never be stolen")
 
     assert lock_path.read_bytes() == original
 

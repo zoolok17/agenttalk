@@ -30,6 +30,10 @@ _LOCK_OFFSET = _ARTIFACT_BYTES - 1
 _METADATA_BYTES = _LOCK_OFFSET
 _MAX_WINDOWS_PID = (1 << 32) - 1
 _MAX_FILETIME = (1 << 64) - 1
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_SYNCHRONIZE = 0x00100000
+_WAIT_OBJECT_0 = 0
+_WAIT_TIMEOUT = 0x00000102
 _SAFE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _HEX_GENERATION = re.compile(r"[0-9a-f]{32}")
 _UTC_TIMESTAMP = re.compile(
@@ -218,11 +222,8 @@ def _windows_process_observation(pid: int) -> tuple[str, ProcessIdentity | None]
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.restype = wintypes.HANDLE
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-        kernel32.GetExitCodeProcess.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(wintypes.DWORD),
-        ]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         kernel32.GetProcessTimes.restype = wintypes.BOOL
         kernel32.GetProcessTimes.argtypes = [
             wintypes.HANDLE,
@@ -233,15 +234,19 @@ def _windows_process_observation(pid: int) -> tuple[str, ProcessIdentity | None]
         ]
         kernel32.CloseHandle.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        handle = kernel32.OpenProcess(0x1000, False, pid)
+        handle = kernel32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE,
+            False,
+            pid,
+        )
         if not handle:
             return ("dead", None) if ctypes.get_last_error() == 87 else ("unknown", None)
         try:
-            exit_code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return "unknown", None
-            if exit_code.value != 259:
+            wait_result = kernel32.WaitForSingleObject(handle, 0)
+            if wait_result == _WAIT_OBJECT_0:
                 return "dead", None
+            if wait_result != _WAIT_TIMEOUT:
+                return "unknown", None
             creation = wintypes.FILETIME()
             exit_time = wintypes.FILETIME()
             kernel = wintypes.FILETIME()
@@ -258,6 +263,13 @@ def _windows_process_observation(pid: int) -> tuple[str, ProcessIdentity | None]
                 creation.dwLowDateTime
             )
             if ticks <= 0:
+                return "unknown", None
+            # Close the exit-after-observation race before reporting a live
+            # exact identity. A signaled process can never become live again.
+            wait_result = kernel32.WaitForSingleObject(handle, 0)
+            if wait_result == _WAIT_OBJECT_0:
+                return "dead", None
+            if wait_result != _WAIT_TIMEOUT:
                 return "unknown", None
             return "alive", ProcessIdentity("win32-filetime-v1", str(ticks))
         finally:
@@ -356,7 +368,7 @@ def _darwin_process_observation(pid: int) -> tuple[str, ProcessIdentity | None]:
         received = libproc.proc_pidinfo(
             pid,
             3,  # PROC_PIDTBSDINFO
-            0,
+            1,  # Ask XNU to include a matching zombie in the BSD-info lookup.
             ctypes.byref(info),
             ctypes.sizeof(info),
         )

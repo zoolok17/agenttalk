@@ -1201,6 +1201,80 @@ def test_runtime_rebind_refuses_candidate_without_mutating_install(
     assert _file_snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize("failure_at", ["construction", "start"])
+def test_runtime_rebind_reader_thread_failure_is_retryable_unknown(
+    tmp_path,
+    monkeypatch,
+    failure_at,
+) -> None:
+    root, _, _, _, _ = _install_for_runtime_rebind(tmp_path)
+    candidate = tmp_path / "candidate-runtime"
+    candidate.write_bytes(b"candidate")
+    candidate_started = tmp_path / "candidate.started"
+    real_popen = subprocess.Popen
+    spawned: list[subprocess.Popen] = []
+    reader_calls: list[str] = []
+
+    def capturing_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    class StartFailureThread:
+        ident = None
+
+        def start(self) -> None:
+            reader_calls.append("start")
+            raise RuntimeError("reader thread could not start")
+
+        def join(self, timeout=None) -> None:
+            _ = timeout
+            reader_calls.append("join")
+            raise AssertionError("a never-started reader must not be joined")
+
+        def is_alive(self) -> bool:
+            reader_calls.append("is_alive")
+            raise AssertionError("a never-started reader has no liveness state")
+
+    def failing_thread(*_args, **_kwargs):
+        if failure_at == "construction":
+            raise RuntimeError("reader thread could not be constructed")
+        return StartFailureThread()
+
+    monkeypatch.setattr(service.threading, "Thread", failing_thread)
+    monkeypatch.setattr(service.subprocess, "Popen", capturing_popen)
+    monkeypatch.setattr(
+        service,
+        "_RUNTIME_PROBE_BOOTSTRAP",
+        (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "if sys.stdin.buffer.read(1) == b'1':\n"
+            f"    Path({str(candidate_started)!r}).write_text('started', encoding='ascii')\n"
+        ),
+    )
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    before = _file_snapshot(tmp_path)
+
+    with pytest.raises(service.LiteLLMRuntimeProbeUnknown) as exc_info:
+        service.rebind_runtime(root, litellm_executable=candidate)
+
+    assert exc_info.value.reason_code == "litellm_runtime_probe_unknown"
+    assert exc_info.value.retryable is True
+    expected_detail = (
+        "reader thread could not be constructed"
+        if failure_at == "construction"
+        else "reader thread could not start"
+    )
+    assert expected_detail in str(exc_info.value.__cause__)
+    assert "never-started reader" not in str(exc_info.value.__cause__)
+    assert reader_calls == ([] if failure_at == "construction" else ["start"])
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None
+    assert not candidate_started.exists()
+    assert _file_snapshot(tmp_path) == before
+
+
 @pytest.mark.parametrize("corruption", ["config_hash", "price_policy"])
 def test_runtime_rebind_refuses_invalid_bound_manifest_before_probe(
     tmp_path,

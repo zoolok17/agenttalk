@@ -468,26 +468,33 @@ class RuntimeProbeCommands:
         if os.name != "nt":
             popen_kwargs["start_new_session"] = True
         try:
+            output = bytearray()
+            output_overflow = threading.Event()
+            reader_errors: list[Exception] = []
+        except Exception as exc:
+            raise _RuntimeProbeInfrastructureError(
+                f"probe output capture could not be initialized: {exc}"
+            ) from exc
+        try:
             process = subprocess.Popen(  # nosec B603  # noqa: S603
                 bootstrap_argv,
                 **popen_kwargs,
             )
-        except OSError as exc:
+        except Exception as exc:
             raise _RuntimeProbeInfrastructureError(
                 f"probe bootstrap could not start: {exc}"
             ) from exc
         if process.stdin is None or process.stdout is None:
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(Exception):
                 process.kill()
+            with contextlib.suppress(Exception):
+                process.wait(timeout=5.0)
             raise _RuntimeProbeInfrastructureError(
                 "probe bootstrap pipes are unavailable"
             )
 
         def close_job() -> None:
             return None
-        output = bytearray()
-        output_overflow = threading.Event()
-        reader_errors: list[OSError] = []
 
         def drain_stdout() -> None:
             try:
@@ -499,87 +506,146 @@ class RuntimeProbeCommands:
                         output.extend(chunk[:remaining])
                     if len(output) > LITELLM_RUNTIME_PROBE_OUTPUT_MAX_BYTES:
                         output_overflow.set()
-            except OSError as exc:
+            except Exception as exc:
                 reader_errors.append(exc)
 
         reader: threading.Thread | None = None
+        reader_started = False
         returncode: int | None = None
         timed_out = False
-        infrastructure_error: BaseException | None = None
+        infrastructure_error: _RuntimeProbeInfrastructureError | None = None
+
+        def remember_infrastructure_error(detail: str, exc: Exception) -> None:
+            nonlocal infrastructure_error
+            if infrastructure_error is None:
+                infrastructure_error = _RuntimeProbeInfrastructureError(
+                    f"{detail}: {exc}"
+                )
+
         try:
             try:
                 _, close_job = _attach_kill_on_close_job(process)
-            except OSError as exc:
-                infrastructure_error = _RuntimeProbeInfrastructureError(
-                    f"probe process containment failed: {exc}"
+            except Exception as exc:
+                remember_infrastructure_error(
+                    "probe process containment failed",
+                    exc,
                 )
             if infrastructure_error is None:
-                reader = threading.Thread(
-                    target=drain_stdout,
-                    daemon=True,
-                    name="agenttalk-litellm-probe-output",
-                )
-                reader.start()
+                try:
+                    reader = threading.Thread(
+                        target=drain_stdout,
+                        daemon=True,
+                        name="agenttalk-litellm-probe-output",
+                    )
+                    reader.start()
+                    reader_started = True
+                except Exception as exc:
+                    remember_infrastructure_error(
+                        "probe output drain could not start",
+                        exc,
+                    )
+            if infrastructure_error is None:
                 try:
                     process.stdin.write(b"1")
                     process.stdin.close()
-                except (OSError, ValueError) as exc:
-                    infrastructure_error = _RuntimeProbeInfrastructureError(
-                        f"probe bootstrap gate failed: {exc}"
+                except Exception as exc:
+                    remember_infrastructure_error(
+                        "probe bootstrap gate failed",
+                        exc,
                     )
             if infrastructure_error is None:
-                deadline = time.monotonic() + self.timeout_seconds
-                while returncode is None and not output_overflow.is_set():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        timed_out = True
-                        break
-                    try:
-                        returncode = process.wait(timeout=min(0.05, remaining))
-                    except subprocess.TimeoutExpired:
-                        continue
+                try:
+                    deadline = time.monotonic() + self.timeout_seconds
+                    while returncode is None and not output_overflow.is_set():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            timed_out = True
+                            break
+                        try:
+                            returncode = process.wait(timeout=min(0.05, remaining))
+                        except subprocess.TimeoutExpired:
+                            continue
+                except Exception as exc:
+                    remember_infrastructure_error(
+                        "probe process observation failed",
+                        exc,
+                    )
         finally:
-            with contextlib.suppress(OSError, ValueError):
-                process.stdin.close()
+            try:
+                if not process.stdin.closed:
+                    process.stdin.close()
+            except Exception as exc:
+                remember_infrastructure_error(
+                    "probe bootstrap input cleanup failed",
+                    exc,
+                )
             try:
                 close_job()
-            except OSError as exc:
-                infrastructure_error = infrastructure_error or _RuntimeProbeInfrastructureError(
-                    f"probe process containment release failed: {exc}"
+            except Exception as exc:
+                remember_infrastructure_error(
+                    "probe process containment release failed",
+                    exc,
                 )
             if os.name != "nt":
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                except OSError as exc:
-                    infrastructure_error = infrastructure_error or _RuntimeProbeInfrastructureError(
-                        f"probe process-group teardown failed: {exc}"
+                except Exception as exc:
+                    remember_infrastructure_error(
+                        "probe process-group teardown failed",
+                        exc,
                     )
-            if process.poll() is None:
-                with contextlib.suppress(OSError):
+            process_running = True
+            try:
+                process_running = process.poll() is None
+            except Exception as exc:
+                remember_infrastructure_error(
+                    "probe process state observation failed",
+                    exc,
+                )
+            if process_running:
+                try:
                     process.kill()
+                except Exception as exc:
+                    remember_infrastructure_error(
+                        "probe process teardown failed",
+                        exc,
+                    )
             try:
                 process.wait(timeout=5.0)
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                infrastructure_error = infrastructure_error or _RuntimeProbeInfrastructureError(
-                    f"probe process reap failed: {exc}"
+            except Exception as exc:
+                remember_infrastructure_error(
+                    "probe process reap failed",
+                    exc,
                 )
-            if reader is not None:
-                reader.join(timeout=5.0)
-                if reader.is_alive():
-                    infrastructure_error = infrastructure_error or _RuntimeProbeInfrastructureError(
-                        "probe output drain did not terminate"
+            if reader is not None and reader_started:
+                try:
+                    reader.join(timeout=5.0)
+                    if reader.is_alive():
+                        remember_infrastructure_error(
+                            "probe output drain did not terminate",
+                            RuntimeError("reader remained alive after the cleanup bound"),
+                        )
+                except Exception as exc:
+                    remember_infrastructure_error(
+                        "probe output drain cleanup failed",
+                        exc,
                     )
-            with contextlib.suppress(OSError):
+            try:
                 process.stdout.close()
+            except Exception as exc:
+                remember_infrastructure_error(
+                    "probe output pipe cleanup failed",
+                    exc,
+                )
 
+        if reader_errors and infrastructure_error is None:
+            infrastructure_error = _RuntimeProbeInfrastructureError(
+                f"probe output capture failed: {reader_errors[0]}"
+            )
         if infrastructure_error is not None:
             raise infrastructure_error
-        if reader_errors:
-            raise _RuntimeProbeInfrastructureError(
-                f"probe output capture failed: {reader_errors[0]}"
-            ) from reader_errors[0]
         if timed_out:
             raise subprocess.TimeoutExpired(argv, self.timeout_seconds)
         if output_overflow.is_set():
