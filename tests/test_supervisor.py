@@ -871,7 +871,7 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert "supervise --plan --state-file" in ps
     assert "--record-events" in ps
     assert "--json" not in ps                       # blocker regression guard
-    assert "Start-WrapperProcess $startArgs" in ps
+    assert "Invoke-SupervisorSpawnStep $startArgs" in ps
     assert "ArgumentList" in ps and "PassThru = $true" in ps
     assert "Invoke-Expression" not in ps            # file/args executor, no expr
     assert "windows_file" in ps                     # launches the real exe
@@ -4766,7 +4766,7 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         return
     helpers = _exec_helpers(tmp_path)
     launchers = sup.PS_TEMPLATE[
-        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# region supervisor-spawn-step"):
         sup.PS_TEMPLATE.index("# Console action log")
     ]
     output = tmp_path / "literal-environment.json"
@@ -6488,7 +6488,7 @@ def test_ps_template_prepares_redirects_for_regular_and_ephemeral_launches() -> 
         assert "RedirectStandardOutput" in block
         assert "RedirectStandardError" in block
         assert "AGENTTALK_WRAPPER_LOG_NONCE" in block
-        assert "Start-WrapperProcess $startArgs" in block
+        assert "Invoke-SupervisorSpawnStep $startArgs" in block
         assert block.index(configured_env) < block.index(
             "AGENTTALK_WRAPPER_LOG_NONCE"
         )
@@ -8030,7 +8030,7 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
         pytest.skip("Windows PowerShell hosts are unavailable")
     helpers = _exec_helpers(tmp_path)
     launchers = sup.PS_TEMPLATE[
-        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# region supervisor-spawn-step"):
         sup.PS_TEMPLATE.index("# Console action log")
     ]
     output = tmp_path / "environment-rollback.json"
@@ -8507,7 +8507,7 @@ def test_ps_regular_wrapped_launch_consumes_planned_loop_admission(
 
     helpers = _exec_helpers(tmp_path)
     launchers = sup.PS_TEMPLATE[
-        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# region supervisor-spawn-step"):
         sup.PS_TEMPLATE.index("# Console action log")
     ]
     out = tmp_path / "wrapped-loop-admission.json"
@@ -9457,7 +9457,7 @@ def _launch_admission_runtime_blocks(tmp_path: Path) -> tuple[str, str, str]:
         sup.PS_TEMPLATE.index("# endregion quote-arg")
     ]
     launchers = sup.PS_TEMPLATE[
-        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# region supervisor-spawn-step"):
         sup.PS_TEMPLATE.index("# Console action log")
     ]
     return helpers, quote_arg, launchers
@@ -9940,7 +9940,7 @@ def test_supervisor_wrapper_logging_is_driven_by_typed_admission(
         return
     helpers = _exec_helpers(tmp_path)
     launchers = sup.PS_TEMPLATE[
-        sup.PS_TEMPLATE.index("function Launch($name"):
+        sup.PS_TEMPLATE.index("# region supervisor-spawn-step"):
         sup.PS_TEMPLATE.index("# Console action log")
     ]
     root = str(tmp_path)
