@@ -9319,7 +9319,23 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             ),
         )
 
-    # 0) Manual restart-request marker (highest priority).
+    # A pre-spawn reservation is an unresolved spawn boundary. Presence is the
+    # authority: even malformed evidence must hold, because ignoring it could
+    # create a duplicate child. The relaunch state can still carry the prior
+    # launcher's PID, so that stale field cannot exempt the reservation.
+    if "pending_launch_record" in st:
+        return _result(
+            NONE,
+            state="LAUNCH_RECORD_PENDING",
+            reason=(
+                "a prior spawn outcome is unresolved; HOLDING because the "
+                "pending launch record may belong to a live child. Inspect "
+                "the process table and accepted launch context before any "
+                "retry or attended state repair"
+            ),
+        )
+
+    # 0) Manual restart-request marker (highest priority after safety holds).
     if isinstance(marker, dict) and isinstance(marker.get("request_id"), str):
         rid = marker["request_id"]
         auth_ok = (
@@ -13053,14 +13069,23 @@ namespace Agenttalk {
   public sealed class ExactHandleLaunchResult {
     public Process Process { get; private set; }
     public string CreationFiletime { get; private set; }
+    public bool ProcessCreated { get; private set; }
+    public uint ProcessId { get; private set; }
+    public string FailureMessage { get; private set; }
+    public string CleanupStatus { get; private set; }
     public bool StdoutDegraded { get; private set; }
     public bool StderrDegraded { get; private set; }
 
     internal ExactHandleLaunchResult(
-        Process process, string creationFiletime,
+        Process process, string creationFiletime, bool processCreated,
+        uint processId, string failureMessage, string cleanupStatus,
         bool stdoutDegraded, bool stderrDegraded) {
       Process = process;
       CreationFiletime = creationFiletime;
+      ProcessCreated = processCreated;
+      ProcessId = processId;
+      FailureMessage = failureMessage;
+      CleanupStatus = cleanupStatus;
       StdoutDegraded = stdoutDegraded;
       StderrDegraded = stderrDegraded;
     }
@@ -13080,6 +13105,8 @@ namespace Agenttalk {
     private const uint CREATE_SUSPENDED = 0x00000004;
     private const uint CREATE_NO_WINDOW = 0x08000000;
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private const uint WAIT_OBJECT_0 = 0x00000000;
+    private const uint POST_CREATE_CLEANUP_TIMEOUT_MS = 5000;
     private static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST =
       new IntPtr(0x00020002);
     private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
@@ -13174,6 +13201,10 @@ namespace Agenttalk {
     private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(
+      IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CloseHandle(IntPtr handle);
 
@@ -13206,12 +13237,6 @@ namespace Agenttalk {
     public static ExactHandleLaunchResult Start(
         string fileName, string arguments, string workingDirectory,
         string stdoutPath, string stderrPath, int showWindow) {
-      if (String.Equals(
-          Path.GetFullPath(stdoutPath), Path.GetFullPath(stderrPath),
-          StringComparison.OrdinalIgnoreCase)) {
-        throw new ArgumentException(
-          "stdout and stderr paths must be distinct");
-      }
       IntPtr stdinHandle = IntPtr.Zero;
       IntPtr stdoutHandle = IntPtr.Zero;
       IntPtr stderrHandle = IntPtr.Zero;
@@ -13219,10 +13244,17 @@ namespace Agenttalk {
       IntPtr attributeList = IntPtr.Zero;
       PROCESS_INFORMATION processInfo = new PROCESS_INFORMATION();
       bool processCreated = false;
-      bool stdoutDegraded;
-      bool stderrDegraded;
+      bool stdoutDegraded = false;
+      bool stderrDegraded = false;
+      string creationFiletime = null;
 
       try {
+        if (String.Equals(
+            Path.GetFullPath(stdoutPath), Path.GetFullPath(stderrPath),
+            StringComparison.OrdinalIgnoreCase)) {
+          throw new ArgumentException(
+            "stdout and stderr paths must be distinct");
+        }
         stdinHandle = OpenInherited("NUL", GENERIC_READ, OPEN_EXISTING);
         stdoutHandle = OpenOutputOrNull(stdoutPath, out stdoutDegraded);
         stderrHandle = OpenOutputOrNull(stderrPath, out stderrDegraded);
@@ -13298,16 +13330,17 @@ namespace Agenttalk {
         }
         processCreated = true;
 
-        string creationFiletime = null;
         long creationTime;
         long exitTime;
         long kernelTime;
         long userTime;
-        if (GetProcessTimes(processInfo.hProcess,
+        if (!GetProcessTimes(processInfo.hProcess,
             out creationTime, out exitTime,
             out kernelTime, out userTime)) {
-          creationFiletime = creationTime.ToString(CultureInfo.InvariantCulture);
+          throw new Win32Exception(
+            Marshal.GetLastWin32Error(), "GetProcessTimes failed");
         }
+        creationFiletime = creationTime.ToString(CultureInfo.InvariantCulture);
 
         Process process = Process.GetProcessById((int)processInfo.dwProcessId);
         if (ResumeThread(processInfo.hThread) == UInt32.MaxValue) {
@@ -13315,12 +13348,33 @@ namespace Agenttalk {
             Marshal.GetLastWin32Error(), "ResumeThread failed");
         }
         return new ExactHandleLaunchResult(
-          process, creationFiletime, stdoutDegraded, stderrDegraded);
-      } catch {
-        if (processCreated && processInfo.hProcess != IntPtr.Zero) {
-          TerminateProcess(processInfo.hProcess, 127);
+          process, creationFiletime, true, processInfo.dwProcessId,
+          null, "not_needed", stdoutDegraded, stderrDegraded);
+      } catch (Exception failure) {
+        // A non-zero original handle is positive CreateProcess evidence even
+        // if interop marshalling failed before the next managed assignment.
+        // Treating only processCreated as authority would authorize a fallback
+        // child in that narrow post-create gap.
+        bool createdProcess = processCreated ||
+          processInfo.hProcess != IntPtr.Zero;
+        if (!createdProcess) {
+          return new ExactHandleLaunchResult(
+            null, null, false, 0, failure.Message, "not_started",
+            stdoutDegraded, stderrDegraded);
         }
-        throw;
+        bool cleanupConfirmed = false;
+        if (processInfo.hProcess != IntPtr.Zero) {
+          // Terminate and wait on the ORIGINAL CreateProcess handle. Reopening
+          // by PID would turn cleanup into a PID-reuse race.
+          TerminateProcess(processInfo.hProcess, 127);
+          cleanupConfirmed = WaitForSingleObject(processInfo.hProcess,
+            POST_CREATE_CLEANUP_TIMEOUT_MS) == WAIT_OBJECT_0;
+        }
+        return new ExactHandleLaunchResult(
+          null, creationFiletime, true, processInfo.dwProcessId,
+          failure.Message,
+          cleanupConfirmed ? "confirmed" : "unknown",
+          stdoutDegraded, stderrDegraded);
       } finally {
         if (attributeList != IntPtr.Zero) {
           DeleteProcThreadAttributeList(attributeList);
@@ -13410,36 +13464,56 @@ function Start-WrapperProcess([hashtable]$startArgs) {
           [string]$startArgs.RedirectStandardOutput,
           [string]$startArgs.RedirectStandardError,
           $showWindow)
-        if ($launchResult.StdoutDegraded) {
+        if ([string]$launchResult.CleanupStatus -ne 'not_needed') {
+          if ($launchResult.ProcessCreated) {
+            # CreateProcess succeeded. The native result already terminated
+            # and waited on that exact original handle when it could; falling
+            # back here could create a duplicate child.
+            return [pscustomobject]@{
+              Process = $null
+              ProcessId = [int]$launchResult.ProcessId
+              CreationFiletime = $launchResult.CreationFiletime
+              Redirected = -not (
+                $launchResult.StdoutDegraded -and
+                $launchResult.StderrDegraded)
+              FailurePhase = 'post_create'
+              FailureMessage = [string]$launchResult.FailureMessage
+              CleanupStatus = [string]$launchResult.CleanupStatus
+            }
+          }
           Write-Warning (
-            "supervisor: wrapper stdout log is unavailable; redirected to NUL")
-        }
-        if ($launchResult.StderrDegraded) {
-          Write-Warning (
-            "supervisor: wrapper stderr log is unavailable; redirected to NUL")
-        }
-        # I1, 2nd leak, closed at the source rather than after the fact:
-        # ::Start now throws BEFORE CreateProcess when both sides degrade
-        # (the child must never inherit the authenticated wrapper-log env
-        # vars if it is about to run with neither stream genuinely
-        # redirected), so this line only ever runs with at most one side
-        # degraded. Redirected is still a predicate over the RESULT, not
-        # over whether ::Start threw - true only if at least one advertised
-        # base log is genuinely pointed at by an inherited stream. A
-        # one-side-degraded launch still commits (the other side IS real
-        # evidence); the both-degraded shape can no longer reach here at
-        # all, matching the invariant that already governs the
-        # exact-handle-unavailable fallback path below.
-        return [pscustomobject]@{
-          Process = $launchResult.Process
-          CreationFiletime = $launchResult.CreationFiletime
-          Redirected = -not ($launchResult.StdoutDegraded -and $launchResult.StderrDegraded)
+            ("supervisor: exact-handle wrapper logging failed before " +
+             "CreateProcess ({0}); launching without PowerShell " +
+             "redirection") -f $launchResult.FailureMessage)
+        } else {
+          if ($launchResult.StdoutDegraded) {
+            Write-Warning (
+              "supervisor: wrapper stdout log is unavailable; redirected to NUL")
+          }
+          if ($launchResult.StderrDegraded) {
+            Write-Warning (
+              "supervisor: wrapper stderr log is unavailable; redirected to NUL")
+          }
+          return [pscustomobject]@{
+            Process = $launchResult.Process
+            CreationFiletime = $launchResult.CreationFiletime
+            Redirected = -not (
+              $launchResult.StdoutDegraded -and
+              $launchResult.StderrDegraded)
+          }
         }
       } catch {
-        Write-Warning (
-          ("supervisor: exact-handle wrapper logging failed ({0}); " +
-           "launching without PowerShell redirection") -f
-          $_.Exception.Message)
+        # An untyped escape does not prove whether CreateProcess ran. Treat it
+        # as UNKNOWN and never authorize a fallback spawn.
+        return [pscustomobject]@{
+          Process = $null
+          ProcessId = $null
+          CreationFiletime = $null
+          Redirected = $true
+          FailurePhase = 'unknown'
+          FailureMessage = [string]$_.Exception.Message
+          CleanupStatus = 'unknown'
+        }
       }
     } else {
       Write-Warning (
@@ -13467,22 +13541,28 @@ function Start-WrapperProcess([hashtable]$startArgs) {
     }
     $process = Start-Process @startArgs
     $creationFiletime = $null
+    $processHandle = $null
     try {
-      $creationFiletime = Get-AgenttalkProcessHandleStartFiletime $process.Handle
+      $processHandle = $process.Handle
+      $creationFiletime = Get-AgenttalkProcessHandleStartFiletime $processHandle
     } catch {}
     return [pscustomobject]@{
       Process = $process
+      ProcessHandle = $processHandle
       CreationFiletime = $creationFiletime
       Redirected = $false
     }
   }
   $process = Start-Process @startArgs
   $creationFiletime = $null
+  $processHandle = $null
   try {
-    $creationFiletime = Get-AgenttalkProcessHandleStartFiletime $process.Handle
+    $processHandle = $process.Handle
+    $creationFiletime = Get-AgenttalkProcessHandleStartFiletime $processHandle
   } catch {}
   return [pscustomobject]@{
     Process = $process
+    ProcessHandle = $processHandle
     CreationFiletime = $creationFiletime
     Redirected = $redirected
   }
@@ -14126,6 +14206,21 @@ function Get-LaunchAdmissionPrefixTokens($admission) {
 }
 # endregion launch-admission-helpers
 # region supervisor-spawn-step
+function New-SupervisorSpawnRefusal(
+    [string]$operation, [string]$reasonCode, [string]$remedy) {
+  return [pscustomobject]@{
+    schema = 'agenttalk-supervisor-spawn-step'
+    schema_version = 1
+    outcome = 'refused'
+    reason_code = $reasonCode
+    remedy = $remedy
+    cleanup_status = 'not_started'
+    operation = $operation
+    pid = $null
+    process_identity = $null
+    redirected = $false
+  }
+}
 function Invoke-SupervisorSpawnStep(
     [hashtable]$startArgs,
     [string]$operation) {
@@ -14146,9 +14241,6 @@ function Invoke-SupervisorSpawnStep(
       pid = $null
       process_identity = $null
       redirected = $false
-      _process = $null
-      _error_record = $null
-      _compatibility_disposition = 'no_pid'
     }
   }
   try {
@@ -14156,7 +14248,52 @@ function Invoke-SupervisorSpawnStep(
     $process = $rawLaunch.Process
     $spawnProcessId = if ($null -ne $process -and $process.Id) {
       [int]$process.Id
+    } elseif ($rawLaunch.ProcessId) {
+      [int]$rawLaunch.ProcessId
     } else { $null }
+    $creationFiletime = [string]$rawLaunch.CreationFiletime
+    $identity = if ($creationFiletime -match '^[1-9][0-9]*$') {
+      [pscustomobject]@{
+        scheme = 'win32-filetime-v1'
+        value = $creationFiletime
+      }
+    } else { $null }
+    if ([string]$rawLaunch.FailurePhase -eq 'post_create') {
+      $cleanupConfirmed = (
+        [string]$rawLaunch.CleanupStatus -eq 'confirmed')
+      return [pscustomobject]@{
+        schema = 'agenttalk-supervisor-spawn-step'
+        schema_version = 1
+        outcome = if ($cleanupConfirmed) { 'refused' } else { 'unknown' }
+        reason_code = if ($cleanupConfirmed) {
+          'spawn_post_create_failure_cleaned'
+        } else { 'spawn_post_create_cleanup_unknown' }
+        remedy = if ($cleanupConfirmed) {
+          'inspect the named launch failure, then retry the launch'
+        } else {
+          'do not retry until an operator confirms the reported process is absent'
+        }
+        cleanup_status = if ($cleanupConfirmed) { 'confirmed' } else { 'unknown' }
+        operation = $operation
+        pid = $spawnProcessId
+        process_identity = $identity
+        redirected = [bool]$rawLaunch.Redirected
+      }
+    }
+    if ([string]$rawLaunch.FailurePhase -eq 'unknown') {
+      return [pscustomobject]@{
+        schema = 'agenttalk-supervisor-spawn-step'
+        schema_version = 1
+        outcome = 'unknown'
+        reason_code = 'spawn_step_exception'
+        remedy = 'inspect the process table before retrying the launch'
+        cleanup_status = 'unknown'
+        operation = $operation
+        pid = $spawnProcessId
+        process_identity = $identity
+        redirected = [bool]$rawLaunch.Redirected
+      }
+    }
     if ($null -eq $spawnProcessId) {
       return [pscustomobject]@{
         schema = 'agenttalk-supervisor-spawn-step'
@@ -14169,41 +14306,47 @@ function Invoke-SupervisorSpawnStep(
         pid = $null
         process_identity = $null
         redirected = [bool]$rawLaunch.Redirected
-        _process = $process
-        _error_record = $null
-        _compatibility_disposition = 'no_pid'
       }
     }
-    $creationFiletime = [string]$rawLaunch.CreationFiletime
-    $identity = if ($creationFiletime -match '^[1-9][0-9]*$') {
-      [pscustomobject]@{
-        scheme = 'win32-filetime-v1'
-        value = $creationFiletime
+    if ($null -eq $identity) {
+      $cleanupConfirmed = $false
+      try {
+        $handle = $rawLaunch.ProcessHandle
+        if ($null -ne $handle -and $handle -ne [IntPtr]::Zero) {
+          $null = Stop-AgenttalkProcessHandle $handle
+          $cleanupConfirmed = Wait-AgenttalkProcessHandleExit $handle 5000
+        }
+      } catch {}
+      return [pscustomobject]@{
+        schema = 'agenttalk-supervisor-spawn-step'
+        schema_version = 1
+        outcome = if ($cleanupConfirmed) { 'refused' } else { 'unknown' }
+        reason_code = if ($cleanupConfirmed) {
+          'spawn_identity_unavailable_cleaned'
+        } else { 'spawn_identity_cleanup_unknown' }
+        remedy = if ($cleanupConfirmed) {
+          'retry the launch; exact process identity could not be observed'
+        } else {
+          'do not retry until an operator resolves the reported PID'
+        }
+        cleanup_status = if ($cleanupConfirmed) { 'confirmed' } else { 'unknown' }
+        operation = $operation
+        pid = $spawnProcessId
+        process_identity = $null
+        redirected = [bool]$rawLaunch.Redirected
       }
-    } else { $null }
-    $outcome = if ($null -ne $identity) { 'spawned' } else { 'unknown' }
+    }
     return [pscustomobject]@{
       schema = 'agenttalk-supervisor-spawn-step'
       schema_version = 1
-      outcome = $outcome
-      reason_code = if ($null -ne $identity) {
-        $null
-      } else { 'spawn_identity_unavailable' }
-      remedy = if ($null -ne $identity) {
-        $null
-      } else {
-        'do not retry until an operator resolves the reported PID'
-      }
+      outcome = 'spawned'
+      reason_code = $null
+      remedy = $null
       cleanup_status = 'not_needed'
       operation = $operation
       pid = $spawnProcessId
       process_identity = $identity
       redirected = [bool]$rawLaunch.Redirected
-      _process = $process
-      _error_record = $null
-      # Increment 1 preserves the old record-by-PID behavior when identity
-      # observation is UNKNOWN. Increment 2 replaces that disposition.
-      _compatibility_disposition = 'record_pid'
     }
   } catch {
     return [pscustomobject]@{
@@ -14217,10 +14360,6 @@ function Invoke-SupervisorSpawnStep(
       pid = $null
       process_identity = $null
       redirected = $false
-      _process = $null
-      _error_record = $_
-      # Preserve the existing throw path until increment 2 owns cleanup.
-      _compatibility_disposition = 'rethrow'
     }
   }
 }
@@ -14230,8 +14369,16 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
   if ($null -eq $admission) {
     $admission = Resolve-LaunchAdmission $plan.launch_admission $name 'regular'
   }
-  if ($null -eq $admission) { return $null }
-  if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) { return $null }
+  if ($null -eq $admission) {
+    return (New-SupervisorSpawnRefusal ("regular:{0}" -f $name) `
+      'launch_admission_refused' `
+      'correct the named launch admission refusal before retrying')
+  }
+  if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) {
+    return (New-SupervisorSpawnRefusal ("regular:{0}" -f $name) `
+      'launch_actions_disabled' `
+      'restore supervisor action authority before retrying')
+  }
   $a = $cfg.agents.$name
   # Case-sensitive, for consistency with the bootstrap validator's own
   # Python check (`backend_profile != 'ovh-qwen'`, case-sensitive) -
@@ -14240,11 +14387,15 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
   if ($a.backend_profile -ceq 'ovh-qwen') {
     if ($env:OVH_KEY -or $env:ANTHROPIC_API_KEY) {
       Write-Warning "supervisor: agent '$name': ovh-qwen refuses ambient OVH_KEY/ANTHROPIC_API_KEY; NOT launching"
-      return $null
+      return (New-SupervisorSpawnRefusal ("regular:{0}" -f $name) `
+        'ovh_ambient_credentials_refused' `
+        'remove ambient OVH_KEY and ANTHROPIC_API_KEY before retrying')
     }
     if ($a.env) {
       Write-Warning "supervisor: agent '$name': ovh-qwen forbids literal per-agent env; NOT launching"
-      return $null
+      return (New-SupervisorSpawnRefusal ("regular:{0}" -f $name) `
+        'ovh_literal_environment_refused' `
+        'remove the literal per-agent environment before retrying')
     }
   }
   $file = [string]$admission.windows_file
@@ -14327,16 +14478,13 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
       $startArgs['ArgumentList'] = $argline
     }
     $launch = Invoke-SupervisorSpawnStep $startArgs ("regular:{0}" -f $name)
-    if ($launch._compatibility_disposition -eq 'rethrow') {
-      throw $launch._error_record
-    }
   } catch {
     Discard-PendingWrapperLogTargets $logTargets
     throw
   } finally {
     Restore-AgenttalkEnvironment $saved
   }
-  if ($launch._compatibility_disposition -eq 'record_pid') {
+  if ($launch.outcome -eq 'spawned') {
     # Round 23: committing is no longer this call's decision. If
     # Start-Process itself never redirected, there is no channel a
     # confirmation could ever arrive through, so discarding immediately is
@@ -14369,8 +14517,18 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
     }
     return $launch
   }
-  Discard-PendingWrapperLogTargets $logTargets
-  Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"
+  if ($launch.outcome -eq 'refused') {
+    Discard-PendingWrapperLogTargets $logTargets
+    Write-Warning (
+      "supervisor: launch of '$name' refused ($($launch.reason_code)); " +
+      $launch.remedy)
+    return $launch
+  }
+  # UNKNOWN may still own a child and its authenticated pending log targets.
+  # Preserve both until an operator resolves the durable launch reservation.
+  Write-Warning (
+    "supervisor: launch of '$name' is UNKNOWN ($($launch.reason_code)); " +
+    $launch.remedy)
   return $launch
 }
 
@@ -14379,8 +14537,16 @@ function Launch-Spec($name, $spec, $codexHome, $acceptedAdmission = $null) {
   if ($null -eq $admission) {
     $admission = Resolve-LaunchAdmission $spec.launch_admission $name 'ephemeral'
   }
-  if ($null -eq $admission) { return $null }
-  if (-not (Assert-ActionsEnabled ("launch-spec {0}" -f $name))) { return $null }
+  if ($null -eq $admission) {
+    return (New-SupervisorSpawnRefusal ("ephemeral:{0}" -f $name) `
+      'launch_admission_refused' `
+      'correct the named launch admission refusal before retrying')
+  }
+  if (-not (Assert-ActionsEnabled ("launch-spec {0}" -f $name))) {
+    return (New-SupervisorSpawnRefusal ("ephemeral:{0}" -f $name) `
+      'launch_actions_disabled' `
+      'restore supervisor action authority before retrying')
+  }
   $file = [string]$admission.windows_file
   $windowStyle = if ($spec.window_style) { [string]$spec.window_style } else { 'Hidden' }
   if ($spec.window_style_warning) { Write-Warning ("supervisor: ephemeral {0}: {1}" -f $name, $spec.window_style_warning) }
@@ -14454,16 +14620,13 @@ function Launch-Spec($name, $spec, $codexHome, $acceptedAdmission = $null) {
       $startArgs['ArgumentList'] = $argline
     }
     $launch = Invoke-SupervisorSpawnStep $startArgs ("ephemeral:{0}" -f $name)
-    if ($launch._compatibility_disposition -eq 'rethrow') {
-      throw $launch._error_record
-    }
   } catch {
     Discard-PendingWrapperLogTargets $logTargets
     throw
   } finally {
     Restore-AgenttalkEnvironment $saved
   }
-  if ($launch._compatibility_disposition -eq 'record_pid') {
+  if ($launch.outcome -eq 'spawned') {
     # Round 23: see Launch's own comment - committing is the wrapper's own
     # job now, from evidence, not this call's decision.
     if ($null -ne $logTargets -and -not $launch.Redirected) {
@@ -14483,8 +14646,16 @@ function Launch-Spec($name, $spec, $codexHome, $acceptedAdmission = $null) {
     }
     return $launch
   }
-  Discard-PendingWrapperLogTargets $logTargets
-  Write-Warning "supervisor: ephemeral launch of '$name' returned no PID"
+  if ($launch.outcome -eq 'refused') {
+    Discard-PendingWrapperLogTargets $logTargets
+    Write-Warning (
+      "supervisor: ephemeral launch of '$name' refused " +
+      "($($launch.reason_code)); $($launch.remedy)")
+    return $launch
+  }
+  Write-Warning (
+    "supervisor: ephemeral launch of '$name' is UNKNOWN " +
+    "($($launch.reason_code)); $($launch.remedy)")
   return $launch
 }
 
@@ -14702,7 +14873,7 @@ $pollNum = 0
           $res = Launch $name $p $homeEnv $launchAdmission
           $spawnRecorded = (
             $null -ne $res -and
-            $res._compatibility_disposition -eq 'record_pid')
+            $res.outcome -eq 'spawned')
           if ($spawnRecorded) { Get-ProcSnapshot $postLaunchPath | Out-Null }
           if ($spawnRecorded) {
             # Record the LAUNCHER pid + start (anti-reuse) + open grace via Python
@@ -14726,14 +14897,23 @@ $pollNum = 0
             $state = Load-State
             # Manual restart markers clear on a later readiness-seen plan tick, not on PID return.
             if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
-          } else {
+          } elseif ($null -ne $res -and $res.outcome -eq 'refused') {
             $p.next_state.PSObject.Properties.Remove('pending_launch_record')
             Set-AgentState $state $name $p.next_state
             if (-not (Save-StateForPoll $state)) {
               Wait-ForNextPoll $cfg
               continue supervisorPoll
             }
-            Write-Warning ("supervisor: {0}: {1} FAILED (no PID) - keeping marker/state for retry" -f $name, $p.action)
+            Write-Warning (
+              "supervisor: ${name}: $($p.action) REFUSED " +
+              "($($res.reason_code)) - keeping marker/state for retry")
+          } else {
+            # The reservation was saved before the seam ran. UNKNOWN may mean
+            # a child exists, so retaining it is the durable duplicate barrier.
+            Write-Warning (
+              "supervisor: ${name}: $($p.action) LAUNCH UNKNOWN " +
+              "($($res.reason_code)) - HOLDING pending launch record; " +
+              $res.remedy)
           }
         }
       }
@@ -14809,7 +14989,7 @@ $pollNum = 0
         $res = Launch-Spec $prep.agent $prep $homeEnv $launchAdmission
         $spawnRecorded = (
           $null -ne $res -and
-          $res._compatibility_disposition -eq 'record_pid')
+          $res.outcome -eq 'spawned')
         if ($spawnRecorded) { Get-ProcSnapshot $postLaunchPath | Out-Null }
         if ($spawnRecorded) {
           $extra = @(); if ($res.start) { $extra += @('--pid-start', $res.start) }
@@ -14829,17 +15009,27 @@ $pollNum = 0
             continue supervisorPoll
           }
           $state = Load-State
-        } else {
+        } elseif ($null -ne $res -and $res.outcome -eq 'refused') {
           if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
           $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
             '--request-id', $rid, '--terminal-state', 'failed', '--reason',
-            'launch returned no pid', '--state-file', $StatePath, '--now', [string]$now) +
+            ("spawn refused: {0}" -f $res.reason_code),
+            '--state-file', $StatePath, '--now', [string]$now) +
             (Supervisor-InstanceIdentityArgs)
           if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
             Wait-ForNextPoll $cfg
             continue supervisorPoll
           }
           $state = Load-State
+        } else {
+          # prepare-launch-request saved the requested/claimed reservation in
+          # a child CLI process. This process's $state predates that save; stop
+          # the poll so its final write cannot erase the durable UNKNOWN hold.
+          Write-Warning (
+            "supervisor: launch-request ${rid}: LAUNCH UNKNOWN " +
+            "($($res.reason_code)); HOLDING prepared request; $($res.remedy)")
+          Wait-ForNextPoll $cfg
+          continue supervisorPoll
         }
       }
     }

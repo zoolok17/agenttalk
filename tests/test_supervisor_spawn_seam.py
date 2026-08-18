@@ -146,6 +146,27 @@ def test_exact_launcher_samples_filetime_from_original_handle_before_close() -> 
     assert 'scheme = "win32-filetime-v1"' not in launcher
 
 
+def test_exact_launcher_waits_on_original_handle_after_post_create_failure() -> None:
+    launcher = _region(supervisor.PS_TEMPLATE, "wrapper-log-helpers")
+    created = launcher.index("processCreated = true;")
+    terminated = launcher.index("TerminateProcess(processInfo.hProcess", created)
+    waited = launcher.index("WaitForSingleObject(processInfo.hProcess", terminated)
+    closed = launcher.index("CloseHandle(processInfo.hProcess)", waited)
+
+    assert created < terminated < waited < closed
+
+
+def test_exact_launcher_treats_an_original_handle_as_createprocess_proof() -> None:
+    launcher = _region(supervisor.PS_TEMPLATE, "wrapper-log-helpers")
+    catch = launcher.index("} catch (Exception failure) {")
+    handle_proof = launcher.index(
+        "processInfo.hProcess != IntPtr.Zero", catch
+    )
+    precreate_branch = launcher.index("if (!createdProcess)", handle_proof)
+
+    assert catch < handle_proof < precreate_branch
+
+
 @pytest.mark.parametrize(
     "shell",
     _powershell_hosts(),
@@ -207,10 +228,10 @@ def test_spawn_seam_refuses_invalid_precreate_input_with_closed_result(
     ids=lambda value: Path(value).stem if value else "unavailable",
 )
 @pytest.mark.parametrize(
-    ("failure_mode", "reason_code", "compatibility_disposition"),
+    ("failure_mode", "reason_code"),
     [
-        ("no-pid", "spawn_pid_unavailable", "no_pid"),
-        ("exception", "spawn_step_exception", "rethrow"),
+        ("no-pid", "spawn_pid_unavailable"),
+        ("exception", "spawn_step_exception"),
     ],
 )
 def test_spawn_seam_reports_unknown_without_a_null_result(
@@ -218,7 +239,6 @@ def test_spawn_seam_reports_unknown_without_a_null_result(
     shell: str | None,
     failure_mode: str,
     reason_code: str,
-    compatibility_disposition: str,
 ) -> None:
     if shell is None:
         pytest.skip("Windows PowerShell hosts are unavailable")
@@ -242,7 +262,7 @@ def test_spawn_seam_reports_unknown_without_a_null_result(
                 "@{ FilePath = 'candidate.exe' } 'test-unknown'",
                 "$result | Select-Object schema,schema_version,outcome,"
                 "reason_code,remedy,cleanup_status,pid,process_identity,"
-                "redirected,_compatibility_disposition | ConvertTo-Json "
+                "redirected | ConvertTo-Json "
                 f"-Depth 5 | Set-Content {_ps_literal(output)} -Encoding utf8",
             ]
         ),
@@ -267,7 +287,270 @@ def test_spawn_seam_reports_unknown_without_a_null_result(
     assert payload["cleanup_status"] == "unknown"
     assert payload["pid"] is None
     assert payload["process_identity"] is None
-    assert payload["_compatibility_disposition"] == compatibility_disposition
+
+
+@pytest.mark.parametrize(
+    "shell",
+    _powershell_hosts(),
+    ids=lambda value: Path(value).stem if value else "unavailable",
+)
+def test_spawn_seam_holds_pid_when_exact_identity_is_unavailable(
+    tmp_path: Path,
+    shell: str | None,
+) -> None:
+    if shell is None:
+        pytest.skip("Windows PowerShell hosts are unavailable")
+    output = tmp_path / "spawn-identity-unknown.json"
+    harness = tmp_path / "spawn-identity-unknown.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                "$ErrorActionPreference = 'Stop'",
+                "function Start-WrapperProcess([hashtable]$startArgs) {",
+                "  return [pscustomobject]@{",
+                "    Process = [pscustomobject]@{ Id = 4242 }",
+                "    CreationFiletime = $null",
+                "    Redirected = $false",
+                "  }",
+                "}",
+                _region(supervisor.PS_TEMPLATE, "supervisor-spawn-step"),
+                "$result = Invoke-SupervisorSpawnStep "
+                "@{ FilePath = 'candidate.exe' } 'test-identity-unknown'",
+                "@{ result = $result; properties = @($result.PSObject.Properties.Name) } "
+                "| ConvertTo-Json -Depth 6 | "
+                f"Set-Content {_ps_literal(output)} -Encoding utf8",
+            ]
+        ),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_runtime_env(),
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(output.read_text(encoding="utf-8-sig"))
+    assert payload["result"]["outcome"] == "unknown"
+    assert payload["result"]["reason_code"] == "spawn_identity_cleanup_unknown"
+    assert payload["result"]["pid"] == 4242
+    assert payload["result"]["process_identity"] is None
+    assert "_compatibility_disposition" not in payload["properties"]
+
+
+@pytest.mark.parametrize(
+    "shell",
+    _powershell_hosts(),
+    ids=lambda value: Path(value).stem if value else "unavailable",
+)
+def test_spawn_seam_maps_unconfirmed_post_create_cleanup_to_unknown(
+    tmp_path: Path,
+    shell: str | None,
+) -> None:
+    if shell is None:
+        pytest.skip("Windows PowerShell hosts are unavailable")
+    output = tmp_path / "spawn-post-create-unknown.json"
+    harness = tmp_path / "spawn-post-create-unknown.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                "$ErrorActionPreference = 'Stop'",
+                "function Start-WrapperProcess([hashtable]$startArgs) {",
+                "  return [pscustomobject]@{",
+                "    Process = $null",
+                "    ProcessId = 4242",
+                "    CreationFiletime = '123456789'",
+                "    Redirected = $true",
+                "    FailurePhase = 'post_create'",
+                "    FailureMessage = 'injected post-create failure'",
+                "    CleanupStatus = 'unknown'",
+                "  }",
+                "}",
+                _region(supervisor.PS_TEMPLATE, "supervisor-spawn-step"),
+                "$result = Invoke-SupervisorSpawnStep "
+                "@{ FilePath = 'candidate.exe' } 'test-post-create-unknown'",
+                "$result | Select-Object schema,schema_version,outcome,reason_code,"
+                "remedy,cleanup_status,pid,process_identity,redirected | "
+                "ConvertTo-Json -Depth 5 | "
+                f"Set-Content {_ps_literal(output)} -Encoding utf8",
+            ]
+        ),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(harness)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_runtime_env(),
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(output.read_text(encoding="utf-8-sig"))
+    assert payload["outcome"] == "unknown"
+    assert payload["reason_code"] == "spawn_post_create_cleanup_unknown"
+    assert payload["cleanup_status"] == "unknown"
+    assert payload["pid"] == 4242
+    assert payload["process_identity"] == {
+        "scheme": "win32-filetime-v1",
+        "value": "123456789",
+    }
+    assert "do not retry" in payload["remedy"]
+
+
+@pytest.mark.subprocess
+@pytest.mark.parametrize(
+    "shell",
+    _powershell_hosts(),
+    ids=lambda value: Path(value).stem if value else "unavailable",
+)
+@pytest.mark.parametrize(
+    ("cleanup_mode", "expected_outcome", "expected_reason", "expected_cleanup"),
+    [
+        (
+            "observed",
+            "refused",
+            "spawn_post_create_failure_cleaned",
+            "confirmed",
+        ),
+        (
+            "forced-unknown",
+            "unknown",
+            "spawn_post_create_cleanup_unknown",
+            "unknown",
+        ),
+    ],
+)
+def test_post_create_failure_never_falls_back_and_reports_cleanup(
+    tmp_path: Path,
+    shell: str | None,
+    cleanup_mode: str,
+    expected_outcome: str,
+    expected_reason: str,
+    expected_cleanup: str,
+) -> None:
+    if shell is None:
+        pytest.skip("Windows PowerShell hosts are unavailable")
+    _, text = _generated_executor(tmp_path)
+    helpers = _region(text, "wrapper-log-helpers")
+    # Inject in the narrow gap after CreateProcess populated its original
+    # handle but before the managed processCreated flag and identity sample.
+    # The pre-fix implementation misclassified this as pre-create and spawned
+    # a duplicate fallback child.
+    fault_anchor = "        processCreated = true;"
+    assert fault_anchor in helpers
+    helpers = helpers.replace(
+        fault_anchor,
+        "\n".join(
+            [
+                "        string faultRecord = Environment.GetEnvironmentVariable(",
+                '          "AGENTTALK_TEST_POST_CREATE_RECORD");',
+                "        if (!String.IsNullOrEmpty(faultRecord)) {",
+                "          File.WriteAllText(",
+                "            faultRecord,",
+                "            processInfo.dwProcessId.ToString(CultureInfo.InvariantCulture));",
+                "          throw new IOException(\"injected post-create failure\");",
+                "        }",
+                fault_anchor,
+            ]
+        ),
+        1,
+    )
+    if cleanup_mode == "forced-unknown":
+        cleanup_observation = "\n".join(
+            [
+                "          cleanupConfirmed = WaitForSingleObject(processInfo.hProcess,",
+                "            POST_CREATE_CLEANUP_TIMEOUT_MS) == WAIT_OBJECT_0;",
+            ]
+        )
+        assert cleanup_observation in helpers
+        helpers = helpers.replace(
+            cleanup_observation,
+            "          cleanupConfirmed = false;",
+            1,
+        )
+    direct_python = _direct_python_executable()
+    child_journal = tmp_path / "post-create-child.txt"
+    fault_record = tmp_path / "post-create-created.txt"
+    result_path = tmp_path / "post-create-result.json"
+    child = tmp_path / "post-create-child.py"
+    child.write_text(
+        "\n".join(
+            [
+                "import os, sys",
+                "from pathlib import Path",
+                "Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    harness = tmp_path / "post-create-failure.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                "$ErrorActionPreference = 'Stop'",
+                "$WrapperLogEnvKeys = @()",
+                _region(text, "exec-helpers"),
+                helpers,
+                _region(text, "supervisor-spawn-step"),
+                "$startArgs = @{",
+                f"  FilePath = {_ps_literal(direct_python)}",
+                "  ArgumentList = "
+                f"{_ps_literal(subprocess.list2cmdline([str(child), str(child_journal)]))}",
+                f"  WorkingDirectory = {_ps_literal(tmp_path)}",
+                "  WindowStyle = 'Hidden'",
+                "  PassThru = $true",
+                f"  RedirectStandardOutput = {_ps_literal(tmp_path / 'post-create.out')}",
+                f"  RedirectStandardError = {_ps_literal(tmp_path / 'post-create.err')}",
+                "}",
+                "$result = Invoke-SupervisorSpawnStep $startArgs 'test-post-create'",
+                "$result | Select-Object schema,schema_version,outcome,reason_code,"
+                "remedy,cleanup_status,pid,process_identity,redirected | "
+                "ConvertTo-Json -Depth 5 | "
+                f"Set-Content {_ps_literal(result_path)} -Encoding utf8",
+            ]
+        ),
+        encoding="utf-8-sig",
+    )
+    env = _runtime_env()
+    env["AGENTTALK_TEST_POST_CREATE_RECORD"] = str(fault_record)
+
+    created_pid: int | None = None
+    try:
+        launched = subprocess.run(
+            [shell, "-NoProfile", "-File", str(harness)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            cwd=str(tmp_path),
+        )
+
+        assert launched.returncode == 0, f"{launched.stdout}{launched.stderr}"
+        created_pid = int(fault_record.read_text(encoding="utf-8"))
+        payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+        assert not child_journal.exists(), (
+            "a post-create failure launched a fallback child"
+        )
+        assert payload["outcome"] == expected_outcome
+        assert payload["reason_code"] == expected_reason
+        assert payload["cleanup_status"] == expected_cleanup
+        assert payload["pid"] == created_pid
+        assert payload["process_identity"] is None
+        if cleanup_mode == "observed":
+            assert _wait_identity_gone(created_pid, timeout=5)
+    finally:
+        if created_pid is None and fault_record.exists():
+            created_pid = int(fault_record.read_text(encoding="utf-8"))
+        if created_pid is not None:
+            _stop_exact_process_tree(
+                created_pid, lifecycle_lock.process_identity(created_pid)
+            )
 
 
 @pytest.mark.subprocess

@@ -1209,6 +1209,70 @@ def test_record_launch_authoritatively_persists_launch_clock_and_grace(
     assert "pending_launch_record" not in persisted
 
 
+@pytest.mark.parametrize(
+    "report",
+    [
+        _report(heartbeat_stale=True),
+        _report(
+            heartbeat_stale=True,
+            restart_request=_auth_marker("rr-while-launch-unknown"),
+        ),
+    ],
+    ids=["after-grace", "authorized-restart"],
+)
+def test_pending_launch_record_is_a_high_precedence_durable_hold(
+    report: dict,
+) -> None:
+    context = _record_launch_context(cli_name="claude")
+    state = {
+        "agents": {
+            "worker": _ready(
+                pending_launch_record=context,
+                launching=True,
+                launch_grace_until=NOW - 1,
+                readiness_seen=False,
+                backoff_next_epoch=0,
+            ),
+        },
+    }
+
+    planned = _plan(report, state, snapshot=[])
+
+    assert planned["action"] == sup.NONE
+    assert planned["state"] == "LAUNCH_RECORD_PENDING"
+    assert planned["kill_first"] is False
+    assert planned["kill_targets"] == []
+    assert planned["next_state"]["pending_launch_record"] == context
+
+
+def test_generated_poll_branches_on_spawn_outcome_and_holds_unknown() -> None:
+    text = sup.PS_TEMPLATE
+    regular_start = text.index("$res = Launch $name")
+    regular_end = text.index("'clear_marker'", regular_start)
+    regular = text[regular_start:regular_end]
+    ephemeral_start = text.index("$res = Launch-Spec", regular_end)
+    ephemeral_end = text.index("foreach ($rid in $plan.ephemeral_reviewers", ephemeral_start)
+    ephemeral = text[ephemeral_start:ephemeral_end]
+
+    assert "_compatibility_disposition" not in regular
+    assert "$res.outcome -eq 'spawned'" in regular
+    assert "$res.outcome -eq 'refused'" in regular
+    refused_regular = regular[regular.index("$res.outcome -eq 'refused'") :]
+    assert "pending_launch_record" in refused_regular
+    assert "Save-StateForPoll $state" in refused_regular
+    assert "LAUNCH UNKNOWN" in regular
+
+    assert "_compatibility_disposition" not in ephemeral
+    assert "$res.outcome -eq 'spawned'" in ephemeral
+    assert "$res.outcome -eq 'refused'" in ephemeral
+    refused_ephemeral = ephemeral[ephemeral.index("$res.outcome -eq 'refused'") :]
+    assert "--archive-launch-request" in refused_ephemeral
+    assert "LAUNCH UNKNOWN" in ephemeral
+    unknown_ephemeral = ephemeral[ephemeral.index("LAUNCH UNKNOWN") :]
+    assert "Wait-ForNextPoll $cfg" in unknown_ephemeral
+    assert "continue supervisorPoll" in unknown_ephemeral
+
+
 def test_record_launch_uses_pre_spawn_context_after_config_drift(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -2553,17 +2617,17 @@ def test_zombie_wait_reaps_orphans_then_relaunches() -> None:
     assert p["action"] == sup.NONE and p["state"] == "HEALTHY_IDLE"
 
 
-def test_in_grace_launcher_dead_is_none_no_brain_yet() -> None:
-    # still in grace, brain not found yet, launcher already dead -> LAUNCHING
-    # (NOT a failure): launcher death during grace is expected.
+def test_in_grace_pending_launch_record_holds_even_with_stale_launcher_pid() -> None:
+    # The relaunch state carries its prior launcher PID into the pre-spawn
+    # reservation. That stale PID cannot exempt an unresolved spawn boundary.
     pending = _record_launch_context()
     st = {"agents": {"worker": {"launcher_pid": 199, "launching": True,
                                 "launch_grace_until": NOW + 100,
                                 "readiness_seen": False,
                                 "pending_launch_record": pending}}}
     p = _plan(_report(heartbeat_stale=True), st, snapshot=[])
-    assert p["action"] == sup.NONE and p["state"] == "LAUNCHING"
-    assert p["discover_brain"] is True
+    assert p["action"] == sup.NONE and p["state"] == "LAUNCH_RECORD_PENDING"
+    assert p["discover_brain"] is False
     assert p["next_state"]["pending_launch_record"] == pending
 
 
@@ -4822,7 +4886,8 @@ def test_ephemeral_launcher_applies_environment_names_literally(
         "'AGENTTALK_WRAPPER_LOG_NONCE')",
         "    python = [Environment]::GetEnvironmentVariable('AGENTTALK_PYTHON')",
         "  }",
-        "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; Redirected = $false }",
+        "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; "
+        "CreationFiletime = '123456789'; Redirected = $false }",
         "}",
         launchers,
         f"$regularAdmission = ({_pslit(json.dumps(regular_admission))} | ConvertFrom-Json)",
@@ -8091,7 +8156,8 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
             "    $script:injected = $true",
             "    throw 'injected failure after environment application'",
             "  }",
-            "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; Redirected = $false }",
+            "  return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 42 }; "
+            "CreationFiletime = '123456789'; Redirected = $false }",
             "}",
             launchers,
             f"$regularAdmission = ({_pslit(json.dumps(regular_admission))} | ConvertFrom-Json)",
@@ -8234,12 +8300,16 @@ def test_launch_environment_apply_failure_restores_parent_without_spawn(
         "value": "",
     }
     assert payload["injected"] is True
-    assert payload["caught"] is True
+    expected_caught = failure_mode != "post-application-case-alias"
+    assert payload["caught"] is expected_caught
     expected_spawn_count = (
         1 if failure_mode == "post-application-case-alias" else 0
     )
     assert payload["spawn_count"] == expected_spawn_count
-    assert payload["discard_count"] == 1
+    expected_discard_count = (
+        0 if failure_mode == "post-application-case-alias" else 1
+    )
+    assert payload["discard_count"] == expected_discard_count
     assert payload["after"] == payload["before"]
     if failure_mode == "post-application-case-alias":
         root_mutations = [
@@ -8530,6 +8600,7 @@ def test_ps_regular_wrapped_launch_consumes_planned_loop_admission(
         "  $script:spawned = $true",
         "  return [pscustomobject]@{",
         "    Process = [pscustomobject]@{ Id = 4242 }",
+        "    CreationFiletime = '123456789'",
         "    Redirected = $false",
         "  }",
         "}",
@@ -8546,6 +8617,7 @@ def test_ps_regular_wrapped_launch_consumes_planned_loop_admission(
         "    label = $case.label",
         "    spawned = $script:spawned",
         "    returned = ($null -ne $result)",
+        "    outcome = $result.outcome",
         "    warnings = @($script:warnings)",
         "  }",
         "}",
@@ -8570,7 +8642,10 @@ def test_ps_regular_wrapped_launch_consumes_planned_loop_admission(
     for label, _windows_args, expected_spawn in case_args:
         row = rows[label]
         assert row["spawned"] is expected_spawn, row
-        assert row["returned"] is expected_spawn, row
+        assert row["returned"] is True, row
+        assert row["outcome"] == (
+            "spawned" if expected_spawn else "refused"
+        ), row
         if expected_spawn:
             assert row["warnings"] == [], row
         else:
@@ -9606,6 +9681,7 @@ def test_launchers_consume_accepted_admission_argv_without_dropping_empty_argume
         "  }",
         "  return [pscustomobject]@{",
         "    Process = [pscustomobject]@{ Id = 4242 }",
+        "    CreationFiletime = '123456789'",
         "    Redirected = $false",
         "  }",
         "}",
@@ -10026,6 +10102,7 @@ def test_supervisor_wrapper_logging_is_driven_by_typed_admission(
         "  }",
         "  return [pscustomobject]@{",
         "    Process = [pscustomobject]@{ Id = 4242 }",
+        "    CreationFiletime = '123456789'",
         "    Redirected = $startArgs.ContainsKey('RedirectStandardOutput')",
         "  }",
         "}",
@@ -10475,8 +10552,10 @@ def test_ps_launch_discards_targets_when_fallback_is_unredirected(
         "function Start-Process {",
         "  param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle,",
         "        [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)",
-        "  return [pscustomobject]@{ Id = 4242 }",
+        "  return [pscustomobject]@{ Id = 4242; Handle = [IntPtr]::new(1) }",
         "}",
+        "function Get-AgenttalkProcessHandleStartFiletime($handle) { "
+        "return '123456789' }",
         "function Proc-Start($id) { return '1' }",
         "function Quote-Arg([string]$arg) { return $arg }",
         "function Assert-ActionsEnabled([string]$what) { return $true }",
