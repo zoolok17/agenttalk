@@ -265,6 +265,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "required_wheel_resources",
         "dependency_index",
         "test_requirement",
+        "xdist_requirement",
     }
     for check_id, expected_kind in REQUIRED_CONFIGURED_CHECKS.items():
         spec = _require_object(checks.get(check_id), f"checks.{check_id}")
@@ -278,7 +279,12 @@ def validate_manifest(data: Any) -> dict[str, Any]:
             raise GateBlock("manifest_schema_invalid", f"checks.{check_id}.timeout_seconds must be positive")
 
     required_contract = {
-        "pytest": {"paths": ["tests"], "args": ["-q"], "test_requirement": "pytest>=8.0"},
+        "pytest": {
+            "paths": ["tests"],
+            "args": ["-q", "-p", "xdist.plugin", "-n", "2", "--dist", "loadfile"],
+            "test_requirement": "pytest>=8.0",
+            "xdist_requirement": "pytest-xdist>=3.8.0",
+        },
         "ruff": {"paths": ["src", "tests"]},
         "bandit": {"paths": ["src"], "exclude": ["src/agenttalk/skills"]},
         "gitleaks": {"config": ".gitleaks.toml", "require_full_history": True},
@@ -2689,6 +2695,7 @@ def _prepare_wheel_test_environment(
     for label, requirement in (
         ("candidate", str(wheel)),
         ("pytest", manifest["checks"]["pytest"]["test_requirement"]),
+        ("pytest-xdist", manifest["checks"]["pytest"]["xdist_requirement"]),
     ):
         outcome = run_command(
             check_id=f"wheel-test-install-{label}-{_python_suffix(creator.requested)}",

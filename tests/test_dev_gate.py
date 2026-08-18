@@ -435,6 +435,11 @@ def test_manifest_declares_real_ci_matrix_separately_from_local_interpreters() -
         lambda data: data["checks"].pop("semgrep"),
         lambda data: data.update({"ci_native_exceptions": []}),
         lambda data: data["checks"]["pytest"].update({"paths": ["tests/test_dev_gate.py"]}),
+        lambda data: data["checks"]["pytest"].update({"args": ["-q"]}),
+        lambda data: data["checks"]["pytest"].pop("xdist_requirement"),
+        lambda data: data["checks"]["pytest"].update(
+            {"xdist_requirement": "pytest-xdist"}
+        ),
         lambda data: data["checks"]["ruff"].update({"paths": []}),
         lambda data: data["checks"]["bandit"].update({"exclude": ["src"]}),
         lambda data: data["checks"]["gitleaks"].update({"require_full_history": False}),
@@ -587,6 +592,85 @@ def test_passing_check_command_must_match_committed_plan() -> None:
 
     with pytest.raises(dev_gate.GateBlock, match="command"):
         dev_gate.validate_run_artifact(artifact, manifest)
+
+
+@pytest.mark.parametrize("parallel_arg", ["xdist.plugin", "2", "loadfile"])
+def test_passing_pytest_evidence_requires_parallel_command(parallel_arg: str) -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "windows/3.10")
+    pytest_record = next(
+        check for check in artifact["checks"] if check["id"].startswith("pytest-")
+    )
+    pytest_record["argv"].remove(parallel_arg)
+
+    with pytest.raises(dev_gate.GateBlock, match="command"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_wheel_test_environment_installs_xdist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    creator = dev_gate.InterpreterInfo(
+        requested="3.14",
+        path=Path(sys.executable),
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+    test_interpreter = dev_gate.InterpreterInfo(
+        requested="3.14",
+        path=tmp_path / "test-venv" / "python",
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+    calls: list[dict] = []
+
+    monkeypatch.setattr(
+        dev_gate,
+        "_create_isolated_venv",
+        lambda **_kwargs: (test_interpreter, {"role": "test"}),
+    )
+
+    def passing_command(**kwargs):
+        calls.append(kwargs)
+        return dev_gate.CommandOutcome(
+            argv=tuple(kwargs["argv"]),
+            returncode=0,
+            duration_ms=1,
+            status="pass",
+            reason_code=None,
+            diagnostic="",
+            log_path=tmp_path / "command.log",
+        )
+
+    monkeypatch.setattr(dev_gate, "run_command", passing_command)
+    wheel = tmp_path / "agenttalk.whl"
+
+    interpreter, proof = dev_gate._prepare_wheel_test_environment(
+        creator=creator,
+        wheel=wheel,
+        root=tmp_path / "test-venv",
+        source_root=tmp_path,
+        env={},
+        manifest=_manifest(),
+        logs_dir=tmp_path / "logs",
+    )
+
+    assert interpreter is test_interpreter
+    assert proof == {"role": "test"}
+    assert [call["check_id"] for call in calls] == [
+        "wheel-test-install-candidate-py314",
+        "wheel-test-install-pytest-py314",
+        "wheel-test-install-pytest-xdist-py314",
+        "wheel-test-pip-check-py314",
+    ]
+    assert [call["argv"][-1] for call in calls[:-1]] == [
+        str(wheel),
+        "pytest>=8.0",
+        "pytest-xdist>=3.8.0",
+    ]
+    assert calls[-1]["argv"] == dev_gate.isolated_tool_argv(
+        test_interpreter.path, "pip", "check"
+    )
 
 
 def test_import_provenance_rejects_parent_traversal() -> None:
