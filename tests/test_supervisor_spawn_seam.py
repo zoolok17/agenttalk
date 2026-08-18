@@ -15,6 +15,10 @@ from agenttalk.store import Store
 
 
 STUB_CLI = Path(__file__).parent / "support" / "stub_cli.py"
+WINDOWS_FILETIME_IDENTITY_ONLY = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="win32-filetime-v1 exact process identity is Windows-only",
+)
 
 
 def _powershell_hosts() -> tuple[str | None, ...]:
@@ -271,6 +275,7 @@ def test_spawn_seam_reports_unknown_without_a_null_result(
 
 
 @pytest.mark.subprocess
+@WINDOWS_FILETIME_IDENTITY_ONLY
 @pytest.mark.parametrize(
     "shell",
     _powershell_hosts(),
@@ -281,7 +286,10 @@ def test_spawn_seam_start_process_path_records_exact_identity(
     shell: str | None,
 ) -> None:
     if shell is None:
-        pytest.skip("Windows PowerShell hosts are unavailable")
+        pytest.fail(
+            "a Windows PowerShell host is required for the "
+            "win32-filetime-v1 exact-identity test"
+        )
     _, text = _generated_executor(tmp_path)
     direct_python = _direct_python_executable()
     child_record = tmp_path / "start-process-child.json"
@@ -357,6 +365,7 @@ def test_spawn_seam_start_process_path_records_exact_identity(
 
 
 @pytest.mark.subprocess
+@WINDOWS_FILETIME_IDENTITY_ONLY
 @pytest.mark.parametrize(
     "shell",
     _powershell_hosts(),
@@ -367,7 +376,10 @@ def test_spawn_seam_real_wrapper_reaches_readiness_with_one_exact_identity(
     shell: str | None,
 ) -> None:
     if shell is None:
-        pytest.skip("Windows PowerShell hosts are unavailable")
+        pytest.fail(
+            "a Windows PowerShell host is required for the "
+            "win32-filetime-v1 exact-identity test"
+        )
     store, text = _generated_executor(tmp_path)
     direct_python = _direct_python_executable()
     journal = tmp_path / "spawn-journal.txt"
