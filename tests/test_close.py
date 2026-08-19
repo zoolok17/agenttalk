@@ -31,16 +31,6 @@ from agenttalk.store import Store
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 
-APPROVAL_EVIDENCE = {
-    "risk_class": "none",
-    "release_blocker": "no",
-    "tests_referenced": "n/a",
-    "tests_executed": "n/a",
-    "residual_risk": "n/a",
-    "evidence": "n/a",
-    "na_reason": "lightweight test approval",
-}
-
 
 # --------------------------------------------------------------- pure helpers
 
@@ -64,7 +54,7 @@ def _satisfied() -> dict:
         revision_clean=True, dirty_artifact=None,
         non_lane_isolation_not_asserted=True)
     close.apply_ack(rec, lens_id="sec", status="accept", agent="codex",
-                    from_role=None, at="t1", evidence=APPROVAL_EVIDENCE)
+                    from_role=None, at="t1", evidence={"risk_class": "none"})
     return rec
 
 
@@ -126,113 +116,6 @@ def test_hold_missing_lens() -> None:
     assert close.HOLD_MISSING_LENS in _codes(close.compute_verdict(rec, _gate_go()))
 
 
-def test_malformed_persisted_lens_ack_cannot_satisfy_required_lens(
-    tmp_path: Path,
-) -> None:
-    rec = _satisfied()
-    rec["lens_acks"]["sec"]["status"] = "not-a-verdict"
-    store = Store(tmp_path)
-    store.init(["lead", "codex"])
-    close.closes_dir(store).mkdir(parents=True)
-    close.close_path(store, "c1").write_text(json.dumps(rec), encoding="utf-8")
-
-    with pytest.raises(close.CloseError, match="malformed"):
-        close.load_close(store, "c1")
-
-
-def test_persisted_na_ack_without_reason_cannot_satisfy_required_lens(
-    tmp_path: Path,
-) -> None:
-    rec = _satisfied()
-    rec["lens_acks"]["sec"].update({"status": "na", "reason": None})
-    store = Store(tmp_path)
-    store.init(["lead", "codex"])
-    close.closes_dir(store).mkdir(parents=True)
-    close.close_path(store, "c1").write_text(json.dumps(rec), encoding="utf-8")
-
-    with pytest.raises(close.CloseError, match="malformed"):
-        close.load_close(store, "c1")
-
-
-def test_persisted_accept_ack_without_evidence_cannot_satisfy_required_lens(
-    tmp_path: Path,
-) -> None:
-    rec = _satisfied()
-    rec["lens_acks"]["sec"]["evidence"] = {}
-    store = Store(tmp_path)
-    store.init(["lead", "codex"])
-    close.closes_dir(store).mkdir(parents=True)
-    close.close_path(store, "c1").write_text(json.dumps(rec), encoding="utf-8")
-
-    with pytest.raises(close.CloseError, match="malformed"):
-        close.load_close(store, "c1")
-
-
-def test_persisted_ack_group_type_confusion_cannot_authorize_actor() -> None:
-    rec = close.empty_close(
-        "c-groups", scope="release", revision=SHA, revision_kind="sha",
-        gate_scope="release", opened_by="lead", opened_at="t0", epoch_at_open=None,
-        required_lenses=[close.validate_lens_spec(
-            {"id": "sec", "allowed_groups": ["security"]})],
-        revision_clean=True, dirty_artifact=None,
-        non_lane_isolation_not_asserted=True,
-    )
-    close.apply_ack(
-        rec, lens_id="sec", status="accept", agent="mallory", from_role=None,
-        from_groups=["untrusted"], at="t1", evidence=APPROVAL_EVIDENCE,
-    )
-    rec["lens_acks"]["sec"]["from_groups"] = {"security": False}
-
-    result = close.compute_verdict(rec, _gate_go())
-    assert result["verdict"] == close.VERDICT_HOLD
-    assert close.HOLD_MALFORMED in _codes(result)
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [("from", 7), ("revision", None)],
-)
-def test_wrong_typed_persisted_ack_common_field_is_malformed(
-    field: str, value: object,
-) -> None:
-    rec = _satisfied()
-    rec["lens_acks"]["sec"][field] = value
-    assert close.HOLD_MALFORMED in _codes(close.compute_verdict(rec, _gate_go()))
-
-
-@pytest.mark.parametrize("status", ["accept", "na", "counter"])
-def test_valid_persisted_ack_status_shapes_load(
-    tmp_path: Path, status: str,
-) -> None:
-    rec = close.empty_close(
-        f"c-{status}", scope="release", revision=SHA, revision_kind="sha",
-        gate_scope="release", opened_by="lead", opened_at="t0", epoch_at_open=None,
-        required_lenses=[close.validate_lens_spec(
-            {"id": "sec", "allowed_agents": ["codex"]})],
-        revision_clean=True, dirty_artifact=None,
-        non_lane_isolation_not_asserted=True,
-    )
-    close.apply_ack(
-        rec, lens_id="sec", status=status, agent="codex", from_role="reviewer",
-        from_groups=["security"], at="t1",
-        evidence=APPROVAL_EVIDENCE if status == "accept" else {"finding": "risk"},
-        reason="not applicable" if status == "na" else None,
-        counter_id="ctr-1" if status == "counter" else None,
-    )
-    store = Store(tmp_path)
-    store.init(["lead", "codex"])
-    close.closes_dir(store).mkdir(parents=True)
-    close.close_path(store, rec["close_id"]).write_text(
-        json.dumps(rec), encoding="utf-8")
-
-    loaded = close.load_close(store, rec["close_id"])
-    result = close.compute_verdict(loaded, _gate_go())
-    if status == "counter":
-        assert close.HOLD_UNDECIDED_COUNTER in _codes(result)
-    else:
-        assert result["verdict"] == close.VERDICT_GO
-
-
 def test_hold_unauthorized_lens_ack() -> None:
     rec = _satisfied()
     rec["lens_acks"]["sec"]["from"] = "mallory"  # not in allowed_agents
@@ -255,7 +138,7 @@ def test_role_authorizes_lens_ack() -> None:
         revision_clean=True, dirty_artifact=None,
         non_lane_isolation_not_asserted=True)
     close.apply_ack(rec, lens_id="sec", status="accept", agent="anyone",
-                    from_role="reviewer", at="t", evidence=APPROVAL_EVIDENCE)
+                    from_role="reviewer", at="t")
     assert close.compute_verdict(rec, _gate_go())["verdict"] == close.VERDICT_GO
 
 

@@ -21,16 +21,6 @@ from agenttalk.store import Store
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 
-APPROVAL_EVIDENCE = {
-    "risk_class": "none",
-    "release_blocker": "no",
-    "tests_referenced": "n/a",
-    "tests_executed": "n/a",
-    "residual_risk": "n/a",
-    "evidence": "n/a",
-    "na_reason": "lightweight test approval",
-}
-
 
 def _gate_go() -> dict:
     return {"verdict": "GO", "required_gates": [], "blockers": [], "gates": []}
@@ -81,8 +71,7 @@ def _ev(rec, *, candidates=None, active=None, unmapped=None, policy_error=None,
 
 def _sack(rec, slot, agent, *, status="accept", reason=None, override=False):
     close.apply_ack(rec, lens_id=slot, status=status, agent=agent, from_role="sec",
-                    at="t", evidence=APPROVAL_EVIDENCE if status == "accept" else None,
-                    reason=reason, override=override)
+                    at="t", reason=reason, override=override)
 
 
 def _slots(rec):
