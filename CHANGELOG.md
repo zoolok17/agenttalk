@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.83.0] - 2026-08-19
+
+Theme: **fail closed on ambiguous input — no silent fail-open, no false GO.**
+
+Two release lines converged here. The first (item 1, merged separately) made the supervisor's
+launch door testable: one seam with a closed typed outcome — spawned, refused-with-remedy, or an
+honest UNKNOWN — never a boolean that cannot say "I could not tell".
+
+The second is a security & assurance hardening pass driven by a third-party review and an
+adversarial failure-injection gate. Four fail-open / false-GO defects are closed, each with a
+failing-first control that reproduced the hole before the fix:
+
+- **Dashboard (#195)** — the Team Console accepted a Host header on a port match alone, so a
+  DNS-rebound domain resolving to loopback could read message bodies and, with actions enabled,
+  obtain the CSRF token. The Host must now itself be loopback; userinfo forms are rejected.
+- **Message signing (#196)** — HMAC enforcement failed *open*: any error probing the key path was
+  read as "signing disabled", admitting unsigned messages. Signing enforcement now distinguishes a
+  genuinely-absent key from an unobservable one and fails closed on the latter.
+- **Release gate state (#197, gate-state half)** — gate-state parsing accepted duplicate JSON
+  members (last-wins) and never checked the schema version, either of which could turn a real
+  blocker into a GO. Both now refuse fail-closed.
+- **Assurance git helper (#198)** — the read-only git helper promised a failure sentinel "on any
+  failure" but let a subprocess timeout escape, breaking callers' fail-closed path. The timeout now
+  maps to the sentinel.
+
+The discipline held again: the failure-injection review ran four rounds and each round closed a
+*class*, not an instance. The lens-acknowledgement half of #197 proved to need a structural
+single-decode-boundary rewrite of close.py's persisted state — not a release-4-rounds-deep patch —
+so it was split out to follow-up work rather than shipped half-closed.
+
 ## [0.82.0] - 2026-08-12
 
 Theme: **an agent that cannot start says so, and says what to do about it.**

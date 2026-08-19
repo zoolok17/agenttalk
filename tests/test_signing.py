@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import signing
+from agenttalk import signing, store as store_mod
 from agenttalk.store import Store
 
 
@@ -410,6 +410,69 @@ def test_signing_enforced_flips_on_when_key_file_appears(
     assert s.signing_enforced() is False
     signing.init_key(s.project_id())  # path-derived, not from config
     assert s.signing_enforced() is True
+
+
+def test_key_path_probe_error_does_not_admit_unsigned_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    from agenttalk.store import _new_id, _now_iso
+    forged = {
+        "id": _new_id(), "ts": _now_iso(),
+        "from": "alpha", "to": "beta", "kind": "message",
+        "subject": "", "body": "UNSIGNED PROBE BYPASS", "meta": {},
+    }
+    (s.messages_dir / f"{forged['id']}.json").write_text(
+        json.dumps(forged), encoding="utf-8")
+
+    def fail_probe(_project_id: str, **_kwargs) -> Path:
+        raise OSError("injected key-path probe failure")
+
+    monkeypatch.setattr(signing, "resolve_key_path", fail_probe)
+    assert s.messages_for("beta") == []
+    assert any("signature" in reason for _, reason in s.list_invalid_messages())
+
+
+def test_key_artifact_observation_error_keeps_signing_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_path = tmp_path / "unobservable.key"
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(key_path))
+    s = Store(tmp_path / "project")
+    s.init(["alpha", "beta"])
+
+    def unobservable(_path: Path) -> os.stat_result:
+        raise PermissionError("injected key-artifact observation failure")
+
+    monkeypatch.setattr(store_mod.os, "lstat", unobservable)
+    assert s.signing_enforced() is True
+
+
+def test_dangling_key_symlink_does_not_admit_unsigned_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_path = tmp_path / "dangling.key"
+    try:
+        key_path.symlink_to(tmp_path / "missing-target.key")
+    except OSError:
+        if os.name == "nt":
+            pytest.skip("creating symlinks may require Windows developer mode or privilege")
+        raise
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(key_path))
+    s = Store(tmp_path / "project")
+    s.init(["alpha", "beta"])
+    from agenttalk.store import _new_id, _now_iso
+    forged = {
+        "id": _new_id(), "ts": _now_iso(),
+        "from": "alpha", "to": "beta", "kind": "message",
+        "subject": "", "body": "UNSIGNED DANGLING SYMLINK", "meta": {},
+    }
+    (s.messages_dir / f"{forged['id']}.json").write_text(
+        json.dumps(forged), encoding="utf-8")
+
+    assert s.signing_enforced() is True
+    assert s.messages_for("beta") == []
 
 
 def test_config_tampering_cannot_disable_enforcement_via_require_signatures(
