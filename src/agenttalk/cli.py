@@ -2010,7 +2010,7 @@ def _git(root, argv: list[str]) -> tuple[int, str]:
             encoding="utf-8", errors="replace",
         )
         return p.returncode, (p.stdout or "")
-    except (OSError, ValueError):  # FileNotFoundError, timeout, etc.
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return -1, ""
 
 

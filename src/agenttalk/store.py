@@ -3060,12 +3060,14 @@ class Store:
         config), and the key file lives under the per-user keys dir.
 
         Closes both v0.6.0 iter-1 (config flag bypass) and iter-2
-        (config-stored project_id bypass).
+        (config-stored project_id bypass). If the key path cannot be
+        resolved or probed, enforcement stays ON: ambiguity at this trust
+        boundary must reject unsigned messages rather than disable signing.
         """
         try:
             return _signing.resolve_key_path(self.project_id()).exists()
         except (OSError, ValueError):
-            return False
+            return True
 
     # Legacy: 0.6.0-iter-1 wrote a ``require_signatures`` field AND
     # a ``project_id`` field in config.json. Both are ignored by

@@ -412,6 +412,28 @@ def test_signing_enforced_flips_on_when_key_file_appears(
     assert s.signing_enforced() is True
 
 
+def test_key_path_probe_error_does_not_admit_unsigned_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    from agenttalk.store import _new_id, _now_iso
+    forged = {
+        "id": _new_id(), "ts": _now_iso(),
+        "from": "alpha", "to": "beta", "kind": "message",
+        "subject": "", "body": "UNSIGNED PROBE BYPASS", "meta": {},
+    }
+    (s.messages_dir / f"{forged['id']}.json").write_text(
+        json.dumps(forged), encoding="utf-8")
+
+    def fail_probe(_project_id: str, **_kwargs) -> Path:
+        raise OSError("injected key-path probe failure")
+
+    monkeypatch.setattr(signing, "resolve_key_path", fail_probe)
+    assert s.messages_for("beta") == []
+    assert any("signature" in reason for _, reason in s.list_invalid_messages())
+
+
 def test_config_tampering_cannot_disable_enforcement_via_require_signatures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

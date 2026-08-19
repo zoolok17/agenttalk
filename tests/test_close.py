@@ -116,6 +116,20 @@ def test_hold_missing_lens() -> None:
     assert close.HOLD_MISSING_LENS in _codes(close.compute_verdict(rec, _gate_go()))
 
 
+def test_malformed_persisted_lens_ack_cannot_satisfy_required_lens(
+    tmp_path: Path,
+) -> None:
+    rec = _satisfied()
+    rec["lens_acks"]["sec"]["status"] = "not-a-verdict"
+    store = Store(tmp_path)
+    store.init(["lead", "codex"])
+    close.closes_dir(store).mkdir(parents=True)
+    close.close_path(store, "c1").write_text(json.dumps(rec), encoding="utf-8")
+
+    with pytest.raises(close.CloseError, match="malformed"):
+        close.load_close(store, "c1")
+
+
 def test_hold_unauthorized_lens_ack() -> None:
     rec = _satisfied()
     rec["lens_acks"]["sec"]["from"] = "mallory"  # not in allowed_agents

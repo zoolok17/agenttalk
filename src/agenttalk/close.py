@@ -476,6 +476,9 @@ def _is_wellformed(record: object) -> bool:
     for key in ("lens_acks", "counters", "remediation_items"):
         if not isinstance(record.get(key), dict):
             return False
+    for ack in record["lens_acks"].values():
+        if not isinstance(ack, dict) or ack.get("status") not in ACK_STATUSES:
+            return False
     return True
 
 

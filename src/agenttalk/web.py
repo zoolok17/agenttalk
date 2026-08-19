@@ -3229,7 +3229,11 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
         def _host_allowed(self) -> bool:
             _host, port = _server_host_port(self)
             hp = _normalized_host_port(self.headers.get("Host", ""))
-            return hp is not None and (hp[1] if hp[1] is not None else 80) == port
+            return (
+                hp is not None
+                and _is_loopback_addr(hp[0])
+                and (hp[1] if hp[1] is not None else 80) == port
+            )
 
         def _origin_allowed(self, value: str | None) -> bool:
             if not value:

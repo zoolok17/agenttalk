@@ -323,6 +323,26 @@ def test_api_status_returns_json(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_dashboard_rejects_non_loopback_host_on_bound_port(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    srv, _thread, base = _serve(store, enable_actions=True)
+    parsed = urllib.parse.urlsplit(base)
+    assert parsed.hostname is not None and parsed.port is not None
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+    try:
+        conn.putrequest("GET", "/api/session", skip_host=True)
+        conn.putheader("Host", f"evil.example:{parsed.port}")
+        conn.putheader("Origin", f"http://evil.example:{parsed.port}")
+        conn.endheaders()
+        response = conn.getresponse()
+        response.read()
+        assert response.status == 403
+    finally:
+        conn.close()
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_messages_lists_all(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     s.send(sender="alpha", recipient="beta", body="one")

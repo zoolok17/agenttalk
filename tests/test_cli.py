@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,16 @@ from agenttalk.store import Store
 # Helper: run main() under a fixed root so we don't depend on cwd
 def _run(argv: list[str], root: Path) -> int:
     return cli.main(["--root", str(root), *argv])
+
+
+def test_git_timeout_returns_failure_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=15)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    assert cli._git(tmp_path, ["status"]) == (-1, "")
 
 
 def _run_expect_exit(argv: list[str], root: Path, code: int) -> None:
@@ -3048,7 +3059,11 @@ def test_gate_check_corrupt_state_fails_closed(store_root: Path, capsys) -> None
 
 def test_gate_check_malformed_state_shape_fails_closed(store_root: Path, capsys) -> None:
     (store_root / ".agenttalk" / "gates.json").write_text(
-        json.dumps({"required_gates": "connected-l1", "gates": []}),
+        json.dumps({
+            "schema_version": 1,
+            "required_gates": "connected-l1",
+            "gates": [],
+        }),
         encoding="utf-8",
     )
     assert _run(["gate", "check", "--release", "--json"], store_root) == 3
@@ -3061,6 +3076,7 @@ def test_gate_check_malformed_state_shape_fails_closed(store_root: Path, capsys)
 def test_gate_check_invalid_stored_gate_fails_closed(store_root: Path, capsys) -> None:
     (store_root / ".agenttalk" / "gates.json").write_text(
         json.dumps({
+            "schema_version": 1,
             "required_gates": ["connected-l1"],
             "gates": {
                 "connected-l1": {
@@ -3086,6 +3102,7 @@ def test_gate_check_green_blocker_without_stored_evidence_fails_closed(
 ) -> None:
     (store_root / ".agenttalk" / "gates.json").write_text(
         json.dumps({
+            "schema_version": 1,
             "required_gates": ["connected-l1"],
             "gates": {
                 "connected-l1": {

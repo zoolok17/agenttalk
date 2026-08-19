@@ -53,7 +53,10 @@ def load_gate_state(root: Path) -> dict:
     if not path.exists():
         return {"schema_version": SCHEMA_VERSION, "required_gates": [], "gates": {}}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_members,
+        )
     except (json.JSONDecodeError, OSError, ValueError) as e:
         return _state_load_error(f"could not read gate state: {e}")
     try:
@@ -390,9 +393,22 @@ def _state_load_error(reason: str) -> dict:
     }
 
 
+def _reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON member {key!r}")
+        result[key] = value
+    return result
+
+
 def _normalize_loaded_state(data: Any) -> dict:
     if not isinstance(data, dict):
         raise ValueError("gate state must be a JSON object")
+    if data.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported gate state schema_version {data.get('schema_version')!r}"
+        )
     required = data.get("required_gates", [])
     if not isinstance(required, list):
         raise ValueError("required_gates must be a list")
