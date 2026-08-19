@@ -13034,6 +13034,7 @@ function Test-RunningOnWindows {
   # in hermetic launch environments.
   return [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 }
+# region wrapper-process-launcher
 $script:WrapperLogLauncherTypeReady = $false
 function Initialize-WrapperLogLauncherType {
   if (-not (Test-RunningOnWindows)) { return $false }
@@ -13044,6 +13045,7 @@ function Initialize-WrapperLogLauncherType {
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -13051,12 +13053,15 @@ using System.Text;
 namespace Agenttalk {
   public sealed class ExactHandleLaunchResult {
     public Process Process { get; private set; }
+    public string CreationFiletime { get; private set; }
     public bool StdoutDegraded { get; private set; }
     public bool StderrDegraded { get; private set; }
 
     internal ExactHandleLaunchResult(
-        Process process, bool stdoutDegraded, bool stderrDegraded) {
+        Process process, string creationFiletime,
+        bool stdoutDegraded, bool stderrDegraded) {
       Process = process;
+      CreationFiletime = creationFiletime;
       StdoutDegraded = stdoutDegraded;
       StderrDegraded = stderrDegraded;
     }
@@ -13158,6 +13163,12 @@ namespace Agenttalk {
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint ResumeThread(IntPtr thread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetProcessTimes(
+      IntPtr process, out long creationTime, out long exitTime,
+      out long kernelTime, out long userTime);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -13288,13 +13299,24 @@ namespace Agenttalk {
         }
         processCreated = true;
 
+        string creationFiletime = null;
+        long creationTime;
+        long exitTime;
+        long kernelTime;
+        long userTime;
+        if (GetProcessTimes(processInfo.hProcess,
+            out creationTime, out exitTime,
+            out kernelTime, out userTime)) {
+          creationFiletime = creationTime.ToString(CultureInfo.InvariantCulture);
+        }
+
         Process process = Process.GetProcessById((int)processInfo.dwProcessId);
         if (ResumeThread(processInfo.hThread) == UInt32.MaxValue) {
           throw new Win32Exception(
             Marshal.GetLastWin32Error(), "ResumeThread failed");
         }
         return new ExactHandleLaunchResult(
-          process, stdoutDegraded, stderrDegraded);
+          process, creationFiletime, stdoutDegraded, stderrDegraded);
       } catch {
         if (processCreated && processInfo.hProcess != IntPtr.Zero) {
           TerminateProcess(processInfo.hProcess, 127);
@@ -13342,8 +13364,9 @@ namespace Agenttalk {
   }
 }
 function Start-WrapperProcess([hashtable]$startArgs) {
-  # Returns [pscustomobject]@{ Process = <process>; Redirected = <bool> } -
-  # NEVER the bare process object. I1: logging capability (the env vars
+  # Returns [pscustomobject]@{ Process = <process>;
+  # CreationFiletime = <string|null>; Redirected = <bool> } - NEVER the bare
+  # process object. I1: logging capability (the env vars
   # and the nonce - a wrapper that never actually got redirected has no
   # channel to confirm anything through) is granted if and only if the
   # child's output is ACTUALLY redirected.
@@ -13411,6 +13434,7 @@ function Start-WrapperProcess([hashtable]$startArgs) {
         # exact-handle-unavailable fallback path below.
         return [pscustomobject]@{
           Process = $launchResult.Process
+          CreationFiletime = $launchResult.CreationFiletime
           Redirected = -not ($launchResult.StdoutDegraded -and $launchResult.StderrDegraded)
         }
       } catch {
@@ -13443,16 +13467,29 @@ function Start-WrapperProcess([hashtable]$startArgs) {
     foreach ($key in $WrapperLogEnvKeys) {
       Remove-Item -LiteralPath ("Env:" + $key) -ErrorAction SilentlyContinue
     }
+    $process = Start-Process @startArgs
+    $creationFiletime = $null
+    try {
+      $creationFiletime = Get-AgenttalkProcessHandleStartFiletime $process.Handle
+    } catch {}
     return [pscustomobject]@{
-      Process = (Start-Process @startArgs)
+      Process = $process
+      CreationFiletime = $creationFiletime
       Redirected = $false
     }
   }
+  $process = Start-Process @startArgs
+  $creationFiletime = $null
+  try {
+    $creationFiletime = Get-AgenttalkProcessHandleStartFiletime $process.Handle
+  } catch {}
   return [pscustomobject]@{
-    Process = (Start-Process @startArgs)
+    Process = $process
+    CreationFiletime = $creationFiletime
     Redirected = $redirected
   }
 }
+# endregion wrapper-process-launcher
 if (-not ('AgenttalkSupervisorNativePosix' -as [type])) {
   Add-Type -TypeDefinition @'
 using System.Runtime.InteropServices;
@@ -14091,6 +14128,106 @@ function Get-LaunchAdmissionPrefixTokens($admission) {
   return ,@(@($admission.argv)[0..([int]$index - 1)])
 }
 # endregion launch-admission-helpers
+# region supervisor-spawn-step
+function Invoke-SupervisorSpawnStep(
+    [hashtable]$startArgs,
+    [string]$operation) {
+  # This is the single process-creation seam used by both launch populations.
+  # It observes the process returned by the shipped launcher; it does not wait
+  # for wrapper readiness, which remains later-poll evidence.
+  if ($null -eq $startArgs -or
+      -not $startArgs.ContainsKey('FilePath') -or
+      [string]::IsNullOrWhiteSpace([string]$startArgs.FilePath)) {
+    return [pscustomobject]@{
+      schema = 'agenttalk-supervisor-spawn-step'
+      schema_version = 1
+      outcome = 'refused'
+      reason_code = 'spawn_args_invalid'
+      remedy = 'regenerate the supervisor script and retry the launch'
+      cleanup_status = 'not_started'
+      operation = $operation
+      pid = $null
+      process_identity = $null
+      redirected = $false
+      _process = $null
+      _error_record = $null
+      _compatibility_disposition = 'no_pid'
+    }
+  }
+  try {
+    $rawLaunch = Start-WrapperProcess $startArgs
+    $process = $rawLaunch.Process
+    $spawnProcessId = if ($null -ne $process -and $process.Id) {
+      [int]$process.Id
+    } else { $null }
+    if ($null -eq $spawnProcessId) {
+      return [pscustomobject]@{
+        schema = 'agenttalk-supervisor-spawn-step'
+        schema_version = 1
+        outcome = 'unknown'
+        reason_code = 'spawn_pid_unavailable'
+        remedy = 'inspect the process table before retrying the launch'
+        cleanup_status = 'unknown'
+        operation = $operation
+        pid = $null
+        process_identity = $null
+        redirected = [bool]$rawLaunch.Redirected
+        _process = $process
+        _error_record = $null
+        _compatibility_disposition = 'no_pid'
+      }
+    }
+    $creationFiletime = [string]$rawLaunch.CreationFiletime
+    $identity = if ($creationFiletime -match '^[1-9][0-9]*$') {
+      [pscustomobject]@{
+        scheme = 'win32-filetime-v1'
+        value = $creationFiletime
+      }
+    } else { $null }
+    $outcome = if ($null -ne $identity) { 'spawned' } else { 'unknown' }
+    return [pscustomobject]@{
+      schema = 'agenttalk-supervisor-spawn-step'
+      schema_version = 1
+      outcome = $outcome
+      reason_code = if ($null -ne $identity) {
+        $null
+      } else { 'spawn_identity_unavailable' }
+      remedy = if ($null -ne $identity) {
+        $null
+      } else {
+        'do not retry until an operator resolves the reported PID'
+      }
+      cleanup_status = 'not_needed'
+      operation = $operation
+      pid = $spawnProcessId
+      process_identity = $identity
+      redirected = [bool]$rawLaunch.Redirected
+      _process = $process
+      _error_record = $null
+      # Increment 1 preserves the old record-by-PID behavior when identity
+      # observation is UNKNOWN. Increment 2 replaces that disposition.
+      _compatibility_disposition = 'record_pid'
+    }
+  } catch {
+    return [pscustomobject]@{
+      schema = 'agenttalk-supervisor-spawn-step'
+      schema_version = 1
+      outcome = 'unknown'
+      reason_code = 'spawn_step_exception'
+      remedy = 'inspect the process table before retrying the launch'
+      cleanup_status = 'unknown'
+      operation = $operation
+      pid = $null
+      process_identity = $null
+      redirected = $false
+      _process = $null
+      _error_record = $_
+      # Preserve the existing throw path until increment 2 owns cleanup.
+      _compatibility_disposition = 'rethrow'
+    }
+  }
+}
+# endregion supervisor-spawn-step
 function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
   $admission = $acceptedAdmission
   if ($null -eq $admission) {
@@ -14192,15 +14329,17 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
       $startArgs['ArgumentList'] = $argline
     }
-    $launch = Start-WrapperProcess $startArgs
+    $launch = Invoke-SupervisorSpawnStep $startArgs ("regular:{0}" -f $name)
+    if ($launch._compatibility_disposition -eq 'rethrow') {
+      throw $launch._error_record
+    }
   } catch {
     Discard-PendingWrapperLogTargets $logTargets
     throw
   } finally {
     Restore-AgenttalkEnvironment $saved
   }
-  $proc = $launch.Process
-  if ($proc -and $proc.Id) {
+  if ($launch._compatibility_disposition -eq 'record_pid') {
     # Round 23: committing is no longer this call's decision. If
     # Start-Process itself never redirected, there is no channel a
     # confirmation could ever arrive through, so discarding immediately is
@@ -14217,15 +14356,25 @@ function Launch($name, $plan, $codexHome, $acceptedAdmission = $null) {
     if ($null -ne $logTargets -and -not $launch.Redirected) {
       Discard-PendingWrapperLogTargets $logTargets
     }
-    $out = @{ pid = $proc.Id; session_id = $sid; start = (Proc-Start $proc.Id);
-              launcher_nonce_injected = [bool]$nonceResult.injected;
-              launcher_nonce_source = $nonceResult.source;
-              launcher_nonce_missing_reason = $nonceResult.missing_reason }
-    if ($nonceResult.injected -and $nonceResult.nonce) { $out.launcher_nonce = $nonceResult.nonce }
-    return $out
+    $launch | Add-Member -NotePropertyName session_id `
+      -NotePropertyValue $sid -Force
+    $launch | Add-Member -NotePropertyName start `
+      -NotePropertyValue (Proc-Start $launch.pid) -Force
+    $launch | Add-Member -NotePropertyName launcher_nonce_injected `
+      -NotePropertyValue ([bool]$nonceResult.injected) -Force
+    $launch | Add-Member -NotePropertyName launcher_nonce_source `
+      -NotePropertyValue $nonceResult.source -Force
+    $launch | Add-Member -NotePropertyName launcher_nonce_missing_reason `
+      -NotePropertyValue $nonceResult.missing_reason -Force
+    if ($nonceResult.injected -and $nonceResult.nonce) {
+      $launch | Add-Member -NotePropertyName launcher_nonce `
+        -NotePropertyValue $nonceResult.nonce -Force
+    }
+    return $launch
   }
   Discard-PendingWrapperLogTargets $logTargets
-  Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"; return $null
+  Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"
+  return $launch
 }
 
 function Launch-Spec($name, $spec, $codexHome, $acceptedAdmission = $null) {
@@ -14307,29 +14456,39 @@ function Launch-Spec($name, $spec, $codexHome, $acceptedAdmission = $null) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
       $startArgs['ArgumentList'] = $argline
     }
-    $launch = Start-WrapperProcess $startArgs
+    $launch = Invoke-SupervisorSpawnStep $startArgs ("ephemeral:{0}" -f $name)
+    if ($launch._compatibility_disposition -eq 'rethrow') {
+      throw $launch._error_record
+    }
   } catch {
     Discard-PendingWrapperLogTargets $logTargets
     throw
   } finally {
     Restore-AgenttalkEnvironment $saved
   }
-  $proc = $launch.Process
-  if ($proc -and $proc.Id) {
+  if ($launch._compatibility_disposition -eq 'record_pid') {
     # Round 23: see Launch's own comment - committing is the wrapper's own
     # job now, from evidence, not this call's decision.
     if ($null -ne $logTargets -and -not $launch.Redirected) {
       Discard-PendingWrapperLogTargets $logTargets
     }
-    $out = @{ pid = $proc.Id; start = (Proc-Start $proc.Id);
-              launcher_nonce_injected = [bool]$nonceResult.injected;
-              launcher_nonce_source = $nonceResult.source;
-              launcher_nonce_missing_reason = $nonceResult.missing_reason }
-    if ($nonceResult.injected -and $nonceResult.nonce) { $out.launcher_nonce = $nonceResult.nonce }
-    return $out
+    $launch | Add-Member -NotePropertyName start `
+      -NotePropertyValue (Proc-Start $launch.pid) -Force
+    $launch | Add-Member -NotePropertyName launcher_nonce_injected `
+      -NotePropertyValue ([bool]$nonceResult.injected) -Force
+    $launch | Add-Member -NotePropertyName launcher_nonce_source `
+      -NotePropertyValue $nonceResult.source -Force
+    $launch | Add-Member -NotePropertyName launcher_nonce_missing_reason `
+      -NotePropertyValue $nonceResult.missing_reason -Force
+    if ($nonceResult.injected -and $nonceResult.nonce) {
+      $launch | Add-Member -NotePropertyName launcher_nonce `
+        -NotePropertyValue $nonceResult.nonce -Force
+    }
+    return $launch
   }
   Discard-PendingWrapperLogTargets $logTargets
-  Write-Warning "supervisor: ephemeral launch of '$name' returned no PID"; return $null
+  Write-Warning "supervisor: ephemeral launch of '$name' returned no PID"
+  return $launch
 }
 
 # Console action log (0.29.0 observability): $lastLogged remembers the last state
@@ -14544,8 +14703,11 @@ $pollNum = 0
           $postLaunchPath = Join-Path $PSScriptRoot ("supervisor-postlaunch-{0}.json" -f $name)
           Get-ProcSnapshot $preLaunchPath | Out-Null
           $res = Launch $name $p $homeEnv $launchAdmission
-          if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
-          if ($res) {
+          $spawnRecorded = (
+            $null -ne $res -and
+            $res._compatibility_disposition -eq 'record_pid')
+          if ($spawnRecorded) { Get-ProcSnapshot $postLaunchPath | Out-Null }
+          if ($spawnRecorded) {
             # Record the LAUNCHER pid + start (anti-reuse) + open grace via Python
             # (authoritative: claude pins the minted id; codex resumes by --last).
             $extra = @(); if ($res.session_id) { $extra += @('--session-id', $res.session_id) }
@@ -14648,8 +14810,11 @@ $pollNum = 0
         $postLaunchPath = Join-Path $PSScriptRoot ("supervisor-postlaunch-{0}.json" -f $rid)
         Get-ProcSnapshot $preLaunchPath | Out-Null
         $res = Launch-Spec $prep.agent $prep $homeEnv $launchAdmission
-        if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
-        if ($res) {
+        $spawnRecorded = (
+          $null -ne $res -and
+          $res._compatibility_disposition -eq 'record_pid')
+        if ($spawnRecorded) { Get-ProcSnapshot $postLaunchPath | Out-Null }
+        if ($spawnRecorded) {
           $extra = @(); if ($res.start) { $extra += @('--pid-start', $res.start) }
           if ($res.launcher_nonce_injected -and $res.launcher_nonce) {
             $extra += @('--launcher-nonce', $res.launcher_nonce, '--launcher-nonce-injected', '--launcher-nonce-source', $res.launcher_nonce_source)
