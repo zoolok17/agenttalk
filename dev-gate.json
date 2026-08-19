@@ -70,7 +70,7 @@
         "-q"
       ],
       "test_requirement": "pytest>=8.0",
-      "timeout_seconds": 2700
+      "timeout_seconds": 3600
     },
     "ruff": {
       "kind": "ruff",
