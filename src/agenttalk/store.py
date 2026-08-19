@@ -3066,9 +3066,12 @@ class Store:
         """
         try:
             key_path = _signing.resolve_key_path(self.project_id())
-            return key_path.exists() or key_path.is_symlink()
+            os.lstat(key_path)
+        except FileNotFoundError:
+            return False
         except (OSError, ValueError):
             return True
+        return True
 
     # Legacy: 0.6.0-iter-1 wrote a ``require_signatures`` field AND
     # a ``project_id`` field in config.json. Both are ignored by

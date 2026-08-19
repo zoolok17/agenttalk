@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import signing
+from agenttalk import signing, store as store_mod
 from agenttalk.store import Store
 
 
@@ -432,6 +432,21 @@ def test_key_path_probe_error_does_not_admit_unsigned_messages(
     monkeypatch.setattr(signing, "resolve_key_path", fail_probe)
     assert s.messages_for("beta") == []
     assert any("signature" in reason for _, reason in s.list_invalid_messages())
+
+
+def test_key_artifact_observation_error_keeps_signing_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_path = tmp_path / "unobservable.key"
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(key_path))
+    s = Store(tmp_path / "project")
+    s.init(["alpha", "beta"])
+
+    def unobservable(_path: Path) -> os.stat_result:
+        raise PermissionError("injected key-artifact observation failure")
+
+    monkeypatch.setattr(store_mod.os, "lstat", unobservable)
+    assert s.signing_enforced() is True
 
 
 def test_dangling_key_symlink_does_not_admit_unsigned_messages(

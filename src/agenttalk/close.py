@@ -453,7 +453,10 @@ def _ack_authorized(ack: dict, lens: dict) -> bool:
     if ack.get("from_role") in (lens.get("allowed_roles") or []):
         return True
     allowed_groups = set(lens.get("allowed_groups") or [])
-    return bool(allowed_groups & set(ack.get("from_groups") or []))
+    from_groups = ack.get("from_groups")
+    if not isinstance(from_groups, list):
+        return False
+    return bool(allowed_groups & set(from_groups))
 
 
 def _is_wellformed(record: object) -> bool:
@@ -480,34 +483,68 @@ def _is_wellformed(record: object) -> bool:
     for key in ("lens_acks", "counters", "remediation_items"):
         if not isinstance(record.get(key), dict):
             return False
-    for ack in record["lens_acks"].values():
-        if not _is_wellformed_ack(ack):
+    for lens_id, ack in record["lens_acks"].items():
+        if not _is_wellformed_ack(lens_id, ack):
             return False
     return True
 
 
-def _is_wellformed_ack(ack: object) -> bool:
+def _is_wellformed_ack(lens_id: object, ack: object) -> bool:
     if not isinstance(ack, dict):
         return False
-    status = ack.get("status")
-    if status not in ACK_STATUSES:
+    try:
+        _validate_ack(lens_id, ack)
+    except CloseError:
         return False
-    if status == NA:
-        reason = ack.get("reason")
-        return isinstance(reason, str) and bool(reason.strip())
-    if status == COUNTER:
-        counter_id = ack.get("counter_id")
-        return isinstance(counter_id, str) and bool(counter_id)
+    return True
+
+
+def _validate_ack(lens_id: object, ack: dict) -> None:
+    if not isinstance(lens_id, str) or not lens_id or ack.get("lens") != lens_id:
+        raise CloseError("ack lens must match its persisted lens key")
+    agent = ack.get("from")
+    if not isinstance(agent, str) or not agent:
+        raise CloseError("ack from must be a non-empty string")
+    from_role = ack.get("from_role")
+    if from_role is not None and (not isinstance(from_role, str) or not from_role):
+        raise CloseError("ack from_role must be null or a non-empty string")
+    from_groups = ack.get("from_groups")
+    if not isinstance(from_groups, list) or not all(
+        isinstance(group, str) and bool(group) for group in from_groups
+    ):
+        raise CloseError("ack from_groups must be a list of non-empty strings")
+    for field in ("revision", "at"):
+        value = ack.get(field)
+        if not isinstance(value, str) or not value:
+            raise CloseError(f"ack {field} must be a non-empty string")
+    if type(ack.get("override")) is not bool:
+        raise CloseError("ack override must be a boolean")
     evidence = ack.get("evidence")
     if not isinstance(evidence, dict):
-        return False
+        raise CloseError("ack evidence must be an object")
+    reason = ack.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        raise CloseError("ack reason must be a string or null")
+    counter_id = ack.get("counter_id")
+    if counter_id is not None and not isinstance(counter_id, str):
+        raise CloseError("ack counter_id must be a string or null")
+    status = ack.get("status")
+    if status not in ACK_STATUSES:
+        raise CloseError(f"ack status must be one of {sorted(ACK_STATUSES)}")
+    if status == NA:
+        if not (isinstance(reason, str) and reason.strip()):
+            raise CloseError("an NA ack requires a reason")
+        return
+    if status == COUNTER:
+        if not counter_id:
+            raise CloseError("a COUNTER ack requires a counter_id")
+        return
     try:
         validate_review_result_evidence(
             "review-result", {**evidence, "status": "approved"}
         )
-    except ValueError:
-        return False
-    return True
+    except ValueError as error:
+        raise CloseError(str(error)) from error
 
 
 # --------------------------------------------------------------- validators
@@ -1678,21 +1715,17 @@ def apply_ack(record: dict, *, lens_id: str, status: str, agent: str,
     stays pure (see :func:`_ack_authorized`)."""
     if record.get("status") == PUBLISHED:
         raise CloseError("close is published; reopen before acking (stale-proof)")
-    if status not in ACK_STATUSES:
-        raise CloseError(f"ack status must be one of {sorted(ACK_STATUSES)}")
-    if status == NA and not (reason and reason.strip()):
-        raise CloseError("an NA ack requires a reason")
-    if status == COUNTER and not counter_id:
-        raise CloseError("a COUNTER ack requires a counter_id")
     if status == COUNTER and counter_id in record.get("counters", {}):
         raise CloseError(f"duplicate counter id {counter_id!r} on this close")
-    record["lens_acks"][lens_id] = {
+    ack = {
         "lens": lens_id, "status": status, "from": agent, "from_role": from_role,
-        "from_groups": list(from_groups or []),
+        "from_groups": [] if from_groups is None else from_groups,
         "revision": record.get("revision"), "at": at,
-        "evidence": evidence or {}, "reason": reason, "counter_id": counter_id,
-        "override": bool(override),
+        "evidence": {} if evidence is None else evidence,
+        "reason": reason, "counter_id": counter_id, "override": override,
     }
+    _validate_ack(lens_id, ack)
+    record["lens_acks"][lens_id] = ack
     if status == COUNTER:
         record["counters"][counter_id] = {
             "counter_id": counter_id, "lens": lens_id, "raised_by": agent,
