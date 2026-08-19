@@ -3065,7 +3065,8 @@ class Store:
         boundary must reject unsigned messages rather than disable signing.
         """
         try:
-            return _signing.resolve_key_path(self.project_id()).exists()
+            key_path = _signing.resolve_key_path(self.project_id())
+            return key_path.exists() or key_path.is_symlink()
         except (OSError, ValueError):
             return True
 

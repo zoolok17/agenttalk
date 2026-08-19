@@ -364,7 +364,7 @@ def _server_host_port(handler: BaseHTTPRequestHandler) -> tuple[str, int]:
 
 
 def _normalized_host_port(value: str) -> tuple[str, int | None] | None:
-    if not value or value.endswith("."):
+    if not value or value.endswith(".") or "@" in value:
         return None
     parsed = urllib.parse.urlsplit("//" + value)
     try:

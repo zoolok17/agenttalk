@@ -405,9 +405,10 @@ def _reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _normalize_loaded_state(data: Any) -> dict:
     if not isinstance(data, dict):
         raise ValueError("gate state must be a JSON object")
-    if data.get("schema_version") != SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
         raise ValueError(
-            f"unsupported gate state schema_version {data.get('schema_version')!r}"
+            f"unsupported gate state schema_version {schema_version!r}"
         )
     required = data.get("required_gates", [])
     if not isinstance(required, list):

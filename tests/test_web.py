@@ -343,6 +343,53 @@ def test_dashboard_rejects_non_loopback_host_on_bound_port(tmp_path: Path) -> No
         srv.server_close()
 
 
+def test_dashboard_rejects_userinfo_disguised_as_loopback_host(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    srv, _thread, base = _serve(store, enable_actions=True)
+    parsed = urllib.parse.urlsplit(base)
+    assert parsed.hostname is not None and parsed.port is not None
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+    try:
+        conn.putrequest("GET", "/api/session", skip_host=True)
+        conn.putheader("Host", f"evil.example@localhost:{parsed.port}")
+        conn.putheader("Origin", f"http://localhost:{parsed.port}")
+        conn.endheaders()
+        response = conn.getresponse()
+        response.read()
+        assert response.status == 403
+    finally:
+        conn.close()
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["127.0.0.1", "localhost", "LOCALHOST", "[::1]", "[::ffff:127.0.0.1]"],
+)
+def test_dashboard_accepts_supported_loopback_host_forms(
+    tmp_path: Path, host: str,
+) -> None:
+    store = _make_store(tmp_path)
+    srv, _thread, base = _serve(store, enable_actions=True)
+    parsed = urllib.parse.urlsplit(base)
+    assert parsed.hostname is not None and parsed.port is not None
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+    try:
+        authority = f"{host}:{parsed.port}"
+        conn.putrequest("GET", "/api/session", skip_host=True)
+        conn.putheader("Host", authority)
+        conn.putheader("Origin", f"http://{authority}")
+        conn.endheaders()
+        response = conn.getresponse()
+        response.read()
+        assert response.status == 200
+    finally:
+        conn.close()
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_messages_lists_all(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     s.send(sender="alpha", recipient="beta", body="one")

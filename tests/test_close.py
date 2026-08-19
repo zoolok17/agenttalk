@@ -31,6 +31,16 @@ from agenttalk.store import Store
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 
+APPROVAL_EVIDENCE = {
+    "risk_class": "none",
+    "release_blocker": "no",
+    "tests_referenced": "n/a",
+    "tests_executed": "n/a",
+    "residual_risk": "n/a",
+    "evidence": "n/a",
+    "na_reason": "lightweight test approval",
+}
+
 
 # --------------------------------------------------------------- pure helpers
 
@@ -54,7 +64,7 @@ def _satisfied() -> dict:
         revision_clean=True, dirty_artifact=None,
         non_lane_isolation_not_asserted=True)
     close.apply_ack(rec, lens_id="sec", status="accept", agent="codex",
-                    from_role=None, at="t1", evidence={"risk_class": "none"})
+                    from_role=None, at="t1", evidence=APPROVAL_EVIDENCE)
     return rec
 
 
@@ -130,6 +140,34 @@ def test_malformed_persisted_lens_ack_cannot_satisfy_required_lens(
         close.load_close(store, "c1")
 
 
+def test_persisted_na_ack_without_reason_cannot_satisfy_required_lens(
+    tmp_path: Path,
+) -> None:
+    rec = _satisfied()
+    rec["lens_acks"]["sec"].update({"status": "na", "reason": None})
+    store = Store(tmp_path)
+    store.init(["lead", "codex"])
+    close.closes_dir(store).mkdir(parents=True)
+    close.close_path(store, "c1").write_text(json.dumps(rec), encoding="utf-8")
+
+    with pytest.raises(close.CloseError, match="malformed"):
+        close.load_close(store, "c1")
+
+
+def test_persisted_accept_ack_without_evidence_cannot_satisfy_required_lens(
+    tmp_path: Path,
+) -> None:
+    rec = _satisfied()
+    rec["lens_acks"]["sec"]["evidence"] = {}
+    store = Store(tmp_path)
+    store.init(["lead", "codex"])
+    close.closes_dir(store).mkdir(parents=True)
+    close.close_path(store, "c1").write_text(json.dumps(rec), encoding="utf-8")
+
+    with pytest.raises(close.CloseError, match="malformed"):
+        close.load_close(store, "c1")
+
+
 def test_hold_unauthorized_lens_ack() -> None:
     rec = _satisfied()
     rec["lens_acks"]["sec"]["from"] = "mallory"  # not in allowed_agents
@@ -152,7 +190,7 @@ def test_role_authorizes_lens_ack() -> None:
         revision_clean=True, dirty_artifact=None,
         non_lane_isolation_not_asserted=True)
     close.apply_ack(rec, lens_id="sec", status="accept", agent="anyone",
-                    from_role="reviewer", at="t")
+                    from_role="reviewer", at="t", evidence=APPROVAL_EVIDENCE)
     assert close.compute_verdict(rec, _gate_go())["verdict"] == close.VERDICT_GO
 
 

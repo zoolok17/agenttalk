@@ -262,11 +262,11 @@ def test_duplicate_gate_state_member_fails_closed(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "schema_version",
-    [None, gates.SCHEMA_VERSION + 1],
-    ids=["missing", "future"],
+    [None, gates.SCHEMA_VERSION + 1, True, 1.0],
+    ids=["missing", "future", "boolean", "float"],
 )
 def test_unsupported_gate_state_schema_fails_closed(
-    tmp_path: Path, schema_version: int | None,
+    tmp_path: Path, schema_version: object,
 ) -> None:
     root = _root(tmp_path)
     state_data = {"required_gates": [], "gates": {}}
@@ -280,6 +280,15 @@ def test_unsupported_gate_state_schema_fails_closed(
     assert state.get("load_error")
     assert "schema_version" in state["load_error"]
     assert gates.check_gates(root, scope="release")["verdict"] == "HOLD"
+
+
+def test_exact_integer_gate_state_schema_loads(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    _gp(root).write_text(
+        json.dumps({"schema_version": 1, "required_gates": [], "gates": {}}),
+        encoding="utf-8",
+    )
+    assert gates.load_gate_state(root).get("load_error") is None
 
 
 def test_load_error_on_stored_green_blocker_without_evidence(tmp_path: Path) -> None:

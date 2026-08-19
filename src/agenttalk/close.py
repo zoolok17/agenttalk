@@ -39,7 +39,11 @@ import uuid
 from typing import Any
 
 from agenttalk.coverage_contract import COVERAGE_GATE_NAMES, coverage_profile_from_gate
-from agenttalk.gates import CORE_RISK_CLASSES, is_valid_risk_class
+from agenttalk.gates import (
+    CORE_RISK_CLASSES,
+    is_valid_risk_class,
+    validate_review_result_evidence,
+)
 
 SCHEMA_VERSION = 1
 DIRNAME = "closes"
@@ -477,8 +481,32 @@ def _is_wellformed(record: object) -> bool:
         if not isinstance(record.get(key), dict):
             return False
     for ack in record["lens_acks"].values():
-        if not isinstance(ack, dict) or ack.get("status") not in ACK_STATUSES:
+        if not _is_wellformed_ack(ack):
             return False
+    return True
+
+
+def _is_wellformed_ack(ack: object) -> bool:
+    if not isinstance(ack, dict):
+        return False
+    status = ack.get("status")
+    if status not in ACK_STATUSES:
+        return False
+    if status == NA:
+        reason = ack.get("reason")
+        return isinstance(reason, str) and bool(reason.strip())
+    if status == COUNTER:
+        counter_id = ack.get("counter_id")
+        return isinstance(counter_id, str) and bool(counter_id)
+    evidence = ack.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    try:
+        validate_review_result_evidence(
+            "review-result", {**evidence, "status": "approved"}
+        )
+    except ValueError:
+        return False
     return True
 
 
