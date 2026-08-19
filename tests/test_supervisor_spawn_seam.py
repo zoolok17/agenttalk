@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,10 @@ def _region(text: str, name: str) -> str:
     start = text.index(start_marker)
     end = text.index(end_marker, start) + len(end_marker)
     return text[start:end]
+
+
+def _powershell_code(text: str) -> str:
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
 
 
 def _generated_executor(tmp_path: Path) -> tuple[Store, str]:
@@ -120,10 +125,10 @@ def _stop_exact_process_tree(
     )
 
 
-def test_generated_supervisor_has_one_spawn_door_for_both_populations() -> None:
-    text = supervisor.PS_TEMPLATE
+def _assert_single_spawn_door(text: str) -> None:
+    launcher = _region(text, "wrapper-process-launcher")
     seam = _region(text, "supervisor-spawn-step")
-    outside = text.replace(seam, "", 1)
+    outside = text.replace(launcher, "", 1).replace(seam, "", 1)
     regular = text[
         text.index("function Launch($name") : text.index("function Launch-Spec")
     ]
@@ -131,10 +136,76 @@ def test_generated_supervisor_has_one_spawn_door_for_both_populations() -> None:
         text.index("function Launch-Spec") : text.index("# Console action log")
     ]
 
-    assert seam.count("Start-WrapperProcess $startArgs") == 1
-    assert "Start-WrapperProcess $startArgs" not in outside
-    assert regular.count("Invoke-SupervisorSpawnStep $startArgs") == 1
-    assert ephemeral.count("Invoke-SupervisorSpawnStep $startArgs") == 1
+    launcher_code = _powershell_code(launcher)
+    seam_code = _powershell_code(seam)
+    outside_code = _powershell_code(outside)
+    all_code = _powershell_code(text)
+    assert len(re.findall(r"\bStart-WrapperProcess\b", launcher_code, re.I)) == 1
+    assert len(re.findall(r"\bStart-WrapperProcess\b", seam_code, re.I)) == 1
+    assert not re.search(r"\bStart-WrapperProcess\b", outside_code, re.I)
+    assert len(re.findall(r"\bInvoke-SupervisorSpawnStep\b", all_code, re.I)) == 3
+    assert len(
+        re.findall(r"\bInvoke-SupervisorSpawnStep\b", _powershell_code(regular), re.I)
+    ) == 1
+    assert len(
+        re.findall(
+            r"\bInvoke-SupervisorSpawnStep\b", _powershell_code(ephemeral), re.I
+        )
+    ) == 1
+
+    normalized_outside_launcher = " ".join(
+        _powershell_code(text.replace(launcher, "", 1)).split()
+    )
+    process_creation_patterns = [
+        r"\bStart-Process\b",
+        r"(?:::|\.)\s*Start\s*\(",
+        r"\bNew-Object\b(?:\s+-TypeName)?\s+(?:System\.)?Diagnostics\.Process\b",
+        r"\b(?:Invoke-CimMethod|Invoke-WmiMethod)\b.{0,300}"
+        r"\b(?:Win32_Process|Create)\b",
+        r"\bWin32_Process\b.{0,300}\.\s*Create\s*\(",
+        r"\bCreateProcess(?:A|W)?\s*\(",
+    ]
+    for pattern in process_creation_patterns:
+        assert not re.search(pattern, normalized_outside_launcher, re.I)
+
+
+def test_generated_supervisor_has_one_spawn_door_for_both_populations() -> None:
+    _assert_single_spawn_door(supervisor.PS_TEMPLATE)
+
+
+@pytest.mark.parametrize(
+    "escaped_spawn",
+    [
+        "Start-WrapperProcess -startArgs $startArgs",
+        "Start-Process @startArgs",
+        "[System.Diagnostics.Process]::Start('candidate.exe')",
+        "$process = New-Object System.Diagnostics.Process; $process.Start()",
+        "Invoke-CimMethod -ClassName Win32_Process -MethodName Create",
+        "Invoke-WmiMethod -Class Win32_Process -Name Create",
+        "CreateProcessW($null, $null)",
+    ],
+    ids=[
+        "named-launcher-call",
+        "direct-start-process",
+        "dotnet-process-start",
+        "new-process-object",
+        "cim-process-create",
+        "wmi-process-create",
+        "native-create-process",
+    ],
+)
+def test_spawn_door_guard_rejects_process_creation_outside_seam(
+    escaped_spawn: str,
+) -> None:
+    anchor = '$launch = Invoke-SupervisorSpawnStep $startArgs ("regular:{0}" -f $name)'
+    mutated = supervisor.PS_TEMPLATE.replace(
+        anchor,
+        f"{escaped_spawn}\n    {anchor}",
+        1,
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_single_spawn_door(mutated)
 
 
 def test_exact_launcher_samples_filetime_from_original_handle_before_close() -> None:

@@ -13034,6 +13034,7 @@ function Test-RunningOnWindows {
   # in hermetic launch environments.
   return [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 }
+# region wrapper-process-launcher
 $script:WrapperLogLauncherTypeReady = $false
 function Initialize-WrapperLogLauncherType {
   if (-not (Test-RunningOnWindows)) { return $false }
@@ -13363,8 +13364,9 @@ namespace Agenttalk {
   }
 }
 function Start-WrapperProcess([hashtable]$startArgs) {
-  # Returns [pscustomobject]@{ Process = <process>; Redirected = <bool> } -
-  # NEVER the bare process object. I1: logging capability (the env vars
+  # Returns [pscustomobject]@{ Process = <process>;
+  # CreationFiletime = <string|null>; Redirected = <bool> } - NEVER the bare
+  # process object. I1: logging capability (the env vars
   # and the nonce - a wrapper that never actually got redirected has no
   # channel to confirm anything through) is granted if and only if the
   # child's output is ACTUALLY redirected.
@@ -13487,6 +13489,7 @@ function Start-WrapperProcess([hashtable]$startArgs) {
     Redirected = $redirected
   }
 }
+# endregion wrapper-process-launcher
 if (-not ('AgenttalkSupervisorNativePosix' -as [type])) {
   Add-Type -TypeDefinition @'
 using System.Runtime.InteropServices;
