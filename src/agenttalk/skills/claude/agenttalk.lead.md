@@ -363,20 +363,28 @@ lead publishes on its behalf. Three failures live in that one step, and the
 first two are silent.
 
 1. **Require a clean-SHA handoff.** The worker's reply must carry the final
-   full SHA and an empty `git status --porcelain` for its worktree. Pushing a
-   branch publishes the committed HEAD, never uncommitted edits — so a dirty
-   worktree publishes a tree nobody tested.
+   full SHA and an empty status for its worktree. Pushing a branch publishes the
+   committed HEAD, never uncommitted edits — so a dirty worktree publishes a tree
+   nobody tested.
    ```powershell
-   git -C <worktree> status --porcelain     # must be empty
-   git -C <worktree> log -1 --format=%H     # must equal the reported SHA
+   git -C "<worktree>" status --porcelain --untracked-files=all   # must be empty
+   git -C "<worktree>" log -1 --format=%H                         # must equal the reported SHA
    ```
+   **Two details that make the difference between a check and a placebo.**
+   `--untracked-files=all` is required: a repository or user config setting
+   `status.showUntrackedFiles=no` makes a bare `--porcelain` print NOTHING even
+   when the worker has uncommitted new files, so the handoff passes and you
+   publish a commit missing files the worker's tests depended on. And quote the
+   path: `-C` takes exactly ONE argument, so an unquoted worktree under a path
+   containing spaces splits into two and git fails *before* validating anything.
 
 2. **Never let the current directory choose which commit is pushed.** This is
    the trap:
    ```powershell
-   # WRONG when run from the main checkout: HEAD is the MAIN branch,
-   # not the worker's commit. This publishes the base branch over the
-   # feature branch.
+   # WRONG when run from the main checkout: HEAD is the MAIN branch, not the
+   # worker's commit. If Git accepts it — as a fast-forward, or with force or a
+   # lease — this publishes the base branch over the feature branch. A
+   # non-fast-forward rejection here is luck, not a safeguard.
    git push origin HEAD:<branch>
    ```
    Push the **explicit full SHA**, which cannot be ambiguous about which tree
@@ -384,7 +392,7 @@ first two are silent.
    ```powershell
    git push origin <full-sha>:refs/heads/<branch>
    ```
-   `git -C <worktree> push origin HEAD:<branch>` also works. Prefer the
+   `git -C "<worktree>" push origin HEAD:<branch>` also works. Prefer the
    explicit SHA.
 
    **`--force-with-lease` does not protect you here.** The lease asserts what
