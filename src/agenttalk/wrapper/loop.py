@@ -20,6 +20,9 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+
+from agenttalk import reply_transport
 
 from . import recv_api
 
@@ -66,6 +69,61 @@ def _as_outcome(ret: object) -> DriveOutcome:
     if ret:
         return DriveOutcome(ok=True)
     return DriveOutcome(ok=False, failure_class=CLASS_POISON, summary="drive returned False")
+
+
+# #201 wrapper-owned reply delivery (freeform path). Kinds whose natural
+# reply is a plain message get a wrapper-declared draft file the child can
+# answer through with nothing but its structured Write tool — the fix for
+# seats whose harness statically rejects or approval-gates shell commands.
+# Typed-response threads (review-request/proposal) are excluded: their
+# closure requires a typed kind the draft channel does not carry yet.
+_REPLY_DRAFT_KINDS = frozenset({"question", "message"})
+
+
+def _with_reply_draft(store, agent: str, record: dict) -> dict:
+    """Decorate a freeform (no-admission) record with its declared draft path."""
+    if record.get("kind") not in _REPLY_DRAFT_KINDS:
+        return record
+    inbound_id = record.get("id")
+    if not isinstance(inbound_id, str) or not inbound_id:
+        return record
+    if record.get("from") == agent:
+        return record
+    path = reply_transport.reply_draft_path(store, agent, inbound_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return record
+    decorated = dict(record)
+    decorated["reply_draft"] = {"path": str(path)}
+    return decorated
+
+
+def _deliver_reply_draft(store, agent: str, record: dict) -> None:
+    """Publish a child-written freeform draft after a CLEAN turn.
+
+    Refusals are silent by contract: freeform replies are not obligatory, so
+    a missing/invalid draft must leave the turn disposition byte-identical
+    to today. The landed-check first makes the two channels race-free — a
+    capable child that ran `agenttalk reply` itself published strictly
+    before this end-of-turn call, and then the draft is only residue.
+    """
+    declared = record.get("reply_draft")
+    if not isinstance(declared, dict) or not declared.get("path"):
+        return
+    draft = Path(str(declared["path"]))
+    try:
+        if reply_transport.landed_reply_exists(store, agent=agent, record=record):
+            try:
+                draft.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        reply_transport.deliver_draft_reply(
+            store, agent=agent, record=record, draft_path=draft,
+        )
+    except Exception:  # noqa: BLE001, S110 - must never change disposition  # nosec B110
+        return
 
 
 @dataclass(frozen=True)
@@ -1172,9 +1230,17 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
 
         # WRITE-AHEAD: count + mark in_progress BEFORE drive() so a crash mid-turn
         # still costs a durable attempt on relaunch. EXACTLY one attempt per drive().
+        record = _with_reply_draft(store, agent, record)
         store.record_attempt_start(agent, record, attempt_id=uuid.uuid4().hex[:12],
                                    at=now_iso())
         outcome = _as_outcome(drive(record))
+        # #201: a CLEAN turn's child-written draft is published by the wrapper
+        # itself BEFORE the landed-check below, which then finds and commits it
+        # through the same proof machinery as a child-delivered reply. A dirty
+        # outcome (watchdog kill, nonzero exit) never publishes — a truncated
+        # draft must not become the agent's authoritative answer.
+        if outcome.ok:
+            _deliver_reply_draft(store, agent, record)
         if commit_gate is not None and legacy_gate_resolution is not None:
             landed = commit_gate.resolve_landed_response(record)
             if landed.proof is not None:
@@ -1730,7 +1796,12 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                 continue
             legacy_gate_resolution = authorized
+        record = _with_reply_draft(store, agent, record)
         outcome = _as_outcome(drive(record))
+        # #201: same wrapper-owned draft delivery as _run_continuous — the
+        # one-shot path must not strand a sandbox-blocked child's answer.
+        if outcome.ok:
+            _deliver_reply_draft(store, agent, record)
         if commit_gate is not None and legacy_gate_resolution is not None:
             landed = commit_gate.resolve_landed_response(record)
             if landed.proof is not None:

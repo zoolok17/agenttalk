@@ -53,6 +53,7 @@ from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
 from agenttalk import gates as gate_mod
+from agenttalk import reply_transport
 from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
 from agenttalk import lead_loop_runtime
@@ -126,20 +127,9 @@ def _operation_idempotency(
         return None, None
     if _OPERATION_NONCE_RE.fullmatch(nonce) is None:
         return None, "operation nonce must be exactly 32 lowercase hexadecimal characters"
-    from agenttalk.wrapper.obligations import operation_payload_digest
-
-    digest = operation_payload_digest(
-        operation=operation,
-        body=body,
-        kind=kind,
-        recipient=recipient,
-        in_reply_to=meta.get("in_reply_to"),
-        request_id=meta.get("request_id"),
-        broadcast_id=meta.get("broadcast_id"),
-        origin_request_id=meta.get("origin_request_id"),
-        origin_inbound_id=meta.get("origin_inbound_id"),
-        origin_obligation_key_digest=meta.get("origin_obligation_key_digest"),
-        expected_roster_revision=meta.get("expected_roster_revision"),
+    # One digest producer for CLI and wrapper (#201) — divergence forks dedupe.
+    digest = reply_transport.operation_digest_for(
+        meta, operation=operation, body=body, kind=kind, recipient=recipient,
     )
     meta["operation_nonce"] = nonce
     meta["operation_digest"] = digest
@@ -9137,32 +9127,15 @@ def cmd_reply(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk reply: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
             return 2
     meta = _parse_meta(args.meta)
-    # Exact immutable anchor for generation-safe replay.  The correlation id
-    # identifies the conversation; in_reply_to identifies this delivery.
-    meta["in_reply_to"] = anchor.id
     if na:
         meta["response"] = "not-applicable"  # the display discriminator
-    # Auto-echo request_id for correlation. Explicit --meta wins.
-    # EXCEPTION: a reply that is ITSELF a thread-opening kind
-    # (review-request = counter-review; proposal = counter-proposal)
-    # opens a NEW correlation thread, so it must NOT inherit the anchor's
-    # request_id — doing so would alias two distinct request/response
-    # pairs and make later responses ambiguous. For those we skip the
-    # echo and let _maybe_autogen_request_id mint a fresh id below
-    # (unless the user passed an explicit --meta one).
-    if (
-        kind not in ("review-request", "proposal")
-        and "request_id" not in meta
-        and "request_id" in (anchor.meta or {})
-    ):
-        meta["request_id"] = anchor.meta["request_id"]
-    if (
-        kind not in ("review-request", "proposal")
-        and "request_id" not in meta
-        and "broadcast_id" not in meta
-        and "broadcast_id" in (anchor.meta or {})
-    ):
-        meta["broadcast_id"] = anchor.meta["broadcast_id"]
+    # Correlation echo lives in reply_transport so the wrapper's draft
+    # delivery (#201) applies IDENTICAL rules: in_reply_to anchor,
+    # request_id echo except for thread-opening reply kinds, broadcast_id
+    # echo only without a request_id. Explicit --meta always wins.
+    reply_transport.echo_reply_correlation(
+        meta, anchor_id=anchor.id, anchor_meta=anchor.meta, kind=kind,
+    )
     _maybe_autogen_request_id(kind, meta, quiet=args.quiet)
     operation_nonce = getattr(args, "operation_nonce", None)
     existing, operation_error = _operation_idempotency(

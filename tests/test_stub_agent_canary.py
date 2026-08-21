@@ -336,3 +336,41 @@ def test_num_turns_is_authoritative_ran_signal_over_event_type_inference() -> No
     assert session.resume_failure_is_session_attributable(
         cls, "error_during_execution", raw_tail=spoof,
         produced_model_output=False, result_num_turns=None)
+
+
+# ----------------------------------------------------------------------- draft_only
+
+
+def test_draft_only_child_is_delivered_by_the_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#201 end-to-end, gate INACTIVE (the field configuration): a child whose
+    sandbox can run NO bus command writes only the wrapper-declared reply draft
+    through the REAL spawn path; the wrapper validates and publishes it with
+    exact thread correlation, and the record commits."""
+    monkeypatch.setenv("AGENTTALK_STUB_SCENARIO", "draft_only")
+    monkeypatch.delenv("AGENTTALK_COMMIT_GATE_POLICY", raising=False)
+    store = _store(tmp_path)
+    inbound = _question(store, "q-draft")
+
+    drive = run.make_drive(
+        store, "beta", "claude", _claude_session(store), _base_argv(),
+        render=False,
+    )
+    turns = loop.run_loop(
+        store, "beta", drive,
+        clock=lambda: 0.0,
+        sleep=lambda _d: None,
+        max_turns=1,
+        max_polls=6,
+    )
+
+    assert turns == 1
+    replies = _reply_from(store, "beta", inbound.id)
+    assert len(replies) == 1
+    reply = replies[0]
+    assert "wrapper-owned draft delivery" in reply.body
+    assert (reply.meta or {}).get("request_id") == "q-draft"
+    assert (reply.meta or {}).get("operation_nonce")   # idempotent publication
+    assert store.cursor("beta") == inbound.id          # committed
+    assert store.dead_lettered_count("beta") == 0
