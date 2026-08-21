@@ -98,26 +98,53 @@ def landed_reply_exists(store: "Store", *, agent: str, record: dict) -> bool:
 
     The dedupe guard for the two freeform channels: a capable child that ran
     `agenttalk reply` itself publishes strictly before the wrapper's
-    end-of-turn check, so finding an exact in_reply_to match here means the
-    wrapper must NOT publish the draft too.
+    end-of-turn check, so a match here means the wrapper must NOT publish the
+    draft too. Matches by exact ``in_reply_to`` OR by the thread request_id —
+    the CLI channel anchors ``--to-request`` to the LATEST thread message, so
+    a reply to a nudge carrying the same request_id must also count. Both
+    matches are bounded to messages AFTER this inbound (``since_id``), so an
+    answer to an EARLIER question on the same thread never suppresses this
+    one's draft. ``composing`` pings never close a thread and are excluded.
     """
     requester = record.get("from")
     inbound_id = record.get("id")
     if not isinstance(requester, str) or not isinstance(inbound_id, str):
         return False
+    record_meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+    thread_rid = record_meta.get("request_id")
     try:
-        inbox = store.messages_for(requester)
+        inbox = store.messages_for(requester, since_id=inbound_id)
     except Exception:
-        # Fail CLOSED for delivery (report "already landed") would LOSE the
-        # reply; fail OPEN here risks at worst a duplicate, which the
-        # requester can correlate by in_reply_to. Prefer not losing work.
+        # Reporting "already landed" on an error would LOSE the reply; the
+        # open failure risks at worst a duplicate the requester can correlate
+        # by in_reply_to. Prefer not losing work.
         return False
     for msg in inbox:
-        if msg.sender != agent:
+        if msg.sender != agent or msg.kind == "composing":
             continue
-        if (msg.meta or {}).get("in_reply_to") == inbound_id:
+        meta = msg.meta or {}
+        if meta.get("in_reply_to") == inbound_id:
+            return True
+        if thread_rid and meta.get("request_id") == thread_rid:
             return True
     return False
+
+
+def preserve_refused_draft(draft_path: Path) -> Path | None:
+    """Rename a refused draft to an observable ``.refused.md`` sibling.
+
+    A refused draft on a turn that still commits would otherwise vanish —
+    behaviorally the same silent loss #201 exists to fix. The preserved file
+    keeps the child's bytes recoverable by an operator and, because the live
+    draft path is now clear, can never be published by a later attempt.
+    """
+    target = draft_path.with_suffix(".refused.md")
+    try:
+        target.unlink(missing_ok=True)
+        draft_path.rename(target)
+    except OSError:
+        return None
+    return target
 
 
 def read_reply_draft(draft_path: Path) -> str | None:
@@ -170,10 +197,6 @@ def deliver_draft_reply(
     echo_reply_correlation(
         meta, anchor_id=inbound_id, anchor_meta=record_meta, kind=kind,
     )
-    # Parity with cmd_reply's validator step (no-ops for kind=message today;
-    # kept so a future typed-kind extension inherits them automatically).
-    gate_mod.validate_response_status(kind, meta)
-    gate_mod.validate_review_result_evidence(kind, meta)
     nonce = secrets.token_hex(16)
     digest = operation_digest_for(
         meta, operation="terminal", body=body, kind=kind, recipient=requester,
@@ -181,6 +204,11 @@ def deliver_draft_reply(
     meta["operation_nonce"] = nonce
     meta["operation_digest"] = digest
     try:
+        # Parity with cmd_reply's validator step (no-ops for kind=message
+        # today; inside the refusal boundary so a future typed-kind extension
+        # inherits both the validators AND the never-raise contract).
+        gate_mod.validate_response_status(kind, meta)
+        gate_mod.validate_review_result_evidence(kind, meta)
         msg, _published = store.send_operation(
             sender=agent,
             recipient=requester,

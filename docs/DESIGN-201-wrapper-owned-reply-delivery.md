@@ -133,18 +133,37 @@ Freeform turns never carried the composing ping, so PR-1 changes nothing
 about composing. The gate-path composing question is PR-2's to answer
 explicitly.
 
-### Bounded residual (documented, not hidden)
+### Bounded residual (documented, not hidden; updated after the cold review)
 
 - A seat that can neither run bus commands NOR write files cannot reply;
   PR-3's preflight exists to catch that seat before work is dispatched.
-- Typed multi-field responses (review-result with evidence refs etc.) work
-  through the draft only as plain kind=message bodies in PR-1; typed
-  kind+meta declaration through the draft channel is PR-2/fast-follow scope.
-  The validators are already wired in `deliver_draft_reply`, so extending
-  is additive.
+  (The draft dir lives under the store's `.agenttalk/state/`, i.e. inside
+  the project root the wrapped child is normally granted — the JAWS claude
+  seat's `--add-dir <root>` covers it — but PR-3's write probe must verify
+  this per seat rather than assume it.)
+- Typed multi-field responses (review-result, proposal-response, consult
+  replies needing `consult=true`+`round`, NA responses needing
+  `response=not-applicable`) are NOT carried by the draft channel in PR-1:
+  consult-marked questions are excluded from decoration, typed threads were
+  never decorated, and NA/broadcast-decline still needs the CLI. Typed
+  kind+meta declaration through the draft is PR-2/fast-follow scope; the
+  validators already run inside `deliver_draft_reply`'s refusal boundary so
+  the extension inherits both them and the never-raise contract.
+- A REFUSED draft (oversize/encoding/publish failure) on a committing turn
+  is preserved as `<id>.refused.md` beside the draft dir — observable and
+  operator-recoverable, but not yet surfaced in status/health; wiring a
+  refusal signal into the wrapper lifecycle log is fast-follow scope.
+- Draft-dir hygiene: delivered drafts are unlinked on publish, stale drafts
+  are unlinked at next decoration, refused drafts are preserved by design;
+  drafts for records disposed WITHOUT a later redelivery linger until then.
+  No unbounded growth path beyond message volume; a reaper is out of scope.
+- `deliver_draft_reply` does not call the request-id autogen helper: replies
+  of kind=message never autogen (no prefix registered), so the CLI-parity
+  claim holds by vacuity today — the PR-2 typed-kind extension must revisit.
 - The freeform wrapper publish gives at-least-once with landed-check
-  dedupe, not exactly-once across generations (matches the bus's existing
-  delivery semantics).
+  dedupe (in_reply_to OR same-thread request_id, bounded to messages after
+  this inbound), not exactly-once across generations — matching the bus's
+  existing delivery semantics.
 
 ## Tests (no model spend; review F7 test gaps folded in)
 

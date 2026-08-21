@@ -91,6 +91,12 @@ def _with_reply_draft(store, agent: str, record: dict) -> dict:
         return record
     if record.get("from") == agent:
         return record
+    # A consult reply must echo consult=true + round meta the draft channel
+    # cannot carry yet — offering the channel would give the child two
+    # contradictory instructions and silently break consult round tracking.
+    record_meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+    if record_meta.get("consult"):
+        return record
     path = reply_transport.reply_draft_path(store, agent, inbound_id)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,9 +132,15 @@ def _deliver_reply_draft(store, agent: str, record: dict) -> None:
             except OSError:
                 pass
             return
-        reply_transport.deliver_draft_reply(
+        published = reply_transport.deliver_draft_reply(
             store, agent=agent, record=record, draft_path=draft,
         )
+        if published is None and draft.exists():
+            # The child wrote an answer the wrapper refused (oversize, bad
+            # encoding, publish failure). The turn still commits, so without
+            # a trace the answer would vanish exactly like the dead-letter
+            # dotfiles #201 exists to fix. Preserve the bytes observably.
+            reply_transport.preserve_refused_draft(draft)
     except Exception:  # noqa: BLE001, S110 - must never change disposition  # nosec B110
         return
 

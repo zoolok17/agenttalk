@@ -275,3 +275,91 @@ def test_wake_kind_gets_the_draft_channel(tmp_path) -> None:
     assert msg.body == "awake"
     assert (msg.meta or {}).get("request_id") == "wk-1"
     assert (msg.meta or {}).get("in_reply_to") == w.id
+
+
+def test_consult_questions_are_excluded_from_the_draft_channel(tmp_path) -> None:
+    # Cold review major 1: a consult reply must echo consult=true + round meta
+    # the draft channel cannot carry — offering it would give the child two
+    # contradictory instructions and silently break consult round tracking.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="question", body="consult?",
+           meta={"request_id": "q-c1", "consult": "true", "round": "1"})
+    seen: list[dict] = []
+
+    def drive(rec):
+        seen.append(rec)
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    assert seen and "reply_draft" not in seen[0]
+
+
+def test_refused_draft_is_preserved_observably(tmp_path) -> None:
+    # Cold review major 2: a refused draft on a committing turn must not
+    # vanish silently — the bytes are preserved at an observable sibling
+    # path an operator can recover, and can never be published later.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-refused"})
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text(
+            "y" * (reply_transport.MAX_DRAFT_BYTES + 1), encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    assert _reply_inbox(s, "alpha") == []
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    refused = live.with_suffix(".refused.md")
+    assert not live.exists()
+    assert refused.exists() and refused.stat().st_size > reply_transport.MAX_DRAFT_BYTES
+
+
+def test_reply_to_thread_nudge_suppresses_the_draft(tmp_path) -> None:
+    # Cold review minor 5: the CLI channel anchors --to-request to the LATEST
+    # thread message, so a child reply to a nudge (same request_id, different
+    # in_reply_to) must still count as landed for dedupe.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+           meta={"request_id": "q-nudge"})
+    nudge = s.send(sender="alpha", recipient="beta", kind="question",
+                   body="any progress?", meta={"request_id": "q-nudge"})
+    handled = {"n": 0}
+
+    def drive(rec):
+        handled["n"] += 1
+        if handled["n"] == 2:
+            # Child answers the SECOND record via CLI anchored to the nudge,
+            # and also leaves a draft (disobeying "one channel").
+            s.send(sender="beta", recipient="alpha", body="cli via nudge",
+                   meta={"in_reply_to": nudge.id, "request_id": "q-nudge"})
+            Path(rec["reply_draft"]["path"]).write_text("dup", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=2)
+    assert [m.body for m in _reply_inbox(s, "alpha")] == ["cli via nudge"]
+
+
+def test_one_shot_path_delivers_the_draft(tmp_path) -> None:
+    # Cold review major 3: the scoped one-shot loop (ephemeral reviewers) has
+    # its own drive site and must not strand a sandbox-blocked child's answer.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="scoped q",
+               meta={"request_id": "q-oneshot"})
+
+    def drive(rec):
+        assert isinstance(rec.get("reply_draft"), dict)
+        Path(rec["reply_draft"]["path"]).write_text("scoped answer", encoding="utf-8")
+        return True
+
+    turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0,
+                          sleep=lambda d: None, max_turns=1, max_polls=4,
+                          only_request_id="q-oneshot")
+    assert turns == 1
+    (msg,) = _reply_inbox(s, "alpha")
+    assert msg.body == "scoped answer"
+    assert (msg.meta or {}).get("in_reply_to") == q.id
+    assert (msg.meta or {}).get("request_id") == "q-oneshot"
