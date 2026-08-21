@@ -130,6 +130,25 @@ def landed_reply_exists(store: "Store", *, agent: str, record: dict) -> bool:
     return False
 
 
+def thread_opener_kind(store: "Store", *, agent: str, request_id: str) -> str | None:
+    """The kind of the message that OPENED this request_id's thread.
+
+    Used to withhold the draft channel from a kind=message that arrives on a
+    review-request/proposal thread (e.g. the author's answer to a needs-info
+    review-result): the next response there must be a TYPED kind the draft
+    cannot carry, and a kind=message publish would commit the turn while the
+    typed response stays owed. Returns None when unknown (fail open: an
+    unknown thread is treated as an ordinary message thread).
+    """
+    try:
+        for msg in store.valid_messages():
+            if (msg.meta or {}).get("request_id") == request_id:
+                return msg.kind
+    except Exception:
+        return None
+    return None
+
+
 def preserve_refused_draft(draft_path: Path) -> Path | None:
     """Rename a refused draft to an observable ``.refused.md`` sibling.
 
@@ -221,7 +240,12 @@ def deliver_draft_reply(
             operation_nonce=nonce,
             operation_digest=digest,
         )
-    except ValueError:
+    except Exception:  # noqa: BLE001 - refusal contract: the caller preserves
+        # ValueError (nonce/validator) AND operational failures (publication
+        # lock timeout, I/O): returning None routes ALL of them into the
+        # caller's observable refused-draft preservation instead of a silent
+        # drop. In-process durable retry of publish failures is PR-2 scope
+        # (the captured-operation machinery).
         return None
     try:
         draft_path.unlink(missing_ok=True)

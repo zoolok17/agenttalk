@@ -97,6 +97,17 @@ def _with_reply_draft(store, agent: str, record: dict) -> dict:
     record_meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
     if record_meta.get("consult"):
         return record
+    # A kind=message arriving on a review-request/proposal thread (e.g. the
+    # author's answer to a needs-info review-result) owes a TYPED response
+    # next — publishing a draft as kind=message would commit the turn while
+    # the typed response stays owed (PR #127 connector P2).
+    thread_rid = record_meta.get("request_id")
+    if record.get("kind") == "message" and isinstance(thread_rid, str) and thread_rid:
+        opener = reply_transport.thread_opener_kind(
+            store, agent=agent, request_id=thread_rid,
+        )
+        if opener in ("review-request", "proposal"):
+            return record
     path = reply_transport.reply_draft_path(store, agent, inbound_id)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +137,8 @@ def _deliver_reply_draft(store, agent: str, record: dict) -> None:
         return
     draft = Path(str(declared["path"]))
     try:
+        if not draft.is_file():
+            return          # most turns: no draft written, no scan paid
         if reply_transport.landed_reply_exists(store, agent=agent, record=record):
             try:
                 draft.unlink(missing_ok=True)

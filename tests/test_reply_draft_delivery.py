@@ -363,3 +363,50 @@ def test_one_shot_path_delivers_the_draft(tmp_path) -> None:
     assert msg.body == "scoped answer"
     assert (msg.meta or {}).get("in_reply_to") == q.id
     assert (msg.meta or {}).get("request_id") == "q-oneshot"
+
+
+def test_message_on_review_thread_gets_no_draft_channel(tmp_path) -> None:
+    # PR #127 connector P2: a kind=message on a review-request thread (e.g.
+    # a needs-info answer) owes a TYPED review-result next — the draft
+    # channel would commit the turn with a kind=message while the typed
+    # response stays owed.
+    s = _store(tmp_path)
+    s.send(sender="beta", recipient="alpha", kind="review-request",
+           body="please review", meta={"request_id": "rq-77"})
+    s.send(sender="alpha", recipient="beta", kind="message",
+           body="needs-info answer: here is the context",
+           meta={"request_id": "rq-77"})
+    seen: list[dict] = []
+
+    def drive(rec):
+        seen.append(rec)
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    assert seen and "reply_draft" not in seen[0]
+
+
+def test_publish_exception_preserves_the_draft(tmp_path, monkeypatch) -> None:
+    # PR #127 connector P2: a valid draft whose publication fails on an
+    # operational error (lock timeout, I/O) must not vanish silently while
+    # the turn commits — it is preserved as an observable .refused.md.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-lockfail"})
+
+    def boom(**kwargs):
+        raise OSError("publication lock timeout")
+
+    monkeypatch.setattr(s, "send_operation", boom)
+
+    def drive(rec):
+        Path(rec["reply_draft"]["path"]).write_text("good answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    assert _reply_inbox(s, "alpha") == []
+    refused = reply_transport.reply_draft_path(s, "beta", q.id).with_suffix(".refused.md")
+    assert refused.exists()
+    assert refused.read_text(encoding="utf-8") == "good answer"
