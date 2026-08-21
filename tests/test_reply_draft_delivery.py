@@ -228,3 +228,50 @@ def test_prompt_no_draft_section_without_declaration() -> None:
            "correlation_id": "q-1", "request_id": "q-1", "broadcast_id": None,
            "id": "m-1"}
     assert "PREFERRED DRAFT CHANNEL" not in prompt.assemble_turn_prompt(rec)
+
+
+def test_stale_draft_from_failed_attempt_is_never_published(tmp_path) -> None:
+    # PR #127 connector P1: attempt 1 writes a partial draft and fails; the
+    # retry completes cleanly WITHOUT writing a new draft. The stale bytes
+    # must not be published — decoration deletes any pre-existing draft, so
+    # each draft is bound to the attempt that created it.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-stale"})
+    attempts = {"n": 0}
+
+    def drive(rec):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            Path(rec["reply_draft"]["path"]).write_text(
+                "partial from dead attempt", encoding="utf-8")
+            return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_INFRA,
+                                     summary="killed mid-write")
+        return True                      # clean retry, no draft written
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1, max_polls=4, k_poison=0, k_escalate=0)
+    assert attempts["n"] >= 2
+    assert _reply_inbox(s, "alpha") == []      # stale bytes never published
+    assert s.cursor("beta") == q.id            # clean retry still committed
+
+
+def test_wake_kind_gets_the_draft_channel(tmp_path) -> None:
+    # PR #127 connector P2: wake is an ordinary driven kind whose wk- request
+    # id exists so a plain message reply can correlate — sandbox-blocked
+    # seats must be able to acknowledge it via the draft channel.
+    s = _store(tmp_path)
+    w = s.send(sender="alpha", recipient="beta", kind="wake", body="wake up",
+               meta={"request_id": "wk-1"})
+
+    def drive(rec):
+        assert isinstance(rec.get("reply_draft"), dict)
+        Path(rec["reply_draft"]["path"]).write_text("awake", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    (msg,) = _reply_inbox(s, "alpha")
+    assert msg.body == "awake"
+    assert (msg.meta or {}).get("request_id") == "wk-1"
+    assert (msg.meta or {}).get("in_reply_to") == w.id

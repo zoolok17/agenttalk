@@ -77,7 +77,9 @@ def _as_outcome(ret: object) -> DriveOutcome:
 # seats whose harness statically rejects or approval-gates shell commands.
 # Typed-response threads (review-request/proposal) are excluded: their
 # closure requires a typed kind the draft channel does not carry yet.
-_REPLY_DRAFT_KINDS = frozenset({"question", "message"})
+# `wake` is included: it is an ordinary driven kind whose wk- request id is
+# minted precisely so a plain message reply can correlate.
+_REPLY_DRAFT_KINDS = frozenset({"question", "message", "wake"})
 
 
 def _with_reply_draft(store, agent: str, record: dict) -> dict:
@@ -92,6 +94,11 @@ def _with_reply_draft(store, agent: str, record: dict) -> dict:
     path = reply_transport.reply_draft_path(store, agent, inbound_id)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Bind the draft to THIS attempt: a failed prior attempt may have left
+        # a partial draft at the same deterministic path, and a later clean
+        # turn that never overwrites it must not publish those stale bytes as
+        # the authoritative answer (PR #127 connector P1).
+        path.unlink(missing_ok=True)
     except OSError:
         return record
     decorated = dict(record)

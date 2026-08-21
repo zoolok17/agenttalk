@@ -167,9 +167,9 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         if isinstance(reply_draft, dict) and reply_draft.get("path"):
             out += [
                 "== HOW TO REPLY: PREFERRED DRAFT CHANNEL (works in every sandbox) ==",
-                "Write your COMPLETE reply body (UTF-8, any length/lines) to exactly "
-                "this file with your structured Write/Edit tool, then end your turn — "
-                "the wrapper validates and delivers it on this thread:",
+                "Write your COMPLETE reply body (UTF-8, multi-line fine, up to 1 MiB) "
+                "to exactly this file with your structured Write/Edit tool, then end "
+                "your turn — the wrapper validates and delivers it on this thread:",
                 f"  {reply_draft['path']}",
                 "If your harness can run shell commands you may INSTEAD use the reply "
                 "command below. Use ONE channel, never both.",
