@@ -170,6 +170,36 @@ def _perform_reply(prompt: str, body: str) -> None:
     _run_bus(argv)
 
 
+def _reply_draft_path(prompt: str) -> str | None:
+    """The wrapper-declared freeform draft path (#201): the indented path line
+    inside the PREFERRED DRAFT CHANNEL section."""
+    m = re.search(
+        r"PREFERRED DRAFT CHANNEL.*?\n {2}(\S.*?)\n",
+        prompt,
+        re.DOTALL,
+    )
+    return m.group(1).strip() if m else None
+
+
+def _scenario_draft_only(prompt: str, session_id: str | None) -> int:
+    """#201: a sandbox-blocked child — writes the wrapper-declared reply draft
+    with its 'structured write' (a plain file write here) and NEVER runs a bus
+    command. The wrapper must deliver the draft itself."""
+    _emit_start()
+    draft = _reply_draft_path(prompt)
+    if draft is None:
+        _emit_assistant_text("No draft channel declared; cannot reply from this sandbox.")
+        _emit_stop()
+        _emit_success(session_id)
+        return 0
+    with open(draft, "w", encoding="utf-8") as handle:
+        handle.write("result=399 via wrapper-owned draft delivery\n")
+    _emit_assistant_text("Wrote the answer to the declared reply draft; ending turn.")
+    _emit_stop()
+    _emit_success(session_id)
+    return 0
+
+
 def _scenario_reply_ok(prompt: str, session_id: str | None) -> int:
     _emit_start()
     _emit_assistant_text("Computed the answer (19 * 21 = 399); replying on the bus.")
@@ -220,6 +250,8 @@ def main(argv: list[str]) -> int:
     session_id = _flag_value(argv, "--session-id") or _flag_value(argv, "--resume")
     if scenario == "reply_ok":
         return _scenario_reply_ok(prompt, session_id)
+    if scenario == "draft_only":
+        return _scenario_draft_only(prompt, session_id)
     if scenario == "compute_no_reply":
         return _scenario_compute_no_reply(session_id)
     if scenario == "resume_missing":
