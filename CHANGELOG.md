@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.84.0] - 2026-08-23
+
+Theme: **every seat can answer — wrapper-owned reply delivery.**
+
+Field basis: the JAWS migration dry-run retrospective. A claude-wrapped seat
+could not deliver a bus reply in 5 of 5 work turns — its harness statically
+rejected the prescribed reply command and approval-gated every literal
+respelling, so finished answers dead-lettered into files indistinguishable on
+the bus from a dead agent.
+
+### Added
+
+- **Wrapper-owned reply delivery (freeform path, #201 PR-1).** Every tracked
+  `question`/`message`/`wake` turn now declares a per-message reply draft
+  file in the child prompt. A child that can run no shell command at all
+  answers by writing that file with its structured Write tool and ending its
+  turn; the wrapper validates the draft and publishes it on the thread
+  itself with exact correlation (`in_reply_to` + request-id echo) through
+  the idempotent operation-nonce path. Proven end to end by a stub child
+  through the real spawn path and by a live two-seat smoke (claude + codex,
+  both replies wrapper-delivered).
+- `agenttalk.reply_transport`: the correlation-echo and operation-digest
+  rules are now ONE shared module used by both `agenttalk reply` and the
+  wrapper, so the two reply producers cannot drift (a broadcast copy echoes
+  `request_id` only — a live divergence the design review caught).
+
+### Safety properties (review-driven)
+
+- Delivery is sealed on a CLEAN turn outcome: a child killed mid-write can
+  never have a truncated draft published as its authoritative answer, and a
+  stale draft from a failed attempt is deleted before every retry.
+- A draft the wrapper refuses (oversize, bad encoding, publish failure) is
+  preserved observably as `<id>.refused.md` — never silently dropped.
+- Dual-channel is race-free: a capable child that still uses the reply
+  command causes no duplicate (landed-check by exact anchor or same-thread
+  request id, bounded to messages after the inbound).
+- Typed-response threads keep their contracts: consult questions,
+  review-request/proposal threads, and needs-info follow-ups on review
+  threads are never offered the draft channel.
+
+### Notes
+
+- The commit-gate (owed-action) variant and the seat preflight echo-turn are
+  the next increments (design: `docs/DESIGN-201-wrapper-owned-reply-delivery.md`).
+
 ## [0.83.0] - 2026-08-19
 
 Theme: **fail closed on ambiguous input — no silent fail-open, no false GO.**
