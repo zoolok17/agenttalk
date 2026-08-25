@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.85.0] - 2026-08-25
+
+Theme: **seat reliability — a wrapped seat fails loudly, recovers honestly.**
+
+Field basis: the v0.84.0 two-seat live smoke plus the JAWS retrospective's
+remaining seat-reliability findings (#202/#204/#205).
+
+### Added
+
+- **Interruption-aware redelivery (#202).** A turn killed by the turn
+  watchdog (or lost to a crash mid-turn) is now recorded as an INTERRUPTION,
+  not an anonymous ambiguous failure: the attempt ledger tracks consecutive
+  interruptions, the next delivery carries a rejoin block telling the child
+  it was interrupted and to prefer resuming over redoing, and a partial
+  reply draft left by the killed attempt is preserved as recoverable
+  progress (`<id>.interrupted.md`) instead of being deleted as stale
+  residue. Repeated watchdog kills back off exponentially (chunked,
+  heartbeat-stamped, hard-capped at 15 minutes) and a third consecutive
+  watchdog kill dead-letters the head with a self-clearing
+  `interruption_budget_exhausted` reason naming the preserved draft and the
+  requeue remedy — the seat keeps serving its queue instead of wedging.
+- **Never-started promotion (#205).** A child that consecutively refuses to
+  start (non-git workspace, untrusted directory, broken auth/path) is
+  promoted to a sticky `config_blocked` park with a concrete operator
+  remedy — once 60 seconds have elapsed since the first refusal, or
+  immediately when an unbroken run of refusals reaches the escalation
+  ceiling — instead of burning 20 silent ambiguous retries into an
+  unexplained dead-letter. After the operator fixes the workspace and the
+  wrapper restarts, the park grants exactly one re-probe per wrapper
+  generation, so recovery needs no manual ledger surgery.
+- **Loud wrap refusals (#204).** A plain `wrap` (one-shot) whose child
+  produces zero events now refuses loudly with the honest caveat that the
+  child ran (side effects are real) and concrete remedies, plus an honest
+  `wrapper_no_turn_driven` health state — replacing a silent exit 1 with
+  zero bytes of output. `--to-request` without `--one-shot` is refused at
+  admission with the correct pairing named.
+
+### Fixed
+
+- Never-started classification matches only the canonical signature at the
+  START of a failure summary — a child whose own error output merely echoes
+  the words can no longer be falsely parked as config-blocked.
+- The interruption backoff survives a corrupted cap constant (runtime
+  literal bound), an overflow-length counter (exponent capped before
+  evaluation), and a backwards clock (clamped) — degrading to "slow",
+  never to "effectively never".
+
 ## [0.84.0] - 2026-08-23
 
 Theme: **every seat can answer — wrapper-owned reply delivery.**
