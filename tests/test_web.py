@@ -2752,6 +2752,29 @@ def test_console_renderer_safety(tmp_path: Path) -> None:
     assert "sessionStorage" not in js
 
 
+def test_console_mission_pill_bounds_long_text(tmp_path: Path) -> None:
+    """#207: long mission labels stay inside the header and retain a full-text
+    tooltip when the visible label is truncated."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/console.css") as resp:
+            css = resp.read().decode("utf-8")
+        with _get(f"{base}/static/console.js") as resp:
+            js = resp.read().decode("utf-8")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    pill = re.search(r"\.tc-mission-pill\s*\{([^}]*)\}", css, re.S)
+    label = re.search(r"\.tc-mission-name\s*\{([^}]*)\}", css, re.S)
+    assert pill is not None and "min-width: 0" in pill.group(1)
+    assert pill is not None and "max-width:" in pill.group(1)
+    assert label is not None and "overflow: hidden" in label.group(1)
+    assert label is not None and "text-overflow: ellipsis" in label.group(1)
+    assert "titled(pill, missionText)" in js
+
+
 def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path) -> None:
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")

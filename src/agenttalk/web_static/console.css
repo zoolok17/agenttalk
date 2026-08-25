@@ -277,6 +277,9 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(40vw, 520px);
   padding: 6px 12px;
   border-radius: 8px;
   background: var(--surface2);
@@ -285,7 +288,13 @@ body {
   color: var(--ink2);
 }
 .tc-mission-pill svg { flex: none; }
-.tc-mission-name { font-weight: 500; }
+.tc-mission-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
 .tc-mission-frac { font-family: var(--font-mono); color: var(--ink3); }
 
 .tc-spacer { flex: 1; }

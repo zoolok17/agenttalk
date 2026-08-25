@@ -1166,8 +1166,10 @@
     // Mission pill (from root.spec_kitty.missions — name only, no x/y).
     if (root && root.spec_kitty && isArray(root.spec_kitty.missions) && root.spec_kitty.missions.length) {
       var pill = el('div', 'tc-mission-pill');
+      var missionText = root.spec_kitty.missions.join(' · ');
       pill.appendChild(missionIcon());
-      pill.appendChild(el('span', 'tc-mission-name', root.spec_kitty.missions.join(' · ')));
+      pill.appendChild(el('span', 'tc-mission-name', missionText));
+      titled(pill, missionText);
       bar.appendChild(pill);
     }
 
