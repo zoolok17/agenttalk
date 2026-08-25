@@ -166,6 +166,26 @@ def preserve_refused_draft(draft_path: Path) -> Path | None:
     return target
 
 
+def preserve_interrupted_draft(draft_path: Path) -> Path | None:
+    """Rename an interrupted attempt's leftover draft to ``.interrupted.md``.
+
+    #202 D5: a draft cut short by a watchdog kill / crash is the child's
+    recoverable progress, not stale garbage — the next attempt's rejoin context
+    names this path so the child can resume instead of redoing. Single suffix;
+    the target is unlinked first (Windows rename-over-existing throws —
+    mirrors preserve_refused_draft). The LIVE draft path is left clear, and
+    delivery reads only the exact declared live path, so the preserved copy
+    can never publish.
+    """
+    target = draft_path.with_suffix(".interrupted.md")
+    try:
+        target.unlink(missing_ok=True)
+        draft_path.rename(target)
+    except OSError:
+        return None
+    return target
+
+
 def read_reply_draft(draft_path: Path) -> str | None:
     """Read and bound a child-written draft; None means 'no deliverable draft'.
 

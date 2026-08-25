@@ -731,6 +731,99 @@ def test_30_f3_supervisor_config_caps_take_effect(tmp_path: Path) -> None:
     assert sup.resolve_dead_letter_caps({"dead_letter": {"max_attempts": 0}}, {}) == (0, 20)  # 0 disables
 
 
+def test_interruption_policy_resolver_chain_and_corrupt_values() -> None:
+    # #202 D2: per-agent -> global -> default, mirroring resolve_dead_letter_caps -
+    # but a PRESENT-and-corrupt value is an ERROR (refuse-visibly), never a clamp.
+    assert sup.resolve_interruption_policy({}, {}) == (60.0, 3, [])              # defaults
+    assert sup.resolve_interruption_policy(
+        {"interruption_redrive_seconds": 30, "k_interrupted": 5}, {}) == (30.0, 5, [])
+    assert sup.resolve_interruption_policy(
+        {"interruption_redrive_seconds": 30},
+        {"interruption_redrive_seconds": 15, "k_interrupted": 2}) == (15.0, 2, [])  # per-agent wins
+    assert sup.resolve_interruption_policy({}, {"k_interrupted": 0}) == (60.0, 0, [])  # 0 disables
+    _, _, errors = sup.resolve_interruption_policy(
+        {}, {"interruption_redrive_seconds": "fast"})
+    assert errors and "interruption_redrive_seconds" in errors[0]
+    _, _, errors = sup.resolve_interruption_policy({"k_interrupted": -1}, {})
+    assert errors and "k_interrupted" in errors[0]
+    # corrupt containers degrade to defaults without crashing (resolver-chain parity)
+    assert sup.resolve_interruption_policy("junk", 7) == (60.0, 3, [])
+    # #202 cold-review P2-4: a valid-JSON-but-absurd knob (a hand-edited config, or
+    # the JSON extension `Infinity`) that the D2 backoff's base*2**(n-1) would
+    # overflow toward inf must refuse (never silently clamp to the 900s runtime
+    # cap) - same discipline as a non-numeric value.
+    _, _, errors = sup.resolve_interruption_policy(
+        {}, {"interruption_redrive_seconds": 1e308})
+    assert errors and "interruption_redrive_seconds" in errors[0]
+    _, _, errors = sup.resolve_interruption_policy(
+        {}, {"interruption_redrive_seconds": float("inf")})
+    assert errors and "interruption_redrive_seconds" in errors[0]
+    # #7-fix-3: the resolver's bound is tightened to (0, 900] to match the
+    # runtime's INTERRUPTION_BACKOFF_CAP_SECONDS - a base above 900 would
+    # otherwise pass here but be silently reduced by the runtime cap on the
+    # very first interruption, exactly the silent-clamp this resolver exists
+    # to refuse instead of doing.
+    _, _, errors = sup.resolve_interruption_policy(
+        {}, {"interruption_redrive_seconds": 901})
+    assert errors and "interruption_redrive_seconds" in errors[0]
+    assert "900" in errors[0]
+    # the upper bound itself is a VALID launch value
+    assert sup.resolve_interruption_policy(
+        {}, {"interruption_redrive_seconds": 900}) == (900.0, 3, [])
+
+
+def test_interruption_ledger_counts_always_write_and_survive_relaunch(tmp_path: Path) -> None:
+    # #202 D1: interrupted result -> counter+1 (both counters for turn_watchdog);
+    # non-interrupted -> counters reset AND flags overwritten to False/None (the
+    # stale-flag bug); the ledger is durable across a relaunch (new Store instance).
+    s = _store(tmp_path)
+    m = _send(s, "task")
+    rec = _rec(s)
+    for n in (1, 2):
+        s.record_attempt_start("beta", rec, attempt_id=f"a{n}", at=f"t{n}")
+        s.record_attempt_result("beta", rec["id"], failure_class=CLASS_AMBIGUOUS,
+                                summary="turn watchdog killed hung tool descendant",
+                                at=f"t{n}", interrupted=True,
+                                interruption_kind="turn_watchdog")
+        r = s.attempt_record("beta", rec["id"])
+        assert r["interrupted_consecutive"] == n
+        assert r["interrupted_watchdog_consecutive"] == n
+        assert r["last_interrupted"] is True
+        assert r["last_interruption_kind"] == "turn_watchdog"
+    # relaunch: a NEW Store instance reads the same persisted counters
+    r = Store(tmp_path).attempt_record("beta", rec["id"])
+    assert r["interrupted_consecutive"] == 2
+    # a non-interrupted result RESETS the run and overwrites the flags
+    s.record_attempt_start("beta", rec, attempt_id="a3", at="t3")
+    s.record_attempt_result("beta", rec["id"], failure_class=CLASS_AMBIGUOUS,
+                            summary="ordinary failure", at="t3")
+    r = s.attempt_record("beta", rec["id"])
+    assert r["interrupted_consecutive"] == 0
+    assert r["interrupted_watchdog_consecutive"] == 0
+    assert r["last_interrupted"] is False
+    assert r["last_interruption_kind"] is None
+    assert m.id == rec["id"]
+
+
+def test_crash_reconcile_increments_any_kind_but_never_the_watchdog_counter(
+    tmp_path: Path,
+) -> None:
+    # #202 D1 + NEW-2: crash_mid_turn IS an interruption (backoff + rejoin apply),
+    # but its cause is UNOBSERVED - it must never count toward the turn_watchdog-only
+    # k_interrupted ceiling (the codified store ruling stands).
+    s = _store(tmp_path)
+    _send(s, "task")
+    rec = _rec(s)
+    for n in (1, 2, 3):
+        s.record_attempt_start("beta", rec, attempt_id=f"a{n}", at=f"t{n}")
+        assert s.reconcile_crash_in_progress("beta", rec["id"], at=f"t{n}") is True
+        r = s.attempt_record("beta", rec["id"])
+        assert r["interrupted_consecutive"] == n
+        assert r.get("interrupted_watchdog_consecutive", 0) == 0   # never the ceiling counter
+        assert r["last_interrupted"] is True
+        assert r["last_interruption_kind"] == "crash_mid_turn"
+
+
 def test_31_unrouted_escalation_retries_after_target_configured(tmp_path: Path) -> None:
     # codex re-review P2: an UNROUTED escalation (no liaison/lead) must NOT be permanently
     # deduped - once an operator target is configured, the loop retries and the notice
@@ -1258,6 +1351,27 @@ def test_46_crash_mid_turn_resets_poison_counter(tmp_path: Path) -> None:
     rec2 = s.attempt_record("beta", m.id)
     assert int(rec2["poison_eligible_failures"]) == 0        # crash reset the consecutive run
     assert rec2["last_failure_class"] == "ambiguous_or_unknown"
+
+
+def test_46b_crash_mid_turn_resets_never_started_tracking(tmp_path: Path) -> None:
+    # #7-fix-4: a crash mid-turn breaks the "consecutive never-started" run by
+    # definition (the process DID start this attempt - it crashed, which is why
+    # it's here). Leaving never_started_first_at/never_started_consecutive
+    # intact would let a LATER never-started failure promote using a
+    # window/count that spans across the crash, not an actually-consecutive run.
+    s = _store(tmp_path)
+    m = _send(s, "never-started-then-crash")
+    rec = _rec(s)
+    s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+    data = s.dead_letter_attempts("beta")
+    data["messages"][m.id]["never_started_first_at"] = "t0"
+    data["messages"][m.id]["never_started_consecutive"] = 1
+    data["messages"][m.id]["in_progress"] = True             # crashed mid-turn
+    s._write_attempts("beta", data)
+    assert s.reconcile_crash_in_progress("beta", m.id, at="t2") is True
+    rec2 = s.attempt_record("beta", m.id)
+    assert rec2["never_started_first_at"] is None
+    assert rec2["never_started_consecutive"] == 0
 
 
 def test_47_infra_dominant_crash_at_ceiling_escalates_no_dispose(tmp_path: Path) -> None:

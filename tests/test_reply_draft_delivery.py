@@ -365,6 +365,91 @@ def test_one_shot_path_delivers_the_draft(tmp_path) -> None:
     assert (msg.meta or {}).get("request_id") == "q-oneshot"
 
 
+def test_one_shot_interrupted_draft_is_preserved_across_the_in_memory_redrive(tmp_path) -> None:
+    # cold-review FIX 5: _run_one_shot has NO attempt ledger, so _with_reply_draft's
+    # preservation gate must ALSO trust the in-memory ``interrupted_redelivery``
+    # decoration the one-shot loop places on the record - otherwise the ledger read
+    # is always empty here and the interrupted attempt's draft is unconditionally
+    # deleted even while the rejoin still says "prefer resuming over redoing".
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="scoped q",
+               meta={"request_id": "q-oneshot-interrupted"})
+    attempts = {"n": 0}
+
+    def drive(rec):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            Path(rec["reply_draft"]["path"]).write_text(
+                "scoped partial progress", encoding="utf-8")
+            return loop.DriveOutcome(
+                ok=False, failure_class=loop.CLASS_AMBIGUOUS,
+                summary="turn watchdog killed hung tool descendant",
+                interrupted=True, interruption_kind="turn_watchdog")
+        return True                      # clean retry, no draft written
+
+    turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                          max_turns=1, max_polls=6,
+                          only_request_id="q-oneshot-interrupted")
+    assert turns == 1
+    assert attempts["n"] == 2
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    preserved = live.with_suffix(".interrupted.md")
+    assert preserved.is_file()
+    assert preserved.read_text(encoding="utf-8") == "scoped partial progress"
+    assert not live.exists()             # live path clear for the retry
+    assert _reply_inbox(s, "alpha") == []
+
+
+def test_direct_reply_with_no_draft_this_turn_also_gcs_the_interrupted_draft(
+    tmp_path,
+) -> None:
+    # #202 cold-review P2-6: _deliver_reply_draft used to return EARLY when there
+    # is no LIVE draft this turn (the child answered directly via the CLI/bus
+    # channel instead) - skipping the landed-check entirely, so a preserved
+    # <id>.interrupted.md from an earlier interrupted attempt survived FOREVER
+    # once the retry succeeded via the direct channel (nothing else ever revisits
+    # a head once it commits clean). The landed-check-success path must GC it too.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-direct"})
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    preserved = live.with_suffix(".interrupted.md")
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    preserved.write_text("earlier partial progress", encoding="utf-8")
+
+    def drive(rec):
+        # the child answers directly via the bus, writing NO draft this turn.
+        s.send(sender="beta", recipient="alpha", body="direct answer",
+               meta={"in_reply_to": q.id, "request_id": "q-direct"})
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    assert [m.body for m in _reply_inbox(s, "alpha")] == ["direct answer"]
+    assert not preserved.exists()          # GC'd, not left to linger forever
+
+
+def test_clean_turn_with_no_draft_and_no_interruption_history_never_scans(
+    tmp_path, monkeypatch,
+) -> None:
+    # P2-6 cost guard: a plain clean turn with NO preserved .interrupted.md sibling
+    # must not pay the landed-reply store scan at all (cheap is_file() check first).
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+           meta={"request_id": "q-plain"})
+    scanned = {"n": 0}
+    real_landed = reply_transport.landed_reply_exists
+
+    def counting_landed(*args, **kwargs):
+        scanned["n"] += 1
+        return real_landed(*args, **kwargs)
+
+    monkeypatch.setattr(reply_transport, "landed_reply_exists", counting_landed)
+    loop.run_loop(s, "beta", lambda rec: True, clock=lambda: 0.0,
+                  sleep=lambda d: None, max_turns=1)
+    assert scanned["n"] == 0
+
+
 def test_message_on_review_thread_gets_no_draft_channel(tmp_path) -> None:
     # PR #127 connector P2: a kind=message on a review-request thread (e.g.
     # a needs-info answer) owes a TYPED review-result next — the draft
@@ -410,3 +495,157 @@ def test_publish_exception_preserves_the_draft(tmp_path, monkeypatch) -> None:
     refused = reply_transport.reply_draft_path(s, "beta", q.id).with_suffix(".refused.md")
     assert refused.exists()
     assert refused.read_text(encoding="utf-8") == "good answer"
+
+
+# ---------------------------------------- #202 D5: preserve the interrupted draft
+
+def test_interrupted_draft_never_published_and_gcd_on_clean_no_reply_commit(
+    tmp_path,
+) -> None:
+    # #202 D5: attempt 1 writes a partial draft and is INTERRUPTED (watchdog kill);
+    # the retry preserves it at <id>.interrupted.md (the rejoin names it) while the
+    # LIVE path stays clear - so the preserved bytes can never be published.
+    #
+    # #7-fix-7: this clean retry writes no live draft and sends no direct reply
+    # (a freeform message may owe no reply at all) - once it COMMITS, the
+    # preserved sibling is moot (nothing else will ever revisit this head) and
+    # must be GC'd, not left on disk forever.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-interrupted"})
+    attempts = {"n": 0}
+
+    def drive(rec):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            Path(rec["reply_draft"]["path"]).write_text(
+                "partial progress", encoding="utf-8")
+            return loop.DriveOutcome(
+                ok=False, failure_class=loop.CLASS_AMBIGUOUS,
+                summary="turn watchdog killed hung tool descendant",
+                interrupted=True, interruption_kind="turn_watchdog")
+        return True                      # clean retry, no draft written
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1, max_polls=4, k_poison=0, k_escalate=0,
+                  interruption_redrive_seconds=0.0)
+    assert attempts["n"] >= 2
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    preserved = live.with_suffix(".interrupted.md")
+    assert not preserved.exists()                # GC'd once the clean retry committed
+    assert not live.exists()                     # live path clear for the retry
+    assert _reply_inbox(s, "alpha") == []        # preserved copy never publishes
+    assert s.cursor("beta") == q.id              # the clean retry still committed
+
+
+def test_non_interrupted_failed_attempt_draft_is_still_deleted(tmp_path) -> None:
+    # #202 D5 (the other half): an ordinary NON-interrupted failure keeps today's
+    # delete - no .interrupted.md sibling appears (that suffix means "interrupted").
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-ordinary"})
+    attempts = {"n": 0}
+
+    def drive(rec):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            Path(rec["reply_draft"]["path"]).write_text("partial", encoding="utf-8")
+            return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_INFRA,
+                                     summary="killed mid-write")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1, max_polls=4, k_poison=0, k_escalate=0)
+    assert attempts["n"] >= 2
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    assert not live.exists()
+    assert not live.with_suffix(".interrupted.md").exists()
+
+
+def test_preserve_interrupted_draft_pre_unlinks_the_target(tmp_path) -> None:
+    # Windows rename-over-existing throws: a stale preserved copy from an earlier
+    # interruption must be unlinked first (mirrors preserve_refused_draft).
+    d = tmp_path / "drafts"
+    d.mkdir()
+    live = d / "m-1.md"
+    live.write_text("new partial", encoding="utf-8")
+    stale = d / "m-1.interrupted.md"
+    stale.write_text("old preserved copy", encoding="utf-8")
+    out = reply_transport.preserve_interrupted_draft(live)
+    assert out == stale
+    assert stale.read_text(encoding="utf-8") == "new partial"
+    assert not live.exists()
+
+
+# ------------------------------------------------------- cold-review FIX 6: GC
+
+def test_interruption_budget_exhausted_dispose_keeps_the_preserved_draft(tmp_path) -> None:
+    # cold-review FIX 6 originally GC'd <id>.interrupted.md on EVERY dispose. #202
+    # cold-review P2-3 narrows that: the interruption-budget-exhausted dispose is
+    # the ONE case where that sibling IS the final progress evidence for the very
+    # interruptions that exhausted the budget - it must be KEPT (not unlinked) so
+    # the operator can inspect/requeue with context. See
+    # test_ordinary_dispose_still_gcs_the_interrupted_draft (test_wrapper_loop.py)
+    # for the still-GC'd ordinary-dispose case.
+    #
+    # #7-fix-6: the KTH (final, budget-ending) attempt's LIVE draft is NEWER than
+    # the sibling preserved from attempt 1 - it must be moved over that older
+    # copy before the dispose, so the remedy/operator sees the NEWEST partial
+    # work, not the first attempt's stale one.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-gc-dispose"})
+    attempts = {"n": 0}
+
+    def drive(rec):
+        attempts["n"] += 1
+        Path(rec["reply_draft"]["path"]).write_text(
+            f"partial {attempts['n']}", encoding="utf-8")
+        return loop.DriveOutcome(
+            ok=False, failure_class=loop.CLASS_AMBIGUOUS,
+            summary="turn watchdog killed hung tool descendant",
+            interrupted=True, interruption_kind="turn_watchdog")
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_polls=4, k_poison=0, k_escalate=0, k_interrupted=2,
+                  interruption_redrive_seconds=0.0)
+    assert attempts["n"] == 2                  # 1st preserves attempt 1's draft, 2nd hits k_interrupted
+    assert s.dead_lettered_count("beta") == 1
+    entry = s.list_dead_letters("beta")[0]
+    assert entry["last_reason"] == "interruption_budget_exhausted"
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    preserved = live.with_suffix(".interrupted.md")
+    assert preserved.is_file()                 # KEPT - the operator's final progress evidence
+    assert preserved.read_text(encoding="utf-8") == "partial 2"  # NEWEST attempt's content
+    assert not live.exists()                   # the kth attempt's live draft is never left behind
+
+
+def test_successful_draft_delivery_unlinks_the_preserved_interrupted_draft(tmp_path) -> None:
+    # cold-review FIX 6 (the other half): once a real reply lands for a head, an
+    # earlier preserved <id>.interrupted.md for that SAME head is moot - GC it so
+    # a stale pre-success draft can never be misread as still-pending progress.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-gc-deliver"})
+    attempts = {"n": 0}
+
+    def drive(rec):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            Path(rec["reply_draft"]["path"]).write_text(
+                "partial progress", encoding="utf-8")
+            return loop.DriveOutcome(
+                ok=False, failure_class=loop.CLASS_AMBIGUOUS,
+                summary="turn watchdog killed hung tool descendant",
+                interrupted=True, interruption_kind="turn_watchdog")
+        Path(rec["reply_draft"]["path"]).write_text("the real answer", encoding="utf-8")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1, max_polls=4, k_poison=0, k_escalate=0,
+                  interruption_redrive_seconds=0.0)
+    assert attempts["n"] == 2
+    preserved = reply_transport.reply_draft_path(s, "beta", q.id).with_suffix(".interrupted.md")
+    assert not preserved.exists()              # GC'd once the real reply landed
+    (msg,) = _reply_inbox(s, "alpha")
+    assert msg.body == "the real answer"

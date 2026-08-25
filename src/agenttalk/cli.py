@@ -10041,10 +10041,14 @@ def _dead_letter_notifier(store, agent: str):
                 return True
             request_id = "esc-" + uuid.uuid4().hex[:12]
             verb = "DEAD-LETTERED" if disposed else "repeatedly FAILING (not yet dead-lettered)"
+            # #202 D3 (review finding 9): carry the REAL reason/remedy, not only the
+            # class - e.g. the interruption-budget escalation's concrete remedy.
+            reason = str(info.get("summary") or "")
             body = (f"[dead-letter] agent {ag} {verb} message {mid} from "
                     f"{info.get('from')} (kind={info.get('kind')}, "
                     f"attempts={info.get('attempts')}, class={info.get('failure_class')}). "
-                    f"Inspect: agenttalk dead-letter show --agent {ag} --id {mid}")
+                    + (f"Reason: {reason}  " if reason else "")
+                    + f"Inspect: agenttalk dead-letter show --agent {ag} --id {mid}")
             if disposed:
                 body += f"  Requeue: agenttalk dead-letter requeue --agent {ag} --id {mid}"
             store.send(sender=agent, recipient=target, kind="question",
@@ -10353,10 +10357,101 @@ def _inject_claude_permission_mode(argv: list[str], cli: str,
     return [*argv, "--permission-mode", perm_mode]
 
 
+def _interruption_rejoin_for(store, agent: str, k_interrupted: int):
+    """Build make_drive's #202 D4 rejoin provider (cli wiring, NOT the loop).
+
+    Keyed per head id from the PERSISTED attempt ledger, so a rejoin can never leak
+    across heads and survives relaunch. The one-shot loop has no ledger; it decorates
+    the record in-memory (``interrupted_redelivery``) and is read here first. Returns
+    the REJOIN CONTEXT block, or None on a first attempt / clean redelivery."""
+    from agenttalk import reply_transport as _rt
+
+    def _elapsed_text(last_at: object) -> str:
+        if not isinstance(last_at, str) or not last_at.strip():
+            return "an unknown time"
+        try:
+            at = datetime.fromisoformat(last_at.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return "an unknown time"
+        seconds = max(0.0, datetime.now(timezone.utc).timestamp() - at.timestamp())
+        return f"~{seconds:.0f}s"
+
+    def rejoin_for(record: dict) -> str | None:
+        head_id = record.get("id")
+        ctx = record.get("interrupted_redelivery")
+        # #202 cold-review P2-2: the one-shot path (``ctx`` is the in-memory
+        # decoration) has NO attempt ledger and _run_one_shot never enforces
+        # k_interrupted (bounded by max_wall instead) - the budget clause below
+        # must never be shown for it, or the rejoin promises a dead-letter ceiling
+        # that can never fire.
+        is_one_shot = isinstance(ctx, dict)
+        watchdog_count = 0
+        if is_one_shot:
+            kind = ctx.get("kind") or "unknown"
+            count = ctx.get("consecutive") or 1
+            last_at = ctx.get("last_failure_at")
+        else:
+            if not isinstance(head_id, str) or not head_id:
+                return None
+            rec = store.attempt_record(agent, head_id) or {}
+            if not rec.get("last_interrupted"):
+                return None
+            kind = rec.get("last_interruption_kind") or "unknown"
+            try:
+                count = max(1, int(rec.get("interrupted_consecutive") or 1))
+            except (TypeError, ValueError):
+                count = 1
+            # #202 cold-review P2-5: ``interrupted_consecutive`` counts ANY kind
+            # (crash_mid_turn interruptions included), but the budget is
+            # turn_watchdog-only - showing the any-kind count against it overstates
+            # how close the message is to the ceiling after a mixed crash+watchdog
+            # run. Show the watchdog-only count against k, and name any extra
+            # crash interruptions separately instead of folding them in silently.
+            try:
+                watchdog_count = max(0, int(rec.get("interrupted_watchdog_consecutive") or 0))
+            except (TypeError, ValueError):
+                watchdog_count = 0
+            last_at = rec.get("last_failure_at")
+        lines = [
+            f"Your previous turn on this message was INTERRUPTED ({kind}) "
+            f"{_elapsed_text(last_at)} ago - the work was killed mid-turn, "
+            "not rejected.",
+        ]
+        if is_one_shot:
+            lines.append(
+                f"Consecutive interruptions on this message: {count}; no automatic "
+                "budget applies in one-shot mode.")
+        elif kind == "turn_watchdog" and k_interrupted > 0:
+            n_shown = max(1, watchdog_count)
+            crash_extra = max(0, count - watchdog_count)
+            plus_clause = (
+                f" (plus {crash_extra} crash interruption{'s' if crash_extra != 1 else ''})"
+                if crash_extra > 0 else "")
+            lines.append(
+                f"This is interruption {n_shown} of a budget of {k_interrupted}"
+                f"{plus_clause}; at the budget the message is dead-lettered for "
+                "the operator.")
+        else:
+            lines.append(f"Consecutive interruptions on this message: {count}.")
+        if isinstance(head_id, str) and head_id:
+            preserved = _rt.reply_draft_path(store, agent, head_id).with_suffix(
+                ".interrupted.md")
+            if preserved.is_file():
+                lines.append(f"Your interrupted draft was preserved at: {preserved}")
+        lines.append("Verify state before repeating side-effectful work; prefer "
+                     "resuming over redoing.")
+        return "\n".join(lines)
+
+    return rejoin_for
+
+
 def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     sender: str, min_interval: float, render: bool,
                     one_shot_request_id: str | None = None,
                     k_poison: int = 3, k_escalate: int = 20,
+                    k_interrupted: int = 3,
+                    heartbeat_interval: float | None = None,
+                    interruption_redrive_seconds: float = 60.0,
                     infra_exhaust_after_seconds: float = 14400.0,
                     infra_exhaust_min_attempts: int = 100,
                     noninfra_sub_ceiling: int | None = None,
@@ -10513,6 +10608,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             # lost_lease, never a bus heartbeat without the lease), while the
             # pre_commit gate remains the consume-boundary authority.
             lease_lost_exceptions=(_LeadLoopLeaseLost,) if lead_loop else (),
+            # #202 D4: tell the child it was interrupted - built here in the cli
+            # wiring (review finding 7), reading the persisted attempt ledger.
+            rejoin_for=_interruption_rejoin_for(store, agent, k_interrupted),
         )
     except ValueError as e:
         _release()
@@ -10658,6 +10756,22 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             only_request_id=one_shot_request_id,
             max_wall=max_wall,
             k_poison=k_poison, k_escalate=k_escalate,
+            k_interrupted=k_interrupted,
+            # cold-review FIX 7: pass the SAME value cmd_wrap already validated
+            # against stuck_after (HEARTBEAT_INTERVAL_SECONDS) explicitly, rather
+            # than relying on run_loop's default parameter matching the module
+            # constant by coincidence - the launch invariant and the runtime value
+            # can then never drift apart.
+            heartbeat_interval=(
+                heartbeat_interval if heartbeat_interval is not None
+                else wloop.HEARTBEAT_INTERVAL_SECONDS
+            ),
+            interruption_redrive_seconds=interruption_redrive_seconds,
+            # for the escalation's remedy text only: the watchdog budget each
+            # killed turn burned (None when the watchdog is not live).
+            interruption_budget_seconds=(
+                getattr(turn_watchdog, "turn_elapsed_seconds", None)
+                if getattr(turn_watchdog, "enabled", False) else None),
             infra_exhaust_after_seconds=infra_exhaust_after_seconds,
             infra_exhaust_min_attempts=infra_exhaust_min_attempts,
             noninfra_sub_ceiling=noninfra_sub_ceiling,
@@ -11212,6 +11326,35 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
                 return _handle_launch_config_blocked(
                     store, agent, args.cli, mode=whb_mode,
                     min_interval=args.min_interval, summary=summary)
+        # #202 D2: interruption-aware redelivery knobs. A present-but-corrupt value
+        # refuses visibly through the launch config-blocked path (never silently
+        # clamped) - same discipline as work_heartbeat above.
+        interruption_redrive, k_interrupted, _int_errors = (
+            _sup.resolve_interruption_policy(sup_cfg, cfg_agent))
+        if _int_errors:
+            summary = ("invalid interruption redelivery config (never silently "
+                       "coerced): " + "; ".join(_int_errors))
+            sys.stderr.write(f"agenttalk wrap: {summary}\n")
+            return _handle_launch_config_blocked(
+                store, agent, args.cli, mode=whb_mode,
+                min_interval=args.min_interval, summary=summary)
+        # #202 D2 launch validation (rev 3): the chunked backoff stamps once per
+        # heartbeat_interval slice, keeping heartbeat age <= heartbeat_interval no
+        # matter how long the total backoff - so the ONE load-bearing invariant is
+        # heartbeat_interval < stuck_after. Refuse with both numbers.
+        from agenttalk.wrapper.loop import HEARTBEAT_INTERVAL_SECONDS as _hb_interval
+        _stuck_after = _sup.resolve_stuck_after(sup_cfg, cfg_agent)
+        if _hb_interval >= _stuck_after:
+            summary = (
+                f"wrapper heartbeat_interval {_hb_interval:.0f}s must be below "
+                f"stuck_after {_stuck_after:.0f}s: the interruption backoff stamps "
+                f"the heartbeat once per {_hb_interval:.0f}s chunk, so a stuck_after "
+                "at/below it would let the supervisor kill a deliberately "
+                "backing-off wrapper. Raise stuck_after_seconds.")
+            sys.stderr.write(f"agenttalk wrap: {summary}\n")
+            return _handle_launch_config_blocked(
+                store, agent, args.cli, mode=whb_mode,
+                min_interval=args.min_interval, summary=summary)
         return _wrap_loop_mode(
             store,
             agent,
@@ -11223,6 +11366,9 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
             one_shot_request_id=args.to_request if args.one_shot else None,
             k_poison=k_poison,
             k_escalate=k_escalate,
+            k_interrupted=k_interrupted,
+            heartbeat_interval=_hb_interval,
+            interruption_redrive_seconds=interruption_redrive,
             infra_exhaust_after_seconds=infra_ceiling[
                 "infra_exhaust_after_seconds"
             ],

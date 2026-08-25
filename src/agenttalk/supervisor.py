@@ -845,6 +845,61 @@ def resolve_dead_letter_caps(config: dict, cfg_agent: dict) -> tuple[int, int]:
     return _pick("max_attempts"), _pick("escalate_after_attempts")
 
 
+def resolve_interruption_policy(config: dict, cfg_agent: dict) -> tuple[float, int, list[str]]:
+    """The interruption-aware redelivery knobs (#202, PURE):
+    ``(interruption_redrive_seconds, k_interrupted, errors)``.
+
+    Per-agent -> global -> default (60.0s / 3), mirroring resolve_dead_letter_caps'
+    chain - but unlike the caps, a PRESENT-and-corrupt value is returned as an ERROR
+    the launch path refuses visibly (config-blocked), never a silent clamp or
+    default. ``k_interrupted`` 0 disables the ceiling (debug only).
+
+    #202 cold-review P2-4: ``interruption_redrive_seconds`` must be finite AND
+    bounded - a hand-edited (or JSON-extension ``Infinity``) value like ``1e308``
+    is a valid positive number that the D2 backoff's ``base * 2**(n-1)`` overflows
+    toward ``inf``; the runtime hard cap (INTERRUPTION_BACKOFF_CAP_SECONDS) then
+    SILENTLY CLAMPS it to 900s regardless of what the operator configured - exactly
+    the silent-clamp this resolver exists to refuse instead of doing.
+
+    #7-fix-3: the bound here used to be (0, 86400] (24h), but the runtime's D2
+    backoff hard-caps the computed sleep at INTERRUPTION_BACKOFF_CAP_SECONDS
+    (900s) regardless of ``base``. A base above 900 would pass this resolver
+    but still be silently reduced by the runtime cap on the very first
+    interruption (n=1: ``base * 2**0 == base``) - exactly the silent-clamp
+    this resolver exists to refuse. So the resolver's own bound is tightened
+    to (0, 900] to match, and refused loudly (not clamped) if exceeded."""
+    config = config if isinstance(config, dict) else {}
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+    errors: list[str] = []
+    redrive = 60.0
+    for source_name, src in (("per-agent", cfg_agent), ("global", config)):
+        if "interruption_redrive_seconds" not in src:
+            continue
+        v = src.get("interruption_redrive_seconds")
+        if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and 0 < v <= 900):
+            redrive = float(v)
+        else:
+            errors.append(
+                f"invalid {source_name} interruption_redrive_seconds={v!r}; "
+                "expected a finite positive number no greater than 900 "
+                "(the runtime's interruption backoff cap)")
+        break
+    k_interrupted = 3
+    for source_name, src in (("per-agent", cfg_agent), ("global", config)):
+        if "k_interrupted" not in src:
+            continue
+        v = src.get("k_interrupted")
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+            k_interrupted = v
+        else:
+            errors.append(
+                f"invalid {source_name} k_interrupted={v!r}; "
+                "expected a non-negative integer (0 disables)")
+        break
+    return redrive, k_interrupted, errors
+
+
 def resolve_infra_retry_exhaustion(config: dict, cfg_agent: dict,
                                    k_escalate: int) -> dict:
     """Resolve the finite infra-exhaustion ceiling.

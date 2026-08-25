@@ -562,6 +562,60 @@ def test_run_wrapper_degraded_codex_message_escalates_when_enabled() -> None:
     assert "degraded-output" in restarts[0].reason
 
 
+@pytest.mark.parametrize("child_rc,expected_rc", [(0, 1), (7, 7)])
+def test_run_wrapper_zero_events_refuses_loudly(
+    monkeypatch, capsys, child_rc: int, expected_rc: int,
+) -> None:
+    # #204: a child that produces NO parseable structured events drove nothing - no
+    # heartbeat, no render, no degraded detection. That used to exit 0 (child rc) in
+    # total silence. Now: a one-line stderr diagnostic naming the remedy, and never
+    # exit 0 (a clean child rc becomes 1; a nonzero child rc passes through).
+    class _Stdout:
+        def __iter__(self):
+            return iter(["not json at all\n", "\n"])   # noise only -> zero events
+
+        def close(self):
+            pass
+
+    class _Popen:
+        def __init__(self, argv, **kwargs):
+            _ = argv, kwargs
+            self.stdout = _Stdout()
+
+        def wait(self):
+            return child_rc
+
+    monkeypatch.setattr(run.subprocess, "Popen", _Popen)
+
+    rc = run.run_wrapper(
+        cli="codex", agent="worker", argv=["codex"], render=False,
+        heartbeat_fn=lambda _event, _now: None,
+        restart_fn=lambda _signal: None,
+        info_fn=lambda _signal: None,
+    )
+    assert rc == expected_rc
+    err = capsys.readouterr().err
+    assert "no turn driven" in err
+    assert "--loop" in err                         # the concrete remedy reaches stderr
+
+
+def test_run_wrapper_injected_line_source_zero_events_refuses_loudly(capsys) -> None:
+    # cold-review FIX 4: the injected-stream branch used to return 0 silently on
+    # zero parseable events. It must refuse the same way the real subprocess
+    # branch does (never a silent success-shaped no-op).
+    rc = run.run_wrapper(
+        cli="codex", agent="worker", argv=["codex"], render=False,
+        line_source=["not json at all\n", "\n"],
+        heartbeat_fn=lambda _event, _now: None,
+        restart_fn=lambda _signal: None,
+        info_fn=lambda _signal: None,
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "no turn driven" in err
+    assert "--loop" in err
+
+
 def test_run_wrapper_unknown_cli_raises() -> None:
     import pytest
     # codex + claude are registered (Phase 1 + 2); an unknown CLI has no adapter.
