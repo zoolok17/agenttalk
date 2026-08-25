@@ -2775,6 +2775,85 @@ def test_console_mission_pill_bounds_long_text(tmp_path: Path) -> None:
     assert "titled(pill, missionText)" in js
 
 
+def test_console_ages_and_staleness_use_server_time_anchor(tmp_path: Path) -> None:
+    """#207: wall-clock skew on the browser cannot make a server-timestamped
+    event newer/older or keep a failed poll labelled current."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console timestamp test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    acceptState: function (payload) {\n"
+        "      stampStatePayload(payload);\n"
+        "      lastState = payload;\n"
+        "      return payload;\n"
+        "    },\n"
+        "    liveAge: liveAge,\n"
+        "    serverClockText: serverClockText,\n"
+        "    pollingStatus: pollingStatus,\n"
+        "    resetText: resetText\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-time.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-time.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+let monotonic = 1000;
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return monotonic; } },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+vm.runInContext('Date.now = () => Date.parse("2100-01-01T00:00:00Z")', ctx);
+
+const hooks = ctx.__agenttalkConsoleTestHooks;
+const payload = {
+  generated_at: '2026-08-25T20:00:00Z',
+  roots: [],
+  sample: { ts: '2026-08-25T19:59:50Z', age_seconds: 10 },
+};
+hooks.acceptState(payload);
+monotonic = 6000;
+if (hooks.liveAge(payload.sample) !== 15) {
+  throw new Error(`server-relative age mixed in client clock: ${hooks.liveAge(payload.sample)}`);
+}
+if (hooks.serverClockText() !== '20:00:05 UTC') {
+  throw new Error(`server clock was not rendered in UTC: ${hooks.serverClockText()}`);
+}
+const resetAt = Date.parse('2026-08-25T20:30:00Z') / 1000;
+if (hooks.resetText({ resets_at: resetAt }) !== 'resets at 20:30 UTC') {
+  throw new Error(`server reset timestamp was not rendered in UTC: ${hooks.resetText({ resets_at: resetAt })}`);
+}
+if (hooks.pollingStatus().label !== 'Current') {
+  throw new Error(`fresh server snapshot was not labelled current: ${hooks.pollingStatus().label}`);
+}
+monotonic = 10000;
+if (hooks.pollingStatus().label !== 'Stale') {
+  throw new Error(`aged server snapshot was not labelled stale: ${hooks.pollingStatus().label}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path) -> None:
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")

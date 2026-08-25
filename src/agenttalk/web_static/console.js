@@ -123,8 +123,9 @@
     sessionRid: null,      // thread request_id
     filter: 'all',         // all | working | idle | attention
     selectedRootId: initialRootId(),
-    now: Date.now(),
+    now: null,             // server-derived wall time; never the browser clock
   };
+  var serverClock = null;  // { epochMs, receivedAt } anchored by /api/state.generated_at
   var rootGeneration = 0;
   // Prefs (persisted). Loaded/validated below.
   var prefs = { theme: 'light', accent: 'blue', density: 'comfortable' };
@@ -203,6 +204,54 @@
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
   function isArray(x) { return Object.prototype.toString.call(x) === '[object Array]'; }
   function on(node, ev, fn) { node.addEventListener(ev, fn); return node; }
+  function monotonicNow() {
+    // performance.now is elapsed-time only: client wall-clock skew cannot enter
+    // server ages, freshness, or the displayed clock. Freezing is safer than
+    // falling back to Date.now in the unlikely event it is unavailable.
+    return (typeof performance !== 'undefined' && performance &&
+      typeof performance.now === 'function') ? performance.now() : 0;
+  }
+  function serverNowAt(receivedAt) {
+    if (!serverClock) return null;
+    return serverClock.epochMs + Math.max(0, receivedAt - serverClock.receivedAt);
+  }
+  function serverNow() { return serverNowAt(monotonicNow()); }
+  function defineTiming(value, key, timing) {
+    try {
+      Object.defineProperty(value, key, { value: timing, configurable: true });
+    } catch (e) { value[key] = timing; }
+  }
+  function stampPayloadTiming(value, receivedAt, serverAt) {
+    if (!value || typeof value !== 'object') return;
+    defineTiming(value, '_receivedAt', receivedAt);
+    if (typeof serverAt === 'number' && isFinite(serverAt)) {
+      defineTiming(value, '_serverAt', serverAt);
+    }
+    var keys = Object.keys(value);
+    for (var i = 0; i < keys.length; i++) {
+      stampPayloadTiming(value[keys[i]], receivedAt, serverAt);
+    }
+  }
+  function stampStatePayload(data) {
+    var receivedAt = monotonicNow();
+    var generatedAt = data ? Date.parse(data.generated_at) : NaN;
+    if (isFinite(generatedAt)) {
+      serverClock = { epochMs: generatedAt, receivedAt: receivedAt };
+      state.now = generatedAt;
+    } else {
+      serverClock = null;
+      state.now = null;
+    }
+    stampPayloadTiming(data, receivedAt, isFinite(generatedAt) ? generatedAt : null);
+    return data;
+  }
+  function stampAuxPayload(data) {
+    var receivedAt = monotonicNow();
+    var generatedAt = data ? Date.parse(data.generated_at) : NaN;
+    var serverAt = isFinite(generatedAt) ? generatedAt : serverNowAt(receivedAt);
+    stampPayloadTiming(data, receivedAt, serverAt);
+    return data;
+  }
   var LEAD_CHAT_VOLATILE_KEYS = nullMap({
     age_seconds: true,
     heartbeat_age_seconds: true,
@@ -312,16 +361,21 @@
     var h = Math.floor(sec / 3600), mm = Math.floor((sec % 3600) / 60);
     return mm ? (h + 'h ' + mm + 'm') : (h + 'h');
   }
-  // Age of a wire item: prefer a live recompute from `ts`, else fall back to
-  // the server-computed `age_seconds` (adjusted by drift since the poll).
+  // Age of a wire item. Prefer the server-computed age and advance it only by
+  // monotonic elapsed time since THAT payload was received. If the wire carries
+  // only `ts`, compare it with the /api/state `generated_at` clock anchor. The
+  // browser wall clock is deliberately absent from both paths (#207).
   function liveAge(item) {
+    var elapsed = item && typeof item._receivedAt === 'number'
+      ? Math.max(0, monotonicNow() - item._receivedAt) / 1000 : 0;
+    if (item && typeof item.age_seconds === 'number') {
+      return item.age_seconds + elapsed;
+    }
     if (item && item.ts) {
       var t = Date.parse(item.ts);
-      if (!isNaN(t)) return (state.now - t) / 1000;
-    }
-    if (item && typeof item.age_seconds === 'number') {
-      var base = lastState && lastState._fetchedAt ? lastState._fetchedAt : state.now;
-      return item.age_seconds + (state.now - base) / 1000;
+      var now = item && typeof item._serverAt === 'number'
+        ? item._serverAt + elapsed * 1000 : serverNow();
+      if (!isNaN(t) && typeof now === 'number') return (now - t) / 1000;
     }
     return null;
   }
@@ -329,8 +383,8 @@
   // A relative-age span that the 1 Hz clock ticker updates IN PLACE (B2a) —
   // NOT via a DOM rebuild, which would destroy inner-scroll and text selection
   // in the transcript/feed every second. The node is tagged with the raw inputs
-  // (`data-age-ts` / `data-age-sec`) plus formatting opts so `updateAges` can
-  // recompute textContent from the current `state.now` without re-rendering.
+  // (`data-age-ts` / `data-age-sec` plus its server/monotonic receipt anchors)
+  // and formatting opts so `updateAges` can recompute without re-rendering.
   //   opts.suffix   — appended after the formatted age (e.g. ' ago')
   //   opts.prefix   — prepended before it (e.g. 'since ')
   //   opts.nullText — shown when age is null / noHb (e.g. 'no hb', 'missing')
@@ -342,6 +396,12 @@
     if (item && item.ts) n.setAttribute('data-age-ts', String(item.ts));
     if (item && typeof item.age_seconds === 'number') {
       n.setAttribute('data-age-sec', String(item.age_seconds));
+    }
+    if (item && typeof item._receivedAt === 'number') {
+      n.setAttribute('data-age-received', String(item._receivedAt));
+    }
+    if (item && typeof item._serverAt === 'number') {
+      n.setAttribute('data-age-server', String(item._serverAt));
     }
     if (opts.suffix) n.setAttribute('data-age-suffix', opts.suffix);
     if (opts.prefix) n.setAttribute('data-age-prefix', opts.prefix);
@@ -355,9 +415,9 @@
     titled(n, absTimeTitle(item, opts));
     return n;
   }
-  // The absolute local time an age refers to, for the hover tooltip. Prefers the
-  // wire `ts`; else derives from `age_seconds` relative to the last poll (like
-  // liveAge). Returns '' for a no-heartbeat node or an unparseable time.
+  // The absolute UTC time an age refers to, for the hover tooltip. A direct wire
+  // `ts` is authoritative; an age-only item is derived from the server-time
+  // anchor captured with that payload. Never derive it from browser wall time.
   function absTimeTitle(item, opts) {
     opts = opts || {};
     var meaning = opts.title || '';   // optional plain-language prefix (e.g. heartbeat)
@@ -367,18 +427,19 @@
       var t = Date.parse(item.ts);
       if (!isNaN(t)) ms = t;
     }
-    if (ms === null && item && typeof item.age_seconds === 'number') {
-      var base = lastState && lastState._fetchedAt ? lastState._fetchedAt : state.now;
-      ms = base - item.age_seconds * 1000;
+    if (ms === null && item && typeof item.age_seconds === 'number' &&
+      typeof item._serverAt === 'number') {
+      ms = item._serverAt - item.age_seconds * 1000;
     }
     if (ms === null) return meaning;
     var abs;
-    try { abs = new Date(ms).toLocaleString(); } catch (e) { abs = ''; }
+    try { abs = new Date(ms).toISOString(); } catch (e) { abs = ''; }
     if (!abs) return meaning;
     return meaning ? (meaning + ' · ' + abs) : abs;
   }
   // Format the current text for a tagged age node from its data-* inputs + the
-  // live `state.now`. Shared by `ageEl` (initial render) and `updateAges` (tick).
+  // trusted payload timing. Shared by `ageEl` (initial render) and
+  // `updateAges` (tick).
   function ageText(n) {
     var pfx = n.getAttribute('data-age-prefix') || '';
     var sfx = n.getAttribute('data-age-suffix') || '';
@@ -389,6 +450,10 @@
     if (ts) item.ts = ts;
     var sec = n.getAttribute('data-age-sec');
     if (sec !== null && sec !== '') item.age_seconds = Number(sec);
+    var received = n.getAttribute('data-age-received');
+    if (received !== null && received !== '') item._receivedAt = Number(received);
+    var server = n.getAttribute('data-age-server');
+    if (server !== null && server !== '') item._serverAt = Number(server);
     var age = liveAge(item);
     if (age === null) return nullText || '';
     return pfx + fmtAge(age) + sfx;
@@ -801,7 +866,7 @@
   // Is the human-attention queue KNOWN (loaded + fresh)? attentionData is null
   // until the first successful fetch and is retained (not blanked) on a failed
   // poll, so a bare count can't tell "confirmed empty" from "never loaded / stale
-  // during an outage". A stamped _fetchedAt (set on each successful fetchAttention,
+  // during an outage". A stamped _receivedAt (set on each successful fetchAttention,
   // which polls every POLL_MS) ages out during an outage -> unknown. An unstamped
   // non-null payload (e.g. a test harness) is treated as known.
   // PURE (testable without module state): an attention payload counts as KNOWN — safe
@@ -812,6 +877,11 @@
   function attentionKnownFrom(data, now) {
     if (data == null) return false;
     if (Array.isArray(data.errors) && data.errors.length) return false;
+    var received = data._receivedAt;
+    if (typeof received === 'number' && isFinite(received)) {
+      return (monotonicNow() - received) <= ATTENTION_STALE_MS;
+    }
+    // Compatibility for pure test fixtures written before the monotonic stamp.
     var at = data._fetchedAt;
     if (typeof at !== 'number' || !isFinite(at)) return true;
     return (now - at) <= ATTENTION_STALE_MS;
@@ -823,9 +893,29 @@
   // verdict must NOT assert green from it (v0.76.0 trust contract).
   function stateFresh() {
     if (lastState == null) return false;
+    var received = lastState._receivedAt;
+    if (typeof received === 'number' && isFinite(received)) {
+      return (monotonicNow() - received) <= STATE_STALE_MS;
+    }
+    // Compatibility for pure test fixtures written before the monotonic stamp.
     var at = lastState._fetchedAt;
     if (typeof at !== 'number' || !isFinite(at)) return true;
     return (state.now - at) <= STATE_STALE_MS;
+  }
+  function serverClockText() {
+    var now = serverNow();
+    if (typeof now !== 'number' || !isFinite(now)) return 'Server time unavailable';
+    try { return new Date(now).toISOString().slice(11, 19) + ' UTC'; }
+    catch (e) { return 'Server time unavailable'; }
+  }
+  function pollingStatus() {
+    if (!lastState) {
+      return { label: 'Connecting', tone: 'waiting', title: 'Waiting for the first server snapshot' };
+    }
+    if (!stateFresh()) {
+      return { label: 'Stale', tone: 'stale', title: 'The last successful server snapshot is stale' };
+    }
+    return { label: 'Current', tone: 'current', title: 'The latest server snapshot is current' };
   }
   function teamHealthVerdict(root) {
     var c = agentCounts(root);
@@ -1074,9 +1164,8 @@
     }
     var at = capNum(win, 'resets_at');
     if (at !== null) {
-      return 'resets at ' + new Date(at * 1000).toLocaleTimeString('en-US', {
-        hour: '2-digit', minute: '2-digit'
-      });
+      try { return 'resets at ' + new Date(at * 1000).toISOString().slice(11, 16) + ' UTC'; }
+      catch (e) { return '—'; }
     }
     return '—';
   }
@@ -1175,12 +1264,17 @@
 
     bar.appendChild(el('div', 'tc-spacer'));
 
-    // Live indicator + clock (recomputed each tick).
-    var live = el('div', 'tc-live');
+    // Poll freshness + server clock (recomputed each tick). "Current" describes
+    // the last successful server snapshot; it is never inferred from a client
+    // clock or from the mere absence of an error.
+    var poll = pollingStatus();
+    var live = el('div', 'tc-live is-' + poll.tone);
     live.appendChild(el('span', 'tc-live-dot'));
-    titled(live, 'The page is polling the bus live');
-    live.appendChild(el('span', 'tc-live-label', 'Live'));
-    live.appendChild(el('span', 'tc-clock', new Date(state.now).toLocaleTimeString('en-US', { hour12: false })));
+    titled(live, poll.title);
+    live.appendChild(el('span', 'tc-live-label', poll.label));
+    var clock = el('span', 'tc-clock', serverClockText());
+    titled(clock, 'Server-provided UTC time; advanced only by monotonic elapsed time');
+    live.appendChild(clock);
     bar.appendChild(live);
 
     // Overall team-health pill (v0.76.0): the green "Live" dot only means the page
@@ -3532,6 +3626,7 @@
     }).then(function (data) {
       if (sessionPending === requestKey) sessionPending = null;
       if (!rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       if (data && data.csrf_token) {
         actionSession.enabled = true;
         actionSession.token = data.csrf_token;
@@ -3562,6 +3657,7 @@
     }).then(function (data) {
       if (intentsPending === requestKey) intentsPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       intentsData = data;
       if (state.view === 'sessions') renderActiveViewFromPoll();
     }).catch(function () {
@@ -3685,7 +3781,7 @@
       if (!data) return;                       // non-ok — keep last-good
       if (seq < stateCommitted) return;        // stale response — drop (P2-4)
       stateCommitted = seq;
-      data._fetchedAt = Date.now();
+      stampStatePayload(data);
       var hadState = !!lastState;
       lastState = data;
       var projectChanged = reconcileProjectSelection();
@@ -3737,7 +3833,7 @@
     }).then(function (data) {
       if (attentionPending === requestKey) attentionPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
-      data._fetchedAt = Date.now();   // freshness stamp for the team-health verdict (v0.76.0)
+      stampAuxPayload(data);   // monotonic freshness + server-time anchor (#207)
       attentionData = data;
       renderSidebar();  // count badge
       if (state.view === 'attention') renderActiveViewFromPoll();
@@ -3758,6 +3854,7 @@
     }).then(function (data) {
       if (leadChatPending === requestKey) leadChatPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       var nextHash = leadChatPayloadFingerprint(data);
       var changed = leadChatPayloadHash !== nextHash;
       leadChatPayloadHash = nextHash;
@@ -3782,6 +3879,7 @@
     }).then(function (data) {
       if (learningPending === requestKey) learningPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       learningData = data;
       renderSidebar();
       if (state.view === 'learning') renderActiveViewFromPoll();
@@ -3803,6 +3901,7 @@
     }).then(function (data) {
       if (onboardingPending === requestKey) onboardingPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       onboardingData = data;
       renderSidebar();
       if (state.view === 'onboarding') renderActiveViewFromPoll();
@@ -3839,6 +3938,7 @@
         archivedState.items = reset ? [] : archivedState.items;
         archivedState.nextCursor = null;
       } else {
+        stampAuxPayload(data);
         var items = data.items || [];
         archivedState.items = reset ? items : archivedState.items.concat(items);
         archivedState.nextCursor = data.next_cursor || null;
@@ -3885,6 +3985,7 @@
       } else if (!rootPayloadMatches(data, projectId, generation)) {
         return;
       } else {
+        stampAuxPayload(data);
         threadCache[key] = data;
         delete threadNotFound[key];
       }
@@ -3905,10 +4006,18 @@
 
   // ------------------------------------------------------------ loops
   function clockTick() {
-    state.now = Date.now();
-    // Recompute the wall clock + relative ages without a network round-trip.
+    state.now = serverNow();
+    // Recompute server clock + relative ages without a network round-trip.
     var clock = document.querySelector('#topbar .tc-clock');
-    if (clock) clock.textContent = new Date(state.now).toLocaleTimeString('en-US', { hour12: false });
+    if (clock) clock.textContent = serverClockText();
+    var live = document.querySelector('#topbar .tc-live');
+    if (live) {
+      var poll = pollingStatus();
+      live.className = 'tc-live is-' + poll.tone;
+      live.setAttribute('title', poll.title);
+      var label = live.querySelector ? live.querySelector('.tc-live-label') : null;
+      if (label) label.textContent = poll.label;
+    }
     // Advance age counters IN PLACE (B2a) — NEVER rebuild the DOM here, or the
     // transcript inner-scroll and any in-progress text selection are destroyed
     // every second. Only the 2s DATA poll re-renders the view.

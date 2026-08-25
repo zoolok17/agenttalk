@@ -314,6 +314,9 @@ body {
   background: var(--ok);
   animation: liveDot 1.8s ease-in-out infinite;
 }
+.tc-live.is-stale .tc-live-dot { background: var(--danger); animation: none; }
+.tc-live.is-waiting .tc-live-dot { background: var(--gray); animation: none; }
+.tc-live.is-stale .tc-live-label { color: var(--danger); }
 .tc-live-label { font-weight: 500; }
 .tc-clock { font-family: var(--font-mono); color: var(--ink3); }
 
