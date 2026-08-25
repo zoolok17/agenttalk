@@ -1527,13 +1527,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 INTERRUPTION_BACKOFF_CAP_SECONDS,
             )
             # #202 cold-review P2-4 belt: the cap above already bounds ordinary
-            # cases, but a NaN/inf base (a corrupt knob that slipped past the
-            # resolver, or a direct run_loop() caller that bypasses it) must never
-            # reach `sleep()` as a non-finite duration - fail loud, not an endless
-            # chunked backoff.
-            assert math.isfinite(required), (
-                f"interruption backoff computed a non-finite duration ({required!r}); "
-                "interruption_redrive_seconds must be a finite, bounded config value")
+            # cases, but a NaN/inf value (a corrupt knob past the resolver, a
+            # bypassing run_loop() caller, or the CAP constant itself corrupted
+            # by a future refactor) must never reach `sleep()` as a non-finite
+            # duration. Not an assert (stripped under -O; bandit B101), and a
+            # LITERAL fallback on purpose: falling back to the module constant
+            # would re-feed the corruption when the constant is the bad value.
+            if not math.isfinite(required):
+                required = 900.0
             last_at = _iso_epoch(rec.get("last_failure_at"))
             now_at = _iso_epoch(now_iso())
             remaining = (required if last_at is None or now_at is None

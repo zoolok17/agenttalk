@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import errno
 import gc
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -881,28 +882,32 @@ def test_interruption_backoff_is_hard_capped_for_a_long_crash_chain(tmp_path) ->
     assert total_sleep == loop.INTERRUPTION_BACKOFF_CAP_SECONDS  # capped at 900s, not 30720s
 
 
-def test_interruption_backoff_asserts_finite_if_the_cap_itself_is_corrupted(
+def test_interruption_backoff_bounds_even_a_corrupted_cap_constant(
     tmp_path, monkeypatch,
 ) -> None:
-    # #202 cold-review P2-4 belt: resolve_interruption_policy now refuses a
-    # non-finite/absurd knob before it ever reaches the loop (config error, never a
-    # silent clamp) - the ordinary overflow case (a huge-but-finite base) is
-    # already bounded by INTERRUPTION_BACKOFF_CAP_SECONDS regardless. The residual
-    # risk this assert defends is the CAP itself going bad (e.g. a future
-    # refactor): ``min(inf, nan)`` returns ``inf`` (NaN never wins a comparison),
-    # so a corrupted cap would otherwise sleep an undefined/endless backoff
-    # silently - assert loud instead.
+    # #202 cold-review P2-4 belt (bandit B101 rework: a runtime bound, not an
+    # assert): resolve_interruption_policy refuses non-finite/absurd knobs at
+    # launch, and INTERRUPTION_BACKOFF_CAP_SECONDS bounds ordinary overflow.
+    # The residual risk is the CAP constant itself going bad in a future
+    # refactor: ``min(inf, nan)`` returns ``inf`` (NaN never wins a
+    # comparison). The loop must then degrade to the LITERAL 900s bound —
+    # never an endless chunked sleep, never a non-finite sleep() argument.
     s = _store(tmp_path)
     m = s.send(sender="alpha", recipient="beta", body="task")
     _seed_interruptions(s, m.id, 10)          # base * 2^9 overflows to +inf pre-cap
     monkeypatch.setattr(loop, "INTERRUPTION_BACKOFF_CAP_SECONDS", float("nan"))
-    with pytest.raises(AssertionError):
-        loop.run_loop(
-            Store(tmp_path), "beta", lambda rec: True,
-            clock=lambda: 0.0, sleep=lambda d: None,
-            now_iso=lambda: _ISO_T0,
-            interruption_redrive_seconds=1e308,
-            k_interrupted=0, max_polls=1, k_poison=0, k_escalate=0)
+    sleeps: list = []
+    drove: list = []
+    loop.run_loop(
+        Store(tmp_path), "beta",
+        lambda rec: drove.append(1) or True,
+        clock=lambda: 0.0, sleep=lambda d: sleeps.append(d),
+        now_iso=lambda: _ISO_T0,
+        interruption_redrive_seconds=1e308,
+        k_interrupted=0, max_polls=1, max_turns=1, k_poison=0, k_escalate=0)
+    assert drove, "the head must still drive after the bounded backoff"
+    assert all(math.isfinite(d) for d in sleeps)
+    assert sum(d for d in sleeps) <= 900.0 + 1.0
 
 
 def test_non_interrupted_failure_keeps_the_ordinary_idle_backoff(tmp_path) -> None:
