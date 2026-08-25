@@ -726,6 +726,60 @@ def test_never_started_fast_retry_loop_promotes_once_60s_elapsed_from_first_not_
     assert s.dead_lettered_count("beta") == 0
 
 
+def test_crash_reconcile_resets_never_started_window_for_a_fresh_start(tmp_path) -> None:
+    # #7-fix-4: reconcile_crash_in_progress must reset never_started_first_at /
+    # never_started_consecutive - a crash breaks the "consecutive never-started"
+    # run by definition (the process DID start this attempt; it crashed mid-turn,
+    # which is why it's here). Without the reset, a never-started failure
+    # recorded long BEFORE a crash would let the very next post-crash
+    # never-started failure "inherit" an already-elapsed window and promote
+    # immediately - using a run that was never actually consecutive.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+
+    # A pre-crash never-started failure, long enough ago that its window is
+    # trivially "elapsed" by the time of the crash below.
+    t0 = "2026-08-25T00:00:00Z"
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a0", at=t0)
+    s.record_attempt_result(
+        "beta", m.id, failure_class=loop.CLASS_AMBIGUOUS,
+        summary="turn never started (rc=1, no clear signal)", at=t0,
+        never_started_first_at=t0, never_started_consecutive=1)
+
+    # A crash mid-turn, long after t0 (in_progress left True == the process died).
+    t1 = "2026-08-25T01:00:00Z"
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a1", at=t1)
+
+    # Two post-crash never-started drives, only 10s apart - well INSIDE a fresh
+    # 60s window measured from the first POST-CRASH failure.
+    base = datetime(2026, 8, 25, 1, 0, 5, tzinfo=timezone.utc)
+    clock_box = {"t": 0.0}
+    calls = {"n": 0}
+
+    def now_iso() -> str:
+        return (base + timedelta(seconds=clock_box["t"])).isoformat().replace("+00:00", "Z")
+
+    def drive(rec):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            clock_box["t"] += 10.0
+        return _never_started_drive()
+
+    parked: list = []
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        now_iso=now_iso, interruption_redrive_seconds=0.0,
+        max_polls=2, k_poison=0, k_escalate=20,
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    assert calls["n"] == 2
+    assert parked == []                                     # NOT promoted - the window is fresh
+    rec = s.attempt_record("beta", m.id)
+    assert rec["last_failure_class"] == loop.CLASS_AMBIGUOUS
+    assert rec["never_started_consecutive"] == 2
+    assert rec["never_started_first_at"] != t0              # window restarted post-crash, not at t0
+
+
 def test_config_blocked_reprobes_once_on_wrapper_generation_change_and_reparks(
     tmp_path,
 ) -> None:
@@ -792,6 +846,55 @@ def test_config_blocked_reprobes_once_on_wrapper_generation_change_and_reparks(
     assert drives_d == [m.id]
     assert turns == 1
     assert s.cursor("beta") == m.id                           # committed, park cleared
+
+
+def test_config_blocked_reprobe_failing_directly_records_current_generation(
+    tmp_path,
+) -> None:
+    # #7-fix-5: the re-probe's failure can land as config_blocked DIRECTLY from
+    # drive() (e.g. #58's gateway-held/sandbox-denial shape), never through the
+    # #205 never-started promotion path - so promoted_by_generation is never set
+    # by that path's own write. Before the fix this left the STALE generation
+    # ("gen-1") on the record forever: a second poll in the SAME "gen-2" process
+    # would then see promoted_gen ("gen-1") != wrapper_generation ("gen-2") and
+    # grant ANOTHER re-probe - a same-generation re-probe storm. The fix threads
+    # the generation the entry-check just consumed through to the re-park write.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    seed_at = "2026-08-25T00:00:00Z"
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a0", at=seed_at)
+    s.record_attempt_result(
+        "beta", m.id, failure_class=loop.CLASS_CONFIG_BLOCKED,
+        summary=f"{loop.NEVER_STARTED_REMEDY} (turn never started)", at=seed_at,
+        never_started_first_at=seed_at, never_started_consecutive=2,
+        promoted_by_generation="gen-1")
+
+    # (a) DIFFERENT generation, still-broken child: drives EXACTLY once, fails
+    # DIRECTLY as config_blocked (not never-started), and re-parks recording the
+    # NEW generation instead of leaving "gen-1" stuck on the record.
+    drives_a: list = []
+    loop.run_loop(
+        Store(tmp_path), "beta",
+        lambda rec: drives_a.append(rec["id"]) or _config_blocked_drive(),
+        clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=2, k_poison=0, k_escalate=0, wrapper_generation="gen-2",
+    )
+    assert drives_a == [m.id]                                # drove exactly once
+    rec = s.attempt_record("beta", m.id)
+    assert rec["last_failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert rec["promoted_by_generation"] == "gen-2"           # updated, not stuck at "gen-1"
+
+    # (b) a SECOND poll still under "gen-2" (no restart): must re-park WITHOUT
+    # driving again - proving the stale generation no longer grants a
+    # same-generation re-probe storm.
+    drives_b: list = []
+    loop.run_loop(
+        Store(tmp_path), "beta", lambda rec: drives_b.append(rec["id"]) or True,
+        clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=2, k_poison=0, k_escalate=0, wrapper_generation="gen-2",
+    )
+    assert drives_b == []
+    assert s.cursor("beta") == ""
 
 
 def test_non_never_started_ambiguous_failure_never_promotes(tmp_path) -> None:

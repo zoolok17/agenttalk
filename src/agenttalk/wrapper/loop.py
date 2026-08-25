@@ -1367,6 +1367,16 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 continue
 
         # ---- dead-letter: bound the at-least-once retry of a POISON head message ----
+        # #7-fix-5: set below (non-None) only when this turn's drive() is the ONE
+        # re-probe allowed by the generation-mismatch fall-through further down -
+        # threaded through to the result-recording block so a re-probe that fails
+        # (whether via direct config_blocked or via re-promotion) re-parks with THE
+        # CURRENT generation, not the stale one that granted the re-probe. Without
+        # this, a re-probe failing DIRECTLY as config_blocked (never_started False,
+        # so the promotion path below never runs) would leave the old generation on
+        # the record forever, granting every later generation a further free
+        # re-probe.
+        reprobe_generation_consumed: str | None = None
         head_id = record.get("id")
         # A stale in_progress on this head means the process crashed mid-turn last run ->
         # reconcile it as an AMBIGUOUS crash_mid_turn failure (unobserved cause, NOT poison),
@@ -1401,7 +1411,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             if (wrapper_generation is not None
                     and isinstance(promoted_gen, str) and promoted_gen
                     and promoted_gen != wrapper_generation):
-                pass
+                reprobe_generation_consumed = wrapper_generation
             else:
                 _park_config_blocked(record)
                 continue
@@ -1522,8 +1532,16 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # validation (cli).
         interrupted_n = _safe_int(rec.get("interrupted_consecutive"))
         if interrupted_n > 0 and interruption_redrive_seconds > 0:
+            # #7-fix-1: cap the EXPONENT before evaluating 2.0 ** x. A huge
+            # persisted counter (repeated reconciled crashes in an
+            # infra-dominant history) can push interrupted_n past ~1025,
+            # where CPython's 2.0 ** 1025 raises OverflowError instead of
+            # returning inf - crashing the loop before the cap below ever
+            # applies. 2**32 seconds is already many orders past the 900s
+            # cap, so clamping the exponent there changes no real behavior.
             required = min(
-                float(interruption_redrive_seconds) * (2.0 ** (interrupted_n - 1)),
+                float(interruption_redrive_seconds)
+                * (2.0 ** min(interrupted_n - 1, 32)),
                 INTERRUPTION_BACKOFF_CAP_SECONDS,
             )
             # #202 cold-review P2-4 belt: the cap above already bounds ordinary
@@ -1539,6 +1557,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             now_at = _iso_epoch(now_iso())
             remaining = (required if last_at is None or now_at is None
                          else required - (now_at - last_at))
+            # #7-fix-2: a backwards wall clock (last_failure_at recorded in
+            # the future, or a clock step-back) can make elapsed negative,
+            # pushing remaining above required. Clamp into [0, required] so
+            # a clock anomaly can neither skip the backoff nor extend it.
+            remaining = min(max(remaining, 0.0), required)
             while remaining > 0:
                 stamp()
                 last_hb = clock()
@@ -1631,6 +1654,18 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 continue
             store.clear_attempt(agent, head_id)
             store.gc_attempts_below(agent, store.cursor(agent))
+            # #7-fix-7: a clean retry that writes no live draft and sends no
+            # direct reply (so neither _deliver_reply_draft branch above GC'd
+            # it) would otherwise leave an earlier attempt's preserved
+            # <id>.interrupted.md on disk FOREVER - nothing else ever revisits
+            # a head once it commits clean. GC it here, unconditionally, once
+            # the record has actually committed.
+            preserved = _interrupted_draft_path(store, agent, head_id)
+            if preserved is not None:
+                try:
+                    preserved.unlink(missing_ok=True)
+                except OSError:
+                    pass
             last_hb = clock()                           # drive already stamped on success
             _maybe_refresh_capacity(last_hb)
             fail_sleep = idle_interval                  # reset failure backoff
@@ -1694,6 +1729,16 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 promoted_by_generation = wrapper_generation
             # else: window not yet elapsed (or timestamps unavailable) - keep
             # retrying ambiguous instead of permanently parking the head.
+        if (outcome.failure_class == CLASS_CONFIG_BLOCKED
+                and promoted_by_generation is None
+                and reprobe_generation_consumed is not None):
+            # #7-fix-5: this turn consumed the one allowed re-probe (entry-check
+            # above), and it failed directly as config_blocked (not through the
+            # never-started promotion above, so promoted_by_generation is still
+            # unset). Record the CURRENT generation now, so the next generation's
+            # entry-check sees a matching (not stale) value and re-parks instead
+            # of granting yet another free re-probe.
+            promoted_by_generation = reprobe_generation_consumed
         # record the classified failure (clears in_progress), then decide.
         store.record_attempt_result(agent, head_id, failure_class=outcome.failure_class,
                                     summary=outcome.summary, at=failure_now,
@@ -1718,6 +1763,18 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # wedge the seat with no un-park path (rev 1 F1/F2).
         if (k_interrupted > 0 and _safe_int(
                 rec.get("interrupted_watchdog_consecutive")) >= k_interrupted):
+            # #7-fix-6: THIS turn's drive() just ran (and was interrupted, so
+            # _deliver_reply_draft above never published it) - if it left a LIVE
+            # draft (<id>.md), that is the child's NEWEST recoverable progress,
+            # newer than whatever older <id>.interrupted.md an earlier interrupted
+            # attempt may have preserved. Move it over that older copy (pre-unlink
+            # for Windows, via preserve_interrupted_draft) BEFORE the dispose below
+            # keeps the interrupted.md sibling - so the remedy names the freshest
+            # partial work, not a stale one, and the live copy is never orphaned.
+            if isinstance(head_id, str) and head_id:
+                live_draft = reply_transport.reply_draft_path(store, agent, head_id)
+                if live_draft.is_file():
+                    reply_transport.preserve_interrupted_draft(live_draft)
             # P2-3: name the preserved draft (if any) in the remedy, then keep it
             # through the dispose below instead of GC'ing it.
             preserved_for_remedy = _interrupted_draft_path(store, agent, head_id)

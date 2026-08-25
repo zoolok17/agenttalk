@@ -859,9 +859,15 @@ def resolve_interruption_policy(config: dict, cfg_agent: dict) -> tuple[float, i
     is a valid positive number that the D2 backoff's ``base * 2**(n-1)`` overflows
     toward ``inf``; the runtime hard cap (INTERRUPTION_BACKOFF_CAP_SECONDS) then
     SILENTLY CLAMPS it to 900s regardless of what the operator configured - exactly
-    the silent-clamp this resolver exists to refuse instead of doing. Values outside
-    (0, 86400] (24h - already far beyond any sane single-turn backoff) are refused
-    as a config error, same as a non-numeric value."""
+    the silent-clamp this resolver exists to refuse instead of doing.
+
+    #7-fix-3: the bound here used to be (0, 86400] (24h), but the runtime's D2
+    backoff hard-caps the computed sleep at INTERRUPTION_BACKOFF_CAP_SECONDS
+    (900s) regardless of ``base``. A base above 900 would pass this resolver
+    but still be silently reduced by the runtime cap on the very first
+    interruption (n=1: ``base * 2**0 == base``) - exactly the silent-clamp
+    this resolver exists to refuse. So the resolver's own bound is tightened
+    to (0, 900] to match, and refused loudly (not clamped) if exceeded."""
     config = config if isinstance(config, dict) else {}
     cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
     errors: list[str] = []
@@ -871,12 +877,13 @@ def resolve_interruption_policy(config: dict, cfg_agent: dict) -> tuple[float, i
             continue
         v = src.get("interruption_redrive_seconds")
         if (isinstance(v, (int, float)) and not isinstance(v, bool)
-                and math.isfinite(v) and 0 < v <= 86400):
+                and math.isfinite(v) and 0 < v <= 900):
             redrive = float(v)
         else:
             errors.append(
                 f"invalid {source_name} interruption_redrive_seconds={v!r}; "
-                "expected a finite positive number no greater than 86400 (24h)")
+                "expected a finite positive number no greater than 900 "
+                "(the runtime's interruption backoff cap)")
         break
     k_interrupted = 3
     for source_name, src in (("per-agent", cfg_agent), ("global", config)):

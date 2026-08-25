@@ -499,10 +499,17 @@ def test_publish_exception_preserves_the_draft(tmp_path, monkeypatch) -> None:
 
 # ---------------------------------------- #202 D5: preserve the interrupted draft
 
-def test_interrupted_attempt_draft_is_preserved_and_never_published(tmp_path) -> None:
+def test_interrupted_draft_never_published_and_gcd_on_clean_no_reply_commit(
+    tmp_path,
+) -> None:
     # #202 D5: attempt 1 writes a partial draft and is INTERRUPTED (watchdog kill);
     # the retry preserves it at <id>.interrupted.md (the rejoin names it) while the
     # LIVE path stays clear - so the preserved bytes can never be published.
+    #
+    # #7-fix-7: this clean retry writes no live draft and sends no direct reply
+    # (a freeform message may owe no reply at all) - once it COMMITS, the
+    # preserved sibling is moot (nothing else will ever revisit this head) and
+    # must be GC'd, not left on disk forever.
     s = _store(tmp_path)
     q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
                meta={"request_id": "q-interrupted"})
@@ -525,8 +532,7 @@ def test_interrupted_attempt_draft_is_preserved_and_never_published(tmp_path) ->
     assert attempts["n"] >= 2
     live = reply_transport.reply_draft_path(s, "beta", q.id)
     preserved = live.with_suffix(".interrupted.md")
-    assert preserved.is_file()
-    assert preserved.read_text(encoding="utf-8") == "partial progress"
+    assert not preserved.exists()                # GC'd once the clean retry committed
     assert not live.exists()                     # live path clear for the retry
     assert _reply_inbox(s, "alpha") == []        # preserved copy never publishes
     assert s.cursor("beta") == q.id              # the clean retry still committed
@@ -581,6 +587,11 @@ def test_interruption_budget_exhausted_dispose_keeps_the_preserved_draft(tmp_pat
     # the operator can inspect/requeue with context. See
     # test_ordinary_dispose_still_gcs_the_interrupted_draft (test_wrapper_loop.py)
     # for the still-GC'd ordinary-dispose case.
+    #
+    # #7-fix-6: the KTH (final, budget-ending) attempt's LIVE draft is NEWER than
+    # the sibling preserved from attempt 1 - it must be moved over that older
+    # copy before the dispose, so the remedy/operator sees the NEWEST partial
+    # work, not the first attempt's stale one.
     s = _store(tmp_path)
     q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
                meta={"request_id": "q-gc-dispose"})
@@ -602,9 +613,11 @@ def test_interruption_budget_exhausted_dispose_keeps_the_preserved_draft(tmp_pat
     assert s.dead_lettered_count("beta") == 1
     entry = s.list_dead_letters("beta")[0]
     assert entry["last_reason"] == "interruption_budget_exhausted"
-    preserved = reply_transport.reply_draft_path(s, "beta", q.id).with_suffix(".interrupted.md")
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    preserved = live.with_suffix(".interrupted.md")
     assert preserved.is_file()                 # KEPT - the operator's final progress evidence
-    assert preserved.read_text(encoding="utf-8") == "partial 1"
+    assert preserved.read_text(encoding="utf-8") == "partial 2"  # NEWEST attempt's content
+    assert not live.exists()                   # the kth attempt's live draft is never left behind
 
 
 def test_successful_draft_delivery_unlinks_the_preserved_interrupted_draft(tmp_path) -> None:

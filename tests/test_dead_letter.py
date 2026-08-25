@@ -758,12 +758,18 @@ def test_interruption_policy_resolver_chain_and_corrupt_values() -> None:
     _, _, errors = sup.resolve_interruption_policy(
         {}, {"interruption_redrive_seconds": float("inf")})
     assert errors and "interruption_redrive_seconds" in errors[0]
+    # #7-fix-3: the resolver's bound is tightened to (0, 900] to match the
+    # runtime's INTERRUPTION_BACKOFF_CAP_SECONDS - a base above 900 would
+    # otherwise pass here but be silently reduced by the runtime cap on the
+    # very first interruption, exactly the silent-clamp this resolver exists
+    # to refuse instead of doing.
     _, _, errors = sup.resolve_interruption_policy(
-        {}, {"interruption_redrive_seconds": 86401})
+        {}, {"interruption_redrive_seconds": 901})
     assert errors and "interruption_redrive_seconds" in errors[0]
+    assert "900" in errors[0]
     # the upper bound itself is a VALID launch value
     assert sup.resolve_interruption_policy(
-        {}, {"interruption_redrive_seconds": 86400}) == (86400.0, 3, [])
+        {}, {"interruption_redrive_seconds": 900}) == (900.0, 3, [])
 
 
 def test_interruption_ledger_counts_always_write_and_survive_relaunch(tmp_path: Path) -> None:
@@ -1345,6 +1351,27 @@ def test_46_crash_mid_turn_resets_poison_counter(tmp_path: Path) -> None:
     rec2 = s.attempt_record("beta", m.id)
     assert int(rec2["poison_eligible_failures"]) == 0        # crash reset the consecutive run
     assert rec2["last_failure_class"] == "ambiguous_or_unknown"
+
+
+def test_46b_crash_mid_turn_resets_never_started_tracking(tmp_path: Path) -> None:
+    # #7-fix-4: a crash mid-turn breaks the "consecutive never-started" run by
+    # definition (the process DID start this attempt - it crashed, which is why
+    # it's here). Leaving never_started_first_at/never_started_consecutive
+    # intact would let a LATER never-started failure promote using a
+    # window/count that spans across the crash, not an actually-consecutive run.
+    s = _store(tmp_path)
+    m = _send(s, "never-started-then-crash")
+    rec = _rec(s)
+    s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+    data = s.dead_letter_attempts("beta")
+    data["messages"][m.id]["never_started_first_at"] = "t0"
+    data["messages"][m.id]["never_started_consecutive"] = 1
+    data["messages"][m.id]["in_progress"] = True             # crashed mid-turn
+    s._write_attempts("beta", data)
+    assert s.reconcile_crash_in_progress("beta", m.id, at="t2") is True
+    rec2 = s.attempt_record("beta", m.id)
+    assert rec2["never_started_first_at"] is None
+    assert rec2["never_started_consecutive"] == 0
 
 
 def test_47_infra_dominant_crash_at_ceiling_escalates_no_dispose(tmp_path: Path) -> None:

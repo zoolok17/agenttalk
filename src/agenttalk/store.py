@@ -4057,6 +4057,14 @@ class Store:
         rec["last_interrupted"] = True
         rec["last_interruption_kind"] = "crash_mid_turn"
         rec["interrupted_consecutive"] = _safe_int(rec.get("interrupted_consecutive")) + 1
+        # #7-fix-4: a crash BREAKS the "consecutive never-started" run by
+        # definition (the process DID start this attempt - it crashed mid-turn,
+        # which is exactly why it is here). Leaving never_started_first_at /
+        # never_started_consecutive intact would let a LATER never-started
+        # failure promote using a window/count that spans across the crash,
+        # not an actually-consecutive run.
+        rec["never_started_first_at"] = None
+        rec["never_started_consecutive"] = 0
         data["messages"][msg_id] = rec
         self._write_attempts(agent, data)
         return True
