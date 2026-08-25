@@ -560,6 +560,82 @@ def test_make_drive_watchdog_default_path_stamps_store_heartbeat(tmp_path: Path)
     assert s.read_heartbeat("beta") is not None
 
 
+# --------------------- #202 D1: the interruption fact is structural, never sniffed
+
+def test_drive_outcome_marks_watchdog_interruption_on_plain_failure(tmp_path: Path) -> None:
+    # main failure-return site: sig["watchdog"] -> interrupted + kind, structurally.
+    s = _store(tmp_path)
+    st = wsession.load_session(s, "beta", "codex")
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"],
+                           spawn=lambda a, i: _FakeStream(_PARTIAL, returncode=-1,
+                                                          watchdog_result=_WD_RESULT))
+    out = drive({"id": "m1", "body": "x"})
+    assert out.interrupted is True and out.interruption_kind == "turn_watchdog"
+    # and an ORDINARY failure (no watchdog) is overwritten-to-False by construction
+    st2 = wsession.load_session(s, "beta", "codex")
+    drive2 = run.make_drive(s, "beta", "codex", st2, ["codex"],
+                            spawn=lambda a, i: _FakeStream(_PARTIAL, returncode=-1))
+    out2 = drive2({"id": "m1", "body": "x"})
+    assert out2.interrupted is False and out2.interruption_kind is None
+
+
+def test_drive_outcome_marks_interruption_on_resume_rewrite_sites(tmp_path: Path) -> None:
+    # #202 D1: the resume-failure branches REWRITE the outcome summary, so
+    # summary-sniffing is forbidden by construction - the interruption fields must
+    # ride each return structurally. Drive a resumable codex session into a
+    # session-attributable watchdog failure twice: first the "retrying resume"
+    # rewrite, then the "resume_unavailable" rewrite.
+    s = _store(tmp_path)
+    st = wsession.load_session(s, "beta", "codex")
+    st.codex_thread_id = "t-1"                        # build_turn -> exec resume (resume path)
+    # a NON-JSON diagnostic line lands in the discarded tail; with no model output
+    # it makes the failure session-ATTRIBUTABLE ("no session") while the watchdog
+    # still owns the classification.
+    lines = ["No conversation found with session ID: t-1"]
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"],
+                           spawn=lambda a, i: _FakeStream(lines, returncode=1,
+                                                          watchdog_result=_WD_RESULT))
+    out1 = drive({"id": "m1", "body": "x"})
+    assert out1.summary == "resume attempt failed; retrying resume once before fresh session"
+    assert out1.interrupted is True and out1.interruption_kind == "turn_watchdog"
+    out2 = drive({"id": "m1", "body": "x"})
+    assert out2.summary == "resume_unavailable; next attempt will start a fresh session"
+    assert out2.interrupted is True and out2.interruption_kind == "turn_watchdog"
+
+
+def test_make_drive_rejoin_for_reaches_the_child_prompt(tmp_path: Path) -> None:
+    # #202 D4: the injected rejoin_for's block rides assemble_turn_prompt's rejoin
+    # param; a None rejoin (first attempt) leaves the prompt untouched; a raising
+    # provider never kills the turn.
+    s = _store(tmp_path)
+    prompts: list[str] = []
+
+    def spawn(_argv, stdin):
+        prompts.append(stdin)
+        return _FakeStream(_COMPLETED, returncode=0)
+
+    st = wsession.load_session(s, "beta", "codex")
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=spawn,
+                           rejoin_for=lambda rec: "previous turn was interrupted")
+    drive({"id": "m1", "body": "x"})
+    assert "== REJOIN CONTEXT ==" in prompts[0]
+    assert "previous turn was interrupted" in prompts[0]
+    st2 = wsession.load_session(s, "beta", "codex")
+    drive2 = run.make_drive(s, "beta", "codex", st2, ["codex"], spawn=spawn,
+                            rejoin_for=lambda rec: None)
+    drive2({"id": "m2", "body": "x"})
+    assert "REJOIN CONTEXT" not in prompts[1]
+
+    def boom(rec):
+        raise RuntimeError("advisory only")
+
+    st3 = wsession.load_session(s, "beta", "codex")
+    drive3 = run.make_drive(s, "beta", "codex", st3, ["codex"], spawn=spawn,
+                            rejoin_for=boom)
+    out = drive3({"id": "m3", "body": "x"})
+    assert out.ok is True and "REJOIN CONTEXT" not in prompts[2]
+
+
 def test_proc_stream_watchdog_enabled_normal_exit_needs_no_wake() -> None:
     stream = run._ProcStream(
         [sys.executable, "-c", "print('done', flush=True)"],

@@ -537,6 +537,365 @@ def test_gateway_held_escalates_exactly_once_across_a_long_hold(tmp_path) -> Non
     assert len(escalations) == 1                  # one-shot, not once-per-poll
 
 
+# ------------------- #205: repeated never-started child promotes to config_blocked
+
+def _never_started_drive():
+    return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_AMBIGUOUS,
+                             summary="turn never started (rc=1, no clear signal)")
+
+
+def test_first_never_started_failure_stays_ambiguous_and_retries(tmp_path) -> None:
+    # #205 guard: ONE never-started result may be a transient host hiccup - it must NOT
+    # park a healthy seat. It stays ambiguous and the uncommitted head re-drives.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    parked: list = []
+    loop.run_loop(
+        s, "beta", lambda rec: _never_started_drive(),
+        clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=1, k_poison=0, k_escalate=0,
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    assert parked == []                                     # not parked on first sight
+    rec = s.attempt_record("beta", m.id)
+    assert rec["last_failure_class"] == loop.CLASS_AMBIGUOUS
+    assert s.cursor("beta") == ""                           # uncommitted -> re-drives
+    assert s.dead_lettered_count("beta") == 0
+
+
+def test_second_consecutive_never_started_parks_config_blocked_with_remedy(tmp_path) -> None:
+    # #205: the field case - a codex child in a non-git workspace exits rc=1 before any
+    # stream output, deterministically. The SECOND consecutive never-started result on
+    # the same head promotes to config_blocked (escalate once + durable park, the
+    # existing #62 machinery) instead of burning 20 ambiguous k_escalate retries.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        return _never_started_drive()
+
+    parked: list = []
+    escalations: list = []
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=4, k_poison=0, k_escalate=20,
+        on_escalate=lambda info: escalations.append(info.get("msg_id")) or True,
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    assert drives["n"] == 2                       # one honest retry, then parked - never 20
+    assert parked                                 # visibly parked, not silently retried
+    assert all(pid == m.id and reason == "config_blocked" for pid, reason in parked)
+    rec = s.attempt_record("beta", m.id)
+    assert rec["last_failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert "child CLI never started" in rec["last_failure_summary"]
+    assert "git repo" in rec["last_failure_summary"]        # names the concrete remedies
+    assert len(escalations) == 1                            # escalated exactly once
+    assert s.cursor("beta") == ""                           # parked, never committed
+    assert s.dead_lettered_count("beta") == 0               # parked, never dead-lettered
+
+
+def test_non_never_started_ambiguous_failure_never_promotes(tmp_path) -> None:
+    # An ambiguous failure WITHOUT the never-started signature (the child started, then
+    # exited nonzero) keeps today's semantics: retry toward the ceiling, never a
+    # config_blocked park.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_AMBIGUOUS,
+                                 summary="nonzero child exit (rc=1) after start")
+
+    parked: list = []
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=4, k_poison=0, k_escalate=0,
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    assert drives["n"] == 4                                 # re-drove every poll
+    assert parked == []                                     # never promoted/parked
+    rec = s.attempt_record("beta", m.id)
+    assert rec["last_failure_class"] == loop.CLASS_AMBIGUOUS
+
+
+# ------------------- #202: interruption-aware redelivery (backoff, budget, rejoin)
+
+_ISO_T0 = "2026-08-25T00:00:00Z"
+
+
+def _watchdog_interrupted_outcome():
+    return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_AMBIGUOUS,
+                             summary="turn watchdog killed hung tool descendant",
+                             interrupted=True, interruption_kind="turn_watchdog")
+
+
+def _seed_interruptions(s, msg_id: str, n: int, *, at: str = _ISO_T0) -> None:
+    for i in range(n):
+        s.record_attempt_start("beta", {"id": msg_id}, attempt_id=f"a{i}", at=at)
+        s.record_attempt_result("beta", msg_id, failure_class=loop.CLASS_AMBIGUOUS,
+                                summary="turn watchdog killed hung tool descendant",
+                                at=at, interrupted=True,
+                                interruption_kind="turn_watchdog")
+
+
+def test_interruption_backoff_is_chunked_and_stamps_during(tmp_path) -> None:
+    # #202 D2: the backoff is computed at HEAD ENTRY from the PERSISTED record (a
+    # NEW Store instance here = simulated relaunch, so in-memory fail_sleep amnesia
+    # cannot skip it) and slept in heartbeat_interval chunks WITH a stamp per chunk
+    # - a deliberately backing-off wrapper never looks stale to the supervisor.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    _seed_interruptions(s, m.id, 1)              # required = 25 * 2^0 = 25s, 5s already elapsed
+    events: list = []
+    turns = loop.run_loop(
+        Store(tmp_path), "beta", lambda rec: events.append("drive") or True,
+        clock=lambda: 0.0, sleep=lambda d: events.append(("sleep", d)),
+        heartbeat=lambda: events.append("hb"),
+        now_iso=lambda: "2026-08-25T00:00:05Z",
+        heartbeat_interval=10.0, interruption_redrive_seconds=25.0,
+        k_interrupted=3, max_polls=1, k_poison=0, k_escalate=0)
+    assert turns == 1
+    backoff = events[:events.index("drive")]
+    assert backoff == ["hb", ("sleep", 10.0), "hb", ("sleep", 10.0)]  # 20s remainder, stamped per chunk
+
+
+def test_non_interrupted_failure_keeps_the_ordinary_idle_backoff(tmp_path) -> None:
+    # A non-interrupted ambiguous failure must keep today's fail_sleep backoff:
+    # no chunked pre-drive sleep, no pre-drive heartbeat stamping.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="task")
+    events: list = []
+    loop.run_loop(
+        s, "beta",
+        lambda rec: events.append("drive") or loop.DriveOutcome(
+            ok=False, failure_class=loop.CLASS_AMBIGUOUS, summary="plain failure"),
+        clock=lambda: 0.0, sleep=lambda d: events.append(("sleep", d)),
+        heartbeat=lambda: events.append("hb"),
+        heartbeat_interval=10.0, interruption_redrive_seconds=60.0,
+        max_polls=2, k_poison=0, k_escalate=0)
+    assert events[0] == "drive"                             # no backoff before the first drive
+    assert events.count("drive") == 2                       # and none before the retry either
+    assert all(d <= 2.0 for kind, d in
+               [e for e in events if isinstance(e, tuple)])  # fail_sleep only, never 10s chunks
+
+
+def test_third_consecutive_watchdog_interruption_dead_letters_with_remedy(tmp_path) -> None:
+    # #202 D3: at k_interrupted the head DEAD-LETTERS (reason
+    # interruption_budget_exhausted), the escalation carries the concrete remedy,
+    # and the cursor ADVANCES - the seat keeps serving the queue (never a park).
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="oversized task")
+    nxt = s.send(sender="alpha", recipient="beta", body="next task")
+    driven: list = []
+
+    def drive(rec):
+        driven.append(rec["id"])
+        if rec["id"] == m.id:
+            return _watchdog_interrupted_outcome()
+        return loop.DriveOutcome(ok=True)
+
+    escalations: list = []
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=8, k_poison=0, k_escalate=0, k_interrupted=3,
+        interruption_redrive_seconds=0.0,        # backoff off: this test forces the CEILING
+        interruption_budget_seconds=1800.0,
+        on_escalate=lambda info: escalations.append(info) or True)
+    assert driven.count(m.id) == 3                          # three attempts, never 20
+    assert s.dead_lettered_count("beta") == 1
+    entry = s.list_dead_letters("beta")[0]
+    assert entry["last_reason"] == "interruption_budget_exhausted"
+    assert len(escalations) == 1
+    remedy = escalations[0]["summary"]
+    assert "killed 3 times by turn_watchdog after 1800s each" in remedy
+    assert "turn_watchdog.turn_elapsed_seconds" in remedy
+    assert f"agenttalk dead-letter requeue --agent beta --id {m.id}" in remedy
+    assert turns == 1 and driven[-1] == nxt.id              # cursor advanced; seat kept serving
+    assert s.cursor("beta") == nxt.id
+    # requeue after the ceiling yields a FRESH message with a FRESH attempt ledger
+    assert cli.main(["--root", str(tmp_path), "dead-letter", "requeue",
+                     "--agent", "beta", "--id", m.id, "--from", "alpha"]) == 0
+    fresh = [msg for msg in s.messages_for("beta") if msg.id not in (m.id, nxt.id)]
+    assert fresh and s.attempt_record("beta", fresh[0].id) is None
+
+
+def test_non_interrupted_failure_between_resets_the_interruption_run(tmp_path) -> None:
+    # #202 D3: consecutiveness is real - an ordinary failure between watchdog kills
+    # resets the run, so an alternating pattern never reaches the ceiling.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    pattern = [True, True, False, True, True, False]        # never 3 consecutive
+    driven = {"n": 0}
+
+    def drive(rec):
+        interrupted = pattern[driven["n"] % len(pattern)]
+        driven["n"] += 1
+        if interrupted:
+            return _watchdog_interrupted_outcome()
+        return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_AMBIGUOUS,
+                                 summary="plain failure")
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_polls=6, k_poison=0, k_escalate=0, k_interrupted=3,
+                  interruption_redrive_seconds=0.0)
+    assert driven["n"] == 6                                  # kept retrying
+    assert s.dead_lettered_count("beta") == 0                # ceiling never tripped
+    rec = s.attempt_record("beta", m.id)
+    assert rec["interrupted_watchdog_consecutive"] < 3
+
+
+def test_crash_mid_turn_interruptions_never_trip_the_interruption_ceiling(tmp_path) -> None:
+    # #202 NEW-2: 3+ crash reconciles leave the head RETRYING UNDER BACKOFF, never
+    # dead-lettered at k_interrupted (the store.py crash_mid_turn ruling stands).
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    for i in range(4):
+        s.record_attempt_start("beta", {"id": m.id}, attempt_id=f"c{i}", at=_ISO_T0)
+        assert s.reconcile_crash_in_progress("beta", m.id, at=_ISO_T0)
+    events: list = []
+    turns = loop.run_loop(
+        Store(tmp_path), "beta", lambda rec: events.append("drive") or True,
+        clock=lambda: 0.0, sleep=lambda d: events.append(("sleep", d)),
+        heartbeat=lambda: events.append("hb"),
+        now_iso=lambda: _ISO_T0,
+        heartbeat_interval=10.0, interruption_redrive_seconds=5.0,
+        k_interrupted=3, max_polls=1, k_poison=0, k_escalate=0)
+    assert s.dead_lettered_count("beta") == 0               # never disposed at the ceiling
+    assert turns == 1 and "drive" in events                 # it DROVE (after backing off)
+    assert events[:2] == ["hb", ("sleep", 10.0)]            # ...under the stamped backoff
+    #                                                         (5 * 2^3 = 40s, chunked at 10s)
+
+
+def test_head_at_interruption_ceiling_on_entry_disposes_without_a_drive(tmp_path) -> None:
+    # #202 NEW-3 (entry mirror): a head already AT the ceiling on entry (killed
+    # between the result-write and the dispose, then relaunched) is disposed
+    # WITHOUT burning another watchdog budget.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    _seed_interruptions(s, m.id, 3)
+    driven: list = []
+    escalations: list = []
+    loop.run_loop(
+        Store(tmp_path), "beta", lambda rec: driven.append(rec["id"]) or True,
+        clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=2, k_poison=0, k_escalate=0, k_interrupted=3,
+        interruption_redrive_seconds=0.0,
+        on_escalate=lambda info: escalations.append(info) or True)
+    assert driven == []                                     # disposed WITHOUT another drive
+    assert s.dead_lettered_count("beta") == 1
+    assert s.list_dead_letters("beta")[0]["last_reason"] == "interruption_budget_exhausted"
+    assert escalations and "dead-letter requeue" in escalations[0]["summary"]
+    assert s.cursor("beta") == m.id                         # cursor advanced (self-clearing)
+
+
+def test_one_shot_interrupted_redrive_carries_in_memory_context(tmp_path) -> None:
+    # #202 D4 (one-shot): no attempt ledger - the previous scoped attempt's
+    # interruption rides the record IN-MEMORY so the re-drive still gets a rejoin.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="the task",
+           meta={"request_id": "rq-1"})
+    seen: list = []
+
+    def drive(rec):
+        seen.append(rec.get("interrupted_redelivery"))
+        if len(seen) == 1:
+            return _watchdog_interrupted_outcome()
+        return loop.DriveOutcome(ok=True)
+
+    turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                          max_turns=1, max_polls=6, only_request_id="rq-1")
+    assert turns == 1
+    assert seen[0] is None                                  # first attempt: no context
+    assert seen[1]["kind"] == "turn_watchdog"               # re-drive: in-memory context
+    assert seen[1]["consecutive"] == 1
+
+
+def test_rejoin_for_builds_block_from_ledger_and_names_the_preserved_draft(tmp_path) -> None:
+    # #202 D4: the cli-built provider reads the PERSISTED ledger per head id (never
+    # leaking across heads), names the preserved draft, and counts attempt n of k.
+    from agenttalk import reply_transport
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    _seed_interruptions(s, m.id, 2)
+    preserved = reply_transport.reply_draft_path(s, "beta", m.id).with_suffix(
+        ".interrupted.md")
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    preserved.write_text("partial progress", encoding="utf-8")
+    rejoin_for = cli._interruption_rejoin_for(s, "beta", 3)
+    block = rejoin_for({"id": m.id})
+    assert "INTERRUPTED (turn_watchdog)" in block
+    assert "interruption 2 of a budget of 3" in block
+    assert str(preserved) in block
+    assert "prefer resuming over redoing" in block
+    # a DIFFERENT head with no interruption history carries no rejoin (no leak)
+    clean = s.send(sender="alpha", recipient="beta", body="other")
+    assert rejoin_for({"id": clean.id}) is None
+    # the one-shot in-memory decoration is consumed by the same provider
+    block2 = rejoin_for({"id": m.id, "interrupted_redelivery": {
+        "kind": "turn_watchdog", "consecutive": 1, "last_failure_at": None}})
+    assert "interruption 1 of a budget of 3" in block2
+
+
+def test_cmd_wrap_refuses_when_heartbeat_interval_not_below_stuck_after(tmp_path) -> None:
+    # #202 D2 launch validation (rev 3): the load-bearing invariant is
+    # heartbeat_interval < stuck_after (the chunked stamp bounds heartbeat age at
+    # heartbeat_interval); refuse at launch with BOTH numbers, config-blocked.
+    import json as _json
+    s = _store(tmp_path)
+    (s.dir / "supervisor.json").write_text(_json.dumps({
+        "agents": {"beta": {"wrapped": True, "cli": "codex",
+                            "stuck_after_seconds": 5}},
+    }), encoding="utf-8")
+    rc = cli.main(["--root", str(tmp_path), "wrap", "--for", "beta", "--cli", "codex",
+                   "--loop", "--", sys.executable, "-c", "pass"])
+    assert rc == 1
+    hold = s.read_config_blocked_hold("beta")
+    assert hold is not None
+    assert "10" in hold["summary"] and "5" in hold["summary"]   # both numbers named
+
+
+def test_cmd_wrap_corrupt_interruption_knob_refuses_visibly(tmp_path) -> None:
+    # #202 D2: a present-but-corrupt knob refuses through the launch
+    # config-blocked path - never silently clamped or defaulted.
+    import json as _json
+    s = _store(tmp_path)
+    (s.dir / "supervisor.json").write_text(_json.dumps({
+        "agents": {"beta": {"interruption_redrive_seconds": "fast"}},
+    }), encoding="utf-8")
+    rc = cli.main(["--root", str(tmp_path), "wrap", "--for", "beta", "--cli", "codex",
+                   "--loop", "--", sys.executable, "-c", "pass"])
+    assert rc == 1
+    hold = s.read_config_blocked_hold("beta")
+    assert hold is not None and "interruption_redrive_seconds" in hold["summary"]
+
+
+def test_cmd_wrap_valid_interruption_config_reaches_the_loop(tmp_path, monkeypatch) -> None:
+    # valid knobs launch and are threaded into the loop (per-agent values win).
+    import json as _json
+    s = _store(tmp_path)
+    (s.dir / "supervisor.json").write_text(_json.dumps({
+        "agents": {"beta": {"interruption_redrive_seconds": 30, "k_interrupted": 2}},
+    }), encoding="utf-8")
+    seen: dict = {}
+
+    def fake_loop(store, agent, **kwargs):
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "_wrap_loop_mode", fake_loop)
+    monkeypatch.setattr(
+        run, "preflight_launch_runtime",
+        lambda argv, _cli, _root, _env: run.LaunchPreflightResult(list(argv)))
+    rc = cli.main(["--root", str(tmp_path), "wrap", "--for", "beta", "--cli", "codex",
+                   "--loop", "--", "codex.exe"])
+    assert rc == 0
+    assert seen["k_interrupted"] == 2
+    assert seen["interruption_redrive_seconds"] == 30.0
+
+
 # --------------------------------------------- make_drive (run.py, injected spawn)
 
 def _codex_turn_lines(thread_id: str = "t-1", text: str = "done") -> list[str]:
@@ -2594,6 +2953,49 @@ def test_cmd_wrap_preflight_success_clears_config_blocked_hold(
     assert seen["agent"] == "beta"
     assert seen["base_argv"] == [str(native), "exec"]
     assert s.read_config_blocked_hold("beta") is None
+
+
+def test_cmd_wrap_plain_silent_child_refuses_loudly_with_remedy(tmp_path, capsys) -> None:
+    # #204: plain `wrap` (no --loop) is the direct progress-adapter over a COMPLETE
+    # child command - it never reads the inbox. A child that emits no structured
+    # events used to exit 0 in total silence (success-shaped no-op, message left
+    # unread, health 'wrapper_completed'). It must refuse loudly with the remedy.
+    s = _store(tmp_path)
+    msg = s.send(sender="alpha", recipient="beta", body="answer me")
+
+    rc = cli.main([
+        "--root", str(tmp_path),
+        "wrap", "--for", "beta", "--cli", "codex",
+        "--", sys.executable, "-c", "pass",
+    ])
+
+    assert rc == 1                                          # no longer a silent exit 0
+    err = capsys.readouterr().err
+    assert "no turn driven" in err                          # one-line diagnostic...
+    assert "--loop" in err                                  # ...with the concrete remedy
+    assert s.cursor("beta") == ""                           # plain mode never consumed it
+    assert s.messages_for("beta")[0].id == msg.id
+    health = s.read_health("beta", ttl_seconds=999999)
+    assert health["reason_code"] == "wrapper_no_turn_driven"  # not 'wrapper_completed'
+
+
+def test_cmd_wrap_to_request_without_one_shot_refuses_loudly(tmp_path, capsys) -> None:
+    # #204: --to-request without --one-shot used to be silently dropped (the wrap ran
+    # unscoped and never drove the named request). Now a loud usage refusal, with and
+    # without --loop.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="answer me")
+    for extra in ([], ["--loop"]):
+        rc = cli.main([
+            "--root", str(tmp_path),
+            "wrap", "--for", "beta", "--cli", "codex", *extra,
+            "--to-request", "q-1",
+            "--", sys.executable, "-c", "pass",
+        ])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "--to-request" in err and "--one-shot" in err  # names the remedy
+    assert s.cursor("beta") == ""                             # nothing was consumed
 
 
 def test_make_drive_retryable_after_start_needs_structured_infra_signal(tmp_path) -> None:

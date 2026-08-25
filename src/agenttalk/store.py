@@ -3965,9 +3965,21 @@ class Store:
         return rec
 
     def record_attempt_result(self, agent: str, msg_id: str, *, failure_class: str,
-                              summary: str | None, at: str) -> dict | None:
+                              summary: str | None, at: str,
+                              interrupted: bool = False,
+                              interruption_kind: str | None = None) -> dict | None:
         """After a FAILED drive: clear ``in_progress``, bump the per-class failure
-        counter, record the last class/summary. (Success calls clear_attempt.)"""
+        counter, record the last class/summary. (Success calls clear_attempt.)
+
+        #202 D1: a SELF-INFLICTED interruption (the turn watchdog killed the child's
+        tree) is a first-class fact with its own persisted accounting. The fields are
+        ALWAYS written - overwritten to False/None on a non-interrupted result
+        (including the loop's commit-gate CAS-miss results) - so a stale flag can
+        never pollute the rejoin context or the k_interrupted ceiling. Two counters:
+        ``interrupted_consecutive`` (any kind - drives the D2 backoff) and
+        ``interrupted_watchdog_consecutive`` (kind=turn_watchdog only - drives the D3
+        ceiling; crash_mid_turn must never count toward it, per the
+        reconcile_crash_in_progress ruling below)."""
         data = self.dead_letter_attempts(agent)
         rec = data["messages"].get(msg_id)
         if not isinstance(rec, dict):
@@ -3976,6 +3988,17 @@ class Store:
         rec["last_failure_class"] = failure_class
         rec["last_failure_summary"] = (summary or "")[:500]
         rec["last_failure_at"] = at
+        rec["last_interrupted"] = bool(interrupted)
+        rec["last_interruption_kind"] = interruption_kind if interrupted else None
+        if interrupted:
+            rec["interrupted_consecutive"] = _safe_int(
+                rec.get("interrupted_consecutive")) + 1
+            if interruption_kind == "turn_watchdog":
+                rec["interrupted_watchdog_consecutive"] = _safe_int(
+                    rec.get("interrupted_watchdog_consecutive")) + 1
+        else:
+            rec["interrupted_consecutive"] = 0
+            rec["interrupted_watchdog_consecutive"] = 0
         key = {"poison_eligible": "poison_eligible_failures",
                "known_global_infra": "infra_failures"}.get(
                    failure_class, "ambiguous_failures")
@@ -4010,6 +4033,12 @@ class Store:
         rec["last_failure_class"] = "ambiguous_or_unknown"
         rec["last_failure_summary"] = "crash_mid_turn"
         rec["last_failure_at"] = at
+        # #202 D1: a crash IS an interruption (it gets the D2 backoff + D4 rejoin), but
+        # its cause is UNOBSERVED, so it must NOT count toward - nor erase the evidence
+        # behind - the turn_watchdog-only k_interrupted ceiling (the ruling above).
+        rec["last_interrupted"] = True
+        rec["last_interruption_kind"] = "crash_mid_turn"
+        rec["interrupted_consecutive"] = _safe_int(rec.get("interrupted_consecutive")) + 1
         data["messages"][msg_id] = rec
         self._write_attempts(agent, data)
         return True

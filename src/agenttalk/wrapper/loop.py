@@ -18,7 +18,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +46,46 @@ CLASS_INFRA_RETRY_EXHAUSTED = "infra_retry_exhausted"
 # instant the operator clears the hold. See _hold_park + the failed-turn branch below (#62).
 CLASS_GATEWAY_HELD = "gateway_held"
 
+# #205: the classifier summary prefix for a child that produced NO turn-start and NO
+# model output before exiting (run._classify_drive_failure's last-resort branch, e.g. a
+# codex child refusing a non-git/untrusted workspace before it emits a single stream
+# event). ONE such result stays AMBIGUOUS (a transient host hiccup must not park a
+# healthy seat), but the SECOND CONSECUTIVE one on the same head is deterministic: the
+# loop promotes it to CLASS_CONFIG_BLOCKED (escalate once + durable park + safe
+# re-probe, #62) instead of burning the K_escalate ceiling on 20 ambiguous retries.
+NEVER_STARTED_SUMMARY_PREFIX = "turn never started"
+NEVER_STARTED_REMEDY = (
+    "child CLI never started; check: workspace is a git repo / trusted directory, "
+    "CLI auth, executable path")
+
+
+def _is_never_started_failure(failure_class: object, summary: object) -> bool:
+    """True iff a failure result carries the never-started AMBIGUOUS signature."""
+    return (failure_class == CLASS_AMBIGUOUS and isinstance(summary, str)
+            and NEVER_STARTED_SUMMARY_PREFIX in summary)
+
+
+# The continuous loop's idle-heartbeat cadence AND the #202 D2 backoff chunk size.
+# Named so the launch validation (cli) can enforce the load-bearing invariant
+# heartbeat_interval < stuck_after: the chunked backoff stamps once per chunk, so
+# a wrapper deliberately backing off can never look stale to the supervisor.
+HEARTBEAT_INTERVAL_SECONDS = 10.0
+
+# #202 D3: dead-letter reason for a head whose turns were repeatedly killed by the
+# turn watchdog (k_interrupted consecutive turn_watchdog interruptions).
+INTERRUPTION_BUDGET_EXHAUSTED = "interruption_budget_exhausted"
+
+
+def _interruption_remedy(agent: str, head_id: object, *, k: int, kind: str,
+                         budget_seconds: float | None) -> str:
+    """The operator remedy carried by the k_interrupted escalation (#202 D3)."""
+    budget = (f" after {budget_seconds:.0f}s each"
+              if isinstance(budget_seconds, (int, float)) else "")
+    return (f"this message's turns were killed {k} times by {kind}{budget}; "
+            f"raise turn_watchdog.turn_elapsed_seconds for {agent}, split the task, "
+            f"or requeue as-is: `agenttalk dead-letter requeue --agent {agent} "
+            f"--id {head_id}`")
+
 
 @dataclass(frozen=True)
 class DriveOutcome:
@@ -61,6 +101,12 @@ class DriveOutcome:
     bus_action_attempted: bool = False
     bus_action_infra: bool = False
     bus_action_rejected: bool = False
+    # #202 D1: a SELF-INFLICTED interruption (the per-turn watchdog killed the
+    # child's tree) is a first-class fact - set structurally at every make_drive
+    # failure-return site under sig["watchdog"], never sniffed from the summary
+    # (the resume branches rewrite summaries). Kind: "turn_watchdog".
+    interrupted: bool = False
+    interruption_kind: str | None = None
 
 
 def _as_outcome(ret: object) -> DriveOutcome:
@@ -115,6 +161,13 @@ def _with_reply_draft(store, agent: str, record: dict) -> dict:
         # a partial draft at the same deterministic path, and a later clean
         # turn that never overwrites it must not publish those stale bytes as
         # the authoritative answer (PR #127 connector P1).
+        # #202 D5: when the PREVIOUS attempt was interrupted, that leftover is the
+        # child's recoverable progress - preserve it as <id>.interrupted.md (the
+        # rejoin names it; a failed rename falls through to today's delete). The
+        # live path is cleared either way, so the preserved copy never publishes.
+        prev = store.attempt_record(agent, inbound_id) or {}
+        if prev.get("last_interrupted") and path.is_file():
+            reply_transport.preserve_interrupted_draft(path)
         path.unlink(missing_ok=True)
     except OSError:
         return record
@@ -296,13 +349,16 @@ def classify_loop_control(store, record: dict) -> str:
 
 def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              idle_interval: float = 0.3, max_idle_interval: float = 2.0,
-             heartbeat_interval: float = 10.0,
+             heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
              clock: Callable[[], float] = time.monotonic,
              sleep: Callable[[float], None] = time.sleep,
              max_turns: int | None = None, max_polls: int | None = None,
              only_request_id: str | None = None,
              max_wall: float | None = None,
              k_poison: int = 3, k_escalate: int = 20,
+             k_interrupted: int = 3,
+             interruption_redrive_seconds: float = 60.0,
+             interruption_budget_seconds: float | None = None,
              infra_exhaust_after_seconds: float = 14400.0,
              infra_exhaust_min_attempts: int = 100,
              noninfra_sub_ceiling: int | None = None,
@@ -393,6 +449,9 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             max_idle_interval=max_idle_interval, heartbeat_interval=heartbeat_interval,
             clock=clock, sleep=sleep, max_turns=max_turns, max_polls=max_polls,
             max_wall=max_wall, k_poison=k_poison, k_escalate=k_escalate,
+            k_interrupted=k_interrupted,
+            interruption_redrive_seconds=interruption_redrive_seconds,
+            interruption_budget_seconds=interruption_budget_seconds,
             infra_exhaust_after_seconds=infra_exhaust_after_seconds,
             infra_exhaust_min_attempts=infra_exhaust_min_attempts,
             noninfra_sub_ceiling=noninfra_sub_ceiling,
@@ -416,6 +475,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     sleep: Callable[[float], None], max_turns: int | None,
                     max_polls: int | None, max_wall: float | None,
                     k_poison: int, k_escalate: int,
+                    k_interrupted: int,
+                    interruption_redrive_seconds: float,
+                    interruption_budget_seconds: float | None,
                     infra_exhaust_after_seconds: float,
                     infra_exhaust_min_attempts: int,
                     noninfra_sub_ceiling: int | None,
@@ -539,7 +601,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             return
 
     def _info(record: dict, rec: dict, failure_class: str, *,
-              infra_exhausted: bool = False, quarantined: bool = False) -> dict:
+              infra_exhausted: bool = False, quarantined: bool = False,
+              summary: str | None = None) -> dict:
         attempts = _safe_int((rec or {}).get("attempts_started"))
         bucket = "below_backstop"
         if quarantined:
@@ -558,7 +621,10 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 "infra_exhausted": infra_exhausted,
                 "quarantined": quarantined,
                 "failure_class": failure_class,
-                "summary": (rec or {}).get("last_failure_summary") or ""}
+                # #202 D3 (review finding 9): an explicit summary carries the REAL
+                # reason/remedy to the operator instead of only the ledger's last line.
+                "summary": (summary if summary is not None
+                            else (rec or {}).get("last_failure_summary") or "")}
 
     def _dispose(record: dict, *, failure_class: str, reason: str | None,
                  infra_exhausted: bool = False,
@@ -625,7 +691,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             except Exception:  # noqa: BLE001 - a notification must never crash the loop
                 return
 
-    def _escalate_once(record: dict, failure_class: str, *, retry_unrouted: bool = True) -> None:
+    def _escalate_once(record: dict, failure_class: str, *, retry_unrouted: bool = True,
+                       summary: str | None = None) -> None:
         """Class-agnostic K_escalate backstop: emit an operator escalation, DEDUPED on
         successful ROUTING - not merely on having attempted. An UNROUTED notice (no
         liaison/lead resolved) is retried on subsequent polls so it fires once the operator
@@ -635,7 +702,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if rec.get("escalation_routed") or (rec.get("escalated") and not retry_unrouted):
             return                                    # already routed -> done (deduped)
         try:
-            routed = bool(on_escalate(_info(record, rec, failure_class))) \
+            routed = bool(on_escalate(_info(record, rec, failure_class, summary=summary))) \
                 if on_escalate is not None else False
         except Exception:  # noqa: BLE001 - a notification must never crash the loop
             routed = False                            # unrouted -> retried + doctor LOUD
@@ -1190,6 +1257,22 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # relaunch/crash-accumulation path - test #3).
         if rec.get("last_failure_class") != CLASS_CONFIG_BLOCKED:
             cap_now = now_iso()
+            # #202 D3 (rev 3 NEW-3, entry mirror): a head whose persisted
+            # turn_watchdog-only counter is already AT the k_interrupted ceiling
+            # (the process died between the result-write and the dispose, then
+            # relaunched) is disposed WITHOUT burning another watchdog budget.
+            # Strictly more specific than the caps below, so it is checked first.
+            # Only turn_watchdog counts reach this counter - crash_mid_turn's
+            # reconcile never increments it (the store.py ruling stands).
+            if (k_interrupted > 0 and _safe_int(
+                    rec.get("interrupted_watchdog_consecutive")) >= k_interrupted):
+                remedy = _interruption_remedy(
+                    agent, head_id, k=k_interrupted, kind="turn_watchdog",
+                    budget_seconds=interruption_budget_seconds)
+                _escalate_once(record, CLASS_AMBIGUOUS, summary=remedy)
+                _dispose(record, failure_class=CLASS_AMBIGUOUS,
+                         reason=INTERRUPTION_BUDGET_EXHAUSTED)
+                continue
             if k_poison > 0 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison:
                 _dispose(record, failure_class=CLASS_POISON,
                          reason=rec.get("last_failure_summary"))
@@ -1260,6 +1343,30 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 continue
             legacy_gate_resolution = authorized
 
+        # #202 D2: supervisor-safe interruption backoff, computed HERE (head entry)
+        # from the PERSISTED record - never from in-memory fail_sleep, which relaunch
+        # amnesia resets. This single site therefore also covers crash_mid_turn's
+        # immediate-redrive-at-relaunch path (the reconcile above just incremented
+        # the counter). base x 2^(n-1), n = interrupted_consecutive (any kind); no
+        # separate cap needed (n is bounded by the k_interrupted dispose above for
+        # watchdog kills and by k_escalate for crashes). The sleep is CHUNKED at
+        # heartbeat_interval with a stamp per chunk (blocked-but-alive, the same
+        # posture as the holds), so the supervisor can never STUCK_RECOVER a wrapper
+        # that is deliberately backing off. Control kinds are delayed for the
+        # duration - documented cost, bounded by the launch validation (cli).
+        interrupted_n = _safe_int(rec.get("interrupted_consecutive"))
+        if interrupted_n > 0 and interruption_redrive_seconds > 0:
+            required = float(interruption_redrive_seconds) * (2.0 ** (interrupted_n - 1))
+            last_at = _iso_epoch(rec.get("last_failure_at"))
+            now_at = _iso_epoch(now_iso())
+            remaining = (required if last_at is None or now_at is None
+                         else required - (now_at - last_at))
+            while remaining > 0:
+                stamp()
+                last_hb = clock()
+                chunk = min(max(0.1, float(heartbeat_interval)), remaining)
+                sleep(chunk)
+                remaining -= chunk
         # WRITE-AHEAD: count + mark in_progress BEFORE drive() so a crash mid-turn
         # still costs a durable attempt on relaunch. EXACTLY one attempt per drive().
         record = _with_reply_draft(store, agent, record)
@@ -1363,14 +1470,46 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             # ledger (and so it can never reach a dispose ceiling). See _hold_park.
             _hold_park(record)
             continue
+        # #205: a SECOND consecutive never-started result on the same head (the attempt
+        # record still holds the previous failure - record_attempt_start preserves it)
+        # is a deterministic launch/config denial, not an ambiguous hiccup. Promote it
+        # to CLASS_CONFIG_BLOCKED with the concrete remedies so the existing branch
+        # below escalates once + parks durably instead of retrying blind to K_escalate.
+        if _is_never_started_failure(outcome.failure_class, outcome.summary):
+            prev = store.attempt_record(agent, head_id) or {}
+            if _is_never_started_failure(prev.get("last_failure_class"),
+                                         prev.get("last_failure_summary")):
+                outcome = replace(outcome, failure_class=CLASS_CONFIG_BLOCKED,
+                                  summary=f"{NEVER_STARTED_REMEDY} ({outcome.summary})")
         # record the classified failure (clears in_progress), then decide.
         store.record_attempt_result(agent, head_id, failure_class=outcome.failure_class,
-                                    summary=outcome.summary, at=now_iso())
+                                    summary=outcome.summary, at=now_iso(),
+                                    interrupted=outcome.interrupted,
+                                    interruption_kind=outcome.interruption_kind)
         rec = store.attempt_record(agent, head_id) or {}
         if outcome.failure_class == CLASS_CONFIG_BLOCKED:
             if isinstance(head_id, str):
                 config_blocked_ids.add(head_id)
             _park_config_blocked(record)
+            continue
+        # #202 D3: the interruption budget. Counts ONLY kind=turn_watchdog results
+        # (crash_mid_turn's cause is unobserved - its disposal ceiling stays
+        # k_escalate, per the codified store.py ruling). Checked BEFORE
+        # k_poison/noninfra/k_escalate: strictly more specific. At the ceiling the
+        # head DEAD-LETTERS (self-clearing: cursor advances, the seat keeps serving
+        # the queue; `dead-letter requeue` is the operator's raised-budget retry)
+        # and the escalation carries the concrete remedy - NOT a park, which would
+        # wedge the seat with no un-park path (rev 1 F1/F2).
+        if (k_interrupted > 0 and _safe_int(
+                rec.get("interrupted_watchdog_consecutive")) >= k_interrupted):
+            remedy = _interruption_remedy(
+                agent, head_id, k=k_interrupted, kind="turn_watchdog",
+                budget_seconds=interruption_budget_seconds)
+            _escalate_once(record, outcome.failure_class or CLASS_AMBIGUOUS,
+                           summary=remedy)
+            _dispose(record, failure_class=CLASS_AMBIGUOUS,
+                     reason=INTERRUPTION_BUDGET_EXHAUSTED,
+                     child_output_tail=outcome.child_output_tail)
             continue
         if (k_poison > 0 and outcome.failure_class == CLASS_POISON
                 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison):
@@ -1428,6 +1567,32 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
     fail_sleep = idle_interval
     start = clock()
     _stamp = stamp if stamp is not None else (lambda: store.write_heartbeat(agent))
+
+    # #202 D4 (one-shot): this scoped loop has NO attempt ledger, so the previous
+    # attempt's interruption is carried IN-MEMORY (single head by construction - a
+    # local run suffices) and handed to the drive as a record decoration the cli's
+    # rejoin_for consumes. D2's persisted-entry backoff deliberately does not apply
+    # here (the one-shot is bounded by max_wall anyway).
+    interrupted_run: dict = {"count": 0, "kind": None, "at": None}
+
+    def _with_interruption_context(rec: dict) -> dict:
+        if interrupted_run["count"] <= 0:
+            return rec
+        decorated = dict(rec)
+        decorated["interrupted_redelivery"] = {
+            "kind": interrupted_run["kind"],
+            "consecutive": interrupted_run["count"],
+            "last_failure_at": interrupted_run["at"],
+        }
+        return decorated
+
+    def _note_interruption(outcome: DriveOutcome) -> None:
+        if outcome.interrupted:
+            interrupted_run["count"] += 1
+            interrupted_run["kind"] = outcome.interruption_kind
+            interrupted_run["at"] = _iso_now()
+        else:
+            interrupted_run.update({"count": 0, "kind": None, "at": None})
 
     def _runtime_idle() -> None:
         if on_runtime_idle is not None:
@@ -1664,7 +1829,9 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     sleep(fail_sleep)
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
-                outcome = _as_outcome(drive(dispatch_record))
+                outcome = _as_outcome(
+                    drive(_with_interruption_context(dispatch_record)))
+                _note_interruption(outcome)
                 action_infra = (
                     outcome.bus_action_infra or outcome.failure_class == CLASS_INFRA
                 )
@@ -1829,7 +1996,8 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 continue
             legacy_gate_resolution = authorized
         record = _with_reply_draft(store, agent, record)
-        outcome = _as_outcome(drive(record))
+        outcome = _as_outcome(drive(_with_interruption_context(record)))
+        _note_interruption(outcome)
         # #201: same wrapper-owned draft delivery as _run_continuous — the
         # one-shot path must not strand a sandbox-blocked child's answer.
         if outcome.ok:

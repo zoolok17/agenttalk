@@ -548,6 +548,15 @@ def validate_standalone_wrap(args: argparse.Namespace | WrapInvocation) -> WrapP
             "one_shot_without_request",
             "agenttalk wrap: --one-shot requires --to-request <id>",
         )
+    if invocation.to_request and not invocation.one_shot:
+        # #204 refuse-loudly (#166): without --one-shot the request scope was
+        # silently dropped - the invocation ran as an unscoped plain/loop wrap
+        # and never drove the named request.
+        return WrapRefusal(
+            "to_request_without_one_shot",
+            "agenttalk wrap: --to-request only scopes a one-shot turn; use "
+            "--loop --one-shot --to-request <id> to drive that request",
+        )
     if invocation.lead_loop and not invocation.loop:
         return WrapRefusal(
             "lead_loop_without_loop",

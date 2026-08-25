@@ -410,3 +410,77 @@ def test_publish_exception_preserves_the_draft(tmp_path, monkeypatch) -> None:
     refused = reply_transport.reply_draft_path(s, "beta", q.id).with_suffix(".refused.md")
     assert refused.exists()
     assert refused.read_text(encoding="utf-8") == "good answer"
+
+
+# ---------------------------------------- #202 D5: preserve the interrupted draft
+
+def test_interrupted_attempt_draft_is_preserved_and_never_published(tmp_path) -> None:
+    # #202 D5: attempt 1 writes a partial draft and is INTERRUPTED (watchdog kill);
+    # the retry preserves it at <id>.interrupted.md (the rejoin names it) while the
+    # LIVE path stays clear - so the preserved bytes can never be published.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-interrupted"})
+    attempts = {"n": 0}
+
+    def drive(rec):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            Path(rec["reply_draft"]["path"]).write_text(
+                "partial progress", encoding="utf-8")
+            return loop.DriveOutcome(
+                ok=False, failure_class=loop.CLASS_AMBIGUOUS,
+                summary="turn watchdog killed hung tool descendant",
+                interrupted=True, interruption_kind="turn_watchdog")
+        return True                      # clean retry, no draft written
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1, max_polls=4, k_poison=0, k_escalate=0,
+                  interruption_redrive_seconds=0.0)
+    assert attempts["n"] >= 2
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    preserved = live.with_suffix(".interrupted.md")
+    assert preserved.is_file()
+    assert preserved.read_text(encoding="utf-8") == "partial progress"
+    assert not live.exists()                     # live path clear for the retry
+    assert _reply_inbox(s, "alpha") == []        # preserved copy never publishes
+    assert s.cursor("beta") == q.id              # the clean retry still committed
+
+
+def test_non_interrupted_failed_attempt_draft_is_still_deleted(tmp_path) -> None:
+    # #202 D5 (the other half): an ordinary NON-interrupted failure keeps today's
+    # delete - no .interrupted.md sibling appears (that suffix means "interrupted").
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-ordinary"})
+    attempts = {"n": 0}
+
+    def drive(rec):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            Path(rec["reply_draft"]["path"]).write_text("partial", encoding="utf-8")
+            return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_INFRA,
+                                     summary="killed mid-write")
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1, max_polls=4, k_poison=0, k_escalate=0)
+    assert attempts["n"] >= 2
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    assert not live.exists()
+    assert not live.with_suffix(".interrupted.md").exists()
+
+
+def test_preserve_interrupted_draft_pre_unlinks_the_target(tmp_path) -> None:
+    # Windows rename-over-existing throws: a stale preserved copy from an earlier
+    # interruption must be unlinked first (mirrors preserve_refused_draft).
+    d = tmp_path / "drafts"
+    d.mkdir()
+    live = d / "m-1.md"
+    live.write_text("new partial", encoding="utf-8")
+    stale = d / "m-1.interrupted.md"
+    stale.write_text("old preserved copy", encoding="utf-8")
+    out = reply_transport.preserve_interrupted_draft(live)
+    assert out == stale
+    assert stale.read_text(encoding="utf-8") == "new partial"
+    assert not live.exists()
