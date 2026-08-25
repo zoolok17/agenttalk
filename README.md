@@ -27,7 +27,7 @@ exported on session end.
 | **Review handoffs** | the `/agenttalk.handoff` and `/agenttalk.consult` skills (`$agenttalk-…` on Codex) plus the `agenttalk propose` command — fresh cross-review by an agent that didn't write the code. |
 | **Named teams** | roles, groups, a `lead`/operator-liaison; `escalate` routes decisions to one human voice. |
 | **Operator-safety** | supersede/`rescind`, pre-action `check`, epoch barriers — stale or rescinded requests can't quietly close. |
-| **24/7 supervision** | auto-restart agents *with their session intact* across outages; a progress wrapper (`wrap`) for visibility. |
+| **24/7 supervision** | auto-restart agents *with their session intact* across outages; a progress wrapper (`wrap`) that also delivers replies for harness-blocked seats, rejoins interrupted turns, and fails loudly with a remedy instead of retrying silently. |
 | **Shared ownership** | a `domain` registry mapping repo areas to owners/reviewers. |
 | **Assurance** | `gate` HOLD/GO state + typed review evidence, so unsafe closure is hard. |
 
@@ -95,7 +95,7 @@ a prerequisite.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.81.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.85.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -205,7 +205,7 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.81.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.85.0"
 ```
 
 Pin to a specific tag so you control upgrades. Replace the tag with
@@ -1183,7 +1183,7 @@ through.
 > existing project in and out of supervision** (it's additive and
 > reversible — no data migration, no re-init).
 
-Three ideas carry it:
+Four ideas carry it:
 
 - **Health authority follows the launch mode.** Manual listeners use the
   activity `heartbeat`. Wrapped listeners also publish a strict lifecycle
@@ -1194,6 +1194,16 @@ Three ideas carry it:
   supervise --report`/`--plan` are read-only derivations; a generated
   `supervisor.ps1` polls the plan and does the launching/relaunching/
   scoped-killing. The bus stays just files.
+- **A seat fails loudly and recovers honestly** (0.84.0-0.85.0). The
+  wrapper itself publishes a child's reply draft when the child's harness
+  blocks the reply command, so every seat can answer. A turn killed by the
+  per-turn watchdog is redelivered as an explicit *interruption* — the child
+  is told to resume rather than redo, its partial draft is preserved, and
+  repeated kills back off and then dead-letter with the preserved work
+  named. A child that consistently refuses to start (untrusted or non-git
+  workspace, broken auth) parks as `config_blocked` with the concrete
+  operator fix instead of burning silent retries, and a zero-output
+  one-shot `wrap` refuses loudly with remedies instead of exiting empty.
 - **Every restart resumes the agent's session**, so a relaunched agent
   still knows what it was doing — via a pinned id for manual Claude
   (`--resume <id>`), `resume --last` in its `CODEX_HOME` for manual Codex,
