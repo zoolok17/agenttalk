@@ -726,6 +726,41 @@ def test_never_started_fast_retry_loop_promotes_once_60s_elapsed_from_first_not_
     assert s.dead_lettered_count("beta") == 0
 
 
+def test_never_started_run_at_the_escalate_ceiling_promotes_instead_of_disposing(
+    tmp_path,
+) -> None:
+    # connector P1 (final head): fail_sleep retries land 0.3-2.0s apart, so a FAST
+    # deterministic refusal reaches k_escalate=20 attempts in well under the 60s
+    # promotion window (a 1s cadence here: 19s elapsed at attempt 20). Without the
+    # ceiling clause the head dead-letters CLASS_AMBIGUOUS at the ceiling BEFORE
+    # the window can ever elapse - killing the promotion exactly for the fastest,
+    # most clearly deterministic refusals. An unbroken never-started run as long
+    # as the ceiling is deterministic evidence regardless of wall time: promote.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+    now_iso, wrap_drive = _now_iso_bumping_every_drive(1.0)
+
+    @wrap_drive
+    def drive(rec):
+        drives["n"] += 1
+        return _never_started_drive()
+
+    parked: list = []
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        now_iso=now_iso,
+        max_polls=25, k_poison=0, k_escalate=20,
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    assert drives["n"] == 20                    # promoted AT the ceiling, not disposed
+    assert parked
+    rec = s.attempt_record("beta", m.id)
+    assert rec["last_failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert rec["never_started_consecutive"] == 20
+    assert s.dead_lettered_count("beta") == 0   # the ambiguous dead-letter never fired
+
+
 def test_crash_reconcile_resets_never_started_window_for_a_fresh_start(tmp_path) -> None:
     # #7-fix-4: reconcile_crash_in_progress must reset never_started_first_at /
     # never_started_consecutive - a crash breaks the "consecutive never-started"
@@ -1248,6 +1283,44 @@ def test_one_shot_interrupted_redrive_carries_in_memory_context(tmp_path) -> Non
     assert seen[0] is None                                  # first attempt: no context
     assert seen[1]["kind"] == "turn_watchdog"               # re-drive: in-memory context
     assert seen[1]["consecutive"] == 1
+
+
+def test_one_shot_bound_expiry_preserves_the_interrupted_draft_for_a_later_run(
+    tmp_path,
+) -> None:
+    # connector P2 (final head): one-shot is LEDGER-LESS, so the in-memory
+    # interruption decoration only helps if the SAME invocation gets another
+    # iteration. When the bound (max_polls/max_wall) expires right after a
+    # killed attempt, the partial draft used to stay at the LIVE path - and a
+    # LATER invocation (fresh memory, empty ledger) deleted it as ordinary
+    # stale residue. The interrupted outcome itself must preserve it.
+    from agenttalk import reply_transport
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="the task",
+               meta={"request_id": "rq-1"})
+    live = reply_transport.reply_draft_path(s, "beta", m.id)
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        live.parent.mkdir(parents=True, exist_ok=True)
+        live.write_text("partial progress", encoding="utf-8")
+        return _watchdog_interrupted_outcome()
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1, max_polls=1, only_request_id="rq-1")
+    assert drives["n"] == 1                     # the bound expired before a re-drive
+    preserved = live.with_suffix(".interrupted.md")
+    assert not live.is_file()                   # nothing recoverable left as live residue
+    assert preserved.is_file()                  # the killed attempt's progress survived
+    assert preserved.read_text(encoding="utf-8") == "partial progress"
+
+    # A LATER invocation (fresh memory, still no ledger) must not GC it either.
+    loop.run_loop(s, "beta", lambda rec: loop.DriveOutcome(ok=True),
+                  clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1, max_polls=2, only_request_id="rq-1")
+    assert preserved.is_file()
+    assert preserved.read_text(encoding="utf-8") == "partial progress"
 
 
 def test_rejoin_for_builds_block_from_ledger_and_names_the_preserved_draft(tmp_path) -> None:

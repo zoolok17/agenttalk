@@ -1720,7 +1720,20 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 and (now_at_epoch - first_at_epoch)
                     >= NEVER_STARTED_PROMOTION_MIN_ELAPSED_SECONDS
             )
-            if never_started_consecutive >= 2 and elapsed_ok:
+            # connector P1 (final head): fail_sleep retries land 0.3-2.0s apart,
+            # so a FAST deterministic refusal reaches the k_escalate attempt
+            # ceiling (default 20, disposed below as ambiguous) in well under
+            # the 60s window - the promotion would never fire exactly for the
+            # fastest, most clearly deterministic refusals. An UNBROKEN run of
+            # never-started results as long as the ceiling is deterministic
+            # evidence regardless of wall time: promote it here, preempting the
+            # generic ceiling dispose this same iteration. A mixed history
+            # (count resets on any non-never-started result) still disposes
+            # ambiguous at the ceiling - that run is not deterministic.
+            ceiling_run_ok = (
+                k_escalate > 0 and never_started_consecutive >= k_escalate
+            )
+            if never_started_consecutive >= 2 and (elapsed_ok or ceiling_run_ok):
                 outcome = replace(outcome, failure_class=CLASS_CONFIG_BLOCKED,
                                   summary=f"{NEVER_STARTED_REMEDY} ({outcome.summary})")
                 # #205 cold-review P1-A: name the wrapper generation active at THIS
@@ -2282,6 +2295,22 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
         record = _with_reply_draft(store, agent, _with_interruption_context(record))
         outcome = _as_outcome(drive(record))
         _note_interruption(outcome)
+        # connector P2 (final head): one-shot is LEDGER-LESS, so the FIX 5
+        # decoration above is the only carrier of "previously interrupted" -
+        # and it only helps if THIS invocation gets another iteration. If the
+        # bound (max_wall/max_polls) expires first, the killed attempt's
+        # partial draft stays at the LIVE path, and a LATER invocation (fresh
+        # memory, empty ledger) deletes it as ordinary stale residue. Preserve
+        # it NOW, at the interrupted outcome itself; the next attempt's
+        # preservation gate then finds no live file (a no-op) and the
+        # preserved copy survives the exit either way.
+        if outcome.interrupted:
+            inbound_id = record.get("id")
+            if isinstance(inbound_id, str) and inbound_id:
+                live_draft = reply_transport.reply_draft_path(
+                    store, agent, inbound_id)
+                if live_draft.is_file():
+                    reply_transport.preserve_interrupted_draft(live_draft)
         # #201: same wrapper-owned draft delivery as _run_continuous — the
         # one-shot path must not strand a sandbox-blocked child's answer.
         if outcome.ok:
