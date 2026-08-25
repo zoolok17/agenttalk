@@ -229,3 +229,49 @@ that don't mean what they look like they mean.
    remote-access mode for the client view only (e.g. a signed, time-boxed,
    read-only export server) — or is static export the permanent answer to
    "the client isn't at the operator's desk"?
+
+---
+
+## 7. Reconciliation with the third-party review (2026-08-25)
+
+An independent reviewer assessed the live console (all seven views, desktop
+and narrow-laptop) against the same question. The two reviews converge on
+every structural call and the external one sharpens ours:
+
+**Where we agree** — keep the Team Console as the engineering/operations
+view and build a program layer above it (their words: "a cosmetic redesign
+alone will not make the present UI compelling"); separate personas over the
+same evidence (we said two, they say three — Executive / Delivery leader /
+Engineer — theirs is better); the Gate & Evidence Wall generalizes into
+their readiness-and-assurance matrix (every green = evidence + independent
+verifier + expiry; missing = HOLD); static signed briefings first, remote
+portal only as a later, explicitly-decided trade-off — both reviews reached
+this independently, which settles open question 5.
+
+**What they add that ours missed:**
+- An evidence-backed *stage vocabulary* (assessment-complete → plan-approved
+  → reimplementation-complete → parity-verified → acceptance-ready →
+  cutover-ready → legacy-decommissioned). This answers our open question 1:
+  the plateau concept should be formalized as these stages — they exist
+  precisely to prevent "complete but not cutover-ready" overstatement.
+- An executive scorecard with named KPIs, and a Decision Center upgrade of
+  the Human Queue (plain-language decision, options, impact, owner,
+  deadline, expiring risk acceptance).
+- Concrete, verified mechanical defects in today's console (header
+  mission-pill overflow, untrustworthy relative timestamps, default scope
+  showing retired agents, endpoint latency vs the 2-second poll, narrow-
+  layout priority) — filed as an immediate fix bundle.
+- The best near-term showcase: a customer-facing static dashboard built
+  from the Papendal pilot — a real migration that is reimplemented and
+  parity-verified but honestly NOT cutover-ready, with clickable evidence.
+  That demo is the differentiator stated exactly: the system proves what
+  was migrated, surfaces what remains unknown, and stops a confident team
+  declaring victory early.
+
+**Where we hold our ground** — nothing in the external review contradicts
+the "what NOT to build" list; it independently endorses the loopback
+posture and static-first stakeholder delivery.
+
+**Disposition:** mechanical fixes = task #207 (immediate, small); the merged
+program layer = task #208 (quarter-scale, built together with the #55
+assessment/comprehension plane, which is its data source).
