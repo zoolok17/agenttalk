@@ -2914,6 +2914,81 @@ if (JSON.stringify(names) !== JSON.stringify(expected)) {
                    capture_output=True, text=True)
 
 
+def test_console_poll_waits_for_slow_endpoint_before_rescheduling(tmp_path: Path) -> None:
+    """#207: each endpoint gets one in-flight request and its next cadence starts
+    after settlement, so a response slower than POLL_MS cannot stack requests."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console polling test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ boot\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    startEndpointPoll: startEndpointPoll\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-poll.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-poll.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+const timers = [];
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setTimeout(fn, delay) { timers.push({ fn, delay }); },
+  setInterval() { throw new Error('data polling must not use setInterval'); },
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+
+let calls = 0;
+const resolvers = [];
+function slowEndpoint() {
+  calls += 1;
+  return new Promise((resolve) => resolvers.push(resolve));
+}
+async function flush() {
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+}
+(async () => {
+  ctx.__agenttalkConsoleTestHooks.startEndpointPoll(slowEndpoint);
+  if (calls !== 1 || timers.length !== 0) {
+    throw new Error(`poll stacked before settlement: calls=${calls}, timers=${timers.length}`);
+  }
+  await flush();
+  if (calls !== 1 || timers.length !== 0) {
+    throw new Error(`pending endpoint was rescheduled: calls=${calls}, timers=${timers.length}`);
+  }
+  resolvers.shift()();
+  await flush();
+  if (timers.length !== 1 || timers[0].delay !== 2000) {
+    throw new Error(`next poll was not delayed after settlement: ${JSON.stringify(timers)}`);
+  }
+  const next = timers.shift();
+  next.fn();
+  if (calls !== 2 || timers.length !== 0) {
+    throw new Error(`second slow request stacked: calls=${calls}, timers=${timers.length}`);
+  }
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path) -> None:
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")

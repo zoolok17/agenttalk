@@ -3662,9 +3662,9 @@
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (intentsPending === requestKey) return;
+    if (intentsPending === requestKey) return null;
     intentsPending = requestKey;
-    fetch(rootUrl('/api/intents', projectId)).then(function (r) {
+    return fetch(rootUrl('/api/intents', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -3781,10 +3781,10 @@
     // >2s, stacked requests could commit out of arrival order and move the
     // console backwards; the guard + the per-response sequence check below
     // (drop anything older than the newest committed) prevent that.
-    if (statePending) return;
+    if (statePending) return null;
     statePending = true;
     var seq = ++stateSeq;
-    fetch('/api/state').then(function (r) {
+    return fetch('/api/state').then(function (r) {
       // r.ok guard (P3): on a non-2xx, keep the last-good lastState rather than
       // blanking the view to an error object / "Loading…".
       if (!r.ok) return null;
@@ -3838,9 +3838,9 @@
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (attentionPending === requestKey) return;
+    if (attentionPending === requestKey) return null;
     attentionPending = requestKey;
-    fetch(rootUrl('/api/attention', projectId)).then(function (r) {
+    return fetch(rootUrl('/api/attention', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -3859,9 +3859,9 @@
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (leadChatPending === requestKey) return;
+    if (leadChatPending === requestKey) return null;
     leadChatPending = requestKey;
-    fetch(rootUrl('/api/lead-chat', projectId)).then(function (r) {
+    return fetch(rootUrl('/api/lead-chat', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4042,20 +4042,36 @@
     refreshHealthIfChanged();
   }
 
+  function startEndpointPoll(fetcher) {
+    // One independent completion-driven loop per endpoint. A 9-second scan
+    // therefore produces one request, then waits POLL_MS before the next; it
+    // never queues four interval ticks behind the slow request (#207).
+    function scheduleNext() { setTimeout(run, POLL_MS); }
+    function run() {
+      var request;
+      try { request = fetcher(); }
+      catch (e) { scheduleNext(); return; }
+      Promise.resolve(request).then(scheduleNext, scheduleNext);
+    }
+    run();
+  }
+
   // ------------------------------------------------------------ boot
   function boot() {
     loadPrefs();
     applyPrefs();
     renderChrome();
-    fetchState();
     // Fetch attention at boot AND poll it (P2-3), regardless of the initial
     // view: the sidebar count badge is the open-attention count and must be
     // current from the start, not blank until the Attention view is opened.
-    fetchRootPayloads();
-    setInterval(fetchState, POLL_MS);
-    setInterval(fetchAttention, POLL_MS);
-    setInterval(fetchLeadChat, POLL_MS);
-    setInterval(fetchIntents, POLL_MS);
+    startEndpointPoll(fetchState);
+    startEndpointPoll(fetchAttention);
+    startEndpointPoll(fetchLeadChat);
+    startEndpointPoll(fetchIntents);
+    // These payloads are view support, not high-cadence telemetry.
+    fetchSession();
+    fetchLearning();
+    fetchOnboarding();
     setInterval(clockTick, CLOCK_MS);
   }
 
