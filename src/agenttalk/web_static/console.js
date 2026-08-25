@@ -121,7 +121,7 @@
     view: 'overview',
     selectedAgent: null,   // agent name
     sessionRid: null,      // thread request_id
-    filter: 'all',         // all | working | idle | attention
+    filter: 'active',      // active run by default; all history remains opt-in
     selectedRootId: initialRootId(),
     now: null,             // server-derived wall time; never the browser clock
   };
@@ -831,13 +831,25 @@
     }
     return c;
   }
+  function agentInActiveRun(agent) {
+    // A supervised seat remains part of the run while recovering/exited; hiding
+    // it would conceal exactly the operator-critical failure state. An
+    // unsupervised seat is current only while its independent heartbeat is fresh.
+    return !!agent && (agent.wrapped === true || freshHeartbeat(agent));
+  }
+  function activeRunCount(root) {
+    var as = agentsOf(root), count = 0;
+    for (var i = 0; i < as.length; i++) if (agentInActiveRun(as[i])) count++;
+    return count;
+  }
   function filterAgents(root) {
     var as = agentsOf(root);
     if (state.filter === 'all') return as.slice();
     var out = [];
     for (var i = 0; i < as.length; i++) {
       var grp = agentStateInfo(as[i]).grp;
-      if (state.filter === 'working' && grp === 'work') out.push(as[i]);
+      if (state.filter === 'active' && agentInActiveRun(as[i])) out.push(as[i]);
+      else if (state.filter === 'working' && grp === 'work') out.push(as[i]);
       else if (state.filter === 'idle' && grp === 'idle') out.push(as[i]);
       else if (state.filter === 'attention' && grp === 'attn') out.push(as[i]);
       else if (state.filter === 'unknown' && grp === 'unknown') out.push(as[i]);
@@ -1540,7 +1552,8 @@
   function filterChips(root, counts) {
     var wrap = el('div', 'tc-filters');
     var defs = [
-      { key: 'all', label: 'All', count: agentsOf(root).length },
+      { key: 'active', label: 'Active run', count: activeRunCount(root) },
+      { key: 'all', label: 'All roster', count: agentsOf(root).length },
       { key: 'working', label: 'Working', count: counts.work },
       { key: 'idle', label: 'Idle', count: counts.idle },
       { key: 'attention', label: 'Health attention', count: counts.attn },

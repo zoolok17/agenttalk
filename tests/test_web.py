@@ -2854,6 +2854,66 @@ if (hooks.pollingStatus().label !== 'Stale') {
                    capture_output=True, text=True)
 
 
+def test_console_defaults_agent_grid_to_active_run(tmp_path: Path) -> None:
+    """#207: stale unwrapped roster history is opt-in via All; supervised
+    recovery targets and live unwrapped agents remain in the default scope."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console active-run test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    defaultFilter: state.filter,\n"
+        "    filterAgents: filterAgents\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-active-run.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-active-run.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+if (hooks.defaultFilter !== 'active') {
+  throw new Error(`default filter is ${hooks.defaultFilter}, not active run`);
+}
+const root = { agents: [
+  { name: 'supervised-idle', wrapped: true, health: { state: 'idle_waiting' } },
+  { name: 'supervised-exited', wrapped: true, health: { state: 'crashed_or_exited' } },
+  { name: 'live-unwrapped', wrapped: false, last_seen_age_seconds: 5,
+    health: { state: 'unknown' } },
+  { name: 'historical-unwrapped', wrapped: false, last_seen_age_seconds: 500,
+    health: { state: 'unknown' } },
+] };
+const names = hooks.filterAgents(root).map((item) => item.name);
+const expected = ['supervised-idle', 'supervised-exited', 'live-unwrapped'];
+if (JSON.stringify(names) !== JSON.stringify(expected)) {
+  throw new Error(`active-run scope mismatch: ${JSON.stringify(names)}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path) -> None:
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")
