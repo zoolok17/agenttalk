@@ -761,6 +761,22 @@ def test_never_started_run_at_the_escalate_ceiling_promotes_instead_of_disposing
     assert s.dead_lettered_count("beta") == 0   # the ambiguous dead-letter never fired
 
 
+def test_never_started_signature_matches_only_at_the_start_of_the_summary() -> None:
+    # connector P2 (final head): the canonical signature is only ever PRODUCED at
+    # the start of the summary. An ambiguous diagnostic that merely embeds the
+    # words (child stderr echoed into an unrecognized-cause summary) must not
+    # count - repeated, it would falsely promote to a sticky config_blocked park
+    # with the wrong remedy for a child that DID start.
+    assert loop._is_never_started_failure(
+        loop.CLASS_AMBIGUOUS, "turn never started (rc=1, no clear signal)")
+    assert not loop._is_never_started_failure(
+        loop.CLASS_AMBIGUOUS,
+        "terminal failure, unrecognized cause: child said 'turn never started'")
+    assert not loop._is_never_started_failure(
+        loop.CLASS_INFRA, "turn never started (rc=1, no clear signal)")
+    assert not loop._is_never_started_failure(loop.CLASS_AMBIGUOUS, None)
+
+
 def test_crash_reconcile_resets_never_started_window_for_a_fresh_start(tmp_path) -> None:
     # #7-fix-4: reconcile_crash_in_progress must reset never_started_first_at /
     # never_started_consecutive - a crash breaks the "consecutive never-started"

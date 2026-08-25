@@ -73,9 +73,17 @@ NEVER_STARTED_PROMOTION_MIN_ELAPSED_SECONDS = 60.0
 
 
 def _is_never_started_failure(failure_class: object, summary: object) -> bool:
-    """True iff a failure result carries the never-started AMBIGUOUS signature."""
+    """True iff a failure result carries the never-started AMBIGUOUS signature.
+
+    connector P2 (final head): the canonical signature is only ever produced at
+    the START of the summary (run.py's _classify_drive_failure). An ambiguous
+    diagnostic that merely EMBEDS the words (e.g. child stderr echoed into
+    "terminal failure, unrecognized cause: ...") must not count - repeated, it
+    would promote to a sticky config_blocked park with the WRONG remedy for a
+    child that did start and failed for an unrelated reason.
+    """
     return (failure_class == CLASS_AMBIGUOUS and isinstance(summary, str)
-            and NEVER_STARTED_SUMMARY_PREFIX in summary)
+            and summary.startswith(NEVER_STARTED_SUMMARY_PREFIX))
 
 
 # The continuous loop's idle-heartbeat cadence AND the #202 D2 backoff chunk size.
