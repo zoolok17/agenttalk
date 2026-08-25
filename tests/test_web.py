@@ -2989,6 +2989,79 @@ async function flush() {
                    capture_output=True, text=True)
 
 
+def test_console_narrow_layout_collapses_secondary_panels(tmp_path: Path) -> None:
+    """#207: secondary material is a closed native details panel at narrow
+    widths, while the same panel stays open on desktop and primary panels sort
+    ahead of it."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console narrow-layout test")
+
+    static_dir = Path(web.__file__).with_name("web_static")
+    src = (static_dir / "console.js").read_text(encoding="utf-8")
+    css = (static_dir / "console.css").read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    responsiveSecondary: responsiveSecondary\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-narrow.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-narrow.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+let narrow = true;
+function node(tag) {
+  return {
+    tagName: String(tag).toUpperCase(), className: '', textContent: '', children: [], open: false,
+    appendChild(child) { this.children.push(child); return child; },
+    setAttribute() {}, addEventListener() {},
+  };
+}
+const document = {
+  readyState: 'loading', addEventListener() {},
+  createElement: node,
+  createElementNS(_ns, tag) { return node(tag); },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setInterval() {}, clearInterval() {},
+  matchMedia() { return { matches: narrow }; },
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+const mobileContent = node('div');
+const mobile = hooks.responsiveSecondary('Recent activity', mobileContent);
+if (mobile.tagName !== 'DETAILS' || mobile.open || mobile.children[0].tagName !== 'SUMMARY' ||
+    mobile.children[1] !== mobileContent) {
+  throw new Error(`narrow secondary panel did not collapse safely: ${JSON.stringify(mobile)}`);
+}
+narrow = false;
+const desktop = hooks.responsiveSecondary('Recent activity', node('div'));
+if (!desktop.open) throw new Error('desktop secondary panel was not open');
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+    narrow_css = css[css.index("@media (max-width: 560px)"):]
+    assert ".tc-priority-primary" in narrow_css and "order: -1" in narrow_css
+    assert ".tc-secondary-summary" in narrow_css
+    assert "responsiveSecondary('Team totals', tiles)" in src
+    assert "responsiveSecondary('Recent activity', activityRail(root))" in src
+
+
 def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path) -> None:
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")

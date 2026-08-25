@@ -2152,6 +2152,13 @@ body {
   to { opacity: 1; transform: none; }
 }
 
+/* Desktop keeps secondary material in its original layout. At phone widths
+   the native details wrapper becomes a visible, keyboard-operable disclosure. */
+.tc-secondary-panel { display: contents; }
+.tc-secondary-summary { display: none; }
+.tc-lead-secondary,
+.tc-session-actions { display: flex; flex-direction: column; gap: 12px; }
+
 @media (max-width: 900px) {
   #topbar {
     height: auto;
@@ -2226,6 +2233,40 @@ body {
 }
 
 @media (max-width: 560px) {
+  .tc-priority-primary {
+    order: -1;
+  }
+  .tc-secondary-panel {
+    display: block;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+  .tc-secondary-summary {
+    display: block;
+    padding: 11px 13px;
+    color: var(--ink2);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .tc-secondary-panel[open] > .tc-secondary-summary {
+    border-bottom: 1px solid var(--border);
+  }
+  .tc-secondary-panel > .tc-lead-secondary,
+  .tc-secondary-panel > .tc-session-actions,
+  .tc-secondary-panel > .tc-legend {
+    padding: 12px;
+  }
+  .tc-secondary-panel > .tc-card,
+  .tc-secondary-panel > .tc-rail,
+  .tc-secondary-panel > .tc-stats,
+  .tc-secondary-panel > .tc-learning-stats,
+  .tc-secondary-panel > .tc-onboarding-stats {
+    border: 0;
+    border-radius: 0 0 var(--radius) var(--radius);
+  }
   .tc-project-context {
     flex-basis: calc(100% - 130px);
   }

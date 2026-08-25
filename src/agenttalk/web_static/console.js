@@ -165,6 +165,7 @@
   };
   var answerComposerState = {};       // to_request -> body text
   var leadChatComposerState = { body: '' };
+  var secondaryOpen = {};             // disclosure choices survive 2s re-renders
   var archivedState = {
     root: '',
     open: false,
@@ -189,6 +190,18 @@
   function titled(n, title) {
     if (n && title) n.setAttribute('title', String(title));
     return n;
+  }
+  function responsiveSecondary(label, content) {
+    var details = el('details', 'tc-secondary-panel');
+    var narrow = typeof window !== 'undefined' && window.matchMedia &&
+      window.matchMedia('(max-width: 560px)').matches;
+    details.open = !narrow || secondaryOpen[label] === true;
+    details.appendChild(el('summary', 'tc-secondary-summary', label));
+    details.appendChild(content);
+    on(details, 'toggle', function () {
+      if (narrow) secondaryOpen[label] = !!details.open;
+    });
+    return details;
   }
   function svgEl(tag, attrs) {
     var n = document.createElementNS(SVG_NS, tag);
@@ -1435,7 +1448,7 @@
       legendRows.appendChild(lr);
     }
     legend.appendChild(legendRows);
-    side.appendChild(legend);
+    side.appendChild(responsiveSecondary('Status legend', legend));
   }
 
   // ------------------------------------------------------------ view router
@@ -1511,7 +1524,7 @@
       tile.appendChild(el('div', 'tc-stat-value', tileDefs[i].value));
       tiles.appendChild(tile);
     }
-    main.appendChild(tiles);
+    main.appendChild(responsiveSecondary('Team totals', tiles));
 
     // Two-column body: agent grid + live-activity rail.
     var body = el('div', 'tc-overview-body');
@@ -1545,7 +1558,7 @@
       for (var g = 0; g < shown.length; g++) grid.appendChild(agentCard(root, shown[g]));
     }
     body.appendChild(grid);
-    body.appendChild(activityRail(root));
+    body.appendChild(responsiveSecondary('Recent activity', activityRail(root)));
     main.appendChild(body);
   }
 
@@ -1701,10 +1714,10 @@
     var graphCard = el('div', 'tc-card tc-graph-card');
     graphCard.appendChild(buildGraph(root));
     graphCard.appendChild(flowLegend(root));
-    body.appendChild(graphCard);
+    body.appendChild(responsiveSecondary('Relationship graph', graphCard));
 
     // Right: Active-threads list.
-    var listCard = el('div', 'tc-card tc-card-clip');
+    var listCard = el('div', 'tc-card tc-card-clip tc-priority-primary');
     var listHead = el('div', 'tc-card-head');
     listHead.appendChild(el('span', 'tc-card-title', 'Active threads'));
     listCard.appendChild(listHead);
@@ -2332,10 +2345,12 @@
   }
 
   function leadChatSide(data) {
-    var side = el('div', 'tc-lead-side');
-    side.appendChild(leadChatLivenessCard(data));
+    var side = el('div', 'tc-lead-side tc-priority-primary');
     side.appendChild(leadChatDecisionsCard(data));
-    side.appendChild(intentSummaryStrip());
+    var secondary = el('div', 'tc-lead-secondary');
+    secondary.appendChild(leadChatLivenessCard(data));
+    secondary.appendChild(intentSummaryStrip());
+    side.appendChild(responsiveSecondary('Lead status and queued actions', secondary));
     return side;
   }
 
@@ -2506,12 +2521,12 @@
       return;
     }
 
-    wrap.appendChild(learningSummary(data));
+    wrap.appendChild(responsiveSecondary('Learning totals', learningSummary(data)));
     var body = el('div', 'tc-learning-layout');
     body.appendChild(learningLessons(data));
-    var side = el('div', 'tc-learning-side');
-    side.appendChild(learningExposurePanel(data));
+    var side = el('div', 'tc-learning-side tc-priority-primary');
     side.appendChild(learningProblemsPanel(data));
+    side.appendChild(responsiveSecondary('Recent surfaced lessons', learningExposurePanel(data)));
     body.appendChild(side);
     wrap.appendChild(body);
     main.appendChild(wrap);
@@ -2696,12 +2711,12 @@
       return;
     }
 
-    wrap.appendChild(onboardingSummary(data));
+    wrap.appendChild(responsiveSecondary('Onboarding totals', onboardingSummary(data)));
     var body = el('div', 'tc-onboarding-layout');
     body.appendChild(onboardingRuns(data));
-    var side = el('div', 'tc-onboarding-side');
+    var side = el('div', 'tc-onboarding-side tc-priority-primary');
     side.appendChild(onboardingBlockersPanel(data));
-    side.appendChild(onboardingProblemsPanel(data));
+    side.appendChild(responsiveSecondary('Ledger health', onboardingProblemsPanel(data)));
     body.appendChild(side);
     wrap.appendChild(body);
     main.appendChild(wrap);
@@ -3003,8 +3018,10 @@
     var body = el('div', 'tc-sessions-body');
 
     var left = el('div', 'tc-session-left');
-    left.appendChild(actionComposer(root));
-    left.appendChild(intentSummaryStrip());
+    var actions = el('div', 'tc-session-actions');
+    actions.appendChild(actionComposer(root));
+    actions.appendChild(intentSummaryStrip());
+    left.appendChild(responsiveSecondary('Compose and queued actions', actions));
     left.appendChild(activeThreadsCard(root));
     left.appendChild(archivedThreadsCard(root));
     body.appendChild(left);
@@ -3015,7 +3032,7 @@
   }
 
   function activeThreadsCard(root) {
-    var listCard = el('div', 'tc-card tc-card-clip');
+    var listCard = el('div', 'tc-card tc-card-clip tc-priority-primary');
     var head = el('div', 'tc-session-list-title tc-session-section-head');
     head.appendChild(el('span', null, 'Active'));
     head.appendChild(el('span', 'tc-spacer'));
