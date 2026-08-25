@@ -748,6 +748,22 @@ def test_interruption_policy_resolver_chain_and_corrupt_values() -> None:
     assert errors and "k_interrupted" in errors[0]
     # corrupt containers degrade to defaults without crashing (resolver-chain parity)
     assert sup.resolve_interruption_policy("junk", 7) == (60.0, 3, [])
+    # #202 cold-review P2-4: a valid-JSON-but-absurd knob (a hand-edited config, or
+    # the JSON extension `Infinity`) that the D2 backoff's base*2**(n-1) would
+    # overflow toward inf must refuse (never silently clamp to the 900s runtime
+    # cap) - same discipline as a non-numeric value.
+    _, _, errors = sup.resolve_interruption_policy(
+        {}, {"interruption_redrive_seconds": 1e308})
+    assert errors and "interruption_redrive_seconds" in errors[0]
+    _, _, errors = sup.resolve_interruption_policy(
+        {}, {"interruption_redrive_seconds": float("inf")})
+    assert errors and "interruption_redrive_seconds" in errors[0]
+    _, _, errors = sup.resolve_interruption_policy(
+        {}, {"interruption_redrive_seconds": 86401})
+    assert errors and "interruption_redrive_seconds" in errors[0]
+    # the upper bound itself is a VALID launch value
+    assert sup.resolve_interruption_policy(
+        {}, {"interruption_redrive_seconds": 86400}) == (86400.0, 3, [])
 
 
 def test_interruption_ledger_counts_always_write_and_survive_relaunch(tmp_path: Path) -> None:

@@ -852,7 +852,16 @@ def resolve_interruption_policy(config: dict, cfg_agent: dict) -> tuple[float, i
     Per-agent -> global -> default (60.0s / 3), mirroring resolve_dead_letter_caps'
     chain - but unlike the caps, a PRESENT-and-corrupt value is returned as an ERROR
     the launch path refuses visibly (config-blocked), never a silent clamp or
-    default. ``k_interrupted`` 0 disables the ceiling (debug only)."""
+    default. ``k_interrupted`` 0 disables the ceiling (debug only).
+
+    #202 cold-review P2-4: ``interruption_redrive_seconds`` must be finite AND
+    bounded - a hand-edited (or JSON-extension ``Infinity``) value like ``1e308``
+    is a valid positive number that the D2 backoff's ``base * 2**(n-1)`` overflows
+    toward ``inf``; the runtime hard cap (INTERRUPTION_BACKOFF_CAP_SECONDS) then
+    SILENTLY CLAMPS it to 900s regardless of what the operator configured - exactly
+    the silent-clamp this resolver exists to refuse instead of doing. Values outside
+    (0, 86400] (24h - already far beyond any sane single-turn backoff) are refused
+    as a config error, same as a non-numeric value."""
     config = config if isinstance(config, dict) else {}
     cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
     errors: list[str] = []
@@ -861,12 +870,13 @@ def resolve_interruption_policy(config: dict, cfg_agent: dict) -> tuple[float, i
         if "interruption_redrive_seconds" not in src:
             continue
         v = src.get("interruption_redrive_seconds")
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and 0 < v <= 86400):
             redrive = float(v)
         else:
             errors.append(
                 f"invalid {source_name} interruption_redrive_seconds={v!r}; "
-                "expected a positive number")
+                "expected a finite positive number no greater than 86400 (24h)")
         break
     k_interrupted = 3
     for source_name, src in (("per-agent", cfg_agent), ("global", config)):

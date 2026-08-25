@@ -10379,7 +10379,14 @@ def _interruption_rejoin_for(store, agent: str, k_interrupted: int):
     def rejoin_for(record: dict) -> str | None:
         head_id = record.get("id")
         ctx = record.get("interrupted_redelivery")
-        if isinstance(ctx, dict):
+        # #202 cold-review P2-2: the one-shot path (``ctx`` is the in-memory
+        # decoration) has NO attempt ledger and _run_one_shot never enforces
+        # k_interrupted (bounded by max_wall instead) - the budget clause below
+        # must never be shown for it, or the rejoin promises a dead-letter ceiling
+        # that can never fire.
+        is_one_shot = isinstance(ctx, dict)
+        watchdog_count = 0
+        if is_one_shot:
             kind = ctx.get("kind") or "unknown"
             count = ctx.get("consecutive") or 1
             last_at = ctx.get("last_failure_at")
@@ -10394,16 +10401,36 @@ def _interruption_rejoin_for(store, agent: str, k_interrupted: int):
                 count = max(1, int(rec.get("interrupted_consecutive") or 1))
             except (TypeError, ValueError):
                 count = 1
+            # #202 cold-review P2-5: ``interrupted_consecutive`` counts ANY kind
+            # (crash_mid_turn interruptions included), but the budget is
+            # turn_watchdog-only - showing the any-kind count against it overstates
+            # how close the message is to the ceiling after a mixed crash+watchdog
+            # run. Show the watchdog-only count against k, and name any extra
+            # crash interruptions separately instead of folding them in silently.
+            try:
+                watchdog_count = max(0, int(rec.get("interrupted_watchdog_consecutive") or 0))
+            except (TypeError, ValueError):
+                watchdog_count = 0
             last_at = rec.get("last_failure_at")
         lines = [
             f"Your previous turn on this message was INTERRUPTED ({kind}) "
             f"{_elapsed_text(last_at)} ago - the work was killed mid-turn, "
             "not rejected.",
         ]
-        if kind == "turn_watchdog" and k_interrupted > 0:
+        if is_one_shot:
             lines.append(
-                f"This is interruption {count} of a budget of {k_interrupted}; "
-                "at the budget the message is dead-lettered for the operator.")
+                f"Consecutive interruptions on this message: {count}; no automatic "
+                "budget applies in one-shot mode.")
+        elif kind == "turn_watchdog" and k_interrupted > 0:
+            n_shown = max(1, watchdog_count)
+            crash_extra = max(0, count - watchdog_count)
+            plus_clause = (
+                f" (plus {crash_extra} crash interruption{'s' if crash_extra != 1 else ''})"
+                if crash_extra > 0 else "")
+            lines.append(
+                f"This is interruption {n_shown} of a budget of {k_interrupted}"
+                f"{plus_clause}; at the budget the message is dead-lettered for "
+                "the operator.")
         else:
             lines.append(f"Consecutive interruptions on this message: {count}.")
         if isinstance(head_id, str) and head_id:

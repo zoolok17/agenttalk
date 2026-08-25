@@ -588,6 +588,29 @@ def _now_iso_bumping_after_nth_drive(n: int, delta_seconds: float):
     return now_iso, wrap_drive
 
 
+def _now_iso_bumping_every_drive(delta_seconds: float):
+    """A now_iso() fake whose virtual clock advances by ``delta_seconds`` before
+    EVERY drive() call after the first - simulating a fast, ALWAYS-failing retry
+    loop where each attempt is evenly spaced (unlike ``_now_iso_bumping_after_nth_drive``,
+    which bumps once). Returns ``(now_iso, wrap_drive)``."""
+    base = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    clock_box = {"t": 0.0}
+    calls = {"n": 0}
+
+    def now_iso() -> str:
+        return (base + timedelta(seconds=clock_box["t"])).isoformat().replace("+00:00", "Z")
+
+    def wrap_drive(inner):
+        def driven(rec):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                clock_box["t"] += delta_seconds
+            return inner(rec)
+        return driven
+
+    return now_iso, wrap_drive
+
+
 def test_second_consecutive_never_started_parks_config_blocked_with_remedy(tmp_path) -> None:
     # #205: the field case - a codex child in a non-git workspace exits rc=1 before any
     # stream output, deterministically. The SECOND consecutive never-started result on
@@ -624,6 +647,11 @@ def test_second_consecutive_never_started_parks_config_blocked_with_remedy(tmp_p
     assert len(escalations) == 1                            # escalated exactly once
     assert s.cursor("beta") == ""                           # parked, never committed
     assert s.dead_lettered_count("beta") == 0               # parked, never dead-lettered
+    # #205 cold-review P1-A/P1-B: promotion persists the window state and the
+    # ACTIVE wrapper generation, so a later restart can be told apart from a
+    # same-generation re-poll.
+    assert rec["never_started_consecutive"] == 2
+    assert rec.get("promoted_by_generation")
 
 
 def test_second_consecutive_never_started_inside_the_window_stays_ambiguous(tmp_path) -> None:
@@ -631,7 +659,7 @@ def test_second_consecutive_never_started_inside_the_window_stays_ambiguous(tmp_
     # evidence of a deterministic denial - only a transient hiccup (auth refresh, CLI update
     # banner, AV lock). A second consecutive never-started result arriving WITHIN
     # NEVER_STARTED_PROMOTION_MIN_ELAPSED_SECONDS (here 30s, inside the 60s window) of the
-    # first must stay ambiguous and keep retrying - never permanently park a healthy seat.
+    # FIRST must stay ambiguous and keep retrying - never permanently park a healthy seat.
     s = _store(tmp_path)
     m = s.send(sender="alpha", recipient="beta", body="task")
     drives = {"n": 0}
@@ -655,6 +683,114 @@ def test_second_consecutive_never_started_inside_the_window_stays_ambiguous(tmp_
     assert rec["last_failure_class"] == loop.CLASS_AMBIGUOUS
     assert s.cursor("beta") == ""
     assert s.dead_lettered_count("beta") == 0
+    # #205 cold-review P1-B: the window is measured from the FIRST never-started
+    # failure (not this pairwise gap) - the persisted state proves it.
+    assert rec["never_started_consecutive"] == 3
+    assert rec.get("never_started_first_at") is not None
+
+
+def test_never_started_fast_retry_loop_promotes_once_60s_elapsed_from_first_not_never(
+    tmp_path,
+) -> None:
+    # #205 cold-review P1-B (the actual field bug): a child that ALWAYS fails
+    # never-started, retried at a roughly constant cadence (0.3-2.0s in production;
+    # a fixed 10s here for clean arithmetic), NEVER satisfies a window measured
+    # against the immediately-PRECEDING failure (every gap is 10s < 60s, forever) -
+    # burning k_escalate=20 ambiguous retries again instead of promoting. Measuring
+    # from the FIRST never-started failure promotes at the first result that is
+    # >=60s after it: with a 10s cadence that is the 7th drive (elapsed = 6*10 = 60s).
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+    delta = 10.0
+    now_iso, wrap_drive = _now_iso_bumping_every_drive(delta)
+
+    @wrap_drive
+    def drive(rec):
+        drives["n"] += 1
+        return _never_started_drive()
+
+    parked: list = []
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        now_iso=now_iso,
+        max_polls=20, k_poison=0, k_escalate=20,
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    assert drives["n"] == 7                                 # promotes here, not at 20 (never)
+    assert parked
+    rec = s.attempt_record("beta", m.id)
+    assert rec["last_failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert rec["never_started_consecutive"] == 7
+    assert s.dead_lettered_count("beta") == 0
+
+
+def test_config_blocked_reprobes_once_on_wrapper_generation_change_and_reparks(
+    tmp_path,
+) -> None:
+    # #205 cold-review P1-A: a sticky config_blocked park never re-fires under an
+    # unchanged class - but the operator CAN fix the underlying denial (workspace
+    # trust, git, auth) and RESTART the wrapper, which mints a NEW wrapper
+    # generation. The entry-check must allow exactly ONE re-probe drive when the
+    # current generation differs from the one that PROMOTED the head - never a
+    # same-generation re-probe (that would be a re-probe storm), and never
+    # unbounded (a still-broken child re-parks recording the NEW generation).
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    seed_at = "2026-08-25T00:00:00Z"
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a0", at=seed_at)
+    s.record_attempt_result(
+        "beta", m.id, failure_class=loop.CLASS_CONFIG_BLOCKED,
+        summary=f"{loop.NEVER_STARTED_REMEDY} (turn never started)", at=seed_at,
+        never_started_first_at=seed_at, never_started_consecutive=2,
+        promoted_by_generation="gen-1")
+
+    # (a) SAME generation on entry: re-parks WITHOUT driving.
+    drives_a: list = []
+    loop.run_loop(
+        Store(tmp_path), "beta", lambda rec: drives_a.append(rec["id"]) or True,
+        clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=2, k_poison=0, k_escalate=0, wrapper_generation="gen-1",
+    )
+    assert drives_a == []
+    assert s.cursor("beta") == ""
+
+    # (b) DIFFERENT generation, still-broken child: drives EXACTLY once, fails
+    # never-started again, and re-promotes recording the NEW generation.
+    drives_b: list = []
+    loop.run_loop(
+        Store(tmp_path), "beta",
+        lambda rec: drives_b.append(rec["id"]) or _never_started_drive(),
+        clock=lambda: 0.0, sleep=lambda d: None,
+        now_iso=lambda: "2026-08-25T00:05:00Z",   # well past the 60s window from T0
+        max_polls=2, k_poison=0, k_escalate=20, wrapper_generation="gen-2",
+    )
+    assert drives_b == [m.id]                                # drove exactly once
+    rec = s.attempt_record("beta", m.id)
+    assert rec["last_failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert rec["promoted_by_generation"] == "gen-2"           # re-parked under the NEW generation
+    assert s.cursor("beta") == ""
+
+    # (c) SAME generation as the re-promotion ("gen-2"): re-parks without driving.
+    drives_c: list = []
+    loop.run_loop(
+        Store(tmp_path), "beta", lambda rec: drives_c.append(rec["id"]) or True,
+        clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=2, k_poison=0, k_escalate=0, wrapper_generation="gen-2",
+    )
+    assert drives_c == []
+
+    # (d) a THIRD generation with the workspace now fixed: drives once and
+    # succeeds, clearing the park entirely.
+    drives_d: list = []
+    turns = loop.run_loop(
+        Store(tmp_path), "beta", lambda rec: drives_d.append(rec["id"]) or True,
+        clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=2, k_poison=0, k_escalate=0, wrapper_generation="gen-3",
+    )
+    assert drives_d == [m.id]
+    assert turns == 1
+    assert s.cursor("beta") == m.id                           # committed, park cleared
 
 
 def test_non_never_started_ambiguous_failure_never_promotes(tmp_path) -> None:
@@ -745,6 +881,30 @@ def test_interruption_backoff_is_hard_capped_for_a_long_crash_chain(tmp_path) ->
     assert total_sleep == loop.INTERRUPTION_BACKOFF_CAP_SECONDS  # capped at 900s, not 30720s
 
 
+def test_interruption_backoff_asserts_finite_if_the_cap_itself_is_corrupted(
+    tmp_path, monkeypatch,
+) -> None:
+    # #202 cold-review P2-4 belt: resolve_interruption_policy now refuses a
+    # non-finite/absurd knob before it ever reaches the loop (config error, never a
+    # silent clamp) - the ordinary overflow case (a huge-but-finite base) is
+    # already bounded by INTERRUPTION_BACKOFF_CAP_SECONDS regardless. The residual
+    # risk this assert defends is the CAP itself going bad (e.g. a future
+    # refactor): ``min(inf, nan)`` returns ``inf`` (NaN never wins a comparison),
+    # so a corrupted cap would otherwise sleep an undefined/endless backoff
+    # silently - assert loud instead.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    _seed_interruptions(s, m.id, 10)          # base * 2^9 overflows to +inf pre-cap
+    monkeypatch.setattr(loop, "INTERRUPTION_BACKOFF_CAP_SECONDS", float("nan"))
+    with pytest.raises(AssertionError):
+        loop.run_loop(
+            Store(tmp_path), "beta", lambda rec: True,
+            clock=lambda: 0.0, sleep=lambda d: None,
+            now_iso=lambda: _ISO_T0,
+            interruption_redrive_seconds=1e308,
+            k_interrupted=0, max_polls=1, k_poison=0, k_escalate=0)
+
+
 def test_non_interrupted_failure_keeps_the_ordinary_idle_backoff(tmp_path) -> None:
     # A non-interrupted ambiguous failure must keep today's fail_sleep backoff:
     # no chunked pre-drive sleep, no pre-drive heartbeat stamping.
@@ -803,6 +963,59 @@ def test_third_consecutive_watchdog_interruption_dead_letters_with_remedy(tmp_pa
                      "--agent", "beta", "--id", m.id, "--from", "alpha"]) == 0
     fresh = [msg for msg in s.messages_for("beta") if msg.id not in (m.id, nxt.id)]
     assert fresh and s.attempt_record("beta", fresh[0].id) is None
+
+
+def test_interruption_budget_exhausted_dispose_preserves_the_interrupted_draft(
+    tmp_path,
+) -> None:
+    # #202 cold-review P2-3: the interrupted-draft GC-on-dispose (cold-review FIX 6)
+    # must NOT unlink the <id>.interrupted.md sibling when the dispose IS the
+    # interruption-budget-exhausted one - that file is the final progress evidence
+    # for the very interruptions that exhausted the budget, and the operator needs
+    # it most right when the budget trips. The remedy must name its path too.
+    from agenttalk import reply_transport
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="oversized task")
+    preserved = reply_transport.reply_draft_path(s, "beta", m.id).with_suffix(
+        ".interrupted.md")
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    preserved.write_text("last partial progress before the final kill", encoding="utf-8")
+
+    escalations: list = []
+    loop.run_loop(
+        s, "beta", lambda rec: _watchdog_interrupted_outcome(),
+        clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=3, k_poison=0, k_escalate=0, k_interrupted=3,
+        interruption_redrive_seconds=0.0,
+        on_escalate=lambda info: escalations.append(info) or True,
+    )
+    assert s.dead_lettered_count("beta") == 1
+    assert preserved.is_file()                              # KEPT, not GC'd
+    assert preserved.read_text(encoding="utf-8") == "last partial progress before the final kill"
+    remedy = escalations[0]["summary"]
+    assert "the last preserved partial progress is at:" in remedy
+    assert str(preserved) in remedy
+
+
+def test_ordinary_dispose_still_gcs_the_interrupted_draft(tmp_path) -> None:
+    # P2-3 counterpart: a dispose for any OTHER reason keeps today's GC (cold-review
+    # FIX 6) - only the interruption-budget-exhausted dispose is special-cased.
+    from agenttalk import reply_transport
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    preserved = reply_transport.reply_draft_path(s, "beta", m.id).with_suffix(
+        ".interrupted.md")
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    preserved.write_text("stale progress", encoding="utf-8")
+
+    def drive(rec):
+        return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_POISON,
+                                 summary="deterministic bad input")
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_polls=1, k_poison=1, k_escalate=0)
+    assert s.dead_lettered_count("beta") == 1
+    assert not preserved.exists()                            # GC'd as today
 
 
 def test_dead_letter_notice_carries_the_remedy_even_when_escalation_already_latched(
@@ -949,10 +1162,42 @@ def test_rejoin_for_builds_block_from_ledger_and_names_the_preserved_draft(tmp_p
     # a DIFFERENT head with no interruption history carries no rejoin (no leak)
     clean = s.send(sender="alpha", recipient="beta", body="other")
     assert rejoin_for({"id": clean.id}) is None
-    # the one-shot in-memory decoration is consumed by the same provider
+    # the one-shot in-memory decoration is consumed by the same provider - #202
+    # cold-review P2-2: _run_one_shot never enforces k_interrupted (bounded by
+    # max_wall instead), so the rejoin must NOT promise a dead-letter budget it
+    # can never reach.
     block2 = rejoin_for({"id": m.id, "interrupted_redelivery": {
         "kind": "turn_watchdog", "consecutive": 1, "last_failure_at": None}})
-    assert "interruption 1 of a budget of 3" in block2
+    assert "no automatic budget applies in one-shot mode" in block2
+    assert "budget of 3" not in block2
+
+
+def test_rejoin_shows_watchdog_only_count_against_the_budget_not_any_kind(
+    tmp_path,
+) -> None:
+    # #202 cold-review P2-5: interrupted_consecutive counts ANY kind (including
+    # crash_mid_turn, which never counts toward k_interrupted); showing it against
+    # the watchdog-only budget OVERSTATES how close the message is to the ceiling
+    # after one crash + one watchdog kill. The budget line must show the
+    # watchdog-only count, and name any extra crash interruptions separately.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    # one crash_mid_turn reconcile, then one turn_watchdog kill (last kind on the
+    # ledger is turn_watchdog, so the budget line applies).
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="c0", at=_ISO_T0)
+    assert s.reconcile_crash_in_progress("beta", m.id, at=_ISO_T0)
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="w0", at=_ISO_T0)
+    s.record_attempt_result("beta", m.id, failure_class=loop.CLASS_AMBIGUOUS,
+                            summary="turn watchdog killed hung tool descendant",
+                            at=_ISO_T0, interrupted=True,
+                            interruption_kind="turn_watchdog")
+    rec = s.attempt_record("beta", m.id)
+    assert rec["interrupted_consecutive"] == 2               # any-kind: crash + watchdog
+    assert rec["interrupted_watchdog_consecutive"] == 1       # watchdog-only
+    rejoin_for = cli._interruption_rejoin_for(s, "beta", 3)
+    block = rejoin_for({"id": m.id})
+    assert "interruption 1 of a budget of 3" in block         # watchdog-only count, not 2
+    assert "plus 1 crash interruption" in block                # crash named separately
 
 
 def test_cmd_wrap_refuses_when_heartbeat_interval_not_below_stuck_after(tmp_path) -> None:

@@ -3967,7 +3967,10 @@ class Store:
     def record_attempt_result(self, agent: str, msg_id: str, *, failure_class: str,
                               summary: str | None, at: str,
                               interrupted: bool = False,
-                              interruption_kind: str | None = None) -> dict | None:
+                              interruption_kind: str | None = None,
+                              never_started_first_at: str | None = None,
+                              never_started_consecutive: int = 0,
+                              promoted_by_generation: str | None = None) -> dict | None:
         """After a FAILED drive: clear ``in_progress``, bump the per-class failure
         counter, record the last class/summary. (Success calls clear_attempt.)
 
@@ -3979,7 +3982,18 @@ class Store:
         ``interrupted_consecutive`` (any kind - drives the D2 backoff) and
         ``interrupted_watchdog_consecutive`` (kind=turn_watchdog only - drives the D3
         ceiling; crash_mid_turn must never count toward it, per the
-        reconcile_crash_in_progress ruling below)."""
+        reconcile_crash_in_progress ruling below).
+
+        #205 cold-review P1-B: ``never_started_first_at``/``never_started_consecutive``
+        are ALSO always written (the caller computes them from the prior record before
+        this call, so they persist across relaunch and are cleared the instant a
+        non-never-started result lands) - the promotion window is measured from the
+        FIRST never-started failure, never a pairwise gap that every fast retry resets.
+
+        #205 cold-review P1-A: ``promoted_by_generation`` is written only when the
+        caller is PROMOTING this result to CLASS_CONFIG_BLOCKED (non-None); it names
+        the wrapper generation active at promotion time so the entry-check park can
+        allow exactly one re-probe drive after a restart (operator intervention)."""
         data = self.dead_letter_attempts(agent)
         rec = data["messages"].get(msg_id)
         if not isinstance(rec, dict):
@@ -3990,6 +4004,10 @@ class Store:
         rec["last_failure_at"] = at
         rec["last_interrupted"] = bool(interrupted)
         rec["last_interruption_kind"] = interruption_kind if interrupted else None
+        rec["never_started_first_at"] = never_started_first_at
+        rec["never_started_consecutive"] = _safe_int(never_started_consecutive)
+        if promoted_by_generation is not None:
+            rec["promoted_by_generation"] = promoted_by_generation
         if interrupted:
             rec["interrupted_consecutive"] = _safe_int(
                 rec.get("interrupted_consecutive")) + 1

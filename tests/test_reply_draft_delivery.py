@@ -400,6 +400,56 @@ def test_one_shot_interrupted_draft_is_preserved_across_the_in_memory_redrive(tm
     assert _reply_inbox(s, "alpha") == []
 
 
+def test_direct_reply_with_no_draft_this_turn_also_gcs_the_interrupted_draft(
+    tmp_path,
+) -> None:
+    # #202 cold-review P2-6: _deliver_reply_draft used to return EARLY when there
+    # is no LIVE draft this turn (the child answered directly via the CLI/bus
+    # channel instead) - skipping the landed-check entirely, so a preserved
+    # <id>.interrupted.md from an earlier interrupted attempt survived FOREVER
+    # once the retry succeeded via the direct channel (nothing else ever revisits
+    # a head once it commits clean). The landed-check-success path must GC it too.
+    s = _store(tmp_path)
+    q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+               meta={"request_id": "q-direct"})
+    live = reply_transport.reply_draft_path(s, "beta", q.id)
+    preserved = live.with_suffix(".interrupted.md")
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    preserved.write_text("earlier partial progress", encoding="utf-8")
+
+    def drive(rec):
+        # the child answers directly via the bus, writing NO draft this turn.
+        s.send(sender="beta", recipient="alpha", body="direct answer",
+               meta={"in_reply_to": q.id, "request_id": "q-direct"})
+        return True
+
+    loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_turns=1)
+    assert [m.body for m in _reply_inbox(s, "alpha")] == ["direct answer"]
+    assert not preserved.exists()          # GC'd, not left to linger forever
+
+
+def test_clean_turn_with_no_draft_and_no_interruption_history_never_scans(
+    tmp_path, monkeypatch,
+) -> None:
+    # P2-6 cost guard: a plain clean turn with NO preserved .interrupted.md sibling
+    # must not pay the landed-reply store scan at all (cheap is_file() check first).
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="question", body="q?",
+           meta={"request_id": "q-plain"})
+    scanned = {"n": 0}
+    real_landed = reply_transport.landed_reply_exists
+
+    def counting_landed(*args, **kwargs):
+        scanned["n"] += 1
+        return real_landed(*args, **kwargs)
+
+    monkeypatch.setattr(reply_transport, "landed_reply_exists", counting_landed)
+    loop.run_loop(s, "beta", lambda rec: True, clock=lambda: 0.0,
+                  sleep=lambda d: None, max_turns=1)
+    assert scanned["n"] == 0
+
+
 def test_message_on_review_thread_gets_no_draft_channel(tmp_path) -> None:
     # PR #127 connector P2: a kind=message on a review-request thread (e.g.
     # a needs-info answer) owes a TYPED review-result next — the draft
@@ -523,10 +573,14 @@ def test_preserve_interrupted_draft_pre_unlinks_the_target(tmp_path) -> None:
 
 # ------------------------------------------------------- cold-review FIX 6: GC
 
-def test_dispose_unlinks_the_preserved_interrupted_draft(tmp_path) -> None:
-    # cold-review FIX 6: nothing removed <id>.interrupted.md - a head that is
-    # eventually dead-lettered must GC its preserved-progress sibling too, so it
-    # cannot linger on disk forever.
+def test_interruption_budget_exhausted_dispose_keeps_the_preserved_draft(tmp_path) -> None:
+    # cold-review FIX 6 originally GC'd <id>.interrupted.md on EVERY dispose. #202
+    # cold-review P2-3 narrows that: the interruption-budget-exhausted dispose is
+    # the ONE case where that sibling IS the final progress evidence for the very
+    # interruptions that exhausted the budget - it must be KEPT (not unlinked) so
+    # the operator can inspect/requeue with context. See
+    # test_ordinary_dispose_still_gcs_the_interrupted_draft (test_wrapper_loop.py)
+    # for the still-GC'd ordinary-dispose case.
     s = _store(tmp_path)
     q = s.send(sender="alpha", recipient="beta", kind="question", body="q?",
                meta={"request_id": "q-gc-dispose"})
@@ -546,8 +600,11 @@ def test_dispose_unlinks_the_preserved_interrupted_draft(tmp_path) -> None:
                   interruption_redrive_seconds=0.0)
     assert attempts["n"] == 2                  # 1st preserves attempt 1's draft, 2nd hits k_interrupted
     assert s.dead_lettered_count("beta") == 1
+    entry = s.list_dead_letters("beta")[0]
+    assert entry["last_reason"] == "interruption_budget_exhausted"
     preserved = reply_transport.reply_draft_path(s, "beta", q.id).with_suffix(".interrupted.md")
-    assert not preserved.exists()              # GC'd on dispose - never outlives the head
+    assert preserved.is_file()                 # KEPT - the operator's final progress evidence
+    assert preserved.read_text(encoding="utf-8") == "partial 1"
 
 
 def test_successful_draft_delivery_unlinks_the_preserved_interrupted_draft(tmp_path) -> None:
