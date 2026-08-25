@@ -599,6 +599,23 @@ def test_run_wrapper_zero_events_refuses_loudly(
     assert "--loop" in err                         # the concrete remedy reaches stderr
 
 
+def test_run_wrapper_injected_line_source_zero_events_refuses_loudly(capsys) -> None:
+    # cold-review FIX 4: the injected-stream branch used to return 0 silently on
+    # zero parseable events. It must refuse the same way the real subprocess
+    # branch does (never a silent success-shaped no-op).
+    rc = run.run_wrapper(
+        cli="codex", agent="worker", argv=["codex"], render=False,
+        line_source=["not json at all\n", "\n"],
+        heartbeat_fn=lambda _event, _now: None,
+        restart_fn=lambda _signal: None,
+        info_fn=lambda _signal: None,
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "no turn driven" in err
+    assert "--loop" in err
+
+
 def test_run_wrapper_unknown_cli_raises() -> None:
     import pytest
     # codex + claude are registered (Phase 1 + 2); an unknown CLI has no adapter.

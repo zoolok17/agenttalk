@@ -77,8 +77,20 @@ work complete under an unchanged watchdog budget; that is #206
   remainder). This single site survives relaunch amnesia (fail_sleep is
   in-memory) and covers crash_mid_turn's immediate-redrive-at-relaunch path
   (loop.py:1182 → 1268) with the same code.
-- Backoff: base × 2^(n-1), n = interrupted_consecutive, no separate cap
-  needed (n ≤ k_interrupted by D3).
+- Backoff: base × 2^(n-1), n = interrupted_consecutive, HARD-CAPPED at
+  `INTERRUPTION_BACKOFF_CAP_SECONDS` = 900s (cold-review FIX 1, post-ship: the
+  "no separate cap needed (n ≤ k_interrupted by D3)" claim above was **wrong**.
+  D3's ceiling bounds n only for `turn_watchdog` interruptions; `crash_mid_turn`
+  is excluded from that ceiling by design (its cause is unobserved — see D3)
+  and its own counter is bounded only by k_escalate (default 20), so n can
+  reach 19. Worse, an infra-dominant crash history escapes even the
+  k_escalate backstop (the loop keeps retrying through a sustained outage
+  instead of disposing). Uncapped, n=10 demands 60×2⁹ = 30720s (8.5h) and
+  n=19 demands ~182 DAYS of head-of-line blocking on a single message, all
+  while the chunked stamp reads the wrapper as healthy. The cap makes a
+  runaway counter degrade to "very slow" instead of "effectively never",
+  with no config knob — it is a named module constant next to the failure
+  mode it defends against.)
 
 ### D3. Interruption budget → self-clearing dead-letter (NOT a park)
 

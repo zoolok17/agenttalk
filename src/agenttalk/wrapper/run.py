@@ -1384,7 +1384,9 @@ def run_wrapper(
     clock: Callable[[], float] = time.monotonic,
 ) -> int:
     """Wrap one CLI run. Returns the child exit code (0 when a line_source is
-    injected, i.e. tests)."""
+    injected AND it produced at least one parseable structured event, i.e.
+    tests; 1 if a line_source produced none - see the zero-events refusal
+    below)."""
     mapper = _ADAPTERS.get(cli)
     if mapper is None:
         raise ValueError(f"no wrapper adapter for cli {cli!r} (Phase 1 = codex)")
@@ -1443,6 +1445,21 @@ def run_wrapper(
         if health_writer is not None:
             health_writer.turn_start(None)
         engine.run(_health_events(parse_lines(line_source, mapper)), clock)
+        if seen["events"] == 0:
+            # cold-review FIX 4: apply the same zero-events refusal as the real
+            # subprocess branch below (never silently return 0) - a caller feeding an
+            # injected line source (tests / an alternate stream adapter) that produces
+            # no parseable structured events drove no turn either.
+            sys.stderr.write(
+                "agenttalk wrap: no turn driven by the wrapper - no parseable "
+                "stream events in the supplied line source. Plain `wrap` only "
+                "adapts a complete structured-stream command (e.g. `codex ... "
+                "exec --json \"...\"`); to drive inbox messages use --loop, or "
+                "--loop --one-shot --to-request <id> for a single request.\n")
+            sys.stderr.flush()
+            if health_writer is not None:
+                health_writer.crashed_or_exited(reason_code="wrapper_no_turn_driven")
+            return 1
         if (health_writer is not None
                 and health_writer.state != health_model.STATE_DEGRADED_OUTPUT):
             health_writer.idle(reason_code="wrapper_completed")
@@ -1493,13 +1510,22 @@ def run_wrapper(
         _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
     rc = proc.wait()
     if seen["events"] == 0:
-        # Zero structured events = no turn driven, whatever the child's rc. Say
-        # so ONCE with the concrete remedy instead of the historical silent
-        # exit-0 no-op (#204): plain wrap only adapts an already-complete
-        # structured-stream command; it never reads the inbox.
+        # cold-review FIX 4: zero structured events means the WRAPPER drove no turn -
+        # it must NOT claim the child "did nothing": the child process genuinely ran
+        # and exited rc={rc}, and anything it did outside the structured stream (file
+        # writes, side-effectful commands) is real and already happened. Say so ONCE
+        # with the concrete remedy instead of the historical silent exit-0 no-op
+        # (#204): plain wrap only adapts an already-complete structured-stream
+        # command; it never reads the inbox.
+        # rc semantics: PASS THROUGH a nonzero child rc unchanged (it is already an
+        # honest failure signal); promote a clean rc=0 to 1, because "no turn driven"
+        # dressed as a successful exit is exactly the misleading success-shaped no-op
+        # this fix exists to end - a caller checking only the exit code must see a
+        # failure, not a silent success.
         sys.stderr.write(
-            f"agenttalk wrap: no turn driven - the child (exit {rc}) produced no "
-            "structured events. Plain `wrap` only adapts a complete structured-"
+            "agenttalk wrap: no turn driven by the wrapper - no parseable stream "
+            f"events; the child process ran and exited rc={rc} - any side effects "
+            "it made are real. Plain `wrap` only adapts a complete structured-"
             "stream command (e.g. `codex ... exec --json \"...\"`); to drive "
             "inbox messages use --loop, or --loop --one-shot --to-request <id> "
             "for a single request.\n")

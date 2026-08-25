@@ -10423,6 +10423,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     one_shot_request_id: str | None = None,
                     k_poison: int = 3, k_escalate: int = 20,
                     k_interrupted: int = 3,
+                    heartbeat_interval: float | None = None,
                     interruption_redrive_seconds: float = 60.0,
                     infra_exhaust_after_seconds: float = 14400.0,
                     infra_exhaust_min_attempts: int = 100,
@@ -10729,6 +10730,15 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             max_wall=max_wall,
             k_poison=k_poison, k_escalate=k_escalate,
             k_interrupted=k_interrupted,
+            # cold-review FIX 7: pass the SAME value cmd_wrap already validated
+            # against stuck_after (HEARTBEAT_INTERVAL_SECONDS) explicitly, rather
+            # than relying on run_loop's default parameter matching the module
+            # constant by coincidence - the launch invariant and the runtime value
+            # can then never drift apart.
+            heartbeat_interval=(
+                heartbeat_interval if heartbeat_interval is not None
+                else wloop.HEARTBEAT_INTERVAL_SECONDS
+            ),
             interruption_redrive_seconds=interruption_redrive_seconds,
             # for the escalation's remedy text only: the watchdog budget each
             # killed turn burned (None when the watchdog is not live).
@@ -11330,6 +11340,7 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
             k_poison=k_poison,
             k_escalate=k_escalate,
             k_interrupted=k_interrupted,
+            heartbeat_interval=_hb_interval,
             interruption_redrive_seconds=interruption_redrive,
             infra_exhaust_after_seconds=infra_ceiling[
                 "infra_exhaust_after_seconds"

@@ -50,13 +50,25 @@ CLASS_GATEWAY_HELD = "gateway_held"
 # model output before exiting (run._classify_drive_failure's last-resort branch, e.g. a
 # codex child refusing a non-git/untrusted workspace before it emits a single stream
 # event). ONE such result stays AMBIGUOUS (a transient host hiccup must not park a
-# healthy seat), but the SECOND CONSECUTIVE one on the same head is deterministic: the
-# loop promotes it to CLASS_CONFIG_BLOCKED (escalate once + durable park + safe
-# re-probe, #62) instead of burning the K_escalate ceiling on 20 ambiguous retries.
+# healthy seat). A SECOND CONSECUTIVE one on the same head, at least
+# NEVER_STARTED_PROMOTION_MIN_ELAPSED_SECONDS after the first (cold-review FIX 2: two
+# 0.3-2.0s-apart fail_sleep samples are NOT evidence of determinism - a transient auth
+# refresh / CLI update banner / AV lock must not permanently park a healthy seat), is
+# deterministic: the loop promotes it to CLASS_CONFIG_BLOCKED and escalates once via
+# _park_config_blocked. Unlike CLASS_GATEWAY_HELD/_hold_park's #62 self-healing
+# re-probe (which clears its attempt and re-drives every poll), a config_blocked park
+# is STICKY - the entry-mirror check below re-parks WITHOUT ever driving again, so
+# there is no automatic re-probe here; an operator must clear the underlying denial
+# (and the attempt ledger) before this head can proceed. This avoids burning the
+# K_escalate ceiling on 20 ambiguous retries for a deterministic denial.
 NEVER_STARTED_SUMMARY_PREFIX = "turn never started"
 NEVER_STARTED_REMEDY = (
     "child CLI never started; check: workspace is a git repo / trusted directory, "
     "CLI auth, executable path")
+# #205 (cold-review FIX 2): the minimum time that must have elapsed since the FIRST
+# never-started failure before a second consecutive one is trusted as deterministic
+# rather than a transient hiccup landing ~seconds apart under fail_sleep (0.3-2.0s).
+NEVER_STARTED_PROMOTION_MIN_ELAPSED_SECONDS = 60.0
 
 
 def _is_never_started_failure(failure_class: object, summary: object) -> bool:
@@ -74,6 +86,18 @@ HEARTBEAT_INTERVAL_SECONDS = 10.0
 # #202 D3: dead-letter reason for a head whose turns were repeatedly killed by the
 # turn watchdog (k_interrupted consecutive turn_watchdog interruptions).
 INTERRUPTION_BUDGET_EXHAUSTED = "interruption_budget_exhausted"
+
+# #202 D2 (cold-review FIX 1): hard cap on the ANY-KIND interruption backoff
+# (base x 2^(n-1)). n = interrupted_consecutive is bounded by k_interrupted ONLY
+# for turn_watchdog kills; crash_mid_turn's cause is unobserved, so its disposal
+# ceiling stays k_escalate (default 20) - and an infra-dominant crash history
+# evades even THAT ceiling (_infra_dominant keeps retrying through a sustained
+# outage instead of disposing). Left uncapped, n=10 demands an 8.5h sleep and
+# n=19 demands ~182 DAYS, all while the chunked stamp reads the wrapper as
+# healthy - a single interrupted head would head-of-line block the whole seat's
+# queue for that long. Capped, a runaway counter degrades to "very slow"
+# instead of "effectively never".
+INTERRUPTION_BACKOFF_CAP_SECONDS = 900.0
 
 
 def _interruption_remedy(agent: str, head_id: object, *, k: int, kind: str,
@@ -128,6 +152,17 @@ def _as_outcome(ret: object) -> DriveOutcome:
 _REPLY_DRAFT_KINDS = frozenset({"question", "message", "wake"})
 
 
+def _interrupted_draft_path(store, agent: str, msg_id: object) -> Path | None:
+    """The preserved-progress sibling #202 D5 writes for an interrupted attempt's
+    draft, or None when ``msg_id`` cannot name one. Shared by the write side
+    (_with_reply_draft), the GC-on-deliver side (_deliver_reply_draft), and the
+    GC-on-dispose side (_run_continuous._dispose) so a stale preserved copy never
+    outlives the head it was recovered for (cold-review FIX 6)."""
+    if not isinstance(msg_id, str) or not msg_id:
+        return None
+    return reply_transport.reply_draft_path(store, agent, msg_id).with_suffix(".interrupted.md")
+
+
 def _with_reply_draft(store, agent: str, record: dict) -> dict:
     """Decorate a freeform (no-admission) record with its declared draft path."""
     if record.get("kind") not in _REPLY_DRAFT_KINDS:
@@ -165,8 +200,16 @@ def _with_reply_draft(store, agent: str, record: dict) -> dict:
         # child's recoverable progress - preserve it as <id>.interrupted.md (the
         # rejoin names it; a failed rename falls through to today's delete). The
         # live path is cleared either way, so the preserved copy never publishes.
+        # cold-review FIX 5: _run_continuous has a persisted ledger (last_interrupted
+        # on the attempt record), but _run_one_shot is LEDGER-LESS - its previous
+        # interruption rides ONLY the in-memory ``interrupted_redelivery`` decoration
+        # the one-shot loop places on the record before calling here. Without this
+        # second gate the ledger read is always empty for one-shot and the draft is
+        # unconditionally deleted, even while the rejoin still says "prefer resuming".
         prev = store.attempt_record(agent, inbound_id) or {}
-        if prev.get("last_interrupted") and path.is_file():
+        previously_interrupted = bool(prev.get("last_interrupted")) or isinstance(
+            record.get("interrupted_redelivery"), dict)
+        if previously_interrupted and path.is_file():
             reply_transport.preserve_interrupted_draft(path)
         path.unlink(missing_ok=True)
     except OSError:
@@ -207,6 +250,17 @@ def _deliver_reply_draft(store, agent: str, record: dict) -> None:
             # a trace the answer would vanish exactly like the dead-letter
             # dotfiles #201 exists to fix. Preserve the bytes observably.
             reply_transport.preserve_refused_draft(draft)
+        elif published is not None:
+            # cold-review FIX 6: a real reply just landed for this head, so any
+            # earlier <id>.interrupted.md leftover (recovered progress from a
+            # PRIOR interrupted attempt on the same id) is now moot - GC it so it
+            # cannot linger on disk / be misread as still-pending by a later probe.
+            preserved = _interrupted_draft_path(store, agent, record.get("id"))
+            if preserved is not None:
+                try:
+                    preserved.unlink(missing_ok=True)
+                except OSError:
+                    pass
     except Exception:  # noqa: BLE001, S110 - must never change disposition  # nosec B110
         return
 
@@ -628,10 +682,18 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
 
     def _dispose(record: dict, *, failure_class: str, reason: str | None,
                  infra_exhausted: bool = False,
-                 child_output_tail: dict | None = None) -> None:
+                 child_output_tail: dict | None = None,
+                 summary: str | None = None) -> None:
         """Dead-letter the head record (store advances the cursor past it), then stamp
         progress: DL is PROGRESS, not a failed turn, so the heartbeat goes FRESH and
-        the failure backoff resets - the supervisor sees progress + never restarts."""
+        the failure backoff resets - the supervisor sees progress + never restarts.
+
+        ``summary`` (cold-review FIX 3) overrides the operator-facing notice text
+        (default: the ledger's ``last_failure_summary``, via ``_info``). Needed
+        because ``_escalate_once``'s remedy no-ops when escalation is already
+        latched (a prior, unrelated escalation on this head routed already) - the
+        dead-letter notification must still carry the REAL remedy (e.g. the #202 D3
+        interruption-budget-exhausted remedy) regardless of that dedupe."""
         nonlocal last_hb, fail_sleep
         rec = store.attempt_record(agent, record.get("id")) or {}
         _guard_advance()                      # dead-letter ADVANCES the cursor - verify
@@ -672,6 +734,15 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             sleep(fail_sleep)
             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
             return
+        # cold-review FIX 6: the head is durably disposed - GC any <id>.interrupted.md
+        # preserved-progress sibling now, so it cannot outlive the head it was
+        # recovered for (nothing else ever removes it once a head is dead-lettered).
+        preserved = _interrupted_draft_path(store, agent, record.get("id"))
+        if preserved is not None:
+            try:
+                preserved.unlink(missing_ok=True)
+            except OSError:
+                pass
         if on_runtime_dead_letter is not None:
             on_runtime_dead_letter(record)
         _runtime_idle()
@@ -687,7 +758,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             try:
                 on_dead_letter(_info(
                     record, rec, failure_class,
-                    infra_exhausted=infra_exhausted, quarantined=True))
+                    infra_exhausted=infra_exhausted, quarantined=True,
+                    summary=summary))
             except Exception:  # noqa: BLE001 - a notification must never crash the loop
                 return
 
@@ -1271,7 +1343,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     budget_seconds=interruption_budget_seconds)
                 _escalate_once(record, CLASS_AMBIGUOUS, summary=remedy)
                 _dispose(record, failure_class=CLASS_AMBIGUOUS,
-                         reason=INTERRUPTION_BUDGET_EXHAUSTED)
+                         reason=INTERRUPTION_BUDGET_EXHAUSTED, summary=remedy)
                 continue
             if k_poison > 0 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison:
                 _dispose(record, failure_class=CLASS_POISON,
@@ -1347,16 +1419,26 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # from the PERSISTED record - never from in-memory fail_sleep, which relaunch
         # amnesia resets. This single site therefore also covers crash_mid_turn's
         # immediate-redrive-at-relaunch path (the reconcile above just incremented
-        # the counter). base x 2^(n-1), n = interrupted_consecutive (any kind); no
-        # separate cap needed (n is bounded by the k_interrupted dispose above for
-        # watchdog kills and by k_escalate for crashes). The sleep is CHUNKED at
-        # heartbeat_interval with a stamp per chunk (blocked-but-alive, the same
-        # posture as the holds), so the supervisor can never STUCK_RECOVER a wrapper
-        # that is deliberately backing off. Control kinds are delayed for the
-        # duration - documented cost, bounded by the launch validation (cli).
+        # the counter). base x 2^(n-1), n = interrupted_consecutive (ANY kind -
+        # turn_watchdog AND crash_mid_turn), HARD-CAPPED at
+        # INTERRUPTION_BACKOFF_CAP_SECONDS (cold-review FIX 1: the earlier "no separate
+        # cap needed" claim was wrong - n is bounded by k_interrupted ONLY for
+        # turn_watchdog; crash_mid_turn's counter is bounded only by k_escalate
+        # (default 20, so n=19 is reachable), and an infra-dominant crash history
+        # evades even that ceiling (_infra_dominant keeps retrying through a sustained
+        # outage instead of disposing) - so an uncapped exponent reaches hours (n=10)
+        # to months (n=19) of head-of-line blocking while heartbeat-stamped healthy).
+        # The sleep is CHUNKED at heartbeat_interval with a stamp per chunk
+        # (blocked-but-alive, the same posture as the holds), so the supervisor can
+        # never STUCK_RECOVER a wrapper that is deliberately backing off. Control
+        # kinds are delayed for the duration - documented cost, bounded by the launch
+        # validation (cli).
         interrupted_n = _safe_int(rec.get("interrupted_consecutive"))
         if interrupted_n > 0 and interruption_redrive_seconds > 0:
-            required = float(interruption_redrive_seconds) * (2.0 ** (interrupted_n - 1))
+            required = min(
+                float(interruption_redrive_seconds) * (2.0 ** (interrupted_n - 1)),
+                INTERRUPTION_BACKOFF_CAP_SECONDS,
+            )
             last_at = _iso_epoch(rec.get("last_failure_at"))
             now_at = _iso_epoch(now_iso())
             remaining = (required if last_at is None or now_at is None
@@ -1472,18 +1554,35 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             continue
         # #205: a SECOND consecutive never-started result on the same head (the attempt
         # record still holds the previous failure - record_attempt_start preserves it)
-        # is a deterministic launch/config denial, not an ambiguous hiccup. Promote it
-        # to CLASS_CONFIG_BLOCKED with the concrete remedies so the existing branch
-        # below escalates once + parks durably instead of retrying blind to K_escalate.
+        # is a deterministic launch/config denial, not an ambiguous hiccup - PROVIDED
+        # it is actually separated in time from the first one. cold-review FIX 2: with
+        # fail_sleep 0.3-2.0s, two samples can land ~seconds apart - that is NOT
+        # evidence of determinism, just an unlucky pair of retries during a transient
+        # hiccup (auth refresh, CLI update banner, AV lock). Require BOTH the
+        # never-started signature AND at least
+        # NEVER_STARTED_PROMOTION_MIN_ELAPSED_SECONDS since the previous failure's
+        # recorded time before promoting to CLASS_CONFIG_BLOCKED (escalate once + durable
+        # park below); missing/unparseable timestamps fail CLOSED (keep retrying
+        # ambiguous) rather than promote on unproven elapsed time.
+        failure_now = now_iso()
         if _is_never_started_failure(outcome.failure_class, outcome.summary):
             prev = store.attempt_record(agent, head_id) or {}
             if _is_never_started_failure(prev.get("last_failure_class"),
                                          prev.get("last_failure_summary")):
-                outcome = replace(outcome, failure_class=CLASS_CONFIG_BLOCKED,
-                                  summary=f"{NEVER_STARTED_REMEDY} ({outcome.summary})")
+                prev_at = _iso_epoch(prev.get("last_failure_at"))
+                now_at = _iso_epoch(failure_now)
+                elapsed_ok = (
+                    prev_at is not None and now_at is not None
+                    and (now_at - prev_at) >= NEVER_STARTED_PROMOTION_MIN_ELAPSED_SECONDS
+                )
+                if elapsed_ok:
+                    outcome = replace(outcome, failure_class=CLASS_CONFIG_BLOCKED,
+                                      summary=f"{NEVER_STARTED_REMEDY} ({outcome.summary})")
+                # else: too soon after the first sample (or timestamps unavailable) -
+                # keep retrying ambiguous instead of permanently parking the head.
         # record the classified failure (clears in_progress), then decide.
         store.record_attempt_result(agent, head_id, failure_class=outcome.failure_class,
-                                    summary=outcome.summary, at=now_iso(),
+                                    summary=outcome.summary, at=failure_now,
                                     interrupted=outcome.interrupted,
                                     interruption_kind=outcome.interruption_kind)
         rec = store.attempt_record(agent, head_id) or {}
@@ -1509,7 +1608,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                            summary=remedy)
             _dispose(record, failure_class=CLASS_AMBIGUOUS,
                      reason=INTERRUPTION_BUDGET_EXHAUSTED,
-                     child_output_tail=outcome.child_output_tail)
+                     child_output_tail=outcome.child_output_tail,
+                     summary=remedy)
             continue
         if (k_poison > 0 and outcome.failure_class == CLASS_POISON
                 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison):
@@ -1995,8 +2095,11 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                 continue
             legacy_gate_resolution = authorized
-        record = _with_reply_draft(store, agent, record)
-        outcome = _as_outcome(drive(_with_interruption_context(record)))
+        # cold-review FIX 5: decorate with the in-memory interruption context BEFORE
+        # _with_reply_draft, so its ledger-less preservation gate (see there) can see
+        # THIS attempt's "previously interrupted" fact on the record itself.
+        record = _with_reply_draft(store, agent, _with_interruption_context(record))
+        outcome = _as_outcome(drive(record))
         _note_interruption(outcome)
         # #201: same wrapper-owned draft delivery as _run_continuous — the
         # one-shot path must not strand a sandbox-blocked child's answer.

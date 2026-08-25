@@ -5,6 +5,7 @@ fixture Store + injected drive/spawn - NO real CLI.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import errno
 import gc
 import json
@@ -563,15 +564,43 @@ def test_first_never_started_failure_stays_ambiguous_and_retries(tmp_path) -> No
     assert s.dead_lettered_count("beta") == 0
 
 
+def _now_iso_bumping_after_nth_drive(n: int, delta_seconds: float):
+    """A now_iso() fake whose virtual clock jumps by ``delta_seconds`` the instant the
+    n-th drive() call is made (before it returns) - so everything computed AFTER that
+    call (record_attempt_result, the FIX 2 elapsed-window check) sees the bumped time,
+    while everything up to and including entry to that call still sees the baseline.
+    Returns ``(now_iso, wrap_drive)``; wrap the test's drive callable with ``wrap_drive``."""
+    base = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    clock_box = {"t": 0.0}
+    calls = {"n": 0}
+
+    def now_iso() -> str:
+        return (base + timedelta(seconds=clock_box["t"])).isoformat().replace("+00:00", "Z")
+
+    def wrap_drive(inner):
+        def driven(rec):
+            calls["n"] += 1
+            if calls["n"] == n:
+                clock_box["t"] += delta_seconds
+            return inner(rec)
+        return driven
+
+    return now_iso, wrap_drive
+
+
 def test_second_consecutive_never_started_parks_config_blocked_with_remedy(tmp_path) -> None:
     # #205: the field case - a codex child in a non-git workspace exits rc=1 before any
     # stream output, deterministically. The SECOND consecutive never-started result on
-    # the same head promotes to config_blocked (escalate once + durable park, the
-    # existing #62 machinery) instead of burning 20 ambiguous k_escalate retries.
+    # the same head, ARRIVING AT LEAST NEVER_STARTED_PROMOTION_MIN_ELAPSED_SECONDS after
+    # the first (cold-review FIX 2 - here 90s, well outside the 60s window), promotes to
+    # config_blocked (escalate once + durable park, the existing #62 machinery) instead
+    # of burning 20 ambiguous k_escalate retries.
     s = _store(tmp_path)
     m = s.send(sender="alpha", recipient="beta", body="task")
     drives = {"n": 0}
+    now_iso, wrap_drive = _now_iso_bumping_after_nth_drive(2, 90.0)
 
+    @wrap_drive
     def drive(rec):
         drives["n"] += 1
         return _never_started_drive()
@@ -580,6 +609,7 @@ def test_second_consecutive_never_started_parks_config_blocked_with_remedy(tmp_p
     escalations: list = []
     loop.run_loop(
         s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        now_iso=now_iso,
         max_polls=4, k_poison=0, k_escalate=20,
         on_escalate=lambda info: escalations.append(info.get("msg_id")) or True,
         on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
@@ -594,6 +624,37 @@ def test_second_consecutive_never_started_parks_config_blocked_with_remedy(tmp_p
     assert len(escalations) == 1                            # escalated exactly once
     assert s.cursor("beta") == ""                           # parked, never committed
     assert s.dead_lettered_count("beta") == 0               # parked, never dead-lettered
+
+
+def test_second_consecutive_never_started_inside_the_window_stays_ambiguous(tmp_path) -> None:
+    # cold-review FIX 2: two never-started samples 0.3-2.0s apart under fail_sleep are NOT
+    # evidence of a deterministic denial - only a transient hiccup (auth refresh, CLI update
+    # banner, AV lock). A second consecutive never-started result arriving WITHIN
+    # NEVER_STARTED_PROMOTION_MIN_ELAPSED_SECONDS (here 30s, inside the 60s window) of the
+    # first must stay ambiguous and keep retrying - never permanently park a healthy seat.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+    now_iso, wrap_drive = _now_iso_bumping_after_nth_drive(2, 30.0)
+
+    @wrap_drive
+    def drive(rec):
+        drives["n"] += 1
+        return _never_started_drive()
+
+    parked: list = []
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        now_iso=now_iso,
+        max_polls=3, k_poison=0, k_escalate=0,
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    assert drives["n"] == 3                                 # kept retrying - never parked
+    assert parked == []
+    rec = s.attempt_record("beta", m.id)
+    assert rec["last_failure_class"] == loop.CLASS_AMBIGUOUS
+    assert s.cursor("beta") == ""
+    assert s.dead_lettered_count("beta") == 0
 
 
 def test_non_never_started_ambiguous_failure_never_promotes(tmp_path) -> None:
@@ -662,6 +723,28 @@ def test_interruption_backoff_is_chunked_and_stamps_during(tmp_path) -> None:
     assert backoff == ["hb", ("sleep", 10.0), "hb", ("sleep", 10.0)]  # 20s remainder, stamped per chunk
 
 
+def test_interruption_backoff_is_hard_capped_for_a_long_crash_chain(tmp_path) -> None:
+    # cold-review FIX 1: base x 2^(n-1) with n=10 and a 60s base UNCAPPED demands
+    # 60 * 2^9 = 30720s (8.5h) - a crash_mid_turn chain is bounded only by k_escalate
+    # (default 20, so n can reach 19 -> ~182 DAYS uncapped), not by k_interrupted.
+    # INTERRUPTION_BACKOFF_CAP_SECONDS (900s) must cap the REQUESTED sleep regardless.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    _seed_interruptions(s, m.id, 10)              # uncapped required = 60 * 2^9 = 30720s
+    events: list = []
+    turns = loop.run_loop(
+        Store(tmp_path), "beta", lambda rec: events.append("drive") or True,
+        clock=lambda: 0.0, sleep=lambda d: events.append(("sleep", d)),
+        heartbeat=lambda: events.append("hb"),
+        now_iso=lambda: _ISO_T0,                  # 0s elapsed since last_failure_at
+        heartbeat_interval=10.0, interruption_redrive_seconds=60.0,
+        k_interrupted=0, max_polls=1, k_poison=0, k_escalate=0)
+    assert turns == 1
+    backoff = events[:events.index("drive")]
+    total_sleep = sum(item[1] for item in backoff if isinstance(item, tuple))
+    assert total_sleep == loop.INTERRUPTION_BACKOFF_CAP_SECONDS  # capped at 900s, not 30720s
+
+
 def test_non_interrupted_failure_keeps_the_ordinary_idle_backoff(tmp_path) -> None:
     # A non-interrupted ambiguous failure must keep today's fail_sleep backoff:
     # no chunked pre-drive sleep, no pre-drive heartbeat stamping.
@@ -720,6 +803,39 @@ def test_third_consecutive_watchdog_interruption_dead_letters_with_remedy(tmp_pa
                      "--agent", "beta", "--id", m.id, "--from", "alpha"]) == 0
     fresh = [msg for msg in s.messages_for("beta") if msg.id not in (m.id, nxt.id)]
     assert fresh and s.attempt_record("beta", fresh[0].id) is None
+
+
+def test_dead_letter_notice_carries_the_remedy_even_when_escalation_already_latched(
+    tmp_path,
+) -> None:
+    # cold-review FIX 3: _escalate_once no-ops when escalation_routed is already
+    # latched (a prior, unrelated escalation on this head routed already) - the
+    # DEAD-LETTER notification (on_dead_letter) must still carry the interruption
+    # remedy, not silently fall back to the ledger's stale last_failure_summary.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="oversized task")
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="pre", at=_ISO_T0)
+    s.record_attempt_result("beta", m.id, failure_class=loop.CLASS_AMBIGUOUS,
+                            summary="an earlier, unrelated failure", at=_ISO_T0)
+    s.mark_attempt_escalated("beta", m.id, routed=True)   # PRE-LATCH: already routed
+
+    escalations: list = []
+    disposals: list = []
+    loop.run_loop(
+        s, "beta", lambda rec: _watchdog_interrupted_outcome(),
+        clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=8, k_poison=0, k_escalate=0, k_interrupted=3,
+        interruption_redrive_seconds=0.0,
+        interruption_budget_seconds=1800.0,
+        on_escalate=lambda info: escalations.append(info) or True,
+        on_dead_letter=lambda info: disposals.append(info),
+    )
+    assert escalations == []                       # already latched - never re-sent
+    assert len(disposals) == 1
+    remedy = disposals[0]["summary"]
+    assert "killed 3 times by turn_watchdog after 1800s each" in remedy
+    assert "turn_watchdog.turn_elapsed_seconds" in remedy
+    assert remedy != "an earlier, unrelated failure"
 
 
 def test_non_interrupted_failure_between_resets_the_interruption_run(tmp_path) -> None:
