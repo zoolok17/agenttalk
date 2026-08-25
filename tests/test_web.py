@@ -4052,7 +4052,7 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
   assert(historyWrites.at(-1).method === 'push' &&
     history.entries[1].includes('root=project-b'),
     `user selection was not a project-B push: ${JSON.stringify(historyWrites)}`);
-  assert(calls.length === 6 && calls.every((call) => call.url.includes('root=project-b')),
+  assert(calls.length === 9 && calls.every((call) => call.url.includes('root=project-b')),
     `project-B selection did not refetch B: ${JSON.stringify(calls)}`);
   const staleB = calls.find((call) => call.url.startsWith('/api/attention'));
   hooks.seedRootContext('project B');
@@ -4071,8 +4071,8 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
   assert(history.entries.length === 2 && history.index === 0 &&
     historyWrites.length === writesBeforeBack,
     `Back wrote history: ${JSON.stringify(historyWrites)}`);
-  const aCalls = calls.slice(6);
-  assert(aCalls.length === 6 && aCalls.every((call) => call.url.includes('root=project-a')),
+  const aCalls = calls.slice(9);
+  assert(aCalls.length === 9 && aCalls.every((call) => call.url.includes('root=project-a')),
     `Back did not refetch A: ${JSON.stringify(aCalls)}`);
 
   const currentA = aCalls.find((call) => call.url.startsWith('/api/attention'));
@@ -4080,7 +4080,7 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
     root_info: {project_id: rootA.project_id}, count: 3, items: [],
   }));
   for (const call of aCalls) if (call !== currentA) call.resolve(response(false, {}));
-  for (const call of calls.slice(0, 6)) {
+  for (const call of calls.slice(0, 9)) {
     if (call !== staleB) call.resolve(response(false, {}));
   }
   await flush();
@@ -4104,8 +4104,8 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
   assert(history.entries.length === 2 && history.index === 1 &&
     historyWrites.length === writesBeforeForward,
     `Forward wrote history: ${JSON.stringify(historyWrites)}`);
-  const forwardCalls = calls.slice(12);
-  assert(forwardCalls.length === 6 &&
+  const forwardCalls = calls.slice(18);
+  assert(forwardCalls.length === 9 &&
     forwardCalls.every((call) => call.url.includes('root=project-b')),
     `Forward did not refetch B: ${JSON.stringify(forwardCalls)}`);
 })().catch((err) => {
@@ -6249,6 +6249,289 @@ def test_api_state_thread_carries_opener(tmp_path: Path) -> None:
         (row,) = root["threads"]
         assert row["opener"] == "alpha"
         assert row["opener_peer"] == "beta"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# ------------------------------------------------------- /api/gates (§4c)
+#
+# Gate & Evidence Wall, read side (docs/PROPOSAL-console-client-sellability.md
+# #1). Quick-win selection: 20260825-215757-153513-ljQ3.
+
+def _gates(base: str) -> dict:
+    with _get(f"{base}/api/gates") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_gates_shape_evidence_and_waiver(tmp_path: Path) -> None:
+    """A green blocker gate carries its evidence; a waived gate carries its
+    waiver reason/expiry; a missing required gate blocks with a reason. The
+    envelope carries the full picture /api/attention only ever summarizes as
+    one blocker line."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="tests", status="green", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  evidence=["ci-run-42"], reason="all green", required=True)
+    gmod.waive_gate(s.root, name="security-scan", operator="alpha",
+                    reason="scanner unavailable", scope="release",
+                    expires="2099-01-01T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        assert set(payload) == {
+            "root", "root_path", "root_info", "target_root_project_id",
+            "verdict", "required_gates", "gates", "count",
+        }
+        assert payload["count"] == len(payload["gates"])
+        assert payload["required_gates"] == ["tests"]
+        by_name = {g["name"]: g for g in payload["gates"]}
+
+        tests_gate = by_name["tests"]
+        assert tests_gate["status"] == "green"
+        assert tests_gate["severity"] == "blocker"
+        assert tests_gate["scope"] == "release"
+        assert tests_gate["blocks"] is False
+        assert tests_gate["waiver"] is None
+        (evidence_entry,) = tests_gate["evidence"]
+        assert evidence_entry["source"] == "automation_ci"
+        assert evidence_entry["refs"] == ["ci-run-42"]
+        assert evidence_entry["by"] == "alpha"
+        assert "at" in evidence_entry
+
+        scan_gate = by_name["security-scan"]
+        assert scan_gate["status"] == "waived"
+        assert scan_gate["blocks"] is False
+        assert scan_gate["waiver"] == {
+            "operator": "alpha",
+            "date": scan_gate["waiver"]["date"],
+            "reason": "scanner unavailable",
+            "scope": "release",
+            "expires": "2099-01-01T00:00:00Z",
+        }
+
+        # every required blocker gate is green -> GO
+        assert payload["verdict"] == "GO"
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_missing_required_gate_blocks(tmp_path: Path) -> None:
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    state = gmod.load_gate_state(s.root)
+    state["required_gates"] = ["never-run"]
+    gmod.write_gate_state(s.root, state)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        assert payload["verdict"] == "HOLD"
+        (gate,) = payload["gates"]
+        assert gate["name"] == "never-run"
+        assert gate["status"] == "unknown"
+        assert gate["blocks"] is True
+        assert gate["reason"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_degrades_on_corrupt_root(tmp_path: Path) -> None:
+    """Parity with /api/attention's errors-as-data (B1): a corrupt gates.json
+    must NOT 500 the route. gates.check_gates already fails closed for a
+    corrupt state file with a single synthetic ``__gate_state__`` blocker
+    (mirrored by attention.gate_hold_items) - build_gates must pass that
+    through, not crash trying to read a non-existent evidence list for it."""
+    s = _make_store(tmp_path)
+    (s.dir / "gates.json").write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        assert set(payload) >= {"root", "gates", "count", "verdict"}
+        assert payload["count"] == len(payload["gates"])
+        assert payload["verdict"] == "HOLD"
+        (gate,) = payload["gates"]
+        assert gate["name"] == "__gate_state__"
+        assert gate["blocks"] is True
+        assert gate["evidence"] == []
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# --------------------------------------------------- /api/risk-register (§4e)
+#
+# Risk Register relabel (docs/PROPOSAL-console-client-sellability.md #6).
+
+def _risk_register(base: str) -> dict:
+    with _get(f"{base}/api/risk-register") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_risk_register_shape_and_sorted_by_severity_then_age(
+    tmp_path: Path,
+) -> None:
+    from agenttalk import gates as gmod
+    from agenttalk.wrapper import recv_api
+
+    s = _make_store(tmp_path)
+    # A high-severity gate-hold risk (blocker gate, red).
+    gmod.set_gate(s.root, name="ci", status="red", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  reason="pipeline red", required=True)
+    # A dead letter -> med severity risk with an owning agent.
+    message = s.send(sender="alpha", recipient="beta", body="poison",
+                     kind="message", meta={})
+    record = recv_api.next_record(s, "beta")
+    assert record["id"] == message.id
+    s.dead_letter("beta", record, reason="deterministic",
+                  failure_class="poison_eligible", at="2026-07-02T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert set(payload) == {
+            "root", "root_path", "root_info", "target_root_project_id",
+            "items", "count",
+        }
+        assert payload["count"] == len(payload["items"])
+        for it in payload["items"]:
+            assert set(it) == {
+                "id", "category", "category_label", "severity", "title",
+                "owner", "detail", "age_seconds", "human_can_unblock_now",
+            }
+            assert it["severity"] in ("high", "med", "low")
+        # severity-desc, then age-desc within a severity band
+        order = [("high", 0), ("med", 1), ("low", 2)]
+        rank = dict(order)
+        ranks = [rank[it["severity"]] for it in payload["items"]]
+        assert ranks == sorted(ranks)
+        gate_items = [it for it in payload["items"] if it["category"] == "gate"]
+        assert gate_items and gate_items[0]["category_label"] == "Gate blocker"
+        deadletter_items = [it for it in payload["items"] if it["category"] == "deadletter"]
+        assert deadletter_items and deadletter_items[0]["category_label"] == "Delivery failure"
+        assert deadletter_items[0]["owner"] == "beta"
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_degrades_on_corrupt_root(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    cfg_path = s.dir / "config.json"
+    cfg_path.write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert set(payload) >= {"root", "items", "count"}
+        assert payload["count"] == len(payload["items"])
+        _assert_no_body_keys(payload)
+        assert payload["items"] == [] or all(
+            it["category"] in ("escalation", "supervisor", "gate", "deadletter",
+                               "coordination_stall", "stuck")
+            for it in payload["items"]
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# ----------------------------------------------------- /api/ownership (§4d)
+#
+# Ownership & Accountability Map (docs/PROPOSAL-console-client-sellability.md
+# #7).
+
+def _ownership(base: str) -> dict:
+    with _get(f"{base}/api/ownership") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_ownership_full_registry_shape(tmp_path: Path) -> None:
+    """The full registry - domains with resolved owners/reviewers/curators plus
+    shared_paths - not just the thin per-agent slice /api/state carries."""
+    s = _make_store(tmp_path)
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {
+            "web": {
+                "title": "Web layer",
+                "owners": {"agents": ["alpha"]},
+                "reviewers": {"agents": ["beta"]},
+                "owned_globs": ["src/agenttalk/web.py"],
+                "description": "the dashboard server",
+            },
+        },
+        "shared_paths": [{
+            "glob": "**/pyproject.toml",
+            "category": "package-metadata",
+            "requires": "lead-approval",
+            "default_approvers": {"agents": ["alpha"]},
+        }],
+    }), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        assert set(payload) == {
+            "root", "root_path", "root_info", "target_root_project_id",
+            "domains", "shared_paths", "count",
+        }
+        assert payload["count"] == len(payload["domains"])
+        (domain,) = payload["domains"]
+        assert domain["id"] == "web"
+        assert domain["title"] == "Web layer"
+        assert domain["owners"] == ["alpha"]
+        assert domain["reviewers"] == ["beta"]
+        assert domain["curators"] == []
+        assert domain["owned_globs"] == ["src/agenttalk/web.py"]
+        assert domain["description"] == "the dashboard server"
+        (shared,) = payload["shared_paths"]
+        assert shared["glob"] == "**/pyproject.toml"
+        assert shared["category"] == "package-metadata"
+        assert shared["requires"] == "lead-approval"
+        assert shared["default_approvers"] == ["alpha"]
+        assert shared["default_reviewers"] == []
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_ownership_missing_registry_is_empty_not_error(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        assert payload["domains"] == []
+        assert payload["shared_paths"] == []
+        assert payload["count"] == 0
+        assert "errors" not in payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_ownership_degrades_on_malformed_registry(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    (s.dir / "domains.json").write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        assert payload["domains"] == []
+        assert payload["count"] == 0
+        assert payload["errors"]
+        _assert_no_body_keys(payload)
     finally:
         srv.shutdown()
         srv.server_close()

@@ -55,6 +55,12 @@ Routes
 - ``GET  /static/<name>``       — allowlisted console assets (css/js/png; 0.58.0/0.61.0)
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
 - ``GET  /api/attention``       — ranked "needs a human" queue for a selected root
+- ``GET  /api/gates``           — gate & evidence wall: every gate's status/
+  severity/evidence/waiver for a selected root
+- ``GET  /api/risk-register``   — client-legible relabel of the attention queue,
+  sorted by severity/age
+- ``GET  /api/ownership``       — full domain-ownership registry (owners/
+  reviewers/curators/shared-paths) for a selected root
 - ``GET  /api/learning``        — lesson ledger + pointer-only exposure telemetry
 - ``GET  /api/onboarding``      — project/codebase onboarding runs + evidence pointers
 - ``GET  /api/thread/<rid>``    — one thread's full transcript, CARRIES bodies (0.58.0)
@@ -86,7 +92,8 @@ message-derived HTML server-side and its client builds DOM via
 ``textContent`` only. The console CSS/JS ship as served files, so the console
 CSP drops ``'unsafe-inline'`` entirely (``script-src 'self'; style-src
 'self'``). Routes that render hostile message bodies (``/messages/<id>``) and
-every JSON feed (``/api/state``, ``/api/attention``, ``/api/learning``,
+every JSON feed (``/api/state``, ``/api/attention``, ``/api/gates``,
+``/api/risk-register``, ``/api/ownership``, ``/api/learning``,
 ``/api/onboarding``,
 ``/api/thread/<rid>``) keep the stricter no-script policy byte-identical.
 """
@@ -2765,6 +2772,320 @@ def _attention_prompt_excerpt(value: Any) -> str:
     return s
 
 
+# --------------------------------------------------- /api/gates (§4c)
+#
+# Gate & Evidence Wall, read side (docs/PROPOSAL-console-client-sellability.md
+# #1 - the "nothing is green without proof" screen). Every gate by scope as a
+# red/green/waived card, with the evidence behind a green and the reason/
+# expiry behind a waiver. READ-ONLY: wraps gates.check_gates's already-
+# computed status/severity/blocks/reason and merges each gate's raw evidence
+# list; today web.py only ever reads ``.get("blockers", [])`` for the
+# attention queue (§4a's ``_collect_web_attention_items``), discarding every
+# green/waived gate and the evidence/waiver detail entirely. No new data
+# capture, no writes - export (proposal #5) is explicitly out of scope here.
+
+_GATE_EVIDENCE_MAX_ENTRIES = 50
+_GATE_EVIDENCE_REFS_MAX = 20
+
+
+def _gate_evidence_entry(entry: Any) -> dict | None:
+    """Bound one raw gates.json evidence entry to safe fields (§4c). Evidence
+    entries are operator/CI-authored (``gates.set_gate``), not raw message
+    bodies, but every string is still capped like every other envelope field
+    - belt-and-braces against an oversized/binary value riding a JSON field
+    that was never meant to carry prose."""
+    if not isinstance(entry, dict):
+        return None
+    out: dict[str, Any] = {}
+    source = entry.get("source")
+    if isinstance(source, str):
+        out["source"] = _envelope_str(source)
+    refs = entry.get("refs")
+    if isinstance(refs, list):
+        out["refs"] = [
+            _envelope_str(r) for r in refs[:_GATE_EVIDENCE_REFS_MAX] if isinstance(r, str)
+        ]
+    at = entry.get("at")
+    if isinstance(at, str):
+        out["at"] = _envelope_str(at)
+    by = entry.get("by")
+    if isinstance(by, str):
+        out["by"] = _envelope_str(by)
+    for key, value in entry.items():
+        if key in ("source", "refs", "at", "by") or key in out:
+            continue
+        if isinstance(value, str):
+            out[key] = _envelope_str(value)
+        elif isinstance(value, (int, float, bool)) or value is None:
+            out[key] = value
+    return out
+
+
+def _gate_waiver_entry(waiver: Any) -> dict | None:
+    if not isinstance(waiver, dict):
+        return None
+    return {
+        "operator": _envelope_str(waiver.get("operator")),
+        "date": _envelope_str(waiver.get("date")),
+        "reason": _envelope_str(waiver.get("reason")),
+        "scope": _envelope_str(waiver.get("scope")),
+        "expires": _envelope_str(waiver.get("expires")),
+    }
+
+
+def build_gates(desc: RootDescriptor) -> dict:
+    """The /api/gates payload for one root (§4c). Envelope-only, GET-only,
+    read-only. Errors-as-data (parity with build_attention/build_state): a
+    corrupt or uninitialized root must NOT 500 this JSON route - it degrades
+    to a 200 body ``{"gates": [], "count": 0, "errors": ["<str(e)>"]}``.
+    """
+    store = desc.store
+    try:
+        from agenttalk import gates as _gates
+
+        checked = _gates.check_gates(store.root)
+        raw_state = _gates.load_gate_state(store.root)
+        raw_gates = raw_state.get("gates")
+        if not isinstance(raw_gates, dict):
+            raw_gates = {}
+        wire: list[dict] = []
+        for item in checked.get("gates", []):
+            name = item.get("name", "")
+            raw = raw_gates.get(name) if isinstance(name, str) else None
+            evidence_raw = raw.get("evidence") if isinstance(raw, dict) else None
+            evidence: list[dict] = []
+            if isinstance(evidence_raw, list):
+                for entry in evidence_raw[:_GATE_EVIDENCE_MAX_ENTRIES]:
+                    parsed = _gate_evidence_entry(entry)
+                    if parsed is not None:
+                        evidence.append(parsed)
+            wire.append({
+                "name": _envelope_str(name),
+                "status": _envelope_str(item.get("status") or "unknown"),
+                "severity": _envelope_str(item.get("severity") or "blocker"),
+                "scope": _envelope_str(item.get("scope") or "global"),
+                "blocks": bool(item.get("blocks")),
+                "reason": _envelope_str(item.get("reason") or ""),
+                "updated_at": _envelope_str(item.get("updated_at") or ""),
+                "updated_by": _envelope_str(item.get("updated_by") or ""),
+                "evidence": evidence,
+                "waiver": _gate_waiver_entry(item.get("waiver")),
+            })
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "verdict": checked.get("verdict", "HOLD"),
+            "required_gates": [
+                _envelope_str(n) for n in (checked.get("required_gates") or [])
+            ],
+            "gates": wire,
+            "count": len(wire),
+        }
+    except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "verdict": "HOLD",
+            "required_gates": [],
+            "gates": [],
+            "count": 0,
+            "errors": [str(e)],
+        }
+
+
+# --------------------------------------------------- /api/risk-register (§4e)
+#
+# Risk Register relabel (docs/PROPOSAL-console-client-sellability.md #6): the
+# SAME ranked queue /api/attention already computes (build_attention, §4a),
+# resorted by severity/age and relabeled with client-legible categories and an
+# owner column instead of the operator triage source tags. READ-ONLY, no new
+# data, no writes.
+#
+# v1 scope note: onboarding drift/unknown items are deliberately NOT folded in
+# here - the proposal's own effort note calls #6 "close to a relabeling
+# exercise" over fields the attention queue ALREADY computes; onboarding
+# findings are a distinct source (see /api/onboarding) with no severity/age/
+# owner shape today, so including them is a fast-follow, not this quick win.
+
+_RISK_CATEGORY_LABELS: dict[str, str] = {
+    "escalation": "Decision needed",
+    "supervisor": "Process health",
+    "gate": "Gate blocker",
+    "deadletter": "Delivery failure",
+    "coordination_stall": "Coordination risk",
+    "stuck": "Process health",
+}
+# severity stays the SAME "high"/"med"/"low" vocabulary /api/attention already
+# uses (not remapped to "medium") so the frontend can reuse the existing
+# SEV_COLOR/SEV_LABEL/.sev-<key> convention verbatim - this is a relabel of
+# category/sort, not a new severity vocabulary.
+_RISK_SEVERITY_ORDER = {"high": 0, "med": 1, "low": 2}
+
+
+def build_risk_register(desc: RootDescriptor) -> dict:
+    """The /api/risk-register payload for one root (§4e). Envelope-only,
+    GET-only, read-only. Errors-as-data (parity with build_attention): a
+    corrupt/uninitialized root degrades to a 200 body with ``items: []`` and
+    an ``errors`` list, never a 500."""
+    store = desc.store
+    now = datetime.now(timezone.utc)
+    try:
+        cfg = _safe_load_config(store)
+        roster = cfg.get("agents", []) or []
+        try:
+            for_agent = store.operator_facing() or store.sole_lead()
+        except Exception:  # noqa: BLE001 — a corrupt root can't resolve a liaison
+            for_agent = None
+        items = _collect_web_attention_items(store, roster, for_agent)
+        disps, _problems = _attention.read_dispositions(store)
+        queue = _attention.build_queue(items, disps,
+                                       now_iso=now.isoformat().replace("+00:00", "Z"))
+        risks: list[dict] = []
+        for it in queue.get("items", []):
+            src = it.get("source", "")
+            mapped = _ATTENTION_SOURCE_MAP.get(src)
+            if mapped is None:
+                continue  # unknown internal source — skip rather than mislabel
+            wire_source, _label, coarse_severity = mapped
+            risks.append({
+                "id": it.get("item_id", ""),
+                "category": wire_source,
+                "category_label": _RISK_CATEGORY_LABELS.get(wire_source, "Other"),
+                "severity": coarse_severity,
+                "title": _envelope_str(it.get("title") or "attention needed"),
+                "owner": _attention_agent(it),
+                "detail": _envelope_str(it.get("why_it_matters") or ""),
+                "age_seconds": float(it.get("age_seconds") or 0),
+                "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
+            })
+        try:
+            agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
+                                    for_agent)
+        except Exception:  # noqa: BLE001 — stuck items are best-effort
+            agents = []
+        for stuck in _derive_stuck_items(agents, now=now):
+            risks.append({
+                "id": stuck["id"],
+                "category": "stuck",
+                "category_label": _RISK_CATEGORY_LABELS["stuck"],
+                "severity": stuck.get("severity") or "low",
+                "title": _envelope_str(stuck.get("title") or ""),
+                "owner": stuck.get("agent"),
+                "detail": _envelope_str(stuck.get("detail") or ""),
+                "age_seconds": float(stuck.get("age_seconds") or 0),
+                "human_can_unblock_now": bool(stuck.get("human_can_unblock_now")),
+            })
+        risks.sort(key=lambda r: (_RISK_SEVERITY_ORDER.get(r["severity"], 3),
+                                  -r["age_seconds"]))
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "items": risks,
+            "count": len(risks),
+        }
+    except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "items": [],
+            "count": 0,
+            "errors": [str(e)],
+        }
+
+
+# --------------------------------------------------- /api/ownership (§4d)
+#
+# Ownership & Accountability Map (docs/PROPOSAL-console-client-sellability.md
+# #7): the full domain-ownership registry - which agent/team owns which part
+# of the codebase, which paths require shared sign-off - as its own view,
+# instead of the thin per-agent ``owned_domains`` slice /api/state already
+# carries (§3a's ``_owned_domains_map``, only names + globs, only visible on
+# a single agent's detail card). READ-ONLY: a straight read of domains.json
+# via the existing ``domains.load_registry``, no new data, no writes.
+
+def build_ownership(desc: RootDescriptor) -> dict:
+    """The /api/ownership payload for one root (§4d). Envelope-only,
+    GET-only, read-only. A missing registry is a valid empty state
+    (``domains.load_registry`` already returns ``empty_registry()``); a
+    MALFORMED registry degrades to a 200 body with ``domains: []`` and an
+    ``errors`` list, matching build_gates/build_attention's errors-as-data
+    contract rather than a 500."""
+    store = desc.store
+    try:
+        cfg = _safe_load_config(store)
+        try:
+            reg = _domains.load_registry(store.dir / _domains.FILENAME, cfg)
+        except _domains.DomainError as e:
+            return {
+                "root": desc.label,
+                "root_path": str(store.root),
+                "root_info": _root_info(desc),
+                "target_root_project_id": store.project_id(),
+                "domains": [],
+                "shared_paths": [],
+                "count": 0,
+                "errors": [str(e)],
+            }
+        data = reg.data
+        domains: list[dict] = []
+        for did, dentry in sorted((data.get("domains") or {}).items()):
+            if not isinstance(dentry, dict):
+                continue
+            domains.append({
+                "id": _envelope_str(did),
+                "title": _envelope_str(dentry.get("title") or did),
+                "owners": _domains.resolve_refset(dentry.get("owners") or {}, cfg),
+                "reviewers": _domains.resolve_refset(dentry.get("reviewers") or {}, cfg),
+                "curators": _domains.resolve_refset(dentry.get("curators") or {}, cfg),
+                "owned_globs": [
+                    _envelope_str(g) for g in (dentry.get("owned_globs") or [])
+                ],
+                "description": _envelope_str(dentry.get("description") or ""),
+            })
+        shared_paths: list[dict] = []
+        for entry in data.get("shared_paths") or []:
+            if not isinstance(entry, dict):
+                continue
+            shared_paths.append({
+                "glob": _envelope_str(entry.get("glob") or ""),
+                "category": _envelope_str(entry.get("category") or ""),
+                "requires": _envelope_str(entry.get("requires") or ""),
+                "default_reviewers": _domains.resolve_refset(
+                    entry.get("default_reviewers") or {}, cfg),
+                "default_approvers": _domains.resolve_refset(
+                    entry.get("default_approvers") or {}, cfg),
+                "description": _envelope_str(entry.get("description") or ""),
+            })
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "domains": domains,
+            "shared_paths": shared_paths,
+            "count": len(domains),
+        }
+    except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "domains": [],
+            "shared_paths": [],
+            "count": 0,
+            "errors": [str(e)],
+        }
+
+
 # ------------------------------------------------ /api/thread/<rid> (§4b)
 
 def _cli_from_prefix(name: str) -> str | None:
@@ -3835,6 +4156,34 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._send_json(HTTPStatus.OK,
                                 build_attention(root,
                                                 actions_enabled=enable_actions))
+                return
+            if path == "/api/gates":
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _root_index, root = selected
+                # Gate & Evidence Wall, read side (§4c). Envelope-only,
+                # read-only, strict _DEFAULT_CSP (JSON is not executed).
+                self._send_json(HTTPStatus.OK, build_gates(root))
+                return
+            if path == "/api/risk-register":
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _root_index, root = selected
+                # Client-legible relabel of the /api/attention queue (§4e).
+                self._send_json(HTTPStatus.OK, build_risk_register(root))
+                return
+            if path == "/api/ownership":
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _root_index, root = selected
+                # Ownership & Accountability Map (§4d).
+                self._send_json(HTTPStatus.OK, build_ownership(root))
                 return
             if path == "/api/learning":
                 # Lessons + wrapper exposure telemetry for the selected root.

@@ -1220,6 +1220,94 @@ body {
 .sev-med  { color: var(--warn); background: var(--warn-soft); }
 .sev-low  { color: var(--chip-neutral); background: var(--chip-neutral-bg); }
 
+/* Secondary section heading (e.g. "Shared paths" under Ownership). */
+.tc-h2 {
+  margin: 22px 0 10px;
+  font-family: var(--font-head);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+/* Gate & Evidence Wall (§4c) + Ownership & Accountability Map (§4d) cards.
+   Both reuse the plain .tc-card shell with their own padding/left-bar accent,
+   the same pattern .tc-attn-card uses for the human queue. */
+.tc-gate-list, .tc-domain-list { display: flex; flex-direction: column; gap: 12px; }
+.tc-gate-card, .tc-domain-card {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tc-gate-card.gate-green  { box-shadow: inset 3px 0 0 var(--ok), 0 1px 2px var(--shadow); }
+.tc-gate-card.gate-red    { box-shadow: inset 3px 0 0 var(--danger), 0 1px 2px var(--shadow); }
+.tc-gate-card.gate-waived { box-shadow: inset 3px 0 0 var(--violet), 0 1px 2px var(--shadow); }
+.tc-gate-card.gate-unknown,
+.tc-gate-card.gate-skipped { box-shadow: inset 3px 0 0 var(--gray), 0 1px 2px var(--shadow); }
+
+.tc-gate-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.tc-gate-name { font-size: 14.5px; font-weight: 500; color: var(--ink); }
+.tc-gate-scope, .tc-gate-severity {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink4);
+  text-transform: uppercase;
+  letter-spacing: .02em;
+}
+.tc-chip.gate-green   { color: var(--ok); background: var(--ok-soft); }
+.tc-chip.gate-red      { color: var(--danger); background: var(--danger-soft); }
+.tc-chip.gate-waived   { color: var(--violet); background: var(--violet-soft); }
+.tc-chip.gate-unknown,
+.tc-chip.gate-skipped  { color: var(--chip-neutral); background: var(--chip-neutral-bg); }
+.tc-gate-verdict { font-family: var(--font-mono); font-weight: 600; }
+
+.tc-gate-reason { font-size: 12px; color: var(--ink3); }
+.tc-gate-updated { font-size: 11px; color: var(--ink4); margin-top: 2px; }
+
+.tc-gate-waiver {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--inset);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.tc-gate-waiver-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--violet);
+}
+.tc-gate-waiver-line { font-size: 12px; color: var(--ink2); }
+
+.tc-gate-evidence { display: flex; flex-direction: column; gap: 3px; }
+.tc-gate-evidence-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--ink4);
+}
+.tc-gate-evidence-row { font-size: 12px; color: var(--ink2); }
+.tc-gate-evidence-refs {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink3);
+  overflow-wrap: anywhere;
+}
+
+.tc-domain-line { font-size: 12.5px; color: var(--ink2); }
+.tc-domain-globs {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink3);
+  overflow-wrap: anywhere;
+}
+
 /* Empty "All clear" state */
 .tc-empty {
   background: var(--surface);
