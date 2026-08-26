@@ -2822,6 +2822,139 @@ assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative 
                    capture_output=True, text=True)
 
 
+def test_console_gate_card_expired_waiver_renders_as_blocking(tmp_path: Path) -> None:
+    """review rq-a7038d8175f2 finding 2: gates.check_gates keeps
+    status='waived' for an EXPIRED blocker waiver but sets blocks=True (reason
+    'waiver expired or invalid'). A populated Gates view render must show that
+    as blocking (red/expired), not the calm purple 'WAIVED' card a still-valid
+    waiver gets - a shape-only JSON test cannot catch a frontend styling bug,
+    so this actually renders renderGates()/gateCard() and inspects the DOM."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the gate-card render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkGatesTestHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, gates) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      gatesData = gates;\n"
+        "      state.view = 'gates';\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-gates.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    className: '',
+    textContent: '',
+    attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    // renderActiveView() unconditionally calls snapshotScroll/restoreScroll,
+    // which do root.querySelector(<inner-scroller selector>) - a no-match
+    // stub is enough, this test does not exercise scroll preservation.
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function findAllByClass(node, cls, out) {
+  if (hasClass(node, cls)) out.push(node);
+  for (const child of node.children || []) findAllByClass(child, cls, out);
+  return out;
+}
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += ' ' + collectText(child);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading',
+  createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {},
+  getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkGatesTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkGatesTestHooks;
+
+hooks.setup(
+  { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] },
+  {
+    root: 'demo', verdict: 'HOLD', required_gates: ['security-scan'],
+    gates: [{
+      name: 'security-scan', status: 'waived', severity: 'blocker', scope: 'release',
+      blocks: true, reason: 'waiver expired or invalid',
+      updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha',
+      evidence: [],
+      waiver: {
+        operator: 'alpha', date: '2025-01-01T00:00:00Z',
+        reason: 'scanner unavailable', scope: 'release',
+        expires: '2025-06-01T00:00:00Z',
+      },
+    }],
+    count: 1,
+  },
+);
+hooks.renderActiveView();
+
+const cards = findAllByClass(main, 'tc-gate-card', []);
+assert(cards.length === 1, 'expected exactly one gate card');
+const card = cards[0];
+assert(hasClass(card, 'gate-waived_expired'),
+  `expired blocker waiver must render gate-waived_expired, got class=${card.className}`);
+assert(!hasClass(card, 'gate-waived'),
+  'expired blocker waiver must NOT carry the calm gate-waived class');
+const text = collectText(card);
+assert(text.includes('WAIVED (EXPIRED)'),
+  `expected the expired-waiver label in the card, got: ${text}`);
+assert(text.includes('Waiver expired'),
+  `expected the waiver box to say it is expired, got: ${text}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def test_console_all_dashboard_views_render_smoke_non_empty_main(tmp_path: Path) -> None:
     if shutil.which("node") is None:
         pytest.skip("node is required for console all-views render smoke test")
@@ -6426,6 +6559,87 @@ def test_api_risk_register_shape_and_sorted_by_severity_then_age(
         srv.server_close()
 
 
+def test_api_risk_register_uses_typed_risk_severity_over_source_default(
+    tmp_path: Path,
+) -> None:
+    """review rq-a7038d8175f2 finding 1: an escalation's OWN typed
+    risk_severity must win over the coarse per-source default. The shape test
+    above only covers a gate + dead letter, where source and risk happen to
+    align (both land on the coarse default because neither source sets a
+    typed risk_severity) - this test forces them to DIVERGE."""
+    s = _make_store(tmp_path)
+    s.set_operator_facing("beta")
+    s.send(sender="alpha", recipient="beta", kind="question", body="?",
+           subject="operator input needed",
+           meta={"request_id": "esc-low-risk", "needs_operator": "true",
+                 "attention": {"decision": "Pick a font",
+                               "risk_severity": "low", "confidence": "high"}})
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        item = next(it for it in payload["items"] if it["category"] == "escalation")
+        assert item["severity"] == "low", (
+            "typed risk_severity=low must not be overridden by the coarse "
+            f"escalation source default (high): {item}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_includes_open_onboarding_drift_and_unknown(
+    tmp_path: Path,
+) -> None:
+    """review rq-a7038d8175f2 finding 3: docs/PROPOSAL-console-client-sellability.md:105-112
+    defines item #6's risk register as covering "stalled agent, dead letter,
+    gate blocker, open onboarding drift/unknown" - onboarding findings were
+    omitted. A RESOLVED drift/unknown record must NOT surface (only open
+    ones are risks)."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="repo scan", objective="map the codebase",
+        base_ref="main", lead="alpha", state="scanning",
+        at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-1", status="open",
+        summary="docs say X, code does Y", actor="alpha", owner="beta",
+        blocking=True, at="2026-01-01T00:05:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_UNKNOWN, key="unknown-1", status="open",
+        summary="unclear retry policy", actor="alpha", blocking=False,
+        at="2026-01-01T00:10:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-resolved", status="resolved",
+        summary="already fixed", actor="alpha", blocking=True,
+        at="2026-01-01T00:15:00Z"))
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        by_category = {}
+        for it in payload["items"]:
+            by_category.setdefault(it["category"], []).append(it)
+
+        drift_items = by_category.get("onboarding_drift", [])
+        assert len(drift_items) == 1, (
+            f"expected exactly the OPEN drift record, not the resolved one: {payload['items']}")
+        assert drift_items[0]["category_label"] == "Doc/code drift"
+        assert drift_items[0]["severity"] == "high"  # blocking=True
+        assert drift_items[0]["owner"] == "beta"
+        assert drift_items[0]["title"] == "docs say X, code does Y"
+
+        unknown_items = by_category.get("onboarding_unknown", [])
+        assert len(unknown_items) == 1
+        assert unknown_items[0]["category_label"] == "Open unknown"
+        assert unknown_items[0]["severity"] == "med"  # blocking=False
+        assert unknown_items[0]["owner"] == "alpha"  # falls back to actor
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_risk_register_degrades_on_corrupt_root(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     cfg_path = s.dir / "config.json"
@@ -6438,7 +6652,8 @@ def test_api_risk_register_degrades_on_corrupt_root(tmp_path: Path) -> None:
         _assert_no_body_keys(payload)
         assert payload["items"] == [] or all(
             it["category"] in ("escalation", "supervisor", "gate", "deadletter",
-                               "coordination_stall", "stuck")
+                               "coordination_stall", "stuck", "onboarding_drift",
+                               "onboarding_unknown")
             for it in payload["items"]
         )
     finally:

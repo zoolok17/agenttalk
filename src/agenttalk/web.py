@@ -2902,14 +2902,11 @@ def build_gates(desc: RootDescriptor) -> dict:
 # Risk Register relabel (docs/PROPOSAL-console-client-sellability.md #6): the
 # SAME ranked queue /api/attention already computes (build_attention, §4a),
 # resorted by severity/age and relabeled with client-legible categories and an
-# owner column instead of the operator triage source tags. READ-ONLY, no new
-# data, no writes.
-#
-# v1 scope note: onboarding drift/unknown items are deliberately NOT folded in
-# here - the proposal's own effort note calls #6 "close to a relabeling
-# exercise" over fields the attention queue ALREADY computes; onboarding
-# findings are a distinct source (see /api/onboarding) with no severity/age/
-# owner shape today, so including them is a fast-follow, not this quick win.
+# owner column instead of the operator triage source tags, PLUS open
+# onboarding drift/unknown findings (the proposal's #6 body explicitly lists
+# "open onboarding drift/unknown" alongside stalled agent/dead letter/gate
+# blocker - review rq-a7038d8175f2 finding 3). READ-ONLY, no new data, no
+# writes.
 
 _RISK_CATEGORY_LABELS: dict[str, str] = {
     "escalation": "Decision needed",
@@ -2918,12 +2915,20 @@ _RISK_CATEGORY_LABELS: dict[str, str] = {
     "deadletter": "Delivery failure",
     "coordination_stall": "Coordination risk",
     "stuck": "Process health",
+    "onboarding_drift": "Doc/code drift",
+    "onboarding_unknown": "Open unknown",
 }
 # severity stays the SAME "high"/"med"/"low" vocabulary /api/attention already
 # uses (not remapped to "medium") so the frontend can reuse the existing
 # SEV_COLOR/SEV_LABEL/.sev-<key> convention verbatim - this is a relabel of
 # category/sort, not a new severity vocabulary.
 _RISK_SEVERITY_ORDER = {"high": 0, "med": 1, "low": 2}
+# attention.py's typed meta.attention risk_severity vocabulary is "low" /
+# "medium" / "high" (RISK_LEVELS) - distinct spelling from the wire's "med".
+# "unknown" (the _mk_item default when a source never set it) intentionally
+# has NO entry here, so an untyped item falls through to the coarse
+# per-source severity below rather than silently becoming "low".
+_RISK_SEVERITY_FROM_TYPED = {"high": "high", "medium": "med", "low": "low"}
 
 
 def build_risk_register(desc: RootDescriptor) -> dict:
@@ -2951,11 +2956,18 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             if mapped is None:
                 continue  # unknown internal source — skip rather than mislabel
             wire_source, _label, coarse_severity = mapped
+            # Prefer the item's OWN typed risk assessment (an operator-authored
+            # escalation's meta.attention.risk_severity) over the coarse
+            # per-source default - a low-risk escalation must not be forced to
+            # "high" just because escalations are high-severity on average
+            # (review rq-a7038d8175f2 finding 1).
+            severity = _RISK_SEVERITY_FROM_TYPED.get(
+                it.get("risk_severity"), coarse_severity)
             risks.append({
                 "id": it.get("item_id", ""),
                 "category": wire_source,
                 "category_label": _RISK_CATEGORY_LABELS.get(wire_source, "Other"),
-                "severity": coarse_severity,
+                "severity": severity,
                 "title": _envelope_str(it.get("title") or "attention needed"),
                 "owner": _attention_agent(it),
                 "detail": _envelope_str(it.get("why_it_matters") or ""),
@@ -2979,6 +2991,33 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 "age_seconds": float(stuck.get("age_seconds") or 0),
                 "human_can_unblock_now": bool(stuck.get("human_can_unblock_now")),
             })
+        try:
+            onboarding = build_onboarding(desc)
+            for run in onboarding.get("runs") or []:
+                run_records = run.get("records") or {}
+                for kind, category in (
+                    ("drift", "onboarding_drift"),
+                    ("unknown", "onboarding_unknown"),
+                ):
+                    for rec in run_records.get(kind) or []:
+                        if rec.get("status") != "open":
+                            continue
+                        age = _age_seconds_of(rec.get("updated_at"), now=now)
+                        blocking = bool(rec.get("blocking"))
+                        risks.append({
+                            "id": f"onboarding:{run.get('run_id')}:{kind}:{rec.get('key')}",
+                            "category": category,
+                            "category_label": _RISK_CATEGORY_LABELS[category],
+                            "severity": "high" if blocking else "med",
+                            "title": _envelope_str(
+                                rec.get("summary") or f"{kind}: {rec.get('key')}"),
+                            "owner": (rec.get("owner") or rec.get("actor")) or None,
+                            "detail": _envelope_str(run.get("title") or ""),
+                            "age_seconds": age if age is not None else 0.0,
+                            "human_can_unblock_now": blocking,
+                        })
+        except Exception:  # noqa: BLE001, S110 — onboarding risk items are best-effort  # nosec B110
+            pass
         risks.sort(key=lambda r: (_RISK_SEVERITY_ORDER.get(r["severity"], 3),
                                   -r["age_seconds"]))
         return {

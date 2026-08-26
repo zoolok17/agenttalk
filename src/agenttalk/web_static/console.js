@@ -2098,7 +2098,17 @@
   // waiver}], count, errors?}.
   var GATE_STATUS_LABEL = nullMap({
     green: 'GREEN', red: 'RED', waived: 'WAIVED', unknown: 'UNKNOWN', skipped: 'SKIPPED',
+    waived_expired: 'WAIVED (EXPIRED)',
   });
+  // A waiver that no longer covers the gate (gates._gate_verdict: status stays
+  // "waived" but blocks=true, reason="waiver expired or invalid") must NOT
+  // read as the calm purple "WAIVED" state - it is back to blocking (review
+  // rq-a7038d8175f2 finding 2). This is the one place status alone is not
+  // enough; every other card/chip class keys off gate.status directly.
+  function gateVisualState(gate) {
+    if (gate.status === 'waived' && gate.blocks) return 'waived_expired';
+    return gate.status || 'unknown';
+  }
 
   function renderGates(main, root) {
     var wrap = el('div', 'tc-gates');
@@ -2134,11 +2144,12 @@
   }
 
   function gateCard(gate) {
-    var card = el('div', 'tc-card tc-gate-card gate-' + (gate.status || 'unknown'));
+    var visual = gateVisualState(gate);
+    var card = el('div', 'tc-card tc-gate-card gate-' + visual);
     var head = el('div', 'tc-gate-head');
     head.appendChild(el('span', 'tc-gate-name', gate.name || ''));
-    head.appendChild(titled(el('span', 'tc-chip gate-' + (gate.status || 'unknown'),
-      GATE_STATUS_LABEL[gate.status] || (gate.status || '').toUpperCase()),
+    head.appendChild(titled(el('span', 'tc-chip gate-' + visual,
+      GATE_STATUS_LABEL[visual] || (gate.status || '').toUpperCase()),
       gate.blocks ? 'This gate is blocking' : 'Not currently blocking'));
     head.appendChild(el('span', 'tc-gate-scope', gate.scope || 'global'));
     head.appendChild(el('span', 'tc-gate-severity', gate.severity || ''));
@@ -2148,8 +2159,10 @@
 
     if (gate.waiver) {
       var w = gate.waiver;
-      var waiverBox = el('div', 'tc-gate-waiver');
-      waiverBox.appendChild(el('div', 'tc-gate-waiver-title', 'Waived'));
+      var expired = visual === 'waived_expired';
+      var waiverBox = el('div', 'tc-gate-waiver' + (expired ? ' is-expired' : ''));
+      waiverBox.appendChild(el('div', 'tc-gate-waiver-title',
+        expired ? 'Waiver expired — blocking' : 'Waived'));
       waiverBox.appendChild(el('div', 'tc-gate-waiver-line',
         (w.operator ? w.operator + ' — ' : '') + (w.reason || '')));
       if (w.expires) waiverBox.appendChild(el('div', 'tc-gate-waiver-line', 'Expires ' + w.expires));

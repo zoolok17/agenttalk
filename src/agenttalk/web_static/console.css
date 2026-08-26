@@ -1240,7 +1240,8 @@ body {
   gap: 6px;
 }
 .tc-gate-card.gate-green  { box-shadow: inset 3px 0 0 var(--ok), 0 1px 2px var(--shadow); }
-.tc-gate-card.gate-red    { box-shadow: inset 3px 0 0 var(--danger), 0 1px 2px var(--shadow); }
+.tc-gate-card.gate-red,
+.tc-gate-card.gate-waived_expired { box-shadow: inset 3px 0 0 var(--danger), 0 1px 2px var(--shadow); }
 .tc-gate-card.gate-waived { box-shadow: inset 3px 0 0 var(--violet), 0 1px 2px var(--shadow); }
 .tc-gate-card.gate-unknown,
 .tc-gate-card.gate-skipped { box-shadow: inset 3px 0 0 var(--gray), 0 1px 2px var(--shadow); }
@@ -1255,7 +1256,8 @@ body {
   letter-spacing: .02em;
 }
 .tc-chip.gate-green   { color: var(--ok); background: var(--ok-soft); }
-.tc-chip.gate-red      { color: var(--danger); background: var(--danger-soft); }
+.tc-chip.gate-red,
+.tc-chip.gate-waived_expired { color: var(--danger); background: var(--danger-soft); }
 .tc-chip.gate-waived   { color: var(--violet); background: var(--violet-soft); }
 .tc-chip.gate-unknown,
 .tc-chip.gate-skipped  { color: var(--chip-neutral); background: var(--chip-neutral-bg); }
@@ -1281,6 +1283,10 @@ body {
   text-transform: uppercase;
   color: var(--violet);
 }
+/* An EXPIRED waiver is back to blocking - it must read as danger, not the
+   calm purple "still covered" waiver color (review rq-a7038d8175f2 #2). */
+.tc-gate-waiver.is-expired { border-color: var(--danger); }
+.tc-gate-waiver.is-expired .tc-gate-waiver-title { color: var(--danger); }
 .tc-gate-waiver-line { font-size: 12px; color: var(--ink2); }
 
 .tc-gate-evidence { display: flex; flex-direction: column; gap: 3px; }
