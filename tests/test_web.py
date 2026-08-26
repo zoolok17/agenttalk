@@ -6640,6 +6640,47 @@ def test_api_risk_register_includes_open_onboarding_drift_and_unknown(
         srv.server_close()
 
 
+def test_api_risk_register_onboarding_not_truncated_by_dashboard_run_limit(
+    tmp_path: Path,
+) -> None:
+    """review rq-4ecf94c4f814 finding 1: build_onboarding's dashboard
+    presentation cap (_ONBOARDING_DEFAULT_LIMIT=50 newest-first runs) must
+    NOT silently drop an older run's open finding from the risk register -
+    "each open item" (proposal §3 #6) has no recency cutoff. Reproduces the
+    reviewer's 51-run repro: the OLDEST run carries the one open, blocking
+    drift; 50 strictly newer runs carry nothing open, so a naive 50-run cap
+    would push the victim run's open finding out of the window."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    victim_run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=victim_run_id, title="oldest scan", objective="map it",
+        base_ref="main", lead="alpha", state="scanning",
+        at="2020-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=victim_run_id, kind=ob.KIND_DRIFT, key="old-drift", status="open",
+        summary="an old unresolved drift", actor="alpha", owner="beta",
+        blocking=True, at="2020-01-01T00:05:00Z"))
+    for i in range(50):
+        run_id = ob.new_run_id()
+        ob.create_run(s, ob.new_create_event(
+            run_id=run_id, title=f"newer scan {i}", objective="map it",
+            base_ref="main", lead="alpha", state="scanning",
+            at=f"2026-01-{(i % 28) + 1:02d}T00:00:00Z"))
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        drift_items = [it for it in payload["items"] if it["category"] == "onboarding_drift"]
+        assert len(drift_items) == 1, (
+            "the older run's open drift must not be truncated by the dashboard's "
+            f"50-run presentation cap: {payload['items']}")
+        assert drift_items[0]["title"] == "an old unresolved drift"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_risk_register_degrades_on_corrupt_root(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     cfg_path = s.dir / "config.json"

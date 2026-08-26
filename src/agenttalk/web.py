@@ -2992,27 +2992,37 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 "human_can_unblock_now": bool(stuck.get("human_can_unblock_now")),
             })
         try:
-            onboarding = build_onboarding(desc)
-            for run in onboarding.get("runs") or []:
+            # limit=None, NOT build_onboarding(desc) - that helper caps at
+            # _ONBOARDING_DEFAULT_LIMIT (50) newest-first runs for the
+            # Onboarding VIEW's presentation payload. A risk register must
+            # source "each open item" (proposal §3 #6) without that cap: an
+            # older unresolved drift/unknown must not silently vanish once
+            # 50 newer runs exist (review rq-4ecf94c4f814 finding 1).
+            all_runs = _onboarding.list_runs(store, limit=None).get("runs") or []
+            for run in all_runs:
                 run_records = run.get("records") or {}
+                run_id = _onboarding_short(run.get("run_id") or run.get("id"), limit=96)
+                run_title = _onboarding_short(run.get("title"), limit=240)
                 for kind, category in (
-                    ("drift", "onboarding_drift"),
-                    ("unknown", "onboarding_unknown"),
+                    (_onboarding.KIND_DRIFT, "onboarding_drift"),
+                    (_onboarding.KIND_UNKNOWN, "onboarding_unknown"),
                 ):
                     for rec in run_records.get(kind) or []:
-                        if rec.get("status") != "open":
+                        if not isinstance(rec, dict) or rec.get("status") != "open":
                             continue
                         age = _age_seconds_of(rec.get("updated_at"), now=now)
                         blocking = bool(rec.get("blocking"))
+                        owner = rec.get("owner") or rec.get("actor") or None
                         risks.append({
-                            "id": f"onboarding:{run.get('run_id')}:{kind}:{rec.get('key')}",
+                            "id": f"onboarding:{run_id}:{kind}:"
+                                  f"{_onboarding_short(rec.get('key'), limit=128)}",
                             "category": category,
                             "category_label": _RISK_CATEGORY_LABELS[category],
                             "severity": "high" if blocking else "med",
                             "title": _envelope_str(
                                 rec.get("summary") or f"{kind}: {rec.get('key')}"),
-                            "owner": (rec.get("owner") or rec.get("actor")) or None,
-                            "detail": _envelope_str(run.get("title") or ""),
+                            "owner": _onboarding_short(owner, limit=96) if owner else None,
+                            "detail": run_title,
                             "age_seconds": age if age is not None else 0.0,
                             "human_can_unblock_now": blocking,
                         })
