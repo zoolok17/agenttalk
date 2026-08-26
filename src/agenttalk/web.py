@@ -55,6 +55,12 @@ Routes
 - ``GET  /static/<name>``       — allowlisted console assets (css/js/png; 0.58.0/0.61.0)
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
 - ``GET  /api/attention``       — ranked "needs a human" queue for a selected root
+- ``GET  /api/gates``           — gate & evidence wall: every gate's status/
+  severity/evidence/waiver for a selected root
+- ``GET  /api/risk-register``   — client-legible relabel of the attention queue,
+  sorted by severity/age
+- ``GET  /api/ownership``       — full domain-ownership registry (owners/
+  reviewers/curators/shared-paths) for a selected root
 - ``GET  /api/learning``        — lesson ledger + pointer-only exposure telemetry
 - ``GET  /api/onboarding``      — project/codebase onboarding runs + evidence pointers
 - ``GET  /api/thread/<rid>``    — one thread's full transcript, CARRIES bodies (0.58.0)
@@ -86,7 +92,8 @@ message-derived HTML server-side and its client builds DOM via
 ``textContent`` only. The console CSS/JS ship as served files, so the console
 CSP drops ``'unsafe-inline'`` entirely (``script-src 'self'; style-src
 'self'``). Routes that render hostile message bodies (``/messages/<id>``) and
-every JSON feed (``/api/state``, ``/api/attention``, ``/api/learning``,
+every JSON feed (``/api/state``, ``/api/attention``, ``/api/gates``,
+``/api/risk-register``, ``/api/ownership``, ``/api/learning``,
 ``/api/onboarding``,
 ``/api/thread/<rid>``) keep the stricter no-script policy byte-identical.
 """
@@ -98,6 +105,7 @@ import html
 import hmac
 import ipaddress
 import json
+import math
 import re
 import secrets
 import socket
@@ -1717,8 +1725,15 @@ def build_state(roots: list[RootDescriptor],
                 *, history: "HealthTimelineRing | None" = None) -> dict:
     """The /api/state aggregate (data-model.md, schema v1).
 
-    ``generated_at`` is informational only — message ids remain the
-    bus's sole ordering primitive.
+    ``generated_at`` is NOT purely informational: message ids remain the
+    bus's sole ordering primitive, but the console's ``stampStatePayload``
+    now also uses this field as its client-side clock/freshness anchor
+    (``stateFresh`` et al.). It is stamped BEFORE the ``[_root_state(d,
+    history) for d in roots]`` scan below, so under a slow scan it can lag
+    the payload it's attached to by however long that scan takes - a known,
+    accepted limitation (PR #129 connector round-5, banked as a fast-follow
+    rather than fixed here: moving the stamp after the scan, or per-root
+    stamping, is new machinery out of this round's bounded scope).
 
     PURE by default: ``history`` is None unless the /api/state route handler
     passes the server's in-memory ring, so every unit/perf test that calls
@@ -2417,12 +2432,18 @@ def _collect_web_attention_items(store: Store, roster: list[str],
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
     try:
-        items += A.dead_letter_items(store.list_dead_letters())
+        # now_epoch (PR #129 connector finding): derive real age_seconds
+        # from each entry's own deadlettered_at instead of leaving every
+        # dead letter reading as freshly-created.
+        items += A.dead_letter_items(store.list_dead_letters(), now_epoch=time.time())
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("dead_letter", str(e)))
     try:
         from agenttalk import gates as _gates
-        items += A.gate_hold_items(_gates.check_gates(store.root).get("blockers", []))
+        # now_epoch (PR #129 connector finding): derive real age_seconds
+        # from each blocker's own updated_at, same rationale as above.
+        items += A.gate_hold_items(_gates.check_gates(store.root).get("blockers", []),
+                                   now_epoch=time.time())
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("gate_hold", str(e)))
     try:
@@ -2510,6 +2531,12 @@ def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
             continue
         name = a.get("name")
         age = a.get("last_seen_age_seconds")
+        # PR #129 connector round-5 (web.py:3166): a missing last_seen used to
+        # be silently reported as age_seconds=0.0 with no signal that the age
+        # was never known - same conflation _age_seconds_from_iso was fixed
+        # for. Route through the same age_unknown convention so the register
+        # sorts this item as MOST urgent (inf) instead of as "just happened".
+        age_known = isinstance(age, (int, float))
         stuck.append({
             "id": f"stuck:{name}",
             "source": "stuck",
@@ -2518,7 +2545,8 @@ def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
             "title": f"{name} {title_suffix}",
             "agent": name,
             "detail": detail,
-            "age_seconds": float(age) if isinstance(age, (int, float)) else 0.0,
+            "age_seconds": float(age) if age_known else 0.0,
+            "age_unknown": not age_known,
             "human_can_unblock_now": True,
         })
     return stuck
@@ -2734,6 +2762,29 @@ def _envelope_str(value: Any) -> str:
     return s
 
 
+# A glob is matching SYNTAX, not prose: truncating one at _ENVELOPE_MAX can
+# silently change which paths it matches, or make two DISTINCT ownership
+# globs display identically (PR #129 connector finding, web.py:3183). Bound
+# it much more generously - effectively lossless for any realistic
+# repo-relative pattern - while still capping a corrupted/pathological value.
+# PR #129 connector round-2 (web.py:2763, folds in reviewer-3 F-5): raising
+# the cap from _ENVELOPE_MAX to this alone just MOVES the same silent-
+# truncation threshold rather than removing it - a >4096-char glob would
+# still be silently altered. _glob_str now returns whether it truncated so
+# the caller can expose that explicitly instead of claiming losslessness it
+# cannot guarantee.
+_GLOB_MAX = 4096
+
+
+def _glob_str(value: Any) -> tuple[str, bool]:
+    """Returns ``(bounded_glob, truncated)``."""
+    s = "" if value is None else str(value)
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    if len(s) > _GLOB_MAX:
+        return s[:_GLOB_MAX], True
+    return s, False
+
+
 def _operator_command_str(value: Any) -> str:
     """Return one complete, bounded operator command without body-like text."""
     if not isinstance(value, str):
@@ -2763,6 +2814,603 @@ def _attention_prompt_excerpt(value: Any) -> str:
     if len(s) > _ATTENTION_PROMPT_MAX:
         s = s[: _ATTENTION_PROMPT_MAX - 3].rstrip() + "..."
     return s
+
+
+# --------------------------------------------------- /api/gates (§4c)
+#
+# Gate & Evidence Wall, read side (docs/PROPOSAL-console-client-sellability.md
+# #1 - the "nothing is green without proof" screen). Every gate by scope as a
+# red/green/waived card, with the evidence behind a green and the reason/
+# expiry behind a waiver. READ-ONLY: wraps gates.check_gates's already-
+# computed status/severity/blocks/reason and merges each gate's raw evidence
+# list; today web.py only ever reads ``.get("blockers", [])`` for the
+# attention queue (§4a's ``_collect_web_attention_items``), discarding every
+# green/waived gate and the evidence/waiver detail entirely. No new data
+# capture, no writes - export (proposal #5) is explicitly out of scope here.
+
+_GATE_EVIDENCE_MAX_ENTRIES = 50
+_GATE_EVIDENCE_REFS_MAX = 20
+_GATE_EVIDENCE_EXTRA_KEYS_MAX = 20
+_GATE_EVIDENCE_KEY_MAX = 64
+
+
+def _gate_evidence_entry(entry: Any) -> dict | None:
+    """Bound one raw gates.json evidence entry to safe fields (§4c). Evidence
+    entries are operator/CI-authored (``gates.set_gate``), not raw message
+    bodies, but every string is still capped like every other envelope field
+    - belt-and-braces against an oversized/binary value riding a JSON field
+    that was never meant to carry prose."""
+    if not isinstance(entry, dict):
+        return None
+    out: dict[str, Any] = {}
+    source = entry.get("source")
+    if isinstance(source, str):
+        out["source"] = _envelope_str(source)
+    refs = entry.get("refs")
+    if isinstance(refs, list):
+        window = refs[:_GATE_EVIDENCE_REFS_MAX]
+        # PR #129 connector round-2 finding (P1, web.py:2832): a green
+        # blocker gate's VALIDATING ref could sit past position 20 and be
+        # silently cut, presenting the gate as green with only empty/
+        # non-validating refs visible. Preserving every ref isn't safe
+        # (unbounded), so expose the cut count instead - the wall can no
+        # longer imply it received the complete proof without saying so.
+        refs_truncated = max(0, len(refs) - _GATE_EVIDENCE_REFS_MAX)
+        ref_strs: list[str] = []
+        ref_text_truncated = 0
+        for r in window:
+            if not isinstance(r, str):
+                # reviewer-3 F-2: a non-str ref inside the window used to be
+                # dropped by the `isinstance` filter without counting toward
+                # refs_truncated - same shape as evidence_truncated's F-3 fix
+                # for parse-failed evidence entries, applied here too.
+                refs_truncated += 1
+                continue
+            # PR #129 connector round-5 (web.py:2839): a >300-char ref (e.g.
+            # a long evidence URL) was silently cut mid-string by
+            # _envelope_str into a different, unusable string with no signal
+            # that it happened - flag it the same way _glob_str flags a
+            # truncated glob instead of hiding it.
+            normalized = r.replace("\r", " ").replace("\n", " ").strip()
+            if len(normalized) > _ENVELOPE_MAX:
+                ref_text_truncated += 1
+            ref_strs.append(_envelope_str(r))
+        out["refs"] = ref_strs
+        if refs_truncated:
+            out["refs_truncated"] = refs_truncated
+        if ref_text_truncated:
+            out["ref_text_truncated"] = ref_text_truncated
+    at = entry.get("at")
+    if isinstance(at, str):
+        out["at"] = _envelope_str(at)
+    by = entry.get("by")
+    if isinstance(by, str):
+        out["by"] = _envelope_str(by)
+    # F-2 (review rq-093f956dd595): every OTHER key from gates.json's
+    # operator-defined evidence_details passes through too - gates.py leaves
+    # that schema open by design (coverage_percent, pr_url, ...), so a closed
+    # field list isn't viable here. Bound the KEY the same way every value is
+    # already bounded, and cap how many extra keys ride one entry (entries
+    # themselves are already capped at _GATE_EVIDENCE_MAX_ENTRIES).
+    #
+    # R-1 (review rq-e05589aa3c80, follow-up on F-2): the reserved-name and
+    # duplicate check MUST run on the bounded key, not the raw one - a raw
+    # key like "source " (trailing space) or two long keys sharing the same
+    # 64-char prefix are DISTINCT raw keys but collide once bounded, and
+    # checking the raw key let a collision silently overwrite an
+    # already-populated field (the canonical "source" in the first case).
+    # Skip on collision (first write wins) rather than overwrite.
+    extra_keys = 0
+    for key, value in entry.items():
+        if not isinstance(key, str) or extra_keys >= _GATE_EVIDENCE_EXTRA_KEYS_MAX:
+            continue
+        bounded_key = _envelope_str(key)[:_GATE_EVIDENCE_KEY_MAX]
+        if not bounded_key or bounded_key in ("source", "refs", "at", "by") or bounded_key in out:
+            continue
+        if isinstance(value, str):
+            out[bounded_key] = _envelope_str(value)
+        elif isinstance(value, float) and not math.isfinite(value):
+            # PR #129 connector finding (P2, web.py:2840): json.dumps
+            # (Python's loader too) accepts NaN/Infinity by default, but
+            # they are not valid per strict JSON - a browser's
+            # response.json() rejects them outright, which would fail the
+            # WHOLE /api/gates payload for one bad field instead of
+            # degrading just this entry. Never forward a non-finite float.
+            continue
+        elif isinstance(value, (int, float, bool)) or value is None:
+            out[bounded_key] = value
+        else:
+            continue
+        extra_keys += 1
+    return out
+
+
+def _gate_waiver_entry(waiver: Any) -> dict | None:
+    if not isinstance(waiver, dict):
+        return None
+    return {
+        "operator": _envelope_str(waiver.get("operator")),
+        "date": _envelope_str(waiver.get("date")),
+        "reason": _envelope_str(waiver.get("reason")),
+        "scope": _envelope_str(waiver.get("scope")),
+        "expires": _envelope_str(waiver.get("expires")),
+    }
+
+
+def build_gates(desc: RootDescriptor) -> dict:
+    """The /api/gates payload for one root (§4c). Envelope-only, GET-only,
+    read-only. Errors-as-data (parity with build_attention/build_state): a
+    corrupt or uninitialized root must NOT 500 this JSON route - it degrades
+    to a 200 body ``{"gates": [], "count": 0, "errors": ["<str(e)>"]}``.
+    """
+    store = desc.store
+    try:
+        from agenttalk import gates as _gates
+
+        # PR #129 connector round-2 finding (P2, web.py:2901): check_gates()
+        # and load_gate_state() used to be TWO separate reads - a set_gate()
+        # commit landing between them could combine the verdict/status from
+        # the FIRST snapshot with evidence/waiver data from the SECOND
+        # (green beside proof that didn't produce it, or green with no
+        # proof at all). Load once, derive the verdict from that exact
+        # snapshot.
+        raw_state = _gates.load_gate_state(store.root)
+        checked = _gates.check_gates(store.root, state=raw_state)
+        raw_gates = raw_state.get("gates")
+        if not isinstance(raw_gates, dict):
+            raw_gates = {}
+        wire: list[dict] = []
+        for item in checked.get("gates", []):
+            name = item.get("name", "")
+            raw = raw_gates.get(name) if isinstance(name, str) else None
+            evidence_raw = raw.get("evidence") if isinstance(raw, dict) else None
+            evidence: list[dict] = []
+            evidence_truncated = 0
+            if isinstance(evidence_raw, list):
+                # PR #129 connector finding (P1, web.py:2881): set_gate
+                # APPENDS chronologically, so slicing from the START kept
+                # the OLDEST entries - once a gate passed
+                # _GATE_EVIDENCE_MAX_ENTRIES updates, the wall could show a
+                # current green status/updated_at next to evidence that did
+                # NOT produce it, while the evidence that actually did was
+                # cut. Keep the NEWEST entries and expose the cut count.
+                # L-1 (review rq-1a23fd25053d): guard cap<=0 explicitly -
+                # Python's ``xs[-0:]`` is ``xs[0:]`` (the WHOLE list, not
+                # nothing), so a naive ``evidence_raw[-cap:]`` would silently
+                # return everything if the cap constant were ever 0.
+                cap = _GATE_EVIDENCE_MAX_ENTRIES
+                evidence_truncated = max(0, len(evidence_raw) - cap)
+                newest = evidence_raw[-cap:] if cap > 0 else []
+                for entry in newest:
+                    parsed = _gate_evidence_entry(entry)
+                    if parsed is not None:
+                        evidence.append(parsed)
+                    else:
+                        # F-3 (review rq-1a23fd25053d): an entry that fails
+                        # to parse (not a dict) was silently dropped without
+                        # counting toward evidence_truncated - the wall
+                        # could then show FEWER entries than the cap implied
+                        # with no signal that any were lost to a shape
+                        # problem rather than the cap itself.
+                        evidence_truncated += 1
+            reason = _envelope_str(item.get("reason") or "")
+            waiver = item.get("waiver")
+            wire.append({
+                "name": _envelope_str(name),
+                "status": _envelope_str(item.get("status") or "unknown"),
+                "severity": _envelope_str(item.get("severity") or "blocker"),
+                "scope": _envelope_str(item.get("scope") or "global"),
+                "blocks": bool(item.get("blocks")),
+                "reason": reason,
+                "updated_at": _envelope_str(item.get("updated_at") or ""),
+                "updated_by": _envelope_str(item.get("updated_by") or ""),
+                "evidence": evidence,
+                "evidence_truncated": evidence_truncated,
+                "waiver": _gate_waiver_entry(waiver),
+                # PR #129 connector finding (P2, console.js:2277): blocks=True
+                # marks an expired waiver as blocking ONLY for severity=
+                # blocker - gates._gate_verdict leaves blocks=False for an
+                # expired warn/info waiver even though it sets this exact
+                # reason string. A severity-independent signal so the view
+                # doesn't need blocks as a (wrong, for warn/info) proxy.
+                # F-4 (review rq-1a23fd25053d): derived from gates.
+                # WAIVER_EXPIRED_REASON, the SAME constant gates.py:343 sets
+                # this reason to, not a separately-typed literal that could
+                # drift out of sync.
+                "waiver_expired": bool(waiver) and reason == _gates.WAIVER_EXPIRED_REASON,
+            })
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "verdict": checked.get("verdict", "HOLD"),
+            "required_gates": [
+                _envelope_str(n) for n in (checked.get("required_gates") or [])
+            ],
+            "gates": wire,
+            "count": len(wire),
+        }
+    except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "verdict": "HOLD",
+            "required_gates": [],
+            "gates": [],
+            "count": 0,
+            "errors": [str(e)],
+        }
+
+
+# --------------------------------------------------- /api/risk-register (§4e)
+#
+# Risk Register relabel (docs/PROPOSAL-console-client-sellability.md #6): the
+# SAME ranked queue /api/attention already computes (build_attention, §4a),
+# resorted by severity/age and relabeled with client-legible categories and an
+# owner column instead of the operator triage source tags, PLUS open
+# onboarding drift/unknown findings (the proposal's #6 body explicitly lists
+# "open onboarding drift/unknown" alongside stalled agent/dead letter/gate
+# blocker - review rq-a7038d8175f2 finding 3). READ-ONLY, no new data, no
+# writes.
+
+_RISK_CATEGORY_LABELS: dict[str, str] = {
+    "escalation": "Decision needed",
+    "supervisor": "Process health",
+    "gate": "Gate blocker",
+    "deadletter": "Delivery failure",
+    "coordination_stall": "Coordination risk",
+    "stuck": "Process health",
+    "onboarding_drift": "Doc/code drift",
+    "onboarding_unknown": "Open unknown",
+}
+# severity stays the SAME "high"/"med"/"low" vocabulary /api/attention already
+# uses (not remapped to "medium") so the frontend can reuse the existing
+# SEV_COLOR/SEV_LABEL/.sev-<key> convention verbatim - this is a relabel of
+# category/sort, not a new severity vocabulary.
+_RISK_SEVERITY_ORDER = {"high": 0, "med": 1, "low": 2}
+# attention.py's typed meta.attention risk_severity vocabulary is "low" /
+# "medium" / "high" (RISK_LEVELS) - distinct spelling from the wire's "med".
+# "unknown" (the _mk_item default when a source never set it) intentionally
+# has NO entry here, so an untyped item falls through to the coarse
+# per-source severity below rather than silently becoming "low".
+_RISK_SEVERITY_FROM_TYPED = {"high": "high", "medium": "med", "low": "low"}
+# F-1 (review rq-093f956dd595): every neighboring surface in this diff bounds
+# itself (_ONBOARDING_DEFAULT_LIMIT, _GATE_EVIDENCE_MAX_ENTRIES, ...) - the
+# register itself was left unbounded after removing the 50-run cap. A high
+# cap + an explicit `truncated` count keeps the "an old item must not
+# silently vanish" intent (the point was never "no bound", only "no SILENT
+# bound").
+_RISK_REGISTER_ITEM_CAP = 500
+# B-1/B-2 (review rq-093f956dd595): cap how many degraded-source notes ride
+# the payload, so a pathological number of corrupt onboarding runs can't
+# blow up the response - the COUNT of open items lost is what matters to a
+# human, not an unbounded list of which ones.
+_RISK_DEGRADED_MAX = 50
+
+
+def build_risk_register(desc: RootDescriptor) -> dict:
+    """The /api/risk-register payload for one root (§4e). Envelope-only,
+    GET-only, read-only. Errors-as-data (parity with build_attention): a
+    corrupt/uninitialized root degrades to a 200 body with ``items: []`` and
+    an ``errors`` list, never a 500.
+
+    B-1 (review rq-093f956dd595): a register whose CONTRACT is "each open
+    item" must never let an inner collection failure render as a confident,
+    error-free "0 risks" - that is indistinguishable from a genuine all-clear
+    and is the worst failure mode for a screen whose purpose is letting a
+    client conclude nothing is outstanding. Every inner best-effort fallback
+    below (liaison resolution, stuck-agent derivation, onboarding) now
+    records what it lost into ``degraded``, surfaced as ``partial`` +
+    ``degraded_sources`` even on an otherwise-200 response - never silently
+    swallowed.
+    """
+    store = desc.store
+    now = datetime.now(timezone.utc)
+    degraded: list[str] = []
+    try:
+        cfg = _safe_load_config(store)
+        roster = cfg.get("agents", []) or []
+        try:
+            for_agent = store.operator_facing() or store.sole_lead()
+        except Exception as e:  # noqa: BLE001 — a corrupt root can't resolve a liaison
+            for_agent = None
+            degraded.append(_envelope_str(f"liaison_resolution: {e}"))
+        items = _collect_web_attention_items(store, roster, for_agent)
+        # PR #129 connector round-2 (reviewer-3 F-1 + connector P1,
+        # web.py:3103): scan the RAW collected items for SOURCE_ERROR here,
+        # BEFORE build_queue applies dispositions. source_error's only
+        # allowed disposition is `defer` (dismiss is forbidden for a
+        # blocking-class warning) - a DEFERRED item is excluded from
+        # queue.get("items", []) by default, so scanning the post-queue
+        # list let an operator defer the warning and see partial=false
+        # again while the underlying source was still genuinely broken.
+        # Deferring silences the REMINDER, not the fact that data is missing.
+        for it in items:
+            if it.get("source") == _attention.SOURCE_ERROR:
+                degraded.append(_envelope_str(
+                    it.get("title") or "attention source unavailable"))
+        disps, disposition_problems = _attention.read_dispositions(store)
+        if disposition_problems:
+            # PR #129 connector finding (web.py:2997): read_dispositions
+            # already reports malformed/torn/unreadable lines through its
+            # second return value - discarding it here is the SAME
+            # silent-partial-read shape as B-2 (onboarding problems), just
+            # for a different source. A damaged defer/resolve record can
+            # leave a risk shown as active while the payload still claimed
+            # partial=false.
+            degraded.append(_envelope_str(
+                f"dispositions: {len(disposition_problems)} unreadable record(s)"))
+        queue = _attention.build_queue(items, disps,
+                                       now_iso=now.isoformat().replace("+00:00", "Z"))
+        risks: list[dict] = []
+        for it in queue.get("items", []):
+            src = it.get("source", "")
+            mapped = _ATTENTION_SOURCE_MAP.get(src)
+            if mapped is None:
+                continue  # unknown internal source — skip rather than mislabel
+            wire_source, _label, coarse_severity = mapped
+            # Prefer the item's OWN typed risk assessment (an operator-authored
+            # escalation's meta.attention.risk_severity) over the coarse
+            # per-source default - a low-risk escalation must not be forced to
+            # "high" just because escalations are high-severity on average
+            # (review rq-a7038d8175f2 finding 1).
+            severity = _RISK_SEVERITY_FROM_TYPED.get(
+                it.get("risk_severity"), coarse_severity)
+            # age_unknown (review rq-1a23fd25053d F-2): gate/dead-letter
+            # items now stamp this via attention._age_seconds_from_iso when
+            # their source timestamp was missing/unparseable/future -
+            # every other source leaves it absent, i.e. known.
+            age_unknown = bool(it.get("age_unknown"))
+            age_seconds = float(it.get("age_seconds") or 0)
+            risks.append({
+                "id": it.get("item_id", ""),
+                "category": wire_source,
+                "category_label": _RISK_CATEGORY_LABELS.get(wire_source, "Other"),
+                "severity": severity,
+                "title": _envelope_str(it.get("title") or "attention needed"),
+                # PR #129 connector finding (web.py:3020): a needs_operator
+                # escalation's source_refs only carry {kind, request_id} - no
+                # "agent" key - so _attention_agent(it) alone always misses.
+                # needs_operator_items already stamps the requester onto the
+                # item; fall back to it so escalations (the "decision
+                # needed" category) don't lose their owner column entirely.
+                "owner": _attention_agent(it) or it.get("requester") or None,
+                "detail": _envelope_str(it.get("why_it_matters") or ""),
+                "age_seconds": age_seconds,
+                "age_unknown": age_unknown,
+                "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
+                "_sort_age": float("inf") if age_unknown else age_seconds,
+            })
+        try:
+            agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
+                                    for_agent)
+        except Exception as e:  # noqa: BLE001
+            agents = []
+            degraded.append(_envelope_str(f"stuck_agents: {e}"))
+        for stuck in _derive_stuck_items(agents, now=now):
+            stuck_age = float(stuck.get("age_seconds") or 0)
+            # PR #129 connector round-5 (web.py:3166): this hardcoded
+            # age_unknown=False regardless of what _derive_stuck_items
+            # reported - a missing last_seen (age_seconds forced to 0.0)
+            # sorted as the LEAST urgent, the opposite of the age_unknown
+            # convention every other risk source follows.
+            stuck_age_unknown = bool(stuck.get("age_unknown"))
+            risks.append({
+                "id": stuck["id"],
+                "category": "stuck",
+                "category_label": _RISK_CATEGORY_LABELS["stuck"],
+                "severity": stuck.get("severity") or "low",
+                "title": _envelope_str(stuck.get("title") or ""),
+                "owner": stuck.get("agent"),
+                "detail": _envelope_str(stuck.get("detail") or ""),
+                "age_seconds": stuck_age,
+                "age_unknown": stuck_age_unknown,
+                "human_can_unblock_now": bool(stuck.get("human_can_unblock_now")),
+                "_sort_age": float("inf") if stuck_age_unknown else stuck_age,
+            })
+        try:
+            # limit=None, NOT build_onboarding(desc) - that helper caps at
+            # _ONBOARDING_DEFAULT_LIMIT (50) newest-first runs for the
+            # Onboarding VIEW's presentation payload. A risk register must
+            # source "each open item" (proposal §3 #6) without that cap: an
+            # older unresolved drift/unknown must not silently vanish once
+            # 50 newer runs exist (review rq-4ecf94c4f814 finding 1).
+            onboarding_result = _onboarding.list_runs(store, limit=None)
+            all_runs = onboarding_result.get("runs") or []
+            # B-2: a run whose ledger fails to parse is SKIPPED from `runs`
+            # and only ever named in `problems` - discarding that channel
+            # drops the run's open findings with no signal at all, no
+            # exception required. Surface which runs were unreadable.
+            for p in (onboarding_result.get("problems") or [])[:_RISK_DEGRADED_MAX]:
+                degraded.append(_envelope_str(
+                    f"onboarding_run:{_onboarding_short(p.get('run_id'), limit=96)}"))
+            for run in all_runs:
+                run_records = run.get("records") or {}
+                run_id = _onboarding_short(run.get("run_id") or run.get("id"), limit=96)
+                run_title = _onboarding_short(run.get("title"), limit=240)
+                for kind, category in (
+                    (_onboarding.KIND_DRIFT, "onboarding_drift"),
+                    (_onboarding.KIND_UNKNOWN, "onboarding_unknown"),
+                ):
+                    for rec in run_records.get(kind) or []:
+                        if not isinstance(rec, dict) or rec.get("status") != "open":
+                            continue
+                        age = _age_seconds_of(rec.get("updated_at"), now=now)
+                        if age is not None and age < 0:
+                            # PR #129 connector finding (web.py:3156): a
+                            # bounded-but-future updated_at (a skewed
+                            # external writer) parses fine and produces a
+                            # NEGATIVE age - treating that as "known" clamps
+                            # display to 0s and sorts it to the LEAST urgent
+                            # end of its band, the opposite of the fail-safe
+                            # "unknown is not safe" treatment an unparseable
+                            # timestamp already gets. Route it through the
+                            # exact same unknown-age path.
+                            age = None
+                        blocking = bool(rec.get("blocking"))
+                        owner = rec.get("owner") or rec.get("actor") or None
+                        risks.append({
+                            "id": f"onboarding:{run_id}:{kind}:"
+                                  f"{_onboarding_short(rec.get('key'), limit=128)}",
+                            "category": category,
+                            "category_label": _RISK_CATEGORY_LABELS[category],
+                            "severity": "high" if blocking else "med",
+                            "title": _envelope_str(
+                                rec.get("summary") or f"{kind}: {rec.get('key')}"),
+                            "owner": _onboarding_short(owner, limit=96) if owner else None,
+                            "detail": run_title,
+                            # L-2: an unparseable updated_at must not read as
+                            # "0 seconds old" (misleadingly fresh) AND must
+                            # not silently sort to the bottom of its severity
+                            # band (deprioritized) - "unknown" is flagged
+                            # explicitly and sorted as the MOST urgent within
+                            # its band via the internal-only _sort_age below.
+                            "age_seconds": age if age is not None else 0.0,
+                            "age_unknown": age is None,
+                            # L-1: "blocking" (an onboarding workflow-progress
+                            # claim) is a DIFFERENT claim from "a human can
+                            # clear this right now" (a triage-affordance
+                            # claim the attention pipeline computes
+                            # separately for every other source). Nothing
+                            # external gates a human from acting on an
+                            # onboarding finding, so this is unconditionally
+                            # true here - not copied from `blocking`.
+                            "human_can_unblock_now": True,
+                            "_sort_age": age if age is not None else float("inf"),
+                        })
+        except Exception as e:  # noqa: BLE001
+            degraded.append(_envelope_str(f"onboarding: {e}"))
+        risks.sort(key=lambda r: (_RISK_SEVERITY_ORDER.get(r["severity"], 3),
+                                  -r.get("_sort_age", r["age_seconds"])))
+        truncated = max(0, len(risks) - _RISK_REGISTER_ITEM_CAP)
+        risks = risks[:_RISK_REGISTER_ITEM_CAP]
+        for r in risks:
+            r.pop("_sort_age", None)
+        degraded = degraded[:_RISK_DEGRADED_MAX]
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "items": risks,
+            "count": len(risks),
+            "truncated": truncated,
+            "partial": bool(degraded),
+            "degraded_sources": degraded,
+        }
+    except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "items": [],
+            "count": 0,
+            "truncated": 0,
+            "partial": True,
+            "degraded_sources": degraded[:_RISK_DEGRADED_MAX],
+            "errors": [str(e)],
+        }
+
+
+# --------------------------------------------------- /api/ownership (§4d)
+#
+# Ownership & Accountability Map (docs/PROPOSAL-console-client-sellability.md
+# #7): the full domain-ownership registry - which agent/team owns which part
+# of the codebase, which paths require shared sign-off - as its own view,
+# instead of the thin per-agent ``owned_domains`` slice /api/state already
+# carries (§3a's ``_owned_domains_map``, only names + globs, only visible on
+# a single agent's detail card). READ-ONLY: a straight read of domains.json
+# via the existing ``domains.load_registry``, no new data, no writes.
+
+def build_ownership(desc: RootDescriptor) -> dict:
+    """The /api/ownership payload for one root (§4d). Envelope-only,
+    GET-only, read-only. A missing registry is a valid empty state
+    (``domains.load_registry`` already returns ``empty_registry()``); a
+    MALFORMED registry degrades to a 200 body with ``domains: []`` and an
+    ``errors`` list, matching build_gates/build_attention's errors-as-data
+    contract rather than a 500."""
+    store = desc.store
+    try:
+        cfg = _safe_load_config(store)
+        try:
+            reg = _domains.load_registry(store.dir / _domains.FILENAME, cfg)
+        except _domains.DomainError as e:
+            return {
+                "root": desc.label,
+                "root_path": str(store.root),
+                "root_info": _root_info(desc),
+                "target_root_project_id": store.project_id(),
+                "domains": [],
+                "shared_paths": [],
+                "count": 0,
+                "errors": [str(e)],
+            }
+        data = reg.data
+        domains: list[dict] = []
+        for did, dentry in sorted((data.get("domains") or {}).items()):
+            if not isinstance(dentry, dict):
+                continue
+            owned_globs: list[str] = []
+            owned_globs_truncated = 0
+            for g in (dentry.get("owned_globs") or []):
+                bounded, glob_cut = _glob_str(g)
+                owned_globs.append(bounded)
+                if glob_cut:
+                    owned_globs_truncated += 1
+            domains.append({
+                "id": _envelope_str(did),
+                "title": _envelope_str(dentry.get("title") or did),
+                "owners": _domains.resolve_refset(dentry.get("owners") or {}, cfg),
+                "reviewers": _domains.resolve_refset(dentry.get("reviewers") or {}, cfg),
+                "curators": _domains.resolve_refset(dentry.get("curators") or {}, cfg),
+                "owned_globs": owned_globs,
+                # PR #129 connector round-2 (web.py:2763 / reviewer-3 F-5): a
+                # count of how many of THIS domain's globs were still cut by
+                # _GLOB_MAX, so a client never has to trust "long enough" -
+                # it can see when it wasn't.
+                "owned_globs_truncated": owned_globs_truncated,
+                "description": _envelope_str(dentry.get("description") or ""),
+            })
+        shared_paths: list[dict] = []
+        for entry in data.get("shared_paths") or []:
+            if not isinstance(entry, dict):
+                continue
+            glob_bounded, glob_truncated = _glob_str(entry.get("glob") or "")
+            shared_paths.append({
+                "glob": glob_bounded,
+                "glob_truncated": glob_truncated,
+                "category": _envelope_str(entry.get("category") or ""),
+                "requires": _envelope_str(entry.get("requires") or ""),
+                "default_reviewers": _domains.resolve_refset(
+                    entry.get("default_reviewers") or {}, cfg),
+                "default_approvers": _domains.resolve_refset(
+                    entry.get("default_approvers") or {}, cfg),
+                "description": _envelope_str(entry.get("description") or ""),
+            })
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "domains": domains,
+            "shared_paths": shared_paths,
+            "count": len(domains),
+        }
+    except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "domains": [],
+            "shared_paths": [],
+            "count": 0,
+            "errors": [str(e)],
+        }
 
 
 # ------------------------------------------------ /api/thread/<rid> (§4b)
@@ -3835,6 +4483,34 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._send_json(HTTPStatus.OK,
                                 build_attention(root,
                                                 actions_enabled=enable_actions))
+                return
+            if path == "/api/gates":
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _root_index, root = selected
+                # Gate & Evidence Wall, read side (§4c). Envelope-only,
+                # read-only, strict _DEFAULT_CSP (JSON is not executed).
+                self._send_json(HTTPStatus.OK, build_gates(root))
+                return
+            if path == "/api/risk-register":
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _root_index, root = selected
+                # Client-legible relabel of the /api/attention queue (§4e).
+                self._send_json(HTTPStatus.OK, build_risk_register(root))
+                return
+            if path == "/api/ownership":
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _root_index, root = selected
+                # Ownership & Accountability Map (§4d).
+                self._send_json(HTTPStatus.OK, build_ownership(root))
                 return
             if path == "/api/learning":
                 # Lessons + wrapper exposure telemetry for the selected root.

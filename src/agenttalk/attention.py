@@ -1340,39 +1340,77 @@ def process_tree_hold_items(
     return out
 
 
-def dead_letter_items(entries: list[dict]) -> list[dict]:
+def _age_seconds_from_iso(value: Any, now_epoch: float | None) -> tuple[float, bool]:
+    """Returns ``(age_seconds, unknown)``. ``age_seconds`` is 0.0 whenever
+    ``unknown`` is True - the CALLER must check ``unknown`` rather than
+    treating a bare 0.0 as a real "just happened" age (review
+    rq-1a23fd25053d F-2: the original version returned a bare float and
+    conflated "genuinely 0 seconds old" with "we don't actually know",
+    which also meant a source record that could not be timed sorted
+    identically to a brand-new one instead of being flagged, same class as
+    the onboarding ``age_unknown`` convention this now matches). A negative
+    result (the timestamp is in the FUTURE relative to ``now_epoch`` - a
+    skewed writer, not a real age) is ALSO reported unknown rather than
+    silently clamped, matching the fail-safe treatment of an unparseable
+    timestamp instead of the opposite (PR #129 connector finding,
+    web.py:3156, applied here too for the same reasoning)."""
+    if now_epoch is None:
+        return 0.0, True
+    dt = parse_iso_dt(value)
+    if dt is None:
+        return 0.0, True
+    age = now_epoch - dt.timestamp()
+    if age < 0:
+        return 0.0, True
+    return age, False
+
+
+def dead_letter_items(entries: list[dict], *, now_epoch: float | None = None) -> list[dict]:
     """Build items from canonical dead-letter entries.
 
     Resolution filtering is applied centrally by ``build_queue`` against each
     entry's source snapshot, so callers pass both resolved and unresolved rows.
+    ``now_epoch`` (optional, keyword-only): derives ``age_seconds`` from the
+    entry's own ``deadlettered_at`` instead of leaving the ``_mk_item``
+    default of 0.0 - omit for a pure/deterministic call (defaults to 0.0,
+    unchanged from before). Also stamps ``age_unknown`` (see
+    ``_age_seconds_from_iso``).
     """
     out = []
     for e in entries:
         ag, mid = e.get("agent", ""), e.get("message_id", "")
         ident = dead_letter_entry_notice_state(e)
+        age_seconds, age_unknown = _age_seconds_from_iso(e.get("deadlettered_at"), now_epoch)
         it = _mk_item(SOURCE_DEAD_LETTER, item_id(SOURCE_DEAD_LETTER, ag, mid),
                       title=f"dead-letter: {ag}/{mid}",
                       ident_content=ident,
                       human_can_unblock_now=True,
+                      age_seconds=age_seconds,
                       fields={"why_it_matters": "a required message could not be delivered",
-                              "priority": "high"},
+                              "priority": "high", "age_unknown": age_unknown},
                       source_refs=[{"kind": "dead_letter", "agent": ag, "message_id": mid}])
         it["dedupe_key"] = dedupe_key(SOURCE_DEAD_LETTER, identity=f"{ag}:{mid}")
         out.append(it)
     return out
 
 
-def gate_hold_items(blockers: list[dict], *, scope: str = "release") -> list[dict]:
-    """Each blocker: gates.check_gates()[...] item {name, reason, scope, ...}."""
+def gate_hold_items(blockers: list[dict], *, scope: str = "release",
+                    now_epoch: float | None = None) -> list[dict]:
+    """Each blocker: gates.check_gates()[...] item {name, reason, scope, ...}.
+    ``now_epoch`` (optional, keyword-only): derives ``age_seconds`` from the
+    blocker's own ``updated_at`` - see ``dead_letter_items``."""
     out = []
     for b in blockers:
         name = b.get("name", "")
         sc = b.get("scope", scope)
+        age_seconds, age_unknown = _age_seconds_from_iso(b.get("updated_at"), now_epoch)
         it = _mk_item(SOURCE_GATE_HOLD, item_id(SOURCE_GATE_HOLD, sc, name),
                       title=f"gate HOLD: {name} ({sc})",
                       ident_content={"scope": sc, "name": name, "reason": b.get("reason")},
                       human_can_unblock_now=True,
-                      fields={"why_it_matters": b.get("reason") or "", "priority": "high"},
+                      age_seconds=age_seconds,
+                      fields={"why_it_matters": b.get("reason") or "", "priority": "high",
+                              "age_unknown": age_unknown},
                       source_refs=[{"kind": "gate", "scope": sc, "name": name}])
         it["dedupe_key"] = dedupe_key(SOURCE_GATE_HOLD, identity=f"{sc}:{name}")
         out.append(it)

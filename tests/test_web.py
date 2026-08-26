@@ -1258,6 +1258,9 @@ def test_multi_root_explicit_project_id_routes_every_console_get(
             "/api/intents",
             "/api/preflight",
             "/api/attention",
+            "/api/gates",
+            "/api/risk-register",
+            "/api/ownership",
             "/api/learning",
             "/api/onboarding",
             "/api/lead-chat",
@@ -1537,6 +1540,9 @@ def test_duplicate_project_id_descriptors_are_rejected(tmp_path: Path) -> None:
         "/api/intents",
         "/api/preflight",
         "/api/attention",
+        "/api/gates",
+        "/api/risk-register",
+        "/api/ownership",
         "/api/learning",
         "/api/onboarding",
         "/api/lead-chat",
@@ -1971,7 +1977,8 @@ def test_csp_split_per_route(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in (f"/messages/{mid}", "/api/status", "/api/state",
-                     "/api/attention", "/api/learning", "/api/onboarding",
+                     "/api/attention", "/api/gates", "/api/risk-register",
+                     "/api/ownership", "/api/learning", "/api/onboarding",
                      "/api/thread/rid-c"):
             with _get(f"{base}{path}") as resp:
                 assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP, path
@@ -1995,6 +2002,7 @@ def test_new_routes_reject_write_methods(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in ("/api/state", "/api/threads", "/dashboard", "/api/attention",
+                     "/api/gates", "/api/risk-register", "/api/ownership",
                      "/api/learning", "/api/onboarding", "/api/thread/rid-w", "/static/console.js",
                      "/static/console.css", "/static/avatars/claude-dev.png"):
             req = urllib.request.Request(  # noqa: S310  # nosemgrep
@@ -2508,7 +2516,8 @@ def test_no_mutation_full_tree_hash(tmp_path: Path) -> None:
         for _ in range(3):
             _state(base)
         for path in ("/dashboard", "/static/console.js", "/static/console.css",
-                     "/", f"/messages/{mid}", "/api/attention", "/api/learning",
+                     "/", f"/messages/{mid}", "/api/attention", "/api/gates",
+                     "/api/risk-register", "/api/ownership", "/api/learning",
                      "/api/onboarding", "/api/thread/r1"):
             with _get(f"{base}{path}") as resp:
                 resp.read()
@@ -2752,6 +2761,411 @@ def test_console_renderer_safety(tmp_path: Path) -> None:
     assert "sessionStorage" not in js
 
 
+def test_console_mission_pill_bounds_long_text(tmp_path: Path) -> None:
+    """#207: long mission labels stay inside the header and retain a full-text
+    tooltip when the visible label is truncated."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/console.css") as resp:
+            css = resp.read().decode("utf-8")
+        with _get(f"{base}/static/console.js") as resp:
+            js = resp.read().decode("utf-8")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    pill = re.search(r"\.tc-mission-pill\s*\{([^}]*)\}", css, re.S)
+    label = re.search(r"\.tc-mission-name\s*\{([^}]*)\}", css, re.S)
+    assert pill is not None and "min-width: 0" in pill.group(1)
+    assert pill is not None and "max-width:" in pill.group(1)
+    assert label is not None and "overflow: hidden" in label.group(1)
+    assert label is not None and "text-overflow: ellipsis" in label.group(1)
+    assert "titled(pill, missionText)" in js
+
+
+def test_console_ages_and_staleness_use_server_time_anchor(tmp_path: Path) -> None:
+    """#207: wall-clock skew on the browser cannot make a server-timestamped
+    event newer/older or keep a failed poll labelled current."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console timestamp test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    acceptState: function (payload) {\n"
+        "      stampStatePayload(payload);\n"
+        "      lastState = payload;\n"
+        "      return payload;\n"
+        "    },\n"
+        "    liveAge: liveAge,\n"
+        "    serverClockText: serverClockText,\n"
+        "    pollingStatus: pollingStatus,\n"
+        "    resetText: resetText\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-time.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-time.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+let monotonic = 1000;
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return monotonic; } },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+vm.runInContext('Date.now = () => Date.parse("2100-01-01T00:00:00Z")', ctx);
+
+const hooks = ctx.__agenttalkConsoleTestHooks;
+const payload = {
+  generated_at: '2026-08-25T20:00:00Z',
+  roots: [],
+  sample: { ts: '2026-08-25T19:59:50Z', age_seconds: 10 },
+};
+hooks.acceptState(payload);
+monotonic = 6000;
+if (hooks.liveAge(payload.sample) !== 15) {
+  throw new Error(`server-relative age mixed in client clock: ${hooks.liveAge(payload.sample)}`);
+}
+if (hooks.serverClockText() !== '20:00:05 UTC') {
+  throw new Error(`server clock was not rendered in UTC: ${hooks.serverClockText()}`);
+}
+const resetAt = Date.parse('2026-08-25T20:30:00Z') / 1000;
+if (hooks.resetText({ resets_at: resetAt }) !== 'resets at 20:30 UTC') {
+  throw new Error(`server reset timestamp was not rendered in UTC: ${hooks.resetText({ resets_at: resetAt })}`);
+}
+if (hooks.pollingStatus().label !== 'Current') {
+  throw new Error(`fresh server snapshot was not labelled current: ${hooks.pollingStatus().label}`);
+}
+monotonic = 10000;
+if (hooks.pollingStatus().label !== 'Stale') {
+  throw new Error(`aged server snapshot was not labelled stale: ${hooks.pollingStatus().label}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_defaults_agent_grid_to_active_run(tmp_path: Path) -> None:
+    """#207: stale unwrapped roster history is opt-in via All; supervised
+    recovery targets and live unwrapped agents remain in the default scope."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console active-run test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    defaultFilter: state.filter,\n"
+        "    filterAgents: filterAgents\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-active-run.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-active-run.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+if (hooks.defaultFilter !== 'active') {
+  throw new Error(`default filter is ${hooks.defaultFilter}, not active run`);
+}
+const root = { agents: [
+  { name: 'supervised-idle', wrapped: true, health: { state: 'idle_waiting' } },
+  { name: 'supervised-exited', wrapped: true, health: { state: 'crashed_or_exited' } },
+  { name: 'live-unwrapped', wrapped: false, last_seen_age_seconds: 5,
+    health: { state: 'unknown' } },
+  { name: 'historical-unwrapped', wrapped: false, last_seen_age_seconds: 500,
+    health: { state: 'unknown' } },
+] };
+const names = hooks.filterAgents(root).map((item) => item.name);
+const expected = ['supervised-idle', 'supervised-exited', 'live-unwrapped'];
+if (JSON.stringify(names) !== JSON.stringify(expected)) {
+  throw new Error(`active-run scope mismatch: ${JSON.stringify(names)}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_poll_waits_for_slow_endpoint_before_rescheduling(tmp_path: Path) -> None:
+    """#207: each endpoint gets one in-flight request and its next cadence starts
+    after settlement, so a response slower than POLL_MS cannot stack requests."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console polling test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ boot\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    startEndpointPoll: startEndpointPoll\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-poll.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-poll.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+const timers = [];
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setTimeout(fn, delay) { timers.push({ fn, delay }); },
+  setInterval() { throw new Error('data polling must not use setInterval'); },
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+
+let calls = 0;
+const resolvers = [];
+function slowEndpoint() {
+  calls += 1;
+  return new Promise((resolve) => resolvers.push(resolve));
+}
+async function flush() {
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+}
+(async () => {
+  ctx.__agenttalkConsoleTestHooks.startEndpointPoll(slowEndpoint);
+  if (calls !== 1 || timers.length !== 0) {
+    throw new Error(`poll stacked before settlement: calls=${calls}, timers=${timers.length}`);
+  }
+  await flush();
+  if (calls !== 1 || timers.length !== 0) {
+    throw new Error(`pending endpoint was rescheduled: calls=${calls}, timers=${timers.length}`);
+  }
+  resolvers.shift()();
+  await flush();
+  if (timers.length !== 1 || timers[0].delay !== 2000) {
+    throw new Error(`next poll was not delayed after settlement: ${JSON.stringify(timers)}`);
+  }
+  const next = timers.shift();
+  next.fn();
+  if (calls !== 2 || timers.length !== 0) {
+    throw new Error(`second slow request stacked: calls=${calls}, timers=${timers.length}`);
+  }
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_narrow_layout_collapses_secondary_panels(tmp_path: Path) -> None:
+    """#207: secondary material is a closed native details panel at narrow
+    widths, while the same panel stays open on desktop and primary panels sort
+    ahead of it."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console narrow-layout test")
+
+    static_dir = Path(web.__file__).with_name("web_static")
+    src = (static_dir / "console.js").read_text(encoding="utf-8")
+    css = (static_dir / "console.css").read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    responsiveSecondary: responsiveSecondary\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-narrow.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-narrow.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function node(tag) {
+  const attrs = {};
+  return {
+    tagName: String(tag).toUpperCase(), className: '', textContent: '', children: [], open: false,
+    appendChild(child) { this.children.push(child); return child; },
+    setAttribute(name, value) { attrs[name] = String(value); },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+    },
+    addEventListener() {},
+  };
+}
+// A live MediaQueryList mock: ONE shared object (like the real
+// `window.matchMedia(query)` returning an equivalent list for a repeated
+// query), so the module-level listener registered against it (once, at
+// script load - review rq-2968d93df2bc) can be fired to simulate a real
+// viewport crossing the boundary, and so this test can assert exactly how
+// many listeners ever accumulate on it.
+const mq = { matches: true, _listeners: [] };
+function fireMediaChange(matches) {
+  mq.matches = matches;
+  for (const cb of mq._listeners) cb({ matches });
+}
+// A minimal "mounted DOM" root, separate from panels that are merely
+// CREATED: round 2 of this review (rq-2968d93df2bc) showed that reacting on
+// the next RENDER isn't equivalent to reacting on the live DOM when a poll
+// is delayed/failed. The fix walks document.querySelectorAll('.tc-secondary-panel')
+// on every real media-query change, so this harness must model "currently
+// attached to the page" vs "created but discarded" to prove it only ever
+// touches what's actually mounted (never a registry that could leak).
+const mountRoot = node('main');
+function mount(panel) { mountRoot.children.push(panel); return panel; }
+function unmount(panel) {
+  const idx = mountRoot.children.indexOf(panel);
+  if (idx !== -1) mountRoot.children.splice(idx, 1);
+}
+function hasClass(n, cls) { return String(n.className || '').split(/\s+/).includes(cls); }
+function queryAllByClass(root, cls) {
+  const out = [];
+  (function walk(n) {
+    if (hasClass(n, cls)) out.push(n);
+    for (const c of n.children || []) walk(c);
+  })(root);
+  return out;
+}
+const document = {
+  readyState: 'loading', addEventListener() {},
+  createElement: node,
+  createElementNS(_ns, tag) { return node(tag); },
+  querySelectorAll(selector) {
+    return queryAllByClass(mountRoot, selector.replace(/^\./, ''));
+  },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setInterval() {}, clearInterval() {},
+  matchMedia() {
+    return {
+      get matches() { return mq.matches; },
+      addEventListener(type, cb) { if (type === 'change') mq._listeners.push(cb); },
+    };
+  },
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+
+// review rq-2968d93df2bc: a per-panel change listener leaked (1000 rendered
+// panels left 1000 live listeners, each closing over a detached node). The
+// fix is ONE shared listener registered at module load, not one per panel -
+// assert that up front, before creating anything.
+if (mq._listeners.length !== 1) {
+  throw new Error(`expected exactly one shared change listener at module load, got ${mq._listeners.length}`);
+}
+
+// Created narrow: closed, per the existing contract. Mount it - this is the
+// panel a real page would currently be displaying.
+const mobileContent = node('div');
+const panel = mount(hooks.responsiveSecondary('Recent activity', mobileContent));
+if (panel.tagName !== 'DETAILS' || panel.open || panel.children[0].tagName !== 'SUMMARY' ||
+    panel.children[1] !== mobileContent) {
+  throw new Error(`narrow secondary panel did not collapse safely: ${JSON.stringify(panel)}`);
+}
+
+// Direct regression for the reviewer's leak repro: render 1000 panels,
+// mount-then-immediately-unmount each (simulating 1000 view rebuilds). The
+// listener count must stay at exactly one - nothing accumulates per panel,
+// and nothing is retained for a panel that is no longer mounted.
+for (let i = 0; i < 1000; i++) {
+  unmount(mount(hooks.responsiveSecondary('Recent activity', node('div'))));
+}
+if (mq._listeners.length !== 1) {
+  throw new Error(`1000 rendered panels must not accumulate listeners, got ${mq._listeners.length}`);
+}
+
+// review rq-2968d93df2bc round 2: the SAME still-mounted node ("panel" from
+// above) must react to a live viewport crossing WITHOUT any render/poll in
+// between - fetchState keeps last-good state on a failed poll, so depending
+// on the next render is not equivalent to the original live-node contract.
+fireMediaChange(false);
+if (!panel.open) {
+  throw new Error('the SAME mounted panel did not reopen on narrow -> wide with no poll in between');
+}
+fireMediaChange(true);
+if (panel.open) {
+  throw new Error('the SAME mounted panel did not re-collapse on wide -> narrow with no poll in between');
+}
+
+// A panel that was mounted and then discarded (unmounted, as a real view
+// teardown would do) must NOT be touched by a later change - proves the fix
+// walks the LIVE DOM (querySelectorAll), not a leak-prone registry of every
+// panel ever created.
+const discardedContent = node('div');
+const discarded = mount(hooks.responsiveSecondary('Recent activity', discardedContent));
+unmount(discarded);
+const discardedOpenBefore = discarded.open;
+fireMediaChange(false);
+if (discarded.open !== discardedOpenBefore) {
+  throw new Error('an unmounted/discarded panel must not be mutated by a later media-query change');
+}
+
+// Still exactly one listener after all of the above.
+if (mq._listeners.length !== 1) {
+  throw new Error(`expected exactly one shared change listener at the end, got ${mq._listeners.length}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+    narrow_css = css[css.index("@media (max-width: 560px)"):]
+    assert ".tc-priority-primary" in narrow_css and "order: -1" in narrow_css
+    assert ".tc-secondary-summary" in narrow_css
+    assert "responsiveSecondary('Team totals', tiles)" in src
+    assert "responsiveSecondary('Recent activity', activityRail(root))" in src
+
+
 def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path) -> None:
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")
@@ -2762,7 +3176,8 @@ def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path)
         "  globalThis.__agenttalkConsoleTestHooks = {\n"
         "    stateInfo: stateInfo,\n"
         "    agentStateInfo: agentStateInfo,\n"
-        "    freshHeartbeat: freshHeartbeat\n"
+        "    freshHeartbeat: freshHeartbeat,\n"
+        "    monotonicNow: monotonicNow\n"
         "  };\n\n" + marker,
         1,
     )
@@ -2817,6 +3232,557 @@ check({ health: { state: 'working_turn' }, last_seen_age_seconds: 5, wrapped: tr
 check({ health: { state: 'idle_waiting' }, last_seen_age_seconds: 5, wrapped: true },
   { key: 'idle_waiting', label: 'Idle \u00b7 waiting', color: 'warn', grp: 'idle' });
 assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative heartbeat fails');
+
+// #207 residual, finding 3: this ctx has NO `performance` global, so
+// monotonicNow() must take its fallback branch. A frozen `0` fallback is
+// fail-open (every later delta reads permanently "just now"); the fix must
+// fall back to a real, advancing wall clock instead.
+const before = Date.now();
+const stamp = hooks.monotonicNow();
+const after = Date.now();
+assert(stamp !== 0, 'monotonicNow() fallback must not freeze at 0 when performance is unavailable');
+assert(stamp >= before && stamp <= after,
+  `monotonicNow() fallback should track Date.now(): ${stamp} not in [${before}, ${after}]`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_gate_card_expired_waiver_renders_as_blocking(tmp_path: Path) -> None:
+    """review rq-a7038d8175f2 finding 2: gates.check_gates keeps
+    status='waived' for an EXPIRED blocker waiver but sets blocks=True (reason
+    'waiver expired or invalid'). A populated Gates view render must show that
+    as blocking (red/expired), not the calm purple 'WAIVED' card a still-valid
+    waiver gets - a shape-only JSON test cannot catch a frontend styling bug,
+    so this actually renders renderGates()/gateCard() and inspects the DOM."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the gate-card render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkGatesTestHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, gates) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      gatesData = gates;\n"
+        "      state.view = 'gates';\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-gates.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    className: '',
+    textContent: '',
+    attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    // renderActiveView() unconditionally calls snapshotScroll/restoreScroll,
+    // which do root.querySelector(<inner-scroller selector>) - a no-match
+    // stub is enough, this test does not exercise scroll preservation.
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function findAllByClass(node, cls, out) {
+  if (hasClass(node, cls)) out.push(node);
+  for (const child of node.children || []) findAllByClass(child, cls, out);
+  return out;
+}
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += ' ' + collectText(child);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading',
+  createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {},
+  getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkGatesTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkGatesTestHooks;
+
+hooks.setup(
+  { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] },
+  {
+    root: 'demo', verdict: 'HOLD', required_gates: ['security-scan'],
+    gates: [{
+      name: 'security-scan', status: 'waived', severity: 'blocker', scope: 'release',
+      blocks: true, reason: 'waiver expired or invalid',
+      updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha',
+      evidence: [],
+      waiver: {
+        operator: 'alpha', date: '2025-01-01T00:00:00Z',
+        reason: 'scanner unavailable', scope: 'release',
+        expires: '2025-06-01T00:00:00Z',
+      },
+    }],
+    count: 1,
+  },
+);
+hooks.renderActiveView();
+
+const cards = findAllByClass(main, 'tc-gate-card', []);
+assert(cards.length === 1, 'expected exactly one gate card');
+const card = cards[0];
+assert(hasClass(card, 'gate-waived_expired'),
+  `expired blocker waiver must render gate-waived_expired, got class=${card.className}`);
+assert(!hasClass(card, 'gate-waived'),
+  'expired blocker waiver must NOT carry the calm gate-waived class');
+const text = collectText(card);
+assert(text.includes('WAIVED (EXPIRED)'),
+  `expected the expired-waiver label in the card, got: ${text}`);
+assert(text.includes('Waiver expired'),
+  `expected the waiver box to say it is expired, got: ${text}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_gate_card_renders_evidence_details_and_nonblocker_waiver_expiry(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector findings (P2 x2):
+    1. gateCard only ever rendered evidence.source/by/at/refs, hiding any
+       evidence_details field the API deliberately forwards (coverage_percent,
+       pr_url, ...) even though it is present in the response.
+    2. gateVisualState used `blocks` as the sole expiry test, but
+       gates._gate_verdict only sets blocks=true for an expired waiver when
+       severity=blocker - a warn/info gate's expired waiver stayed blocks=false
+       and rendered as the calm WAIVED state. The server-derived
+       `waiver_expired` field is severity-independent; this renders a WARN
+       gate with an expired waiver and blocks=false."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the gate-card render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkGatesTestHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, gates) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      gatesData = gates;\n"
+        "      state.view = 'gates';\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-gates-2.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    className: '',
+    textContent: '',
+    attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function findAllByClass(node, cls, out) {
+  if (hasClass(node, cls)) out.push(node);
+  for (const child of node.children || []) findAllByClass(child, cls, out);
+  return out;
+}
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += ' ' + collectText(child);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading',
+  createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {},
+  getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkGatesTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkGatesTestHooks;
+
+hooks.setup(
+  { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] },
+  {
+    root: 'demo', verdict: 'HOLD', required_gates: [],
+    gates: [
+      {
+        name: 'coverage', status: 'green', severity: 'blocker', scope: 'release',
+        blocks: false, reason: '', updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha',
+        evidence: [{
+          source: 'automation_ci', by: 'alpha', at: '2026-01-01T00:00:00Z',
+          refs: ['ci-run-1'], coverage_percent: 91.5, pr_url: 'https://example.invalid/pr/1',
+        }],
+        evidence_truncated: 0, waiver: null, waiver_expired: false,
+      },
+      {
+        name: 'docs-freshness', status: 'waived', severity: 'warn', scope: 'release',
+        blocks: false, reason: 'waiver expired or invalid',
+        updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha',
+        evidence: [], evidence_truncated: 0,
+        waiver: {
+          operator: 'alpha', date: '2025-01-01T00:00:00Z',
+          reason: 'known stale, tracked separately', scope: 'release',
+          expires: '2020-01-01T00:00:00Z',
+        },
+        waiver_expired: true,
+      },
+      {
+        name: 'missing-required', status: 'unknown', severity: 'blocker', scope: 'release',
+        blocks: true, reason: 'required gate is missing',
+        updated_at: '', updated_by: '',
+        evidence: [], evidence_truncated: 0, waiver: null, waiver_expired: false,
+      },
+      {
+        name: 'skipped-blocker', status: 'skipped', severity: 'blocker', scope: 'release',
+        blocks: true, reason: 'required evidence not run (skipped); use a waiver for not-applicable',
+        updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha',
+        evidence: [], evidence_truncated: 0, waiver: null, waiver_expired: false,
+      },
+    ],
+    count: 4,
+  },
+);
+hooks.renderActiveView();
+
+const cards = findAllByClass(main, 'tc-gate-card', []);
+assert(cards.length === 4, `expected four gate cards, got ${cards.length}`);
+
+const coverageText = collectText(cards[0]);
+assert(coverageText.includes('coverage_percent: 91.5'),
+  `expected the forwarded coverage_percent evidence detail, got: ${coverageText}`);
+assert(coverageText.includes('pr_url: https://example.invalid/pr/1'),
+  `expected the forwarded pr_url evidence detail, got: ${coverageText}`);
+
+const docsCard = cards[1];
+assert(hasClass(docsCard, 'gate-waived_expired'),
+  `a WARN-severity gate with an expired (blocks=false) waiver must still render ` +
+  `gate-waived_expired, got class=${docsCard.className}`);
+assert(!hasClass(docsCard, 'gate-waived'),
+  'expired non-blocker waiver must NOT carry the calm gate-waived class');
+const docsText = collectText(docsCard);
+assert(docsText.includes('WAIVED (EXPIRED)'), `expected the expired label, got: ${docsText}`);
+// PR #129 connector round-2 finding (console.js:2336): blocks=false here,
+// so the waiver box must NOT claim it is blocking.
+assert(!docsText.includes('blocking'),
+  `an advisory (non-blocking) expired waiver must not say "blocking", got: ${docsText}`);
+
+// PR #129 connector round-2 finding (P1, console.js:2281): a missing
+// required gate (status=unknown, blocks=true) and a skipped blocker
+// (status=skipped, blocks=true) must render danger (reuse gate-red), not
+// the neutral gray unknown/skipped color - both are real HOLD contributors.
+const missingCard = cards[2];
+assert(hasClass(missingCard, 'gate-red'),
+  `a blocking status=unknown gate must render danger (gate-red), got class=${missingCard.className}`);
+assert(!hasClass(missingCard, 'gate-unknown'),
+  'a blocking gate must not keep the neutral gray unknown class');
+
+const skippedCard = cards[3];
+assert(hasClass(skippedCard, 'gate-red'),
+  `a blocking status=skipped gate must render danger (gate-red), got class=${skippedCard.className}`);
+assert(!hasClass(skippedCard, 'gate-skipped'),
+  'a blocking gate must not keep the neutral gray skipped class');
+
+// PR #129 connector round-5 (reviewer-3 F-3 + connector P2, console.js:2339):
+// the forced-red CLASS above is a color-only visual escalation - the chip
+// TEXT must still say what the gate's real status is, not "RED" (which
+// falsely claims a run actually FAILED rather than never ran / was skipped).
+const missingChip = findAllByClass(missingCard, 'tc-chip', [])[0];
+assert(missingChip.textContent === 'UNKNOWN',
+  `a blocking status=unknown gate must show the UNKNOWN label text, not RED, got: ${missingChip.textContent}`);
+const skippedChip = findAllByClass(skippedCard, 'tc-chip', [])[0];
+assert(skippedChip.textContent === 'SKIPPED',
+  `a blocking status=skipped gate must show the SKIPPED label text, not RED, got: ${skippedChip.textContent}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_fetch_risk_register_stamps_payload_timing(tmp_path: Path) -> None:
+    """PR #129 connector finding (P2, console.js:4321): unlike every other
+    payload carrying relative ages, fetchRiskRegister skipped
+    stampAuxPayload, so items never received _receivedAt - liveAge()'s
+    elapsed-time term (monotonicNow() - item._receivedAt) always fell back
+    to 0, so the 1s updateAges loop kept reconstructing the SAME age
+    forever. Assert every fetched item now carries a numeric _receivedAt."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the risk-register fetch-stamp test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkRiskRegisterFetchHooks = {\n"
+        "    setup: function (root) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "    },\n"
+        "    fetchRiskRegister: fetchRiskRegister,\n"
+        "    snapshot: function () { return riskRegisterData; }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-risk-register-fetch.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 1000; } },
+  setInterval() {}, clearInterval() {},
+  fetch(_url) {
+    return Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        root_info: { project_id: 'project-demo' },
+        target_root_project_id: 'project-demo',
+        items: [{
+          id: 'gate:release:ci', category: 'gate', category_label: 'Gate blocker',
+          severity: 'high', title: 'ci', owner: null, detail: '',
+          age_seconds: 30, human_can_unblock_now: true,
+        }],
+        count: 1, truncated: 0, partial: false, degraded_sources: [],
+      }),
+    });
+  },
+  __agenttalkRiskRegisterFetchHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkRiskRegisterFetchHooks;
+
+hooks.setup({ label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] });
+
+(async () => {
+  hooks.fetchRiskRegister();
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  const data = hooks.snapshot();
+  assert(data, 'riskRegisterData was never set');
+  assert(typeof data._receivedAt === 'number',
+    `expected the payload itself to carry _receivedAt, got: ${JSON.stringify(data)}`);
+  const item = data.items[0];
+  assert(typeof item._receivedAt === 'number',
+    `expected each risk item to carry _receivedAt (stampAuxPayload recurses into ` +
+    `arrays), got: ${JSON.stringify(item)}`);
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : err);
+  process.exitCode = 1;
+});
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_risk_register_partial_state_renders_incomplete_banner(
+    tmp_path: Path,
+) -> None:
+    """review rq-093f956dd595 B-1: "surface partial/degraded state in
+    payload AND view" - a payload-shape assertion alone cannot catch a
+    frontend that silently drops the partial/degraded_sources fields. This
+    actually renders renderRiskRegister() and inspects the DOM for the
+    incomplete-list banner and the truncated-count note."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the risk-register render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkRiskRegisterTestHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, riskRegister) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      riskRegisterData = riskRegister;\n"
+        "      state.view = 'risk-register';\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-risk-register.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    className: '',
+    textContent: '',
+    attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += ' ' + collectText(child);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading',
+  createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {},
+  getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkRiskRegisterTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkRiskRegisterTestHooks;
+
+hooks.setup(
+  { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] },
+  {
+    root: 'demo', root_path: 'D:\\work\\demo',
+    root_info: { project_id: 'project-demo', label: 'demo', path: 'D:\\work\\demo' },
+    target_root_project_id: 'project-demo',
+    items: [{
+      id: 'onboarding:run-1:drift:d1', category: 'onboarding_drift',
+      category_label: 'Doc/code drift', severity: 'high', title: 'a real open risk',
+      owner: 'beta', detail: 'scan run', age_seconds: 30, age_unknown: false,
+      human_can_unblock_now: true,
+    }],
+    count: 1,
+    truncated: 2,
+    partial: true,
+    degraded_sources: ['onboarding_run:corrupt-run-1'],
+  },
+);
+hooks.renderActiveView();
+
+const text = collectText(main);
+assert(text.includes('incomplete'),
+  `expected the header to flag the count as incomplete, got: ${text}`);
+assert(text.includes('INCOMPLETE') || text.includes('could not be read'),
+  `expected an incomplete-list banner naming the degraded source, got: ${text}`);
+assert(text.includes('corrupt-run-1'),
+  `expected the degraded source name in the banner, got: ${text}`);
+assert(text.includes('a real open risk'),
+  `the item that WAS read must still render alongside the partial banner: ${text}`);
+assert(text.includes('2') && text.includes('not shown'),
+  `expected the truncated-count note, got: ${text}`);
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
@@ -4052,7 +5018,7 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
   assert(historyWrites.at(-1).method === 'push' &&
     history.entries[1].includes('root=project-b'),
     `user selection was not a project-B push: ${JSON.stringify(historyWrites)}`);
-  assert(calls.length === 6 && calls.every((call) => call.url.includes('root=project-b')),
+  assert(calls.length === 9 && calls.every((call) => call.url.includes('root=project-b')),
     `project-B selection did not refetch B: ${JSON.stringify(calls)}`);
   const staleB = calls.find((call) => call.url.startsWith('/api/attention'));
   hooks.seedRootContext('project B');
@@ -4071,8 +5037,8 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
   assert(history.entries.length === 2 && history.index === 0 &&
     historyWrites.length === writesBeforeBack,
     `Back wrote history: ${JSON.stringify(historyWrites)}`);
-  const aCalls = calls.slice(6);
-  assert(aCalls.length === 6 && aCalls.every((call) => call.url.includes('root=project-a')),
+  const aCalls = calls.slice(9);
+  assert(aCalls.length === 9 && aCalls.every((call) => call.url.includes('root=project-a')),
     `Back did not refetch A: ${JSON.stringify(aCalls)}`);
 
   const currentA = aCalls.find((call) => call.url.startsWith('/api/attention'));
@@ -4080,7 +5046,7 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
     root_info: {project_id: rootA.project_id}, count: 3, items: [],
   }));
   for (const call of aCalls) if (call !== currentA) call.resolve(response(false, {}));
-  for (const call of calls.slice(0, 6)) {
+  for (const call of calls.slice(0, 9)) {
     if (call !== staleB) call.resolve(response(false, {}));
   }
   await flush();
@@ -4104,8 +5070,8 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
   assert(history.entries.length === 2 && history.index === 1 &&
     historyWrites.length === writesBeforeForward,
     `Forward wrote history: ${JSON.stringify(historyWrites)}`);
-  const forwardCalls = calls.slice(12);
-  assert(forwardCalls.length === 6 &&
+  const forwardCalls = calls.slice(18);
+  assert(forwardCalls.length === 9 &&
     forwardCalls.every((call) => call.url.includes('root=project-b')),
     `Forward did not refetch B: ${JSON.stringify(forwardCalls)}`);
 })().catch((err) => {
@@ -5659,6 +6625,30 @@ def test_api_attention_derived_stuck_item(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_api_risk_register_stuck_item_with_no_heartbeat_is_age_unknown(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector round-5 (web.py:3166): an agent with no heartbeat at
+    all (a genuinely never-seen or long-vanished agent) used to surface as a
+    STUCK risk item with age_seconds=0.0 and no age_unknown flag - the same
+    "just happened" conflation _age_seconds_from_iso was already fixed for
+    everywhere else. It must route through the same age_unknown convention:
+    _sort_age = inf, so it sorts as MOST urgent, never least."""
+    s = _make_store(tmp_path)
+    _write_health(s, "alpha", _hm.STATE_STUCK_SUSPECTED, cli="claude", mode="wrapper-loop")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        stuck = [it for it in payload["items"] if it["category"] == "stuck"]
+        assert len(stuck) == 1, payload
+        assert stuck[0]["age_seconds"] == 0.0, stuck[0]
+        assert stuck[0]["age_unknown"] is True, (
+            f"a stuck agent with no heartbeat must be age_unknown, not a bare 0.0: {stuck[0]}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_attention_derived_worktree_stall_item(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     s.write_heartbeat("alpha")
@@ -6252,3 +7242,1318 @@ def test_api_state_thread_carries_opener(tmp_path: Path) -> None:
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+# ------------------------------------------------------- /api/gates (§4c)
+#
+# Gate & Evidence Wall, read side (docs/PROPOSAL-console-client-sellability.md
+# #1). Quick-win selection: 20260825-215757-153513-ljQ3.
+
+def _gates(base: str) -> dict:
+    with _get(f"{base}/api/gates") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_gates_shape_evidence_and_waiver(tmp_path: Path) -> None:
+    """A green blocker gate carries its evidence; a waived gate carries its
+    waiver reason/expiry; a missing required gate blocks with a reason. The
+    envelope carries the full picture /api/attention only ever summarizes as
+    one blocker line."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="tests", status="green", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  evidence=["ci-run-42"], reason="all green", required=True)
+    gmod.waive_gate(s.root, name="security-scan", operator="alpha",
+                    reason="scanner unavailable", scope="release",
+                    expires="2099-01-01T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        assert set(payload) == {
+            "root", "root_path", "root_info", "target_root_project_id",
+            "verdict", "required_gates", "gates", "count",
+        }
+        assert payload["count"] == len(payload["gates"])
+        assert payload["required_gates"] == ["tests"]
+        by_name = {g["name"]: g for g in payload["gates"]}
+
+        tests_gate = by_name["tests"]
+        assert tests_gate["status"] == "green"
+        assert tests_gate["severity"] == "blocker"
+        assert tests_gate["scope"] == "release"
+        assert tests_gate["blocks"] is False
+        assert tests_gate["waiver"] is None
+        (evidence_entry,) = tests_gate["evidence"]
+        assert evidence_entry["source"] == "automation_ci"
+        assert evidence_entry["refs"] == ["ci-run-42"]
+        assert evidence_entry["by"] == "alpha"
+        assert "at" in evidence_entry
+
+        scan_gate = by_name["security-scan"]
+        assert scan_gate["status"] == "waived"
+        assert scan_gate["blocks"] is False
+        assert scan_gate["waiver"] == {
+            "operator": "alpha",
+            "date": scan_gate["waiver"]["date"],
+            "reason": "scanner unavailable",
+            "scope": "release",
+            "expires": "2099-01-01T00:00:00Z",
+        }
+
+        # every required blocker gate is green -> GO
+        assert payload["verdict"] == "GO"
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_key_bounding_does_not_collide(tmp_path: Path) -> None:
+    """review rq-e05589aa3c80 R-1: a bounded evidence key must not silently
+    overwrite an already-populated field (a whitespace-padded "source "
+    collapsing onto the canonical "source" once _envelope_str strips it),
+    and two distinct long keys that share the same 64-char prefix must not
+    silently merge - first write wins, neither overwrites the other."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    long_prefix = "x" * 64
+    gmod.set_gate(
+        s.root, name="ci", status="green", severity="blocker", scope="release",
+        actor="alpha", evidence_source="automation_ci", evidence=["ref1"],
+        evidence_details={
+            "source ": "SHADOWED",
+            f"{long_prefix}-one": "first",
+            f"{long_prefix}-two": "second",
+        },
+        required=True,
+    )
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert entry["source"] == "automation_ci", (
+            f"the canonical 'source' field must survive a whitespace-padded "
+            f"colliding key: {entry}")
+        assert entry.get(long_prefix) == "first", (
+            f"two keys sharing a 64-char prefix must not silently merge "
+            f"(first write should win): {entry}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_missing_required_gate_blocks(tmp_path: Path) -> None:
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    state = gmod.load_gate_state(s.root)
+    state["required_gates"] = ["never-run"]
+    gmod.write_gate_state(s.root, state)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        assert payload["verdict"] == "HOLD"
+        (gate,) = payload["gates"]
+        assert gate["name"] == "never-run"
+        assert gate["status"] == "unknown"
+        assert gate["blocks"] is True
+        assert gate["reason"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_degrades_on_corrupt_root(tmp_path: Path) -> None:
+    """Parity with /api/attention's errors-as-data (B1): a corrupt gates.json
+    must NOT 500 the route. gates.check_gates already fails closed for a
+    corrupt state file with a single synthetic ``__gate_state__`` blocker
+    (mirrored by attention.gate_hold_items) - build_gates must pass that
+    through, not crash trying to read a non-existent evidence list for it."""
+    s = _make_store(tmp_path)
+    (s.dir / "gates.json").write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        assert set(payload) >= {"root", "gates", "count", "verdict"}
+        assert payload["count"] == len(payload["gates"])
+        assert payload["verdict"] == "HOLD"
+        (gate,) = payload["gates"]
+        assert gate["name"] == "__gate_state__"
+        assert gate["blocks"] is True
+        assert gate["evidence"] == []
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# --------------------------------------------------- /api/risk-register (§4e)
+#
+# Risk Register relabel (docs/PROPOSAL-console-client-sellability.md #6).
+
+def _risk_register(base: str) -> dict:
+    with _get(f"{base}/api/risk-register") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_risk_register_shape_and_sorted_by_severity_then_age(
+    tmp_path: Path,
+) -> None:
+    from agenttalk import gates as gmod
+    from agenttalk.wrapper import recv_api
+
+    s = _make_store(tmp_path)
+    # A high-severity gate-hold risk (blocker gate, red).
+    gmod.set_gate(s.root, name="ci", status="red", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  reason="pipeline red", required=True)
+    # A dead letter -> med severity risk with an owning agent.
+    message = s.send(sender="alpha", recipient="beta", body="poison",
+                     kind="message", meta={})
+    record = recv_api.next_record(s, "beta")
+    assert record["id"] == message.id
+    s.dead_letter("beta", record, reason="deterministic",
+                  failure_class="poison_eligible", at="2026-07-02T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert set(payload) == {
+            "root", "root_path", "root_info", "target_root_project_id",
+            "items", "count", "truncated", "partial", "degraded_sources",
+        }
+        assert payload["count"] == len(payload["items"])
+        assert payload["partial"] is False
+        assert payload["degraded_sources"] == []
+        assert payload["truncated"] == 0
+        for it in payload["items"]:
+            assert set(it) == {
+                "id", "category", "category_label", "severity", "title",
+                "owner", "detail", "age_seconds", "age_unknown",
+                "human_can_unblock_now",
+            }
+            assert it["severity"] in ("high", "med", "low")
+            # both gate and dead-letter sources have a real updated_at/
+            # deadlettered_at here, so age is known (PR #129 connector
+            # round-2 finding, web.py:3088 - age derivation - and
+            # reviewer-3 F-2 - flag unknown rather than defaulting to 0.0).
+            assert it["age_unknown"] is False
+            assert it["age_seconds"] >= 0, (
+                f"gate/dead-letter age must reflect a real elapsed time: {it}")
+        # severity-desc, then age-desc within a severity band
+        order = [("high", 0), ("med", 1), ("low", 2)]
+        rank = dict(order)
+        ranks = [rank[it["severity"]] for it in payload["items"]]
+        assert ranks == sorted(ranks)
+        gate_items = [it for it in payload["items"] if it["category"] == "gate"]
+        assert gate_items and gate_items[0]["category_label"] == "Gate blocker"
+        deadletter_items = [it for it in payload["items"] if it["category"] == "deadletter"]
+        assert deadletter_items and deadletter_items[0]["category_label"] == "Delivery failure"
+        assert deadletter_items[0]["owner"] == "beta"
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_uses_typed_risk_severity_over_source_default(
+    tmp_path: Path,
+) -> None:
+    """review rq-a7038d8175f2 finding 1: an escalation's OWN typed
+    risk_severity must win over the coarse per-source default. The shape test
+    above only covers a gate + dead letter, where source and risk happen to
+    align (both land on the coarse default because neither source sets a
+    typed risk_severity) - this test forces them to DIVERGE."""
+    s = _make_store(tmp_path)
+    s.set_operator_facing("beta")
+    s.send(sender="alpha", recipient="beta", kind="question", body="?",
+           subject="operator input needed",
+           meta={"request_id": "esc-low-risk", "needs_operator": "true",
+                 "attention": {"decision": "Pick a font",
+                               "risk_severity": "low", "confidence": "high"}})
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        item = next(it for it in payload["items"] if it["category"] == "escalation")
+        assert item["severity"] == "low", (
+            "typed risk_severity=low must not be overridden by the coarse "
+            f"escalation source default (high): {item}")
+        # PR #129 connector finding (web.py:3020): a needs_operator item's
+        # source_refs carry only {kind, request_id} - no "agent" key - so
+        # _attention_agent(it) alone always returns None for escalations.
+        # Falls back to the stamped requester (the sender, "alpha" here).
+        assert item["owner"] == "alpha", (
+            f"escalation owner must fall back to the requester, not be null: {item}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_includes_open_onboarding_drift_and_unknown(
+    tmp_path: Path,
+) -> None:
+    """review rq-a7038d8175f2 finding 3: docs/PROPOSAL-console-client-sellability.md:105-112
+    defines item #6's risk register as covering "stalled agent, dead letter,
+    gate blocker, open onboarding drift/unknown" - onboarding findings were
+    omitted. A RESOLVED drift/unknown record must NOT surface (only open
+    ones are risks)."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="repo scan", objective="map the codebase",
+        base_ref="main", lead="alpha", state="scanning",
+        at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-1", status="open",
+        summary="docs say X, code does Y", actor="alpha", owner="beta",
+        blocking=True, at="2026-01-01T00:05:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_UNKNOWN, key="unknown-1", status="open",
+        summary="unclear retry policy", actor="alpha", blocking=False,
+        at="2026-01-01T00:10:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-resolved", status="resolved",
+        summary="already fixed", actor="alpha", blocking=True,
+        at="2026-01-01T00:15:00Z"))
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        by_category = {}
+        for it in payload["items"]:
+            by_category.setdefault(it["category"], []).append(it)
+
+        drift_items = by_category.get("onboarding_drift", [])
+        assert len(drift_items) == 1, (
+            f"expected exactly the OPEN drift record, not the resolved one: {payload['items']}")
+        assert drift_items[0]["category_label"] == "Doc/code drift"
+        assert drift_items[0]["severity"] == "high"  # blocking=True
+        assert drift_items[0]["owner"] == "beta"
+        assert drift_items[0]["title"] == "docs say X, code does Y"
+        # review rq-093f956dd595 L-1: "human_can_unblock_now" is a triage
+        # affordance claim, not a copy of the onboarding "blocking" flag.
+        assert drift_items[0]["human_can_unblock_now"] is True
+        assert drift_items[0]["age_unknown"] is False
+
+        unknown_items = by_category.get("onboarding_unknown", [])
+        assert len(unknown_items) == 1
+        assert unknown_items[0]["category_label"] == "Open unknown"
+        assert unknown_items[0]["severity"] == "med"  # blocking=False
+        assert unknown_items[0]["owner"] == "alpha"  # falls back to actor
+        # L-1: still True even though blocking=False here - nothing external
+        # gates a human from acting on this finding.
+        assert unknown_items[0]["human_can_unblock_now"] is True
+        assert unknown_items[0]["age_unknown"] is False
+        assert payload["partial"] is False
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_onboarding_not_truncated_by_dashboard_run_limit(
+    tmp_path: Path,
+) -> None:
+    """review rq-4ecf94c4f814 finding 1: build_onboarding's dashboard
+    presentation cap (_ONBOARDING_DEFAULT_LIMIT=50 newest-first runs) must
+    NOT silently drop an older run's open finding from the risk register -
+    "each open item" (proposal §3 #6) has no recency cutoff. Reproduces the
+    reviewer's 51-run repro: the OLDEST run carries the one open, blocking
+    drift; 50 strictly newer runs carry nothing open, so a naive 50-run cap
+    would push the victim run's open finding out of the window."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    victim_run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=victim_run_id, title="oldest scan", objective="map it",
+        base_ref="main", lead="alpha", state="scanning",
+        at="2020-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=victim_run_id, kind=ob.KIND_DRIFT, key="old-drift", status="open",
+        summary="an old unresolved drift", actor="alpha", owner="beta",
+        blocking=True, at="2020-01-01T00:05:00Z"))
+    for i in range(50):
+        run_id = ob.new_run_id()
+        ob.create_run(s, ob.new_create_event(
+            run_id=run_id, title=f"newer scan {i}", objective="map it",
+            base_ref="main", lead="alpha", state="scanning",
+            at=f"2026-01-{(i % 28) + 1:02d}T00:00:00Z"))
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        drift_items = [it for it in payload["items"] if it["category"] == "onboarding_drift"]
+        assert len(drift_items) == 1, (
+            "the older run's open drift must not be truncated by the dashboard's "
+            f"50-run presentation cap: {payload['items']}")
+        assert drift_items[0]["title"] == "an old unresolved drift"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_degrades_on_corrupt_root(tmp_path: Path) -> None:
+    """review rq-093f956dd595 B-1/B-3: a corrupt config.json makes
+    store.operator_facing() raise, caught by the liaison-resolution
+    fallback. This must be VISIBLE (partial=True, a degraded_sources entry)
+    - a prior version of this test accepted a silent empty-and-clean 200 as
+    passing, which is the exact defect B-1 closes."""
+    s = _make_store(tmp_path)
+    cfg_path = s.dir / "config.json"
+    cfg_path.write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert set(payload) >= {"root", "items", "count", "partial", "degraded_sources"}
+        assert payload["count"] == len(payload["items"])
+        _assert_no_body_keys(payload)
+        assert payload["items"] == [] or all(
+            it["category"] in ("escalation", "supervisor", "gate", "deadletter",
+                               "coordination_stall", "stuck", "onboarding_drift",
+                               "onboarding_unknown")
+            for it in payload["items"]
+        )
+        assert payload["partial"] is True, (
+            f"a corrupt config that breaks liaison resolution must be surfaced, "
+            f"not silently absorbed into a clean-looking response: {payload}")
+        assert payload["degraded_sources"], "must name at least one degraded source"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_surfaces_partial_when_onboarding_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """review rq-093f956dd595 B-1: reproduces the reviewer's exact repro -
+    one open blocking drift, then onboarding.list_runs raising. Before the
+    fix this returned a clean HTTP 200 with count=0 and no errors key,
+    indistinguishable from a genuine all-clear. Must now surface partial."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-1", status="open",
+        summary="a blocking drift that must not silently vanish", actor="alpha",
+        blocking=True, at="2026-01-01T00:05:00Z"))
+
+    srv, _t, base = _serve(s)
+    try:
+        baseline = _risk_register(base)
+        assert baseline["count"] == 1
+        assert baseline["partial"] is False
+
+        def boom(*_args, **_kwargs):
+            raise OSError("simulated onboarding read failure")
+        monkeypatch.setattr(ob, "list_runs", boom)
+
+        payload = _risk_register(base)
+        assert payload["items"] == []
+        assert payload["count"] == 0
+        assert payload["partial"] is True, (
+            f"an inner collection failure must not render as a silent all-clear: {payload}")
+        assert any("onboarding" in d for d in payload["degraded_sources"]), payload
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_corrupt_onboarding_run_is_flagged_not_dropped(
+    tmp_path: Path,
+) -> None:
+    """review rq-093f956dd595 B-2: onboarding.list_runs SKIPS a run whose
+    ledger fails to parse (view=None) and only names it in `problems` - a
+    silent drop reachable with NO exception at all. The risk register must
+    surface that instead of discarding the `problems` channel."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-1", status="open",
+        summary="an open drift in a run that will be corrupted", actor="alpha",
+        blocking=True, at="2026-01-01T00:05:00Z"))
+    events_file = ob.events_path(s, run_id)
+    lines = events_file.read_text(encoding="utf-8").splitlines()
+    lines[0] = "{not valid json"  # corrupt the create event -> run_view() is None
+    events_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["items"] == [], (
+            f"the corrupt run's open drift must not silently appear: {payload}")
+        assert payload["partial"] is True, (
+            f"a corrupt onboarding run must be surfaced, not silently dropped: {payload}")
+        assert any("onboarding_run" in d for d in payload["degraded_sources"]), payload
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_caps_items_with_explicit_truncated_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """review rq-093f956dd595 F-1: every neighboring surface in this diff
+    bounds itself; the register must too - a high cap, never a silent one.
+    The point was never "no bound", only "no SILENT bound"."""
+    from agenttalk import gates as gmod
+
+    monkeypatch.setattr(web, "_RISK_REGISTER_ITEM_CAP", 3)
+    s = _make_store(tmp_path)
+    for i in range(5):
+        gmod.set_gate(s.root, name=f"gate-{i}", status="red", severity="blocker",
+                      scope="release", actor="alpha", evidence_source="automation_ci",
+                      reason="red", required=True)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["count"] == 3
+        assert len(payload["items"]) == 3
+        assert payload["truncated"] == 2
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_unknown_age_flagged_and_not_deprioritized(
+    tmp_path: Path,
+) -> None:
+    """review rq-093f956dd595 L-2: an onboarding record whose updated_at
+    cannot parse must be flagged age_unknown (never silently read as "0s
+    old", which looks freshly-created - the opposite of the truth) and must
+    NOT be silently pushed to the bottom of its severity band."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="known-drift", status="open",
+        summary="known-age drift", actor="alpha", blocking=True,
+        at="2026-01-01T00:05:00Z"))
+    # Hand-written record: new_record_event's `at` is never format-validated
+    # by onboarding.event_problem (only byte-bounded), so this is a legal
+    # on-disk event with an unparseable timestamp - simulates a foreign/
+    # legacy writer, not a fabricated test-only shape.
+    events_file = ob.events_path(s, run_id)
+    bad_event = {
+        "schema_version": ob.SCHEMA_VERSION, "event": ob.EVENT_RECORD,
+        "run_id": run_id, "kind": ob.KIND_DRIFT, "key": "bad-drift",
+        "status": "open", "summary": "unparseable timestamp drift",
+        "actor": "alpha", "blocking": True, "updated_at": "not-a-timestamp",
+    }
+    with events_file.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(bad_event) + "\n")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        drift_items = [it for it in payload["items"] if it["category"] == "onboarding_drift"]
+        by_key = {it["id"].rsplit(":", 1)[-1]: it for it in drift_items}
+        assert by_key["bad-drift"]["age_unknown"] is True
+        assert by_key["known-drift"]["age_unknown"] is False
+        # both are severity=high (blocking=True) - unknown age must sort
+        # FIRST within that band, not last.
+        assert drift_items[0]["id"] == by_key["bad-drift"]["id"], (
+            f"unknown-age item was deprioritized instead of surfaced: {drift_items}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# ----------------------------------------------------- /api/ownership (§4d)
+#
+# Ownership & Accountability Map (docs/PROPOSAL-console-client-sellability.md
+# #7).
+
+def _ownership(base: str) -> dict:
+    with _get(f"{base}/api/ownership") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_ownership_full_registry_shape(tmp_path: Path) -> None:
+    """The full registry - domains with resolved owners/reviewers/curators plus
+    shared_paths - not just the thin per-agent slice /api/state carries."""
+    s = _make_store(tmp_path)
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {
+            "web": {
+                "title": "Web layer",
+                "owners": {"agents": ["alpha"]},
+                "reviewers": {"agents": ["beta"]},
+                "owned_globs": ["src/agenttalk/web.py"],
+                "description": "the dashboard server",
+            },
+        },
+        "shared_paths": [{
+            "glob": "**/pyproject.toml",
+            "category": "package-metadata",
+            "requires": "lead-approval",
+            "default_approvers": {"agents": ["alpha"]},
+        }],
+    }), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        assert set(payload) == {
+            "root", "root_path", "root_info", "target_root_project_id",
+            "domains", "shared_paths", "count",
+        }
+        assert payload["count"] == len(payload["domains"])
+        (domain,) = payload["domains"]
+        assert domain["id"] == "web"
+        assert domain["title"] == "Web layer"
+        assert domain["owners"] == ["alpha"]
+        assert domain["reviewers"] == ["beta"]
+        assert domain["curators"] == []
+        assert domain["owned_globs"] == ["src/agenttalk/web.py"]
+        assert domain["description"] == "the dashboard server"
+        (shared,) = payload["shared_paths"]
+        assert shared["glob"] == "**/pyproject.toml"
+        assert shared["category"] == "package-metadata"
+        assert shared["requires"] == "lead-approval"
+        assert shared["default_approvers"] == ["alpha"]
+        assert shared["default_reviewers"] == []
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_ownership_missing_registry_is_empty_not_error(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        assert payload["domains"] == []
+        assert payload["shared_paths"] == []
+        assert payload["count"] == 0
+        assert "errors" not in payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_ownership_degrades_on_malformed_registry(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    (s.dir / "domains.json").write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        assert payload["domains"] == []
+        assert payload["count"] == 0
+        assert payload["errors"]
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# --------------------------------------------- PR #129 connector findings
+
+def test_api_gates_evidence_cap_keeps_newest_entries(tmp_path: Path) -> None:
+    """PR #129 connector finding (P1, web.py:2881): set_gate APPENDS
+    evidence chronologically, so slicing the cap from the START kept the
+    OLDEST entries - once a gate passed the cap, the wall could show a
+    current green status/updated_at next to evidence that did NOT produce
+    it, while the evidence that DID was cut. Keep the NEWEST and expose
+    the truncated count."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    total = 55
+    for i in range(total):
+        gmod.set_gate(s.root, name="ci", status="green", severity="blocker",
+                      scope="release", actor="alpha", evidence_source="automation_ci",
+                      evidence=[f"ref-{i}"], reason="ok", required=True)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        assert gate["evidence_truncated"] == total - 50, gate["evidence_truncated"]
+        refs = [e["refs"][0] for e in gate["evidence"]]
+        assert refs == [f"ref-{i}" for i in range(total - 50, total)], (
+            f"expected the NEWEST 50 refs, oldest-to-newest within that window: {refs}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_rejects_non_finite_floats(tmp_path: Path) -> None:
+    """PR #129 connector finding (P2, web.py:2840): json.dumps (and Python's
+    loader) accept NaN/Infinity by default, but they are not valid per
+    strict JSON - response.json() in a real browser rejects them outright,
+    failing the WHOLE Gates view for one bad field instead of degrading
+    just that field. Simulates a hand-authored/corrupted gates.json (the
+    public set_gate API already rejects non-finite values, so this can only
+    be reached by writing the file directly)."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="ci", status="green", severity="warn",
+                  scope="release", actor="alpha", evidence_source="local_command",
+                  evidence=["ref"], reason="ok")
+    gates_path = gmod.gates_path(s.root)
+    raw = json.loads(gates_path.read_text(encoding="utf-8"))
+    raw["gates"]["ci"]["evidence"][0]["coverage_percent"] = float("nan")
+    raw["gates"]["ci"]["evidence"][0]["weird_metric"] = float("inf")
+    gates_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/gates") as resp:
+            raw_body = resp.read()
+        assert b"NaN" not in raw_body, "a non-finite float leaked into the JSON response"
+        assert b"Infinity" not in raw_body
+        payload = json.loads(raw_body)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert "coverage_percent" not in entry
+        assert "weird_metric" not in entry
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_expired_non_blocker_waiver_flagged_expired(tmp_path: Path) -> None:
+    """PR #129 connector finding (P2, console.js:2277 - backend half):
+    gates._gate_verdict only sets blocks=true for an expired waiver when
+    severity=blocker; a warn/info gate's expired waiver leaves blocks=false
+    even though reason says "waiver expired or invalid". The server must
+    expose a severity-independent signal for the view to key off."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="docs-freshness", status="red", severity="warn",
+                  scope="release", actor="alpha", evidence_source="local_command",
+                  reason="stale")
+    gmod.waive_gate(s.root, name="docs-freshness", operator="alpha",
+                    reason="known stale, tracked separately", scope="release",
+                    expires="2020-01-01T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        assert gate["severity"] == "warn"
+        assert gate["blocks"] is False, "warn severity never blocks by design"
+        assert gate["waiver_expired"] is True, (
+            f"an expired waiver on a non-blocker gate must still be flagged: {gate}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_derives_real_age_for_gate_and_deadletter(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector finding (P1, web.py:3022): gate_hold_items/
+    dead_letter_items left age_seconds at the _mk_item default (0.0) even
+    though their source records carry updated_at/deadlettered_at - every
+    such risk sorted as newly-created regardless of how long it had been
+    open, materially wrong for two of the register's principal categories."""
+    from agenttalk import gates as gmod
+    from agenttalk.wrapper import recv_api
+
+    s = _make_store(tmp_path)
+    old_iso = "2020-01-01T00:00:00Z"
+    gmod.set_gate(s.root, name="ci", status="red", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  reason="pipeline red", required=True)
+    gates_path = gmod.gates_path(s.root)
+    raw = json.loads(gates_path.read_text(encoding="utf-8"))
+    raw["gates"]["ci"]["updated_at"] = old_iso
+    gates_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    message = s.send(sender="alpha", recipient="beta", body="poison",
+                     kind="message", meta={})
+    record = recv_api.next_record(s, "beta")
+    assert record["id"] == message.id
+    s.dead_letter("beta", record, reason="deterministic",
+                  failure_class="poison_eligible", at=old_iso)
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        gate_items = [it for it in payload["items"] if it["category"] == "gate"]
+        deadletter_items = [it for it in payload["items"] if it["category"] == "deadletter"]
+        six_years = 86400 * 365 * 3
+        assert gate_items and gate_items[0]["age_seconds"] > six_years, (
+            f"gate blocker age must reflect its real updated_at, not 0: {gate_items}")
+        assert deadletter_items and deadletter_items[0]["age_seconds"] > six_years, (
+            f"dead letter age must reflect its real deadlettered_at, not 0: {deadletter_items}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_surfaces_disposition_read_problems_as_partial(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector finding (P2, web.py:2997): read_dispositions
+    already reports malformed/torn/unreadable lines through its second
+    return value - the exact silent-partial-read shape already closed for
+    onboarding (review rq-093f956dd595 B-2). Apply the same pattern here:
+    a damaged defer/resolve record must not leave the register looking
+    authoritative (partial=false) despite known corruption."""
+    from agenttalk import attention as attn_mod
+
+    s = _make_store(tmp_path)
+    disp_path = attn_mod.dispositions_path(s)
+    disp_path.parent.mkdir(parents=True, exist_ok=True)
+    disp_path.write_text("{not valid json\n", encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["partial"] is True, (
+            f"a corrupt dispositions log must be surfaced, not silently dropped: {payload}")
+        assert any("disposition" in d for d in payload["degraded_sources"]), payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_ownership_preserves_long_globs_losslessly(tmp_path: Path) -> None:
+    """PR #129 connector finding (P2, web.py:3183): _envelope_str's 300-char
+    cap silently replaced a long glob's tail with an ellipsis - two DISTINCT
+    long globs could then display identically, and neither would match the
+    path it was meant to. Globs need (near-)lossless transport, not prose
+    truncation."""
+    s = _make_store(tmp_path)
+    long_glob = "src/" + "generated/nested/" * 20 + "*.py"
+    assert len(long_glob) > 300
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {
+            "gen": {"title": "Generated code", "owners": {"agents": ["alpha"]},
+                    "owned_globs": [long_glob]},
+        },
+        "shared_paths": [{
+            "glob": long_glob, "category": "generated", "requires": "lead-approval",
+        }],
+    }), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        (domain,) = payload["domains"]
+        assert domain["owned_globs"] == [long_glob], (
+            "a long owned_globs entry must not be silently truncated")
+        assert domain["owned_globs_truncated"] == 0
+        (shared,) = payload["shared_paths"]
+        assert shared["glob"] == long_glob, (
+            "a long shared_paths glob must not be silently truncated")
+        assert shared["glob_truncated"] is False
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_ownership_flags_globs_still_cut_beyond_the_cap(tmp_path: Path) -> None:
+    """PR #129 connector round-2 finding (web.py:2763 / reviewer-3 F-5):
+    raising the cap to 4096 just MOVES the same silent-truncation threshold
+    - a glob longer than THAT still gets silently altered unless the
+    response says so explicitly."""
+    s = _make_store(tmp_path)
+    huge_glob = "src/" + "x" * 5000 + "/*.py"
+    assert len(huge_glob) > 4096
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {
+            "gen": {"title": "Generated code", "owners": {"agents": ["alpha"]},
+                    "owned_globs": [huge_glob]},
+        },
+        "shared_paths": [{
+            "glob": huge_glob, "category": "generated", "requires": "lead-approval",
+        }],
+    }), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        (domain,) = payload["domains"]
+        assert domain["owned_globs"][0] != huge_glob, "sanity: this glob IS still cut"
+        assert domain["owned_globs_truncated"] == 1, (
+            f"a glob still cut past the 4096 cap must be flagged, not silent: {domain}")
+        (shared,) = payload["shared_paths"]
+        assert shared["glob_truncated"] is True
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_refs_truncation_is_flagged(tmp_path: Path) -> None:
+    """PR #129 connector round-2 finding (P1, web.py:2832): a green blocker
+    gate's validating ref could sit past position 20 in a single evidence
+    entry's refs list and be silently cut - the wall could then present the
+    gate as green with only empty/non-validating refs. Expose the cut count
+    rather than preserving or silently dropping."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    refs = [f"ref-{i}" for i in range(25)]
+    gmod.set_gate(s.root, name="ci", status="green", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  evidence=refs, reason="ok", required=True)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert entry["refs"] == refs[:20]
+        assert entry["refs_truncated"] == 5, entry
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_ref_text_truncation_is_flagged(tmp_path: Path) -> None:
+    """PR #129 connector round-5 (web.py:2839): per-reference envelope
+    truncation (300 chars) was silent - a long evidence URL could be cut
+    into a different, unusable string with no signal it happened. Flag it
+    the same way _glob_str flags a truncated glob."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    long_ref = "https://example.invalid/" + ("x" * 400)
+    gmod.set_gate(s.root, name="ci", status="green", severity="warn",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  evidence=["short-ref", long_ref], reason="ok")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert entry["refs"][0] == "short-ref"
+        assert entry["refs"][1] != long_ref, "a truncated ref must not be presented as complete"
+        assert entry["refs"][1].endswith("…")
+        assert entry["ref_text_truncated"] == 1, entry
+        assert "refs_truncated" not in entry, (
+            f"refs_truncated must not fire for a text-only truncation within the window: {entry}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_refs_truncated_counts_non_str_refs_in_window(tmp_path: Path) -> None:
+    """PR #129 connector round-5 (reviewer-3 F-2): a non-str ref inside the
+    (first 20) window used to be dropped by the `isinstance(r, str)` filter
+    without counting toward refs_truncated - the exact counting fix already
+    made for unparseable evidence entries (evidence_truncated), applied here
+    to refs."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="ci", status="green", severity="warn",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  evidence=["ref-a", "ref-b"], reason="ok")
+    gates_path = gmod.gates_path(s.root)
+    raw = json.loads(gates_path.read_text(encoding="utf-8"))
+    # Two of the (now 4) refs are non-str and must be dropped from `refs` -
+    # but still counted, same shape as F-3's evidence_truncated fix.
+    raw["gates"]["ci"]["evidence"][0]["refs"] = ["ref-a", 42, "ref-b", None]
+    gates_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert entry["refs"] == ["ref-a", "ref-b"]
+        assert entry["refs_truncated"] == 2, (
+            f"2 non-str refs inside the window must count toward refs_truncated: {entry}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_truncated_counts_unparseable_entries(tmp_path: Path) -> None:
+    """PR #129 connector round-2 finding (reviewer-3 F-3): an evidence entry
+    that fails to parse (not a JSON object) was silently dropped without
+    counting toward evidence_truncated - the wall could show fewer entries
+    than the cap implied with no signal that any were lost to a shape
+    problem rather than the cap itself. Also: the truncation notice must
+    still be reachable in the view even when EVERY entry is lost (covered
+    by the console render test)."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="ci", status="green", severity="warn",
+                  scope="release", actor="alpha", evidence_source="local_command",
+                  evidence=["ref"], reason="ok")
+    gates_path = gmod.gates_path(s.root)
+    raw = json.loads(gates_path.read_text(encoding="utf-8"))
+    # 5 of the (now 6) entries are not objects and must fail to parse.
+    raw["gates"]["ci"]["evidence"] = ["not-a-dict"] * 5 + raw["gates"]["ci"]["evidence"]
+    gates_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        assert len(gate["evidence"]) == 1
+        assert gate["evidence_truncated"] == 5, (
+            f"5 unparseable entries must count toward evidence_truncated: {gate}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_surfaces_source_error_items_as_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #129 connector round-2 finding (P1, web.py:3047): a failure inside
+    _collect_web_attention_items becomes a visible, DISPOSITIONABLE
+    SOURCE_ERROR queue item, but that alone didn't mark the register
+    partial - an operator could disposition the warning item away and lose
+    the only signal that a source could not be fully read."""
+    s = _make_store(tmp_path)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("simulated dead-letter read failure")
+    monkeypatch.setattr(s, "list_dead_letters", boom)
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["partial"] is True, (
+            f"a SOURCE_ERROR item must mark the register partial: {payload}")
+        assert any("dead_letter" in d for d in payload["degraded_sources"]), payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_stays_partial_when_source_error_is_deferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #129 connector round-5 (reviewer-3 F-1 + connector P1, web.py:3103):
+    the degraded-source scan used to iterate queue.get("items", []), which is
+    POST-disposition - build_queue excludes DEFERRED items by default, and
+    defer is the ONLY disposition source_error is allowed to have
+    (allowed_action_for_source). So an operator deferring the warning (the
+    only action available to them) made partial flip back to False while the
+    dead-letter source was still genuinely unreadable. The scan must inspect
+    the raw collected items, before dispositions are applied."""
+    from agenttalk import attention as att
+
+    s = _make_store(tmp_path)
+
+    error_text = "simulated dead-letter read failure"
+
+    def boom(*_args, **_kwargs):
+        raise OSError(error_text)
+    monkeypatch.setattr(s, "list_dead_letters", boom)
+
+    item_id = att.item_id(att.SOURCE_ERROR, "dead_letter")
+    src_hash = att.source_hash({"source": "dead_letter", "error": error_text[:200]})
+    att.append_disposition(s, {
+        "schema_version": 1, "event_id": "att-defer-1", "item_id": item_id,
+        "source": att.SOURCE_ERROR, "action": att.ACTION_DEFER, "actor": "claude",
+        "reason": "operator deferred while investigating", "at": "2026-01-01T00:00:00Z",
+        "until": "2099-01-01T00:00:00Z",
+        "source_snapshot": {"source_hash": src_hash, "refs": []},
+    })
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert not any(it["id"].startswith("source_error:") for it in payload["items"]), (
+            f"the deferred source_error item must NOT still be a visible queue item: {payload}")
+        assert payload["partial"] is True, (
+            f"a DEFERRED source_error must still mark the register partial - the source "
+            f"is still genuinely unreadable even though the warning item is hidden: {payload}")
+        assert any("dead_letter" in d for d in payload["degraded_sources"]), payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_treats_future_onboarding_timestamp_as_unknown(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector round-2 finding (P2, web.py:3156): a bounded but
+    parseable FUTURE updated_at (a skewed external writer) produced a
+    negative age, which read as "known" - clamped to 0s on the wire and
+    sorted to the LEAST urgent end of its severity band, the opposite of
+    the fail-safe "unknown is not safe" treatment an unparseable timestamp
+    already gets."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="future-drift", status="open",
+        summary="from a clock-skewed writer", actor="alpha", blocking=True,
+        at="2030-01-01T00:00:00Z"))
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        drift_items = [it for it in payload["items"] if it["category"] == "onboarding_drift"]
+        (item,) = drift_items
+        assert item["age_unknown"] is True, (
+            f"a future timestamp must be treated as unknown, not a negative-then-clamped "
+            f"age: {item}")
+        assert item["age_seconds"] == 0.0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_console_boot_polls_gates_and_risk_register(tmp_path: Path) -> None:
+    """PR #129 connector round-2 finding (P1, console.js:4521): Gates and
+    Risk Register used to be fetched once (boot/root-entry/navigation) and
+    never again while the view stayed open, so an operator watching either
+    screen kept seeing a stale all-clear/count indefinitely. boot() must
+    wire both through the SAME completion-driven startEndpointPoll loop as
+    state/attention/lead-chat/intents - that generic mechanism is already
+    behaviorally proven by
+    test_console_poll_waits_for_slow_endpoint_before_rescheduling; this
+    guards the wiring itself landing (and staying) inside boot()."""
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    boot_marker = "  function boot() {\n"
+    assert boot_marker in src
+    boot_start = src.index(boot_marker)
+    boot_end = src.index("\n  }\n", boot_start)
+    boot_body = src[boot_start:boot_end]
+    assert "startEndpointPoll(fetchGates)" in boot_body, boot_body
+    assert "startEndpointPoll(fetchRiskRegister)" in boot_body, boot_body
+
+
+def test_console_fetch_gates_and_risk_register_return_their_promise_to_the_poller(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector round-5 (console.js:4387): fetchGates and
+    fetchRiskRegister built their fetch().then(...) chain but never
+    RETURNED it. startEndpointPoll's run() does
+    `Promise.resolve(request).then(scheduleNext, scheduleNext)` - with
+    `request` left undefined, that resolves immediately, so the next poll
+    was scheduled right away instead of after the in-flight request
+    settled (the exact stacking bug #207/test_console_poll_waits_for_slow_
+    endpoint_before_rescheduling proved the generic mechanism prevents,
+    but only if the fetcher cooperates by returning its promise)."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console polling test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ boot\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    startEndpointPoll: startEndpointPoll,\n"
+        "    fetchGates: fetchGates,\n"
+        "    fetchRiskRegister: fetchRiskRegister,\n"
+        "    setup: function (root) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-poll-gates-risk.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-poll-gates-risk.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+async function run(fetcherName, urlFragment, jsonBody) {
+  const timers = [];
+  const resolvers = [];
+  let fetchCalls = 0;
+  const ctx = {
+    console,
+    document: { readyState: 'loading', addEventListener() {} },
+    localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+    performance: { now() { return 0; } },
+    setTimeout(fn, delay) { timers.push({ fn, delay }); },
+    setInterval() { throw new Error('data polling must not use setInterval'); },
+    clearInterval() {},
+    fetch(url) {
+      if (!String(url).includes(urlFragment)) {
+        throw new Error(`unexpected fetch url for ${fetcherName}: ${url}`);
+      }
+      fetchCalls += 1;
+      return new Promise((resolve) => resolvers.push(resolve));
+    },
+    __agenttalkConsoleTestHooks: null,
+  };
+  ctx.globalThis = ctx;
+  ctx.window = ctx;
+  vm.createContext(ctx);
+  vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+  const hooks = ctx.__agenttalkConsoleTestHooks;
+  hooks.setup({ label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] });
+
+  async function flush() { for (let i = 0; i < 8; i += 1) await Promise.resolve(); }
+
+  hooks.startEndpointPoll(hooks[fetcherName]);
+  if (fetchCalls !== 1 || timers.length !== 0) {
+    throw new Error(`${fetcherName}: poll stacked before settlement: calls=${fetchCalls}, timers=${timers.length}`);
+  }
+  await flush();
+  if (fetchCalls !== 1 || timers.length !== 0) {
+    throw new Error(`${fetcherName} did not return its fetch promise to startEndpointPoll - the next poll ` +
+      `was scheduled before the in-flight request settled: calls=${fetchCalls}, timers=${timers.length}`);
+  }
+  resolvers.shift()({ ok: true, json: () => Promise.resolve(jsonBody) });
+  await flush();
+  if (timers.length !== 1 || timers[0].delay !== 2000) {
+    throw new Error(`${fetcherName}: next poll was not delayed after settlement: ${JSON.stringify(timers)}`);
+  }
+}
+
+(async () => {
+  await run('fetchGates', '/api/gates',
+    { target_root_project_id: 'project-demo', verdict: 'GO', required_gates: [], gates: [], count: 0 });
+  await run('fetchRiskRegister', '/api/risk-register',
+    { target_root_project_id: 'project-demo', items: [], count: 0, truncated: 0, partial: false,
+      degraded_sources: [] });
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_gates_and_risk_register_show_stale_badge_on_outage(tmp_path: Path) -> None:
+    """PR #129 connector round-5 (P1, console.js:4377, judgment call): a
+    failing gates/risk-register poll silently keeps rendering the last-good
+    payload with nothing on those views themselves signalling that it
+    stopped updating (only the global topbar tracks /api/state freshness).
+    Bounded fix: reuse stampAuxPayload/_receivedAt (already added to
+    fetchGates/fetchRiskRegister this round) plus the same freshness-window
+    check attentionKnownFrom uses, surfaced as a STALE chip on each view."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the stale-badge render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkStaleBadgeHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, view, gates, riskRegister) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      gatesData = gates;\n"
+        "      riskRegisterData = riskRegister;\n"
+        "      state.view = view;\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-stale-badge.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(), children: [], parentNode: null,
+    className: '', textContent: '', attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function findAllByClass(node, cls, out) {
+  if (hasClass(node, cls)) out.push(node);
+  for (const child of node.children || []) findAllByClass(child, cls, out);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading', createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {}, getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; }, querySelectorAll() { return []; },
+};
+let clock = 0;
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return clock; } },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkStaleBadgeHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkStaleBadgeHooks;
+
+const root = { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] };
+const gatesFresh = { verdict: 'GO', required_gates: [], gates: [], count: 0, _receivedAt: 0 };
+const riskFresh = { items: [], count: 0, truncated: 0, partial: false, degraded_sources: [], _receivedAt: 0 };
+
+// Just-received payload (clock === _receivedAt): no stale badge.
+clock = 0;
+main.children = [];  // this mock's clear() needs firstChild/removeChild it doesn't implement
+hooks.setup(root, 'gates', gatesFresh, riskFresh);
+hooks.renderActiveView();
+assert(findAllByClass(main, 'is-stale', []).length === 0,
+  'a freshly-received gates payload must not render the STALE badge');
+
+// Poll has been failing for well past the freshness window (4 * POLL_MS = 8000ms).
+clock = 60000;
+main.children = [];
+hooks.setup(root, 'gates', gatesFresh, riskFresh);
+hooks.renderActiveView();
+const gateStale = findAllByClass(main, 'is-stale', []);
+assert(gateStale.length === 1, `expected one STALE badge on an outage-aged gates view, got ${gateStale.length}`);
+assert(gateStale[0].textContent === 'STALE', `expected the badge text to read STALE, got: ${gateStale[0].textContent}`);
+
+main.children = [];
+hooks.setup(root, 'risk-register', gatesFresh, riskFresh);
+hooks.renderActiveView();
+const riskStale = findAllByClass(main, 'is-stale', []);
+assert(riskStale.length === 1,
+  `expected exactly one STALE badge on an outage-aged risk register view, got ${riskStale.length}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
