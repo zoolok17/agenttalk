@@ -2268,12 +2268,16 @@
     waived_expired: 'WAIVED (EXPIRED)',
   });
   // A waiver that no longer covers the gate (gates._gate_verdict: status stays
-  // "waived" but blocks=true, reason="waiver expired or invalid") must NOT
-  // read as the calm purple "WAIVED" state - it is back to blocking (review
-  // rq-a7038d8175f2 finding 2). This is the one place status alone is not
-  // enough; every other card/chip class keys off gate.status directly.
+  // "waived" but reason="waiver expired or invalid") must NOT read as the
+  // calm purple "WAIVED" state (review rq-a7038d8175f2 finding 2). PR #129
+  // connector finding: `blocks` alone under-detects this - _gate_verdict
+  // only sets blocks=true for severity=blocker; an expired warn/info waiver
+  // stays blocks=false. The server now derives `waiver_expired`
+  // severity-independently; prefer it, with `blocks` as a fallback for an
+  // older payload shape.
   function gateVisualState(gate) {
-    if (gate.status === 'waived' && gate.blocks) return 'waived_expired';
+    var expired = 'waiver_expired' in gate ? gate.waiver_expired : gate.blocks;
+    if (gate.status === 'waived' && expired) return 'waived_expired';
     return gate.status || 'unknown';
   }
 
@@ -2348,6 +2352,22 @@
         if (isArray(e.refs) && e.refs.length) {
           evBox.appendChild(el('div', 'tc-gate-evidence-refs', e.refs.join(', ')));
         }
+        // PR #129 connector finding: the API forwards every OTHER
+        // evidence_details field too (coverage_percent, pr_url, ...) - this
+        // used to only ever render source/by/at/refs, hiding the actual
+        // proof a gate relied on even though it was present in the payload.
+        var extraKeys = Object.keys(e).filter(function (k) {
+          return k !== 'source' && k !== 'refs' && k !== 'at' && k !== 'by';
+        }).sort();
+        for (var j = 0; j < extraKeys.length; j++) {
+          var k = extraKeys[j];
+          evBox.appendChild(el('div', 'tc-gate-evidence-row', k + ': ' + e[k]));
+        }
+      }
+      if (gate.evidence_truncated) {
+        evBox.appendChild(el('div', 'tc-gate-evidence-refs',
+          gate.evidence_truncated + ' older evidence entr' +
+          (gate.evidence_truncated === 1 ? 'y' : 'ies') + ' not shown.'));
       }
       card.appendChild(evBox);
     }
@@ -4318,6 +4338,11 @@
     }).then(function (data) {
       if (riskRegisterPending === requestKey) riskRegisterPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      // PR #129 connector finding: unlike every other payload with relative
+      // ages, this fetch skipped stampAuxPayload, so risk items never got
+      // _receivedAt and the 1s updateAges loop kept reconstructing the same
+      // (zero-elapsed) age - every displayed age froze at fetch time.
+      stampAuxPayload(data);
       riskRegisterData = data;
       renderSidebar();
       if (state.view === 'risk-register') renderActiveViewFromPoll();

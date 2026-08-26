@@ -1340,11 +1340,29 @@ def process_tree_hold_items(
     return out
 
 
-def dead_letter_items(entries: list[dict]) -> list[dict]:
+def _age_seconds_from_iso(value: Any, now_epoch: float | None) -> float:
+    """Seconds between an ISO-8601 marker and ``now_epoch`` (0.0 if either is
+    missing/unparseable - fail-safe, never raises). PR #129 connector finding
+    (web.py:3022): a source record that carries its own timestamp must not
+    silently present as "0 seconds old" just because the caller didn't wire
+    a clock through."""
+    if now_epoch is None:
+        return 0.0
+    dt = parse_iso_dt(value)
+    if dt is None:
+        return 0.0
+    return max(0.0, now_epoch - dt.timestamp())
+
+
+def dead_letter_items(entries: list[dict], *, now_epoch: float | None = None) -> list[dict]:
     """Build items from canonical dead-letter entries.
 
     Resolution filtering is applied centrally by ``build_queue`` against each
     entry's source snapshot, so callers pass both resolved and unresolved rows.
+    ``now_epoch`` (optional, keyword-only): derives ``age_seconds`` from the
+    entry's own ``deadlettered_at`` instead of leaving the ``_mk_item``
+    default of 0.0 - omit for a pure/deterministic call (defaults to 0.0,
+    unchanged from before).
     """
     out = []
     for e in entries:
@@ -1354,6 +1372,7 @@ def dead_letter_items(entries: list[dict]) -> list[dict]:
                       title=f"dead-letter: {ag}/{mid}",
                       ident_content=ident,
                       human_can_unblock_now=True,
+                      age_seconds=_age_seconds_from_iso(e.get("deadlettered_at"), now_epoch),
                       fields={"why_it_matters": "a required message could not be delivered",
                               "priority": "high"},
                       source_refs=[{"kind": "dead_letter", "agent": ag, "message_id": mid}])
@@ -1362,8 +1381,11 @@ def dead_letter_items(entries: list[dict]) -> list[dict]:
     return out
 
 
-def gate_hold_items(blockers: list[dict], *, scope: str = "release") -> list[dict]:
-    """Each blocker: gates.check_gates()[...] item {name, reason, scope, ...}."""
+def gate_hold_items(blockers: list[dict], *, scope: str = "release",
+                    now_epoch: float | None = None) -> list[dict]:
+    """Each blocker: gates.check_gates()[...] item {name, reason, scope, ...}.
+    ``now_epoch`` (optional, keyword-only): derives ``age_seconds`` from the
+    blocker's own ``updated_at`` - see ``dead_letter_items``."""
     out = []
     for b in blockers:
         name = b.get("name", "")
@@ -1372,6 +1394,7 @@ def gate_hold_items(blockers: list[dict], *, scope: str = "release") -> list[dic
                       title=f"gate HOLD: {name} ({sc})",
                       ident_content={"scope": sc, "name": name, "reason": b.get("reason")},
                       human_can_unblock_now=True,
+                      age_seconds=_age_seconds_from_iso(b.get("updated_at"), now_epoch),
                       fields={"why_it_matters": b.get("reason") or "", "priority": "high"},
                       source_refs=[{"kind": "gate", "scope": sc, "name": name}])
         it["dedupe_key"] = dedupe_key(SOURCE_GATE_HOLD, identity=f"{sc}:{name}")
