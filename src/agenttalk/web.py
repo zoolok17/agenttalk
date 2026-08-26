@@ -2753,15 +2753,22 @@ def _envelope_str(value: Any) -> str:
 # globs display identically (PR #129 connector finding, web.py:3183). Bound
 # it much more generously - effectively lossless for any realistic
 # repo-relative pattern - while still capping a corrupted/pathological value.
+# PR #129 connector round-2 (web.py:2763, folds in reviewer-3 F-5): raising
+# the cap from _ENVELOPE_MAX to this alone just MOVES the same silent-
+# truncation threshold rather than removing it - a >4096-char glob would
+# still be silently altered. _glob_str now returns whether it truncated so
+# the caller can expose that explicitly instead of claiming losslessness it
+# cannot guarantee.
 _GLOB_MAX = 4096
 
 
-def _glob_str(value: Any) -> str:
+def _glob_str(value: Any) -> tuple[str, bool]:
+    """Returns ``(bounded_glob, truncated)``."""
     s = "" if value is None else str(value)
     s = s.replace("\r", " ").replace("\n", " ").strip()
     if len(s) > _GLOB_MAX:
-        s = s[:_GLOB_MAX]
-    return s
+        return s[:_GLOB_MAX], True
+    return s, False
 
 
 def _operator_command_str(value: Any) -> str:
@@ -2830,6 +2837,14 @@ def _gate_evidence_entry(entry: Any) -> dict | None:
         out["refs"] = [
             _envelope_str(r) for r in refs[:_GATE_EVIDENCE_REFS_MAX] if isinstance(r, str)
         ]
+        # PR #129 connector round-2 finding (P1, web.py:2832): a green
+        # blocker gate's VALIDATING ref could sit past position 20 and be
+        # silently cut, presenting the gate as green with only empty/
+        # non-validating refs visible. Preserving every ref isn't safe
+        # (unbounded), so expose the cut count instead - the wall can no
+        # longer imply it received the complete proof without saying so.
+        if len(refs) > _GATE_EVIDENCE_REFS_MAX:
+            out["refs_truncated"] = len(refs) - _GATE_EVIDENCE_REFS_MAX
     at = entry.get("at")
     if isinstance(at, str):
         out["at"] = _envelope_str(at)
@@ -2897,8 +2912,15 @@ def build_gates(desc: RootDescriptor) -> dict:
     try:
         from agenttalk import gates as _gates
 
-        checked = _gates.check_gates(store.root)
+        # PR #129 connector round-2 finding (P2, web.py:2901): check_gates()
+        # and load_gate_state() used to be TWO separate reads - a set_gate()
+        # commit landing between them could combine the verdict/status from
+        # the FIRST snapshot with evidence/waiver data from the SECOND
+        # (green beside proof that didn't produce it, or green with no
+        # proof at all). Load once, derive the verdict from that exact
+        # snapshot.
         raw_state = _gates.load_gate_state(store.root)
+        checked = _gates.check_gates(store.root, state=raw_state)
         raw_gates = raw_state.get("gates")
         if not isinstance(raw_gates, dict):
             raw_gates = {}
@@ -2917,11 +2939,25 @@ def build_gates(desc: RootDescriptor) -> dict:
                 # current green status/updated_at next to evidence that did
                 # NOT produce it, while the evidence that actually did was
                 # cut. Keep the NEWEST entries and expose the cut count.
-                evidence_truncated = max(0, len(evidence_raw) - _GATE_EVIDENCE_MAX_ENTRIES)
-                for entry in evidence_raw[-_GATE_EVIDENCE_MAX_ENTRIES:]:
+                # L-1 (review rq-1a23fd25053d): guard cap<=0 explicitly -
+                # Python's ``xs[-0:]`` is ``xs[0:]`` (the WHOLE list, not
+                # nothing), so a naive ``evidence_raw[-cap:]`` would silently
+                # return everything if the cap constant were ever 0.
+                cap = _GATE_EVIDENCE_MAX_ENTRIES
+                evidence_truncated = max(0, len(evidence_raw) - cap)
+                newest = evidence_raw[-cap:] if cap > 0 else []
+                for entry in newest:
                     parsed = _gate_evidence_entry(entry)
                     if parsed is not None:
                         evidence.append(parsed)
+                    else:
+                        # F-3 (review rq-1a23fd25053d): an entry that fails
+                        # to parse (not a dict) was silently dropped without
+                        # counting toward evidence_truncated - the wall
+                        # could then show FEWER entries than the cap implied
+                        # with no signal that any were lost to a shape
+                        # problem rather than the cap itself.
+                        evidence_truncated += 1
             reason = _envelope_str(item.get("reason") or "")
             waiver = item.get("waiver")
             wire.append({
@@ -2942,7 +2978,11 @@ def build_gates(desc: RootDescriptor) -> dict:
                 # expired warn/info waiver even though it sets this exact
                 # reason string. A severity-independent signal so the view
                 # doesn't need blocks as a (wrong, for warn/info) proxy.
-                "waiver_expired": bool(waiver) and reason == "waiver expired or invalid",
+                # F-4 (review rq-1a23fd25053d): derived from gates.
+                # WAIVER_EXPIRED_REASON, the SAME constant gates.py:343 sets
+                # this reason to, not a separately-typed literal that could
+                # drift out of sync.
+                "waiver_expired": bool(waiver) and reason == _gates.WAIVER_EXPIRED_REASON,
             })
         return {
             "root": desc.label,
@@ -3060,6 +3100,16 @@ def build_risk_register(desc: RootDescriptor) -> dict:
         risks: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
+            if src == _attention.SOURCE_ERROR:
+                # PR #129 connector finding (P1, web.py:3047): a source-read
+                # failure inside _collect_web_attention_items becomes a
+                # visible, DISPOSITIONABLE SOURCE_ERROR item - an operator
+                # can defer/dismiss it away, silently losing the only
+                # signal that the register could not fully enumerate. Mark
+                # the failure into degraded_sources directly so partial
+                # does not depend on that warning item still being present.
+                degraded.append(_envelope_str(
+                    it.get("title") or "attention source unavailable"))
             mapped = _ATTENTION_SOURCE_MAP.get(src)
             if mapped is None:
                 continue  # unknown internal source — skip rather than mislabel
@@ -3071,6 +3121,12 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             # (review rq-a7038d8175f2 finding 1).
             severity = _RISK_SEVERITY_FROM_TYPED.get(
                 it.get("risk_severity"), coarse_severity)
+            # age_unknown (review rq-1a23fd25053d F-2): gate/dead-letter
+            # items now stamp this via attention._age_seconds_from_iso when
+            # their source timestamp was missing/unparseable/future -
+            # every other source leaves it absent, i.e. known.
+            age_unknown = bool(it.get("age_unknown"))
+            age_seconds = float(it.get("age_seconds") or 0)
             risks.append({
                 "id": it.get("item_id", ""),
                 "category": wire_source,
@@ -3085,8 +3141,10 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 # needed" category) don't lose their owner column entirely.
                 "owner": _attention_agent(it) or it.get("requester") or None,
                 "detail": _envelope_str(it.get("why_it_matters") or ""),
-                "age_seconds": float(it.get("age_seconds") or 0),
+                "age_seconds": age_seconds,
+                "age_unknown": age_unknown,
                 "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
+                "_sort_age": float("inf") if age_unknown else age_seconds,
             })
         try:
             agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
@@ -3095,6 +3153,7 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             agents = []
             degraded.append(_envelope_str(f"stuck_agents: {e}"))
         for stuck in _derive_stuck_items(agents, now=now):
+            stuck_age = float(stuck.get("age_seconds") or 0)
             risks.append({
                 "id": stuck["id"],
                 "category": "stuck",
@@ -3103,8 +3162,10 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 "title": _envelope_str(stuck.get("title") or ""),
                 "owner": stuck.get("agent"),
                 "detail": _envelope_str(stuck.get("detail") or ""),
-                "age_seconds": float(stuck.get("age_seconds") or 0),
+                "age_seconds": stuck_age,
+                "age_unknown": False,
                 "human_can_unblock_now": bool(stuck.get("human_can_unblock_now")),
+                "_sort_age": stuck_age,
             })
         try:
             # limit=None, NOT build_onboarding(desc) - that helper caps at
@@ -3134,6 +3195,17 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                         if not isinstance(rec, dict) or rec.get("status") != "open":
                             continue
                         age = _age_seconds_of(rec.get("updated_at"), now=now)
+                        if age is not None and age < 0:
+                            # PR #129 connector finding (web.py:3156): a
+                            # bounded-but-future updated_at (a skewed
+                            # external writer) parses fine and produces a
+                            # NEGATIVE age - treating that as "known" clamps
+                            # display to 0s and sorts it to the LEAST urgent
+                            # end of its band, the opposite of the fail-safe
+                            # "unknown is not safe" treatment an unparseable
+                            # timestamp already gets. Route it through the
+                            # exact same unknown-age path.
+                            age = None
                         blocking = bool(rec.get("blocking"))
                         owner = rec.get("owner") or rec.get("actor") or None
                         risks.append({
@@ -3238,23 +3310,35 @@ def build_ownership(desc: RootDescriptor) -> dict:
         for did, dentry in sorted((data.get("domains") or {}).items()):
             if not isinstance(dentry, dict):
                 continue
+            owned_globs: list[str] = []
+            owned_globs_truncated = 0
+            for g in (dentry.get("owned_globs") or []):
+                bounded, glob_cut = _glob_str(g)
+                owned_globs.append(bounded)
+                if glob_cut:
+                    owned_globs_truncated += 1
             domains.append({
                 "id": _envelope_str(did),
                 "title": _envelope_str(dentry.get("title") or did),
                 "owners": _domains.resolve_refset(dentry.get("owners") or {}, cfg),
                 "reviewers": _domains.resolve_refset(dentry.get("reviewers") or {}, cfg),
                 "curators": _domains.resolve_refset(dentry.get("curators") or {}, cfg),
-                "owned_globs": [
-                    _glob_str(g) for g in (dentry.get("owned_globs") or [])
-                ],
+                "owned_globs": owned_globs,
+                # PR #129 connector round-2 (web.py:2763 / reviewer-3 F-5): a
+                # count of how many of THIS domain's globs were still cut by
+                # _GLOB_MAX, so a client never has to trust "long enough" -
+                # it can see when it wasn't.
+                "owned_globs_truncated": owned_globs_truncated,
                 "description": _envelope_str(dentry.get("description") or ""),
             })
         shared_paths: list[dict] = []
         for entry in data.get("shared_paths") or []:
             if not isinstance(entry, dict):
                 continue
+            glob_bounded, glob_truncated = _glob_str(entry.get("glob") or "")
             shared_paths.append({
-                "glob": _glob_str(entry.get("glob") or ""),
+                "glob": glob_bounded,
+                "glob_truncated": glob_truncated,
                 "category": _envelope_str(entry.get("category") or ""),
                 "requires": _envelope_str(entry.get("requires") or ""),
                 "default_reviewers": _domains.resolve_refset(

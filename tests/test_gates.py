@@ -305,3 +305,48 @@ def test_missing_file_is_empty_go(tmp_path: Path) -> None:
     root = _root(tmp_path)
     res = gates.check_gates(root, scope="release")
     assert res["verdict"] == "GO" and res["required_gates"] == []
+
+
+def test_check_gates_uses_provided_state_snapshot_not_a_fresh_read(tmp_path: Path) -> None:
+    """PR #129 connector round-2 finding (P2, web.py:2901): web.py's
+    build_gates used to call check_gates() and load_gate_state() as TWO
+    separate reads - a set_gate() commit landing between them could combine
+    a verdict from the first snapshot with evidence from the second (green
+    beside proof that did not produce it, or green with no proof at all).
+    check_gates(state=...) must derive the verdict from the EXACT snapshot
+    passed in, never re-reading the file itself."""
+    root = _root(tmp_path)
+    gates.set_gate(root, name="ci", status="green", severity="blocker",
+                   scope="release", actor="alpha", evidence_source="automation_ci",
+                   evidence=["ref"], reason="ok", required=True)
+    snapshot = gates.load_gate_state(root)
+    # Simulate a concurrent write landing AFTER the snapshot was taken.
+    gates.set_gate(root, name="ci", status="red", severity="blocker",
+                   scope="release", actor="alpha", evidence_source="local_command",
+                   reason="broke")
+    from_snapshot = gates.check_gates(root, state=snapshot)
+    assert from_snapshot["gates"][0]["status"] == "green", (
+        "check_gates(state=snapshot) must reflect the SNAPSHOT, not the live file")
+    # Sanity: a fresh (no state=) read still sees the newer write - the
+    # default behavior is unchanged for every OTHER caller.
+    fresh = gates.check_gates(root)
+    assert fresh["gates"][0]["status"] == "red"
+
+
+def test_waiver_expired_reason_constant_matches_gate_verdict(tmp_path: Path) -> None:
+    """PR #129 connector round-2 (reviewer-3 F-4): web.py derives its
+    waiver_expired signal by comparing a gate's verdict reason against
+    gates.WAIVER_EXPIRED_REASON. Link the two directly so they can never
+    silently drift apart - this is the exact reason _gate_verdict sets for
+    an inactive waiver."""
+    root = _root(tmp_path)
+    gates.set_gate(root, name="ci", status="red", severity="warn",
+                   scope="release", actor="alpha", evidence_source="local_command",
+                   reason="stale")
+    gates.waive_gate(root, name="ci", operator="alpha", reason="tracked separately",
+                     scope="release", expires="2020-01-01T00:00:00Z")
+    checked = gates.check_gates(root)
+    (gate,) = checked["gates"]
+    assert gate["reason"] == gates.WAIVER_EXPIRED_REASON, (
+        "an expired waiver's verdict reason must be the shared constant, "
+        f"not a separately-typed literal: {gate['reason']!r}")
