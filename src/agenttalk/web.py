@@ -2819,14 +2819,20 @@ def _gate_evidence_entry(entry: Any) -> dict | None:
     # field list isn't viable here. Bound the KEY the same way every value is
     # already bounded, and cap how many extra keys ride one entry (entries
     # themselves are already capped at _GATE_EVIDENCE_MAX_ENTRIES).
+    #
+    # R-1 (review rq-e05589aa3c80, follow-up on F-2): the reserved-name and
+    # duplicate check MUST run on the bounded key, not the raw one - a raw
+    # key like "source " (trailing space) or two long keys sharing the same
+    # 64-char prefix are DISTINCT raw keys but collide once bounded, and
+    # checking the raw key let a collision silently overwrite an
+    # already-populated field (the canonical "source" in the first case).
+    # Skip on collision (first write wins) rather than overwrite.
     extra_keys = 0
     for key, value in entry.items():
-        if key in ("source", "refs", "at", "by") or key in out:
-            continue
         if not isinstance(key, str) or extra_keys >= _GATE_EVIDENCE_EXTRA_KEYS_MAX:
             continue
         bounded_key = _envelope_str(key)[:_GATE_EVIDENCE_KEY_MAX]
-        if not bounded_key:
+        if not bounded_key or bounded_key in ("source", "refs", "at", "by") or bounded_key in out:
             continue
         if isinstance(value, str):
             out[bounded_key] = _envelope_str(value)

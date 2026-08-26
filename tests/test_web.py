@@ -6589,6 +6589,42 @@ def test_api_gates_shape_evidence_and_waiver(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_api_gates_evidence_key_bounding_does_not_collide(tmp_path: Path) -> None:
+    """review rq-e05589aa3c80 R-1: a bounded evidence key must not silently
+    overwrite an already-populated field (a whitespace-padded "source "
+    collapsing onto the canonical "source" once _envelope_str strips it),
+    and two distinct long keys that share the same 64-char prefix must not
+    silently merge - first write wins, neither overwrites the other."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    long_prefix = "x" * 64
+    gmod.set_gate(
+        s.root, name="ci", status="green", severity="blocker", scope="release",
+        actor="alpha", evidence_source="automation_ci", evidence=["ref1"],
+        evidence_details={
+            "source ": "SHADOWED",
+            f"{long_prefix}-one": "first",
+            f"{long_prefix}-two": "second",
+        },
+        required=True,
+    )
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert entry["source"] == "automation_ci", (
+            f"the canonical 'source' field must survive a whitespace-padded "
+            f"colliding key: {entry}")
+        assert entry.get(long_prefix) == "first", (
+            f"two keys sharing a 64-char prefix must not silently merge "
+            f"(first write should win): {entry}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_gates_missing_required_gate_blocks(tmp_path: Path) -> None:
     from agenttalk import gates as gmod
 
