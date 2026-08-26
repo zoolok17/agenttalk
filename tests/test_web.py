@@ -3381,6 +3381,245 @@ assert(text.includes('Waiver expired'),
                    capture_output=True, text=True)
 
 
+def test_console_gate_card_renders_evidence_details_and_nonblocker_waiver_expiry(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector findings (P2 x2):
+    1. gateCard only ever rendered evidence.source/by/at/refs, hiding any
+       evidence_details field the API deliberately forwards (coverage_percent,
+       pr_url, ...) even though it is present in the response.
+    2. gateVisualState used `blocks` as the sole expiry test, but
+       gates._gate_verdict only sets blocks=true for an expired waiver when
+       severity=blocker - a warn/info gate's expired waiver stayed blocks=false
+       and rendered as the calm WAIVED state. The server-derived
+       `waiver_expired` field is severity-independent; this renders a WARN
+       gate with an expired waiver and blocks=false."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the gate-card render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkGatesTestHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, gates) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      gatesData = gates;\n"
+        "      state.view = 'gates';\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-gates-2.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    className: '',
+    textContent: '',
+    attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function findAllByClass(node, cls, out) {
+  if (hasClass(node, cls)) out.push(node);
+  for (const child of node.children || []) findAllByClass(child, cls, out);
+  return out;
+}
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += ' ' + collectText(child);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading',
+  createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {},
+  getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkGatesTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkGatesTestHooks;
+
+hooks.setup(
+  { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] },
+  {
+    root: 'demo', verdict: 'HOLD', required_gates: [],
+    gates: [
+      {
+        name: 'coverage', status: 'green', severity: 'blocker', scope: 'release',
+        blocks: false, reason: '', updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha',
+        evidence: [{
+          source: 'automation_ci', by: 'alpha', at: '2026-01-01T00:00:00Z',
+          refs: ['ci-run-1'], coverage_percent: 91.5, pr_url: 'https://example.invalid/pr/1',
+        }],
+        evidence_truncated: 0, waiver: null, waiver_expired: false,
+      },
+      {
+        name: 'docs-freshness', status: 'waived', severity: 'warn', scope: 'release',
+        blocks: false, reason: 'waiver expired or invalid',
+        updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha',
+        evidence: [], evidence_truncated: 0,
+        waiver: {
+          operator: 'alpha', date: '2025-01-01T00:00:00Z',
+          reason: 'known stale, tracked separately', scope: 'release',
+          expires: '2020-01-01T00:00:00Z',
+        },
+        waiver_expired: true,
+      },
+    ],
+    count: 2,
+  },
+);
+hooks.renderActiveView();
+
+const cards = findAllByClass(main, 'tc-gate-card', []);
+assert(cards.length === 2, `expected two gate cards, got ${cards.length}`);
+
+const coverageText = collectText(cards[0]);
+assert(coverageText.includes('coverage_percent: 91.5'),
+  `expected the forwarded coverage_percent evidence detail, got: ${coverageText}`);
+assert(coverageText.includes('pr_url: https://example.invalid/pr/1'),
+  `expected the forwarded pr_url evidence detail, got: ${coverageText}`);
+
+const docsCard = cards[1];
+assert(hasClass(docsCard, 'gate-waived_expired'),
+  `a WARN-severity gate with an expired (blocks=false) waiver must still render ` +
+  `gate-waived_expired, got class=${docsCard.className}`);
+assert(!hasClass(docsCard, 'gate-waived'),
+  'expired non-blocker waiver must NOT carry the calm gate-waived class');
+const docsText = collectText(docsCard);
+assert(docsText.includes('WAIVED (EXPIRED)'), `expected the expired label, got: ${docsText}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_fetch_risk_register_stamps_payload_timing(tmp_path: Path) -> None:
+    """PR #129 connector finding (P2, console.js:4321): unlike every other
+    payload carrying relative ages, fetchRiskRegister skipped
+    stampAuxPayload, so items never received _receivedAt - liveAge()'s
+    elapsed-time term (monotonicNow() - item._receivedAt) always fell back
+    to 0, so the 1s updateAges loop kept reconstructing the SAME age
+    forever. Assert every fetched item now carries a numeric _receivedAt."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the risk-register fetch-stamp test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkRiskRegisterFetchHooks = {\n"
+        "    setup: function (root) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "    },\n"
+        "    fetchRiskRegister: fetchRiskRegister,\n"
+        "    snapshot: function () { return riskRegisterData; }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-risk-register-fetch.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 1000; } },
+  setInterval() {}, clearInterval() {},
+  fetch(_url) {
+    return Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        root_info: { project_id: 'project-demo' },
+        target_root_project_id: 'project-demo',
+        items: [{
+          id: 'gate:release:ci', category: 'gate', category_label: 'Gate blocker',
+          severity: 'high', title: 'ci', owner: null, detail: '',
+          age_seconds: 30, human_can_unblock_now: true,
+        }],
+        count: 1, truncated: 0, partial: false, degraded_sources: [],
+      }),
+    });
+  },
+  __agenttalkRiskRegisterFetchHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkRiskRegisterFetchHooks;
+
+hooks.setup({ label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] });
+
+(async () => {
+  hooks.fetchRiskRegister();
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  const data = hooks.snapshot();
+  assert(data, 'riskRegisterData was never set');
+  assert(typeof data._receivedAt === 'number',
+    `expected the payload itself to carry _receivedAt, got: ${JSON.stringify(data)}`);
+  const item = data.items[0];
+  assert(typeof item._receivedAt === 'number',
+    `expected each risk item to carry _receivedAt (stampAuxPayload recurses into ` +
+    `arrays), got: ${JSON.stringify(item)}`);
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : err);
+  process.exitCode = 1;
+});
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def test_console_risk_register_partial_state_renders_incomplete_banner(
     tmp_path: Path,
 ) -> None:
@@ -7171,6 +7410,12 @@ def test_api_risk_register_uses_typed_risk_severity_over_source_default(
         assert item["severity"] == "low", (
             "typed risk_severity=low must not be overridden by the coarse "
             f"escalation source default (high): {item}")
+        # PR #129 connector finding (web.py:3020): a needs_operator item's
+        # source_refs carry only {kind, request_id} - no "agent" key - so
+        # _attention_agent(it) alone always returns None for escalations.
+        # Falls back to the stamped requester (the sender, "alpha" here).
+        assert item["owner"] == "alpha", (
+            f"escalation owner must fall back to the requester, not be null: {item}")
     finally:
         srv.shutdown()
         srv.server_close()
@@ -7547,6 +7792,203 @@ def test_api_ownership_degrades_on_malformed_registry(tmp_path: Path) -> None:
         assert payload["count"] == 0
         assert payload["errors"]
         _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# --------------------------------------------- PR #129 connector findings
+
+def test_api_gates_evidence_cap_keeps_newest_entries(tmp_path: Path) -> None:
+    """PR #129 connector finding (P1, web.py:2881): set_gate APPENDS
+    evidence chronologically, so slicing the cap from the START kept the
+    OLDEST entries - once a gate passed the cap, the wall could show a
+    current green status/updated_at next to evidence that did NOT produce
+    it, while the evidence that DID was cut. Keep the NEWEST and expose
+    the truncated count."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    total = 55
+    for i in range(total):
+        gmod.set_gate(s.root, name="ci", status="green", severity="blocker",
+                      scope="release", actor="alpha", evidence_source="automation_ci",
+                      evidence=[f"ref-{i}"], reason="ok", required=True)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        assert gate["evidence_truncated"] == total - 50, gate["evidence_truncated"]
+        refs = [e["refs"][0] for e in gate["evidence"]]
+        assert refs == [f"ref-{i}" for i in range(total - 50, total)], (
+            f"expected the NEWEST 50 refs, oldest-to-newest within that window: {refs}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_rejects_non_finite_floats(tmp_path: Path) -> None:
+    """PR #129 connector finding (P2, web.py:2840): json.dumps (and Python's
+    loader) accept NaN/Infinity by default, but they are not valid per
+    strict JSON - response.json() in a real browser rejects them outright,
+    failing the WHOLE Gates view for one bad field instead of degrading
+    just that field. Simulates a hand-authored/corrupted gates.json (the
+    public set_gate API already rejects non-finite values, so this can only
+    be reached by writing the file directly)."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="ci", status="green", severity="warn",
+                  scope="release", actor="alpha", evidence_source="local_command",
+                  evidence=["ref"], reason="ok")
+    gates_path = gmod.gates_path(s.root)
+    raw = json.loads(gates_path.read_text(encoding="utf-8"))
+    raw["gates"]["ci"]["evidence"][0]["coverage_percent"] = float("nan")
+    raw["gates"]["ci"]["evidence"][0]["weird_metric"] = float("inf")
+    gates_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/gates") as resp:
+            raw_body = resp.read()
+        assert b"NaN" not in raw_body, "a non-finite float leaked into the JSON response"
+        assert b"Infinity" not in raw_body
+        payload = json.loads(raw_body)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert "coverage_percent" not in entry
+        assert "weird_metric" not in entry
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_expired_non_blocker_waiver_flagged_expired(tmp_path: Path) -> None:
+    """PR #129 connector finding (P2, console.js:2277 - backend half):
+    gates._gate_verdict only sets blocks=true for an expired waiver when
+    severity=blocker; a warn/info gate's expired waiver leaves blocks=false
+    even though reason says "waiver expired or invalid". The server must
+    expose a severity-independent signal for the view to key off."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="docs-freshness", status="red", severity="warn",
+                  scope="release", actor="alpha", evidence_source="local_command",
+                  reason="stale")
+    gmod.waive_gate(s.root, name="docs-freshness", operator="alpha",
+                    reason="known stale, tracked separately", scope="release",
+                    expires="2020-01-01T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        assert gate["severity"] == "warn"
+        assert gate["blocks"] is False, "warn severity never blocks by design"
+        assert gate["waiver_expired"] is True, (
+            f"an expired waiver on a non-blocker gate must still be flagged: {gate}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_derives_real_age_for_gate_and_deadletter(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector finding (P1, web.py:3022): gate_hold_items/
+    dead_letter_items left age_seconds at the _mk_item default (0.0) even
+    though their source records carry updated_at/deadlettered_at - every
+    such risk sorted as newly-created regardless of how long it had been
+    open, materially wrong for two of the register's principal categories."""
+    from agenttalk import gates as gmod
+    from agenttalk.wrapper import recv_api
+
+    s = _make_store(tmp_path)
+    old_iso = "2020-01-01T00:00:00Z"
+    gmod.set_gate(s.root, name="ci", status="red", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  reason="pipeline red", required=True)
+    gates_path = gmod.gates_path(s.root)
+    raw = json.loads(gates_path.read_text(encoding="utf-8"))
+    raw["gates"]["ci"]["updated_at"] = old_iso
+    gates_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    message = s.send(sender="alpha", recipient="beta", body="poison",
+                     kind="message", meta={})
+    record = recv_api.next_record(s, "beta")
+    assert record["id"] == message.id
+    s.dead_letter("beta", record, reason="deterministic",
+                  failure_class="poison_eligible", at=old_iso)
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        gate_items = [it for it in payload["items"] if it["category"] == "gate"]
+        deadletter_items = [it for it in payload["items"] if it["category"] == "deadletter"]
+        six_years = 86400 * 365 * 3
+        assert gate_items and gate_items[0]["age_seconds"] > six_years, (
+            f"gate blocker age must reflect its real updated_at, not 0: {gate_items}")
+        assert deadletter_items and deadletter_items[0]["age_seconds"] > six_years, (
+            f"dead letter age must reflect its real deadlettered_at, not 0: {deadletter_items}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_surfaces_disposition_read_problems_as_partial(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector finding (P2, web.py:2997): read_dispositions
+    already reports malformed/torn/unreadable lines through its second
+    return value - the exact silent-partial-read shape already closed for
+    onboarding (review rq-093f956dd595 B-2). Apply the same pattern here:
+    a damaged defer/resolve record must not leave the register looking
+    authoritative (partial=false) despite known corruption."""
+    from agenttalk import attention as attn_mod
+
+    s = _make_store(tmp_path)
+    disp_path = attn_mod.dispositions_path(s)
+    disp_path.parent.mkdir(parents=True, exist_ok=True)
+    disp_path.write_text("{not valid json\n", encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["partial"] is True, (
+            f"a corrupt dispositions log must be surfaced, not silently dropped: {payload}")
+        assert any("disposition" in d for d in payload["degraded_sources"]), payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_ownership_preserves_long_globs_losslessly(tmp_path: Path) -> None:
+    """PR #129 connector finding (P2, web.py:3183): _envelope_str's 300-char
+    cap silently replaced a long glob's tail with an ellipsis - two DISTINCT
+    long globs could then display identically, and neither would match the
+    path it was meant to. Globs need (near-)lossless transport, not prose
+    truncation."""
+    s = _make_store(tmp_path)
+    long_glob = "src/" + "generated/nested/" * 20 + "*.py"
+    assert len(long_glob) > 300
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {
+            "gen": {"title": "Generated code", "owners": {"agents": ["alpha"]},
+                    "owned_globs": [long_glob]},
+        },
+        "shared_paths": [{
+            "glob": long_glob, "category": "generated", "requires": "lead-approval",
+        }],
+    }), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        (domain,) = payload["domains"]
+        assert domain["owned_globs"] == [long_glob], (
+            "a long owned_globs entry must not be silently truncated")
+        (shared,) = payload["shared_paths"]
+        assert shared["glob"] == long_glob, (
+            "a long shared_paths glob must not be silently truncated")
     finally:
         srv.shutdown()
         srv.server_close()

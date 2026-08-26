@@ -105,6 +105,7 @@ import html
 import hmac
 import ipaddress
 import json
+import math
 import re
 import secrets
 import socket
@@ -2424,12 +2425,18 @@ def _collect_web_attention_items(store: Store, roster: list[str],
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
     try:
-        items += A.dead_letter_items(store.list_dead_letters())
+        # now_epoch (PR #129 connector finding): derive real age_seconds
+        # from each entry's own deadlettered_at instead of leaving every
+        # dead letter reading as freshly-created.
+        items += A.dead_letter_items(store.list_dead_letters(), now_epoch=time.time())
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("dead_letter", str(e)))
     try:
         from agenttalk import gates as _gates
-        items += A.gate_hold_items(_gates.check_gates(store.root).get("blockers", []))
+        # now_epoch (PR #129 connector finding): derive real age_seconds
+        # from each blocker's own updated_at, same rationale as above.
+        items += A.gate_hold_items(_gates.check_gates(store.root).get("blockers", []),
+                                   now_epoch=time.time())
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("gate_hold", str(e)))
     try:
@@ -2741,6 +2748,22 @@ def _envelope_str(value: Any) -> str:
     return s
 
 
+# A glob is matching SYNTAX, not prose: truncating one at _ENVELOPE_MAX can
+# silently change which paths it matches, or make two DISTINCT ownership
+# globs display identically (PR #129 connector finding, web.py:3183). Bound
+# it much more generously - effectively lossless for any realistic
+# repo-relative pattern - while still capping a corrupted/pathological value.
+_GLOB_MAX = 4096
+
+
+def _glob_str(value: Any) -> str:
+    s = "" if value is None else str(value)
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    if len(s) > _GLOB_MAX:
+        s = s[:_GLOB_MAX]
+    return s
+
+
 def _operator_command_str(value: Any) -> str:
     """Return one complete, bounded operator command without body-like text."""
     if not isinstance(value, str):
@@ -2836,6 +2859,14 @@ def _gate_evidence_entry(entry: Any) -> dict | None:
             continue
         if isinstance(value, str):
             out[bounded_key] = _envelope_str(value)
+        elif isinstance(value, float) and not math.isfinite(value):
+            # PR #129 connector finding (P2, web.py:2840): json.dumps
+            # (Python's loader too) accepts NaN/Infinity by default, but
+            # they are not valid per strict JSON - a browser's
+            # response.json() rejects them outright, which would fail the
+            # WHOLE /api/gates payload for one bad field instead of
+            # degrading just this entry. Never forward a non-finite float.
+            continue
         elif isinstance(value, (int, float, bool)) or value is None:
             out[bounded_key] = value
         else:
@@ -2877,22 +2908,41 @@ def build_gates(desc: RootDescriptor) -> dict:
             raw = raw_gates.get(name) if isinstance(name, str) else None
             evidence_raw = raw.get("evidence") if isinstance(raw, dict) else None
             evidence: list[dict] = []
+            evidence_truncated = 0
             if isinstance(evidence_raw, list):
-                for entry in evidence_raw[:_GATE_EVIDENCE_MAX_ENTRIES]:
+                # PR #129 connector finding (P1, web.py:2881): set_gate
+                # APPENDS chronologically, so slicing from the START kept
+                # the OLDEST entries - once a gate passed
+                # _GATE_EVIDENCE_MAX_ENTRIES updates, the wall could show a
+                # current green status/updated_at next to evidence that did
+                # NOT produce it, while the evidence that actually did was
+                # cut. Keep the NEWEST entries and expose the cut count.
+                evidence_truncated = max(0, len(evidence_raw) - _GATE_EVIDENCE_MAX_ENTRIES)
+                for entry in evidence_raw[-_GATE_EVIDENCE_MAX_ENTRIES:]:
                     parsed = _gate_evidence_entry(entry)
                     if parsed is not None:
                         evidence.append(parsed)
+            reason = _envelope_str(item.get("reason") or "")
+            waiver = item.get("waiver")
             wire.append({
                 "name": _envelope_str(name),
                 "status": _envelope_str(item.get("status") or "unknown"),
                 "severity": _envelope_str(item.get("severity") or "blocker"),
                 "scope": _envelope_str(item.get("scope") or "global"),
                 "blocks": bool(item.get("blocks")),
-                "reason": _envelope_str(item.get("reason") or ""),
+                "reason": reason,
                 "updated_at": _envelope_str(item.get("updated_at") or ""),
                 "updated_by": _envelope_str(item.get("updated_by") or ""),
                 "evidence": evidence,
-                "waiver": _gate_waiver_entry(item.get("waiver")),
+                "evidence_truncated": evidence_truncated,
+                "waiver": _gate_waiver_entry(waiver),
+                # PR #129 connector finding (P2, console.js:2277): blocks=True
+                # marks an expired waiver as blocking ONLY for severity=
+                # blocker - gates._gate_verdict leaves blocks=False for an
+                # expired warn/info waiver even though it sets this exact
+                # reason string. A severity-independent signal so the view
+                # doesn't need blocks as a (wrong, for warn/info) proxy.
+                "waiver_expired": bool(waiver) and reason == "waiver expired or invalid",
             })
         return {
             "root": desc.label,
@@ -2994,7 +3044,17 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             for_agent = None
             degraded.append(_envelope_str(f"liaison_resolution: {e}"))
         items = _collect_web_attention_items(store, roster, for_agent)
-        disps, _problems = _attention.read_dispositions(store)
+        disps, disposition_problems = _attention.read_dispositions(store)
+        if disposition_problems:
+            # PR #129 connector finding (web.py:2997): read_dispositions
+            # already reports malformed/torn/unreadable lines through its
+            # second return value - discarding it here is the SAME
+            # silent-partial-read shape as B-2 (onboarding problems), just
+            # for a different source. A damaged defer/resolve record can
+            # leave a risk shown as active while the payload still claimed
+            # partial=false.
+            degraded.append(_envelope_str(
+                f"dispositions: {len(disposition_problems)} unreadable record(s)"))
         queue = _attention.build_queue(items, disps,
                                        now_iso=now.isoformat().replace("+00:00", "Z"))
         risks: list[dict] = []
@@ -3017,7 +3077,13 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 "category_label": _RISK_CATEGORY_LABELS.get(wire_source, "Other"),
                 "severity": severity,
                 "title": _envelope_str(it.get("title") or "attention needed"),
-                "owner": _attention_agent(it),
+                # PR #129 connector finding (web.py:3020): a needs_operator
+                # escalation's source_refs only carry {kind, request_id} - no
+                # "agent" key - so _attention_agent(it) alone always misses.
+                # needs_operator_items already stamps the requester onto the
+                # item; fall back to it so escalations (the "decision
+                # needed" category) don't lose their owner column entirely.
+                "owner": _attention_agent(it) or it.get("requester") or None,
                 "detail": _envelope_str(it.get("why_it_matters") or ""),
                 "age_seconds": float(it.get("age_seconds") or 0),
                 "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
@@ -3179,7 +3245,7 @@ def build_ownership(desc: RootDescriptor) -> dict:
                 "reviewers": _domains.resolve_refset(dentry.get("reviewers") or {}, cfg),
                 "curators": _domains.resolve_refset(dentry.get("curators") or {}, cfg),
                 "owned_globs": [
-                    _envelope_str(g) for g in (dentry.get("owned_globs") or [])
+                    _glob_str(g) for g in (dentry.get("owned_globs") or [])
                 ],
                 "description": _envelope_str(dentry.get("description") or ""),
             })
@@ -3188,7 +3254,7 @@ def build_ownership(desc: RootDescriptor) -> dict:
             if not isinstance(entry, dict):
                 continue
             shared_paths.append({
-                "glob": _envelope_str(entry.get("glob") or ""),
+                "glob": _glob_str(entry.get("glob") or ""),
                 "category": _envelope_str(entry.get("category") or ""),
                 "requires": _envelope_str(entry.get("requires") or ""),
                 "default_reviewers": _domains.resolve_refset(
