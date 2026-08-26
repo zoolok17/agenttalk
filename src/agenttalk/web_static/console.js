@@ -193,14 +193,27 @@
   }
   function responsiveSecondary(label, content) {
     var details = el('details', 'tc-secondary-panel');
-    var narrow = typeof window !== 'undefined' && window.matchMedia &&
-      window.matchMedia('(max-width: 560px)').matches;
-    details.open = !narrow || secondaryOpen[label] === true;
+    var mq = (typeof window !== 'undefined' && window.matchMedia)
+      ? window.matchMedia('(max-width: 560px)') : null;
+    function applyNarrow(narrow) {
+      details.open = !narrow || secondaryOpen[label] === true;
+    }
+    applyNarrow(!!(mq && mq.matches));
     details.appendChild(el('summary', 'tc-secondary-summary', label));
     details.appendChild(content);
     on(details, 'toggle', function () {
-      if (narrow) secondaryOpen[label] = !!details.open;
+      if (mq && mq.matches) secondaryOpen[label] = !!details.open;
     });
+    // #207 residual: the ORIGINAL narrow snapshot was taken once, at node
+    // creation, and never re-checked - an existing panel crossing the 560px
+    // boundary (resize, or a narrow-to-wide/wide-to-narrow rotation) never
+    // re-evaluated open/closed. Listen for the live media-query change so an
+    // EXISTING node reacts, not just newly-created ones.
+    if (mq) {
+      var onChange = function (e) { applyNarrow(!!e.matches); };
+      if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onChange);
+      else if (typeof mq.addListener === 'function') mq.addListener(onChange); // legacy Safari
+    }
     return details;
   }
   function svgEl(tag, attrs) {
@@ -219,10 +232,16 @@
   function on(node, ev, fn) { node.addEventListener(ev, fn); return node; }
   function monotonicNow() {
     // performance.now is elapsed-time only: client wall-clock skew cannot enter
-    // server ages, freshness, or the displayed clock. Freezing is safer than
-    // falling back to Date.now in the unlikely event it is unavailable.
+    // server ages, freshness, or the displayed clock - PREFER it. But a frozen
+    // constant (the old `: 0` fallback) is fail-OPEN: every later
+    // (monotonicNow() - receivedAt) delta would then be permanently 0, so
+    // attentionFresh/stateFresh could never age out even after polling stops
+    // (#207 residual, low confidence but fail-open is the worse direction).
+    // Date.now is not perfectly monotonic, but only feeds this fallback when
+    // performance.now itself is unavailable everywhere in this session, so
+    // every delta still compares two Date.now-based samples consistently.
     return (typeof performance !== 'undefined' && performance &&
-      typeof performance.now === 'function') ? performance.now() : 0;
+      typeof performance.now === 'function') ? performance.now() : Date.now();
   }
   function serverNowAt(receivedAt) {
     if (!serverClock) return null;
@@ -913,9 +932,11 @@
   }
   function attentionFresh() { return attentionKnownFrom(attentionData, state.now); }
   // Is the agent-health data (from /api/state) KNOWN-fresh? Same rationale as
-  // attentionFresh: fetchState stamps _fetchedAt on each successful poll and retains
-  // last-good on failure, so a stale lastState means agent health is obsolete and the
-  // verdict must NOT assert green from it (v0.76.0 trust contract).
+  // attentionFresh: fetchState stamps _receivedAt (via stampStatePayload) on each
+  // successful poll and retains last-good on failure, so a stale lastState means
+  // agent health is obsolete and the verdict must NOT assert green from it (v0.76.0
+  // trust contract). _fetchedAt below is only the compatibility fallback for pure
+  // test fixtures predating the monotonic stamp, same as attentionKnownFrom.
   function stateFresh() {
     if (lastState == null) return false;
     var received = lastState._receivedAt;

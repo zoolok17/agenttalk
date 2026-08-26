@@ -3015,13 +3015,22 @@ def test_console_narrow_layout_collapses_secondary_panels(tmp_path: Path) -> Non
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-let narrow = true;
 function node(tag) {
   return {
     tagName: String(tag).toUpperCase(), className: '', textContent: '', children: [], open: false,
     appendChild(child) { this.children.push(child); return child; },
     setAttribute() {}, addEventListener() {},
   };
+}
+// A live MediaQueryList mock: ONE shared object (like the real
+// `window.matchMedia(query)` returning an equivalent list for a repeated
+// query), so a listener registered against it can be fired later to
+// simulate an EXISTING node's viewport crossing the boundary - not just a
+// freshly created node reading a new snapshot (#207 residual, finding 1).
+const mq = { matches: true, _listeners: [] };
+function fireMediaChange(matches) {
+  mq.matches = matches;
+  for (const cb of mq._listeners) cb({ matches });
 }
 const document = {
   readyState: 'loading', addEventListener() {},
@@ -3033,7 +3042,12 @@ const ctx = {
   localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
   performance: { now() { return 0; } },
   setInterval() {}, clearInterval() {},
-  matchMedia() { return { matches: narrow }; },
+  matchMedia() {
+    return {
+      get matches() { return mq.matches; },
+      addEventListener(type, cb) { if (type === 'change') mq._listeners.push(cb); },
+    };
+  },
   fetch() { throw new Error('fetch should not run'); },
   __agenttalkConsoleTestHooks: null,
 };
@@ -3042,13 +3056,34 @@ ctx.window = ctx;
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
 const hooks = ctx.__agenttalkConsoleTestHooks;
+
+// Created narrow: closed, per the existing contract.
 const mobileContent = node('div');
-const mobile = hooks.responsiveSecondary('Recent activity', mobileContent);
-if (mobile.tagName !== 'DETAILS' || mobile.open || mobile.children[0].tagName !== 'SUMMARY' ||
-    mobile.children[1] !== mobileContent) {
-  throw new Error(`narrow secondary panel did not collapse safely: ${JSON.stringify(mobile)}`);
+const panel = hooks.responsiveSecondary('Recent activity', mobileContent);
+if (panel.tagName !== 'DETAILS' || panel.open || panel.children[0].tagName !== 'SUMMARY' ||
+    panel.children[1] !== mobileContent) {
+  throw new Error(`narrow secondary panel did not collapse safely: ${JSON.stringify(panel)}`);
 }
-narrow = false;
+if (mq._listeners.length !== 1) {
+  throw new Error(`expected responsiveSecondary to register exactly one change listener, got ${mq._listeners.length}`);
+}
+
+// The SAME node crosses narrow -> wide (e.g. rotation, window resize) -
+// it must reopen without being recreated.
+fireMediaChange(false);
+if (!panel.open) {
+  throw new Error('existing panel did not reopen when crossing narrow -> wide');
+}
+
+// And back wide -> narrow: it must re-collapse (no user override recorded).
+fireMediaChange(true);
+if (panel.open) {
+  throw new Error('existing panel did not re-collapse when crossing wide -> narrow');
+}
+
+// A second, freshly-created panel while wide must still open immediately
+// (the original creation-time contract is unchanged).
+fireMediaChange(false);
 const desktop = hooks.responsiveSecondary('Recent activity', node('div'));
 if (!desktop.open) throw new Error('desktop secondary panel was not open');
 """, encoding="utf-8")
@@ -3072,7 +3107,8 @@ def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path)
         "  globalThis.__agenttalkConsoleTestHooks = {\n"
         "    stateInfo: stateInfo,\n"
         "    agentStateInfo: agentStateInfo,\n"
-        "    freshHeartbeat: freshHeartbeat\n"
+        "    freshHeartbeat: freshHeartbeat,\n"
+        "    monotonicNow: monotonicNow\n"
         "  };\n\n" + marker,
         1,
     )
@@ -3127,6 +3163,17 @@ check({ health: { state: 'working_turn' }, last_seen_age_seconds: 5, wrapped: tr
 check({ health: { state: 'idle_waiting' }, last_seen_age_seconds: 5, wrapped: true },
   { key: 'idle_waiting', label: 'Idle \u00b7 waiting', color: 'warn', grp: 'idle' });
 assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative heartbeat fails');
+
+// #207 residual, finding 3: this ctx has NO `performance` global, so
+// monotonicNow() must take its fallback branch. A frozen `0` fallback is
+// fail-open (every later delta reads permanently "just now"); the fix must
+// fall back to a real, advancing wall clock instead.
+const before = Date.now();
+const stamp = hooks.monotonicNow();
+const after = Date.now();
+assert(stamp !== 0, 'monotonicNow() fallback must not freeze at 0 when performance is unavailable');
+assert(stamp >= before && stamp <= after,
+  `monotonicNow() fallback should track Date.now(): ${stamp} not in [${before}, ${after}]`);
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
