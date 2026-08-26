@@ -338,10 +338,15 @@ MUST NOT make an older or partial generation current.
 
 **R-09 — Three-state freshness and dispatch [S1, product boundary].** Freshness MUST
 be computed against the scan's whole-scope source fingerprint, not only the selected
-pack paths. A complete match is `current`; a proven mismatch is `stale`; inability to
-enumerate or fingerprint the whole scope is `unknown`. Stale or unknown data MUST NOT
-satisfy dispatch/review admission unless an attended waiver is recorded on the work
-item. Warning-and-continue is not an allowed default.
+pack paths. `current` requires a complete comparison under the same root, platform/path
+policy, scope/configuration, and adapter identities, an exact whole-scope fingerprint
+match, and matching selected pointers. `stale` requires direct proof that a selected
+path changed or disappeared, or that a requested exact VCS revision differs. An
+incomplete comparison or a whole-scope/identity mismatch without that direct proof is
+`unknown`; a new or changed unselected path is therefore `unknown` because its relevance
+to the old pack is undecidable. Stale or unknown data MUST NOT satisfy dispatch/review
+admission unless an attended waiver is recorded on the work item. Warning-and-continue
+is not an allowed default.
 
 ### C. Comprehension model
 
@@ -479,7 +484,7 @@ not an S1 release gate.
 | --- | --- | --- |
 | 1. Provider keys, proxy variables, and remote-looking configuration are present while an offline code scan runs under a network-deny harness. | S1 | The scan completes with zero connection attempts; production still carries R-01's no-OS-sandbox residual. |
 | 2. Mixed code/docs input cannot silently select a remote backend. | S1 | S1 indexes only explicitly supported local inputs or refuses, and reports exclusions. |
-| 3. Source changes, deletion, or a newly relevant file alter the whole-scope fingerprint. | S1 | The old pack is `stale` on a proven mismatch and `unknown` when full-scope comparison cannot be completed; it is never `current`. |
+| 3. A selected source changes/disappears, or a new/changed unselected scope path alters the whole-scope fingerprint. | S1 | Direct selected-path or exact-revision proof makes the old pack `stale`; an unselected-only whole-scope mismatch or incomplete comparison makes it `unknown`; neither can be `current`. |
 | 4. A scanner is killed or competes with another scanner during publication. | S1 | The previous generation remains current; stale locks and unpublished staging are reclaimed; compare-and-set prevents an older writer becoming latest. |
 | 5. Dynamic dispatch, unsupported grammar, parse failure, conflict, or resource truncation occurs. | S1 | The bounded scope and unknown/conflict appear in coverage and packs; omission is a test failure. |
 | 6. Gate-active and gate-inactive static configurations share one extracted edge. | S2 | Conditional reachability differs without changing or promoting the extracted fact. |
