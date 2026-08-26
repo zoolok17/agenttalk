@@ -2207,7 +2207,9 @@
     var errs = (data && isArray(data.errors)) ? data.errors : [];
     var items = (data && isArray(data.items)) ? data.items : [];
     var count = data && typeof data.count === 'number' ? data.count : items.length;
-    header.appendChild(el('span', 'tc-attn-count', errs.length ? 'status unknown' : count + ' open'));
+    var partial = !!(data && data.partial);
+    header.appendChild(el('span', 'tc-attn-count',
+      errs.length ? 'status unknown' : count + ' open' + (partial ? ' · incomplete' : '')));
     wrap.appendChild(header);
 
     if (!data) {
@@ -2216,14 +2218,41 @@
       wrap.appendChild(genericErrorState(
         'Can’t read the risk register right now',
         'The dashboard hit an error building this list. (' + errs.join('; ') + ')'));
-    } else if (!items.length) {
-      wrap.appendChild(emptyState('No open risks', 'Nothing is waiting on you right now.'));
     } else {
-      var list = el('div', 'tc-attn-list');
-      for (var i = 0; i < items.length; i++) list.appendChild(riskCard(items[i]));
-      wrap.appendChild(list);
+      // B-1 (review rq-093f956dd595): a register whose contract is "each
+      // open item" must say so out loud when it could NOT enumerate
+      // everything - showing the items it DID get without this banner would
+      // read as a confident, complete list, indistinguishable from a
+      // genuine all-clear.
+      if (partial) wrap.appendChild(riskRegisterPartialBanner(data));
+      if (!items.length) {
+        wrap.appendChild(partial
+          ? genericErrorState('Risk register is incomplete',
+              'No risks could be read from the sources below - this is NOT a confirmed all-clear.')
+          : emptyState('No open risks', 'Nothing is waiting on you right now.'));
+      } else {
+        var list = el('div', 'tc-attn-list');
+        for (var i = 0; i < items.length; i++) list.appendChild(riskCard(items[i]));
+        wrap.appendChild(list);
+        if (typeof data.truncated === 'number' && data.truncated > 0) {
+          wrap.appendChild(el('p', 'tc-recent-empty',
+            data.truncated + ' more open risk(s) not shown (list capped).'));
+        }
+      }
     }
     main.appendChild(wrap);
+  }
+
+  // "Some of this list could not be read" banner - distinct from
+  // attentionError/genericErrorState because the register is NOT empty here;
+  // it's a confirmed-incomplete list, not a confirmed-failed one.
+  function riskRegisterPartialBanner(data) {
+    var sources = isArray(data.degraded_sources) ? data.degraded_sources : [];
+    var b = el('div', 'tc-attn-stale-banner');
+    b.appendChild(el('span', null,
+      'This list is INCOMPLETE - some sources could not be read, so open risks may be missing.'
+      + (sources.length ? ' (' + sources.join('; ') + ')' : '')));
+    return b;
   }
 
   function riskCard(item) {
@@ -2236,7 +2265,11 @@
     tagRow.appendChild(titled(el('span', 'tc-chip sev-' + item.severity,
       SEV_LABEL[item.severity] || (item.severity || '').toUpperCase()), SEV_DESC[item.severity]));
     tagRow.appendChild(el('span', 'tc-spacer'));
-    tagRow.appendChild(ageEl('tc-attn-age', item, { suffix: ' ago' }));
+    // L-2: an item flagged age_unknown must read as "age unknown", never as
+    // "0s ago" (which looks freshly-created, the opposite of the truth).
+    tagRow.appendChild(item.age_unknown
+      ? ageEl('tc-attn-age', item, { noHb: true, nullText: 'age unknown' })
+      : ageEl('tc-attn-age', item, { suffix: ' ago' }));
     body.appendChild(tagRow);
     body.appendChild(el('div', 'tc-attn-title', item.title || ''));
     var detailRow = el('div', 'tc-attn-detailrow');

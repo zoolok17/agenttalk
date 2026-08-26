@@ -1258,6 +1258,9 @@ def test_multi_root_explicit_project_id_routes_every_console_get(
             "/api/intents",
             "/api/preflight",
             "/api/attention",
+            "/api/gates",
+            "/api/risk-register",
+            "/api/ownership",
             "/api/learning",
             "/api/onboarding",
             "/api/lead-chat",
@@ -1537,6 +1540,9 @@ def test_duplicate_project_id_descriptors_are_rejected(tmp_path: Path) -> None:
         "/api/intents",
         "/api/preflight",
         "/api/attention",
+        "/api/gates",
+        "/api/risk-register",
+        "/api/ownership",
         "/api/learning",
         "/api/onboarding",
         "/api/lead-chat",
@@ -1971,7 +1977,8 @@ def test_csp_split_per_route(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in (f"/messages/{mid}", "/api/status", "/api/state",
-                     "/api/attention", "/api/learning", "/api/onboarding",
+                     "/api/attention", "/api/gates", "/api/risk-register",
+                     "/api/ownership", "/api/learning", "/api/onboarding",
                      "/api/thread/rid-c"):
             with _get(f"{base}{path}") as resp:
                 assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP, path
@@ -1995,6 +2002,7 @@ def test_new_routes_reject_write_methods(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in ("/api/state", "/api/threads", "/dashboard", "/api/attention",
+                     "/api/gates", "/api/risk-register", "/api/ownership",
                      "/api/learning", "/api/onboarding", "/api/thread/rid-w", "/static/console.js",
                      "/static/console.css", "/static/avatars/claude-dev.png"):
             req = urllib.request.Request(  # noqa: S310  # nosemgrep
@@ -2508,7 +2516,8 @@ def test_no_mutation_full_tree_hash(tmp_path: Path) -> None:
         for _ in range(3):
             _state(base)
         for path in ("/dashboard", "/static/console.js", "/static/console.css",
-                     "/", f"/messages/{mid}", "/api/attention", "/api/learning",
+                     "/", f"/messages/{mid}", "/api/attention", "/api/gates",
+                     "/api/risk-register", "/api/ownership", "/api/learning",
                      "/api/onboarding", "/api/thread/r1"):
             with _get(f"{base}{path}") as resp:
                 resp.read()
@@ -2950,6 +2959,131 @@ assert(text.includes('WAIVED (EXPIRED)'),
   `expected the expired-waiver label in the card, got: ${text}`);
 assert(text.includes('Waiver expired'),
   `expected the waiver box to say it is expired, got: ${text}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_risk_register_partial_state_renders_incomplete_banner(
+    tmp_path: Path,
+) -> None:
+    """review rq-093f956dd595 B-1: "surface partial/degraded state in
+    payload AND view" - a payload-shape assertion alone cannot catch a
+    frontend that silently drops the partial/degraded_sources fields. This
+    actually renders renderRiskRegister() and inspects the DOM for the
+    incomplete-list banner and the truncated-count note."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the risk-register render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkRiskRegisterTestHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, riskRegister) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      riskRegisterData = riskRegister;\n"
+        "      state.view = 'risk-register';\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-risk-register.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    className: '',
+    textContent: '',
+    attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += ' ' + collectText(child);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading',
+  createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {},
+  getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkRiskRegisterTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkRiskRegisterTestHooks;
+
+hooks.setup(
+  { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] },
+  {
+    root: 'demo', root_path: 'D:\\work\\demo',
+    root_info: { project_id: 'project-demo', label: 'demo', path: 'D:\\work\\demo' },
+    target_root_project_id: 'project-demo',
+    items: [{
+      id: 'onboarding:run-1:drift:d1', category: 'onboarding_drift',
+      category_label: 'Doc/code drift', severity: 'high', title: 'a real open risk',
+      owner: 'beta', detail: 'scan run', age_seconds: 30, age_unknown: false,
+      human_can_unblock_now: true,
+    }],
+    count: 1,
+    truncated: 2,
+    partial: true,
+    degraded_sources: ['onboarding_run:corrupt-run-1'],
+  },
+);
+hooks.renderActiveView();
+
+const text = collectText(main);
+assert(text.includes('incomplete'),
+  `expected the header to flag the count as incomplete, got: ${text}`);
+assert(text.includes('INCOMPLETE') || text.includes('could not be read'),
+  `expected an incomplete-list banner naming the degraded source, got: ${text}`);
+assert(text.includes('corrupt-run-1'),
+  `expected the degraded source name in the banner, got: ${text}`);
+assert(text.includes('a real open risk'),
+  `the item that WAS read must still render alongside the partial banner: ${text}`);
+assert(text.includes('2') && text.includes('not shown'),
+  `expected the truncated-count note, got: ${text}`);
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
@@ -6534,9 +6668,12 @@ def test_api_risk_register_shape_and_sorted_by_severity_then_age(
         payload = _risk_register(base)
         assert set(payload) == {
             "root", "root_path", "root_info", "target_root_project_id",
-            "items", "count",
+            "items", "count", "truncated", "partial", "degraded_sources",
         }
         assert payload["count"] == len(payload["items"])
+        assert payload["partial"] is False
+        assert payload["degraded_sources"] == []
+        assert payload["truncated"] == 0
         for it in payload["items"]:
             assert set(it) == {
                 "id", "category", "category_label", "severity", "title",
@@ -6628,12 +6765,21 @@ def test_api_risk_register_includes_open_onboarding_drift_and_unknown(
         assert drift_items[0]["severity"] == "high"  # blocking=True
         assert drift_items[0]["owner"] == "beta"
         assert drift_items[0]["title"] == "docs say X, code does Y"
+        # review rq-093f956dd595 L-1: "human_can_unblock_now" is a triage
+        # affordance claim, not a copy of the onboarding "blocking" flag.
+        assert drift_items[0]["human_can_unblock_now"] is True
+        assert drift_items[0]["age_unknown"] is False
 
         unknown_items = by_category.get("onboarding_unknown", [])
         assert len(unknown_items) == 1
         assert unknown_items[0]["category_label"] == "Open unknown"
         assert unknown_items[0]["severity"] == "med"  # blocking=False
         assert unknown_items[0]["owner"] == "alpha"  # falls back to actor
+        # L-1: still True even though blocking=False here - nothing external
+        # gates a human from acting on this finding.
+        assert unknown_items[0]["human_can_unblock_now"] is True
+        assert unknown_items[0]["age_unknown"] is False
+        assert payload["partial"] is False
         _assert_no_body_keys(payload)
     finally:
         srv.shutdown()
@@ -6682,13 +6828,18 @@ def test_api_risk_register_onboarding_not_truncated_by_dashboard_run_limit(
 
 
 def test_api_risk_register_degrades_on_corrupt_root(tmp_path: Path) -> None:
+    """review rq-093f956dd595 B-1/B-3: a corrupt config.json makes
+    store.operator_facing() raise, caught by the liaison-resolution
+    fallback. This must be VISIBLE (partial=True, a degraded_sources entry)
+    - a prior version of this test accepted a silent empty-and-clean 200 as
+    passing, which is the exact defect B-1 closes."""
     s = _make_store(tmp_path)
     cfg_path = s.dir / "config.json"
     cfg_path.write_text("{not json", encoding="utf-8")
     srv, _t, base = _serve(s)
     try:
         payload = _risk_register(base)
-        assert set(payload) >= {"root", "items", "count"}
+        assert set(payload) >= {"root", "items", "count", "partial", "degraded_sources"}
         assert payload["count"] == len(payload["items"])
         _assert_no_body_keys(payload)
         assert payload["items"] == [] or all(
@@ -6697,6 +6848,161 @@ def test_api_risk_register_degrades_on_corrupt_root(tmp_path: Path) -> None:
                                "onboarding_unknown")
             for it in payload["items"]
         )
+        assert payload["partial"] is True, (
+            f"a corrupt config that breaks liaison resolution must be surfaced, "
+            f"not silently absorbed into a clean-looking response: {payload}")
+        assert payload["degraded_sources"], "must name at least one degraded source"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_surfaces_partial_when_onboarding_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """review rq-093f956dd595 B-1: reproduces the reviewer's exact repro -
+    one open blocking drift, then onboarding.list_runs raising. Before the
+    fix this returned a clean HTTP 200 with count=0 and no errors key,
+    indistinguishable from a genuine all-clear. Must now surface partial."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-1", status="open",
+        summary="a blocking drift that must not silently vanish", actor="alpha",
+        blocking=True, at="2026-01-01T00:05:00Z"))
+
+    srv, _t, base = _serve(s)
+    try:
+        baseline = _risk_register(base)
+        assert baseline["count"] == 1
+        assert baseline["partial"] is False
+
+        def boom(*_args, **_kwargs):
+            raise OSError("simulated onboarding read failure")
+        monkeypatch.setattr(ob, "list_runs", boom)
+
+        payload = _risk_register(base)
+        assert payload["items"] == []
+        assert payload["count"] == 0
+        assert payload["partial"] is True, (
+            f"an inner collection failure must not render as a silent all-clear: {payload}")
+        assert any("onboarding" in d for d in payload["degraded_sources"]), payload
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_corrupt_onboarding_run_is_flagged_not_dropped(
+    tmp_path: Path,
+) -> None:
+    """review rq-093f956dd595 B-2: onboarding.list_runs SKIPS a run whose
+    ledger fails to parse (view=None) and only names it in `problems` - a
+    silent drop reachable with NO exception at all. The risk register must
+    surface that instead of discarding the `problems` channel."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-1", status="open",
+        summary="an open drift in a run that will be corrupted", actor="alpha",
+        blocking=True, at="2026-01-01T00:05:00Z"))
+    events_file = ob.events_path(s, run_id)
+    lines = events_file.read_text(encoding="utf-8").splitlines()
+    lines[0] = "{not valid json"  # corrupt the create event -> run_view() is None
+    events_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["items"] == [], (
+            f"the corrupt run's open drift must not silently appear: {payload}")
+        assert payload["partial"] is True, (
+            f"a corrupt onboarding run must be surfaced, not silently dropped: {payload}")
+        assert any("onboarding_run" in d for d in payload["degraded_sources"]), payload
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_caps_items_with_explicit_truncated_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """review rq-093f956dd595 F-1: every neighboring surface in this diff
+    bounds itself; the register must too - a high cap, never a silent one.
+    The point was never "no bound", only "no SILENT bound"."""
+    from agenttalk import gates as gmod
+
+    monkeypatch.setattr(web, "_RISK_REGISTER_ITEM_CAP", 3)
+    s = _make_store(tmp_path)
+    for i in range(5):
+        gmod.set_gate(s.root, name=f"gate-{i}", status="red", severity="blocker",
+                      scope="release", actor="alpha", evidence_source="automation_ci",
+                      reason="red", required=True)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["count"] == 3
+        assert len(payload["items"]) == 3
+        assert payload["truncated"] == 2
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_unknown_age_flagged_and_not_deprioritized(
+    tmp_path: Path,
+) -> None:
+    """review rq-093f956dd595 L-2: an onboarding record whose updated_at
+    cannot parse must be flagged age_unknown (never silently read as "0s
+    old", which looks freshly-created - the opposite of the truth) and must
+    NOT be silently pushed to the bottom of its severity band."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="known-drift", status="open",
+        summary="known-age drift", actor="alpha", blocking=True,
+        at="2026-01-01T00:05:00Z"))
+    # Hand-written record: new_record_event's `at` is never format-validated
+    # by onboarding.event_problem (only byte-bounded), so this is a legal
+    # on-disk event with an unparseable timestamp - simulates a foreign/
+    # legacy writer, not a fabricated test-only shape.
+    events_file = ob.events_path(s, run_id)
+    bad_event = {
+        "schema_version": ob.SCHEMA_VERSION, "event": ob.EVENT_RECORD,
+        "run_id": run_id, "kind": ob.KIND_DRIFT, "key": "bad-drift",
+        "status": "open", "summary": "unparseable timestamp drift",
+        "actor": "alpha", "blocking": True, "updated_at": "not-a-timestamp",
+    }
+    with events_file.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(bad_event) + "\n")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        drift_items = [it for it in payload["items"] if it["category"] == "onboarding_drift"]
+        by_key = {it["id"].rsplit(":", 1)[-1]: it for it in drift_items}
+        assert by_key["bad-drift"]["age_unknown"] is True
+        assert by_key["known-drift"]["age_unknown"] is False
+        # both are severity=high (blocking=True) - unknown age must sort
+        # FIRST within that band, not last.
+        assert drift_items[0]["id"] == by_key["bad-drift"]["id"], (
+            f"unknown-age item was deprioritized instead of surfaced: {drift_items}")
     finally:
         srv.shutdown()
         srv.server_close()

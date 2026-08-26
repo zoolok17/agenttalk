@@ -2786,6 +2786,8 @@ def _attention_prompt_excerpt(value: Any) -> str:
 
 _GATE_EVIDENCE_MAX_ENTRIES = 50
 _GATE_EVIDENCE_REFS_MAX = 20
+_GATE_EVIDENCE_EXTRA_KEYS_MAX = 20
+_GATE_EVIDENCE_KEY_MAX = 64
 
 
 def _gate_evidence_entry(entry: Any) -> dict | None:
@@ -2811,13 +2813,28 @@ def _gate_evidence_entry(entry: Any) -> dict | None:
     by = entry.get("by")
     if isinstance(by, str):
         out["by"] = _envelope_str(by)
+    # F-2 (review rq-093f956dd595): every OTHER key from gates.json's
+    # operator-defined evidence_details passes through too - gates.py leaves
+    # that schema open by design (coverage_percent, pr_url, ...), so a closed
+    # field list isn't viable here. Bound the KEY the same way every value is
+    # already bounded, and cap how many extra keys ride one entry (entries
+    # themselves are already capped at _GATE_EVIDENCE_MAX_ENTRIES).
+    extra_keys = 0
     for key, value in entry.items():
         if key in ("source", "refs", "at", "by") or key in out:
             continue
+        if not isinstance(key, str) or extra_keys >= _GATE_EVIDENCE_EXTRA_KEYS_MAX:
+            continue
+        bounded_key = _envelope_str(key)[:_GATE_EVIDENCE_KEY_MAX]
+        if not bounded_key:
+            continue
         if isinstance(value, str):
-            out[key] = _envelope_str(value)
+            out[bounded_key] = _envelope_str(value)
         elif isinstance(value, (int, float, bool)) or value is None:
-            out[key] = value
+            out[bounded_key] = value
+        else:
+            continue
+        extra_keys += 1
     return out
 
 
@@ -2929,22 +2946,47 @@ _RISK_SEVERITY_ORDER = {"high": 0, "med": 1, "low": 2}
 # has NO entry here, so an untyped item falls through to the coarse
 # per-source severity below rather than silently becoming "low".
 _RISK_SEVERITY_FROM_TYPED = {"high": "high", "medium": "med", "low": "low"}
+# F-1 (review rq-093f956dd595): every neighboring surface in this diff bounds
+# itself (_ONBOARDING_DEFAULT_LIMIT, _GATE_EVIDENCE_MAX_ENTRIES, ...) - the
+# register itself was left unbounded after removing the 50-run cap. A high
+# cap + an explicit `truncated` count keeps the "an old item must not
+# silently vanish" intent (the point was never "no bound", only "no SILENT
+# bound").
+_RISK_REGISTER_ITEM_CAP = 500
+# B-1/B-2 (review rq-093f956dd595): cap how many degraded-source notes ride
+# the payload, so a pathological number of corrupt onboarding runs can't
+# blow up the response - the COUNT of open items lost is what matters to a
+# human, not an unbounded list of which ones.
+_RISK_DEGRADED_MAX = 50
 
 
 def build_risk_register(desc: RootDescriptor) -> dict:
     """The /api/risk-register payload for one root (§4e). Envelope-only,
     GET-only, read-only. Errors-as-data (parity with build_attention): a
     corrupt/uninitialized root degrades to a 200 body with ``items: []`` and
-    an ``errors`` list, never a 500."""
+    an ``errors`` list, never a 500.
+
+    B-1 (review rq-093f956dd595): a register whose CONTRACT is "each open
+    item" must never let an inner collection failure render as a confident,
+    error-free "0 risks" - that is indistinguishable from a genuine all-clear
+    and is the worst failure mode for a screen whose purpose is letting a
+    client conclude nothing is outstanding. Every inner best-effort fallback
+    below (liaison resolution, stuck-agent derivation, onboarding) now
+    records what it lost into ``degraded``, surfaced as ``partial`` +
+    ``degraded_sources`` even on an otherwise-200 response - never silently
+    swallowed.
+    """
     store = desc.store
     now = datetime.now(timezone.utc)
+    degraded: list[str] = []
     try:
         cfg = _safe_load_config(store)
         roster = cfg.get("agents", []) or []
         try:
             for_agent = store.operator_facing() or store.sole_lead()
-        except Exception:  # noqa: BLE001 — a corrupt root can't resolve a liaison
+        except Exception as e:  # noqa: BLE001 — a corrupt root can't resolve a liaison
             for_agent = None
+            degraded.append(_envelope_str(f"liaison_resolution: {e}"))
         items = _collect_web_attention_items(store, roster, for_agent)
         disps, _problems = _attention.read_dispositions(store)
         queue = _attention.build_queue(items, disps,
@@ -2977,8 +3019,9 @@ def build_risk_register(desc: RootDescriptor) -> dict:
         try:
             agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
                                     for_agent)
-        except Exception:  # noqa: BLE001 — stuck items are best-effort
+        except Exception as e:  # noqa: BLE001
             agents = []
+            degraded.append(_envelope_str(f"stuck_agents: {e}"))
         for stuck in _derive_stuck_items(agents, now=now):
             risks.append({
                 "id": stuck["id"],
@@ -2998,7 +3041,15 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             # source "each open item" (proposal §3 #6) without that cap: an
             # older unresolved drift/unknown must not silently vanish once
             # 50 newer runs exist (review rq-4ecf94c4f814 finding 1).
-            all_runs = _onboarding.list_runs(store, limit=None).get("runs") or []
+            onboarding_result = _onboarding.list_runs(store, limit=None)
+            all_runs = onboarding_result.get("runs") or []
+            # B-2: a run whose ledger fails to parse is SKIPPED from `runs`
+            # and only ever named in `problems` - discarding that channel
+            # drops the run's open findings with no signal at all, no
+            # exception required. Surface which runs were unreadable.
+            for p in (onboarding_result.get("problems") or [])[:_RISK_DEGRADED_MAX]:
+                degraded.append(_envelope_str(
+                    f"onboarding_run:{_onboarding_short(p.get('run_id'), limit=96)}"))
             for run in all_runs:
                 run_records = run.get("records") or {}
                 run_id = _onboarding_short(run.get("run_id") or run.get("id"), limit=96)
@@ -3023,13 +3074,34 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                                 rec.get("summary") or f"{kind}: {rec.get('key')}"),
                             "owner": _onboarding_short(owner, limit=96) if owner else None,
                             "detail": run_title,
+                            # L-2: an unparseable updated_at must not read as
+                            # "0 seconds old" (misleadingly fresh) AND must
+                            # not silently sort to the bottom of its severity
+                            # band (deprioritized) - "unknown" is flagged
+                            # explicitly and sorted as the MOST urgent within
+                            # its band via the internal-only _sort_age below.
                             "age_seconds": age if age is not None else 0.0,
-                            "human_can_unblock_now": blocking,
+                            "age_unknown": age is None,
+                            # L-1: "blocking" (an onboarding workflow-progress
+                            # claim) is a DIFFERENT claim from "a human can
+                            # clear this right now" (a triage-affordance
+                            # claim the attention pipeline computes
+                            # separately for every other source). Nothing
+                            # external gates a human from acting on an
+                            # onboarding finding, so this is unconditionally
+                            # true here - not copied from `blocking`.
+                            "human_can_unblock_now": True,
+                            "_sort_age": age if age is not None else float("inf"),
                         })
-        except Exception:  # noqa: BLE001, S110 — onboarding risk items are best-effort  # nosec B110
-            pass
+        except Exception as e:  # noqa: BLE001
+            degraded.append(_envelope_str(f"onboarding: {e}"))
         risks.sort(key=lambda r: (_RISK_SEVERITY_ORDER.get(r["severity"], 3),
-                                  -r["age_seconds"]))
+                                  -r.get("_sort_age", r["age_seconds"])))
+        truncated = max(0, len(risks) - _RISK_REGISTER_ITEM_CAP)
+        risks = risks[:_RISK_REGISTER_ITEM_CAP]
+        for r in risks:
+            r.pop("_sort_age", None)
+        degraded = degraded[:_RISK_DEGRADED_MAX]
         return {
             "root": desc.label,
             "root_path": str(store.root),
@@ -3037,6 +3109,9 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             "target_root_project_id": store.project_id(),
             "items": risks,
             "count": len(risks),
+            "truncated": truncated,
+            "partial": bool(degraded),
+            "degraded_sources": degraded,
         }
     except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
         return {
@@ -3046,6 +3121,9 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             "target_root_project_id": store.project_id(),
             "items": [],
             "count": 0,
+            "truncated": 0,
+            "partial": True,
+            "degraded_sources": degraded[:_RISK_DEGRADED_MAX],
             "errors": [str(e)],
         }
 
