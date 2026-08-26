@@ -2761,6 +2761,411 @@ def test_console_renderer_safety(tmp_path: Path) -> None:
     assert "sessionStorage" not in js
 
 
+def test_console_mission_pill_bounds_long_text(tmp_path: Path) -> None:
+    """#207: long mission labels stay inside the header and retain a full-text
+    tooltip when the visible label is truncated."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/console.css") as resp:
+            css = resp.read().decode("utf-8")
+        with _get(f"{base}/static/console.js") as resp:
+            js = resp.read().decode("utf-8")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    pill = re.search(r"\.tc-mission-pill\s*\{([^}]*)\}", css, re.S)
+    label = re.search(r"\.tc-mission-name\s*\{([^}]*)\}", css, re.S)
+    assert pill is not None and "min-width: 0" in pill.group(1)
+    assert pill is not None and "max-width:" in pill.group(1)
+    assert label is not None and "overflow: hidden" in label.group(1)
+    assert label is not None and "text-overflow: ellipsis" in label.group(1)
+    assert "titled(pill, missionText)" in js
+
+
+def test_console_ages_and_staleness_use_server_time_anchor(tmp_path: Path) -> None:
+    """#207: wall-clock skew on the browser cannot make a server-timestamped
+    event newer/older or keep a failed poll labelled current."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console timestamp test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    acceptState: function (payload) {\n"
+        "      stampStatePayload(payload);\n"
+        "      lastState = payload;\n"
+        "      return payload;\n"
+        "    },\n"
+        "    liveAge: liveAge,\n"
+        "    serverClockText: serverClockText,\n"
+        "    pollingStatus: pollingStatus,\n"
+        "    resetText: resetText\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-time.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-time.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+let monotonic = 1000;
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return monotonic; } },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+vm.runInContext('Date.now = () => Date.parse("2100-01-01T00:00:00Z")', ctx);
+
+const hooks = ctx.__agenttalkConsoleTestHooks;
+const payload = {
+  generated_at: '2026-08-25T20:00:00Z',
+  roots: [],
+  sample: { ts: '2026-08-25T19:59:50Z', age_seconds: 10 },
+};
+hooks.acceptState(payload);
+monotonic = 6000;
+if (hooks.liveAge(payload.sample) !== 15) {
+  throw new Error(`server-relative age mixed in client clock: ${hooks.liveAge(payload.sample)}`);
+}
+if (hooks.serverClockText() !== '20:00:05 UTC') {
+  throw new Error(`server clock was not rendered in UTC: ${hooks.serverClockText()}`);
+}
+const resetAt = Date.parse('2026-08-25T20:30:00Z') / 1000;
+if (hooks.resetText({ resets_at: resetAt }) !== 'resets at 20:30 UTC') {
+  throw new Error(`server reset timestamp was not rendered in UTC: ${hooks.resetText({ resets_at: resetAt })}`);
+}
+if (hooks.pollingStatus().label !== 'Current') {
+  throw new Error(`fresh server snapshot was not labelled current: ${hooks.pollingStatus().label}`);
+}
+monotonic = 10000;
+if (hooks.pollingStatus().label !== 'Stale') {
+  throw new Error(`aged server snapshot was not labelled stale: ${hooks.pollingStatus().label}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_defaults_agent_grid_to_active_run(tmp_path: Path) -> None:
+    """#207: stale unwrapped roster history is opt-in via All; supervised
+    recovery targets and live unwrapped agents remain in the default scope."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console active-run test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    defaultFilter: state.filter,\n"
+        "    filterAgents: filterAgents\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-active-run.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-active-run.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+if (hooks.defaultFilter !== 'active') {
+  throw new Error(`default filter is ${hooks.defaultFilter}, not active run`);
+}
+const root = { agents: [
+  { name: 'supervised-idle', wrapped: true, health: { state: 'idle_waiting' } },
+  { name: 'supervised-exited', wrapped: true, health: { state: 'crashed_or_exited' } },
+  { name: 'live-unwrapped', wrapped: false, last_seen_age_seconds: 5,
+    health: { state: 'unknown' } },
+  { name: 'historical-unwrapped', wrapped: false, last_seen_age_seconds: 500,
+    health: { state: 'unknown' } },
+] };
+const names = hooks.filterAgents(root).map((item) => item.name);
+const expected = ['supervised-idle', 'supervised-exited', 'live-unwrapped'];
+if (JSON.stringify(names) !== JSON.stringify(expected)) {
+  throw new Error(`active-run scope mismatch: ${JSON.stringify(names)}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_poll_waits_for_slow_endpoint_before_rescheduling(tmp_path: Path) -> None:
+    """#207: each endpoint gets one in-flight request and its next cadence starts
+    after settlement, so a response slower than POLL_MS cannot stack requests."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console polling test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ boot\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    startEndpointPoll: startEndpointPoll\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-poll.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-poll.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+const timers = [];
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setTimeout(fn, delay) { timers.push({ fn, delay }); },
+  setInterval() { throw new Error('data polling must not use setInterval'); },
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+
+let calls = 0;
+const resolvers = [];
+function slowEndpoint() {
+  calls += 1;
+  return new Promise((resolve) => resolvers.push(resolve));
+}
+async function flush() {
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+}
+(async () => {
+  ctx.__agenttalkConsoleTestHooks.startEndpointPoll(slowEndpoint);
+  if (calls !== 1 || timers.length !== 0) {
+    throw new Error(`poll stacked before settlement: calls=${calls}, timers=${timers.length}`);
+  }
+  await flush();
+  if (calls !== 1 || timers.length !== 0) {
+    throw new Error(`pending endpoint was rescheduled: calls=${calls}, timers=${timers.length}`);
+  }
+  resolvers.shift()();
+  await flush();
+  if (timers.length !== 1 || timers[0].delay !== 2000) {
+    throw new Error(`next poll was not delayed after settlement: ${JSON.stringify(timers)}`);
+  }
+  const next = timers.shift();
+  next.fn();
+  if (calls !== 2 || timers.length !== 0) {
+    throw new Error(`second slow request stacked: calls=${calls}, timers=${timers.length}`);
+  }
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_narrow_layout_collapses_secondary_panels(tmp_path: Path) -> None:
+    """#207: secondary material is a closed native details panel at narrow
+    widths, while the same panel stays open on desktop and primary panels sort
+    ahead of it."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console narrow-layout test")
+
+    static_dir = Path(web.__file__).with_name("web_static")
+    src = (static_dir / "console.js").read_text(encoding="utf-8")
+    css = (static_dir / "console.css").read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    responsiveSecondary: responsiveSecondary\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-narrow.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-narrow.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function node(tag) {
+  const attrs = {};
+  return {
+    tagName: String(tag).toUpperCase(), className: '', textContent: '', children: [], open: false,
+    appendChild(child) { this.children.push(child); return child; },
+    setAttribute(name, value) { attrs[name] = String(value); },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+    },
+    addEventListener() {},
+  };
+}
+// A live MediaQueryList mock: ONE shared object (like the real
+// `window.matchMedia(query)` returning an equivalent list for a repeated
+// query), so the module-level listener registered against it (once, at
+// script load - review rq-2968d93df2bc) can be fired to simulate a real
+// viewport crossing the boundary, and so this test can assert exactly how
+// many listeners ever accumulate on it.
+const mq = { matches: true, _listeners: [] };
+function fireMediaChange(matches) {
+  mq.matches = matches;
+  for (const cb of mq._listeners) cb({ matches });
+}
+// A minimal "mounted DOM" root, separate from panels that are merely
+// CREATED: round 2 of this review (rq-2968d93df2bc) showed that reacting on
+// the next RENDER isn't equivalent to reacting on the live DOM when a poll
+// is delayed/failed. The fix walks document.querySelectorAll('.tc-secondary-panel')
+// on every real media-query change, so this harness must model "currently
+// attached to the page" vs "created but discarded" to prove it only ever
+// touches what's actually mounted (never a registry that could leak).
+const mountRoot = node('main');
+function mount(panel) { mountRoot.children.push(panel); return panel; }
+function unmount(panel) {
+  const idx = mountRoot.children.indexOf(panel);
+  if (idx !== -1) mountRoot.children.splice(idx, 1);
+}
+function hasClass(n, cls) { return String(n.className || '').split(/\s+/).includes(cls); }
+function queryAllByClass(root, cls) {
+  const out = [];
+  (function walk(n) {
+    if (hasClass(n, cls)) out.push(n);
+    for (const c of n.children || []) walk(c);
+  })(root);
+  return out;
+}
+const document = {
+  readyState: 'loading', addEventListener() {},
+  createElement: node,
+  createElementNS(_ns, tag) { return node(tag); },
+  querySelectorAll(selector) {
+    return queryAllByClass(mountRoot, selector.replace(/^\./, ''));
+  },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setInterval() {}, clearInterval() {},
+  matchMedia() {
+    return {
+      get matches() { return mq.matches; },
+      addEventListener(type, cb) { if (type === 'change') mq._listeners.push(cb); },
+    };
+  },
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+
+// review rq-2968d93df2bc: a per-panel change listener leaked (1000 rendered
+// panels left 1000 live listeners, each closing over a detached node). The
+// fix is ONE shared listener registered at module load, not one per panel -
+// assert that up front, before creating anything.
+if (mq._listeners.length !== 1) {
+  throw new Error(`expected exactly one shared change listener at module load, got ${mq._listeners.length}`);
+}
+
+// Created narrow: closed, per the existing contract. Mount it - this is the
+// panel a real page would currently be displaying.
+const mobileContent = node('div');
+const panel = mount(hooks.responsiveSecondary('Recent activity', mobileContent));
+if (panel.tagName !== 'DETAILS' || panel.open || panel.children[0].tagName !== 'SUMMARY' ||
+    panel.children[1] !== mobileContent) {
+  throw new Error(`narrow secondary panel did not collapse safely: ${JSON.stringify(panel)}`);
+}
+
+// Direct regression for the reviewer's leak repro: render 1000 panels,
+// mount-then-immediately-unmount each (simulating 1000 view rebuilds). The
+// listener count must stay at exactly one - nothing accumulates per panel,
+// and nothing is retained for a panel that is no longer mounted.
+for (let i = 0; i < 1000; i++) {
+  unmount(mount(hooks.responsiveSecondary('Recent activity', node('div'))));
+}
+if (mq._listeners.length !== 1) {
+  throw new Error(`1000 rendered panels must not accumulate listeners, got ${mq._listeners.length}`);
+}
+
+// review rq-2968d93df2bc round 2: the SAME still-mounted node ("panel" from
+// above) must react to a live viewport crossing WITHOUT any render/poll in
+// between - fetchState keeps last-good state on a failed poll, so depending
+// on the next render is not equivalent to the original live-node contract.
+fireMediaChange(false);
+if (!panel.open) {
+  throw new Error('the SAME mounted panel did not reopen on narrow -> wide with no poll in between');
+}
+fireMediaChange(true);
+if (panel.open) {
+  throw new Error('the SAME mounted panel did not re-collapse on wide -> narrow with no poll in between');
+}
+
+// A panel that was mounted and then discarded (unmounted, as a real view
+// teardown would do) must NOT be touched by a later change - proves the fix
+// walks the LIVE DOM (querySelectorAll), not a leak-prone registry of every
+// panel ever created.
+const discardedContent = node('div');
+const discarded = mount(hooks.responsiveSecondary('Recent activity', discardedContent));
+unmount(discarded);
+const discardedOpenBefore = discarded.open;
+fireMediaChange(false);
+if (discarded.open !== discardedOpenBefore) {
+  throw new Error('an unmounted/discarded panel must not be mutated by a later media-query change');
+}
+
+// Still exactly one listener after all of the above.
+if (mq._listeners.length !== 1) {
+  throw new Error(`expected exactly one shared change listener at the end, got ${mq._listeners.length}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+    narrow_css = css[css.index("@media (max-width: 560px)"):]
+    assert ".tc-priority-primary" in narrow_css and "order: -1" in narrow_css
+    assert ".tc-secondary-summary" in narrow_css
+    assert "responsiveSecondary('Team totals', tiles)" in src
+    assert "responsiveSecondary('Recent activity', activityRail(root))" in src
+
+
 def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path) -> None:
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")
@@ -2771,7 +3176,8 @@ def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path)
         "  globalThis.__agenttalkConsoleTestHooks = {\n"
         "    stateInfo: stateInfo,\n"
         "    agentStateInfo: agentStateInfo,\n"
-        "    freshHeartbeat: freshHeartbeat\n"
+        "    freshHeartbeat: freshHeartbeat,\n"
+        "    monotonicNow: monotonicNow\n"
         "  };\n\n" + marker,
         1,
     )
@@ -2826,6 +3232,17 @@ check({ health: { state: 'working_turn' }, last_seen_age_seconds: 5, wrapped: tr
 check({ health: { state: 'idle_waiting' }, last_seen_age_seconds: 5, wrapped: true },
   { key: 'idle_waiting', label: 'Idle \u00b7 waiting', color: 'warn', grp: 'idle' });
 assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative heartbeat fails');
+
+// #207 residual, finding 3: this ctx has NO `performance` global, so
+// monotonicNow() must take its fallback branch. A frozen `0` fallback is
+// fail-open (every later delta reads permanently "just now"); the fix must
+// fall back to a real, advancing wall clock instead.
+const before = Date.now();
+const stamp = hooks.monotonicNow();
+const after = Date.now();
+assert(stamp !== 0, 'monotonicNow() fallback must not freeze at 0 when performance is unavailable');
+assert(stamp >= before && stamp <= after,
+  `monotonicNow() fallback should track Date.now(): ${stamp} not in [${before}, ${after}]`);
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)

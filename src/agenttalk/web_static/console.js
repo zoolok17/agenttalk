@@ -123,10 +123,11 @@
     view: 'overview',
     selectedAgent: null,   // agent name
     sessionRid: null,      // thread request_id
-    filter: 'all',         // all | working | idle | attention
+    filter: 'active',      // active run by default; all history remains opt-in
     selectedRootId: initialRootId(),
-    now: Date.now(),
+    now: null,             // server-derived wall time; never the browser clock
   };
+  var serverClock = null;  // { epochMs, receivedAt } anchored by /api/state.generated_at
   var rootGeneration = 0;
   // Prefs (persisted). Loaded/validated below.
   var prefs = { theme: 'light', accent: 'blue', density: 'comfortable' };
@@ -172,6 +173,7 @@
   };
   var answerComposerState = {};       // to_request -> body text
   var leadChatComposerState = { body: '' };
+  var secondaryOpen = {};             // disclosure choices survive 2s re-renders
   var archivedState = {
     root: '',
     open: false,
@@ -197,6 +199,55 @@
     if (n && title) n.setAttribute('title', String(title));
     return n;
   }
+  // Shared narrow-viewport tracker for responsiveSecondary. A per-call
+  // MediaQueryList 'change' listener used to leak (review rq-2968d93df2bc,
+  // round 1): every rendered panel registered its own listener that was
+  // never unregistered, so a long session accumulated one per panel. A pure
+  // "read a shared flag at creation time" fix (round 2) closed the leak but
+  // broke the ORIGINAL live-node contract: an already-displayed panel only
+  // picked up a viewport crossing on the NEXT successful /api/state poll,
+  // and fetchState keeps last-good state on a failed poll - during an
+  // outage a crossing could go unreflected indefinitely.
+  //
+  // Fix: ONE shared listener (still just one, still no leak) that, on a
+  // real change, ALSO walks the LIVE DOM for every currently-mounted
+  // .tc-secondary-panel and updates its open state directly - no per-panel
+  // registry to grow/leak (querySelectorAll always reflects only what is
+  // CURRENTLY attached), no dependency on the next render/poll.
+  var _narrowPanelMq = (typeof window !== 'undefined' && window.matchMedia)
+    ? window.matchMedia('(max-width: 560px)') : null;
+  var isNarrowViewport = !!(_narrowPanelMq && _narrowPanelMq.matches);
+  function _applyNarrowToLiveSecondaryPanels(narrow) {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return;
+    var panels = document.querySelectorAll('.tc-secondary-panel');
+    for (var i = 0; i < panels.length; i++) {
+      var panel = panels[i];
+      var label = panel.getAttribute && panel.getAttribute('data-secondary-label');
+      panel.open = !narrow || secondaryOpen[label] === true;
+    }
+  }
+  if (_narrowPanelMq) {
+    var _onNarrowPanelMqChange = function (e) {
+      isNarrowViewport = !!e.matches;
+      _applyNarrowToLiveSecondaryPanels(isNarrowViewport);
+    };
+    if (typeof _narrowPanelMq.addEventListener === 'function') {
+      _narrowPanelMq.addEventListener('change', _onNarrowPanelMqChange);
+    } else if (typeof _narrowPanelMq.addListener === 'function') {
+      _narrowPanelMq.addListener(_onNarrowPanelMqChange); // legacy Safari
+    }
+  }
+  function responsiveSecondary(label, content) {
+    var details = el('details', 'tc-secondary-panel');
+    details.setAttribute('data-secondary-label', label);
+    details.open = !isNarrowViewport || secondaryOpen[label] === true;
+    details.appendChild(el('summary', 'tc-secondary-summary', label));
+    details.appendChild(content);
+    on(details, 'toggle', function () {
+      if (isNarrowViewport) secondaryOpen[label] = !!details.open;
+    });
+    return details;
+  }
   function svgEl(tag, attrs) {
     var n = document.createElementNS(SVG_NS, tag);
     if (attrs) {
@@ -211,6 +262,60 @@
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
   function isArray(x) { return Object.prototype.toString.call(x) === '[object Array]'; }
   function on(node, ev, fn) { node.addEventListener(ev, fn); return node; }
+  function monotonicNow() {
+    // performance.now is elapsed-time only: client wall-clock skew cannot enter
+    // server ages, freshness, or the displayed clock - PREFER it. But a frozen
+    // constant (the old `: 0` fallback) is fail-OPEN: every later
+    // (monotonicNow() - receivedAt) delta would then be permanently 0, so
+    // attentionFresh/stateFresh could never age out even after polling stops
+    // (#207 residual, low confidence but fail-open is the worse direction).
+    // Date.now is not perfectly monotonic, but only feeds this fallback when
+    // performance.now itself is unavailable everywhere in this session, so
+    // every delta still compares two Date.now-based samples consistently.
+    return (typeof performance !== 'undefined' && performance &&
+      typeof performance.now === 'function') ? performance.now() : Date.now();
+  }
+  function serverNowAt(receivedAt) {
+    if (!serverClock) return null;
+    return serverClock.epochMs + Math.max(0, receivedAt - serverClock.receivedAt);
+  }
+  function serverNow() { return serverNowAt(monotonicNow()); }
+  function defineTiming(value, key, timing) {
+    try {
+      Object.defineProperty(value, key, { value: timing, configurable: true });
+    } catch (e) { value[key] = timing; }
+  }
+  function stampPayloadTiming(value, receivedAt, serverAt) {
+    if (!value || typeof value !== 'object') return;
+    defineTiming(value, '_receivedAt', receivedAt);
+    if (typeof serverAt === 'number' && isFinite(serverAt)) {
+      defineTiming(value, '_serverAt', serverAt);
+    }
+    var keys = Object.keys(value);
+    for (var i = 0; i < keys.length; i++) {
+      stampPayloadTiming(value[keys[i]], receivedAt, serverAt);
+    }
+  }
+  function stampStatePayload(data) {
+    var receivedAt = monotonicNow();
+    var generatedAt = data ? Date.parse(data.generated_at) : NaN;
+    if (isFinite(generatedAt)) {
+      serverClock = { epochMs: generatedAt, receivedAt: receivedAt };
+      state.now = generatedAt;
+    } else {
+      serverClock = null;
+      state.now = null;
+    }
+    stampPayloadTiming(data, receivedAt, isFinite(generatedAt) ? generatedAt : null);
+    return data;
+  }
+  function stampAuxPayload(data) {
+    var receivedAt = monotonicNow();
+    var generatedAt = data ? Date.parse(data.generated_at) : NaN;
+    var serverAt = isFinite(generatedAt) ? generatedAt : serverNowAt(receivedAt);
+    stampPayloadTiming(data, receivedAt, serverAt);
+    return data;
+  }
   var LEAD_CHAT_VOLATILE_KEYS = nullMap({
     age_seconds: true,
     heartbeat_age_seconds: true,
@@ -320,16 +425,21 @@
     var h = Math.floor(sec / 3600), mm = Math.floor((sec % 3600) / 60);
     return mm ? (h + 'h ' + mm + 'm') : (h + 'h');
   }
-  // Age of a wire item: prefer a live recompute from `ts`, else fall back to
-  // the server-computed `age_seconds` (adjusted by drift since the poll).
+  // Age of a wire item. Prefer the server-computed age and advance it only by
+  // monotonic elapsed time since THAT payload was received. If the wire carries
+  // only `ts`, compare it with the /api/state `generated_at` clock anchor. The
+  // browser wall clock is deliberately absent from both paths (#207).
   function liveAge(item) {
+    var elapsed = item && typeof item._receivedAt === 'number'
+      ? Math.max(0, monotonicNow() - item._receivedAt) / 1000 : 0;
+    if (item && typeof item.age_seconds === 'number') {
+      return item.age_seconds + elapsed;
+    }
     if (item && item.ts) {
       var t = Date.parse(item.ts);
-      if (!isNaN(t)) return (state.now - t) / 1000;
-    }
-    if (item && typeof item.age_seconds === 'number') {
-      var base = lastState && lastState._fetchedAt ? lastState._fetchedAt : state.now;
-      return item.age_seconds + (state.now - base) / 1000;
+      var now = item && typeof item._serverAt === 'number'
+        ? item._serverAt + elapsed * 1000 : serverNow();
+      if (!isNaN(t) && typeof now === 'number') return (now - t) / 1000;
     }
     return null;
   }
@@ -337,8 +447,8 @@
   // A relative-age span that the 1 Hz clock ticker updates IN PLACE (B2a) —
   // NOT via a DOM rebuild, which would destroy inner-scroll and text selection
   // in the transcript/feed every second. The node is tagged with the raw inputs
-  // (`data-age-ts` / `data-age-sec`) plus formatting opts so `updateAges` can
-  // recompute textContent from the current `state.now` without re-rendering.
+  // (`data-age-ts` / `data-age-sec` plus its server/monotonic receipt anchors)
+  // and formatting opts so `updateAges` can recompute without re-rendering.
   //   opts.suffix   — appended after the formatted age (e.g. ' ago')
   //   opts.prefix   — prepended before it (e.g. 'since ')
   //   opts.nullText — shown when age is null / noHb (e.g. 'no hb', 'missing')
@@ -350,6 +460,12 @@
     if (item && item.ts) n.setAttribute('data-age-ts', String(item.ts));
     if (item && typeof item.age_seconds === 'number') {
       n.setAttribute('data-age-sec', String(item.age_seconds));
+    }
+    if (item && typeof item._receivedAt === 'number') {
+      n.setAttribute('data-age-received', String(item._receivedAt));
+    }
+    if (item && typeof item._serverAt === 'number') {
+      n.setAttribute('data-age-server', String(item._serverAt));
     }
     if (opts.suffix) n.setAttribute('data-age-suffix', opts.suffix);
     if (opts.prefix) n.setAttribute('data-age-prefix', opts.prefix);
@@ -363,9 +479,9 @@
     titled(n, absTimeTitle(item, opts));
     return n;
   }
-  // The absolute local time an age refers to, for the hover tooltip. Prefers the
-  // wire `ts`; else derives from `age_seconds` relative to the last poll (like
-  // liveAge). Returns '' for a no-heartbeat node or an unparseable time.
+  // The absolute UTC time an age refers to, for the hover tooltip. A direct wire
+  // `ts` is authoritative; an age-only item is derived from the server-time
+  // anchor captured with that payload. Never derive it from browser wall time.
   function absTimeTitle(item, opts) {
     opts = opts || {};
     var meaning = opts.title || '';   // optional plain-language prefix (e.g. heartbeat)
@@ -375,18 +491,19 @@
       var t = Date.parse(item.ts);
       if (!isNaN(t)) ms = t;
     }
-    if (ms === null && item && typeof item.age_seconds === 'number') {
-      var base = lastState && lastState._fetchedAt ? lastState._fetchedAt : state.now;
-      ms = base - item.age_seconds * 1000;
+    if (ms === null && item && typeof item.age_seconds === 'number' &&
+      typeof item._serverAt === 'number') {
+      ms = item._serverAt - item.age_seconds * 1000;
     }
     if (ms === null) return meaning;
     var abs;
-    try { abs = new Date(ms).toLocaleString(); } catch (e) { abs = ''; }
+    try { abs = new Date(ms).toISOString(); } catch (e) { abs = ''; }
     if (!abs) return meaning;
     return meaning ? (meaning + ' · ' + abs) : abs;
   }
   // Format the current text for a tagged age node from its data-* inputs + the
-  // live `state.now`. Shared by `ageEl` (initial render) and `updateAges` (tick).
+  // trusted payload timing. Shared by `ageEl` (initial render) and
+  // `updateAges` (tick).
   function ageText(n) {
     var pfx = n.getAttribute('data-age-prefix') || '';
     var sfx = n.getAttribute('data-age-suffix') || '';
@@ -397,6 +514,10 @@
     if (ts) item.ts = ts;
     var sec = n.getAttribute('data-age-sec');
     if (sec !== null && sec !== '') item.age_seconds = Number(sec);
+    var received = n.getAttribute('data-age-received');
+    if (received !== null && received !== '') item._receivedAt = Number(received);
+    var server = n.getAttribute('data-age-server');
+    if (server !== null && server !== '') item._serverAt = Number(server);
     var age = liveAge(item);
     if (age === null) return nullText || '';
     return pfx + fmtAge(age) + sfx;
@@ -777,13 +898,25 @@
     }
     return c;
   }
+  function agentInActiveRun(agent) {
+    // A supervised seat remains part of the run while recovering/exited; hiding
+    // it would conceal exactly the operator-critical failure state. An
+    // unsupervised seat is current only while its independent heartbeat is fresh.
+    return !!agent && (agent.wrapped === true || freshHeartbeat(agent));
+  }
+  function activeRunCount(root) {
+    var as = agentsOf(root), count = 0;
+    for (var i = 0; i < as.length; i++) if (agentInActiveRun(as[i])) count++;
+    return count;
+  }
   function filterAgents(root) {
     var as = agentsOf(root);
     if (state.filter === 'all') return as.slice();
     var out = [];
     for (var i = 0; i < as.length; i++) {
       var grp = agentStateInfo(as[i]).grp;
-      if (state.filter === 'working' && grp === 'work') out.push(as[i]);
+      if (state.filter === 'active' && agentInActiveRun(as[i])) out.push(as[i]);
+      else if (state.filter === 'working' && grp === 'work') out.push(as[i]);
       else if (state.filter === 'idle' && grp === 'idle') out.push(as[i]);
       else if (state.filter === 'attention' && grp === 'attn') out.push(as[i]);
       else if (state.filter === 'unknown' && grp === 'unknown') out.push(as[i]);
@@ -812,7 +945,7 @@
   // Is the human-attention queue KNOWN (loaded + fresh)? attentionData is null
   // until the first successful fetch and is retained (not blanked) on a failed
   // poll, so a bare count can't tell "confirmed empty" from "never loaded / stale
-  // during an outage". A stamped _fetchedAt (set on each successful fetchAttention,
+  // during an outage". A stamped _receivedAt (set on each successful fetchAttention,
   // which polls every POLL_MS) ages out during an outage -> unknown. An unstamped
   // non-null payload (e.g. a test harness) is treated as known.
   // PURE (testable without module state): an attention payload counts as KNOWN — safe
@@ -823,20 +956,47 @@
   function attentionKnownFrom(data, now) {
     if (data == null) return false;
     if (Array.isArray(data.errors) && data.errors.length) return false;
+    var received = data._receivedAt;
+    if (typeof received === 'number' && isFinite(received)) {
+      return (monotonicNow() - received) <= ATTENTION_STALE_MS;
+    }
+    // Compatibility for pure test fixtures written before the monotonic stamp.
     var at = data._fetchedAt;
     if (typeof at !== 'number' || !isFinite(at)) return true;
     return (now - at) <= ATTENTION_STALE_MS;
   }
   function attentionFresh() { return attentionKnownFrom(attentionData, state.now); }
   // Is the agent-health data (from /api/state) KNOWN-fresh? Same rationale as
-  // attentionFresh: fetchState stamps _fetchedAt on each successful poll and retains
-  // last-good on failure, so a stale lastState means agent health is obsolete and the
-  // verdict must NOT assert green from it (v0.76.0 trust contract).
+  // attentionFresh: fetchState stamps _receivedAt (via stampStatePayload) on each
+  // successful poll and retains last-good on failure, so a stale lastState means
+  // agent health is obsolete and the verdict must NOT assert green from it (v0.76.0
+  // trust contract). _fetchedAt below is only the compatibility fallback for pure
+  // test fixtures predating the monotonic stamp, same as attentionKnownFrom.
   function stateFresh() {
     if (lastState == null) return false;
+    var received = lastState._receivedAt;
+    if (typeof received === 'number' && isFinite(received)) {
+      return (monotonicNow() - received) <= STATE_STALE_MS;
+    }
+    // Compatibility for pure test fixtures written before the monotonic stamp.
     var at = lastState._fetchedAt;
     if (typeof at !== 'number' || !isFinite(at)) return true;
     return (state.now - at) <= STATE_STALE_MS;
+  }
+  function serverClockText() {
+    var now = serverNow();
+    if (typeof now !== 'number' || !isFinite(now)) return 'Server time unavailable';
+    try { return new Date(now).toISOString().slice(11, 19) + ' UTC'; }
+    catch (e) { return 'Server time unavailable'; }
+  }
+  function pollingStatus() {
+    if (!lastState) {
+      return { label: 'Connecting', tone: 'waiting', title: 'Waiting for the first server snapshot' };
+    }
+    if (!stateFresh()) {
+      return { label: 'Stale', tone: 'stale', title: 'The last successful server snapshot is stale' };
+    }
+    return { label: 'Current', tone: 'current', title: 'The latest server snapshot is current' };
   }
   function teamHealthVerdict(root) {
     var c = agentCounts(root);
@@ -1085,9 +1245,8 @@
     }
     var at = capNum(win, 'resets_at');
     if (at !== null) {
-      return 'resets at ' + new Date(at * 1000).toLocaleTimeString('en-US', {
-        hour: '2-digit', minute: '2-digit'
-      });
+      try { return 'resets at ' + new Date(at * 1000).toISOString().slice(11, 16) + ' UTC'; }
+      catch (e) { return '—'; }
     }
     return '—';
   }
@@ -1180,19 +1339,26 @@
     // Mission pill (from root.spec_kitty.missions — name only, no x/y).
     if (root && root.spec_kitty && isArray(root.spec_kitty.missions) && root.spec_kitty.missions.length) {
       var pill = el('div', 'tc-mission-pill');
+      var missionText = root.spec_kitty.missions.join(' · ');
       pill.appendChild(missionIcon());
-      pill.appendChild(el('span', 'tc-mission-name', root.spec_kitty.missions.join(' · ')));
+      pill.appendChild(el('span', 'tc-mission-name', missionText));
+      titled(pill, missionText);
       bar.appendChild(pill);
     }
 
     bar.appendChild(el('div', 'tc-spacer'));
 
-    // Live indicator + clock (recomputed each tick).
-    var live = el('div', 'tc-live');
+    // Poll freshness + server clock (recomputed each tick). "Current" describes
+    // the last successful server snapshot; it is never inferred from a client
+    // clock or from the mere absence of an error.
+    var poll = pollingStatus();
+    var live = el('div', 'tc-live is-' + poll.tone);
     live.appendChild(el('span', 'tc-live-dot'));
-    titled(live, 'The page is polling the bus live');
-    live.appendChild(el('span', 'tc-live-label', 'Live'));
-    live.appendChild(el('span', 'tc-clock', new Date(state.now).toLocaleTimeString('en-US', { hour12: false })));
+    titled(live, poll.title);
+    live.appendChild(el('span', 'tc-live-label', poll.label));
+    var clock = el('span', 'tc-clock', serverClockText());
+    titled(clock, 'Server-provided UTC time; advanced only by monotonic elapsed time');
+    live.appendChild(clock);
     bar.appendChild(live);
 
     // Overall team-health pill (v0.76.0): the green "Live" dot only means the page
@@ -1347,7 +1513,7 @@
       legendRows.appendChild(lr);
     }
     legend.appendChild(legendRows);
-    side.appendChild(legend);
+    side.appendChild(responsiveSecondary('Status legend', legend));
   }
 
   // ------------------------------------------------------------ view router
@@ -1426,7 +1592,7 @@
       tile.appendChild(el('div', 'tc-stat-value', tileDefs[i].value));
       tiles.appendChild(tile);
     }
-    main.appendChild(tiles);
+    main.appendChild(responsiveSecondary('Team totals', tiles));
 
     // Two-column body: agent grid + live-activity rail.
     var body = el('div', 'tc-overview-body');
@@ -1460,14 +1626,15 @@
       for (var g = 0; g < shown.length; g++) grid.appendChild(agentCard(root, shown[g]));
     }
     body.appendChild(grid);
-    body.appendChild(activityRail(root));
+    body.appendChild(responsiveSecondary('Recent activity', activityRail(root)));
     main.appendChild(body);
   }
 
   function filterChips(root, counts) {
     var wrap = el('div', 'tc-filters');
     var defs = [
-      { key: 'all', label: 'All', count: agentsOf(root).length },
+      { key: 'active', label: 'Active run', count: activeRunCount(root) },
+      { key: 'all', label: 'All roster', count: agentsOf(root).length },
       { key: 'working', label: 'Working', count: counts.work },
       { key: 'idle', label: 'Idle', count: counts.idle },
       { key: 'attention', label: 'Health attention', count: counts.attn },
@@ -1615,10 +1782,10 @@
     var graphCard = el('div', 'tc-card tc-graph-card');
     graphCard.appendChild(buildGraph(root));
     graphCard.appendChild(flowLegend(root));
-    body.appendChild(graphCard);
+    body.appendChild(responsiveSecondary('Relationship graph', graphCard));
 
     // Right: Active-threads list.
-    var listCard = el('div', 'tc-card tc-card-clip');
+    var listCard = el('div', 'tc-card tc-card-clip tc-priority-primary');
     var listHead = el('div', 'tc-card-head');
     listHead.appendChild(el('span', 'tc-card-title', 'Active threads'));
     listCard.appendChild(listHead);
@@ -2524,10 +2691,12 @@
   }
 
   function leadChatSide(data) {
-    var side = el('div', 'tc-lead-side');
-    side.appendChild(leadChatLivenessCard(data));
+    var side = el('div', 'tc-lead-side tc-priority-primary');
     side.appendChild(leadChatDecisionsCard(data));
-    side.appendChild(intentSummaryStrip());
+    var secondary = el('div', 'tc-lead-secondary');
+    secondary.appendChild(leadChatLivenessCard(data));
+    secondary.appendChild(intentSummaryStrip());
+    side.appendChild(responsiveSecondary('Lead status and queued actions', secondary));
     return side;
   }
 
@@ -2698,12 +2867,12 @@
       return;
     }
 
-    wrap.appendChild(learningSummary(data));
+    wrap.appendChild(responsiveSecondary('Learning totals', learningSummary(data)));
     var body = el('div', 'tc-learning-layout');
     body.appendChild(learningLessons(data));
-    var side = el('div', 'tc-learning-side');
-    side.appendChild(learningExposurePanel(data));
+    var side = el('div', 'tc-learning-side tc-priority-primary');
     side.appendChild(learningProblemsPanel(data));
+    side.appendChild(responsiveSecondary('Recent surfaced lessons', learningExposurePanel(data)));
     body.appendChild(side);
     wrap.appendChild(body);
     main.appendChild(wrap);
@@ -2888,12 +3057,12 @@
       return;
     }
 
-    wrap.appendChild(onboardingSummary(data));
+    wrap.appendChild(responsiveSecondary('Onboarding totals', onboardingSummary(data)));
     var body = el('div', 'tc-onboarding-layout');
     body.appendChild(onboardingRuns(data));
-    var side = el('div', 'tc-onboarding-side');
+    var side = el('div', 'tc-onboarding-side tc-priority-primary');
     side.appendChild(onboardingBlockersPanel(data));
-    side.appendChild(onboardingProblemsPanel(data));
+    side.appendChild(responsiveSecondary('Ledger health', onboardingProblemsPanel(data)));
     body.appendChild(side);
     wrap.appendChild(body);
     main.appendChild(wrap);
@@ -3195,8 +3364,10 @@
     var body = el('div', 'tc-sessions-body');
 
     var left = el('div', 'tc-session-left');
-    left.appendChild(actionComposer(root));
-    left.appendChild(intentSummaryStrip());
+    var actions = el('div', 'tc-session-actions');
+    actions.appendChild(actionComposer(root));
+    actions.appendChild(intentSummaryStrip());
+    left.appendChild(responsiveSecondary('Compose and queued actions', actions));
     left.appendChild(activeThreadsCard(root));
     left.appendChild(archivedThreadsCard(root));
     body.appendChild(left);
@@ -3207,7 +3378,7 @@
   }
 
   function activeThreadsCard(root) {
-    var listCard = el('div', 'tc-card tc-card-clip');
+    var listCard = el('div', 'tc-card tc-card-clip tc-priority-primary');
     var head = el('div', 'tc-session-list-title tc-session-section-head');
     head.appendChild(el('span', null, 'Active'));
     head.appendChild(el('span', 'tc-spacer'));
@@ -3831,6 +4002,7 @@
     }).then(function (data) {
       if (sessionPending === requestKey) sessionPending = null;
       if (!rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       if (data && data.csrf_token) {
         actionSession.enabled = true;
         actionSession.token = data.csrf_token;
@@ -3853,14 +4025,15 @@
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (intentsPending === requestKey) return;
+    if (intentsPending === requestKey) return null;
     intentsPending = requestKey;
-    fetch(rootUrl('/api/intents', projectId)).then(function (r) {
+    return fetch(rootUrl('/api/intents', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
       if (intentsPending === requestKey) intentsPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       intentsData = data;
       if (state.view === 'sessions') renderActiveViewFromPoll();
     }).catch(function () {
@@ -3971,10 +4144,10 @@
     // >2s, stacked requests could commit out of arrival order and move the
     // console backwards; the guard + the per-response sequence check below
     // (drop anything older than the newest committed) prevent that.
-    if (statePending) return;
+    if (statePending) return null;
     statePending = true;
     var seq = ++stateSeq;
-    fetch('/api/state').then(function (r) {
+    return fetch('/api/state').then(function (r) {
       // r.ok guard (P3): on a non-2xx, keep the last-good lastState rather than
       // blanking the view to an error object / "Loading…".
       if (!r.ok) return null;
@@ -3984,7 +4157,7 @@
       if (!data) return;                       // non-ok — keep last-good
       if (seq < stateCommitted) return;        // stale response — drop (P2-4)
       stateCommitted = seq;
-      data._fetchedAt = Date.now();
+      stampStatePayload(data);
       var hadState = !!lastState;
       lastState = data;
       var projectChanged = reconcileProjectSelection();
@@ -4028,15 +4201,15 @@
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (attentionPending === requestKey) return;
+    if (attentionPending === requestKey) return null;
     attentionPending = requestKey;
-    fetch(rootUrl('/api/attention', projectId)).then(function (r) {
+    return fetch(rootUrl('/api/attention', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
       if (attentionPending === requestKey) attentionPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
-      data._fetchedAt = Date.now();   // freshness stamp for the team-health verdict (v0.76.0)
+      stampAuxPayload(data);   // monotonic freshness + server-time anchor (#207)
       attentionData = data;
       renderSidebar();  // count badge
       if (state.view === 'attention') renderActiveViewFromPoll();
@@ -4049,14 +4222,15 @@
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (leadChatPending === requestKey) return;
+    if (leadChatPending === requestKey) return null;
     leadChatPending = requestKey;
-    fetch(rootUrl('/api/lead-chat', projectId)).then(function (r) {
+    return fetch(rootUrl('/api/lead-chat', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
       if (leadChatPending === requestKey) leadChatPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       var nextHash = leadChatPayloadFingerprint(data);
       var changed = leadChatPayloadHash !== nextHash;
       leadChatPayloadHash = nextHash;
@@ -4081,6 +4255,7 @@
     }).then(function (data) {
       if (learningPending === requestKey) learningPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       learningData = data;
       renderSidebar();
       if (state.view === 'learning') renderActiveViewFromPoll();
@@ -4102,6 +4277,7 @@
     }).then(function (data) {
       if (onboardingPending === requestKey) onboardingPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      stampAuxPayload(data);
       onboardingData = data;
       renderSidebar();
       if (state.view === 'onboarding') renderActiveViewFromPoll();
@@ -4198,6 +4374,7 @@
         archivedState.items = reset ? [] : archivedState.items;
         archivedState.nextCursor = null;
       } else {
+        stampAuxPayload(data);
         var items = data.items || [];
         archivedState.items = reset ? items : archivedState.items.concat(items);
         archivedState.nextCursor = data.next_cursor || null;
@@ -4244,6 +4421,7 @@
       } else if (!rootPayloadMatches(data, projectId, generation)) {
         return;
       } else {
+        stampAuxPayload(data);
         threadCache[key] = data;
         delete threadNotFound[key];
       }
@@ -4267,10 +4445,18 @@
 
   // ------------------------------------------------------------ loops
   function clockTick() {
-    state.now = Date.now();
-    // Recompute the wall clock + relative ages without a network round-trip.
+    state.now = serverNow();
+    // Recompute server clock + relative ages without a network round-trip.
     var clock = document.querySelector('#topbar .tc-clock');
-    if (clock) clock.textContent = new Date(state.now).toLocaleTimeString('en-US', { hour12: false });
+    if (clock) clock.textContent = serverClockText();
+    var live = document.querySelector('#topbar .tc-live');
+    if (live) {
+      var poll = pollingStatus();
+      live.className = 'tc-live is-' + poll.tone;
+      live.setAttribute('title', poll.title);
+      var label = live.querySelector ? live.querySelector('.tc-live-label') : null;
+      if (label) label.textContent = poll.label;
+    }
     // Advance age counters IN PLACE (B2a) — NEVER rebuild the DOM here, or the
     // transcript inner-scroll and any in-progress text selection are destroyed
     // every second. Only the 2s DATA poll re-renders the view.
@@ -4282,20 +4468,36 @@
     refreshHealthIfChanged();
   }
 
+  function startEndpointPoll(fetcher) {
+    // One independent completion-driven loop per endpoint. A 9-second scan
+    // therefore produces one request, then waits POLL_MS before the next; it
+    // never queues four interval ticks behind the slow request (#207).
+    function scheduleNext() { setTimeout(run, POLL_MS); }
+    function run() {
+      var request;
+      try { request = fetcher(); }
+      catch (e) { scheduleNext(); return; }
+      Promise.resolve(request).then(scheduleNext, scheduleNext);
+    }
+    run();
+  }
+
   // ------------------------------------------------------------ boot
   function boot() {
     loadPrefs();
     applyPrefs();
     renderChrome();
-    fetchState();
     // Fetch attention at boot AND poll it (P2-3), regardless of the initial
     // view: the sidebar count badge is the open-attention count and must be
     // current from the start, not blank until the Attention view is opened.
-    fetchRootPayloads();
-    setInterval(fetchState, POLL_MS);
-    setInterval(fetchAttention, POLL_MS);
-    setInterval(fetchLeadChat, POLL_MS);
-    setInterval(fetchIntents, POLL_MS);
+    startEndpointPoll(fetchState);
+    startEndpointPoll(fetchAttention);
+    startEndpointPoll(fetchLeadChat);
+    startEndpointPoll(fetchIntents);
+    // These payloads are view support, not high-cadence telemetry.
+    fetchSession();
+    fetchLearning();
+    fetchOnboarding();
     setInterval(clockTick, CLOCK_MS);
   }
 
