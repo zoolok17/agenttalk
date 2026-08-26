@@ -975,6 +975,19 @@
     return (now - at) <= ATTENTION_STALE_MS;
   }
   function attentionFresh() { return attentionKnownFrom(attentionData, state.now); }
+  // PR #129 connector round-5 (P1, console.js:4377, judgment call - fixed
+  // within the ~30-line budget by reusing stampAuxPayload/_receivedAt
+  // exactly as attentionKnownFrom does): the Gates and Risk Register views
+  // silently keep rendering their last-good payload through a poll outage,
+  // with nothing on the view itself signalling that it stopped updating -
+  // only the global topbar tracks /api/state freshness. This is scoped to
+  // those two views only; the topbar "Live" indicator is untouched.
+  function auxPayloadFresh(data) {
+    if (data == null) return false;
+    var received = data._receivedAt;
+    if (typeof received !== 'number' || !isFinite(received)) return true;
+    return (monotonicNow() - received) <= ATTENTION_STALE_MS;
+  }
   // Is the agent-health data (from /api/state) KNOWN-fresh? Same rationale as
   // attentionFresh: fetchState stamps _receivedAt (via stampStatePayload) on each
   // successful poll and retains last-good on failure, so a stale lastState means
@@ -2284,9 +2297,12 @@
   // stays blocks=false. The server now derives `waiver_expired`
   // severity-independently; prefer it, with `blocks` as a fallback for an
   // older payload shape.
+  function gateWaiverExpired(gate) {
+    return 'waiver_expired' in gate ? gate.waiver_expired : gate.blocks;
+  }
+
   function gateVisualState(gate) {
-    var expired = 'waiver_expired' in gate ? gate.waiver_expired : gate.blocks;
-    if (gate.status === 'waived' && expired) return 'waived_expired';
+    if (gate.status === 'waived' && gateWaiverExpired(gate)) return 'waived_expired';
     // PR #129 connector round-2 finding (P1, console.js:2281): a missing
     // required gate is status=unknown/blocks=true, and a skipped blocker
     // is status=skipped/blocks=true - both used to render with the neutral
@@ -2295,6 +2311,20 @@
     // case above) reuses the existing danger-red treatment.
     if (gate.blocks && gate.status !== 'red') return 'red';
     return gate.status || 'unknown';
+  }
+
+  // PR #129 connector round-5 (reviewer-3 F-3 + connector P2, console.js:2339):
+  // the chip TEXT must come from gate.status, not the visual/class value -
+  // gateVisualState forces a blocking unknown/skipped gate into the red
+  // CLASS for color, but a "RED" label on it falsely claims a run actually
+  // FAILED rather than never ran / was skipped. waived_expired is the one
+  // real status+text override (a bare "WAIVED" reads calm once the waiver
+  // stopped covering the gate), so it is kept here too.
+  function gateStatusLabel(gate) {
+    if (gate.status === 'waived' && gateWaiverExpired(gate)) {
+      return GATE_STATUS_LABEL.waived_expired;
+    }
+    return GATE_STATUS_LABEL[gate.status] || (gate.status || '').toUpperCase();
   }
 
   function renderGates(main, root) {
@@ -2309,6 +2339,11 @@
       var verdictChip = el('span', 'tc-chip tc-gate-verdict gate-' +
         (data.verdict === 'GO' ? 'green' : 'red'), data.verdict || 'HOLD');
       header.appendChild(verdictChip);
+      if (!auxPayloadFresh(data)) {
+        header.appendChild(titled(
+          el('span', 'tc-chip tc-cap-confidence is-stale', 'STALE'),
+          'A poll to refresh this view has been failing - this may not reflect the current gate state'));
+      }
     }
     wrap.appendChild(header);
 
@@ -2336,7 +2371,7 @@
     var head = el('div', 'tc-gate-head');
     head.appendChild(el('span', 'tc-gate-name', gate.name || ''));
     head.appendChild(titled(el('span', 'tc-chip gate-' + visual,
-      GATE_STATUS_LABEL[visual] || (gate.status || '').toUpperCase()),
+      gateStatusLabel(gate)),
       gate.blocks ? 'This gate is blocking' : 'Not currently blocking'));
     head.appendChild(el('span', 'tc-gate-scope', gate.scope || 'global'));
     head.appendChild(el('span', 'tc-gate-severity', gate.severity || ''));
@@ -2435,6 +2470,11 @@
     var countLabel = totalOpen + ' open' + (partial ? ' · incomplete' : '') +
       (truncatedCount ? ' (showing ' + count + ')' : '');
     header.appendChild(el('span', 'tc-attn-count', errs.length ? 'status unknown' : countLabel));
+    if (data && !errs.length && !auxPayloadFresh(data)) {
+      header.appendChild(titled(
+        el('span', 'tc-chip tc-cap-confidence is-stale', 'STALE'),
+        'A poll to refresh this view has been failing - this may not reflect the current risk register'));
+    }
     wrap.appendChild(header);
 
     if (!data) {
@@ -4364,12 +4404,22 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (gatesPending === requestKey) return;
     gatesPending = requestKey;
-    fetch(rootUrl('/api/gates', projectId)).then(function (r) {
+    // PR #129 connector round-5 (console.js:4387): startEndpointPoll's `run`
+    // does `Promise.resolve(request).then(scheduleNext, scheduleNext)` -
+    // without this `return`, `request` is undefined and the NEXT poll is
+    // scheduled immediately instead of after this fetch settles.
+    return fetch(rootUrl('/api/gates', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
       if (gatesPending === requestKey) gatesPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      // PR #129 connector round-5 (P1, console.js:4377, judgment call): a
+      // failing poll keeps this last-good payload forever with no
+      // _receivedAt to age it out - stamp it like every other polled
+      // payload so auxPayloadFresh() below can tell a live gate list from
+      // one an outage froze indefinitely.
+      stampAuxPayload(data);
       gatesData = data;
       renderSidebar();
       if (state.view === 'gates') renderActiveViewFromPoll();
@@ -4384,7 +4434,9 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (riskRegisterPending === requestKey) return;
     riskRegisterPending = requestKey;
-    fetch(rootUrl('/api/risk-register', projectId)).then(function (r) {
+    // PR #129 connector round-5 (console.js:4387): same missing-return as
+    // fetchGates - startEndpointPoll needs this promise back to wait for it.
+    return fetch(rootUrl('/api/risk-register', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {

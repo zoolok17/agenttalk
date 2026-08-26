@@ -3561,6 +3561,17 @@ assert(hasClass(skippedCard, 'gate-red'),
   `a blocking status=skipped gate must render danger (gate-red), got class=${skippedCard.className}`);
 assert(!hasClass(skippedCard, 'gate-skipped'),
   'a blocking gate must not keep the neutral gray skipped class');
+
+// PR #129 connector round-5 (reviewer-3 F-3 + connector P2, console.js:2339):
+// the forced-red CLASS above is a color-only visual escalation - the chip
+// TEXT must still say what the gate's real status is, not "RED" (which
+// falsely claims a run actually FAILED rather than never ran / was skipped).
+const missingChip = findAllByClass(missingCard, 'tc-chip', [])[0];
+assert(missingChip.textContent === 'UNKNOWN',
+  `a blocking status=unknown gate must show the UNKNOWN label text, not RED, got: ${missingChip.textContent}`);
+const skippedChip = findAllByClass(skippedCard, 'tc-chip', [])[0];
+assert(skippedChip.textContent === 'SKIPPED',
+  `a blocking status=skipped gate must show the SKIPPED label text, not RED, got: ${skippedChip.textContent}`);
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
@@ -6614,6 +6625,30 @@ def test_api_attention_derived_stuck_item(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_api_risk_register_stuck_item_with_no_heartbeat_is_age_unknown(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector round-5 (web.py:3166): an agent with no heartbeat at
+    all (a genuinely never-seen or long-vanished agent) used to surface as a
+    STUCK risk item with age_seconds=0.0 and no age_unknown flag - the same
+    "just happened" conflation _age_seconds_from_iso was already fixed for
+    everywhere else. It must route through the same age_unknown convention:
+    _sort_age = inf, so it sorts as MOST urgent, never least."""
+    s = _make_store(tmp_path)
+    _write_health(s, "alpha", _hm.STATE_STUCK_SUSPECTED, cli="claude", mode="wrapper-loop")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        stuck = [it for it in payload["items"] if it["category"] == "stuck"]
+        assert len(stuck) == 1, payload
+        assert stuck[0]["age_seconds"] == 0.0, stuck[0]
+        assert stuck[0]["age_unknown"] is True, (
+            f"a stuck agent with no heartbeat must be age_unknown, not a bare 0.0: {stuck[0]}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_attention_derived_worktree_stall_item(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     s.write_heartbeat("alpha")
@@ -8093,6 +8128,66 @@ def test_api_gates_evidence_refs_truncation_is_flagged(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_api_gates_evidence_ref_text_truncation_is_flagged(tmp_path: Path) -> None:
+    """PR #129 connector round-5 (web.py:2839): per-reference envelope
+    truncation (300 chars) was silent - a long evidence URL could be cut
+    into a different, unusable string with no signal it happened. Flag it
+    the same way _glob_str flags a truncated glob."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    long_ref = "https://example.invalid/" + ("x" * 400)
+    gmod.set_gate(s.root, name="ci", status="green", severity="warn",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  evidence=["short-ref", long_ref], reason="ok")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert entry["refs"][0] == "short-ref"
+        assert entry["refs"][1] != long_ref, "a truncated ref must not be presented as complete"
+        assert entry["refs"][1].endswith("…")
+        assert entry["ref_text_truncated"] == 1, entry
+        assert "refs_truncated" not in entry, (
+            f"refs_truncated must not fire for a text-only truncation within the window: {entry}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_refs_truncated_counts_non_str_refs_in_window(tmp_path: Path) -> None:
+    """PR #129 connector round-5 (reviewer-3 F-2): a non-str ref inside the
+    (first 20) window used to be dropped by the `isinstance(r, str)` filter
+    without counting toward refs_truncated - the exact counting fix already
+    made for unparseable evidence entries (evidence_truncated), applied here
+    to refs."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="ci", status="green", severity="warn",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  evidence=["ref-a", "ref-b"], reason="ok")
+    gates_path = gmod.gates_path(s.root)
+    raw = json.loads(gates_path.read_text(encoding="utf-8"))
+    # Two of the (now 4) refs are non-str and must be dropped from `refs` -
+    # but still counted, same shape as F-3's evidence_truncated fix.
+    raw["gates"]["ci"]["evidence"][0]["refs"] = ["ref-a", 42, "ref-b", None]
+    gates_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert entry["refs"] == ["ref-a", "ref-b"]
+        assert entry["refs_truncated"] == 2, (
+            f"2 non-str refs inside the window must count toward refs_truncated: {entry}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_gates_evidence_truncated_counts_unparseable_entries(tmp_path: Path) -> None:
     """PR #129 connector round-2 finding (reviewer-3 F-3): an evidence entry
     that fails to parse (not a JSON object) was silently dropped without
@@ -8144,6 +8239,51 @@ def test_api_risk_register_surfaces_source_error_items_as_partial(
         payload = _risk_register(base)
         assert payload["partial"] is True, (
             f"a SOURCE_ERROR item must mark the register partial: {payload}")
+        assert any("dead_letter" in d for d in payload["degraded_sources"]), payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_stays_partial_when_source_error_is_deferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #129 connector round-5 (reviewer-3 F-1 + connector P1, web.py:3103):
+    the degraded-source scan used to iterate queue.get("items", []), which is
+    POST-disposition - build_queue excludes DEFERRED items by default, and
+    defer is the ONLY disposition source_error is allowed to have
+    (allowed_action_for_source). So an operator deferring the warning (the
+    only action available to them) made partial flip back to False while the
+    dead-letter source was still genuinely unreadable. The scan must inspect
+    the raw collected items, before dispositions are applied."""
+    from agenttalk import attention as att
+
+    s = _make_store(tmp_path)
+
+    error_text = "simulated dead-letter read failure"
+
+    def boom(*_args, **_kwargs):
+        raise OSError(error_text)
+    monkeypatch.setattr(s, "list_dead_letters", boom)
+
+    item_id = att.item_id(att.SOURCE_ERROR, "dead_letter")
+    src_hash = att.source_hash({"source": "dead_letter", "error": error_text[:200]})
+    att.append_disposition(s, {
+        "schema_version": 1, "event_id": "att-defer-1", "item_id": item_id,
+        "source": att.SOURCE_ERROR, "action": att.ACTION_DEFER, "actor": "claude",
+        "reason": "operator deferred while investigating", "at": "2026-01-01T00:00:00Z",
+        "until": "2099-01-01T00:00:00Z",
+        "source_snapshot": {"source_hash": src_hash, "refs": []},
+    })
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert not any(it["id"].startswith("source_error:") for it in payload["items"]), (
+            f"the deferred source_error item must NOT still be a visible queue item: {payload}")
+        assert payload["partial"] is True, (
+            f"a DEFERRED source_error must still mark the register partial - the source "
+            f"is still genuinely unreadable even though the warning item is hidden: {payload}")
         assert any("dead_letter" in d for d in payload["degraded_sources"]), payload
     finally:
         srv.shutdown()
@@ -8203,3 +8343,217 @@ def test_console_boot_polls_gates_and_risk_register(tmp_path: Path) -> None:
     boot_body = src[boot_start:boot_end]
     assert "startEndpointPoll(fetchGates)" in boot_body, boot_body
     assert "startEndpointPoll(fetchRiskRegister)" in boot_body, boot_body
+
+
+def test_console_fetch_gates_and_risk_register_return_their_promise_to_the_poller(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector round-5 (console.js:4387): fetchGates and
+    fetchRiskRegister built their fetch().then(...) chain but never
+    RETURNED it. startEndpointPoll's run() does
+    `Promise.resolve(request).then(scheduleNext, scheduleNext)` - with
+    `request` left undefined, that resolves immediately, so the next poll
+    was scheduled right away instead of after the in-flight request
+    settled (the exact stacking bug #207/test_console_poll_waits_for_slow_
+    endpoint_before_rescheduling proved the generic mechanism prevents,
+    but only if the fetcher cooperates by returning its promise)."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console polling test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ boot\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    startEndpointPoll: startEndpointPoll,\n"
+        "    fetchGates: fetchGates,\n"
+        "    fetchRiskRegister: fetchRiskRegister,\n"
+        "    setup: function (root) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-poll-gates-risk.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-poll-gates-risk.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+async function run(fetcherName, urlFragment, jsonBody) {
+  const timers = [];
+  const resolvers = [];
+  let fetchCalls = 0;
+  const ctx = {
+    console,
+    document: { readyState: 'loading', addEventListener() {} },
+    localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+    performance: { now() { return 0; } },
+    setTimeout(fn, delay) { timers.push({ fn, delay }); },
+    setInterval() { throw new Error('data polling must not use setInterval'); },
+    clearInterval() {},
+    fetch(url) {
+      if (!String(url).includes(urlFragment)) {
+        throw new Error(`unexpected fetch url for ${fetcherName}: ${url}`);
+      }
+      fetchCalls += 1;
+      return new Promise((resolve) => resolvers.push(resolve));
+    },
+    __agenttalkConsoleTestHooks: null,
+  };
+  ctx.globalThis = ctx;
+  ctx.window = ctx;
+  vm.createContext(ctx);
+  vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+  const hooks = ctx.__agenttalkConsoleTestHooks;
+  hooks.setup({ label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] });
+
+  async function flush() { for (let i = 0; i < 8; i += 1) await Promise.resolve(); }
+
+  hooks.startEndpointPoll(hooks[fetcherName]);
+  if (fetchCalls !== 1 || timers.length !== 0) {
+    throw new Error(`${fetcherName}: poll stacked before settlement: calls=${fetchCalls}, timers=${timers.length}`);
+  }
+  await flush();
+  if (fetchCalls !== 1 || timers.length !== 0) {
+    throw new Error(`${fetcherName} did not return its fetch promise to startEndpointPoll - the next poll ` +
+      `was scheduled before the in-flight request settled: calls=${fetchCalls}, timers=${timers.length}`);
+  }
+  resolvers.shift()({ ok: true, json: () => Promise.resolve(jsonBody) });
+  await flush();
+  if (timers.length !== 1 || timers[0].delay !== 2000) {
+    throw new Error(`${fetcherName}: next poll was not delayed after settlement: ${JSON.stringify(timers)}`);
+  }
+}
+
+(async () => {
+  await run('fetchGates', '/api/gates',
+    { target_root_project_id: 'project-demo', verdict: 'GO', required_gates: [], gates: [], count: 0 });
+  await run('fetchRiskRegister', '/api/risk-register',
+    { target_root_project_id: 'project-demo', items: [], count: 0, truncated: 0, partial: false,
+      degraded_sources: [] });
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_gates_and_risk_register_show_stale_badge_on_outage(tmp_path: Path) -> None:
+    """PR #129 connector round-5 (P1, console.js:4377, judgment call): a
+    failing gates/risk-register poll silently keeps rendering the last-good
+    payload with nothing on those views themselves signalling that it
+    stopped updating (only the global topbar tracks /api/state freshness).
+    Bounded fix: reuse stampAuxPayload/_receivedAt (already added to
+    fetchGates/fetchRiskRegister this round) plus the same freshness-window
+    check attentionKnownFrom uses, surfaced as a STALE chip on each view."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the stale-badge render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkStaleBadgeHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, view, gates, riskRegister) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      gatesData = gates;\n"
+        "      riskRegisterData = riskRegister;\n"
+        "      state.view = view;\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-stale-badge.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(), children: [], parentNode: null,
+    className: '', textContent: '', attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function findAllByClass(node, cls, out) {
+  if (hasClass(node, cls)) out.push(node);
+  for (const child of node.children || []) findAllByClass(child, cls, out);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading', createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {}, getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; }, querySelectorAll() { return []; },
+};
+let clock = 0;
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return clock; } },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkStaleBadgeHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkStaleBadgeHooks;
+
+const root = { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] };
+const gatesFresh = { verdict: 'GO', required_gates: [], gates: [], count: 0, _receivedAt: 0 };
+const riskFresh = { items: [], count: 0, truncated: 0, partial: false, degraded_sources: [], _receivedAt: 0 };
+
+// Just-received payload (clock === _receivedAt): no stale badge.
+clock = 0;
+main.children = [];  // this mock's clear() needs firstChild/removeChild it doesn't implement
+hooks.setup(root, 'gates', gatesFresh, riskFresh);
+hooks.renderActiveView();
+assert(findAllByClass(main, 'is-stale', []).length === 0,
+  'a freshly-received gates payload must not render the STALE badge');
+
+// Poll has been failing for well past the freshness window (4 * POLL_MS = 8000ms).
+clock = 60000;
+main.children = [];
+hooks.setup(root, 'gates', gatesFresh, riskFresh);
+hooks.renderActiveView();
+const gateStale = findAllByClass(main, 'is-stale', []);
+assert(gateStale.length === 1, `expected exactly one STALE badge on an outage-aged gates view, got ${gateStale.length}`);
+assert(gateStale[0].textContent === 'STALE', `expected the badge text to read STALE, got: ${gateStale[0].textContent}`);
+
+main.children = [];
+hooks.setup(root, 'risk-register', gatesFresh, riskFresh);
+hooks.renderActiveView();
+const riskStale = findAllByClass(main, 'is-stale', []);
+assert(riskStale.length === 1,
+  `expected exactly one STALE badge on an outage-aged risk register view, got ${riskStale.length}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)

@@ -1725,8 +1725,15 @@ def build_state(roots: list[RootDescriptor],
                 *, history: "HealthTimelineRing | None" = None) -> dict:
     """The /api/state aggregate (data-model.md, schema v1).
 
-    ``generated_at`` is informational only — message ids remain the
-    bus's sole ordering primitive.
+    ``generated_at`` is NOT purely informational: message ids remain the
+    bus's sole ordering primitive, but the console's ``stampStatePayload``
+    now also uses this field as its client-side clock/freshness anchor
+    (``stateFresh`` et al.). It is stamped BEFORE the ``[_root_state(d,
+    history) for d in roots]`` scan below, so under a slow scan it can lag
+    the payload it's attached to by however long that scan takes - a known,
+    accepted limitation (PR #129 connector round-5, banked as a fast-follow
+    rather than fixed here: moving the stamp after the scan, or per-root
+    stamping, is new machinery out of this round's bounded scope).
 
     PURE by default: ``history`` is None unless the /api/state route handler
     passes the server's in-memory ring, so every unit/perf test that calls
@@ -2524,6 +2531,12 @@ def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
             continue
         name = a.get("name")
         age = a.get("last_seen_age_seconds")
+        # PR #129 connector round-5 (web.py:3166): a missing last_seen used to
+        # be silently reported as age_seconds=0.0 with no signal that the age
+        # was never known - same conflation _age_seconds_from_iso was fixed
+        # for. Route through the same age_unknown convention so the register
+        # sorts this item as MOST urgent (inf) instead of as "just happened".
+        age_known = isinstance(age, (int, float))
         stuck.append({
             "id": f"stuck:{name}",
             "source": "stuck",
@@ -2532,7 +2545,8 @@ def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
             "title": f"{name} {title_suffix}",
             "agent": name,
             "detail": detail,
-            "age_seconds": float(age) if isinstance(age, (int, float)) else 0.0,
+            "age_seconds": float(age) if age_known else 0.0,
+            "age_unknown": not age_known,
             "human_can_unblock_now": True,
         })
     return stuck
@@ -2834,17 +2848,38 @@ def _gate_evidence_entry(entry: Any) -> dict | None:
         out["source"] = _envelope_str(source)
     refs = entry.get("refs")
     if isinstance(refs, list):
-        out["refs"] = [
-            _envelope_str(r) for r in refs[:_GATE_EVIDENCE_REFS_MAX] if isinstance(r, str)
-        ]
+        window = refs[:_GATE_EVIDENCE_REFS_MAX]
         # PR #129 connector round-2 finding (P1, web.py:2832): a green
         # blocker gate's VALIDATING ref could sit past position 20 and be
         # silently cut, presenting the gate as green with only empty/
         # non-validating refs visible. Preserving every ref isn't safe
         # (unbounded), so expose the cut count instead - the wall can no
         # longer imply it received the complete proof without saying so.
-        if len(refs) > _GATE_EVIDENCE_REFS_MAX:
-            out["refs_truncated"] = len(refs) - _GATE_EVIDENCE_REFS_MAX
+        refs_truncated = max(0, len(refs) - _GATE_EVIDENCE_REFS_MAX)
+        ref_strs: list[str] = []
+        ref_text_truncated = 0
+        for r in window:
+            if not isinstance(r, str):
+                # reviewer-3 F-2: a non-str ref inside the window used to be
+                # dropped by the `isinstance` filter without counting toward
+                # refs_truncated - same shape as evidence_truncated's F-3 fix
+                # for parse-failed evidence entries, applied here too.
+                refs_truncated += 1
+                continue
+            # PR #129 connector round-5 (web.py:2839): a >300-char ref (e.g.
+            # a long evidence URL) was silently cut mid-string by
+            # _envelope_str into a different, unusable string with no signal
+            # that it happened - flag it the same way _glob_str flags a
+            # truncated glob instead of hiding it.
+            normalized = r.replace("\r", " ").replace("\n", " ").strip()
+            if len(normalized) > _ENVELOPE_MAX:
+                ref_text_truncated += 1
+            ref_strs.append(_envelope_str(r))
+        out["refs"] = ref_strs
+        if refs_truncated:
+            out["refs_truncated"] = refs_truncated
+        if ref_text_truncated:
+            out["ref_text_truncated"] = ref_text_truncated
     at = entry.get("at")
     if isinstance(at, str):
         out["at"] = _envelope_str(at)
@@ -3084,6 +3119,19 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             for_agent = None
             degraded.append(_envelope_str(f"liaison_resolution: {e}"))
         items = _collect_web_attention_items(store, roster, for_agent)
+        # PR #129 connector round-2 (reviewer-3 F-1 + connector P1,
+        # web.py:3103): scan the RAW collected items for SOURCE_ERROR here,
+        # BEFORE build_queue applies dispositions. source_error's only
+        # allowed disposition is `defer` (dismiss is forbidden for a
+        # blocking-class warning) - a DEFERRED item is excluded from
+        # queue.get("items", []) by default, so scanning the post-queue
+        # list let an operator defer the warning and see partial=false
+        # again while the underlying source was still genuinely broken.
+        # Deferring silences the REMINDER, not the fact that data is missing.
+        for it in items:
+            if it.get("source") == _attention.SOURCE_ERROR:
+                degraded.append(_envelope_str(
+                    it.get("title") or "attention source unavailable"))
         disps, disposition_problems = _attention.read_dispositions(store)
         if disposition_problems:
             # PR #129 connector finding (web.py:2997): read_dispositions
@@ -3100,16 +3148,6 @@ def build_risk_register(desc: RootDescriptor) -> dict:
         risks: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
-            if src == _attention.SOURCE_ERROR:
-                # PR #129 connector finding (P1, web.py:3047): a source-read
-                # failure inside _collect_web_attention_items becomes a
-                # visible, DISPOSITIONABLE SOURCE_ERROR item - an operator
-                # can defer/dismiss it away, silently losing the only
-                # signal that the register could not fully enumerate. Mark
-                # the failure into degraded_sources directly so partial
-                # does not depend on that warning item still being present.
-                degraded.append(_envelope_str(
-                    it.get("title") or "attention source unavailable"))
             mapped = _ATTENTION_SOURCE_MAP.get(src)
             if mapped is None:
                 continue  # unknown internal source — skip rather than mislabel
@@ -3154,6 +3192,12 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             degraded.append(_envelope_str(f"stuck_agents: {e}"))
         for stuck in _derive_stuck_items(agents, now=now):
             stuck_age = float(stuck.get("age_seconds") or 0)
+            # PR #129 connector round-5 (web.py:3166): this hardcoded
+            # age_unknown=False regardless of what _derive_stuck_items
+            # reported - a missing last_seen (age_seconds forced to 0.0)
+            # sorted as the LEAST urgent, the opposite of the age_unknown
+            # convention every other risk source follows.
+            stuck_age_unknown = bool(stuck.get("age_unknown"))
             risks.append({
                 "id": stuck["id"],
                 "category": "stuck",
@@ -3163,9 +3207,9 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 "owner": stuck.get("agent"),
                 "detail": _envelope_str(stuck.get("detail") or ""),
                 "age_seconds": stuck_age,
-                "age_unknown": False,
+                "age_unknown": stuck_age_unknown,
                 "human_can_unblock_now": bool(stuck.get("human_can_unblock_now")),
-                "_sort_age": stuck_age,
+                "_sort_age": float("inf") if stuck_age_unknown else stuck_age,
             })
         try:
             # limit=None, NOT build_onboarding(desc) - that helper caps at
