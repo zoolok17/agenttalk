@@ -1258,6 +1258,9 @@ def test_multi_root_explicit_project_id_routes_every_console_get(
             "/api/intents",
             "/api/preflight",
             "/api/attention",
+            "/api/gates",
+            "/api/risk-register",
+            "/api/ownership",
             "/api/learning",
             "/api/onboarding",
             "/api/lead-chat",
@@ -1537,6 +1540,9 @@ def test_duplicate_project_id_descriptors_are_rejected(tmp_path: Path) -> None:
         "/api/intents",
         "/api/preflight",
         "/api/attention",
+        "/api/gates",
+        "/api/risk-register",
+        "/api/ownership",
         "/api/learning",
         "/api/onboarding",
         "/api/lead-chat",
@@ -1971,7 +1977,8 @@ def test_csp_split_per_route(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in (f"/messages/{mid}", "/api/status", "/api/state",
-                     "/api/attention", "/api/learning", "/api/onboarding",
+                     "/api/attention", "/api/gates", "/api/risk-register",
+                     "/api/ownership", "/api/learning", "/api/onboarding",
                      "/api/thread/rid-c"):
             with _get(f"{base}{path}") as resp:
                 assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP, path
@@ -1995,6 +2002,7 @@ def test_new_routes_reject_write_methods(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in ("/api/state", "/api/threads", "/dashboard", "/api/attention",
+                     "/api/gates", "/api/risk-register", "/api/ownership",
                      "/api/learning", "/api/onboarding", "/api/thread/rid-w", "/static/console.js",
                      "/static/console.css", "/static/avatars/claude-dev.png"):
             req = urllib.request.Request(  # noqa: S310  # nosemgrep
@@ -2508,7 +2516,8 @@ def test_no_mutation_full_tree_hash(tmp_path: Path) -> None:
         for _ in range(3):
             _state(base)
         for path in ("/dashboard", "/static/console.js", "/static/console.css",
-                     "/", f"/messages/{mid}", "/api/attention", "/api/learning",
+                     "/", f"/messages/{mid}", "/api/attention", "/api/gates",
+                     "/api/risk-register", "/api/ownership", "/api/learning",
                      "/api/onboarding", "/api/thread/r1"):
             with _get(f"{base}{path}") as resp:
                 resp.read()
@@ -2817,6 +2826,264 @@ check({ health: { state: 'working_turn' }, last_seen_age_seconds: 5, wrapped: tr
 check({ health: { state: 'idle_waiting' }, last_seen_age_seconds: 5, wrapped: true },
   { key: 'idle_waiting', label: 'Idle \u00b7 waiting', color: 'warn', grp: 'idle' });
 assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative heartbeat fails');
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_gate_card_expired_waiver_renders_as_blocking(tmp_path: Path) -> None:
+    """review rq-a7038d8175f2 finding 2: gates.check_gates keeps
+    status='waived' for an EXPIRED blocker waiver but sets blocks=True (reason
+    'waiver expired or invalid'). A populated Gates view render must show that
+    as blocking (red/expired), not the calm purple 'WAIVED' card a still-valid
+    waiver gets - a shape-only JSON test cannot catch a frontend styling bug,
+    so this actually renders renderGates()/gateCard() and inspects the DOM."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the gate-card render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkGatesTestHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, gates) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      gatesData = gates;\n"
+        "      state.view = 'gates';\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-gates.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    className: '',
+    textContent: '',
+    attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    // renderActiveView() unconditionally calls snapshotScroll/restoreScroll,
+    // which do root.querySelector(<inner-scroller selector>) - a no-match
+    // stub is enough, this test does not exercise scroll preservation.
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function findAllByClass(node, cls, out) {
+  if (hasClass(node, cls)) out.push(node);
+  for (const child of node.children || []) findAllByClass(child, cls, out);
+  return out;
+}
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += ' ' + collectText(child);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading',
+  createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {},
+  getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkGatesTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkGatesTestHooks;
+
+hooks.setup(
+  { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] },
+  {
+    root: 'demo', verdict: 'HOLD', required_gates: ['security-scan'],
+    gates: [{
+      name: 'security-scan', status: 'waived', severity: 'blocker', scope: 'release',
+      blocks: true, reason: 'waiver expired or invalid',
+      updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha',
+      evidence: [],
+      waiver: {
+        operator: 'alpha', date: '2025-01-01T00:00:00Z',
+        reason: 'scanner unavailable', scope: 'release',
+        expires: '2025-06-01T00:00:00Z',
+      },
+    }],
+    count: 1,
+  },
+);
+hooks.renderActiveView();
+
+const cards = findAllByClass(main, 'tc-gate-card', []);
+assert(cards.length === 1, 'expected exactly one gate card');
+const card = cards[0];
+assert(hasClass(card, 'gate-waived_expired'),
+  `expired blocker waiver must render gate-waived_expired, got class=${card.className}`);
+assert(!hasClass(card, 'gate-waived'),
+  'expired blocker waiver must NOT carry the calm gate-waived class');
+const text = collectText(card);
+assert(text.includes('WAIVED (EXPIRED)'),
+  `expected the expired-waiver label in the card, got: ${text}`);
+assert(text.includes('Waiver expired'),
+  `expected the waiver box to say it is expired, got: ${text}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_risk_register_partial_state_renders_incomplete_banner(
+    tmp_path: Path,
+) -> None:
+    """review rq-093f956dd595 B-1: "surface partial/degraded state in
+    payload AND view" - a payload-shape assertion alone cannot catch a
+    frontend that silently drops the partial/degraded_sources fields. This
+    actually renders renderRiskRegister() and inspects the DOM for the
+    incomplete-list banner and the truncated-count note."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the risk-register render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkRiskRegisterTestHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, riskRegister) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      riskRegisterData = riskRegister;\n"
+        "      state.view = 'risk-register';\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-risk-register.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    className: '',
+    textContent: '',
+    attributes: {},
+    style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  return node;
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += ' ' + collectText(child);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading',
+  createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {},
+  getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {}, clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkRiskRegisterTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkRiskRegisterTestHooks;
+
+hooks.setup(
+  { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] },
+  {
+    root: 'demo', root_path: 'D:\\work\\demo',
+    root_info: { project_id: 'project-demo', label: 'demo', path: 'D:\\work\\demo' },
+    target_root_project_id: 'project-demo',
+    items: [{
+      id: 'onboarding:run-1:drift:d1', category: 'onboarding_drift',
+      category_label: 'Doc/code drift', severity: 'high', title: 'a real open risk',
+      owner: 'beta', detail: 'scan run', age_seconds: 30, age_unknown: false,
+      human_can_unblock_now: true,
+    }],
+    count: 1,
+    truncated: 2,
+    partial: true,
+    degraded_sources: ['onboarding_run:corrupt-run-1'],
+  },
+);
+hooks.renderActiveView();
+
+const text = collectText(main);
+assert(text.includes('incomplete'),
+  `expected the header to flag the count as incomplete, got: ${text}`);
+assert(text.includes('INCOMPLETE') || text.includes('could not be read'),
+  `expected an incomplete-list banner naming the degraded source, got: ${text}`);
+assert(text.includes('corrupt-run-1'),
+  `expected the degraded source name in the banner, got: ${text}`);
+assert(text.includes('a real open risk'),
+  `the item that WAS read must still render alongside the partial banner: ${text}`);
+assert(text.includes('2') && text.includes('not shown'),
+  `expected the truncated-count note, got: ${text}`);
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
@@ -4052,7 +4319,7 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
   assert(historyWrites.at(-1).method === 'push' &&
     history.entries[1].includes('root=project-b'),
     `user selection was not a project-B push: ${JSON.stringify(historyWrites)}`);
-  assert(calls.length === 6 && calls.every((call) => call.url.includes('root=project-b')),
+  assert(calls.length === 9 && calls.every((call) => call.url.includes('root=project-b')),
     `project-B selection did not refetch B: ${JSON.stringify(calls)}`);
   const staleB = calls.find((call) => call.url.startsWith('/api/attention'));
   hooks.seedRootContext('project B');
@@ -4071,8 +4338,8 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
   assert(history.entries.length === 2 && history.index === 0 &&
     historyWrites.length === writesBeforeBack,
     `Back wrote history: ${JSON.stringify(historyWrites)}`);
-  const aCalls = calls.slice(6);
-  assert(aCalls.length === 6 && aCalls.every((call) => call.url.includes('root=project-a')),
+  const aCalls = calls.slice(9);
+  assert(aCalls.length === 9 && aCalls.every((call) => call.url.includes('root=project-a')),
     `Back did not refetch A: ${JSON.stringify(aCalls)}`);
 
   const currentA = aCalls.find((call) => call.url.startsWith('/api/attention'));
@@ -4080,7 +4347,7 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
     root_info: {project_id: rootA.project_id}, count: 3, items: [],
   }));
   for (const call of aCalls) if (call !== currentA) call.resolve(response(false, {}));
-  for (const call of calls.slice(0, 6)) {
+  for (const call of calls.slice(0, 9)) {
     if (call !== staleB) call.resolve(response(false, {}));
   }
   await flush();
@@ -4104,8 +4371,8 @@ const hooks = ctx.__agenttalkHistoryTestHooks;
   assert(history.entries.length === 2 && history.index === 1 &&
     historyWrites.length === writesBeforeForward,
     `Forward wrote history: ${JSON.stringify(historyWrites)}`);
-  const forwardCalls = calls.slice(12);
-  assert(forwardCalls.length === 6 &&
+  const forwardCalls = calls.slice(18);
+  assert(forwardCalls.length === 9 &&
     forwardCalls.every((call) => call.url.includes('root=project-b')),
     `Forward did not refetch B: ${JSON.stringify(forwardCalls)}`);
 })().catch((err) => {
@@ -6249,6 +6516,620 @@ def test_api_state_thread_carries_opener(tmp_path: Path) -> None:
         (row,) = root["threads"]
         assert row["opener"] == "alpha"
         assert row["opener_peer"] == "beta"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# ------------------------------------------------------- /api/gates (§4c)
+#
+# Gate & Evidence Wall, read side (docs/PROPOSAL-console-client-sellability.md
+# #1). Quick-win selection: 20260825-215757-153513-ljQ3.
+
+def _gates(base: str) -> dict:
+    with _get(f"{base}/api/gates") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_gates_shape_evidence_and_waiver(tmp_path: Path) -> None:
+    """A green blocker gate carries its evidence; a waived gate carries its
+    waiver reason/expiry; a missing required gate blocks with a reason. The
+    envelope carries the full picture /api/attention only ever summarizes as
+    one blocker line."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="tests", status="green", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  evidence=["ci-run-42"], reason="all green", required=True)
+    gmod.waive_gate(s.root, name="security-scan", operator="alpha",
+                    reason="scanner unavailable", scope="release",
+                    expires="2099-01-01T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        assert set(payload) == {
+            "root", "root_path", "root_info", "target_root_project_id",
+            "verdict", "required_gates", "gates", "count",
+        }
+        assert payload["count"] == len(payload["gates"])
+        assert payload["required_gates"] == ["tests"]
+        by_name = {g["name"]: g for g in payload["gates"]}
+
+        tests_gate = by_name["tests"]
+        assert tests_gate["status"] == "green"
+        assert tests_gate["severity"] == "blocker"
+        assert tests_gate["scope"] == "release"
+        assert tests_gate["blocks"] is False
+        assert tests_gate["waiver"] is None
+        (evidence_entry,) = tests_gate["evidence"]
+        assert evidence_entry["source"] == "automation_ci"
+        assert evidence_entry["refs"] == ["ci-run-42"]
+        assert evidence_entry["by"] == "alpha"
+        assert "at" in evidence_entry
+
+        scan_gate = by_name["security-scan"]
+        assert scan_gate["status"] == "waived"
+        assert scan_gate["blocks"] is False
+        assert scan_gate["waiver"] == {
+            "operator": "alpha",
+            "date": scan_gate["waiver"]["date"],
+            "reason": "scanner unavailable",
+            "scope": "release",
+            "expires": "2099-01-01T00:00:00Z",
+        }
+
+        # every required blocker gate is green -> GO
+        assert payload["verdict"] == "GO"
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_key_bounding_does_not_collide(tmp_path: Path) -> None:
+    """review rq-e05589aa3c80 R-1: a bounded evidence key must not silently
+    overwrite an already-populated field (a whitespace-padded "source "
+    collapsing onto the canonical "source" once _envelope_str strips it),
+    and two distinct long keys that share the same 64-char prefix must not
+    silently merge - first write wins, neither overwrites the other."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    long_prefix = "x" * 64
+    gmod.set_gate(
+        s.root, name="ci", status="green", severity="blocker", scope="release",
+        actor="alpha", evidence_source="automation_ci", evidence=["ref1"],
+        evidence_details={
+            "source ": "SHADOWED",
+            f"{long_prefix}-one": "first",
+            f"{long_prefix}-two": "second",
+        },
+        required=True,
+    )
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert entry["source"] == "automation_ci", (
+            f"the canonical 'source' field must survive a whitespace-padded "
+            f"colliding key: {entry}")
+        assert entry.get(long_prefix) == "first", (
+            f"two keys sharing a 64-char prefix must not silently merge "
+            f"(first write should win): {entry}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_missing_required_gate_blocks(tmp_path: Path) -> None:
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    state = gmod.load_gate_state(s.root)
+    state["required_gates"] = ["never-run"]
+    gmod.write_gate_state(s.root, state)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        assert payload["verdict"] == "HOLD"
+        (gate,) = payload["gates"]
+        assert gate["name"] == "never-run"
+        assert gate["status"] == "unknown"
+        assert gate["blocks"] is True
+        assert gate["reason"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_degrades_on_corrupt_root(tmp_path: Path) -> None:
+    """Parity with /api/attention's errors-as-data (B1): a corrupt gates.json
+    must NOT 500 the route. gates.check_gates already fails closed for a
+    corrupt state file with a single synthetic ``__gate_state__`` blocker
+    (mirrored by attention.gate_hold_items) - build_gates must pass that
+    through, not crash trying to read a non-existent evidence list for it."""
+    s = _make_store(tmp_path)
+    (s.dir / "gates.json").write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        assert set(payload) >= {"root", "gates", "count", "verdict"}
+        assert payload["count"] == len(payload["gates"])
+        assert payload["verdict"] == "HOLD"
+        (gate,) = payload["gates"]
+        assert gate["name"] == "__gate_state__"
+        assert gate["blocks"] is True
+        assert gate["evidence"] == []
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# --------------------------------------------------- /api/risk-register (§4e)
+#
+# Risk Register relabel (docs/PROPOSAL-console-client-sellability.md #6).
+
+def _risk_register(base: str) -> dict:
+    with _get(f"{base}/api/risk-register") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_risk_register_shape_and_sorted_by_severity_then_age(
+    tmp_path: Path,
+) -> None:
+    from agenttalk import gates as gmod
+    from agenttalk.wrapper import recv_api
+
+    s = _make_store(tmp_path)
+    # A high-severity gate-hold risk (blocker gate, red).
+    gmod.set_gate(s.root, name="ci", status="red", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  reason="pipeline red", required=True)
+    # A dead letter -> med severity risk with an owning agent.
+    message = s.send(sender="alpha", recipient="beta", body="poison",
+                     kind="message", meta={})
+    record = recv_api.next_record(s, "beta")
+    assert record["id"] == message.id
+    s.dead_letter("beta", record, reason="deterministic",
+                  failure_class="poison_eligible", at="2026-07-02T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert set(payload) == {
+            "root", "root_path", "root_info", "target_root_project_id",
+            "items", "count", "truncated", "partial", "degraded_sources",
+        }
+        assert payload["count"] == len(payload["items"])
+        assert payload["partial"] is False
+        assert payload["degraded_sources"] == []
+        assert payload["truncated"] == 0
+        for it in payload["items"]:
+            assert set(it) == {
+                "id", "category", "category_label", "severity", "title",
+                "owner", "detail", "age_seconds", "human_can_unblock_now",
+            }
+            assert it["severity"] in ("high", "med", "low")
+        # severity-desc, then age-desc within a severity band
+        order = [("high", 0), ("med", 1), ("low", 2)]
+        rank = dict(order)
+        ranks = [rank[it["severity"]] for it in payload["items"]]
+        assert ranks == sorted(ranks)
+        gate_items = [it for it in payload["items"] if it["category"] == "gate"]
+        assert gate_items and gate_items[0]["category_label"] == "Gate blocker"
+        deadletter_items = [it for it in payload["items"] if it["category"] == "deadletter"]
+        assert deadletter_items and deadletter_items[0]["category_label"] == "Delivery failure"
+        assert deadletter_items[0]["owner"] == "beta"
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_uses_typed_risk_severity_over_source_default(
+    tmp_path: Path,
+) -> None:
+    """review rq-a7038d8175f2 finding 1: an escalation's OWN typed
+    risk_severity must win over the coarse per-source default. The shape test
+    above only covers a gate + dead letter, where source and risk happen to
+    align (both land on the coarse default because neither source sets a
+    typed risk_severity) - this test forces them to DIVERGE."""
+    s = _make_store(tmp_path)
+    s.set_operator_facing("beta")
+    s.send(sender="alpha", recipient="beta", kind="question", body="?",
+           subject="operator input needed",
+           meta={"request_id": "esc-low-risk", "needs_operator": "true",
+                 "attention": {"decision": "Pick a font",
+                               "risk_severity": "low", "confidence": "high"}})
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        item = next(it for it in payload["items"] if it["category"] == "escalation")
+        assert item["severity"] == "low", (
+            "typed risk_severity=low must not be overridden by the coarse "
+            f"escalation source default (high): {item}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_includes_open_onboarding_drift_and_unknown(
+    tmp_path: Path,
+) -> None:
+    """review rq-a7038d8175f2 finding 3: docs/PROPOSAL-console-client-sellability.md:105-112
+    defines item #6's risk register as covering "stalled agent, dead letter,
+    gate blocker, open onboarding drift/unknown" - onboarding findings were
+    omitted. A RESOLVED drift/unknown record must NOT surface (only open
+    ones are risks)."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="repo scan", objective="map the codebase",
+        base_ref="main", lead="alpha", state="scanning",
+        at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-1", status="open",
+        summary="docs say X, code does Y", actor="alpha", owner="beta",
+        blocking=True, at="2026-01-01T00:05:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_UNKNOWN, key="unknown-1", status="open",
+        summary="unclear retry policy", actor="alpha", blocking=False,
+        at="2026-01-01T00:10:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-resolved", status="resolved",
+        summary="already fixed", actor="alpha", blocking=True,
+        at="2026-01-01T00:15:00Z"))
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        by_category = {}
+        for it in payload["items"]:
+            by_category.setdefault(it["category"], []).append(it)
+
+        drift_items = by_category.get("onboarding_drift", [])
+        assert len(drift_items) == 1, (
+            f"expected exactly the OPEN drift record, not the resolved one: {payload['items']}")
+        assert drift_items[0]["category_label"] == "Doc/code drift"
+        assert drift_items[0]["severity"] == "high"  # blocking=True
+        assert drift_items[0]["owner"] == "beta"
+        assert drift_items[0]["title"] == "docs say X, code does Y"
+        # review rq-093f956dd595 L-1: "human_can_unblock_now" is a triage
+        # affordance claim, not a copy of the onboarding "blocking" flag.
+        assert drift_items[0]["human_can_unblock_now"] is True
+        assert drift_items[0]["age_unknown"] is False
+
+        unknown_items = by_category.get("onboarding_unknown", [])
+        assert len(unknown_items) == 1
+        assert unknown_items[0]["category_label"] == "Open unknown"
+        assert unknown_items[0]["severity"] == "med"  # blocking=False
+        assert unknown_items[0]["owner"] == "alpha"  # falls back to actor
+        # L-1: still True even though blocking=False here - nothing external
+        # gates a human from acting on this finding.
+        assert unknown_items[0]["human_can_unblock_now"] is True
+        assert unknown_items[0]["age_unknown"] is False
+        assert payload["partial"] is False
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_onboarding_not_truncated_by_dashboard_run_limit(
+    tmp_path: Path,
+) -> None:
+    """review rq-4ecf94c4f814 finding 1: build_onboarding's dashboard
+    presentation cap (_ONBOARDING_DEFAULT_LIMIT=50 newest-first runs) must
+    NOT silently drop an older run's open finding from the risk register -
+    "each open item" (proposal §3 #6) has no recency cutoff. Reproduces the
+    reviewer's 51-run repro: the OLDEST run carries the one open, blocking
+    drift; 50 strictly newer runs carry nothing open, so a naive 50-run cap
+    would push the victim run's open finding out of the window."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    victim_run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=victim_run_id, title="oldest scan", objective="map it",
+        base_ref="main", lead="alpha", state="scanning",
+        at="2020-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=victim_run_id, kind=ob.KIND_DRIFT, key="old-drift", status="open",
+        summary="an old unresolved drift", actor="alpha", owner="beta",
+        blocking=True, at="2020-01-01T00:05:00Z"))
+    for i in range(50):
+        run_id = ob.new_run_id()
+        ob.create_run(s, ob.new_create_event(
+            run_id=run_id, title=f"newer scan {i}", objective="map it",
+            base_ref="main", lead="alpha", state="scanning",
+            at=f"2026-01-{(i % 28) + 1:02d}T00:00:00Z"))
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        drift_items = [it for it in payload["items"] if it["category"] == "onboarding_drift"]
+        assert len(drift_items) == 1, (
+            "the older run's open drift must not be truncated by the dashboard's "
+            f"50-run presentation cap: {payload['items']}")
+        assert drift_items[0]["title"] == "an old unresolved drift"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_degrades_on_corrupt_root(tmp_path: Path) -> None:
+    """review rq-093f956dd595 B-1/B-3: a corrupt config.json makes
+    store.operator_facing() raise, caught by the liaison-resolution
+    fallback. This must be VISIBLE (partial=True, a degraded_sources entry)
+    - a prior version of this test accepted a silent empty-and-clean 200 as
+    passing, which is the exact defect B-1 closes."""
+    s = _make_store(tmp_path)
+    cfg_path = s.dir / "config.json"
+    cfg_path.write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert set(payload) >= {"root", "items", "count", "partial", "degraded_sources"}
+        assert payload["count"] == len(payload["items"])
+        _assert_no_body_keys(payload)
+        assert payload["items"] == [] or all(
+            it["category"] in ("escalation", "supervisor", "gate", "deadletter",
+                               "coordination_stall", "stuck", "onboarding_drift",
+                               "onboarding_unknown")
+            for it in payload["items"]
+        )
+        assert payload["partial"] is True, (
+            f"a corrupt config that breaks liaison resolution must be surfaced, "
+            f"not silently absorbed into a clean-looking response: {payload}")
+        assert payload["degraded_sources"], "must name at least one degraded source"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_surfaces_partial_when_onboarding_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """review rq-093f956dd595 B-1: reproduces the reviewer's exact repro -
+    one open blocking drift, then onboarding.list_runs raising. Before the
+    fix this returned a clean HTTP 200 with count=0 and no errors key,
+    indistinguishable from a genuine all-clear. Must now surface partial."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-1", status="open",
+        summary="a blocking drift that must not silently vanish", actor="alpha",
+        blocking=True, at="2026-01-01T00:05:00Z"))
+
+    srv, _t, base = _serve(s)
+    try:
+        baseline = _risk_register(base)
+        assert baseline["count"] == 1
+        assert baseline["partial"] is False
+
+        def boom(*_args, **_kwargs):
+            raise OSError("simulated onboarding read failure")
+        monkeypatch.setattr(ob, "list_runs", boom)
+
+        payload = _risk_register(base)
+        assert payload["items"] == []
+        assert payload["count"] == 0
+        assert payload["partial"] is True, (
+            f"an inner collection failure must not render as a silent all-clear: {payload}")
+        assert any("onboarding" in d for d in payload["degraded_sources"]), payload
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_corrupt_onboarding_run_is_flagged_not_dropped(
+    tmp_path: Path,
+) -> None:
+    """review rq-093f956dd595 B-2: onboarding.list_runs SKIPS a run whose
+    ledger fails to parse (view=None) and only names it in `problems` - a
+    silent drop reachable with NO exception at all. The risk register must
+    surface that instead of discarding the `problems` channel."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="drift-1", status="open",
+        summary="an open drift in a run that will be corrupted", actor="alpha",
+        blocking=True, at="2026-01-01T00:05:00Z"))
+    events_file = ob.events_path(s, run_id)
+    lines = events_file.read_text(encoding="utf-8").splitlines()
+    lines[0] = "{not valid json"  # corrupt the create event -> run_view() is None
+    events_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["items"] == [], (
+            f"the corrupt run's open drift must not silently appear: {payload}")
+        assert payload["partial"] is True, (
+            f"a corrupt onboarding run must be surfaced, not silently dropped: {payload}")
+        assert any("onboarding_run" in d for d in payload["degraded_sources"]), payload
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_caps_items_with_explicit_truncated_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """review rq-093f956dd595 F-1: every neighboring surface in this diff
+    bounds itself; the register must too - a high cap, never a silent one.
+    The point was never "no bound", only "no SILENT bound"."""
+    from agenttalk import gates as gmod
+
+    monkeypatch.setattr(web, "_RISK_REGISTER_ITEM_CAP", 3)
+    s = _make_store(tmp_path)
+    for i in range(5):
+        gmod.set_gate(s.root, name=f"gate-{i}", status="red", severity="blocker",
+                      scope="release", actor="alpha", evidence_source="automation_ci",
+                      reason="red", required=True)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["count"] == 3
+        assert len(payload["items"]) == 3
+        assert payload["truncated"] == 2
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_unknown_age_flagged_and_not_deprioritized(
+    tmp_path: Path,
+) -> None:
+    """review rq-093f956dd595 L-2: an onboarding record whose updated_at
+    cannot parse must be flagged age_unknown (never silently read as "0s
+    old", which looks freshly-created - the opposite of the truth) and must
+    NOT be silently pushed to the bottom of its severity band."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="known-drift", status="open",
+        summary="known-age drift", actor="alpha", blocking=True,
+        at="2026-01-01T00:05:00Z"))
+    # Hand-written record: new_record_event's `at` is never format-validated
+    # by onboarding.event_problem (only byte-bounded), so this is a legal
+    # on-disk event with an unparseable timestamp - simulates a foreign/
+    # legacy writer, not a fabricated test-only shape.
+    events_file = ob.events_path(s, run_id)
+    bad_event = {
+        "schema_version": ob.SCHEMA_VERSION, "event": ob.EVENT_RECORD,
+        "run_id": run_id, "kind": ob.KIND_DRIFT, "key": "bad-drift",
+        "status": "open", "summary": "unparseable timestamp drift",
+        "actor": "alpha", "blocking": True, "updated_at": "not-a-timestamp",
+    }
+    with events_file.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(bad_event) + "\n")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        drift_items = [it for it in payload["items"] if it["category"] == "onboarding_drift"]
+        by_key = {it["id"].rsplit(":", 1)[-1]: it for it in drift_items}
+        assert by_key["bad-drift"]["age_unknown"] is True
+        assert by_key["known-drift"]["age_unknown"] is False
+        # both are severity=high (blocking=True) - unknown age must sort
+        # FIRST within that band, not last.
+        assert drift_items[0]["id"] == by_key["bad-drift"]["id"], (
+            f"unknown-age item was deprioritized instead of surfaced: {drift_items}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# ----------------------------------------------------- /api/ownership (§4d)
+#
+# Ownership & Accountability Map (docs/PROPOSAL-console-client-sellability.md
+# #7).
+
+def _ownership(base: str) -> dict:
+    with _get(f"{base}/api/ownership") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_ownership_full_registry_shape(tmp_path: Path) -> None:
+    """The full registry - domains with resolved owners/reviewers/curators plus
+    shared_paths - not just the thin per-agent slice /api/state carries."""
+    s = _make_store(tmp_path)
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {
+            "web": {
+                "title": "Web layer",
+                "owners": {"agents": ["alpha"]},
+                "reviewers": {"agents": ["beta"]},
+                "owned_globs": ["src/agenttalk/web.py"],
+                "description": "the dashboard server",
+            },
+        },
+        "shared_paths": [{
+            "glob": "**/pyproject.toml",
+            "category": "package-metadata",
+            "requires": "lead-approval",
+            "default_approvers": {"agents": ["alpha"]},
+        }],
+    }), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        assert set(payload) == {
+            "root", "root_path", "root_info", "target_root_project_id",
+            "domains", "shared_paths", "count",
+        }
+        assert payload["count"] == len(payload["domains"])
+        (domain,) = payload["domains"]
+        assert domain["id"] == "web"
+        assert domain["title"] == "Web layer"
+        assert domain["owners"] == ["alpha"]
+        assert domain["reviewers"] == ["beta"]
+        assert domain["curators"] == []
+        assert domain["owned_globs"] == ["src/agenttalk/web.py"]
+        assert domain["description"] == "the dashboard server"
+        (shared,) = payload["shared_paths"]
+        assert shared["glob"] == "**/pyproject.toml"
+        assert shared["category"] == "package-metadata"
+        assert shared["requires"] == "lead-approval"
+        assert shared["default_approvers"] == ["alpha"]
+        assert shared["default_reviewers"] == []
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_ownership_missing_registry_is_empty_not_error(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        assert payload["domains"] == []
+        assert payload["shared_paths"] == []
+        assert payload["count"] == 0
+        assert "errors" not in payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_ownership_degrades_on_malformed_registry(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    (s.dir / "domains.json").write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        assert payload["domains"] == []
+        assert payload["count"] == 0
+        assert payload["errors"]
+        _assert_no_body_keys(payload)
     finally:
         srv.shutdown()
         srv.server_close()

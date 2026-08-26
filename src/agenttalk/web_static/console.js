@@ -42,9 +42,11 @@
   var DENSITIES = ['comfortable', 'compact'];
   var PREF_KEYS = { theme: 'tc.theme', accent: 'tc.accent', density: 'tc.density' };
 
-  var VIEWS = ['overview', 'flow', 'attention', 'lead-chat', 'learning', 'onboarding', 'sessions', 'agent'];
+  var VIEWS = ['overview', 'flow', 'attention', 'gates', 'risk-register', 'ownership',
+    'lead-chat', 'learning', 'onboarding', 'sessions', 'agent'];
   var VIEW_LABELS = nullMap({
     overview: 'Overview', flow: 'Flow', attention: 'Attention',
+    gates: 'Gates', 'risk-register': 'Risk register', ownership: 'Ownership',
     'lead-chat': 'Lead chat', learning: 'Learning', onboarding: 'Onboarding',
     sessions: 'Sessions', agent: 'Agent',
   });
@@ -135,12 +137,18 @@
   var leadChatData = null;            // /api/lead-chat (operator<->lead bodies)
   var learningData = null;            // /api/learning (lessons + exposure telemetry)
   var onboardingData = null;          // /api/onboarding (project analysis runs)
+  var gatesData = null;               // /api/gates (gate & evidence wall)
+  var riskRegisterData = null;        // /api/risk-register (attention queue relabel)
+  var ownershipData = null;           // /api/ownership (domain ownership registry)
   var leadChatPayloadHash = null;      // unchanged-payload guard for lead-chat
   var intentsData = null;             // /api/intents (body-free queue state)
   var attentionPending = null;
   var leadChatPending = null;
   var learningPending = null;
   var onboardingPending = null;
+  var gatesPending = null;
+  var riskRegisterPending = null;
+  var ownershipPending = null;
   var intentsPending = null;
   var sessionPending = null;
   var statePending = false;           // /api/state in-flight guard (P2-4)
@@ -653,6 +661,9 @@
     leadChatPayloadHash = null;
     learningData = null;
     onboardingData = null;
+    gatesData = null;
+    riskRegisterData = null;
+    ownershipData = null;
     intentsData = null;
     threadCache = {};
     threadNotFound = {};
@@ -1104,6 +1115,9 @@
     if (view === 'lead-chat') fetchLeadChat();
     if (view === 'learning') fetchLearning();
     if (view === 'onboarding') fetchOnboarding();
+    if (view === 'gates') fetchGates();
+    if (view === 'risk-register') fetchRiskRegister();
+    if (view === 'ownership') fetchOwnership();
     if (view === 'sessions' && state.sessionRid) fetchThread(state.sessionRid);
     renderActiveView();
     renderChrome();
@@ -1282,6 +1296,12 @@
       // is visible in the always-on sidebar, not only after opening the queue view.
       { key: 'attention', label: 'Human queue', icon: navIconAlert, badge: attnCount,
         clearWhenZero: true, title: 'Things that need a human decision (escalations, blocked gates, stuck agents, failed messages)' },
+      { key: 'gates', label: 'Gates', icon: navIconFile,
+        title: 'Every gate by scope: red, green, or waived, with its evidence' },
+      { key: 'risk-register', label: 'Risk register', icon: navIconAlert,
+        title: 'The human queue, reframed as a client-legible risk log (severity, age, owner)' },
+      { key: 'ownership', label: 'Ownership', icon: navIconFile,
+        title: 'Which agent/team owns which part of the codebase, and shared-path sign-off' },
       { key: 'lead-chat', label: 'Lead chat', icon: navIconChat, badge: leadPendingCount },
       { key: 'learning', label: 'Learning', icon: navIconFile, badge: learningCount },
       { key: 'onboarding', label: 'Onboarding', icon: navIconFile, badge: onboardingCount },
@@ -1356,6 +1376,9 @@
       case 'overview': renderOverview(main, root); break;
       case 'flow': renderFlow(main, root); break;
       case 'attention': renderAttention(main, root); break;
+      case 'gates': renderGates(main, root); break;
+      case 'risk-register': renderRiskRegister(main, root); break;
+      case 'ownership': renderOwnership(main, root); break;
       case 'lead-chat': renderLeadChat(main, root); break;
       case 'learning': renderLearning(main, root); break;
       case 'onboarding': renderOnboarding(main, root); break;
@@ -2065,6 +2088,284 @@
     card.appendChild(el('div', 'tc-empty-text',
       'The dashboard hit an error building this list, so it can’t tell you what’s waiting. '
       + 'This is a dashboard problem, not an all-clear. (' + (errs || []).join('; ') + ')'));
+    return card;
+  }
+
+  // ------------------------------------------------------------ VIEW 3b: gates
+  // Gate & Evidence Wall, read side (docs/PROPOSAL-console-client-sellability.md
+  // #1). Wire contract: /api/gates -> {verdict, required_gates, gates: [{name,
+  // status, severity, scope, blocks, reason, updated_at, updated_by, evidence,
+  // waiver}], count, errors?}.
+  var GATE_STATUS_LABEL = nullMap({
+    green: 'GREEN', red: 'RED', waived: 'WAIVED', unknown: 'UNKNOWN', skipped: 'SKIPPED',
+    waived_expired: 'WAIVED (EXPIRED)',
+  });
+  // A waiver that no longer covers the gate (gates._gate_verdict: status stays
+  // "waived" but blocks=true, reason="waiver expired or invalid") must NOT
+  // read as the calm purple "WAIVED" state - it is back to blocking (review
+  // rq-a7038d8175f2 finding 2). This is the one place status alone is not
+  // enough; every other card/chip class keys off gate.status directly.
+  function gateVisualState(gate) {
+    if (gate.status === 'waived' && gate.blocks) return 'waived_expired';
+    return gate.status || 'unknown';
+  }
+
+  function renderGates(main, root) {
+    var wrap = el('div', 'tc-gates');
+    var header = viewHead('Gate & evidence wall',
+      'Every gate, by scope — red, green, or waived, with the evidence behind it');
+    header.appendChild(el('div', 'tc-spacer'));
+
+    var data = gatesData;
+    var errs = (data && isArray(data.errors)) ? data.errors : [];
+    if (data && !errs.length) {
+      var verdictChip = el('span', 'tc-chip tc-gate-verdict gate-' +
+        (data.verdict === 'GO' ? 'green' : 'red'), data.verdict || 'HOLD');
+      header.appendChild(verdictChip);
+    }
+    wrap.appendChild(header);
+
+    var gatesList = (data && isArray(data.gates)) ? data.gates : [];
+    if (!data) {
+      wrap.appendChild(el('p', 'tc-recent-empty', 'Loading gates…'));
+    } else if (errs.length) {
+      wrap.appendChild(genericErrorState(
+        'Can’t read gate state right now',
+        'The dashboard hit an error building this list. (' + errs.join('; ') + ')'));
+    } else if (!gatesList.length) {
+      wrap.appendChild(emptyState('No gates recorded',
+        'This project has not recorded any assurance gates yet.'));
+    } else {
+      var list = el('div', 'tc-gate-list');
+      for (var i = 0; i < gatesList.length; i++) list.appendChild(gateCard(gatesList[i]));
+      wrap.appendChild(list);
+    }
+    main.appendChild(wrap);
+  }
+
+  function gateCard(gate) {
+    var visual = gateVisualState(gate);
+    var card = el('div', 'tc-card tc-gate-card gate-' + visual);
+    var head = el('div', 'tc-gate-head');
+    head.appendChild(el('span', 'tc-gate-name', gate.name || ''));
+    head.appendChild(titled(el('span', 'tc-chip gate-' + visual,
+      GATE_STATUS_LABEL[visual] || (gate.status || '').toUpperCase()),
+      gate.blocks ? 'This gate is blocking' : 'Not currently blocking'));
+    head.appendChild(el('span', 'tc-gate-scope', gate.scope || 'global'));
+    head.appendChild(el('span', 'tc-gate-severity', gate.severity || ''));
+    card.appendChild(head);
+
+    if (gate.reason) card.appendChild(el('div', 'tc-gate-reason', gate.reason));
+
+    if (gate.waiver) {
+      var w = gate.waiver;
+      var expired = visual === 'waived_expired';
+      var waiverBox = el('div', 'tc-gate-waiver' + (expired ? ' is-expired' : ''));
+      waiverBox.appendChild(el('div', 'tc-gate-waiver-title',
+        expired ? 'Waiver expired — blocking' : 'Waived'));
+      waiverBox.appendChild(el('div', 'tc-gate-waiver-line',
+        (w.operator ? w.operator + ' — ' : '') + (w.reason || '')));
+      if (w.expires) waiverBox.appendChild(el('div', 'tc-gate-waiver-line', 'Expires ' + w.expires));
+      card.appendChild(waiverBox);
+    }
+
+    var evidence = isArray(gate.evidence) ? gate.evidence : [];
+    if (evidence.length) {
+      var evBox = el('div', 'tc-gate-evidence');
+      evBox.appendChild(el('div', 'tc-gate-evidence-title', 'Evidence'));
+      for (var i = 0; i < evidence.length; i++) {
+        var e = evidence[i];
+        var line = (e.source || 'evidence') + (e.by ? ' by ' + e.by : '') + (e.at ? ' at ' + e.at : '');
+        var row = el('div', 'tc-gate-evidence-row', line);
+        evBox.appendChild(row);
+        if (isArray(e.refs) && e.refs.length) {
+          evBox.appendChild(el('div', 'tc-gate-evidence-refs', e.refs.join(', ')));
+        }
+      }
+      card.appendChild(evBox);
+    }
+    if (gate.updated_at) {
+      card.appendChild(el('div', 'tc-gate-updated',
+        'Updated ' + gate.updated_at + (gate.updated_by ? ' by ' + gate.updated_by : '')));
+    }
+    return card;
+  }
+
+  // ------------------------------------------------------------ VIEW 3c: risk register
+  // Risk Register relabel (docs/PROPOSAL-console-client-sellability.md #6): the
+  // SAME ranked queue /api/attention shows, resorted by severity/age and given
+  // client-legible category labels + an owner column. Reuses the .tc-attn-*
+  // card layout/CSS wholesale — this IS the human queue, relabeled, not a new
+  // visual language.
+  function renderRiskRegister(main, root) {
+    var wrap = el('div', 'tc-attention tc-risk-register');
+    var header = viewHead('Risk register',
+      'Open risks — severity, age, and owner, sorted the way a risk log is sorted');
+    header.appendChild(el('div', 'tc-spacer'));
+
+    var data = riskRegisterData;
+    var errs = (data && isArray(data.errors)) ? data.errors : [];
+    var items = (data && isArray(data.items)) ? data.items : [];
+    var count = data && typeof data.count === 'number' ? data.count : items.length;
+    var partial = !!(data && data.partial);
+    header.appendChild(el('span', 'tc-attn-count',
+      errs.length ? 'status unknown' : count + ' open' + (partial ? ' · incomplete' : '')));
+    wrap.appendChild(header);
+
+    if (!data) {
+      wrap.appendChild(el('p', 'tc-recent-empty', 'Loading risk register…'));
+    } else if (errs.length) {
+      wrap.appendChild(genericErrorState(
+        'Can’t read the risk register right now',
+        'The dashboard hit an error building this list. (' + errs.join('; ') + ')'));
+    } else {
+      // B-1 (review rq-093f956dd595): a register whose contract is "each
+      // open item" must say so out loud when it could NOT enumerate
+      // everything - showing the items it DID get without this banner would
+      // read as a confident, complete list, indistinguishable from a
+      // genuine all-clear.
+      if (partial) wrap.appendChild(riskRegisterPartialBanner(data));
+      if (!items.length) {
+        wrap.appendChild(partial
+          ? genericErrorState('Risk register is incomplete',
+              'No risks could be read from the sources below - this is NOT a confirmed all-clear.')
+          : emptyState('No open risks', 'Nothing is waiting on you right now.'));
+      } else {
+        var list = el('div', 'tc-attn-list');
+        for (var i = 0; i < items.length; i++) list.appendChild(riskCard(items[i]));
+        wrap.appendChild(list);
+        if (typeof data.truncated === 'number' && data.truncated > 0) {
+          wrap.appendChild(el('p', 'tc-recent-empty',
+            data.truncated + ' more open risk(s) not shown (list capped).'));
+        }
+      }
+    }
+    main.appendChild(wrap);
+  }
+
+  // "Some of this list could not be read" banner - distinct from
+  // attentionError/genericErrorState because the register is NOT empty here;
+  // it's a confirmed-incomplete list, not a confirmed-failed one.
+  function riskRegisterPartialBanner(data) {
+    var sources = isArray(data.degraded_sources) ? data.degraded_sources : [];
+    var b = el('div', 'tc-attn-stale-banner');
+    b.appendChild(el('span', null,
+      'This list is INCOMPLETE - some sources could not be read, so open risks may be missing.'
+      + (sources.length ? ' (' + sources.join('; ') + ')' : '')));
+    return b;
+  }
+
+  function riskCard(item) {
+    var card = el('div', 'tc-attn-card');
+    card.style.setProperty('--sev-color', 'var(--' + (SEV_COLOR[item.severity] || 'gray') + ')');
+
+    var body = el('div', 'tc-attn-body');
+    var tagRow = el('div', 'tc-attn-tagrow');
+    tagRow.appendChild(el('span', 'tc-src src-' + item.category, item.category_label || 'Other'));
+    tagRow.appendChild(titled(el('span', 'tc-chip sev-' + item.severity,
+      SEV_LABEL[item.severity] || (item.severity || '').toUpperCase()), SEV_DESC[item.severity]));
+    tagRow.appendChild(el('span', 'tc-spacer'));
+    // L-2: an item flagged age_unknown must read as "age unknown", never as
+    // "0s ago" (which looks freshly-created, the opposite of the truth).
+    tagRow.appendChild(item.age_unknown
+      ? ageEl('tc-attn-age', item, { noHb: true, nullText: 'age unknown' })
+      : ageEl('tc-attn-age', item, { suffix: ' ago' }));
+    body.appendChild(tagRow);
+    body.appendChild(el('div', 'tc-attn-title', item.title || ''));
+    var detailRow = el('div', 'tc-attn-detailrow');
+    if (item.owner) detailRow.appendChild(el('span', 'tc-attn-agent', item.owner));
+    detailRow.appendChild(el('span', 'tc-attn-detail', item.detail || ''));
+    body.appendChild(detailRow);
+    card.appendChild(body);
+    return card;
+  }
+
+  // ------------------------------------------------------------ VIEW 3d: ownership
+  // Ownership & Accountability Map (docs/PROPOSAL-console-client-sellability.md
+  // #7): the full domain registry, not just the thin per-agent slice on the
+  // agent detail card.
+  function renderOwnership(main, root) {
+    var wrap = el('div', 'tc-ownership');
+    var header = viewHead('Ownership & accountability map',
+      'Which agent or team owns which part of the codebase, and where shared sign-off is required');
+    header.appendChild(el('div', 'tc-spacer'));
+
+    var data = ownershipData;
+    var errs = (data && isArray(data.errors)) ? data.errors : [];
+    var domainsList = (data && isArray(data.domains)) ? data.domains : [];
+    header.appendChild(el('span', 'tc-attn-count',
+      errs.length ? 'status unknown' : domainsList.length + ' domains'));
+    wrap.appendChild(header);
+
+    if (!data) {
+      wrap.appendChild(el('p', 'tc-recent-empty', 'Loading ownership map…'));
+    } else if (errs.length) {
+      wrap.appendChild(genericErrorState(
+        'Can’t read the ownership registry right now',
+        'The dashboard hit an error reading it. (' + errs.join('; ') + ')'));
+    } else if (!domainsList.length) {
+      wrap.appendChild(emptyState('No domains declared',
+        'This project has not declared any domain ownership yet.'));
+    } else {
+      var list = el('div', 'tc-domain-list');
+      for (var i = 0; i < domainsList.length; i++) list.appendChild(domainCard(domainsList[i]));
+      wrap.appendChild(list);
+    }
+
+    var sharedList = (data && isArray(data.shared_paths)) ? data.shared_paths : [];
+    if (sharedList.length) {
+      wrap.appendChild(el('h2', 'tc-h2', 'Shared paths requiring sign-off'));
+      var sharedBox = el('div', 'tc-domain-list');
+      for (var j = 0; j < sharedList.length; j++) sharedBox.appendChild(sharedPathCard(sharedList[j]));
+      wrap.appendChild(sharedBox);
+    }
+    main.appendChild(wrap);
+  }
+
+  function domainCard(d) {
+    var card = el('div', 'tc-card tc-domain-card');
+    var head = el('div', 'tc-gate-head');
+    head.appendChild(el('span', 'tc-gate-name', d.title || d.id || ''));
+    card.appendChild(head);
+    if (d.description) card.appendChild(el('div', 'tc-gate-reason', d.description));
+    card.appendChild(el('div', 'tc-domain-line', 'Owners: ' + refsetText(d.owners)));
+    if (d.reviewers && d.reviewers.length) {
+      card.appendChild(el('div', 'tc-domain-line', 'Reviewers: ' + refsetText(d.reviewers)));
+    }
+    if (d.curators && d.curators.length) {
+      card.appendChild(el('div', 'tc-domain-line', 'Curators: ' + refsetText(d.curators)));
+    }
+    if (d.owned_globs && d.owned_globs.length) {
+      card.appendChild(el('div', 'tc-domain-globs', d.owned_globs.join(', ')));
+    }
+    return card;
+  }
+
+  function sharedPathCard(s) {
+    var card = el('div', 'tc-card tc-domain-card');
+    var head = el('div', 'tc-gate-head');
+    head.appendChild(el('span', 'tc-gate-name', s.glob || ''));
+    head.appendChild(el('span', 'tc-gate-scope', s.category || ''));
+    card.appendChild(head);
+    card.appendChild(el('div', 'tc-domain-line', 'Requires: ' + (s.requires || '')));
+    var approvers = refsetText(s.default_approvers);
+    var reviewers = refsetText(s.default_reviewers);
+    if (approvers) card.appendChild(el('div', 'tc-domain-line', 'Default approvers: ' + approvers));
+    if (reviewers) card.appendChild(el('div', 'tc-domain-line', 'Default reviewers: ' + reviewers));
+    if (s.description) card.appendChild(el('div', 'tc-gate-reason', s.description));
+    return card;
+  }
+
+  function refsetText(names) {
+    return (isArray(names) && names.length) ? names.join(', ') : 'none';
+  }
+
+  // Shared error-as-data empty state (§4c/e/d): mirrors attentionError's "this
+  // is a dashboard problem, not an all-clear" contract for the new read views.
+  function genericErrorState(title, text) {
+    var card = el('div', 'tc-empty is-error');
+    card.appendChild(el('div', 'tc-empty-title', title));
+    card.appendChild(el('div', 'tc-empty-text', text));
     return card;
   }
 
@@ -3809,6 +4110,66 @@
     });
   }
 
+  function fetchGates() {
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    var requestKey = rootRequestKey(projectId, generation);
+    if (gatesPending === requestKey) return;
+    gatesPending = requestKey;
+    fetch(rootUrl('/api/gates', projectId)).then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function (data) {
+      if (gatesPending === requestKey) gatesPending = null;
+      if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      gatesData = data;
+      renderSidebar();
+      if (state.view === 'gates') renderActiveViewFromPoll();
+    }).catch(function () {
+      if (gatesPending === requestKey) gatesPending = null;
+    });
+  }
+
+  function fetchRiskRegister() {
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    var requestKey = rootRequestKey(projectId, generation);
+    if (riskRegisterPending === requestKey) return;
+    riskRegisterPending = requestKey;
+    fetch(rootUrl('/api/risk-register', projectId)).then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function (data) {
+      if (riskRegisterPending === requestKey) riskRegisterPending = null;
+      if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      riskRegisterData = data;
+      renderSidebar();
+      if (state.view === 'risk-register') renderActiveViewFromPoll();
+    }).catch(function () {
+      if (riskRegisterPending === requestKey) riskRegisterPending = null;
+    });
+  }
+
+  function fetchOwnership() {
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    var requestKey = rootRequestKey(projectId, generation);
+    if (ownershipPending === requestKey) return;
+    ownershipPending = requestKey;
+    fetch(rootUrl('/api/ownership', projectId)).then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function (data) {
+      if (ownershipPending === requestKey) ownershipPending = null;
+      if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      ownershipData = data;
+      renderSidebar();
+      if (state.view === 'ownership') renderActiveViewFromPoll();
+    }).catch(function () {
+      if (ownershipPending === requestKey) ownershipPending = null;
+    });
+  }
+
   function fetchArchivedThreads(reset) {
     if (archivedState.loading) return;
     var projectId = currentRootId();
@@ -3899,6 +4260,9 @@
     fetchLeadChat();
     fetchLearning();
     fetchOnboarding();
+    fetchGates();
+    fetchRiskRegister();
+    fetchOwnership();
   }
 
   // ------------------------------------------------------------ loops
