@@ -5,7 +5,7 @@
 - Mode: explanation — what the plane must know, why, and which prior art is reusable
 - Research cut: 2026-08-26, agenttalk `abc1c6e`, Graphify
   `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`
-- Companion design: `docs/DESIGN-55-comprehension-plane.md` at `3543f03894bc6d77aea3b99770a73a4beb52f75a`
+- Companion design: `docs/DESIGN-55-comprehension-plane.md` at `6ad0b714e5fa2db0ccc4ea45c7c8e2f0c5e4978d`
 
 ## Decision summary
 
@@ -501,7 +501,7 @@ not an S1 release gate.
 ## Cross-document reconciliation
 
 Only S1 rows below are normative for the companion rev-2 artifact/storage design.
-The reconciled companion contract is frozen at `3543f03894bc6d77aea3b99770a73a4beb52f75a`.
+The reconciled companion contract is frozen at `6ad0b714e5fa2db0ccc4ea45c7c8e2f0c5e4978d`.
 Later rows state the exact residual and destination instead of implying that S1
 produces them.
 
