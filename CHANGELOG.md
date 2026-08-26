@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.86.0] - 2026-08-26
+
+Theme: **the console tells the truth about risk — and the comprehension plane design is frozen.**
+
+### Added
+
+- **Gate & evidence wall, risk register, and ownership map** — three new
+  read-only Team Console views (`/api/gates`, `/api/risk-register`,
+  `/api/ownership`), built for the migration-program direction (#208 quick-win
+  subset). Loopback-only, GET-only, read-only posture unchanged and covered by
+  all five route-enumerating posture regressions.
+- **#55 comprehension-plane design frozen** — `docs/DESIGN-55-comprehension-plane.md`
+  and `docs/DESIGN-55-priorart-and-requirements.md` land at their
+  extended-approval SHAs (6ad0b714 / 7e4348ec). Slice-1 implementation scoping
+  starts from these documents.
+
+### Fixed
+
+- **#207 console mechanical fixes** — mission-pill bound, server-timestamp
+  trust, active-run default scope, serialized slow-endpoint polling,
+  narrow-layout priority, live media-query re-evaluation without listener
+  leaks, fail-closed freshness fallback.
+- **The truth-telling batch** (three independent reviewers, five rounds,
+  ~40 defects): the risk register can no longer report "no risks" when it
+  merely failed to read a source — inner failures surface as
+  `partial`/`degraded_sources` (including deferred outages and corrupt
+  records); severities come from each item's own typed risk; expired blocking
+  waivers render as blocking; blocking unknown/skipped gates render as danger
+  with honest status text; every truncation (evidence entries, references,
+  ref text, globs, register cap) is counted and flagged instead of silent;
+  gate/risk views join the polling loop and show a STALE badge on outage;
+  ages derive from real timestamps end-to-end (console and CLI in parity),
+  with unknown ages marked unknown rather than zero.
+
+
 ## [0.85.0] - 2026-08-25
 
 Theme: **seat reliability — a wrapped seat fails loudly, recovers honestly.**

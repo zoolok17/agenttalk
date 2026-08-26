@@ -95,7 +95,7 @@ a prerequisite.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.85.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.86.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -205,7 +205,7 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.85.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.86.0"
 ```
 
 Pin to a specific tag so you control upgrades. Replace the tag with
@@ -1194,7 +1194,7 @@ Four ideas carry it:
   supervise --report`/`--plan` are read-only derivations; a generated
   `supervisor.ps1` polls the plan and does the launching/relaunching/
   scoped-killing. The bus stays just files.
-- **A seat fails loudly and recovers honestly** (0.84.0-0.85.0). The
+- **A seat fails loudly and recovers honestly** (0.84.0-0.86.0). The
   wrapper itself publishes a child's reply draft when the child's harness
   blocks the reply command, so every seat can answer. A turn killed by the
   per-turn watchdog is redelivered as an explicit *interruption* — the child
