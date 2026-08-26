@@ -8545,7 +8545,7 @@ main.children = [];
 hooks.setup(root, 'gates', gatesFresh, riskFresh);
 hooks.renderActiveView();
 const gateStale = findAllByClass(main, 'is-stale', []);
-assert(gateStale.length === 1, `expected exactly one STALE badge on an outage-aged gates view, got ${gateStale.length}`);
+assert(gateStale.length === 1, `expected one STALE badge on an outage-aged gates view, got ${gateStale.length}`);
 assert(gateStale[0].textContent === 'STALE', `expected the badge text to read STALE, got: ${gateStale[0].textContent}`);
 
 main.children = [];
