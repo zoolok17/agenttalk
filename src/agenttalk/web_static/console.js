@@ -191,29 +191,35 @@
     if (n && title) n.setAttribute('title', String(title));
     return n;
   }
+  // Shared narrow-viewport tracker for responsiveSecondary. A per-call
+  // MediaQueryList 'change' listener leaks: renderActiveView tears down and
+  // rebuilds the whole view from scratch on every successful /api/state poll
+  // (every POLL_MS), so a per-node listener registered inside
+  // responsiveSecondary is NEVER unregistered - the browser retains one
+  // MediaQueryList per unique query string, so every discarded panel's
+  // listener (closing over its now-detached details node) piles up without
+  // bound over a long session (review rq-2968d93df2bc). ONE listener,
+  // registered once at module load, replaces every per-panel listener; the
+  // natural ~POLL_MS re-render already propagates a change to every panel.
+  var _narrowPanelMq = (typeof window !== 'undefined' && window.matchMedia)
+    ? window.matchMedia('(max-width: 560px)') : null;
+  var isNarrowViewport = !!(_narrowPanelMq && _narrowPanelMq.matches);
+  if (_narrowPanelMq) {
+    var _onNarrowPanelMqChange = function (e) { isNarrowViewport = !!e.matches; };
+    if (typeof _narrowPanelMq.addEventListener === 'function') {
+      _narrowPanelMq.addEventListener('change', _onNarrowPanelMqChange);
+    } else if (typeof _narrowPanelMq.addListener === 'function') {
+      _narrowPanelMq.addListener(_onNarrowPanelMqChange); // legacy Safari
+    }
+  }
   function responsiveSecondary(label, content) {
     var details = el('details', 'tc-secondary-panel');
-    var mq = (typeof window !== 'undefined' && window.matchMedia)
-      ? window.matchMedia('(max-width: 560px)') : null;
-    function applyNarrow(narrow) {
-      details.open = !narrow || secondaryOpen[label] === true;
-    }
-    applyNarrow(!!(mq && mq.matches));
+    details.open = !isNarrowViewport || secondaryOpen[label] === true;
     details.appendChild(el('summary', 'tc-secondary-summary', label));
     details.appendChild(content);
     on(details, 'toggle', function () {
-      if (mq && mq.matches) secondaryOpen[label] = !!details.open;
+      if (isNarrowViewport) secondaryOpen[label] = !!details.open;
     });
-    // #207 residual: the ORIGINAL narrow snapshot was taken once, at node
-    // creation, and never re-checked - an existing panel crossing the 560px
-    // boundary (resize, or a narrow-to-wide/wide-to-narrow rotation) never
-    // re-evaluated open/closed. Listen for the live media-query change so an
-    // EXISTING node reacts, not just newly-created ones.
-    if (mq) {
-      var onChange = function (e) { applyNarrow(!!e.matches); };
-      if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onChange);
-      else if (typeof mq.addListener === 'function') mq.addListener(onChange); // legacy Safari
-    }
     return details;
   }
   function svgEl(tag, attrs) {

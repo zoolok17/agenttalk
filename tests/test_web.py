@@ -3024,9 +3024,10 @@ function node(tag) {
 }
 // A live MediaQueryList mock: ONE shared object (like the real
 // `window.matchMedia(query)` returning an equivalent list for a repeated
-// query), so a listener registered against it can be fired later to
-// simulate an EXISTING node's viewport crossing the boundary - not just a
-// freshly created node reading a new snapshot (#207 residual, finding 1).
+// query), so the module-level listener registered against it (once, at
+// script load - review rq-2968d93df2bc) can be fired to simulate a real
+// viewport crossing the boundary, and so this test can assert exactly how
+// many listeners ever accumulate on it.
 const mq = { matches: true, _listeners: [] };
 function fireMediaChange(matches) {
   mq.matches = matches;
@@ -3057,6 +3058,14 @@ vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
 const hooks = ctx.__agenttalkConsoleTestHooks;
 
+// review rq-2968d93df2bc: a per-panel change listener leaked (1000 rendered
+// panels left 1000 live listeners, each closing over a detached node). The
+// fix is ONE shared listener registered at module load, not one per panel -
+// assert that up front, before creating anything.
+if (mq._listeners.length !== 1) {
+  throw new Error(`expected exactly one shared change listener at module load, got ${mq._listeners.length}`);
+}
+
 // Created narrow: closed, per the existing contract.
 const mobileContent = node('div');
 const panel = hooks.responsiveSecondary('Recent activity', mobileContent);
@@ -3064,28 +3073,33 @@ if (panel.tagName !== 'DETAILS' || panel.open || panel.children[0].tagName !== '
     panel.children[1] !== mobileContent) {
   throw new Error(`narrow secondary panel did not collapse safely: ${JSON.stringify(panel)}`);
 }
+
+// Direct regression for the reviewer's repro: render (and, in a real DOM,
+// discard) 1000 panels. The listener count must stay at exactly one -
+// nothing accumulates per panel.
+for (let i = 0; i < 1000; i++) {
+  hooks.responsiveSecondary('Recent activity', node('div'));
+}
 if (mq._listeners.length !== 1) {
-  throw new Error(`expected responsiveSecondary to register exactly one change listener, got ${mq._listeners.length}`);
+  throw new Error(`1000 rendered panels must not accumulate listeners, got ${mq._listeners.length}`);
 }
 
-// The SAME node crosses narrow -> wide (e.g. rotation, window resize) -
-// it must reopen without being recreated.
+// The fix is RENDER-TIME state (the reviewer's own suggested design), not a
+// live per-node listener: renderActiveView already rebuilds the whole view
+// every poll, so the NEXT panel rendered after a viewport crossing must
+// reflect it, in both directions.
 fireMediaChange(false);
-if (!panel.open) {
-  throw new Error('existing panel did not reopen when crossing narrow -> wide');
-}
+const wide = hooks.responsiveSecondary('Recent activity', node('div'));
+if (!wide.open) throw new Error('a panel rendered after crossing narrow -> wide was not open');
 
-// And back wide -> narrow: it must re-collapse (no user override recorded).
 fireMediaChange(true);
-if (panel.open) {
-  throw new Error('existing panel did not re-collapse when crossing wide -> narrow');
-}
+const narrowAgain = hooks.responsiveSecondary('Recent activity', node('div'));
+if (narrowAgain.open) throw new Error('a panel rendered after crossing wide -> narrow was not collapsed');
 
-// A second, freshly-created panel while wide must still open immediately
-// (the original creation-time contract is unchanged).
-fireMediaChange(false);
-const desktop = hooks.responsiveSecondary('Recent activity', node('div'));
-if (!desktop.open) throw new Error('desktop secondary panel was not open');
+// Still exactly one listener after all of the above.
+if (mq._listeners.length !== 1) {
+  throw new Error(`expected exactly one shared change listener at the end, got ${mq._listeners.length}`);
+}
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
