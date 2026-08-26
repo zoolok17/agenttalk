@@ -3016,10 +3016,15 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 function node(tag) {
+  const attrs = {};
   return {
     tagName: String(tag).toUpperCase(), className: '', textContent: '', children: [], open: false,
     appendChild(child) { this.children.push(child); return child; },
-    setAttribute() {}, addEventListener() {},
+    setAttribute(name, value) { attrs[name] = String(value); },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+    },
+    addEventListener() {},
   };
 }
 // A live MediaQueryList mock: ONE shared object (like the real
@@ -3033,10 +3038,35 @@ function fireMediaChange(matches) {
   mq.matches = matches;
   for (const cb of mq._listeners) cb({ matches });
 }
+// A minimal "mounted DOM" root, separate from panels that are merely
+// CREATED: round 2 of this review (rq-2968d93df2bc) showed that reacting on
+// the next RENDER isn't equivalent to reacting on the live DOM when a poll
+// is delayed/failed. The fix walks document.querySelectorAll('.tc-secondary-panel')
+// on every real media-query change, so this harness must model "currently
+// attached to the page" vs "created but discarded" to prove it only ever
+// touches what's actually mounted (never a registry that could leak).
+const mountRoot = node('main');
+function mount(panel) { mountRoot.children.push(panel); return panel; }
+function unmount(panel) {
+  const idx = mountRoot.children.indexOf(panel);
+  if (idx !== -1) mountRoot.children.splice(idx, 1);
+}
+function hasClass(n, cls) { return String(n.className || '').split(/\s+/).includes(cls); }
+function queryAllByClass(root, cls) {
+  const out = [];
+  (function walk(n) {
+    if (hasClass(n, cls)) out.push(n);
+    for (const c of n.children || []) walk(c);
+  })(root);
+  return out;
+}
 const document = {
   readyState: 'loading', addEventListener() {},
   createElement: node,
   createElementNS(_ns, tag) { return node(tag); },
+  querySelectorAll(selector) {
+    return queryAllByClass(mountRoot, selector.replace(/^\./, ''));
+  },
 };
 const ctx = {
   console, document,
@@ -3066,35 +3096,51 @@ if (mq._listeners.length !== 1) {
   throw new Error(`expected exactly one shared change listener at module load, got ${mq._listeners.length}`);
 }
 
-// Created narrow: closed, per the existing contract.
+// Created narrow: closed, per the existing contract. Mount it - this is the
+// panel a real page would currently be displaying.
 const mobileContent = node('div');
-const panel = hooks.responsiveSecondary('Recent activity', mobileContent);
+const panel = mount(hooks.responsiveSecondary('Recent activity', mobileContent));
 if (panel.tagName !== 'DETAILS' || panel.open || panel.children[0].tagName !== 'SUMMARY' ||
     panel.children[1] !== mobileContent) {
   throw new Error(`narrow secondary panel did not collapse safely: ${JSON.stringify(panel)}`);
 }
 
-// Direct regression for the reviewer's repro: render (and, in a real DOM,
-// discard) 1000 panels. The listener count must stay at exactly one -
-// nothing accumulates per panel.
+// Direct regression for the reviewer's leak repro: render 1000 panels,
+// mount-then-immediately-unmount each (simulating 1000 view rebuilds). The
+// listener count must stay at exactly one - nothing accumulates per panel,
+// and nothing is retained for a panel that is no longer mounted.
 for (let i = 0; i < 1000; i++) {
-  hooks.responsiveSecondary('Recent activity', node('div'));
+  unmount(mount(hooks.responsiveSecondary('Recent activity', node('div'))));
 }
 if (mq._listeners.length !== 1) {
   throw new Error(`1000 rendered panels must not accumulate listeners, got ${mq._listeners.length}`);
 }
 
-// The fix is RENDER-TIME state (the reviewer's own suggested design), not a
-// live per-node listener: renderActiveView already rebuilds the whole view
-// every poll, so the NEXT panel rendered after a viewport crossing must
-// reflect it, in both directions.
+// review rq-2968d93df2bc round 2: the SAME still-mounted node ("panel" from
+// above) must react to a live viewport crossing WITHOUT any render/poll in
+// between - fetchState keeps last-good state on a failed poll, so depending
+// on the next render is not equivalent to the original live-node contract.
 fireMediaChange(false);
-const wide = hooks.responsiveSecondary('Recent activity', node('div'));
-if (!wide.open) throw new Error('a panel rendered after crossing narrow -> wide was not open');
-
+if (!panel.open) {
+  throw new Error('the SAME mounted panel did not reopen on narrow -> wide with no poll in between');
+}
 fireMediaChange(true);
-const narrowAgain = hooks.responsiveSecondary('Recent activity', node('div'));
-if (narrowAgain.open) throw new Error('a panel rendered after crossing wide -> narrow was not collapsed');
+if (panel.open) {
+  throw new Error('the SAME mounted panel did not re-collapse on wide -> narrow with no poll in between');
+}
+
+// A panel that was mounted and then discarded (unmounted, as a real view
+// teardown would do) must NOT be touched by a later change - proves the fix
+// walks the LIVE DOM (querySelectorAll), not a leak-prone registry of every
+// panel ever created.
+const discardedContent = node('div');
+const discarded = mount(hooks.responsiveSecondary('Recent activity', discardedContent));
+unmount(discarded);
+const discardedOpenBefore = discarded.open;
+fireMediaChange(false);
+if (discarded.open !== discardedOpenBefore) {
+  throw new Error('an unmounted/discarded panel must not be mutated by a later media-query change');
+}
 
 // Still exactly one listener after all of the above.
 if (mq._listeners.length !== 1) {

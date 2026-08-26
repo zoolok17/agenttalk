@@ -192,20 +192,37 @@
     return n;
   }
   // Shared narrow-viewport tracker for responsiveSecondary. A per-call
-  // MediaQueryList 'change' listener leaks: renderActiveView tears down and
-  // rebuilds the whole view from scratch on every successful /api/state poll
-  // (every POLL_MS), so a per-node listener registered inside
-  // responsiveSecondary is NEVER unregistered - the browser retains one
-  // MediaQueryList per unique query string, so every discarded panel's
-  // listener (closing over its now-detached details node) piles up without
-  // bound over a long session (review rq-2968d93df2bc). ONE listener,
-  // registered once at module load, replaces every per-panel listener; the
-  // natural ~POLL_MS re-render already propagates a change to every panel.
+  // MediaQueryList 'change' listener used to leak (review rq-2968d93df2bc,
+  // round 1): every rendered panel registered its own listener that was
+  // never unregistered, so a long session accumulated one per panel. A pure
+  // "read a shared flag at creation time" fix (round 2) closed the leak but
+  // broke the ORIGINAL live-node contract: an already-displayed panel only
+  // picked up a viewport crossing on the NEXT successful /api/state poll,
+  // and fetchState keeps last-good state on a failed poll - during an
+  // outage a crossing could go unreflected indefinitely.
+  //
+  // Fix: ONE shared listener (still just one, still no leak) that, on a
+  // real change, ALSO walks the LIVE DOM for every currently-mounted
+  // .tc-secondary-panel and updates its open state directly - no per-panel
+  // registry to grow/leak (querySelectorAll always reflects only what is
+  // CURRENTLY attached), no dependency on the next render/poll.
   var _narrowPanelMq = (typeof window !== 'undefined' && window.matchMedia)
     ? window.matchMedia('(max-width: 560px)') : null;
   var isNarrowViewport = !!(_narrowPanelMq && _narrowPanelMq.matches);
+  function _applyNarrowToLiveSecondaryPanels(narrow) {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return;
+    var panels = document.querySelectorAll('.tc-secondary-panel');
+    for (var i = 0; i < panels.length; i++) {
+      var panel = panels[i];
+      var label = panel.getAttribute && panel.getAttribute('data-secondary-label');
+      panel.open = !narrow || secondaryOpen[label] === true;
+    }
+  }
   if (_narrowPanelMq) {
-    var _onNarrowPanelMqChange = function (e) { isNarrowViewport = !!e.matches; };
+    var _onNarrowPanelMqChange = function (e) {
+      isNarrowViewport = !!e.matches;
+      _applyNarrowToLiveSecondaryPanels(isNarrowViewport);
+    };
     if (typeof _narrowPanelMq.addEventListener === 'function') {
       _narrowPanelMq.addEventListener('change', _onNarrowPanelMqChange);
     } else if (typeof _narrowPanelMq.addListener === 'function') {
@@ -214,6 +231,7 @@
   }
   function responsiveSecondary(label, content) {
     var details = el('details', 'tc-secondary-panel');
+    details.setAttribute('data-secondary-label', label);
     details.open = !isNarrowViewport || secondaryOpen[label] === true;
     details.appendChild(el('summary', 'tc-secondary-summary', label));
     details.appendChild(content);
