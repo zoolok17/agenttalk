@@ -3506,14 +3506,26 @@ hooks.setup(
         },
         waiver_expired: true,
       },
+      {
+        name: 'missing-required', status: 'unknown', severity: 'blocker', scope: 'release',
+        blocks: true, reason: 'required gate is missing',
+        updated_at: '', updated_by: '',
+        evidence: [], evidence_truncated: 0, waiver: null, waiver_expired: false,
+      },
+      {
+        name: 'skipped-blocker', status: 'skipped', severity: 'blocker', scope: 'release',
+        blocks: true, reason: 'required evidence not run (skipped); use a waiver for not-applicable',
+        updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha',
+        evidence: [], evidence_truncated: 0, waiver: null, waiver_expired: false,
+      },
     ],
-    count: 2,
+    count: 4,
   },
 );
 hooks.renderActiveView();
 
 const cards = findAllByClass(main, 'tc-gate-card', []);
-assert(cards.length === 2, `expected two gate cards, got ${cards.length}`);
+assert(cards.length === 4, `expected four gate cards, got ${cards.length}`);
 
 const coverageText = collectText(cards[0]);
 assert(coverageText.includes('coverage_percent: 91.5'),
@@ -3529,6 +3541,26 @@ assert(!hasClass(docsCard, 'gate-waived'),
   'expired non-blocker waiver must NOT carry the calm gate-waived class');
 const docsText = collectText(docsCard);
 assert(docsText.includes('WAIVED (EXPIRED)'), `expected the expired label, got: ${docsText}`);
+// PR #129 connector round-2 finding (console.js:2336): blocks=false here,
+// so the waiver box must NOT claim it is blocking.
+assert(!docsText.includes('blocking'),
+  `an advisory (non-blocking) expired waiver must not say "blocking", got: ${docsText}`);
+
+// PR #129 connector round-2 finding (P1, console.js:2281): a missing
+// required gate (status=unknown, blocks=true) and a skipped blocker
+// (status=skipped, blocks=true) must render danger (reuse gate-red), not
+// the neutral gray unknown/skipped color - both are real HOLD contributors.
+const missingCard = cards[2];
+assert(hasClass(missingCard, 'gate-red'),
+  `a blocking status=unknown gate must render danger (gate-red), got class=${missingCard.className}`);
+assert(!hasClass(missingCard, 'gate-unknown'),
+  'a blocking gate must not keep the neutral gray unknown class');
+
+const skippedCard = cards[3];
+assert(hasClass(skippedCard, 'gate-red'),
+  `a blocking status=skipped gate must render danger (gate-red), got class=${skippedCard.className}`);
+assert(!hasClass(skippedCard, 'gate-skipped'),
+  'a blocking gate must not keep the neutral gray skipped class');
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
@@ -7369,9 +7401,17 @@ def test_api_risk_register_shape_and_sorted_by_severity_then_age(
         for it in payload["items"]:
             assert set(it) == {
                 "id", "category", "category_label", "severity", "title",
-                "owner", "detail", "age_seconds", "human_can_unblock_now",
+                "owner", "detail", "age_seconds", "age_unknown",
+                "human_can_unblock_now",
             }
             assert it["severity"] in ("high", "med", "low")
+            # both gate and dead-letter sources have a real updated_at/
+            # deadlettered_at here, so age is known (PR #129 connector
+            # round-2 finding, web.py:3088 - age derivation - and
+            # reviewer-3 F-2 - flag unknown rather than defaulting to 0.0).
+            assert it["age_unknown"] is False
+            assert it["age_seconds"] >= 0, (
+                f"gate/dead-letter age must reflect a real elapsed time: {it}")
         # severity-desc, then age-desc within a severity band
         order = [("high", 0), ("med", 1), ("low", 2)]
         rank = dict(order)
@@ -7986,9 +8026,180 @@ def test_api_ownership_preserves_long_globs_losslessly(tmp_path: Path) -> None:
         (domain,) = payload["domains"]
         assert domain["owned_globs"] == [long_glob], (
             "a long owned_globs entry must not be silently truncated")
+        assert domain["owned_globs_truncated"] == 0
         (shared,) = payload["shared_paths"]
         assert shared["glob"] == long_glob, (
             "a long shared_paths glob must not be silently truncated")
+        assert shared["glob_truncated"] is False
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_api_ownership_flags_globs_still_cut_beyond_the_cap(tmp_path: Path) -> None:
+    """PR #129 connector round-2 finding (web.py:2763 / reviewer-3 F-5):
+    raising the cap to 4096 just MOVES the same silent-truncation threshold
+    - a glob longer than THAT still gets silently altered unless the
+    response says so explicitly."""
+    s = _make_store(tmp_path)
+    huge_glob = "src/" + "x" * 5000 + "/*.py"
+    assert len(huge_glob) > 4096
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {
+            "gen": {"title": "Generated code", "owners": {"agents": ["alpha"]},
+                    "owned_globs": [huge_glob]},
+        },
+        "shared_paths": [{
+            "glob": huge_glob, "category": "generated", "requires": "lead-approval",
+        }],
+    }), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _ownership(base)
+        (domain,) = payload["domains"]
+        assert domain["owned_globs"][0] != huge_glob, "sanity: this glob IS still cut"
+        assert domain["owned_globs_truncated"] == 1, (
+            f"a glob still cut past the 4096 cap must be flagged, not silent: {domain}")
+        (shared,) = payload["shared_paths"]
+        assert shared["glob_truncated"] is True
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_refs_truncation_is_flagged(tmp_path: Path) -> None:
+    """PR #129 connector round-2 finding (P1, web.py:2832): a green blocker
+    gate's validating ref could sit past position 20 in a single evidence
+    entry's refs list and be silently cut - the wall could then present the
+    gate as green with only empty/non-validating refs. Expose the cut count
+    rather than preserving or silently dropping."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    refs = [f"ref-{i}" for i in range(25)]
+    gmod.set_gate(s.root, name="ci", status="green", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  evidence=refs, reason="ok", required=True)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        (entry,) = gate["evidence"]
+        assert entry["refs"] == refs[:20]
+        assert entry["refs_truncated"] == 5, entry
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_gates_evidence_truncated_counts_unparseable_entries(tmp_path: Path) -> None:
+    """PR #129 connector round-2 finding (reviewer-3 F-3): an evidence entry
+    that fails to parse (not a JSON object) was silently dropped without
+    counting toward evidence_truncated - the wall could show fewer entries
+    than the cap implied with no signal that any were lost to a shape
+    problem rather than the cap itself. Also: the truncation notice must
+    still be reachable in the view even when EVERY entry is lost (covered
+    by the console render test)."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="ci", status="green", severity="warn",
+                  scope="release", actor="alpha", evidence_source="local_command",
+                  evidence=["ref"], reason="ok")
+    gates_path = gmod.gates_path(s.root)
+    raw = json.loads(gates_path.read_text(encoding="utf-8"))
+    # 5 of the (now 6) entries are not objects and must fail to parse.
+    raw["gates"]["ci"]["evidence"] = ["not-a-dict"] * 5 + raw["gates"]["ci"]["evidence"]
+    gates_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _gates(base)
+        (gate,) = payload["gates"]
+        assert len(gate["evidence"]) == 1
+        assert gate["evidence_truncated"] == 5, (
+            f"5 unparseable entries must count toward evidence_truncated: {gate}")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_surfaces_source_error_items_as_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #129 connector round-2 finding (P1, web.py:3047): a failure inside
+    _collect_web_attention_items becomes a visible, DISPOSITIONABLE
+    SOURCE_ERROR queue item, but that alone didn't mark the register
+    partial - an operator could disposition the warning item away and lose
+    the only signal that a source could not be fully read."""
+    s = _make_store(tmp_path)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("simulated dead-letter read failure")
+    monkeypatch.setattr(s, "list_dead_letters", boom)
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        assert payload["partial"] is True, (
+            f"a SOURCE_ERROR item must mark the register partial: {payload}")
+        assert any("dead_letter" in d for d in payload["degraded_sources"]), payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_treats_future_onboarding_timestamp_as_unknown(
+    tmp_path: Path,
+) -> None:
+    """PR #129 connector round-2 finding (P2, web.py:3156): a bounded but
+    parseable FUTURE updated_at (a skewed external writer) produced a
+    negative age, which read as "known" - clamped to 0s on the wire and
+    sorted to the LEAST urgent end of its severity band, the opposite of
+    the fail-safe "unknown is not safe" treatment an unparseable timestamp
+    already gets."""
+    from agenttalk import onboarding as ob
+
+    s = _make_store(tmp_path)
+    run_id = ob.new_run_id()
+    ob.create_run(s, ob.new_create_event(
+        run_id=run_id, title="scan", objective="map it", base_ref="main",
+        lead="alpha", state="scanning", at="2026-01-01T00:00:00Z"))
+    ob.append_event(s, ob.new_record_event(
+        run_id=run_id, kind=ob.KIND_DRIFT, key="future-drift", status="open",
+        summary="from a clock-skewed writer", actor="alpha", blocking=True,
+        at="2030-01-01T00:00:00Z"))
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        drift_items = [it for it in payload["items"] if it["category"] == "onboarding_drift"]
+        (item,) = drift_items
+        assert item["age_unknown"] is True, (
+            f"a future timestamp must be treated as unknown, not a negative-then-clamped "
+            f"age: {item}")
+        assert item["age_seconds"] == 0.0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_console_boot_polls_gates_and_risk_register(tmp_path: Path) -> None:
+    """PR #129 connector round-2 finding (P1, console.js:4521): Gates and
+    Risk Register used to be fetched once (boot/root-entry/navigation) and
+    never again while the view stayed open, so an operator watching either
+    screen kept seeing a stale all-clear/count indefinitely. boot() must
+    wire both through the SAME completion-driven startEndpointPoll loop as
+    state/attention/lead-chat/intents - that generic mechanism is already
+    behaviorally proven by
+    test_console_poll_waits_for_slow_endpoint_before_rescheduling; this
+    guards the wiring itself landing (and staying) inside boot()."""
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    boot_marker = "  function boot() {\n"
+    assert boot_marker in src
+    boot_start = src.index(boot_marker)
+    boot_end = src.index("\n  }\n", boot_start)
+    boot_body = src[boot_start:boot_end]
+    assert "startEndpointPoll(fetchGates)" in boot_body, boot_body
+    assert "startEndpointPoll(fetchRiskRegister)" in boot_body, boot_body

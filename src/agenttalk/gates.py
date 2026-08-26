@@ -13,6 +13,11 @@ from agenttalk._atomic import write_text as _atomic_write_text
 
 SCHEMA_VERSION = 1
 
+# PR #129 connector round-2 finding (reviewer-3 F-4): web.py derived its own
+# waiver_expired signal by comparing against this exact reason string as a
+# separate literal - a single shared constant means the two can never drift.
+WAIVER_EXPIRED_REASON = "waiver expired or invalid"
+
 VALID_STATUSES = frozenset({"red", "green", "unknown", "skipped", "waived"})
 VALID_SEVERITIES = frozenset({"blocker", "warn", "info"})
 VALID_EVIDENCE_SOURCES = frozenset({"automation_ci", "local_command", "manual_review", "operator_waiver"})
@@ -207,8 +212,17 @@ def waive_gate(
     return gate
 
 
-def check_gates(root: Path, *, scope: str | None = None, now: datetime | None = None) -> dict:
-    state = load_gate_state(root)
+def check_gates(root: Path, *, scope: str | None = None, now: datetime | None = None,
+                state: dict | None = None) -> dict:
+    """``state`` (optional, PR #129 connector finding web.py:2901): pass an
+    already-loaded ``load_gate_state(root)`` result to compute the verdict
+    from that EXACT snapshot instead of re-reading the file. Without it,
+    this loads fresh (unchanged default behavior) - a caller that ALSO
+    needs the raw state (e.g. for evidence) should load once and pass it
+    here, so a concurrent ``set_gate()`` between two reads can't combine a
+    verdict from one snapshot with evidence from another."""
+    if state is None:
+        state = load_gate_state(root)
     gates = state["gates"]
     required = sorted(set(state["required_gates"]))
     now = now or datetime.now(timezone.utc)
@@ -340,7 +354,7 @@ def _gate_verdict(gate: dict, *, now: datetime) -> dict:
             blocks = False
         else:
             blocks = severity == "blocker"
-            reason = "waiver expired or invalid"
+            reason = WAIVER_EXPIRED_REASON
     elif severity == "blocker" and status != "green":
         # A blocker clears ONLY on validated green (load_gate_state enforces the
         # evidence source/refs for a green blocker) or an active waiver (handled

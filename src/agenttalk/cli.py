@@ -6287,12 +6287,18 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
         items.append(A.source_error_item("process_tree_hold", str(e)))
     # dead-letter (ALL; build_queue hides resolved via the resolve_dead_letter disposition)
     try:
-        items += A.dead_letter_items(store.list_dead_letters())
+        # now_epoch (review rq-1a23fd25053d F-1): derive real age_seconds
+        # from each entry's own deadlettered_at, so CLI attention ages match
+        # the console's /api/risk-register (web.py's collector already
+        # threads this - PR #129 connector finding, web.py:3088).
+        items += A.dead_letter_items(store.list_dead_letters(), now_epoch=time.time())
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("dead_letter", str(e)))
     # gate HOLDs (cheap state read, no git/lane recompute)
     try:
-        items += A.gate_hold_items(gate_mod.check_gates(store.root).get("blockers", []))
+        # now_epoch: same rationale as dead_letter_items above.
+        items += A.gate_hold_items(gate_mod.check_gates(store.root).get("blockers", []),
+                                   now_epoch=time.time())
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("gate_hold", str(e)))
     # lead-loop unarmed (managed agents; PURE lead_loop_state, not doctor text)

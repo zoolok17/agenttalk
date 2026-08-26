@@ -576,7 +576,16 @@
   }
   function freshHeartbeat(agent) {
     var age = Number(agent && agent.last_seen_age_seconds);
-    return Number.isFinite(age) && age >= 0 && age <= UNWRAPPED_LIVE_STALE_AFTER_SECONDS;
+    if (!Number.isFinite(age) || age < 0) return false;
+    // PR #129 connector round-2 finding (P2, console.js:905): last_seen_age_seconds
+    // is a SNAPSHOT from the agent's last successful /api/state poll - if
+    // state polling then fails, this stayed frozen at that value forever,
+    // so an agent could sit in the default "Active" run long after crossing
+    // the freshness boundary. Advance it by the elapsed monotonic time
+    // since that snapshot was received, same pattern as liveAge().
+    var elapsed = agent && typeof agent._receivedAt === 'number'
+      ? Math.max(0, monotonicNow() - agent._receivedAt) / 1000 : 0;
+    return (age + elapsed) <= UNWRAPPED_LIVE_STALE_AFTER_SECONDS;
   }
   function agentStateInfo(agent) {
     var raw = ((agent && agent.health) || {}).state;
@@ -2278,6 +2287,13 @@
   function gateVisualState(gate) {
     var expired = 'waiver_expired' in gate ? gate.waiver_expired : gate.blocks;
     if (gate.status === 'waived' && expired) return 'waived_expired';
+    // PR #129 connector round-2 finding (P1, console.js:2281): a missing
+    // required gate is status=unknown/blocks=true, and a skipped blocker
+    // is status=skipped/blocks=true - both used to render with the neutral
+    // gray unknown/skipped color, understating a real HOLD contributor.
+    // Anything still blocking (and not already red or the waived-expired
+    // case above) reuses the existing danger-red treatment.
+    if (gate.blocks && gate.status !== 'red') return 'red';
     return gate.status || 'unknown';
   }
 
@@ -2332,8 +2348,13 @@
       var w = gate.waiver;
       var expired = visual === 'waived_expired';
       var waiverBox = el('div', 'tc-gate-waiver' + (expired ? ' is-expired' : ''));
+      // PR #129 connector round-2 finding (console.js:2336): the API
+      // intentionally sends waiver_expired=true with blocks=false for an
+      // expired ADVISORY (warn/info) waiver - the unconditional "— blocking"
+      // suffix contradicted the chip tooltip right next to it ("not
+      // currently blocking"). Only say "blocking" when it actually is.
       waiverBox.appendChild(el('div', 'tc-gate-waiver-title',
-        expired ? 'Waiver expired — blocking' : 'Waived'));
+        expired ? ('Waiver expired' + (gate.blocks ? ' — blocking' : '')) : 'Waived'));
       waiverBox.appendChild(el('div', 'tc-gate-waiver-line',
         (w.operator ? w.operator + ' — ' : '') + (w.reason || '')));
       if (w.expires) waiverBox.appendChild(el('div', 'tc-gate-waiver-line', 'Expires ' + w.expires));
@@ -2341,23 +2362,33 @@
     }
 
     var evidence = isArray(gate.evidence) ? gate.evidence : [];
-    if (evidence.length) {
+    // F-3 (review rq-1a23fd25053d): the truncation notice must render even
+    // when EVERY entry was lost (evidence.length === 0 but
+    // evidence_truncated > 0) - it used to sit inside `if (evidence.length)`
+    // and so could never appear in exactly that case.
+    if (evidence.length || gate.evidence_truncated) {
       var evBox = el('div', 'tc-gate-evidence');
-      evBox.appendChild(el('div', 'tc-gate-evidence-title', 'Evidence'));
+      if (evidence.length) evBox.appendChild(el('div', 'tc-gate-evidence-title', 'Evidence'));
       for (var i = 0; i < evidence.length; i++) {
         var e = evidence[i];
         var line = (e.source || 'evidence') + (e.by ? ' by ' + e.by : '') + (e.at ? ' at ' + e.at : '');
         var row = el('div', 'tc-gate-evidence-row', line);
         evBox.appendChild(row);
         if (isArray(e.refs) && e.refs.length) {
-          evBox.appendChild(el('div', 'tc-gate-evidence-refs', e.refs.join(', ')));
+          var refsLine = e.refs.join(', ');
+          if (e.refs_truncated) {
+            refsLine += ' (+' + e.refs_truncated + ' more ref' +
+              (e.refs_truncated === 1 ? '' : 's') + ' not shown)';
+          }
+          evBox.appendChild(el('div', 'tc-gate-evidence-refs', refsLine));
         }
         // PR #129 connector finding: the API forwards every OTHER
         // evidence_details field too (coverage_percent, pr_url, ...) - this
         // used to only ever render source/by/at/refs, hiding the actual
         // proof a gate relied on even though it was present in the payload.
         var extraKeys = Object.keys(e).filter(function (k) {
-          return k !== 'source' && k !== 'refs' && k !== 'at' && k !== 'by';
+          return k !== 'source' && k !== 'refs' && k !== 'at' && k !== 'by' &&
+            k !== 'refs_truncated';
         }).sort();
         for (var j = 0; j < extraKeys.length; j++) {
           var k = extraKeys[j];
@@ -2394,9 +2425,16 @@
     var errs = (data && isArray(data.errors)) ? data.errors : [];
     var items = (data && isArray(data.items)) ? data.items : [];
     var count = data && typeof data.count === 'number' ? data.count : items.length;
+    var truncatedCount = data && typeof data.truncated === 'number' ? data.truncated : 0;
     var partial = !!(data && data.partial);
-    header.appendChild(el('span', 'tc-attn-count',
-      errs.length ? 'status unknown' : count + ' open' + (partial ? ' · incomplete' : '')));
+    // PR #129 connector round-2 finding (console.js:2399): the API's
+    // `count` is only how many items are RETURNED after the cap; the true
+    // open total is count + truncated (e.g. 700 open, 500 shown, 200 more).
+    // Labeling only `count` as "open" understated the real number.
+    var totalOpen = count + truncatedCount;
+    var countLabel = totalOpen + ' open' + (partial ? ' · incomplete' : '') +
+      (truncatedCount ? ' (showing ' + count + ')' : '');
+    header.appendChild(el('span', 'tc-attn-count', errs.length ? 'status unknown' : countLabel));
     wrap.appendChild(header);
 
     if (!data) {
@@ -2525,6 +2563,15 @@
     if (d.owned_globs && d.owned_globs.length) {
       card.appendChild(el('div', 'tc-domain-globs', d.owned_globs.join(', ')));
     }
+    // PR #129 connector round-2 (web.py:2763 / reviewer-3 F-5): the API now
+    // reports when a glob still exceeded the transport cap and was cut - a
+    // truncated glob no longer matches its original pattern, so this must
+    // not stay a silent, invisible difference.
+    if (d.owned_globs_truncated) {
+      card.appendChild(el('div', 'tc-gate-reason',
+        d.owned_globs_truncated + ' glob(s) exceeded the length limit and were cut - ' +
+        'they may no longer match the intended path.'));
+    }
     return card;
   }
 
@@ -2540,6 +2587,11 @@
     if (approvers) card.appendChild(el('div', 'tc-domain-line', 'Default approvers: ' + approvers));
     if (reviewers) card.appendChild(el('div', 'tc-domain-line', 'Default reviewers: ' + reviewers));
     if (s.description) card.appendChild(el('div', 'tc-gate-reason', s.description));
+    if (s.glob_truncated) {
+      card.appendChild(el('div', 'tc-gate-reason',
+        'This glob exceeded the length limit and was cut - it may no longer match ' +
+        'the intended path.'));
+    }
     return card;
   }
 
@@ -4519,6 +4571,16 @@
     startEndpointPoll(fetchAttention);
     startEndpointPoll(fetchLeadChat);
     startEndpointPoll(fetchIntents);
+    // PR #129 connector round-2 finding (P1, console.js:4521): Gates and
+    // Risk Register were fetched only on boot/root-entry or on navigating
+    // to the view, then never again while it stayed open - CI could turn a
+    // gate red, or a new dead letter/blocker could appear, and an operator
+    // watching the screen would keep seeing the stale all-clear/count
+    // indefinitely (displayed ages still advancing, making it LOOK live).
+    // Same completion-driven loop as the other high-cadence feeds (#207 -
+    // never queues a poll behind a slow request).
+    startEndpointPoll(fetchGates);
+    startEndpointPoll(fetchRiskRegister);
     // These payloads are view support, not high-cadence telemetry.
     fetchSession();
     fetchLearning();
