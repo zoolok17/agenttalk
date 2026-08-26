@@ -558,14 +558,34 @@ included and already present locally. The scanner never initializes or updates
 them.
 
 Resource caps apply to file count, individual file bytes, total bytes, nesting,
-and adapter work. V1 hard-caps one scope at 100,000 filesystem entries, 64 MiB
-per file, 2 GiB of hashed source bytes, and 30 seconds for a read-time freshness
-pass. Hitting a scan cap yields a degraded scan and explicit problem; the
-scanner does not silently sample. Hitting a freshness-pass cap yields `unknown`.
-An incomplete enumeration marks the whole-scope fingerprint incomplete, so no
-pack from that run can later claim `current`. Scanner output is deterministic
-even when adapter work is parallelized: merge and serialization order are
-canonical.
+and adapter work. The initial protective values are all **PROVISIONAL**:
+
+- 100,000 filesystem entries per scope — **PROVISIONAL**;
+- 64 MiB per file — **PROVISIONAL**;
+- 2 GiB of hashed source bytes per scope — **PROVISIONAL**; and
+- 30 seconds for one read-time freshness pass — **PROVISIONAL**.
+
+The slice-1 planning gate must confirm or revise all four values from an executed
+measurement against a representative legacy corpus. That evidence pins the
+exact corpus revision/content fingerprint, platform and path policy, file-count
+and size distribution, cold and warm scan/freshness timings, peak memory, and
+cap-hit outcome. The implementation plan cannot present these unmeasured values
+as a proven JAWS-scale budget.
+
+Until that measurement is accepted, treat the provisional values as fail-closed
+guards. If a scan reaches an entry, per-file, or hashed-byte limit, narrow the
+repeated `--scope PATH` selection to a smaller coherent repository region and
+rescan until enumeration completes. If a freshness pass reaches 30 seconds,
+narrow the same scope and rebuild the scan and pack until freshness is
+`current`. Do not raise a cap ad hoc, call an incomplete fingerprint current, or
+use headless dispatch to bypass the resulting `unknown`; only the attended
+work-item waiver described below can admit that state.
+
+Hitting a scan cap yields a degraded scan and explicit problem; the scanner does
+not silently sample. Hitting a freshness-pass cap yields `unknown`. An incomplete
+enumeration marks the whole-scope fingerprint incomplete, so no pack from that
+run can later claim `current`. Scanner output is deterministic even when adapter
+work is parallelized: merge and serialization order are canonical.
 
 ## Proposed CLI surface
 
@@ -890,10 +910,11 @@ step; stale-lock, staging-reclaim, predecessor-CAS, and Windows sharing-violatio
 fixtures; old-generation concurrent readers; VCS ignored/unignored/no-VCS
 admission; full-scope new-file `unknown`, selected-file `stale`, exact-match
 `current`, and waiver records; stored-versus-revalidated readiness; artifact
-ceilings; symlink/root escape; secret/comment/literal canary non-disclosure;
-Linux and Windows network-deny jobs; bounded pack truncation; and CLI/API
-projection parity. Windows crash safety is a first-class test, not subsumed by a
-generic “atomic rename” test.
+ceilings; representative-corpus measurement of all four provisional
+scan/freshness limits; symlink/root escape; secret/comment/literal canary
+non-disclosure; Linux and Windows network-deny jobs; bounded pack truncation;
+and CLI/API projection parity. Windows crash safety is a first-class test, not
+subsumed by a generic “atomic rename” test.
 
 ## Requirements and review-item reconciliation
 
@@ -947,7 +968,7 @@ used as an S1 release gate.
 ## Open questions for adversarial review
 
 These choices can narrow adapters or UX, but cannot relax the S1 invariants,
-freshness semantics, limits, or tier boundary:
+freshness semantics, boundedness requirement, or tier boundary:
 
 1. **Adapter scope:** Which bundled languages/frameworks form the smallest useful
    S1? The answer cannot introduce an external analyzer or a relation without a
@@ -962,8 +983,8 @@ freshness semantics, limits, or tier boundary:
    summary or only the local pack identity/path? Neither choice may add source
    text or weaken admission.
 5. **#208 code ownership:** Should the pure canonical projector live with #55 or
-   be imported by #208? The GET-only schema, root selection, caps, and semantic
-   parity are already fixed here.
+   be imported by #208? The GET-only schema, root selection, projection caps,
+   and semantic parity are already fixed here.
 6. **Published retention:** What explicit, recoverable UX should eventually prune
    immutable runs and packs? V1 reclaims unpublished staging only.
 7. **Optional prior art:** Does a pinned Graphify or other extractor pass the
