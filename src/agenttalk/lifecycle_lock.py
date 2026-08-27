@@ -397,7 +397,17 @@ def _darwin_process_observation(pid: int) -> tuple[str, ProcessIdentity | None]:
         return "unknown", None
 
 
-def _process_observation(pid: object) -> tuple[str, ProcessIdentity | None]:
+def process_observation(pid: object) -> tuple[str, ProcessIdentity | None]:
+    """Classify ``pid`` as exactly ``"dead"``, ``"alive"`` (with its exact
+    identity), or ``"unknown"`` (unsupported platform, invalid PID, or the
+    identity could not be observed). Public so a caller that needs the
+    tri-state distinction directly - e.g. comprehension's scan.lock, which
+    per DESIGN-55-comprehension-plane.md may reclaim a stale lock only when
+    the recorded owner is DEFINITELY dead, never merely unobservable - does
+    not have to reimplement this platform dispatch. ``process_identity``
+    below is the narrower "alive with a known identity, else None" view
+    used by this module's own acquire path.
+    """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return "unknown", None
     if os.name == "nt":
@@ -423,7 +433,7 @@ def sys_platform_darwin() -> bool:
 
 def process_identity(pid: int) -> ProcessIdentity | None:
     """Return an exact live-process identity, or ``None`` on any ambiguity."""
-    status, identity = _process_observation(pid)
+    status, identity = process_observation(pid)
     return identity if status == "alive" else None
 
 
@@ -637,7 +647,7 @@ class CrossProcessLifecycleLock:
         }
 
     def _classify_recorded_owner(self, record: dict) -> str:
-        status, observed = _process_observation(record["pid"])
+        status, observed = process_observation(record["pid"])
         if status == "dead":
             return "gone"
         if status != "alive" or observed is None:
