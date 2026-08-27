@@ -61,6 +61,23 @@ def comprehension_privacy(comprehension_privacy_root: Path):
     return run_privacy_preflight(comprehension_privacy_root)
 
 
+@pytest.fixture
+def comprehension_dir(comprehension_privacy_root: Path) -> Path:
+    """The ``.agenttalk/comprehension/`` directory implied by
+    :func:`comprehension_privacy_root`'s project root, matching the
+    ``paths.comprehension_dir(agenttalk_dir)`` / ``store.DIRNAME``
+    real-layout convention (``root/.agenttalk/comprehension``). Tests must
+    acquire locks and stage/publish under THIS path, not the bare project
+    root — :func:`comprehension_privacy`'s proof is bound to the project
+    root via ``paths.project_root_from_comprehension_dir``, which climbs
+    exactly two levels up from a comprehension dir (reviewer-1 cold-read
+    finding 1 on PR-A, rq-6cc5560b62f6); a flat, unnested test directory
+    would climb to the wrong place and make every root-binding check
+    spuriously fail.
+    """
+    return comprehension_privacy_root / ".agenttalk" / "comprehension"
+
+
 @pytest.fixture(autouse=True)
 def _clear_agenttalk_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Strip AGENTTALK_* env vars between tests so resolution behavior is

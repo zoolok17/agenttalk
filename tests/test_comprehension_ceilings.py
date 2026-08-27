@@ -52,6 +52,63 @@ def test_measure_staging_artifacts_ignores_subdirectories(tmp_path: Path) -> Non
     assert [m.name for m in measurements] == ["scan.json"]
 
 
+# ------------------------------------------ finding 4 regression: negative/non-int counts
+
+def test_measure_staging_artifacts_refuses_a_negative_record_count(tmp_path: Path) -> None:
+    """reviewer-1 cold-read finding 4 on PR-A (rq-6cc5560b62f6), reproduced
+    as a permanent regression test: a negative declared count previously
+    let the summed total UNDERSTATE the true whole-run total, hiding an
+    over-cap run behind a declared sum that stayed within it. Refused
+    before any ceiling summation runs."""
+    (tmp_path / "scan.json").write_text("abc", encoding="utf-8")
+    with pytest.raises(ceil.ArtifactLimitExceeded, match="non-negative integer"):
+        ceil.measure_staging_artifacts(tmp_path, record_counts={"scan.json": -100000})
+
+
+@pytest.mark.parametrize("bad_count", [1.5, "3", None, [], True, False])
+def test_measure_staging_artifacts_refuses_a_non_integer_record_count(
+    tmp_path: Path, bad_count,
+) -> None:
+    (tmp_path / "scan.json").write_text("abc", encoding="utf-8")
+    with pytest.raises(ceil.ArtifactLimitExceeded, match="non-negative integer"):
+        ceil.measure_staging_artifacts(tmp_path, record_counts={"scan.json": bad_count})
+
+
+def test_negative_counts_cannot_offset_the_run_total_under_the_cap(tmp_path: Path) -> None:
+    """Reproduces the reviewer's exact scenario: four artifacts declaring
+    100000, 100000, 100000, -100000 sum to a declared 200000 (under the
+    250000 cap) while the true non-negative total is 300000 (over it). The
+    fix must refuse at measurement time, never let enforcement see the
+    deflated total."""
+    for name in ("a.json", "b.json", "c.json", "d.json"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    with pytest.raises(ceil.ArtifactLimitExceeded, match="non-negative integer"):
+        ceil.measure_staging_artifacts(
+            tmp_path,
+            record_counts={
+                "a.json": 100000, "b.json": 100000, "c.json": 100000, "d.json": -100000,
+            },
+        )
+
+
+# ------------------------------------------------- finding 5 (low-confidence residual): symlinks
+
+def test_measure_staging_artifacts_rejects_a_symlinked_artifact(tmp_path: Path) -> None:
+    """reviewer-1 cold-read low-confidence residual on PR-A (rq-6cc5560b62f6):
+    a staged symlink must be rejected at durable-artifact ADMISSION
+    (measurement), not merely at envelope-path-resolution or reclaim-
+    directory containment — the reviewer noted no test covered this."""
+    outside = tmp_path.parent / "outside-artifact.json"
+    outside.write_text("[]", encoding="utf-8")
+    link = tmp_path / "scan.json"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not permitted in this environment")
+    with pytest.raises(ceil.ArtifactLimitExceeded, match="symlink"):
+        ceil.measure_staging_artifacts(tmp_path, record_counts={"scan.json": 1})
+
+
 # ----------------------------------------------------------- enforce_artifact_ceilings
 
 def test_enforce_ceilings_accepts_small_artifacts() -> None:
@@ -102,7 +159,7 @@ def test_enforce_ceilings_rejects_whole_run_record_total() -> None:
 # ----------------------------------------------------------- integration: publish_run refuses
 
 def test_publish_run_refuses_and_publishes_no_run_when_a_ceiling_is_exceeded(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
     """design: 'Exceeding a ceiling publishes no run.' Shrink the ceiling
     (rather than writing a real 16 MiB fixture) so the test stays fast
@@ -110,59 +167,56 @@ def test_publish_run_refuses_and_publishes_no_run_when_a_ceiling_is_exceeded(
     publish_run, not just the standalone ceilings function."""
     monkeypatch.setattr(ceil, "PER_ARTIFACT_BYTES_MAX", 4)
     lock = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
-    staging = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    staging = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     (staging.path / "scan.json").write_text("this is way more than 4 bytes", encoding="utf-8")
 
     with pytest.raises(ceil.ArtifactLimitExceeded):
         pub.publish_run(
-            comprehension_privacy_root, staging_handle=staging, lock_handle=lock,
-            scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": "scan-1"},
             predecessor_index_digest=None, record_counts={"scan.json": 1},
         )
-    assert not (comprehension_privacy_root / "runs" / "scan-1").exists()  # no run published
+    assert not (comprehension_dir / "runs" / "scan-1").exists()  # no run published
     assert staging.path.exists()  # staging left in place, not silently discarded
     assert not lock.path.exists()  # still a REPORTED failure — lock released
 
 
 def test_publish_run_enforces_record_counts_from_the_caller(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
     monkeypatch.setattr(ceil, "PER_ARTIFACT_RECORDS_MAX", 2)
     lock = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
-    staging = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    staging = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     (staging.path / "modules.json").write_text("[]", encoding="utf-8")
 
     with pytest.raises(ceil.ArtifactLimitExceeded, match="records"):
         pub.publish_run(
-            comprehension_privacy_root, staging_handle=staging, lock_handle=lock,
-            scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": "scan-1"},
             predecessor_index_digest=None, record_counts={"modules.json": 3},
         )
-    assert not (comprehension_privacy_root / "runs" / "scan-1").exists()
+    assert not (comprehension_dir / "runs" / "scan-1").exists()
 
 
 def test_publish_run_refuses_when_a_staged_artifact_has_no_declared_record_count(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """F-1 integration: publish_run's own default (record_counts omitted)
     must refuse rather than silently admit an unmeasured artifact."""
     lock = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
-    staging = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    staging = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     (staging.path / "scan.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(ceil.ArtifactLimitExceeded, match="no declared record count"):
         pub.publish_run(
-            comprehension_privacy_root, staging_handle=staging, lock_handle=lock,
-            scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+            staging_handle=staging, lock_handle=lock,
+            run_summary={"scan_id": "scan-1"},
             predecessor_index_digest=None,
         )
-    assert not (comprehension_privacy_root / "runs" / "scan-1").exists()
+    assert not (comprehension_dir / "runs" / "scan-1").exists()

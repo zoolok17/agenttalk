@@ -41,11 +41,16 @@ from pathlib import Path
 
 from .ceilings import enforce_artifact_ceilings, measure_staging_artifacts
 from .digests import canonical_content_digest
-from .envelope import read_json_document, validate_envelope
+from .envelope import (
+    read_json_document,
+    resolve_under_root,
+    validate_envelope,
+    validate_scan_id,
+)
 from .errors import ComprehensionError
 from .lock import ScanLockHandle, release_scan_lock
 from .paths import index_path as _index_path
-from .paths import run_dir as _run_dir
+from .paths import runs_dir as _runs_dir
 from .staging import StagingHandle
 
 INDEX_SCHEMA_VERSION = 1
@@ -60,6 +65,16 @@ class RunDirectoryExists(ComprehensionError):
     caller bug (scan IDs must be unique), not a retryable condition."""
 
     reason_code = "comprehension_run_directory_exists"
+
+
+class StagingOwnershipMismatch(ComprehensionError):
+    """``staging_handle`` was not created under ``lock_handle``'s
+    acquisition (different ``owner_token``) — publishing it would trust a
+    staging directory this lock never vouched for (reviewer-1 cold-read
+    finding 2 on PR-A, rq-6cc5560b62f6: "cross-check staging_handle.scan_id
+    + owner token + lock/root identity at rename")."""
+
+    reason_code = "comprehension_staging_ownership_mismatch"
 
 
 class RenamePublishFailed(ComprehensionError):
@@ -95,14 +110,35 @@ def _is_windows() -> bool:
 
 
 def rename_staging_to_run(
-    comprehension_dir: Path, staging_handle: StagingHandle, *, scan_id: str,
+    staging_handle: StagingHandle, lock_handle: ScanLockHandle,
 ) -> Path:
     """Publish step 1: rename the staging directory to
     ``runs/<scan_id>/``. Bounded exponential retry on a Windows sharing
     violation, for at most ~2 seconds total; a POSIX failure (or an
     exhausted Windows retry) raises immediately and touches nothing else.
+
+    Takes ``staging_handle`` and ``lock_handle`` only — no independent
+    ``comprehension_dir`` or ``scan_id`` parameter (reviewer-1 cold-read
+    finding 2 on PR-A, rq-6cc5560b62f6: an unchecked, independently
+    supplied ``scan_id`` let a caller construct a ``runs/`` path that
+    disagreed with what was actually staged). The comprehension directory
+    is derived from ``lock_handle.path`` (already root-bound at
+    acquisition — see ``lock.acquire_scan_lock``); ``scan_id`` is
+    re-validated from ``staging_handle.scan_id`` (defense in depth — it
+    was already validated once at staging-creation time, but this is a
+    security-critical path that must never trust an upstream check blindly);
+    and ``staging_handle.owner_token`` is cross-checked against
+    ``lock_handle.owner_token`` — publishing a staging directory this lock
+    never created is refused, not silently trusted.
     """
-    dst = _run_dir(comprehension_dir, scan_id)
+    if staging_handle.owner_token != lock_handle.owner_token:
+        raise StagingOwnershipMismatch(
+            "staging_handle was not created under lock_handle's acquisition "
+            "(owner_token mismatch) — refusing to publish a staging directory this "
+            "lock does not own")
+    scan_id = validate_scan_id(staging_handle.scan_id)
+    comprehension_dir = lock_handle.path.parent
+    dst = resolve_under_root(scan_id, root=_runs_dir(comprehension_dir), label="run directory")
     if dst.exists():
         raise RunDirectoryExists(f"runs/{scan_id}/ already exists — scan IDs must be unique")
     dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -227,11 +263,9 @@ def _replace_with_windows_retry(src: Path, dst: Path) -> None:
 
 
 def publish_run(
-    comprehension_dir: Path,
     *,
     staging_handle: StagingHandle,
     lock_handle: ScanLockHandle,
-    scan_id: str,
     run_summary: dict,
     predecessor_index_digest: str | None,
     now: datetime | None = None,
@@ -246,6 +280,14 @@ def publish_run(
     calling the individual step functions directly instead of this
     orchestrator.
 
+    No independent ``comprehension_dir`` or ``scan_id`` parameter (same
+    fix as ``rename_staging_to_run`` — reviewer-1 cold-read finding 2 on
+    PR-A, rq-6cc5560b62f6): both are derived from ``lock_handle``/
+    ``staging_handle``, the single source of truth for what this publish
+    is scoped to. ``run_summary["scan_id"]`` is cross-checked against
+    ``staging_handle.scan_id`` — the published index must never claim a
+    DIFFERENT scan happened than what was actually renamed into ``runs/``.
+
     ``record_counts`` maps each staged artifact filename to its record
     count for the ceiling check (design: "16 MiB and 100,000 records per
     artifact, and 64 MiB and 250,000 records for all durable artifacts in
@@ -256,12 +298,19 @@ def publish_run(
     regardless and can never be skipped this way.
     """
     try:
+        if (
+            not isinstance(run_summary, dict)
+            or run_summary.get("scan_id") != staging_handle.scan_id
+        ):
+            raise ComprehensionError(
+                "run_summary['scan_id'] must equal staging_handle.scan_id — the index "
+                "must never claim a different scan than what was actually published")
         measurements = measure_staging_artifacts(
             staging_handle.path, record_counts=record_counts or {})
         enforce_artifact_ceilings(measurements)
-        rename_staging_to_run(comprehension_dir, staging_handle, scan_id=scan_id)
+        rename_staging_to_run(staging_handle, lock_handle)
         return publish_index_cas(
-            comprehension_dir, scan_id=scan_id, run_summary=run_summary,
+            lock_handle.path.parent, scan_id=staging_handle.scan_id, run_summary=run_summary,
             predecessor_index_digest=predecessor_index_digest, now=now,
         )
     finally:

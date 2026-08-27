@@ -4,7 +4,7 @@
 Every ``acquire_scan_lock`` call below threads a REAL
 ``PrivacyPreflightResult`` from the ``comprehension_privacy`` fixture,
 which itself runs the real preflight against a real git repository (the
-``comprehension_privacy_root`` fixture) — reviewer-3's B-1 finding on this
+``comprehension_dir`` fixture) — reviewer-3's B-1 finding on this
 PR (rq-5bd5427ad64d) explicitly forbids a permissive test-only
 constructor for this type.
 """
@@ -19,7 +19,11 @@ import pytest
 
 from agenttalk.comprehension import lock as lockmod
 from agenttalk.comprehension import privacy as privacymod
-from agenttalk.comprehension.errors import ScanLockContended, ScanLockUnrecoverable
+from agenttalk.comprehension.errors import (
+    PrivacyProofRootMismatch,
+    ScanLockContended,
+    ScanLockUnrecoverable,
+)
 from agenttalk.comprehension.privacy import PrivacyPreflightResult, VcsPrivacyRefused
 from agenttalk.lifecycle_lock import ProcessIdentity
 
@@ -27,12 +31,12 @@ from agenttalk.lifecycle_lock import ProcessIdentity
 # ----------------------------------------------------------- acquire / release happy path
 
 def test_acquire_then_release_round_trips(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     handle = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest="deadbeef")
-    assert handle.path == comprehension_privacy_root / "scan.lock"
+    assert handle.path == comprehension_dir / "scan.lock"
     assert handle.path.exists()
     record = json.loads(handle.path.read_text(encoding="utf-8"))
     assert record["state"] == "held"
@@ -44,14 +48,14 @@ def test_acquire_then_release_round_trips(
 
 
 def test_acquire_records_the_privacy_disposition_into_the_lock(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """Per the design's requirement that the disposition be recorded
     (reviewer-3 B-1 on PR-A, rq-5bd5427ad64d): the vcs_privacy disposition
     must be durable from the first byte written, not only reachable later
     via scan.json."""
     handle = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     assert handle.vcs_privacy == "ignored"
     assert handle.work_id is None
@@ -62,12 +66,12 @@ def test_acquire_records_the_privacy_disposition_into_the_lock(
 
 
 def test_acquire_records_an_acknowledged_disposition_and_its_work_id(
-    comprehension_privacy_root: Path,
+    comprehension_privacy_root: Path, comprehension_dir: Path,
 ) -> None:
     acknowledged = privacymod.acknowledge_unignored_private_store(
-        vcs_kind="git", work_id="migrate-checkout")
+        comprehension_privacy_root, vcs_kind="git", work_id="migrate-checkout")
     handle = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=acknowledged, predecessor_index_digest=None)
+        comprehension_dir, privacy=acknowledged, predecessor_index_digest=None)
     assert handle.vcs_privacy == "acknowledged_unignored"
     assert handle.work_id == "migrate-checkout"
     record = json.loads(handle.path.read_text(encoding="utf-8"))
@@ -77,10 +81,10 @@ def test_acquire_records_an_acknowledged_disposition_and_its_work_id(
 
 
 def test_acquire_with_no_predecessor_index_digest_persists_null(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     handle = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     record = json.loads(handle.path.read_text(encoding="utf-8"))
     assert record["predecessor_index_digest"] is None
@@ -88,14 +92,14 @@ def test_acquire_with_no_predecessor_index_digest_persists_null(
 
 
 def test_release_lets_a_new_acquire_succeed(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     first = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     lockmod.release_scan_lock(first)
     second = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     assert second.owner_token != first.owner_token
     lockmod.release_scan_lock(second)
@@ -104,17 +108,17 @@ def test_release_lets_a_new_acquire_succeed(
 # ----------------------------------------------------------- live contention
 
 def test_second_acquire_while_first_is_live_is_contended(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """The CURRENT test process is a real, observably-alive process with a
     real process-start identity — a second acquire attempt hits the exact
     live-contention path with no monkeypatching required."""
     first = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     with pytest.raises(ScanLockContended) as exc_info:
         lockmod.acquire_scan_lock(
-            comprehension_privacy_root, privacy=comprehension_privacy,
+            comprehension_dir, privacy=comprehension_privacy,
             predecessor_index_digest=None)
     assert exc_info.value.holder_pid == os.getpid()
     lockmod.release_scan_lock(first)
@@ -123,14 +127,14 @@ def test_second_acquire_while_first_is_live_is_contended(
 # ----------------------------------------------------------- stale-lock reclaim (definitely dead)
 
 def test_definitely_dead_holder_is_reclaimed_automatically(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
     stale = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest="stale-digest")
     monkeypatch.setattr(lockmod, "process_observation", lambda pid: ("dead", None))
     fresh = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest="fresh-digest")
     assert fresh.owner_token != stale.owner_token
     record = json.loads(fresh.path.read_text(encoding="utf-8"))
@@ -139,12 +143,12 @@ def test_definitely_dead_holder_is_reclaimed_automatically(
 
 
 def test_reclaim_only_happens_once_per_acquire_call(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
     """A dead lock that keeps reappearing (pathological) must not spin
     forever — bounded retries, then a typed refusal."""
     lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     calls = {"n": 0}
 
@@ -160,7 +164,7 @@ def test_reclaim_only_happens_once_per_acquire_call(
     monkeypatch.setattr(lockmod, "_classify_and_maybe_reclaim", always_recreates_after_reclaim)
     with pytest.raises(ScanLockUnrecoverable, match="repeated reclaim"):
         lockmod.acquire_scan_lock(
-            comprehension_privacy_root, privacy=comprehension_privacy,
+            comprehension_dir, privacy=comprehension_privacy,
             predecessor_index_digest=None)
     assert calls["n"] > 1
 
@@ -168,12 +172,12 @@ def test_reclaim_only_happens_once_per_acquire_call(
 # ----------------------------------------------------------- stale-lock: unverifiable (PID reuse)
 
 def test_alive_but_identity_mismatch_is_unrecoverable_not_reclaimed(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
     """design: 'PID reuse cannot prove death because the process-start
     identity must also match.'"""
     stale = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     different_identity = ProcessIdentity(
         scheme=stale.process_identity.scheme, value=stale.process_identity.value + "-reused")
@@ -181,7 +185,7 @@ def test_alive_but_identity_mismatch_is_unrecoverable_not_reclaimed(
         lockmod, "process_observation", lambda pid: ("alive", different_identity))
     with pytest.raises(ScanLockUnrecoverable, match="PID reuse"):
         lockmod.acquire_scan_lock(
-            comprehension_privacy_root, privacy=comprehension_privacy,
+            comprehension_dir, privacy=comprehension_privacy,
             predecessor_index_digest=None)
     assert stale.path.exists()  # never deleted — reclaim did not happen
 
@@ -189,15 +193,15 @@ def test_alive_but_identity_mismatch_is_unrecoverable_not_reclaimed(
 # ----------------------------------------------------------- stale-lock: unverifiable (unknown platform)
 
 def test_unknown_liveness_is_unrecoverable(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
     stale = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     monkeypatch.setattr(lockmod, "process_observation", lambda pid: ("unknown", None))
     with pytest.raises(ScanLockUnrecoverable, match="could not be observed"):
         lockmod.acquire_scan_lock(
-            comprehension_privacy_root, privacy=comprehension_privacy,
+            comprehension_dir, privacy=comprehension_privacy,
             predecessor_index_digest=None)
     assert stale.path.exists()
 
@@ -205,16 +209,16 @@ def test_unknown_liveness_is_unrecoverable(
 # ----------------------------------------------------------- stale-lock: unverifiable (different host)
 
 def test_different_host_identity_is_unrecoverable_even_if_pid_matches(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
     monkeypatch.setattr(lockmod, "host_identity", lambda: "host-a")
     stale = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     monkeypatch.setattr(lockmod, "host_identity", lambda: "host-b")
     with pytest.raises(ScanLockUnrecoverable, match="different host"):
         lockmod.acquire_scan_lock(
-            comprehension_privacy_root, privacy=comprehension_privacy,
+            comprehension_dir, privacy=comprehension_privacy,
             predecessor_index_digest=None)
     assert stale.path.exists()
 
@@ -231,24 +235,24 @@ def test_different_host_identity_is_unrecoverable_even_if_pid_matches(
     '"vcs_privacy": "ignored", "work_id": null}',
 ])
 def test_malformed_lock_record_is_unrecoverable(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, raw: str,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, raw: str,
 ) -> None:
-    lock_path = comprehension_privacy_root / "scan.lock"
+    lock_path = comprehension_dir / "scan.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path.write_text(raw, encoding="utf-8")
     with pytest.raises(ScanLockUnrecoverable, match="malformed"):
         lockmod.acquire_scan_lock(
-            comprehension_privacy_root, privacy=comprehension_privacy,
+            comprehension_dir, privacy=comprehension_privacy,
             predecessor_index_digest=None)
 
 
 # ----------------------------------------------------------- release() ownership check
 
 def test_release_refuses_if_owner_token_no_longer_matches(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     handle = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     record = json.loads(handle.path.read_text(encoding="utf-8"))
     record["owner_token"] = "someone-else"
@@ -258,10 +262,10 @@ def test_release_refuses_if_owner_token_no_longer_matches(
 
 
 def test_release_refuses_if_lock_file_is_gone(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     handle = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     os.remove(handle.path)
     with pytest.raises(ScanLockUnrecoverable):
@@ -271,20 +275,20 @@ def test_release_refuses_if_lock_file_is_gone(
 # ----------------------------------------------------------- recover_stale_lock (attended-only)
 
 def test_recover_stale_lock_clears_an_existing_lock_unconditionally(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """recover_stale_lock performs NO liveness check — it is the attended
     override, called only after a human has already confirmed the prior
     scan is gone (design: the CLI flag requires attendance; this function
     is what it calls once attendance is proven)."""
     stale = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     assert stale.path.exists()
-    lockmod.recover_stale_lock(comprehension_privacy_root)
+    lockmod.recover_stale_lock(comprehension_dir)
     assert not stale.path.exists()
     fresh = lockmod.acquire_scan_lock(
-        comprehension_privacy_root, privacy=comprehension_privacy,
+        comprehension_dir, privacy=comprehension_privacy,
         predecessor_index_digest=None)
     lockmod.release_scan_lock(fresh)
 
@@ -341,3 +345,78 @@ def test_refused_preflight_leaves_zero_bytes_under_comprehension_dir(tmp_path: P
         lockmod.acquire_scan_lock(  # unreachable: `result` never gets assigned
             tmp_path, privacy=result, predecessor_index_digest=None)
     assert not (tmp_path / ".agenttalk").exists()
+
+
+# ----------------------------------------------------------- finding 1 regression: cross-root proof reuse
+
+def test_a_proof_from_one_root_cannot_unlock_a_different_root(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """reviewer-1 cold-read finding 1 on PR-A (rq-6cc5560b62f6), reproduced
+    as a permanent regression test: a REAL, proven ``PrivacyPreflightResult``
+    from protected root A must never unlock ``acquire_scan_lock`` at an
+    unrelated root B, even though both are real git repos where the
+    preflight genuinely proves ``ignored``."""
+    other_root = tmp_path_factory.mktemp("other-root")
+    import subprocess
+    subprocess.run(["git", "-C", str(other_root), "init", "-q"], check=True)  # noqa: S603,S607  # nosec B603 B607
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["git", "-C", str(other_root), "config", "user.email", "t@t"], check=True)
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["git", "-C", str(other_root), "config", "user.name", "t"], check=True)
+    (other_root / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    other_comprehension_dir = other_root / ".agenttalk" / "comprehension"
+
+    with pytest.raises(PrivacyProofRootMismatch):
+        lockmod.acquire_scan_lock(
+            other_comprehension_dir, privacy=comprehension_privacy,
+            predecessor_index_digest=None)
+    assert not other_comprehension_dir.exists()
+
+
+def test_acknowledge_proof_is_also_bound_to_its_own_root(
+    comprehension_dir: Path, tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    other_root = tmp_path_factory.mktemp("other-root")
+    acknowledged = privacymod.acknowledge_unignored_private_store(
+        other_root, vcs_kind="none", work_id="w1")
+    with pytest.raises(PrivacyProofRootMismatch):
+        lockmod.acquire_scan_lock(
+            comprehension_dir, privacy=acknowledged, predecessor_index_digest=None)
+
+
+# ----------------------------------------------------------- finding 3 regression: no socket import
+
+def test_comprehension_package_imports_no_socket_or_network_module() -> None:
+    """reviewer-1 cold-read finding 3 on PR-A (rq-6cc5560b62f6): the
+    design's offline contract (lines ~800-813) prohibits network-capable
+    imports anywhere in ``agenttalk.comprehension`` — a static per-file
+    import scan, closing the CHANNEL (the whole package), not merely the
+    one ``lock.py`` instance the reviewer reproduced against.
+    """
+    import ast
+    import importlib
+    import pathlib
+
+    banned = {
+        "socket", "ssl", "http", "http.client", "urllib", "urllib.request",
+        "urllib3", "requests", "ftplib", "smtplib", "telnetlib", "asyncio",
+        "socketserver", "xmlrpc",
+    }
+    package = importlib.import_module("agenttalk.comprehension")
+    package_dir = pathlib.Path(package.__file__).parent
+    offenders = []
+    for source_path in package_dir.rglob("*.py"):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module] if node.module else []
+            else:
+                continue
+            for name in names:
+                if name is not None and (name in banned or name.split(".")[0] in banned):
+                    offenders.append(f"{source_path.relative_to(package_dir)}: {name}")
+    assert offenders == []

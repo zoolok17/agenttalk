@@ -29,7 +29,13 @@ from pathlib import Path
 from typing import Any
 
 from ..lifecycle_lock import process_observation
-from .envelope import EnvelopeError, read_json_document, validate_rfc3339_utc
+from .envelope import (
+    EnvelopeError,
+    read_json_document,
+    resolve_under_root,
+    validate_rfc3339_utc,
+    validate_scan_id,
+)
 from .lock import ScanLockHandle, host_identity
 from .paths import staging_dir as _staging_dir
 
@@ -62,7 +68,6 @@ class StagingReclaimReport:
 
 
 def create_staging_dir(
-    comprehension_dir: Path,
     *,
     scan_id: str,
     lock_handle: ScanLockHandle,
@@ -77,14 +82,29 @@ def create_staging_dir(
     opened for ``acquire_scan_lock``) — since :func:`lock.acquire_scan_lock`
     cannot be called without a proven privacy disposition, requiring one of
     its handles here means staging creation is unreachable without that
-    same proof, with no separate parameter for a caller to forget.
+    same proof, with no separate parameter for a caller to forget. The
+    comprehension directory is DERIVED from ``lock_handle.path`` rather
+    than accepted as an independent parameter for the same reason — there
+    is then no second value that could ever disagree with the lock's own,
+    already-root-bound, root.
+
+    ``scan_id`` is validated against the closed scan-ID grammar BEFORE any
+    path is built from it, and the resulting directory is resolved and
+    confined to stay under ``.staging/`` (reviewer-1 cold-read finding 2 on
+    PR-A, rq-6cc5560b62f6, reproduced: an unvalidated
+    ``scan_id="../../../../escaped"`` previously wrote ``owner.json``
+    outside the protected project root).
     """
+    validated_scan_id = validate_scan_id(scan_id)
+    comprehension_dir = lock_handle.path.parent
     nonce = uuid.uuid4().hex[:12]
-    path = _staging_dir(comprehension_dir) / f"{scan_id}-{nonce}"
+    staging_root = _staging_dir(comprehension_dir)
+    path = resolve_under_root(
+        f"{validated_scan_id}-{nonce}", root=staging_root, label="staging directory")
     path.mkdir(parents=True, exist_ok=False, mode=0o700)
     owner_doc = {
         "schema_version": OWNER_SCHEMA_VERSION,
-        "scan_id": scan_id,
+        "scan_id": validated_scan_id,
         "owner_token": lock_handle.owner_token,
         "pid": os.getpid(),
         "host_identity": host_identity(),
@@ -94,7 +114,8 @@ def create_staging_dir(
         json.dumps(owner_doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
         encoding="utf-8",
     )
-    return StagingHandle(path=path, scan_id=scan_id, owner_token=lock_handle.owner_token)
+    return StagingHandle(
+        path=path, scan_id=validated_scan_id, owner_token=lock_handle.owner_token)
 
 
 def _validate_owner_doc(doc: Any) -> dict:

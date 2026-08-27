@@ -30,7 +30,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import socket
+import platform
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,10 +38,12 @@ from pathlib import Path
 from typing import Any
 
 from ..lifecycle_lock import ProcessIdentity, process_identity, process_observation
+from .digests import root_binding_digest
 from .envelope import EnvelopeError, read_json_document, validate_rfc3339_utc
-from .errors import ScanLockContended, ScanLockUnrecoverable
+from .errors import PrivacyProofRootMismatch, ScanLockContended, ScanLockUnrecoverable
 from .paths import lock_path as _lock_path
-from .privacy import PrivacyPreflightResult
+from .paths import project_root_from_comprehension_dir
+from .privacy import PrivacyPreflightResult, _canonical_root_spelling
 
 LOCK_SCHEMA_VERSION = 1
 _VALID_VCS_PRIVACY = ("ignored", "acknowledged_unignored", "no_vcs_acknowledged")
@@ -51,8 +53,31 @@ def host_identity() -> str:
     """The current host's identity for the lock record. A function (not a
     module-level constant) so tests can monkeypatch it to simulate a
     remote-looking / different-host lock record without touching the real
-    hostname."""
-    return socket.gethostname()
+    hostname.
+
+    Deliberately does NOT import ``socket`` (reviewer-1 cold-read finding 3
+    on PR-A, rq-6cc5560b62f6: the design's offline contract prohibits
+    network-capable imports in this package's production modules,
+    regardless of whether a specific call like ``gethostname()`` ever
+    opens a connection — the allowlist gate is a static per-import check,
+    not a per-call trust judgment). ``platform.node()`` queries the OS's
+    local hostname API directly (``uname(2)`` nodename on POSIX,
+    ``COMPUTERNAME`` on Windows) without this package importing a
+    network-capable module itself, and is stable for the lifetime of the
+    host between reboots — exactly the determinism scan.lock's cross-host
+    detection needs (same host -> same value every time this process or
+    any other reads it). The ``os.environ`` fallback only matters on the
+    rare host where the OS API itself returns nothing.
+    """
+    node = platform.node()
+    if node:
+        return node
+    env_fallback = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME")
+    if env_fallback:
+        return env_fallback
+    raise ScanLockUnrecoverable(
+        "this host's identity could not be determined (platform.node() and the "
+        "COMPUTERNAME/HOSTNAME environment variables are all empty)")
 
 
 @dataclass(frozen=True)
@@ -225,12 +250,26 @@ def acquire_scan_lock(
     — makes the precondition structural rather than procedural. The
     disposition is recorded into the lock record itself (``vcs_privacy``,
     ``work_id``) so it is durable from the very first byte written.
+
+    ``privacy`` must also be BOUND to ``comprehension_dir``'s own project
+    root — a proof obtained for a different root is rejected with
+    :class:`PrivacyProofRootMismatch` (reviewer-1 cold-read finding 1 on
+    PR-A, rq-6cc5560b62f6, reproduced: a real proof from protected root A
+    previously unlocked a write in unrelated root B, since ``isinstance``
+    was the only check performed).
     """
     if not isinstance(privacy, PrivacyPreflightResult):
         raise TypeError(
             "acquire_scan_lock() requires privacy: PrivacyPreflightResult - obtain one "
             "from privacy.run_privacy_preflight() or "
             "privacy.acknowledge_unignored_private_store(), never fabricate one")
+    project_root = project_root_from_comprehension_dir(comprehension_dir)
+    expected_binding = root_binding_digest(_canonical_root_spelling(project_root))
+    if privacy.root_binding != expected_binding:
+        raise PrivacyProofRootMismatch(
+            f"the privacy proof was issued for a different project root than "
+            f"{project_root} - a proof is only valid at the exact root it was "
+            "obtained for")
     self_identity = process_identity(os.getpid())
     if self_identity is None:
         raise ScanLockUnrecoverable(

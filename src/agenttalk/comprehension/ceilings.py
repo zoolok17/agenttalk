@@ -73,20 +73,47 @@ def measure_staging_artifacts(
     ``scan.json`` declares the measured record counts, so an unmeasured
     artifact is a producer bug, not a legitimately-empty one — a
     genuinely empty artifact still gets an explicit ``0`` entry.
+
+    A declared count that is not a non-negative ``int`` REFUSES before any
+    ceiling arithmetic runs (reviewer-1 cold-read finding 4 on PR-A,
+    rq-6cc5560b62f6, reproduced: a negative count let the per-artifact
+    total UNDERSTATE the true whole-run total, hiding an over-cap run
+    behind a declared sum that stayed within it). A symlinked staging
+    entry REFUSES rather than being measured (reviewer-1 cold-read
+    low-confidence residual on PR-A, same request: a staged symlink could
+    otherwise resolve outside the private tree and be admitted as a
+    durable published artifact) — checked with ``is_symlink()`` BEFORE
+    ``is_file()``/``stat()``, since both of those follow a symlink rather
+    than reporting on the link itself.
     """
     measurements = []
     for path in sorted(staging_dir.iterdir()):
-        if not path.is_file() or path.name in _NON_ARTIFACT_FILENAMES:
+        if path.name in _NON_ARTIFACT_FILENAMES:
+            continue
+        if path.is_symlink():
+            raise ArtifactLimitExceeded(
+                f"{path.name} is a symlink - a staged artifact must be a real file, "
+                "never a link that could resolve outside the private staging tree")
+        if not path.is_file():
             continue
         if path.name not in record_counts:
             raise ArtifactLimitExceeded(
                 f"{path.name} has no declared record count - an unmeasured artifact "
                 "cannot be admitted under this fail-closed ceiling; the producer must "
                 "declare it explicitly (even as 0), per scan.json's own contract")
+        record_count = record_counts[path.name]
+        if (
+            not isinstance(record_count, int)
+            or isinstance(record_count, bool)
+            or record_count < 0
+        ):
+            raise ArtifactLimitExceeded(
+                f"{path.name}'s declared record count must be a non-negative integer, "
+                f"got {record_count!r}")
         measurements.append(ArtifactMeasurement(
             name=path.name,
             byte_count=path.stat().st_size,
-            record_count=record_counts[path.name],
+            record_count=record_count,
         ))
     return measurements
 

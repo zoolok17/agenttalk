@@ -25,6 +25,19 @@ def comprehension_dir(agenttalk_dir: Path) -> Path:
     return agenttalk_dir / COMPREHENSION_DIRNAME
 
 
+def project_root_from_comprehension_dir(comprehension_dir: Path) -> Path:
+    """The inverse of ``comprehension_dir(agenttalk_dir)`` composed with
+    the ``root / ".agenttalk"`` convention: climbs two levels
+    (``comprehension`` then ``.agenttalk``) to recover the project root a
+    ``comprehension_dir`` implies. Used to verify a privacy proof's bound
+    root matches the root an operation is about to act on (reviewer-1
+    cold-read finding 1 on PR-A, rq-6cc5560b62f6) — if ``comprehension_dir``
+    was never actually shaped this way, the derived "root" simply won't
+    match any real proof, which is the correct (safe) failure mode.
+    """
+    return comprehension_dir.parent.parent
+
+
 def index_path(comprehension_dir: Path) -> Path:
     return comprehension_dir / INDEX_FILENAME
 

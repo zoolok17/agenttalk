@@ -29,15 +29,44 @@ exactly as the design requires for anything that cannot be proven.
 
 from __future__ import annotations
 
+import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from .digests import root_binding_digest
 from .errors import VcsPrivacyRefused
 from .paths import RELATIVE_COMPREHENSION_DIR
 
 GIT_TIMEOUT_SECONDS = 2.0
 _PROBE_RELATIVE_PATH = f"{RELATIVE_COMPREHENSION_DIR}/.privacy-probe/probe.json"
+
+#: Sentinel identity only this module's own factory functions hold —
+#: PrivacyPreflightResult.__post_init__ refuses any construction that
+#: doesn't present it (reviewer-1 cold-read finding 1 on PR-A,
+#: rq-6cc5560b62f6: "make the result non-trivially-fabricable"). This is
+#: NOT cryptographic secrecy (nothing stops code that reads this source
+#: from importing the sentinel too) - it closes the ACCIDENTAL/careless
+#: fabrication path a public frozen dataclass otherwise invites, matching
+#: the design's own trust model ("does not claim... cryptographically
+#: true") while still raising the bar past "just construct one".
+_ISSUED_BY_THIS_MODULE = object()
+
+
+def _canonical_root_spelling(root: Path) -> str:
+    """Canonicalize ``root`` for :func:`digests.root_binding_digest`:
+    resolve symlinks/`.`/`..` to an absolute path, POSIX-separated, and
+    case-folded on Windows (NTFS is case-insensitive-but-preserving, so
+    two differently-cased spellings of the same directory must bind
+    identically). Not a claim of cross-platform canonicalization beyond
+    what this in-process comparison needs — see root_binding_digest's own
+    docstring for the caveat this mirrors.
+    """
+    resolved = Path(root).resolve()
+    spelling = resolved.as_posix()
+    if os.name == "nt":
+        spelling = spelling.casefold()
+    return spelling
 
 
 @dataclass(frozen=True)
@@ -46,12 +75,34 @@ class PrivacyPreflightResult:
     "acknowledged_unignored", or "no_vcs_acknowledged"), plus the VCS kind,
     the matched ignore rule when one exists, and the work ID bound to
     either acknowledgement (``None`` for the automatic ``ignored``
-    disposition, which needs no attendance)."""
+    disposition, which needs no attendance).
+
+    ``root_binding`` (reviewer-1 cold-read finding 1 on PR-A,
+    rq-6cc5560b62f6, reproduced): a real proof obtained for one project
+    root must never unlock a write in an unrelated root. Every consumer of
+    this result (``lock.acquire_scan_lock``) MUST verify ``root_binding``
+    matches the root it is about to act on before treating the proof as
+    valid — the field is present specifically so that check is possible.
+
+    Only :func:`run_privacy_preflight` and
+    :func:`acknowledge_unignored_private_store` can construct a valid
+    instance - direct construction raises ``TypeError``.
+    """
 
     vcs_privacy: str
     vcs_kind: str
     matched_rule: str | None
     work_id: str | None
+    root_binding: str
+    _issued_by: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._issued_by is not _ISSUED_BY_THIS_MODULE:
+            raise TypeError(
+                "PrivacyPreflightResult must be obtained from "
+                "run_privacy_preflight() or acknowledge_unignored_private_store() "
+                "- it cannot be constructed directly"
+            )
 
 
 def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
@@ -142,11 +193,13 @@ def run_privacy_preflight(root: Path) -> PrivacyPreflightResult:
         )
     return PrivacyPreflightResult(
         vcs_privacy="ignored", vcs_kind="git", matched_rule=matched_rule, work_id=None,
+        root_binding=root_binding_digest(_canonical_root_spelling(root)),
+        _issued_by=_ISSUED_BY_THIS_MODULE,
     )
 
 
 def acknowledge_unignored_private_store(
-    *, vcs_kind: str, work_id: str, matched_rule: str | None = None,
+    root: Path, *, vcs_kind: str, work_id: str, matched_rule: str | None = None,
 ) -> PrivacyPreflightResult:
     """Attended-only override for a :class:`VcsPrivacyRefused` refusal.
 
@@ -160,6 +213,11 @@ def acknowledge_unignored_private_store(
     non-empty (design: "applies to one run bound to an existing work
     item... Scripts and wrappers cannot supply the acknowledgement" — an
     empty/missing work_id is exactly what an unattended caller would have).
+
+    ``root`` binds this acknowledgement to the SAME project root the
+    operator was shown and confirmed the risk for — an attended override
+    for root A must never silently cover a write in unrelated root B
+    (reviewer-1 cold-read finding 1 on PR-A, rq-6cc5560b62f6).
     """
     if not isinstance(work_id, str) or not work_id.strip():
         raise VcsPrivacyRefused(
@@ -172,4 +230,6 @@ def acknowledge_unignored_private_store(
     return PrivacyPreflightResult(
         vcs_privacy=disposition, vcs_kind=vcs_kind, matched_rule=matched_rule,
         work_id=work_id,
+        root_binding=root_binding_digest(_canonical_root_spelling(root)),
+        _issued_by=_ISSUED_BY_THIS_MODULE,
     )

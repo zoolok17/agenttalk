@@ -64,6 +64,20 @@ class VcsPrivacyRefused(ComprehensionError):
         )
 
 
+class PrivacyProofRootMismatch(ComprehensionError):
+    """A ``PrivacyPreflightResult`` proven for one project root was
+    presented at a DIFFERENT root's lock acquisition (reviewer-1 cold-read
+    finding 1 on PR-A, rq-6cc5560b62f6, reproduced: a real proof from
+    protected root A unlocked writes in unrelated root B). A proof is only
+    valid at the exact root it was issued for."""
+
+    reason_code = "comprehension_privacy_proof_root_mismatch"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(f"{self.reason_code}: {detail}")
+
+
 class ScanLockUnrecoverable(ScanLockError):
     """The recorded owner cannot be PROVEN dead (unverifiable identity, a
     process-start mismatch/PID reuse, a host mismatch, an unsupported

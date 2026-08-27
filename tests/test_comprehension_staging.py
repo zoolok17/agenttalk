@@ -5,7 +5,7 @@
 the same door reviewer-3's B-1 finding on PR-A, rq-5bd5427ad64d, opened for
 ``acquire_scan_lock``), which in turn requires a real
 ``PrivacyPreflightResult`` — so every test below acquires a REAL lock
-(via the ``comprehension_privacy``/``comprehension_privacy_root``
+(via the ``comprehension_privacy``/``comprehension_dir``
 fixtures, which run the real preflight against a real git repo) before
 creating a staging directory.
 """
@@ -20,6 +20,7 @@ import pytest
 
 from agenttalk.comprehension import lock as lockmod
 from agenttalk.comprehension import staging as stg
+from agenttalk.comprehension.envelope import EnvelopeError
 from agenttalk.comprehension.privacy import PrivacyPreflightResult
 
 
@@ -30,13 +31,12 @@ def _lock(root: Path, privacy: PrivacyPreflightResult) -> lockmod.ScanLockHandle
 # ----------------------------------------------------------- create_staging_dir
 
 def test_create_staging_dir_creates_directory_and_owner_json(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    lock = _lock(comprehension_privacy_root, comprehension_privacy)
-    handle = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     assert handle.path.is_dir()
-    assert handle.path.parent == comprehension_privacy_root / ".staging"
+    assert handle.path.parent == comprehension_dir / ".staging"
     assert handle.path.name.startswith("scan-1-")
     owner = json.loads((handle.path / "owner.json").read_text(encoding="utf-8"))
     assert owner["scan_id"] == "scan-1"
@@ -46,15 +46,31 @@ def test_create_staging_dir_creates_directory_and_owner_json(
 
 
 def test_create_staging_dir_nonces_are_unique(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    lock = _lock(comprehension_privacy_root, comprehension_privacy)
-    first = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
-    second = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    first = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
+    second = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     assert first.path != second.path
     assert first.path.exists() and second.path.exists()
+    lockmod.release_scan_lock(lock)
+
+
+def test_traversal_scan_id_is_rejected_before_any_path_is_built(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """reviewer-1 cold-read finding 2 on PR-A (rq-6cc5560b62f6), reproduced
+    as a permanent regression test: ``scan_id="../../../../escaped"``
+    previously wrote ``owner.json`` OUTSIDE the protected project root.
+    The closed scan-ID grammar must refuse it before any filesystem path
+    is even constructed, leaving zero bytes written anywhere."""
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    project_root = comprehension_dir.parent.parent
+    with pytest.raises(EnvelopeError, match="scan_id"):
+        stg.create_staging_dir(scan_id="../../../../escaped", lock_handle=lock)
+    for path in project_root.rglob("*"):
+        assert "escaped" not in path.name
+    assert not (project_root.parent / "escaped").exists()
     lockmod.release_scan_lock(lock)
 
 
@@ -76,12 +92,11 @@ def test_reclaim_on_empty_staging_dir_is_a_no_op(tmp_path: Path) -> None:
 # ----------------------------------------------------------- reclaim: live owner retained
 
 def test_reclaim_retains_a_live_owners_staging_dir(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    lock = _lock(comprehension_privacy_root, comprehension_privacy)
-    handle = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
-    report = stg.reclaim_abandoned_staging(comprehension_privacy_root)
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
+    report = stg.reclaim_abandoned_staging(comprehension_dir)
     assert report.reclaimed == []
     assert report.retained == [(handle.path.name, f"owner pid {os.getpid()} is alive")]
     assert handle.path.exists()
@@ -91,13 +106,12 @@ def test_reclaim_retains_a_live_owners_staging_dir(
 # ----------------------------------------------------------- reclaim: definitely dead
 
 def test_reclaim_removes_a_definitely_dead_owners_staging_dir(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
-    lock = _lock(comprehension_privacy_root, comprehension_privacy)
-    handle = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     monkeypatch.setattr(stg, "process_observation", lambda pid: ("dead", None))
-    report = stg.reclaim_abandoned_staging(comprehension_privacy_root)
+    report = stg.reclaim_abandoned_staging(comprehension_dir)
     assert report.reclaimed == [handle.path.name]
     assert report.retained == []
     assert not handle.path.exists()
@@ -105,13 +119,11 @@ def test_reclaim_removes_a_definitely_dead_owners_staging_dir(
 
 
 def test_reclaim_removes_only_the_dead_ones_among_several(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
-    lock = _lock(comprehension_privacy_root, comprehension_privacy)
-    dead = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-dead", lock_handle=lock)
-    alive = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-alive", lock_handle=lock)
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    dead = stg.create_staging_dir(scan_id="scan-dead", lock_handle=lock)
+    alive = stg.create_staging_dir(scan_id="scan-alive", lock_handle=lock)
 
     # Both fixtures recorded THIS test process's real (alive) pid at
     # creation time; give "dead" a distinct, guaranteed-fake pid so the two
@@ -126,7 +138,7 @@ def test_reclaim_removes_only_the_dead_ones_among_several(
         lambda pid: ("dead", None) if pid == 999999 else ("alive", None),
     )
 
-    report = stg.reclaim_abandoned_staging(comprehension_privacy_root)
+    report = stg.reclaim_abandoned_staging(comprehension_dir)
     assert report.reclaimed == [dead.path.name]
     assert not dead.path.exists()
     assert alive.path.exists()
@@ -158,14 +170,13 @@ def test_reclaim_retains_a_directory_with_malformed_owner_json(tmp_path: Path) -
 
 
 def test_reclaim_retains_a_directory_recorded_on_a_different_host(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
-    lock = _lock(comprehension_privacy_root, comprehension_privacy)
+    lock = _lock(comprehension_dir, comprehension_privacy)
     monkeypatch.setattr(stg, "host_identity", lambda: "host-a")
-    handle = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     monkeypatch.setattr(stg, "host_identity", lambda: "host-b")
-    report = stg.reclaim_abandoned_staging(comprehension_privacy_root)
+    report = stg.reclaim_abandoned_staging(comprehension_dir)
     assert report.reclaimed == []
     assert "different host" in report.retained[0][1]
     assert handle.path.exists()
@@ -173,13 +184,12 @@ def test_reclaim_retains_a_directory_recorded_on_a_different_host(
 
 
 def test_reclaim_retains_a_directory_with_unknown_liveness(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
-    lock = _lock(comprehension_privacy_root, comprehension_privacy)
-    handle = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     monkeypatch.setattr(stg, "process_observation", lambda pid: ("unknown", None))
-    report = stg.reclaim_abandoned_staging(comprehension_privacy_root)
+    report = stg.reclaim_abandoned_staging(comprehension_dir)
     assert report.reclaimed == []
     assert "could not be observed" in report.retained[0][1]
     assert handle.path.exists()
@@ -196,19 +206,18 @@ def test_reclaim_retains_a_non_directory_entry(tmp_path: Path) -> None:
 
 
 def test_reclaim_never_touches_runs(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
     """Reclaim is scoped to .staging/ only — a same-named directory under
     runs/ (published, immutable project memory) must never be inspected or
     removed."""
-    runs_scan_dir = comprehension_privacy_root / "runs" / "scan-1-abcdef"
+    runs_scan_dir = comprehension_dir / "runs" / "scan-1-abcdef"
     runs_scan_dir.mkdir(parents=True)
     (runs_scan_dir / "scan.json").write_text("{}", encoding="utf-8")
-    lock = _lock(comprehension_privacy_root, comprehension_privacy)
-    handle = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     monkeypatch.setattr(stg, "process_observation", lambda pid: ("dead", None))
-    stg.reclaim_abandoned_staging(comprehension_privacy_root)
+    stg.reclaim_abandoned_staging(comprehension_dir)
     assert not handle.path.exists()
     assert runs_scan_dir.exists()
     assert (runs_scan_dir / "scan.json").exists()
@@ -241,13 +250,12 @@ def test_reclaim_retains_an_entry_that_resolves_outside_staging(tmp_path: Path) 
 # ----------------------------------------------------------- prune_staging
 
 def test_prune_staging_delegates_to_the_same_reclaim_logic(
-    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
-    lock = _lock(comprehension_privacy_root, comprehension_privacy)
-    handle = stg.create_staging_dir(
-        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    lock = _lock(comprehension_dir, comprehension_privacy)
+    handle = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     monkeypatch.setattr(stg, "process_observation", lambda pid: ("dead", None))
-    report = stg.prune_staging(comprehension_privacy_root)
+    report = stg.prune_staging(comprehension_dir)
     assert report.reclaimed == [handle.path.name]
     assert not handle.path.exists()
     lockmod.release_scan_lock(lock)

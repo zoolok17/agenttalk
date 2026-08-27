@@ -26,6 +26,18 @@ _RFC3339_UTC = re.compile(
 _URL_SCHEME = re.compile(r"\A[A-Za-z][A-Za-z0-9+.-]*://")
 _WINDOWS_DRIVE = re.compile(r"\A[A-Za-z]:")
 _REQUIRED_ENVELOPE_FIELDS = ("schema_version", "artifact_type", "scan_id", "generated_at")
+#: A closed, path-traversal-proof grammar: starts with an alphanumeric,
+#: then any mix of alphanumerics/dash/underscore, 1-128 chars. No '.',
+#: '/', '\\', whitespace, or control characters are POSSIBLE at all — this
+#: is a path-traversal defense, not merely a format check (reviewer-1
+#: cold-read finding 2 on PR-A, rq-6cc5560b62f6, reproduced:
+#: scan_id="../../../../escaped" wrote a staging owner.json OUTSIDE the
+#: protected root, because scan_id was interpolated into a path
+#: unvalidated). The design's own example format
+#: ("20260826T091530Z-a1b2c3d4") fits this grammar; it is intentionally
+#: looser than that exact shape so it does not also encode a producer
+#: policy decision that belongs to PR-B/C.
+_SCAN_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
 def _reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -114,11 +126,23 @@ def validate_envelope(doc: Any, *, artifact_type: str, schema_version: int) -> d
         raise EnvelopeError(
             f"schema_version {got_version} is older than {schema_version}; no reader "
             f"migration is registered for {artifact_type!r}")
-    scan_id = doc["scan_id"]
-    if not isinstance(scan_id, str) or not scan_id:
-        raise EnvelopeError("scan_id must be a non-empty string")
+    validate_scan_id(doc["scan_id"], label="scan_id")
     validate_rfc3339_utc(doc["generated_at"], label="generated_at")
     return doc
+
+
+def validate_scan_id(value: Any, *, label: str = "scan_id") -> str:
+    """Validate ``value`` against the closed scan-ID grammar. MUST run
+    BEFORE any filesystem path is constructed from a scan_id (design's
+    ``runs/<scan-id>/`` and ``.staging/<scan-id>-<nonce>/`` paths) — see
+    the ``_SCAN_ID`` module comment for why this is a security boundary,
+    not just a format check.
+    """
+    if not isinstance(value, str) or not _SCAN_ID.match(value):
+        raise EnvelopeError(
+            f"{label} must match {_SCAN_ID.pattern} (alphanumeric, dash, or "
+            f"underscore only) — got {value!r}")
+    return value
 
 
 def validate_relative_path(value: Any, *, label: str = "path") -> str:

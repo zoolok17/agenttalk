@@ -135,30 +135,40 @@ def test_refuses_with_no_vcs_kind_when_there_is_no_git_repo(tmp_path: Path) -> N
 
 # ----------------------------------------------------------- acknowledge_unignored_private_store
 
-def test_acknowledge_records_acknowledged_unignored_for_git() -> None:
+def test_acknowledge_records_acknowledged_unignored_for_git(tmp_path: Path) -> None:
     result = privacy.acknowledge_unignored_private_store(
-        vcs_kind="git", work_id="migrate-checkout")
+        tmp_path, vcs_kind="git", work_id="migrate-checkout")
     assert result.vcs_privacy == "acknowledged_unignored"
     assert result.work_id == "migrate-checkout"
 
 
-def test_acknowledge_records_no_vcs_acknowledged_for_no_vcs() -> None:
-    result = privacy.acknowledge_unignored_private_store(vcs_kind="none", work_id="w1")
+def test_acknowledge_records_no_vcs_acknowledged_for_no_vcs(tmp_path: Path) -> None:
+    result = privacy.acknowledge_unignored_private_store(tmp_path, vcs_kind="none", work_id="w1")
     assert result.vcs_privacy == "no_vcs_acknowledged"
 
 
 @pytest.mark.parametrize("work_id", ["", "   ", None])
-def test_acknowledge_requires_a_non_empty_work_id(work_id) -> None:
+def test_acknowledge_requires_a_non_empty_work_id(tmp_path: Path, work_id) -> None:
     with pytest.raises(VcsPrivacyRefused, match="work_id"):
-        privacy.acknowledge_unignored_private_store(vcs_kind="git", work_id=work_id)
+        privacy.acknowledge_unignored_private_store(tmp_path, vcs_kind="git", work_id=work_id)
 
 
-def test_acknowledge_rejects_an_unsupported_vcs_kind() -> None:
+def test_acknowledge_rejects_an_unsupported_vcs_kind(tmp_path: Path) -> None:
     with pytest.raises(VcsPrivacyRefused, match="unsupported"):
-        privacy.acknowledge_unignored_private_store(vcs_kind="svn", work_id="w1")
+        privacy.acknowledge_unignored_private_store(tmp_path, vcs_kind="svn", work_id="w1")
 
 
-def test_acknowledge_carries_through_the_matched_rule_when_provided() -> None:
+def test_acknowledge_carries_through_the_matched_rule_when_provided(tmp_path: Path) -> None:
     result = privacy.acknowledge_unignored_private_store(
-        vcs_kind="git", work_id="w1", matched_rule=".gitignore:1:build/")
+        tmp_path, vcs_kind="git", work_id="w1", matched_rule=".gitignore:1:build/")
     assert result.matched_rule == ".gitignore:1:build/"
+
+
+def test_direct_construction_of_preflight_result_is_rejected() -> None:
+    """reviewer-1 cold-read finding 1 on PR-A, rq-6cc5560b62f6: the dataclass
+    must not be publicly constructible despite its docstring claim."""
+    with pytest.raises(TypeError):
+        privacy.PrivacyPreflightResult(
+            vcs_privacy="ignored", vcs_kind="git", matched_rule=None, work_id=None,
+            root_binding="deadbeef",
+        )
