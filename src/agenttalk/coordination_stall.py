@@ -419,8 +419,17 @@ def build_snapshot(
     supervisor_config: dict | None = None,
     supervisor_state: dict | None = None,
     process_snapshot: list[dict] | None = None,
+    valid_messages: list | None = None,
 ) -> dict:
-    """Build one read-only, fail-safe coordination snapshot."""
+    """Build one read-only, fail-safe coordination snapshot.
+
+    ``valid_messages``, when given, is a caller-supplied
+    ``store.valid_messages()`` result — skips this function's own call so
+    a caller that already computed one (e.g. `agenttalk status`) doesn't
+    pay for a second full store scan (#184). Tier 3
+    (``supervisor.build_report``'s own internal message reads) is
+    unchanged/out of scope for this fix.
+    """
     now = time.time() if now_epoch is None else float(now_epoch)
     config = supervisor_config if isinstance(supervisor_config, dict) else _load_supervisor_config(store)
     state = supervisor_state if isinstance(supervisor_state, dict) else _load_supervisor_state(store)
@@ -438,7 +447,7 @@ def build_snapshot(
             now_epoch=now,
             snapshot=process_snapshot,
         )
-        messages = store.valid_messages()
+        messages = valid_messages if valid_messages is not None else store.valid_messages()
         report_agents = report.get("agents") if isinstance(report.get("agents"), dict) else {}
         edges, diagnostics = _wait_edges(
             store,

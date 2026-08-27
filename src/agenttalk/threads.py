@@ -558,6 +558,26 @@ def _derive_broadcast(
     )
 
 
+def group_messages_by_request_id(messages: list[Message]) -> dict[str, list[Message]]:
+    """Group ``messages`` by ``meta.request_id``, each group sorted by id.
+
+    Messages without a request_id are untracked by design (you can't
+    correlate what was never tagged). This grouping is agent-INDEPENDENT —
+    ``derive_threads`` used to redo it fresh on every call, which is
+    wasteful for a caller deriving threads for every roster agent in a
+    loop (#184); compute it once and pass it to every call via
+    ``derive_threads(..., grouped=...)`` instead.
+    """
+    groups: dict[str, list[Message]] = {}
+    for m in messages:
+        rid = (m.meta or {}).get("request_id")
+        if isinstance(rid, str) and rid:
+            groups.setdefault(rid, []).append(m)
+    for group in groups.values():
+        group.sort(key=lambda m: m.id)
+    return groups
+
+
 def derive_threads(
     messages: list[Message],
     *,
@@ -566,6 +586,7 @@ def derive_threads(
     now: datetime | None = None,
     closed_rids: set[str] | None = None,
     retired: set[str] | None = None,
+    grouped: dict[str, list[Message]] | None = None,
 ) -> list[Thread]:
     """Return one :class:`Thread` per correlated request_id involving ``agent``.
 
@@ -577,23 +598,22 @@ def derive_threads(
     manual escape hatch for off-contract / already-handled threads.
     Threads where ``agent`` is neither the opener's sender nor recipient
     are omitted.
+
+    ``grouped``, when given, is a caller-supplied
+    ``group_messages_by_request_id(messages)`` result — skips this
+    function's own (agent-independent) grouping pass. Must be grouped from
+    the SAME ``messages`` list; passing a mismatched grouping silently
+    derives threads from the wrong message set.
     """
     now = now or datetime.now(timezone.utc)
     cursor = cursor or ""
     closed_rids = closed_rids or set()
     retired = retired or set()
 
-    # Group by correlation id. Messages without a request_id are
-    # untracked by design (you can't correlate what was never tagged).
-    groups: dict[str, list[Message]] = {}
-    for m in messages:
-        rid = (m.meta or {}).get("request_id")
-        if isinstance(rid, str) and rid:
-            groups.setdefault(rid, []).append(m)
+    groups = grouped if grouped is not None else group_messages_by_request_id(messages)
 
     threads: list[Thread] = []
     for rid, group in groups.items():
-        group.sort(key=lambda m: m.id)
         # Broadcast (multi-party) thread: question copies carrying a
         # broadcast_id. Gate PRECISELY — `agenttalk broadcast` only ever
         # fans out questions (message/note broadcasts aren't openers) and
