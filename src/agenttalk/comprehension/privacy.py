@@ -30,7 +30,7 @@ exactly as the design requires for anything that cannot be proven.
 from __future__ import annotations
 
 import os
-import subprocess
+import subprocess  # nosec B404 - invokes the real git binary for the VCS ignore proof; no shell, no untrusted input
 from dataclasses import dataclass, field
 from pathlib import Path
 
