@@ -1,9 +1,9 @@
 """#55 slice-1 PR-A: .staging/<scan-id>-<nonce>/ + owner.json reclaim/prune
 (DESIGN-55-comprehension-plane.md, "Local storage model").
 
-``create_staging_dir`` now requires a real ``lock.ScanLockHandle``
-(reviewer-3 B-1 on PR-A, rq-5bd5427ad64d: "make it lock-derived so the
-lock is the only door"), which in turn requires a real
+``create_staging_dir`` now requires a real ``lock.ScanLockHandle`` (closing
+the same door reviewer-3's B-1 finding on PR-A, rq-5bd5427ad64d, opened for
+``acquire_scan_lock``), which in turn requires a real
 ``PrivacyPreflightResult`` — so every test below acquires a REAL lock
 (via the ``comprehension_privacy``/``comprehension_privacy_root``
 fixtures, which run the real preflight against a real git repo) before

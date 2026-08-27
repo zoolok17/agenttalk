@@ -46,7 +46,8 @@ def test_acquire_then_release_round_trips(
 def test_acquire_records_the_privacy_disposition_into_the_lock(
     comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    """design (as amended by reviewer-3 B-1): the vcs_privacy disposition
+    """Per the design's requirement that the disposition be recorded
+    (reviewer-3 B-1 on PR-A, rq-5bd5427ad64d): the vcs_privacy disposition
     must be durable from the first byte written, not only reachable later
     via scan.json."""
     handle = lockmod.acquire_scan_lock(

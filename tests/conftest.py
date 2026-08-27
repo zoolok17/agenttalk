@@ -33,11 +33,11 @@ def comprehension_privacy_root(tmp_path: Path) -> Path:
     """A real git repo with ``.agenttalk/`` gitignored — for #55 comprehension
     tests that need ``run_privacy_preflight`` to genuinely succeed.
 
-    reviewer-3's B-1 finding on PR-A (rq-5bd5427ad64d): the privacy
-    preflight must be a real PRECONDITION, proven against a real git
-    fixture — "do NOT add a permissive test-only constructor; tests
-    should run the real preflight against their git fixtures." This
-    fixture sets up the git state; it does not fabricate a result.
+    reviewer-3's B-1 finding on PR-A (rq-5bd5427ad64d) required the
+    privacy preflight to be a real PRECONDITION, proven against a real
+    git fixture, with no permissive test-only constructor standing in for
+    it. This fixture sets up the git state; it does not fabricate a
+    result.
     """
     if shutil.which("git") is None:
         pytest.skip("git is required for comprehension privacy fixtures")

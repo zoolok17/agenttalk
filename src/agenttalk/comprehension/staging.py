@@ -73,11 +73,11 @@ def create_staging_dir(
     reclaim pass can prove which lock holder — dead or alive — created it.
 
     Takes the FULL ``lock_handle`` rather than a bare ``owner_token: str``
-    (reviewer-3 B-1 on PR-A, rq-5bd5427ad64d: "make it lock-derived so the
-    lock is the only door") — since :func:`lock.acquire_scan_lock` cannot
-    be called without a proven privacy disposition, requiring one of its
-    handles here means staging creation is unreachable without that same
-    proof, with no separate parameter for a caller to forget.
+    (closing the same door reviewer-3's B-1 finding on PR-A, rq-5bd5427ad64d,
+    opened for ``acquire_scan_lock``) — since :func:`lock.acquire_scan_lock`
+    cannot be called without a proven privacy disposition, requiring one of
+    its handles here means staging creation is unreachable without that
+    same proof, with no separate parameter for a caller to forget.
     """
     nonce = uuid.uuid4().hex[:12]
     path = _staging_dir(comprehension_dir) / f"{scan_id}-{nonce}"
