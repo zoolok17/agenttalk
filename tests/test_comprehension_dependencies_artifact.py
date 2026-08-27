@@ -161,13 +161,21 @@ def test_route_edge_resolves_as_external_with_declared_evidence():
 # ----------------------------------------------------------- build (pom.xml, non-java from-path)
 
 def test_build_edges_from_pom_xml_are_attributed_to_the_pom_file():
+    """Dead-parameter removal (reviewer-3, PR-B delta review round 2):
+    build_dependencies used to take a separate build_edges_by_path
+    parameter for this case; since B-3 routed pom.xml through the
+    sanitized worker (worker.process_paths dispatches it into the SAME
+    java_results channel every other adapter claim uses, wrapped as a
+    JavaFileResult with only edges populated), this test now exercises
+    that exact production shape instead of a bespoke parameter."""
     pom_edges = java_adapter.parse_maven_pom(
         "pom.xml",
         "<project><dependencies><dependency>"
         "<groupId>org.springframework</groupId><artifactId>spring-core</artifactId>"
         "</dependency></dependencies></project>",
     )
-    records = da.build_dependencies({}, build_edges_by_path={"pom.xml": pom_edges})
+    results = {"pom.xml": java_adapter.JavaFileResult(edges=pom_edges)}
+    records = da.build_dependencies(results)
     assert len(records) == 1
     assert records[0].relation == "build"
     assert records[0].target_external == "org.springframework:spring-core"

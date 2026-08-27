@@ -156,13 +156,23 @@ def _producer(*, name: str, version: int, rule_version: int, source_digest: str 
 
 def build_dependencies(
     java_results: dict[str, java_adapter.JavaFileResult],
-    build_edges_by_path: dict[str, list[java_adapter.JavaEdgeClaim]] | None = None,
 ) -> list[DependencyRecord]:
-    """``build_edges_by_path`` carries edges from non-``.java`` producers
-    (e.g. :func:`adapters.java.parse_maven_pom`'s ``pom.xml`` dependency
-    edges) keyed by the FROM path (the pom.xml itself, not a Java
-    unit) - these are always ``target_kind: external`` and never need the
-    cross-file registry below.
+    """``java_results`` carries every producer's claims uniformly, keyed
+    by relative path - including a ``pom.xml``'s ``build`` edges (B-3,
+    reviewer-3 PR-B delta review round 1: routed through the sanitized
+    worker's ``process_paths`` on the same already-read bytes, the same
+    way every other adapter claim is). A pom.xml's ``JavaFileResult`` has
+    empty ``units`` and just its ``edges`` populated - these are always
+    ``target_kind: external`` and never need the cross-file registry
+    below, but fall out of the same loop naturally since nothing here
+    depends on the producing file being a ``.java`` source.
+
+    (dead-parameter removal, reviewer-3 PR-B delta review round 2: this
+    function previously took a second, separate ``build_edges_by_path``
+    parameter for exactly this pom.xml case, from when scan_pipeline.py
+    read pom.xml directly in the parent process; once B-3 routed it
+    through the worker instead, that parameter had no production caller
+    left.)
     """
     by_qualified_name, by_simple_name, file_unit_id_by_path = _build_registry(java_results)
     records: list[DependencyRecord] = []
@@ -183,18 +193,6 @@ def build_dependencies(
                 by_qualified_name=by_qualified_name, by_simple_name=by_simple_name,
             )
             records.append(record)
-
-    for path, edges in (build_edges_by_path or {}).items():
-        from_unit_id = digests.unit_id(kind="file", paths=[path], qualified_name=None)
-        for edge in edges:
-            if edge.relation not in CLOSED_RELATIONS:
-                raise UnsupportedRelationClaimed(
-                    f"{java_adapter.ADAPTER_NAME} claimed unsupported relation "
-                    f"{edge.relation!r} for {path}")
-            records.append(_edge_claim_to_record(
-                edge, from_unit_id=from_unit_id, source_digest=None,
-                by_qualified_name=by_qualified_name, by_simple_name=by_simple_name,
-            ))
 
     return records
 
