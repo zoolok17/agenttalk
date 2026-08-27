@@ -31,6 +31,12 @@ GENERATION_IDENTITY_KEYS = frozenset({
 })
 
 _ROOT_BINDING_DOMAIN = b"agenttalk.comprehension.root_binding.v1\x00"
+_UNIT_ID_DOMAIN = b"agenttalk.comprehension.unit_id.v1\x00"
+_EDGE_ID_DOMAIN = b"agenttalk.comprehension.edge_id.v1\x00"
+_ENTRY_POINT_ID_DOMAIN = b"agenttalk.comprehension.entry_point_id.v1\x00"
+_FEATURE_ID_DOMAIN = b"agenttalk.comprehension.feature_id.v1\x00"
+_SIGNAL_ID_DOMAIN = b"agenttalk.comprehension.signal_id.v1\x00"
+_CONFLICT_ID_DOMAIN = b"agenttalk.comprehension.conflict_id.v1\x00"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -99,6 +105,64 @@ def run_content_digest(artifacts: list[dict]) -> str:
         for a in artifacts
     ]
     return sha256_bytes(canonical_json_bytes(tuples))
+
+
+def _domain_separated_id(domain: bytes, payload: Any) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(domain)
+    hasher.update(canonical_json_bytes(payload))
+    return hasher.hexdigest()
+
+
+def unit_id(*, kind: str, paths: list[str], qualified_name: str | None) -> str:
+    """DESIGN-55-comprehension-plane.md, Artifact 1: "Deterministic SHA-256
+    ID over unit kind, normalized path, and qualified name." ``paths`` is
+    sorted here so caller ordering never perturbs the ID."""
+    return _domain_separated_id(
+        _UNIT_ID_DOMAIN,
+        {"kind": kind, "paths": sorted(paths), "qualified_name": qualified_name},
+    )
+
+
+def edge_id(*, from_unit_id: str, relation: str, target: str, phase: str) -> str:
+    """DESIGN-55-comprehension-plane.md, Artifact 2: "a deterministic
+    edge_id and from_unit_id"."""
+    return _domain_separated_id(
+        _EDGE_ID_DOMAIN,
+        {"from_unit_id": from_unit_id, "relation": relation, "target": target, "phase": phase},
+    )
+
+
+def entry_point_id(*, kind: str, owning_unit_id: str, name: str) -> str:
+    return _domain_separated_id(
+        _ENTRY_POINT_ID_DOMAIN,
+        {"kind": kind, "owning_unit_id": owning_unit_id, "name": name},
+    )
+
+
+def feature_id(*, label: str, unit_ids: list[str]) -> str:
+    return _domain_separated_id(
+        _FEATURE_ID_DOMAIN, {"label": label, "unit_ids": sorted(unit_ids)},
+    )
+
+
+def signal_id(*, unit_id: str, check: str, policy_version: int) -> str:
+    """DESIGN-55-comprehension-plane.md, Artifact 4: "Stable ID for unit,
+    check, and policy version.\""""
+    return _domain_separated_id(
+        _SIGNAL_ID_DOMAIN,
+        {"unit_id": unit_id, "check": check, "policy_version": policy_version},
+    )
+
+
+def conflict_id(*, conflict_kind: str, anchor: str, claim_digests: list[str]) -> str:
+    """DESIGN-55-comprehension-plane.md, "Fact provenance and canonical
+    merge": "the SHA-256 of the conflict kind, normalized anchor, and
+    sorted canonical claim digests, with generation identity removed.\""""
+    return _domain_separated_id(
+        _CONFLICT_ID_DOMAIN,
+        {"conflict_kind": conflict_kind, "anchor": anchor, "claim_digests": sorted(claim_digests)},
+    )
 
 
 def root_binding_digest(resolved_root_spelling: str) -> str:

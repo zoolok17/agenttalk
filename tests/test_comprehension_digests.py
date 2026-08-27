@@ -151,3 +151,54 @@ def test_root_binding_digest_never_leaks_the_input_verbatim() -> None:
     digest = dg.root_binding_digest("/home/dev/super-secret-project-name")
     assert "super-secret-project-name" not in digest
     assert len(digest) == 64  # hex-encoded sha256
+
+
+# ----------------------------------------------------------- deterministic record IDs
+
+def test_unit_id_is_deterministic_and_path_order_independent() -> None:
+    a = dg.unit_id(kind="file", paths=["b.java", "a.java"], qualified_name=None)
+    b = dg.unit_id(kind="file", paths=["a.java", "b.java"], qualified_name=None)
+    assert a == b
+
+
+def test_unit_id_differs_by_kind_path_or_qualified_name() -> None:
+    base = dg.unit_id(kind="file", paths=["a.java"], qualified_name=None)
+    assert base != dg.unit_id(kind="component", paths=["a.java"], qualified_name=None)
+    assert base != dg.unit_id(kind="file", paths=["b.java"], qualified_name=None)
+    assert base != dg.unit_id(kind="file", paths=["a.java"], qualified_name="p.A")
+
+
+def test_edge_id_is_deterministic() -> None:
+    a = dg.edge_id(from_unit_id="u1", relation="import", target="java.util.List", phase="runtime")
+    b = dg.edge_id(from_unit_id="u1", relation="import", target="java.util.List", phase="runtime")
+    assert a == b
+
+
+def test_edge_id_differs_by_relation() -> None:
+    a = dg.edge_id(from_unit_id="u1", relation="import", target="x", phase="runtime")
+    b = dg.edge_id(from_unit_id="u1", relation="invoke", target="x", phase="runtime")
+    assert a != b
+
+
+def test_entry_point_id_is_deterministic() -> None:
+    a = dg.entry_point_id(kind="cli_main", owning_unit_id="u1", name="main")
+    b = dg.entry_point_id(kind="cli_main", owning_unit_id="u1", name="main")
+    assert a == b
+
+
+def test_feature_id_is_unit_order_independent() -> None:
+    a = dg.feature_id(label="checkout", unit_ids=["u2", "u1"])
+    b = dg.feature_id(label="checkout", unit_ids=["u1", "u2"])
+    assert a == b
+
+
+def test_signal_id_differs_by_policy_version() -> None:
+    a = dg.signal_id(unit_id="u1", check="deps_resolved", policy_version=1)
+    b = dg.signal_id(unit_id="u1", check="deps_resolved", policy_version=2)
+    assert a != b
+
+
+def test_conflict_id_is_claim_order_independent() -> None:
+    a = dg.conflict_id(conflict_kind="unit_kind", anchor="p.Foo", claim_digests=["d2", "d1"])
+    b = dg.conflict_id(conflict_kind="unit_kind", anchor="p.Foo", claim_digests=["d1", "d2"])
+    assert a == b
