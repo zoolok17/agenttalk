@@ -417,6 +417,18 @@ def test_comprehension_package_imports_no_socket_or_network_module() -> None:
     imports anywhere in ``agenttalk.comprehension`` — a static per-file
     import scan, closing the CHANNEL (the whole package), not merely the
     one ``lock.py`` instance the reviewer reproduced against.
+
+    ``platform`` is banned here too (PR-B item 2, lead's follow-on after
+    the item-2 checkpoint): empirically confirmed TWICE now — once fixing
+    ``lock.host_identity()``, once independently in
+    ``discovery.detect_platform_identity()`` — that
+    ``platform.node()``/``platform.machine()``/``platform.system()`` ALL
+    transitively import and use ``socket`` on Windows (CPython's
+    ``platform.uname()`` builds the whole tuple, node/hostname included,
+    as one cached unit even when only one other field is read). Banning
+    the whole module here closes the CLASS so a third call site can never
+    reopen it silently; this package's socket-free platform/architecture
+    detection lives in ``ctypes``/``os.uname()`` instead.
     """
     import ast
     import importlib
@@ -425,7 +437,7 @@ def test_comprehension_package_imports_no_socket_or_network_module() -> None:
     banned = {
         "socket", "ssl", "http", "http.client", "urllib", "urllib.request",
         "urllib3", "requests", "ftplib", "smtplib", "telnetlib", "asyncio",
-        "socketserver", "xmlrpc",
+        "socketserver", "xmlrpc", "platform",
     }
     package = importlib.import_module("agenttalk.comprehension")
     package_dir = pathlib.Path(package.__file__).parent
