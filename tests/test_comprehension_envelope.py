@@ -208,6 +208,17 @@ def test_resolve_under_root_rejects_a_path_that_escapes_via_symlink(tmp_path: Pa
     try:
         link.symlink_to(outside, target_is_directory=True)
     except (OSError, NotImplementedError):
+        # CAVEAT (reviewer-3 F-3 on PR-A, rq-5bd5427ad64d): on Windows, an
+        # unprivileged process can only create a symlink with Developer
+        # Mode enabled (or SeCreateSymbolicLinkPrivilege granted) — without
+        # it, symlink_to() raises OSError [WinError 1314] and this test
+        # SKIPS. The design lists symlink/root-escape as required increment-1
+        # evidence and treats Windows as a first-class platform, so on a
+        # default (non-Developer-Mode) Windows runner this specific evidence
+        # is UNVERIFIED, not merely "covered elsewhere" — a green run here
+        # does not by itself demonstrate this guard on Windows. Tracked as a
+        # fast-follow: run CI's Windows job with Developer Mode (or an
+        # elevated runner) so this executes instead of skipping.
         pytest.skip("symlink creation is not permitted in this environment")
     with pytest.raises(EnvelopeError, match="outside the project root"):
         env.resolve_under_root("escape/x", root=root)

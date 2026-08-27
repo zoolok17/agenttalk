@@ -10,6 +10,10 @@ a new bus kind, and it does not touch ``cli.py`` (that module's
 ``cmd_escalate`` is deeply argparse-Namespace-coupled; this module builds
 the same wire shape directly against a ``Store`` instead, the same way
 ``wrapper/obligations.py`` already does for its own internal escalation).
+Routing mirrors ``cmd_escalate`` too, not only its wire shape (reviewer-3
+F-2 on PR-A, rq-5bd5427ad64d): the lead-chat-identities branch is
+replicated so a lead-chat lead's escalation routes identically here as it
+would through the CLI.
 
 No CLI exists in PR-A yet — ``--recover-stale-lock`` and
 ``--acknowledge-unignored-private-store`` are PR-B's flags, and proving an
@@ -54,11 +58,26 @@ class EscalationResult:
 
 
 def _resolve_liaison(store: Any, *, sender: str) -> str:
-    target: str | None = None
+    """Mirrors ``cli.cmd_escalate``'s ROUTING exactly, not just its wire
+    shape (reviewer-3 F-2 on PR-A, rq-5bd5427ad64d): first consult
+    ``lead_chat_identities()`` and, when ``sender`` IS the lead-chat lead,
+    route to the reserved operator identity for that dashboard chat
+    project rather than the ordinary operator-facing liaison — otherwise
+    an escalation raised by a lead-chat lead would route differently (or
+    refuse) compared to ``cmd_escalate`` in the exact same configuration.
+    """
     try:
-        target = store.operator_facing()
-    except Exception:  # noqa: BLE001 - a corrupt roster must not crash the escalation path
-        target = None
+        operator_identity, lead_chat_lead = store.lead_chat_identities()
+    except Exception:  # noqa: BLE001 - lead-chat not configured is the common case
+        operator_identity, lead_chat_lead = None, None
+    target: str | None
+    if sender == lead_chat_lead:
+        target = operator_identity
+    else:
+        try:
+            target = store.operator_facing()
+        except Exception:  # noqa: BLE001 - a corrupt roster must not crash the escalation path
+            target = None
     if not target or target == sender:
         lead: str | None = None
         try:

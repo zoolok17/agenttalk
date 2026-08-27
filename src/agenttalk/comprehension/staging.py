@@ -30,7 +30,7 @@ from typing import Any
 
 from ..lifecycle_lock import process_observation
 from .envelope import EnvelopeError, read_json_document, validate_rfc3339_utc
-from .lock import host_identity
+from .lock import ScanLockHandle, host_identity
 from .paths import staging_dir as _staging_dir
 
 OWNER_SCHEMA_VERSION = 1
@@ -65,20 +65,27 @@ def create_staging_dir(
     comprehension_dir: Path,
     *,
     scan_id: str,
-    owner_token: str,
+    lock_handle: ScanLockHandle,
     now: datetime | None = None,
 ) -> StagingHandle:
     """Create ``.staging/<scan_id>-<nonce>/`` and its ``owner.json``,
-    repeating ``owner_token`` (the acquiring scan.lock's token, per the
-    design) so a later reclaim pass can prove which lock holder — dead or
-    alive — created it."""
+    repeating ``lock_handle.owner_token`` (per the design) so a later
+    reclaim pass can prove which lock holder — dead or alive — created it.
+
+    Takes the FULL ``lock_handle`` rather than a bare ``owner_token: str``
+    (reviewer-3 B-1 on PR-A, rq-5bd5427ad64d: "make it lock-derived so the
+    lock is the only door") — since :func:`lock.acquire_scan_lock` cannot
+    be called without a proven privacy disposition, requiring one of its
+    handles here means staging creation is unreachable without that same
+    proof, with no separate parameter for a caller to forget.
+    """
     nonce = uuid.uuid4().hex[:12]
     path = _staging_dir(comprehension_dir) / f"{scan_id}-{nonce}"
     path.mkdir(parents=True, exist_ok=False, mode=0o700)
     owner_doc = {
         "schema_version": OWNER_SCHEMA_VERSION,
         "scan_id": scan_id,
-        "owner_token": owner_token,
+        "owner_token": lock_handle.owner_token,
         "pid": os.getpid(),
         "host_identity": host_identity(),
         "created_at": _utc_now_iso(now),
@@ -87,7 +94,7 @@ def create_staging_dir(
         json.dumps(owner_doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
         encoding="utf-8",
     )
-    return StagingHandle(path=path, scan_id=scan_id, owner_token=owner_token)
+    return StagingHandle(path=path, scan_id=scan_id, owner_token=lock_handle.owner_token)
 
 
 def _validate_owner_doc(doc: Any) -> dict:

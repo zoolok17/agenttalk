@@ -89,14 +89,58 @@ def test_escalate_raises_when_nothing_is_resolvable(tmp_path: Path) -> None:
 
 
 def test_escalate_raises_when_sender_is_the_only_candidate(tmp_path: Path) -> None:
-    """The sender IS the liaison/lead — escalating to yourself is not a
-    real escalation."""
+    """The sender IS the liaison, with no distinct lead-chat operator
+    identity resolvable either — escalating to yourself is not a real
+    escalation. (Whenever lead_chat_identities() DOES resolve, sender ==
+    operator_facing() routes to the distinct reserved "operator" principal
+    instead — see the F-2 lead-chat routing tests above; this test breaks
+    that resolution deliberately, via an unset operator_identity, to reach
+    the genuine no-candidate case.)"""
     store = _make_store(tmp_path)
     store.set_operator_facing("alpha")
+    cfg = store.load_config()
+    # Deliberately invalid (must equal avatars.OPERATOR_PRINCIPAL) so
+    # lead_chat_identities() raises instead of resolving a distinct
+    # "operator" target — config.json backfills a MISSING operator_identity
+    # automatically, so an explicit bad value (not a pop) is what's needed
+    # to break the resolution here.
+    cfg["operator_identity"] = "alpha"
+    store._write_config(cfg)
     with pytest.raises(esc.EscalationRoutingFailed):
         esc.escalate_attended_action_required(
             store, sender="alpha", action=esc.ACTION_RECOVER_STALE_LOCK, reason="x",
         )
+
+
+# ----------------------------------------------------------- F-2: lead-chat routing parity
+
+def test_escalate_from_the_lead_chat_lead_routes_to_the_operator_identity(
+    tmp_path: Path,
+) -> None:
+    """reviewer-3 F-2 on PR-A (rq-5bd5427ad64d): cmd_escalate routes an
+    escalation FROM the lead-chat lead to the reserved operator identity,
+    not the ordinary operator-facing liaison. Mirror that branch exactly
+    — without it, this would fall through to sole_lead() (== sender) and
+    raise EscalationRoutingFailed instead of succeeding, exactly the gap
+    F-2 describes."""
+    store = _make_store(tmp_path)
+    store.set_role("lead", "lead")
+    result = esc.escalate_attended_action_required(
+        store, sender="lead", action=esc.ACTION_RECOVER_STALE_LOCK, reason="x",
+    )
+    assert result.recipient == "operator"
+
+
+def test_escalate_from_a_non_lead_sender_ignores_the_lead_chat_branch(tmp_path: Path) -> None:
+    """The lead-chat branch only fires when sender IS the lead-chat lead —
+    a different sender still gets ordinary operator_facing/lead routing."""
+    store = _make_store(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    result = esc.escalate_attended_action_required(
+        store, sender="alpha", action=esc.ACTION_RECOVER_STALE_LOCK, reason="x",
+    )
+    assert result.recipient == "lead"
 
 
 # ----------------------------------------------------------- unknown action

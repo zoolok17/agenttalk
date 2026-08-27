@@ -3,6 +3,11 @@ CAS-replace index.json) per DESIGN-55-comprehension-plane.md's "Local
 storage model" publish sequence. Crash injection, predecessor-CAS, and a
 Windows sharing-violation fixture are the PR-A dispatch's named acceptance
 evidence for this module.
+
+Every ``acquire_scan_lock``/``create_staging_dir`` call threads a REAL
+``PrivacyPreflightResult`` (reviewer-3 B-1 on PR-A, rq-5bd5427ad64d), and
+every ``publish_run`` call declares ``record_counts`` explicitly (F-1: an
+unmeasured artifact now REFUSES rather than defaulting to 0 records).
 """
 
 from __future__ import annotations
@@ -17,58 +22,70 @@ from agenttalk.comprehension import lock as lockmod
 from agenttalk.comprehension import publish as pub
 from agenttalk.comprehension import staging as stg
 from agenttalk.comprehension.errors import ComprehensionError
+from agenttalk.comprehension.privacy import PrivacyPreflightResult
 
 
-def _stage(tmp_path: Path, scan_id: str, content: str = "hello") -> tuple:
-    lock = lockmod.acquire_scan_lock(tmp_path, predecessor_index_digest=None)
-    staging = stg.create_staging_dir(tmp_path, scan_id=scan_id, owner_token=lock.owner_token)
+def _stage(
+    root: Path, privacy: PrivacyPreflightResult, scan_id: str, content: str = "hello",
+) -> tuple:
+    lock = lockmod.acquire_scan_lock(root, privacy=privacy, predecessor_index_digest=None)
+    staging = stg.create_staging_dir(root, scan_id=scan_id, lock_handle=lock)
     (staging.path / "scan.json").write_text(content, encoding="utf-8")
     return lock, staging
 
 
+_COUNTS = {"scan.json": 1}
+
+
 # ----------------------------------------------------------- happy path, first publish
 
-def test_publish_run_first_ever_publish(tmp_path: Path) -> None:
-    lock, staging = _stage(tmp_path, "scan-1")
+def test_publish_run_first_ever_publish(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    lock, staging = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
     result = pub.publish_run(
-        tmp_path, staging_handle=staging, lock_handle=lock, scan_id="scan-1",
+        comprehension_privacy_root, staging_handle=staging, lock_handle=lock, scan_id="scan-1",
         run_summary={"scan_id": "scan-1", "status": "complete"},
-        predecessor_index_digest=None,
+        predecessor_index_digest=None, record_counts=_COUNTS,
     )
-    run_dir = tmp_path / "runs" / "scan-1"
+    run_dir = comprehension_privacy_root / "runs" / "scan-1"
     assert run_dir.is_dir()
     assert (run_dir / "scan.json").read_text(encoding="utf-8") == "hello"
     assert not staging.path.exists()  # renamed away, not copied
     assert result["latest_scan_id"] == "scan-1"
     assert result["predecessor_digest"] is None
     assert result["runs"] == [{"scan_id": "scan-1", "status": "complete"}]
-    index_doc = json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))
+    index_doc = json.loads((comprehension_privacy_root / "index.json").read_text(encoding="utf-8"))
     assert index_doc == result
     assert not lock.path.exists()  # released
 
 
 def test_publish_run_second_publish_appends_and_chains_predecessor_digest(
-    tmp_path: Path,
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
-    lock1, staging1 = _stage(tmp_path, "scan-1")
+    lock1, staging1 = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
     pub.publish_run(
-        tmp_path, staging_handle=staging1, lock_handle=lock1, scan_id="scan-1",
-        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        comprehension_privacy_root, staging_handle=staging1, lock_handle=lock1, scan_id="scan-1",
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None, record_counts=_COUNTS,
     )
-    _doc, digest1 = pub.read_current_index(tmp_path)
+    _doc, digest1 = pub.read_current_index(comprehension_privacy_root)
 
-    lock2 = lockmod.acquire_scan_lock(tmp_path, predecessor_index_digest=digest1)
-    staging2 = stg.create_staging_dir(tmp_path, scan_id="scan-2", owner_token=lock2.owner_token)
+    lock2 = lockmod.acquire_scan_lock(
+        comprehension_privacy_root, privacy=comprehension_privacy,
+        predecessor_index_digest=digest1)
+    staging2 = stg.create_staging_dir(
+        comprehension_privacy_root, scan_id="scan-2", lock_handle=lock2)
     (staging2.path / "scan.json").write_text("world", encoding="utf-8")
     second = pub.publish_run(
-        tmp_path, staging_handle=staging2, lock_handle=lock2, scan_id="scan-2",
+        comprehension_privacy_root, staging_handle=staging2, lock_handle=lock2, scan_id="scan-2",
         run_summary={"scan_id": "scan-2"}, predecessor_index_digest=digest1,
+        record_counts=_COUNTS,
     )
     assert second["latest_scan_id"] == "scan-2"
     assert second["predecessor_digest"] == digest1
     assert second["runs"] == [{"scan_id": "scan-2"}, {"scan_id": "scan-1"}]
-    assert (tmp_path / "runs" / "scan-1").is_dir()
-    assert (tmp_path / "runs" / "scan-2").is_dir()
+    assert (comprehension_privacy_root / "runs" / "scan-1").is_dir()
+    assert (comprehension_privacy_root / "runs" / "scan-2").is_dir()
 
 
 def test_index_runs_list_is_bounded(tmp_path: Path, monkeypatch) -> None:
@@ -86,11 +103,13 @@ def test_index_runs_list_is_bounded(tmp_path: Path, monkeypatch) -> None:
 
 # ----------------------------------------------------------- never replaces a run dir
 
-def test_rename_refuses_when_run_directory_already_exists(tmp_path: Path) -> None:
-    (tmp_path / "runs" / "scan-1").mkdir(parents=True)
-    lock, staging = _stage(tmp_path, "scan-1")
+def test_rename_refuses_when_run_directory_already_exists(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    (comprehension_privacy_root / "runs" / "scan-1").mkdir(parents=True)
+    lock, staging = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
     with pytest.raises(pub.RunDirectoryExists):
-        pub.rename_staging_to_run(tmp_path, staging, scan_id="scan-1")
+        pub.rename_staging_to_run(comprehension_privacy_root, staging, scan_id="scan-1")
     assert staging.path.exists()  # untouched
     lockmod.release_scan_lock(lock)
 
@@ -98,95 +117,108 @@ def test_rename_refuses_when_run_directory_already_exists(tmp_path: Path) -> Non
 # ----------------------------------------------------------- crash injection
 
 def test_crash_after_rename_before_index_write_leaves_a_valid_unindexed_run(
-    tmp_path: Path,
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """design: 'A crash after step 1 but before step 2 leaves a valid
     unindexed run, never a half-current run; v1 does not silently adopt
     it.' Simulated by calling ONLY step 1 and then stopping, exactly as a
     real crash would."""
-    lock, staging = _stage(tmp_path, "scan-1")
-    pub.rename_staging_to_run(tmp_path, staging, scan_id="scan-1")
+    lock, staging = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
+    pub.rename_staging_to_run(comprehension_privacy_root, staging, scan_id="scan-1")
     # "crash" here: publish_index_cas and release_scan_lock never run.
-    run_dir = tmp_path / "runs" / "scan-1"
+    run_dir = comprehension_privacy_root / "runs" / "scan-1"
     assert run_dir.is_dir()
     assert (run_dir / "scan.json").read_text(encoding="utf-8") == "hello"
-    assert not (tmp_path / "index.json").exists()  # never indexed
+    assert not (comprehension_privacy_root / "index.json").exists()  # never indexed
     assert lock.path.exists()  # lock never released — provable stale evidence
 
 
-def test_crash_after_rename_when_a_prior_run_was_already_indexed(tmp_path: Path) -> None:
+def test_crash_after_rename_when_a_prior_run_was_already_indexed(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
     """Same crash point, but there WAS a previously-published generation —
     the old index must still name ONLY the old scan, never the new one."""
-    lock1, staging1 = _stage(tmp_path, "scan-1")
+    lock1, staging1 = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
     pub.publish_run(
-        tmp_path, staging_handle=staging1, lock_handle=lock1, scan_id="scan-1",
-        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        comprehension_privacy_root, staging_handle=staging1, lock_handle=lock1, scan_id="scan-1",
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None, record_counts=_COUNTS,
     )
-    _doc, digest1 = pub.read_current_index(tmp_path)
+    _doc, digest1 = pub.read_current_index(comprehension_privacy_root)
 
-    lock2 = lockmod.acquire_scan_lock(tmp_path, predecessor_index_digest=digest1)
-    staging2 = stg.create_staging_dir(tmp_path, scan_id="scan-2", owner_token=lock2.owner_token)
+    lock2 = lockmod.acquire_scan_lock(
+        comprehension_privacy_root, privacy=comprehension_privacy,
+        predecessor_index_digest=digest1)
+    staging2 = stg.create_staging_dir(
+        comprehension_privacy_root, scan_id="scan-2", lock_handle=lock2)
     (staging2.path / "scan.json").write_text("world", encoding="utf-8")
-    pub.rename_staging_to_run(tmp_path, staging2, scan_id="scan-2")
+    pub.rename_staging_to_run(comprehension_privacy_root, staging2, scan_id="scan-2")
     # "crash" — index.json is never touched for scan-2.
 
-    doc = json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))
+    doc = json.loads((comprehension_privacy_root / "index.json").read_text(encoding="utf-8"))
     assert doc["latest_scan_id"] == "scan-1"  # still the OLD generation
-    assert (tmp_path / "runs" / "scan-2").is_dir()  # the new run is valid, just unindexed
+    assert (comprehension_privacy_root / "runs" / "scan-2").is_dir()  # valid, just unindexed
     assert lock2.path.exists()
 
 
-def test_crash_after_index_write_before_release_leaves_lock_held(tmp_path: Path) -> None:
-    lock, staging = _stage(tmp_path, "scan-1")
-    pub.rename_staging_to_run(tmp_path, staging, scan_id="scan-1")
+def test_crash_after_index_write_before_release_leaves_lock_held(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    lock, staging = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
+    pub.rename_staging_to_run(comprehension_privacy_root, staging, scan_id="scan-1")
     pub.publish_index_cas(
-        tmp_path, scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+        comprehension_privacy_root, scan_id="scan-1", run_summary={"scan_id": "scan-1"},
         predecessor_index_digest=None,
     )
     # "crash" — release_scan_lock never runs.
     assert lock.path.exists()
-    doc = json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))
+    doc = json.loads((comprehension_privacy_root / "index.json").read_text(encoding="utf-8"))
     assert doc["latest_scan_id"] == "scan-1"  # this generation IS fully current
 
 
-def test_reported_failure_still_releases_the_lock(tmp_path: Path) -> None:
+def test_reported_failure_still_releases_the_lock(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
     """design step 3: release 'only after the index replacement OR a
     reported failure' — a CAUGHT failure (unlike a crash) still releases."""
-    lock, staging = _stage(tmp_path, "scan-1")
-    (tmp_path / "runs" / "scan-1").mkdir(parents=True)  # force rename to fail
+    lock, staging = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
+    (comprehension_privacy_root / "runs" / "scan-1").mkdir(parents=True)  # force rename to fail
     with pytest.raises(pub.RunDirectoryExists):
         pub.publish_run(
-            tmp_path, staging_handle=staging, lock_handle=lock, scan_id="scan-1",
-            run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+            comprehension_privacy_root, staging_handle=staging, lock_handle=lock,
+            scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+            predecessor_index_digest=None, record_counts=_COUNTS,
         )
     assert not lock.path.exists()  # released despite the failure
 
 
 # ----------------------------------------------------------- predecessor-CAS conflict
 
-def test_predecessor_cas_conflict_leaves_prior_index_untouched(tmp_path: Path) -> None:
-    lock1, staging1 = _stage(tmp_path, "scan-1")
+def test_predecessor_cas_conflict_leaves_prior_index_untouched(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    lock1, staging1 = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
     pub.publish_run(
-        tmp_path, staging_handle=staging1, lock_handle=lock1, scan_id="scan-1",
-        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        comprehension_privacy_root, staging_handle=staging1, lock_handle=lock1, scan_id="scan-1",
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None, record_counts=_COUNTS,
     )
-    _doc, digest_after_scan1 = pub.read_current_index(tmp_path)
+    _doc, digest_after_scan1 = pub.read_current_index(comprehension_privacy_root)
     # A second writer publishes scan-2 concurrently, advancing the index...
-    lock2, staging2 = _stage(tmp_path, "scan-2")
+    lock2, staging2 = _stage(comprehension_privacy_root, comprehension_privacy, "scan-2")
     pub.publish_run(
-        tmp_path, staging_handle=staging2, lock_handle=lock2, scan_id="scan-2",
+        comprehension_privacy_root, staging_handle=staging2, lock_handle=lock2, scan_id="scan-2",
         run_summary={"scan_id": "scan-2"}, predecessor_index_digest=digest_after_scan1,
+        record_counts=_COUNTS,
     )
     # ...while a THIRD writer had captured the predecessor digest from
     # BEFORE scan-2 landed (stale by the time it tries to publish).
-    lock3, staging3 = _stage(tmp_path, "scan-3")
+    lock3, _staging3 = _stage(comprehension_privacy_root, comprehension_privacy, "scan-3")
     with pytest.raises(pub.IndexCasConflict):
         pub.publish_index_cas(
-            tmp_path, scan_id="scan-3", run_summary={"scan_id": "scan-3"},
+            comprehension_privacy_root, scan_id="scan-3", run_summary={"scan_id": "scan-3"},
             # stale — captured right after scan-1, but scan-2 has since landed
             predecessor_index_digest=digest_after_scan1,
         )
-    doc = json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))
+    doc = json.loads((comprehension_privacy_root / "index.json").read_text(encoding="utf-8"))
     assert doc["latest_scan_id"] == "scan-2"  # untouched by the conflicting attempt
     lockmod.release_scan_lock(lock3)
 
@@ -205,13 +237,15 @@ def test_read_current_index_on_absent_index(tmp_path: Path) -> None:
     assert pub.read_current_index(tmp_path) == (None, None)
 
 
-def test_read_current_index_matches_the_published_digest(tmp_path: Path) -> None:
-    lock, staging = _stage(tmp_path, "scan-1")
+def test_read_current_index_matches_the_published_digest(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    lock, staging = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
     pub.publish_run(
-        tmp_path, staging_handle=staging, lock_handle=lock, scan_id="scan-1",
-        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        comprehension_privacy_root, staging_handle=staging, lock_handle=lock, scan_id="scan-1",
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None, record_counts=_COUNTS,
     )
-    doc, digest = pub.read_current_index(tmp_path)
+    doc, digest = pub.read_current_index(comprehension_privacy_root)
     assert doc["latest_scan_id"] == "scan-1"
     from agenttalk.comprehension.digests import canonical_content_digest
     assert digest == canonical_content_digest(doc)
@@ -220,9 +254,9 @@ def test_read_current_index_matches_the_published_digest(tmp_path: Path) -> None
 # ----------------------------------------------------------- Windows sharing-violation fixture
 
 def test_rename_retries_a_transient_windows_sharing_violation_then_succeeds(
-    tmp_path: Path, monkeypatch,
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
-    lock, staging = _stage(tmp_path, "scan-1")
+    lock, staging = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
     monkeypatch.setattr(pub, "_is_windows", lambda: True)
     real_rename = os.rename
     calls = {"n": 0}
@@ -234,14 +268,16 @@ def test_rename_retries_a_transient_windows_sharing_violation_then_succeeds(
         real_rename(src, dst)
 
     monkeypatch.setattr(pub.os, "rename", flaky_rename)
-    result = pub.rename_staging_to_run(tmp_path, staging, scan_id="scan-1")
+    result = pub.rename_staging_to_run(comprehension_privacy_root, staging, scan_id="scan-1")
     assert calls["n"] == 3
     assert result.is_dir()
     lockmod.release_scan_lock(lock)
 
 
-def test_rename_fails_after_exhausting_the_retry_window(tmp_path: Path, monkeypatch) -> None:
-    lock, staging = _stage(tmp_path, "scan-1")
+def test_rename_fails_after_exhausting_the_retry_window(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
+    lock, staging = _stage(comprehension_privacy_root, comprehension_privacy, "scan-1")
     monkeypatch.setattr(pub, "_is_windows", lambda: True)
     monkeypatch.setattr(pub, "_RENAME_RETRY_TIMEOUT_SECONDS", 0.05)  # keep the test fast
 
@@ -250,16 +286,16 @@ def test_rename_fails_after_exhausting_the_retry_window(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(pub.os, "rename", always_fails)
     with pytest.raises(pub.RenamePublishFailed):
-        pub.rename_staging_to_run(tmp_path, staging, scan_id="scan-1")
+        pub.rename_staging_to_run(comprehension_privacy_root, staging, scan_id="scan-1")
     assert staging.path.exists()  # never moved
-    assert not (tmp_path / "runs" / "scan-1").exists()
+    assert not (comprehension_privacy_root / "runs" / "scan-1").exists()
     lockmod.release_scan_lock(lock)
 
 
 # ----------------------------------------------------------- old-generation concurrent readers
 
 def test_a_reader_bound_to_the_old_generation_is_undisturbed_by_a_concurrent_publish(
-    tmp_path: Path,
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """design: 'A concurrent scan cannot disturb readers of the prior
     published generation' and 'a reader that already loaded the old
@@ -268,25 +304,28 @@ def test_a_reader_bound_to_the_old_generation_is_undisturbed_by_a_concurrent_pub
     directory, hold that content — THEN a second scan publishes scan-2 —
     then re-read what the first reader already resolved and prove it is
     byte-identical to what it read before scan-2 ever landed."""
-    lock1, staging1 = _stage(tmp_path, "scan-1", content="generation one")
+    lock1, staging1 = _stage(
+        comprehension_privacy_root, comprehension_privacy, "scan-1", content="generation one")
     pub.publish_run(
-        tmp_path, staging_handle=staging1, lock_handle=lock1, scan_id="scan-1",
-        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+        comprehension_privacy_root, staging_handle=staging1, lock_handle=lock1, scan_id="scan-1",
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None, record_counts=_COUNTS,
     )
 
     # The reader: loads the catalog, resolves ITS scan's run directory and
     # content, and holds onto both — exactly what a caller bound to an
     # exact scan_id (e.g. a brief-time context pack) would do.
-    reader_index_doc, digest_after_scan1 = pub.read_current_index(tmp_path)
+    reader_index_doc, digest_after_scan1 = pub.read_current_index(comprehension_privacy_root)
     reader_scan_id = reader_index_doc["latest_scan_id"]
-    reader_run_dir = tmp_path / "runs" / reader_scan_id
+    reader_run_dir = comprehension_privacy_root / "runs" / reader_scan_id
     reader_content_before = (reader_run_dir / "scan.json").read_text(encoding="utf-8")
 
     # A second scan publishes concurrently, advancing the catalog.
-    lock2, staging2 = _stage(tmp_path, "scan-2", content="generation two")
+    lock2, staging2 = _stage(
+        comprehension_privacy_root, comprehension_privacy, "scan-2", content="generation two")
     pub.publish_run(
-        tmp_path, staging_handle=staging2, lock_handle=lock2, scan_id="scan-2",
+        comprehension_privacy_root, staging_handle=staging2, lock_handle=lock2, scan_id="scan-2",
         run_summary={"scan_id": "scan-2"}, predecessor_index_digest=digest_after_scan1,
+        record_counts=_COUNTS,
     )
 
     # The reader's OWN generation is completely undisturbed: same directory,
@@ -296,6 +335,6 @@ def test_a_reader_bound_to_the_old_generation_is_undisturbed_by_a_concurrent_pub
     assert reader_content_before == "generation one"
 
     # The catalog itself DID advance — the reader just never re-read it.
-    live_doc, _digest = pub.read_current_index(tmp_path)
+    live_doc, _digest = pub.read_current_index(comprehension_privacy_root)
     assert live_doc["latest_scan_id"] == "scan-2"
     assert live_doc["latest_scan_id"] != reader_scan_id

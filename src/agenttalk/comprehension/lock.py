@@ -41,8 +41,10 @@ from ..lifecycle_lock import ProcessIdentity, process_identity, process_observat
 from .envelope import EnvelopeError, read_json_document, validate_rfc3339_utc
 from .errors import ScanLockContended, ScanLockUnrecoverable
 from .paths import lock_path as _lock_path
+from .privacy import PrivacyPreflightResult
 
 LOCK_SCHEMA_VERSION = 1
+_VALID_VCS_PRIVACY = ("ignored", "acknowledged_unignored", "no_vcs_acknowledged")
 
 
 def host_identity() -> str:
@@ -66,6 +68,8 @@ class ScanLockHandle:
     host_identity: str
     acquired_at: str
     predecessor_index_digest: str | None
+    vcs_privacy: str
+    work_id: str | None
 
 
 def _utc_now_iso(now: datetime | None) -> str:
@@ -88,6 +92,8 @@ def _record_to_json(handle: ScanLockHandle) -> dict:
         "host_identity": handle.host_identity,
         "acquired_at": handle.acquired_at,
         "predecessor_index_digest": handle.predecessor_index_digest,
+        "vcs_privacy": handle.vcs_privacy,
+        "work_id": handle.work_id,
     }
 
 
@@ -118,6 +124,13 @@ def _validate_lock_record(doc: Any) -> dict:
     predecessor = doc.get("predecessor_index_digest")
     if predecessor is not None and not isinstance(predecessor, str):
         raise EnvelopeError("scan.lock predecessor_index_digest must be a string or null")
+    if doc.get("vcs_privacy") not in _VALID_VCS_PRIVACY:
+        raise EnvelopeError(
+            f"scan.lock vcs_privacy must be one of {_VALID_VCS_PRIVACY}, got "
+            f"{doc.get('vcs_privacy')!r}")
+    work_id = doc.get("work_id")
+    if work_id is not None and not isinstance(work_id, str):
+        raise EnvelopeError("scan.lock work_id must be a string or null")
     return doc
 
 
@@ -189,6 +202,7 @@ def _classify_and_maybe_reclaim(path: Path) -> None:
 def acquire_scan_lock(
     comprehension_dir: Path,
     *,
+    privacy: PrivacyPreflightResult,
     predecessor_index_digest: str | None,
     now: datetime | None = None,
 ) -> ScanLockHandle:
@@ -198,7 +212,25 @@ def acquire_scan_lock(
     proven dead. Reclaim happens at most once per call — if a third party
     wins the race immediately after reclaim, that shows up as ordinary
     contention on the retry, never a loop.
+
+    ``privacy`` is REQUIRED, with no default (reviewer-3 B-1 on PR-A,
+    rq-5bd5427ad64d, reproduced: without this, the privacy preflight was a
+    function a caller could simply forget to call, and three entry points
+    created ``.agenttalk/comprehension/`` unconditionally — an untracked,
+    unignored write reachable even when the preflight refuses). This is
+    the FIRST thing that creates the directory, so requiring a proven
+    :class:`~.privacy.PrivacyPreflightResult` here — obtainable only from
+    :func:`privacy.run_privacy_preflight` or
+    :func:`privacy.acknowledge_unignored_private_store`, never fabricated
+    — makes the precondition structural rather than procedural. The
+    disposition is recorded into the lock record itself (``vcs_privacy``,
+    ``work_id``) so it is durable from the very first byte written.
     """
+    if not isinstance(privacy, PrivacyPreflightResult):
+        raise TypeError(
+            "acquire_scan_lock() requires privacy: PrivacyPreflightResult - obtain one "
+            "from privacy.run_privacy_preflight() or "
+            "privacy.acknowledge_unignored_private_store(), never fabricate one")
     self_identity = process_identity(os.getpid())
     if self_identity is None:
         raise ScanLockUnrecoverable(
@@ -212,6 +244,8 @@ def acquire_scan_lock(
         host_identity=host_identity(),
         acquired_at=_utc_now_iso(now),
         predecessor_index_digest=predecessor_index_digest,
+        vcs_privacy=privacy.vcs_privacy,
+        work_id=privacy.work_id,
     )
     # Bounded retries: each FileExistsError is classified, which either
     # raises a typed error (contended/unrecoverable — the common case) or

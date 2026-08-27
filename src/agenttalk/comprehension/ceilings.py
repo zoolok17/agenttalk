@@ -62,19 +62,31 @@ def measure_staging_artifacts(
 ) -> list[ArtifactMeasurement]:
     """One measurement per durable artifact file directly inside
     ``staging_dir`` (non-recursive — v1's artifacts are flat files per the
-    storage layout). ``record_counts`` maps filename -> record count; a
-    file with no entry is measured as 0 records (a caller that skips
-    supplying a real count is under-reporting to itself, not to this
-    function — it is not this module's job to parse artifact content to
-    find out)."""
+    storage layout). ``record_counts`` maps filename -> record count.
+
+    A file with NO entry in ``record_counts`` REFUSES (reviewer-3 F-1 on
+    PR-A, rq-5bd5427ad64d: defaulting an unmeasured artifact to 0 records
+    is fail-OPEN inside an otherwise fail-closed ceiling — a producer that
+    forgets to declare a count silently skips the record ceiling entirely,
+    the opposite of the byte ceiling's behavior, which is always measured
+    from disk and cannot be skipped). The design's own contract is that
+    ``scan.json`` declares the measured record counts, so an unmeasured
+    artifact is a producer bug, not a legitimately-empty one — a
+    genuinely empty artifact still gets an explicit ``0`` entry.
+    """
     measurements = []
     for path in sorted(staging_dir.iterdir()):
         if not path.is_file() or path.name in _NON_ARTIFACT_FILENAMES:
             continue
+        if path.name not in record_counts:
+            raise ArtifactLimitExceeded(
+                f"{path.name} has no declared record count - an unmeasured artifact "
+                "cannot be admitted under this fail-closed ceiling; the producer must "
+                "declare it explicitly (even as 0), per scan.json's own contract")
         measurements.append(ArtifactMeasurement(
             name=path.name,
             byte_count=path.stat().st_size,
-            record_count=record_counts.get(path.name, 0),
+            record_count=record_counts[path.name],
         ))
     return measurements
 

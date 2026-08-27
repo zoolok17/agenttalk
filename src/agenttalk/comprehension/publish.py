@@ -249,10 +249,11 @@ def publish_run(
     ``record_counts`` maps each staged artifact filename to its record
     count for the ceiling check (design: "16 MiB and 100,000 records per
     artifact, and 64 MiB and 250,000 records for all durable artifacts in
-    one run") — omit it (or a given filename) to measure that artifact's
-    record count as 0, which only makes the record ceiling MORE permissive
-    for a caller that has not measured it, never less; the byte ceiling is
-    always measured directly from disk regardless.
+    one run"). Every staged artifact file MUST have an entry — an
+    unmeasured artifact REFUSES (fail-closed; see
+    ``ceilings.measure_staging_artifacts``), it does not count as 0
+    records. The byte ceiling is always measured directly from disk
+    regardless and can never be skipped this way.
     """
     try:
         measurements = measure_staging_artifacts(

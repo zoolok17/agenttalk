@@ -14,6 +14,7 @@ from agenttalk.comprehension import ceilings as ceil
 from agenttalk.comprehension import lock as lockmod
 from agenttalk.comprehension import publish as pub
 from agenttalk.comprehension import staging as stg
+from agenttalk.comprehension.privacy import PrivacyPreflightResult
 
 
 # ----------------------------------------------------------- measure_staging_artifacts
@@ -27,11 +28,19 @@ def test_measure_staging_artifacts_skips_owner_json(tmp_path: Path) -> None:
     assert measurements[0].record_count == 3
 
 
-def test_measure_staging_artifacts_defaults_missing_record_counts_to_zero(
-    tmp_path: Path,
-) -> None:
+def test_measure_staging_artifacts_refuses_an_unmeasured_artifact(tmp_path: Path) -> None:
+    """F-1 (reviewer-3 on PR-A, rq-5bd5427ad64d): defaulting a missing
+    record count to 0 was fail-OPEN inside an otherwise fail-closed
+    ceiling. An artifact with no entry in record_counts now refuses
+    outright — a genuinely empty artifact must declare 0 explicitly."""
     (tmp_path / "scan.json").write_text("abc", encoding="utf-8")
-    measurements = ceil.measure_staging_artifacts(tmp_path, record_counts={})
+    with pytest.raises(ceil.ArtifactLimitExceeded, match="no declared record count"):
+        ceil.measure_staging_artifacts(tmp_path, record_counts={})
+
+
+def test_measure_staging_artifacts_accepts_an_explicit_zero_record_count(tmp_path: Path) -> None:
+    (tmp_path / "scan.json").write_text("abc", encoding="utf-8")
+    measurements = ceil.measure_staging_artifacts(tmp_path, record_counts={"scan.json": 0})
     assert measurements[0].record_count == 0
 
 
@@ -39,7 +48,7 @@ def test_measure_staging_artifacts_ignores_subdirectories(tmp_path: Path) -> Non
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "nested.json").write_text("{}", encoding="utf-8")
     (tmp_path / "scan.json").write_text("abc", encoding="utf-8")
-    measurements = ceil.measure_staging_artifacts(tmp_path, record_counts={})
+    measurements = ceil.measure_staging_artifacts(tmp_path, record_counts={"scan.json": 0})
     assert [m.name for m in measurements] == ["scan.json"]
 
 
@@ -93,37 +102,67 @@ def test_enforce_ceilings_rejects_whole_run_record_total() -> None:
 # ----------------------------------------------------------- integration: publish_run refuses
 
 def test_publish_run_refuses_and_publishes_no_run_when_a_ceiling_is_exceeded(
-    tmp_path: Path, monkeypatch,
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
 ) -> None:
     """design: 'Exceeding a ceiling publishes no run.' Shrink the ceiling
     (rather than writing a real 16 MiB fixture) so the test stays fast
     while still exercising the REAL enforcement call site inside
     publish_run, not just the standalone ceilings function."""
     monkeypatch.setattr(ceil, "PER_ARTIFACT_BYTES_MAX", 4)
-    lock = lockmod.acquire_scan_lock(tmp_path, predecessor_index_digest=None)
-    staging = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token=lock.owner_token)
+    lock = lockmod.acquire_scan_lock(
+        comprehension_privacy_root, privacy=comprehension_privacy,
+        predecessor_index_digest=None)
+    staging = stg.create_staging_dir(
+        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
     (staging.path / "scan.json").write_text("this is way more than 4 bytes", encoding="utf-8")
 
     with pytest.raises(ceil.ArtifactLimitExceeded):
         pub.publish_run(
-            tmp_path, staging_handle=staging, lock_handle=lock, scan_id="scan-1",
-            run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+            comprehension_privacy_root, staging_handle=staging, lock_handle=lock,
+            scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+            predecessor_index_digest=None, record_counts={"scan.json": 1},
         )
-    assert not (tmp_path / "runs" / "scan-1").exists()  # no run was published
+    assert not (comprehension_privacy_root / "runs" / "scan-1").exists()  # no run published
     assert staging.path.exists()  # staging left in place, not silently discarded
     assert not lock.path.exists()  # still a REPORTED failure — lock released
 
 
-def test_publish_run_enforces_record_counts_from_the_caller(tmp_path: Path, monkeypatch) -> None:
+def test_publish_run_enforces_record_counts_from_the_caller(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult, monkeypatch,
+) -> None:
     monkeypatch.setattr(ceil, "PER_ARTIFACT_RECORDS_MAX", 2)
-    lock = lockmod.acquire_scan_lock(tmp_path, predecessor_index_digest=None)
-    staging = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token=lock.owner_token)
+    lock = lockmod.acquire_scan_lock(
+        comprehension_privacy_root, privacy=comprehension_privacy,
+        predecessor_index_digest=None)
+    staging = stg.create_staging_dir(
+        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
     (staging.path / "modules.json").write_text("[]", encoding="utf-8")
 
     with pytest.raises(ceil.ArtifactLimitExceeded, match="records"):
         pub.publish_run(
-            tmp_path, staging_handle=staging, lock_handle=lock, scan_id="scan-1",
-            run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
-            record_counts={"modules.json": 3},
+            comprehension_privacy_root, staging_handle=staging, lock_handle=lock,
+            scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+            predecessor_index_digest=None, record_counts={"modules.json": 3},
         )
-    assert not (tmp_path / "runs" / "scan-1").exists()
+    assert not (comprehension_privacy_root / "runs" / "scan-1").exists()
+
+
+def test_publish_run_refuses_when_a_staged_artifact_has_no_declared_record_count(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """F-1 integration: publish_run's own default (record_counts omitted)
+    must refuse rather than silently admit an unmeasured artifact."""
+    lock = lockmod.acquire_scan_lock(
+        comprehension_privacy_root, privacy=comprehension_privacy,
+        predecessor_index_digest=None)
+    staging = stg.create_staging_dir(
+        comprehension_privacy_root, scan_id="scan-1", lock_handle=lock)
+    (staging.path / "scan.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ceil.ArtifactLimitExceeded, match="no declared record count"):
+        pub.publish_run(
+            comprehension_privacy_root, staging_handle=staging, lock_handle=lock,
+            scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+            predecessor_index_digest=None,
+        )
+    assert not (comprehension_privacy_root / "runs" / "scan-1").exists()
