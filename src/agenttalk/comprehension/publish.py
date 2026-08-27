@@ -42,16 +42,18 @@ from pathlib import Path
 from .ceilings import enforce_artifact_ceilings, measure_staging_artifacts
 from .digests import canonical_content_digest
 from .envelope import (
+    EnvelopeError,
     read_json_document,
     resolve_under_root,
     validate_envelope,
     validate_scan_id,
 )
-from .errors import ComprehensionError
+from .errors import ComprehensionError, StagingSourceEscapesRoot
 from .lock import ScanLockHandle, release_scan_lock
 from .paths import index_path as _index_path
 from .paths import runs_dir as _runs_dir
-from .staging import StagingHandle
+from .paths import staging_dir as _staging_dir
+from .staging import _OWNER_FILENAME, StagingHandle, _validate_owner_doc
 
 INDEX_SCHEMA_VERSION = 1
 INDEX_ARTIFACT_TYPE = "agenttalk.comprehension.index"
@@ -130,6 +132,17 @@ def rename_staging_to_run(
     and ``staging_handle.owner_token`` is cross-checked against
     ``lock_handle.owner_token`` — publishing a staging directory this lock
     never created is refused, not silently trusted.
+
+    ``StagingHandle`` is a public, trivially-constructible dataclass, so
+    none of its claimed fields are trusted on their own (reviewer-1
+    cold-read finding 2 on PR-A, rq-6cc5560b62f6, round 2, reproduced: a
+    handle naming an EXTERNAL directory, with a copied real
+    ``owner_token``, was accepted by the owner-token string comparison
+    alone and its content published under ``runs/``). ``staging_handle.path``
+    is therefore resolved and confined to the lock's own ``.staging/``
+    directory, and trust is RE-DERIVED from the ``owner.json`` actually on
+    disk at that confined path (never from the handle's claimed fields) —
+    both raise :class:`~.errors.StagingSourceEscapesRoot`.
     """
     if staging_handle.owner_token != lock_handle.owner_token:
         raise StagingOwnershipMismatch(
@@ -138,6 +151,25 @@ def rename_staging_to_run(
             "lock does not own")
     scan_id = validate_scan_id(staging_handle.scan_id)
     comprehension_dir = lock_handle.path.parent
+    staging_root = _staging_dir(comprehension_dir).resolve()
+    staging_path = Path(staging_handle.path).resolve()
+    try:
+        staging_path.relative_to(staging_root)
+    except ValueError as exc:
+        raise StagingSourceEscapesRoot(
+            f"staging_handle.path {staging_handle.path} does not resolve under "
+            f"{staging_root} — refusing to rename a directory outside .staging/"
+        ) from exc
+    try:
+        owner_doc = _validate_owner_doc(read_json_document(staging_path / _OWNER_FILENAME))
+    except EnvelopeError as exc:
+        raise StagingSourceEscapesRoot(
+            f"owner.json under {staging_path} is missing or malformed: {exc}") from exc
+    if owner_doc["owner_token"] != lock_handle.owner_token or owner_doc["scan_id"] != scan_id:
+        raise StagingSourceEscapesRoot(
+            f"owner.json under {staging_path} does not match this lock's owner_token "
+            "and/or staging_handle's scan_id — refusing to publish a staging directory "
+            "this lock did not create")
     dst = resolve_under_root(scan_id, root=_runs_dir(comprehension_dir), label="run directory")
     if dst.exists():
         raise RunDirectoryExists(f"runs/{scan_id}/ already exists — scan IDs must be unique")

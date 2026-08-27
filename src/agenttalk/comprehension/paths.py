@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..store import DIRNAME as _AGENTTALK_DIRNAME
+from .errors import InvalidComprehensionDir
 
 COMPREHENSION_DIRNAME = "comprehension"
 INDEX_FILENAME = "index.json"
@@ -31,11 +32,25 @@ def project_root_from_comprehension_dir(comprehension_dir: Path) -> Path:
     (``comprehension`` then ``.agenttalk``) to recover the project root a
     ``comprehension_dir`` implies. Used to verify a privacy proof's bound
     root matches the root an operation is about to act on (reviewer-1
-    cold-read finding 1 on PR-A, rq-6cc5560b62f6) — if ``comprehension_dir``
-    was never actually shaped this way, the derived "root" simply won't
-    match any real proof, which is the correct (safe) failure mode.
+    cold-read finding 1 on PR-A, rq-6cc5560b62f6).
+
+    Raises :class:`InvalidComprehensionDir` unless the resolved path's last
+    two segments are EXACTLY ``.agenttalk/comprehension`` (reviewer-1
+    cold-read finding 1, round 2: blindly climbing "two parents up" let
+    ``acquire_scan_lock(root / "unignored" / "store", ...)`` derive
+    ``root`` right back out and pass the root-binding check while writing
+    ``scan.lock`` OUTSIDE ``.agenttalk`` entirely — reproduced with
+    ``under_agenttalk=False``). This shape check runs BEFORE the
+    root-binding comparison, so a malformed path can never reach it.
     """
-    return comprehension_dir.parent.parent
+    resolved = Path(comprehension_dir).resolve()
+    if resolved.name != COMPREHENSION_DIRNAME or resolved.parent.name != _AGENTTALK_DIRNAME:
+        raise InvalidComprehensionDir(
+            f"{comprehension_dir} is not a "
+            f"<project root>/{_AGENTTALK_DIRNAME}/{COMPREHENSION_DIRNAME} path - refusing "
+            "to derive a project root, and therefore a privacy disposition, from an "
+            "arbitrary directory")
+    return resolved.parent.parent
 
 
 def index_path(comprehension_dir: Path) -> Path:

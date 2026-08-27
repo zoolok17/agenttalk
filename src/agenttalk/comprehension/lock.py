@@ -30,7 +30,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import platform
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,28 +54,34 @@ def host_identity() -> str:
     remote-looking / different-host lock record without touching the real
     hostname.
 
-    Deliberately does NOT import ``socket`` (reviewer-1 cold-read finding 3
-    on PR-A, rq-6cc5560b62f6: the design's offline contract prohibits
-    network-capable imports in this package's production modules,
-    regardless of whether a specific call like ``gethostname()`` ever
-    opens a connection — the allowlist gate is a static per-import check,
-    not a per-call trust judgment). ``platform.node()`` queries the OS's
-    local hostname API directly (``uname(2)`` nodename on POSIX,
-    ``COMPUTERNAME`` on Windows) without this package importing a
-    network-capable module itself, and is stable for the lifetime of the
-    host between reboots — exactly the determinism scan.lock's cross-host
-    detection needs (same host -> same value every time this process or
-    any other reads it). The ``os.environ`` fallback only matters on the
-    rare host where the OS API itself returns nothing.
+    Deliberately does NOT use ``platform.node()`` (reviewer-1 cold-read
+    finding 3 on PR-A, rq-6cc5560b62f6, round 2, reproduced:
+    ``platform.node()`` on Windows falls back to CPython's
+    ``platform.uname()``, which — because Windows has no ``os.uname()`` —
+    imports ``socket`` and calls ``socket.gethostname()`` internally;
+    observed ``socket_before=False`` -> ``socket_after=True`` in a fresh
+    process at the prior SHA. The design's offline contract prohibits both
+    importing AND calling into a network-capable module, so a module that
+    is merely socket-free ITSELF is not enough if a stdlib helper it calls
+    imports one transitively). On POSIX, ``os.uname().nodename`` queries
+    the kernel directly (no ``socket`` involved at all); on Windows,
+    ``COMPUTERNAME`` is the OS's own environment variable for this same
+    value, requiring no OS call at all. Either way this is stable for the
+    lifetime of the host between reboots — exactly the determinism
+    scan.lock's cross-host detection needs.
     """
-    node = platform.node()
+    if os.name == "nt":
+        node = os.environ.get("COMPUTERNAME")
+    elif hasattr(os, "uname"):
+        node = os.uname().nodename
+    else:
+        node = None
+    if not node:
+        node = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME")
     if node:
         return node
-    env_fallback = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME")
-    if env_fallback:
-        return env_fallback
     raise ScanLockUnrecoverable(
-        "this host's identity could not be determined (platform.node() and the "
+        "this host's identity could not be determined (os.uname()/COMPUTERNAME and the "
         "COMPUTERNAME/HOSTNAME environment variables are all empty)")
 
 
@@ -251,8 +256,15 @@ def acquire_scan_lock(
     disposition is recorded into the lock record itself (``vcs_privacy``,
     ``work_id``) so it is durable from the very first byte written.
 
-    ``privacy`` must also be BOUND to ``comprehension_dir``'s own project
-    root — a proof obtained for a different root is rejected with
+    ``comprehension_dir`` must itself have the exact
+    ``<project root>/.agenttalk/comprehension`` shape — anything else
+    raises :class:`~.errors.InvalidComprehensionDir` before any filesystem
+    access (reviewer-1 cold-read finding 1, round 2: naively climbing "two
+    parents up" let a differently-shaped directory still resolve back to a
+    real, proven root and pass the next check while writing scan.lock
+    outside ``.agenttalk`` entirely). Only once that shape is proven does
+    ``privacy`` get checked as BOUND to the recovered project root — a
+    proof obtained for a different root is rejected with
     :class:`PrivacyProofRootMismatch` (reviewer-1 cold-read finding 1 on
     PR-A, rq-6cc5560b62f6, reproduced: a real proof from protected root A
     previously unlocked a write in unrelated root B, since ``isinstance``

@@ -119,6 +119,35 @@ def test_rename_refuses_a_staging_handle_from_a_different_lock(
     lockmod.release_scan_lock(lock2)
 
 
+def test_rename_refuses_a_forged_handle_naming_an_external_directory(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """reviewer-1 cold-read finding 2 on PR-A, round 2 (rq-6cc5560b62f6),
+    reproduced: ``StagingHandle`` is a public, trivially-constructible
+    dataclass — a handle naming an EXTERNAL directory (never created by
+    ``create_staging_dir``, outside ``.staging/`` entirely), carrying a
+    COPIED real ``owner_token``, was previously accepted by the
+    owner-token string comparison alone; the external directory was
+    removed from its own location and its content published under
+    ``runs/``. The fix must confine the source and re-derive trust from
+    the actual owner.json on disk, so this is refused even though the
+    forged handle's ``owner_token`` field genuinely matches the lock."""
+    lock = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    external = comprehension_dir.parent.parent / "outside-comprehension-entirely"
+    external.mkdir(parents=True)
+    (external / "scan.json").write_text("stolen content", encoding="utf-8")
+    forged = stg.StagingHandle(path=external, scan_id="scan-1", owner_token=lock.owner_token)
+
+    with pytest.raises(pub.StagingSourceEscapesRoot):
+        pub.rename_staging_to_run(forged, lock)
+
+    assert external.exists()  # never moved
+    assert (external / "scan.json").read_text(encoding="utf-8") == "stolen content"
+    assert not (comprehension_dir / "runs" / "scan-1").exists()
+    lockmod.release_scan_lock(lock)
+
+
 def test_publish_run_cross_checks_run_summary_scan_id_against_staging(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:

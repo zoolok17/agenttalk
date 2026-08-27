@@ -4,9 +4,10 @@
 Every ``acquire_scan_lock`` call below threads a REAL
 ``PrivacyPreflightResult`` from the ``comprehension_privacy`` fixture,
 which itself runs the real preflight against a real git repository (the
-``comprehension_dir`` fixture) — reviewer-3's B-1 finding on this
+``comprehension_privacy_root`` fixture) — reviewer-3's B-1 finding on this
 PR (rq-5bd5427ad64d) explicitly forbids a permissive test-only
-constructor for this type.
+constructor for this type. ``comprehension_dir`` is the
+``root/.agenttalk/comprehension`` directory this all acts on.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import pytest
 from agenttalk.comprehension import lock as lockmod
 from agenttalk.comprehension import privacy as privacymod
 from agenttalk.comprehension.errors import (
+    InvalidComprehensionDir,
     PrivacyProofRootMismatch,
     ScanLockContended,
     ScanLockUnrecoverable,
@@ -386,6 +388,27 @@ def test_acknowledge_proof_is_also_bound_to_its_own_root(
             comprehension_dir, privacy=acknowledged, predecessor_index_digest=None)
 
 
+# ------------------------------------- finding 1 round 2: comprehension_dir shape must be exact
+
+def test_a_wrongly_shaped_comprehension_dir_is_rejected_even_at_a_proven_root(
+    comprehension_privacy_root: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """reviewer-1 cold-read finding 1 on PR-A, round 2 (rq-6cc5560b62f6),
+    reproduced: naively deriving the project root as "two parents up" let
+    ``acquire_scan_lock(root / "unignored" / "store", ...)`` recover the
+    SAME real, proven root and pass the root-binding check, while writing
+    scan.lock OUTSIDE ``.agenttalk`` entirely. A ``comprehension_dir`` that
+    is not exactly ``<root>/.agenttalk/comprehension`` must be refused
+    before any filesystem access, even when the privacy proof it derives a
+    root from is completely genuine."""
+    wrong_shape_dir = comprehension_privacy_root / "unignored" / "store"
+    with pytest.raises(InvalidComprehensionDir):
+        lockmod.acquire_scan_lock(
+            wrong_shape_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    assert not wrong_shape_dir.exists()
+    assert not (comprehension_privacy_root / "unignored").exists()
+
+
 # ----------------------------------------------------------- finding 3 regression: no socket import
 
 def test_comprehension_package_imports_no_socket_or_network_module() -> None:
@@ -420,3 +443,34 @@ def test_comprehension_package_imports_no_socket_or_network_module() -> None:
                 if name is not None and (name in banned or name.split(".")[0] in banned):
                     offenders.append(f"{source_path.relative_to(package_dir)}: {name}")
     assert offenders == []
+
+
+def test_host_identity_never_transitively_imports_socket_at_runtime() -> None:
+    """reviewer-1 cold-read finding 3 on PR-A, round 2 (rq-6cc5560b62f6),
+    reproduced: the STATIC import scan above only sees THIS package's own
+    ``import`` statements — it cannot see a stdlib helper (the old
+    ``platform.node()`` call) transitively importing ``socket`` at
+    runtime. Observed ``socket_before=False`` -> ``socket_after=True`` in a
+    fresh process at the prior SHA. Runs in a genuinely fresh subprocess
+    (never the test runner's own interpreter, which may have already
+    imported ``socket`` via unrelated pytest/OS plumbing) and asserts
+    ``socket`` is absent from ``sys.modules`` both before AND after calling
+    ``host_identity()``.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, json\n"
+        "before = 'socket' in sys.modules\n"
+        "from agenttalk.comprehension.lock import host_identity\n"
+        "host_identity()\n"
+        "after = 'socket' in sys.modules\n"
+        "print(json.dumps({'before': before, 'after': after}))\n"
+    )
+    result = subprocess.run(  # noqa: S603  # nosec B603
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    import json
+    observed = json.loads(result.stdout.strip().splitlines()[-1])
+    assert observed == {"before": False, "after": False}, (
+        f"host_identity() transitively imported socket: {observed}\nstderr: {result.stderr}")

@@ -64,6 +64,44 @@ class VcsPrivacyRefused(ComprehensionError):
         )
 
 
+class InvalidComprehensionDir(ComprehensionError):
+    """A ``comprehension_dir`` argument does not have the exact
+    ``<root>/.agenttalk/comprehension`` shape (reviewer-1 cold-read finding
+    1 on the PR-A fix round, rq-6cc5560b62f6, round 2: deriving a project
+    root as merely "two parents up" let ``acquire_scan_lock(root /
+    "unignored" / "store", ...)`` pass a root-binding check proven for
+    ``root`` while writing ``scan.lock`` OUTSIDE ``.agenttalk`` entirely —
+    reproduced with ``under_agenttalk=False``). Every plane output must
+    stay under ``.agenttalk`` (design: "every plane output is written
+    under `.agenttalk/`") — this is checked BEFORE the root-binding
+    comparison even runs, so a malformed path can never reach it."""
+
+    reason_code = "comprehension_dir_invalid_shape"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(f"{self.reason_code}: {detail}")
+
+
+class StagingSourceEscapesRoot(ComprehensionError):
+    """``staging_handle.path`` does not resolve under the lock's own
+    ``.staging/`` directory, or its on-disk ``owner.json`` does not match
+    the presented handle (reviewer-1 cold-read finding 2 on the PR-A fix
+    round, rq-6cc5560b62f6, round 2: ``StagingHandle`` is a public,
+    trivially-constructible dataclass, so a handle naming an external
+    directory — with a copied, real ``owner_token`` — was accepted by the
+    owner-token string comparison alone and its content was published
+    under ``runs/``, reproduced with ``external_content_published=True``).
+    Trust is re-derived from what is ACTUALLY on disk at the confined
+    path, never from the handle's claimed fields alone."""
+
+    reason_code = "comprehension_staging_source_escapes_root"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(f"{self.reason_code}: {detail}")
+
+
 class PrivacyProofRootMismatch(ComprehensionError):
     """A ``PrivacyPreflightResult`` proven for one project root was
     presented at a DIFFERENT root's lock acquisition (reviewer-1 cold-read
