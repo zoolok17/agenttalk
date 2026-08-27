@@ -4,11 +4,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..store import DIRNAME as _AGENTTALK_DIRNAME
+
 COMPREHENSION_DIRNAME = "comprehension"
 INDEX_FILENAME = "index.json"
 LOCK_FILENAME = "scan.lock"
 RUNS_DIRNAME = "runs"
 STAGING_DIRNAME = ".staging"
+
+#: The comprehension dir's path RELATIVE TO THE PROJECT ROOT, POSIX-spelled
+#: (design: "every plane output is written under `.agenttalk/`") — for
+#: callers that need to name it to an external tool (e.g. privacy.py's git
+#: subprocess calls), not for filesystem access (use comprehension_dir()
+#: below for that, given an already-resolved ``.agenttalk/`` Path).
+RELATIVE_COMPREHENSION_DIR = f"{_AGENTTALK_DIRNAME}/{COMPREHENSION_DIRNAME}"
 
 
 def comprehension_dir(agenttalk_dir: Path) -> Path:

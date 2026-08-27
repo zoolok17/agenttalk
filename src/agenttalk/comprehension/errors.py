@@ -45,6 +45,25 @@ class ScanLockContended(ScanLockError):
         )
 
 
+class VcsPrivacyRefused(ComprehensionError):
+    """The private-store VCS-ignore disposition could not be proven before
+    any plane output would be written (design, "Privacy and offline
+    enforcement"). Only the attended ``--acknowledge-unignored-private-
+    store`` action may proceed from here — this refusal fires BEFORE any
+    lock or staging file exists, so refusing here leaves nothing to clean
+    up."""
+
+    reason_code = "comprehension_vcs_privacy_refused"
+
+    def __init__(self, detail: str, *, vcs_kind: str) -> None:
+        self.detail = detail
+        self.vcs_kind = vcs_kind
+        super().__init__(
+            f"{self.reason_code}: {detail}; only an attended operator running "
+            "--acknowledge-unignored-private-store may proceed"
+        )
+
+
 class ScanLockUnrecoverable(ScanLockError):
     """The recorded owner cannot be PROVEN dead (unverifiable identity, a
     process-start mismatch/PID reuse, a host mismatch, an unsupported
