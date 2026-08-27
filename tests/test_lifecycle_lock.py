@@ -570,7 +570,7 @@ def test_lifecycle_lock_refuses_unobservable_recorded_owner_as_unknown(
         "acquired_at": "2026-08-17T13:00:00.000000Z",
     }
     original = _write_record(lock_path, held)
-    real_observation = lock_module._process_observation
+    real_observation = lock_module.process_observation
     observations = 0
 
     def caller_then_unknown(pid):
@@ -580,7 +580,7 @@ def test_lifecycle_lock_refuses_unobservable_recorded_owner_as_unknown(
             return real_observation(pid)
         return "unknown", None
 
-    monkeypatch.setattr(lock_module, "_process_observation", caller_then_unknown)
+    monkeypatch.setattr(lock_module, "process_observation", caller_then_unknown)
 
     with pytest.raises(
         LifecycleLockUnknown,
