@@ -3761,7 +3761,11 @@ class Store:
         valid, _ = self._scan_messages()
         return valid
 
-    def _invalid_file_entries(self) -> list[tuple[Path, str, str]]:
+    def _invalid_file_entries(
+        self,
+        *,
+        scan_result: tuple[list[tuple[Message, Path]], list[tuple[Path, str, str]]] | None = None,
+    ) -> list[tuple[Path, str, str]]:
         """ONE path-aware walk over the FULL gate set (parse + schema +
         roster + signature). Returns ``[(path, ident, reason)]``.
 
@@ -3770,6 +3774,14 @@ class Store:
         projections of this list — FR-011 lockstep by construction, and
         every verdict is paired with its own source file at scan time
         (an ident can collide across files; a path cannot).
+
+        ``scan_result``, when given, is a caller-supplied
+        ``(valid_p, parse_failures)`` pair (the RAW ``_scan_messages_with_paths``
+        output, e.g. as returned by ``_validated_message_snapshot``) — skips
+        this method's own disk walk so a caller that already has one from the
+        SAME instant doesn't pay for a second (#184: `agenttalk status` was).
+        Reasons stay the same detailed, raw exception text this method has
+        always produced; only the disk walk is shared, not the verdict format.
         """
         try:
             cfg = self.load_config()
@@ -3787,7 +3799,10 @@ class Store:
                 key = _signing.load_key(project_id)
             except (FileNotFoundError, OSError, ValueError):
                 key = None
-        valid_p, parse_failures = self._scan_messages_with_paths()
+        if scan_result is not None:
+            valid_p, parse_failures = scan_result
+        else:
+            valid_p, parse_failures = self._scan_messages_with_paths()
         out: list[tuple[Path, str, str]] = list(parse_failures)
         for m, p in valid_p:
             try:
@@ -4357,6 +4372,8 @@ class Store:
         list[Message],
         list[dict[str, str | None]],
         set[str],
+        list[tuple[Message, Path]],
+        list[tuple[Path, str, str]],
     ]:
         """Run the shared full validation gate over one canonical disk walk.
 
@@ -4364,6 +4381,16 @@ class Store:
         that same walk.  The public completeness snapshot uses it to distinguish
         a present-but-rejected message from a publication-ordered message whose
         file is absent.
+
+        The fourth and fifth results are the RAW ``_scan_messages_with_paths``
+        output (parse+schema-valid entries with paths, and parse/schema
+        failures) this call already paid for — callers that need a second,
+        differently-filtered view of the SAME walk (e.g. the parse+schema-valid
+        count ``all_messages()`` reports, or ``_invalid_file_entries``'s
+        richer raw-reason report) pass it back in via their own
+        ``scan_result``/pre-scanned parameter instead of re-walking the
+        message directory (#184: a multi-agent caller like ``status`` was
+        paying for this walk 20+ times over).
 
         ``collect_problems=False`` is the delivery hot path.  In particular, it
         preserves the historical fail-closed early return when no usable roster
@@ -4380,7 +4407,7 @@ class Store:
             # Preserve _validated_messages' existing no-roster fast fail-closed
             # behavior.  The diagnostic API still scans so it can explain why
             # every otherwise-parseable file was rejected.
-            return [], [], set()
+            return [], [], set(), [], []
 
         require_sig = bool(roster) and self.signing_enforced()
         project_id = self.project_id() if require_sig else None
@@ -4449,7 +4476,7 @@ class Store:
                 continue
             seen_ids.add(message.id)
             deduped.append(message)
-        return deduped, problems, present_stems
+        return deduped, problems, present_stems, scanned, scan_failures
 
     def validated_messages_with_problems(
         self,
@@ -4475,7 +4502,7 @@ class Store:
         # Retirement uses the same outer lock ordering, so roster removal cannot
         # race the gate and manufacture a mixed-roster snapshot.
         with self._retirement_lock(), self._message_publication_lock():
-            valid, problems, present_stems = self._validated_message_snapshot(
+            valid, problems, present_stems, _scanned, _scan_failures = self._validated_message_snapshot(
                 since_id=since_id,
                 collect_problems=True,
             )
@@ -4513,7 +4540,7 @@ class Store:
         ``valid_messages`` MUST keep the default ``None`` (full log) —
         epoch / thread / rescind derivation reads the whole history.
         """
-        valid, _, _ = self._validated_message_snapshot(
+        valid, _, _, _, _ = self._validated_message_snapshot(
             since_id=since_id,
             collect_problems=False,
         )

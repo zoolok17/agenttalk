@@ -37,6 +37,7 @@ from agenttalk.store import (
     LEAD_LOOP_LEASE_ENV,
     LEAD_LOOP_REMINDER_AFTER_DEFAULT,
     OPENER_KINDS,
+    Message,
     Store,
     _owner_identity_gone,
     find_root,
@@ -524,8 +525,22 @@ def _gather_status(store: Store) -> dict:
     cfg = store.load_config()
     roles = cfg.get("roles", {}) or {}
     liaison = store.operator_facing()
-    msgs = store.all_messages()
     now = datetime.now(timezone.utc)
+    # #184: ONE full validated-message scan shared by every consumer below
+    # (message_count, invalid_messages, thread warnings, and every agent's
+    # unread count) instead of each independently re-walking and
+    # re-validating the whole message directory. `status` used to pay for
+    # this scan 20+ times over on a real project store (once per roster
+    # agent via unread_for, plus once each for all_messages/
+    # list_invalid_messages/_thread_warnings) - a 45x regression on the
+    # most-used command as both the store and the roster grew.
+    valid, _problems, _present_stems, scanned, scan_failures = (
+        store._validated_message_snapshot(since_id=None, collect_problems=True)
+    )
+    msgs = [m for m, _ in scanned]  # same shape/order as store.all_messages()
+    by_recipient: dict[str, list[Message]] = {}
+    for m in valid:
+        by_recipient.setdefault(m.recipient, []).append(m)
     # Resolve the lead-loop heartbeat window from supervisor.json (if present) so the
     # status view uses the SAME threshold as the steal path - never the 120s default
     # for a wrapped agent (WP1 contract; avoids armed/heartbeat_stale skew).
@@ -574,11 +589,18 @@ def _gather_status(store: Store) -> dict:
             ttl_seconds=health_timing["ttl_seconds"],
             heartbeat_skew_seconds=health_timing["heartbeat_skew_seconds"],
         )
+        cursor = store.cursor(a)
+        # Same exclusive-cursor semantics as Store.messages_for/unread_for
+        # (`since_id and m.id <= since_id` excluded), just computed against
+        # the ONE shared, already-validated `by_recipient` grouping instead
+        # of a fresh per-agent disk re-scan (#184).
+        agent_msgs = by_recipient.get(a, [])
+        unread = agent_msgs if not cursor else [m for m in agent_msgs if m.id > cursor]
         row = {
             "name": a,
             "role": roles.get(a),
-            "cursor": store.cursor(a) or None,
-            "unread": len(store.unread_for(a)),
+            "cursor": cursor or None,
+            "unread": len(unread),
             "heartbeat": heartbeat_iso,
             "last_seen_seconds": (round(last_seen_s, 3)
                                   if last_seen_s is not None else None),
@@ -610,7 +632,16 @@ def _gather_status(store: Store) -> dict:
                 store, a, supervisor_config=sup_cfg or None)["heartbeat_stale_after"]
             row["lead_loop"] = store.lead_loop_state(a, heartbeat_stale_after=hsa)
         agents.append(row)
-    invalid = store.list_invalid_messages()
+    # Same projection list_invalid_messages() applies, over the SAME raw
+    # scan result already paid for above instead of a second full walk
+    # (#184) - reason text is untouched (still the detailed, raw text
+    # list_invalid_messages() has always produced, not the stable codes
+    # `problems` above carries for its own, differently-documented contract).
+    invalid = [
+        (ident, reason)
+        for _, ident, reason in store._invalid_file_entries(
+            scan_result=(scanned, scan_failures))
+    ]
     quarantined = store.quarantined_count()
     dead_lettered = _unresolved_dead_letter_count(store)
     signing_enforced = store.signing_enforced()
@@ -623,12 +654,14 @@ def _gather_status(store: Store) -> dict:
         coordination = _coordination_stall.build_snapshot(
             store,
             supervisor_config=sup_cfg,
+            valid_messages=valid,
         )
     except Exception:  # noqa: BLE001 - status stays fail-safe
         coordination = {"items": [], "diagnostics": []}
     coordination_items = coordination.get("items") or []
     warnings = (
-        _status_warnings(agents) + _thread_warnings(store, cfg) + supervisor_warnings
+        _status_warnings(agents) + _thread_warnings(store, cfg, valid_msgs=valid)
+        + supervisor_warnings
     )
     for item in coordination_items:
         reason = item.get("reason") if isinstance(item, dict) else None
@@ -999,7 +1032,9 @@ def cmd_compact(args: argparse.Namespace) -> int:
     return 0
 
 
-def _thread_warnings(store: Store, cfg: dict) -> list[str]:
+def _thread_warnings(
+    store: Store, cfg: dict, *, valid_msgs: list | None = None,
+) -> list[str]:
     """Thread-correlation warnings shared with `agenttalk threads`.
 
     Derived from the SAME validated message set + derivation as the
@@ -1007,20 +1042,34 @@ def _thread_warnings(store: Store, cfg: dict) -> list[str]:
     "forgot to check if the reviewer replied" footguns per agent:
       1. a correlated response is sitting unread in the inbox; and
       2. an outbound request has gone unanswered past the stale window.
+
+    ``valid_msgs``, when given, is a caller-supplied ``store.valid_messages()``
+    result — skips this function's own call so a caller that already
+    computed one (e.g. `agenttalk status`, which needs the same snapshot
+    for several other things) doesn't pay for a second full scan (#184).
     """
     roster = cfg.get("agents", []) or []
-    try:
-        msgs = store.valid_messages()
-    except (ValueError, OSError, FileNotFoundError):
-        return []
+    if valid_msgs is not None:
+        msgs = valid_msgs
+    else:
+        try:
+            msgs = store.valid_messages()
+        except (ValueError, OSError, FileNotFoundError):
+            return []
     now = datetime.now(timezone.utc)
     liaison = store.operator_facing()
     out: list[str] = []
     pending_escalations_exist = False
+    # #184: grouping messages by request_id is agent-INDEPENDENT (only the
+    # per-thread role/state labeling below varies by `agent`), but
+    # derive_threads() used to redo that O(N) grouping fresh for every
+    # roster agent. Group once, hand every agent the same pre-grouped dict.
+    grouped = th.group_messages_by_request_id(msgs)
     for a in roster:
         rows = th.derive_threads(msgs, agent=a, cursor=store.cursor(a), now=now,
                                  closed_rids=_closed_rids(store, a),
-                                 retired=set(store.retired_agents()))
+                                 retired=set(store.retired_agents()),
+                                 grouped=grouped)
         waiting = [t for t in rows if t.state == "reply-waiting"]
         if waiting:
             ids = ", ".join(t.request_id for t in waiting[:3])

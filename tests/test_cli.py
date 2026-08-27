@@ -1878,6 +1878,119 @@ def test_status_warns_about_unconsumed_reply(
     assert "pp-1" in warnings
 
 
+# ======================== #184: single-scan status regression fix =========
+
+def test_status_json_matches_expected_values_across_cursor_and_validity_edge_cases(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """Acceptance evidence for #184's fix: `_gather_status` now derives
+    message_count/invalid_messages/per-agent unread/thread warnings from
+    ONE shared `_validated_message_snapshot` call instead of each
+    independently re-scanning the message store. This asserts the exact
+    payload values for a fixture store that exercises every dimension the
+    refactor touches: a fresh cursor, a stale (non-head) cursor, no cursor
+    at all, a correlated thread with an unconsumed reply, and one invalid
+    (malformed JSON) message file. Any future change to the shared-scan
+    plumbing that alters these values breaks this test.
+    """
+    root = _team_root(tmp_path, agents="alpha,beta,gamma")
+    s = Store(root)
+
+    # A correlated thread: alpha proposes, beta replies - alpha has an
+    # unconsumed response sitting unread (same proven pattern as
+    # test_status_warns_about_unconsumed_reply above).
+    _run(["propose", "--from", "alpha", "--to", "beta",
+          "--meta", "request_id=pp-1", "-m", "do X", "--quiet"], root)
+    _run(["reply", "--from", "beta", "--kind", "proposal-response",
+          "--meta", "status=accepted", "-m", "ok"], root)
+    # A message to gamma with no cursor set at all - fully unread.
+    _run(["send", "--from", "alpha", "--to", "gamma", "-m", "task for gamma",
+          "--quiet"], root)
+    # Two messages to beta, in order; beta's cursor advances past only the
+    # FIRST, so beta's unread must be exactly the messages after it (the
+    # proposal-response beta itself sent doesn't address beta, so this is
+    # independent of the thread above).
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "beta msg 1",
+          "--quiet"], root)
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "beta msg 2",
+          "--quiet"], root)
+    # beta's inbox now has 3 messages: alpha's original propose (pp-1),
+    # "beta msg 1", "beta msg 2". Advance the cursor to "beta msg 1" - a
+    # stale-but-not-empty cursor that marks the propose AND msg 1 read,
+    # leaving only "beta msg 2" unread.
+    beta_msg_1 = next(
+        m for m in s.all_messages() if m.recipient == "beta" and m.body == "beta msg 1"
+    )
+    s.set_cursor("beta", beta_msg_1.id)
+
+    valid_before = len(s.all_messages())
+
+    # One malformed (unparseable) message file, injected directly - never
+    # produced by send(), but a real corrupt-file scenario the invalid-
+    # messages report must still surface.
+    (root / ".agenttalk" / "messages" / "20260101-000000-000000-ZZZZ.json").write_text(
+        "{not valid json", encoding="utf-8",
+    )
+
+    capsys.readouterr()
+    rc = _run(["status", "--json"], root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    # message_count: parse+schema-valid files only - the malformed one is
+    # excluded (same definition as before the fix: all_messages()'s count).
+    assert payload["message_count"] == valid_before
+
+    # invalid_messages: exactly the one malformed file, with its RAW
+    # (not stable-coded) reason text preserved - list_invalid_messages()'s
+    # existing, documented contract.
+    assert len(payload["invalid_messages"]) == 1
+    entry = payload["invalid_messages"][0]
+    assert entry["id"] == "20260101-000000-000000-ZZZZ"
+    assert "invalid JSON" in entry["reason"]
+
+    agents = {a["name"]: a for a in payload["agents"]}
+    assert agents["alpha"]["unread"] == 1  # beta's proposal-response
+    assert agents["beta"]["unread"] == 1  # only "beta msg 2" (cursor skips msg 1)
+    assert agents["gamma"]["unread"] == 1  # "task for gamma", no cursor at all
+
+    warnings = " ".join(payload["warnings"])
+    assert "unconsumed response" in warnings
+    assert "pp-1" in warnings
+
+
+def test_status_scans_the_message_store_exactly_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#184 acceptance evidence: a wall-clock perf assertion on a fixture
+    store would flake (#160) since fixture stores are tiny regardless of
+    the bug. Assert the SCAN COUNT instead: exactly one
+    `Store._validated_message_snapshot` call per `status` invocation, via
+    a counting spy - this is what a fixture-sized store CAN prove, and it
+    is the actual mechanism of the fix (multiple roster agents no longer
+    trigger multiple re-scans).
+    """
+    root = _team_root(tmp_path, agents="alpha,beta,gamma,delta,epsilon")
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "hi", "--quiet"], root)
+
+    calls = {"n": 0}
+    real = Store._validated_message_snapshot
+
+    def counting_spy(self, *args, **kwargs):
+        calls["n"] += 1
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "_validated_message_snapshot", counting_spy)
+    capsys.readouterr()
+    rc = _run(["status", "--json"], root)
+    assert rc == 0
+    json.loads(capsys.readouterr().out)  # still well-formed
+    assert calls["n"] == 1, (
+        f"expected exactly one full-store scan per status call regardless of "
+        f"the 5-agent roster, got {calls['n']}"
+    )
+
+
 # ======================== 0.13.0: ergonomics (#6/#7/#8) ====================
 
 def test_reply_dry_run_resolves_without_sending(
