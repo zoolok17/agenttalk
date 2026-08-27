@@ -254,3 +254,48 @@ def test_rename_fails_after_exhausting_the_retry_window(tmp_path: Path, monkeypa
     assert staging.path.exists()  # never moved
     assert not (tmp_path / "runs" / "scan-1").exists()
     lockmod.release_scan_lock(lock)
+
+
+# ----------------------------------------------------------- old-generation concurrent readers
+
+def test_a_reader_bound_to_the_old_generation_is_undisturbed_by_a_concurrent_publish(
+    tmp_path: Path,
+) -> None:
+    """design: 'A concurrent scan cannot disturb readers of the prior
+    published generation' and 'a reader that already loaded the old
+    catalog keeps a complete old generation.' Simulated the way a real
+    reader would experience it: read index.json, resolve scan-1's run
+    directory, hold that content — THEN a second scan publishes scan-2 —
+    then re-read what the first reader already resolved and prove it is
+    byte-identical to what it read before scan-2 ever landed."""
+    lock1, staging1 = _stage(tmp_path, "scan-1", content="generation one")
+    pub.publish_run(
+        tmp_path, staging_handle=staging1, lock_handle=lock1, scan_id="scan-1",
+        run_summary={"scan_id": "scan-1"}, predecessor_index_digest=None,
+    )
+
+    # The reader: loads the catalog, resolves ITS scan's run directory and
+    # content, and holds onto both — exactly what a caller bound to an
+    # exact scan_id (e.g. a brief-time context pack) would do.
+    reader_index_doc, digest_after_scan1 = pub.read_current_index(tmp_path)
+    reader_scan_id = reader_index_doc["latest_scan_id"]
+    reader_run_dir = tmp_path / "runs" / reader_scan_id
+    reader_content_before = (reader_run_dir / "scan.json").read_text(encoding="utf-8")
+
+    # A second scan publishes concurrently, advancing the catalog.
+    lock2, staging2 = _stage(tmp_path, "scan-2", content="generation two")
+    pub.publish_run(
+        tmp_path, staging_handle=staging2, lock_handle=lock2, scan_id="scan-2",
+        run_summary={"scan_id": "scan-2"}, predecessor_index_digest=digest_after_scan1,
+    )
+
+    # The reader's OWN generation is completely undisturbed: same directory,
+    # same content, still resolvable, even though the catalog has moved on.
+    assert reader_run_dir.is_dir()
+    assert (reader_run_dir / "scan.json").read_text(encoding="utf-8") == reader_content_before
+    assert reader_content_before == "generation one"
+
+    # The catalog itself DID advance — the reader just never re-read it.
+    live_doc, _digest = pub.read_current_index(tmp_path)
+    assert live_doc["latest_scan_id"] == "scan-2"
+    assert live_doc["latest_scan_id"] != reader_scan_id
