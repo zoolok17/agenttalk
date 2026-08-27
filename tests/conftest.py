@@ -8,11 +8,59 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from agenttalk.store import Store
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _enable_windows_symlink_creation_without_elevation() -> None:
+    """C-1 / #213 (lead's PR-B fix-round dispatch, 2026-08-27): four
+    comprehension tests create a symlink to prove a boundary guard, and
+    skip when that fails - a debt several PR-A/PR-B reviewers flagged as
+    a "fast-follow: run CI's Windows job with Developer Mode (or an
+    elevated runner)" so this executes instead of silently skipping.
+
+    Hosted GitHub Windows runners execute job steps with an unfiltered
+    administrator token already (this codebase's own
+    comprehension-network-deny.yml windows leg relies on exactly that,
+    calling `netsh advfirewall firewall add rule` with no separate
+    elevation step) - so this is self-serviceable from inside the test
+    run itself, with no workflow-file change needed. Sets the same
+    registry policy the Settings app's "Developer Mode" toggle sets
+    (``AllowDevelopmentWithoutDevicePrivilege``), which lets an
+    unprivileged process create a symlink without
+    ``SeCreateSymbolicLinkPrivilege`` - takes effect immediately, no
+    reboot, idempotent.
+
+    On a genuine non-elevated local dev machine this registry write itself
+    fails (``PermissionError``/``OSError``) - left silent here on purpose;
+    each of the four affected tests already has its own
+    ``symlink_to()``/``except (OSError, NotImplementedError):
+    pytest.skip(...)`` guard, so local dev workflows are unaffected either
+    way. Non-Windows platforms need no such policy at all.
+    """
+    if sys.platform != "win32":
+        return
+    import winreg
+
+    try:
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock",
+            0, winreg.KEY_SET_VALUE,
+        )
+    except OSError:
+        return
+    try:
+        winreg.SetValueEx(key, "AllowDevelopmentWithoutDevicePrivilege", 0, winreg.REG_DWORD, 1)
+    except OSError:
+        pass
+    finally:
+        winreg.CloseKey(key)
 
 
 @pytest.fixture

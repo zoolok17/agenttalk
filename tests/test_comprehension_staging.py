@@ -247,11 +247,14 @@ def test_reclaim_retains_an_entry_that_resolves_outside_staging(tmp_path: Path) 
         # CAVEAT (reviewer-3 F-3 on PR-A, rq-5bd5427ad64d): on Windows, an
         # unprivileged process can only create a symlink with Developer
         # Mode enabled (or SeCreateSymbolicLinkPrivilege granted) — without
-        # it this SKIPS. The design lists symlink/root-escape as required
-        # increment-1 evidence and treats Windows as a first-class
-        # platform, so on a default Windows runner this guard is
-        # UNVERIFIED here, not merely covered elsewhere. Fast-follow: run
-        # CI's Windows job with Developer Mode (or an elevated runner).
+        # it this SKIPS. C-1 / #213 (PR-B fix round): conftest.py's
+        # session-scoped `_enable_windows_symlink_creation_without_elevation`
+        # fixture now enables Developer Mode on hosted Windows CI runners
+        # (which run elevated already), so this executes there instead of
+        # skipping. This branch only still fires on a genuinely
+        # non-elevated local dev machine, where that fixture's registry
+        # write itself fails silently and this remains a graceful local
+        # skip.
         pytest.skip("symlink creation is not permitted in this environment")
     report = stg.reclaim_abandoned_staging(tmp_path)
     assert report.reclaimed == []
