@@ -45,6 +45,17 @@ def test_create_staging_dir_creates_directory_and_owner_json(
     lockmod.release_scan_lock(lock)
 
 
+def test_staging_handle_is_not_publicly_constructible() -> None:
+    """reviewer-1 cold-read finding 2 on PR-A, round 2 (rq-6cc5560b62f6):
+    per the lead's dispatch, make ``StagingHandle`` non-forgeable the same
+    way ``PrivacyPreflightResult`` was in round 3 (module-private
+    construction) — a publicly constructible handle previously let a
+    caller name an arbitrary directory and have it accepted by
+    publish-time checks that trusted the handle's claimed fields."""
+    with pytest.raises(TypeError):
+        stg.StagingHandle(path=Path("/somewhere"), scan_id="scan-1", owner_token="tok")
+
+
 def test_create_staging_dir_nonces_are_unique(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:

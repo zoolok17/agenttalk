@@ -34,6 +34,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -133,16 +134,22 @@ def rename_staging_to_run(
     ``lock_handle.owner_token`` — publishing a staging directory this lock
     never created is refused, not silently trusted.
 
-    ``StagingHandle`` is a public, trivially-constructible dataclass, so
-    none of its claimed fields are trusted on their own (reviewer-1
-    cold-read finding 2 on PR-A, rq-6cc5560b62f6, round 2, reproduced: a
-    handle naming an EXTERNAL directory, with a copied real
-    ``owner_token``, was accepted by the owner-token string comparison
-    alone and its content published under ``runs/``). ``staging_handle.path``
-    is therefore resolved and confined to the lock's own ``.staging/``
-    directory, and trust is RE-DERIVED from the ``owner.json`` actually on
-    disk at that confined path (never from the handle's claimed fields) —
-    both raise :class:`~.errors.StagingSourceEscapesRoot`.
+    ``StagingHandle`` can now ONLY be obtained from
+    ``staging.create_staging_dir`` — direct construction raises
+    ``TypeError`` (same module-private-construction pattern as
+    ``privacy.PrivacyPreflightResult``, closing the class of forgery
+    reviewer-1 cold-read finding 2 on PR-A, rq-6cc5560b62f6, round 2,
+    reproduced: a PUBLICLY constructed handle naming an EXTERNAL
+    directory, with a copied real ``owner_token``, was accepted by the
+    owner-token string comparison alone and its content published under
+    ``runs/``). None of a handle's claimed fields are trusted on their own
+    regardless, as defense in depth: ``staging_handle.path`` is resolved
+    and confined to the lock's own ``.staging/`` directory, its final path
+    segment is checked against the exact ``<scan_id>-<nonce>`` shape
+    :func:`staging.create_staging_dir` names it with, and trust is
+    RE-DERIVED from the ``owner.json`` actually on disk at that confined
+    path (never from the handle's claimed fields) — all three raise
+    :class:`~.errors.StagingSourceEscapesRoot`.
     """
     if staging_handle.owner_token != lock_handle.owner_token:
         raise StagingOwnershipMismatch(
@@ -160,6 +167,16 @@ def rename_staging_to_run(
             f"staging_handle.path {staging_handle.path} does not resolve under "
             f"{staging_root} — refusing to rename a directory outside .staging/"
         ) from exc
+    expected_prefix = f"{scan_id}-"
+    nonce = (
+        staging_path.name[len(expected_prefix):]
+        if staging_path.name.startswith(expected_prefix) else ""
+    )
+    if not nonce or not re.fullmatch(r"[0-9a-f]+", nonce):
+        raise StagingSourceEscapesRoot(
+            f"staging_handle.path name {staging_path.name!r} does not match the "
+            f"<scan_id>-<nonce> shape create_staging_dir() names it with for scan_id "
+            f"{scan_id!r}")
     try:
         owner_doc = _validate_owner_doc(read_json_document(staging_path / _OWNER_FILENAME))
     except EnvelopeError as exc:

@@ -42,6 +42,17 @@ from .paths import staging_dir as _staging_dir
 OWNER_SCHEMA_VERSION = 1
 _OWNER_FILENAME = "owner.json"
 
+#: Sentinel identity only this module's own factory function holds — mirrors
+#: ``privacy._ISSUED_BY_THIS_MODULE`` exactly (same non-fabricability
+#: rationale, same non-cryptographic caveat). Added per the lead's PR-A
+#: round-4 dispatch, on top of round-4's resolve-and-confine fix in
+#: ``publish.rename_staging_to_run``: reviewer-1 reproduced a publicly
+#: constructed ``StagingHandle`` naming an external directory being
+#: accepted by an owner-token string comparison alone. Confinement closes
+#: that specific path; this closes the broader class by making
+#: construction itself unreachable outside :func:`create_staging_dir`.
+_ISSUED_BY_THIS_MODULE = object()
+
 
 def _utc_now_iso(now: datetime | None) -> str:
     moment = now or datetime.now(timezone.utc)
@@ -52,9 +63,24 @@ def _utc_now_iso(now: datetime | None) -> str:
 
 @dataclass(frozen=True)
 class StagingHandle:
+    """Returned only by :func:`create_staging_dir` — direct construction
+    raises ``TypeError`` (same module-private-construction pattern as
+    ``privacy.PrivacyPreflightResult``, applied here per the lead's PR-A
+    round-4 dispatch: a publicly constructible handle let a caller name an
+    arbitrary directory and have it accepted by publish-time checks that
+    trusted the handle's own claimed fields)."""
+
     path: Path
     scan_id: str
     owner_token: str
+    _issued_by: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._issued_by is not _ISSUED_BY_THIS_MODULE:
+            raise TypeError(
+                "StagingHandle must be obtained from create_staging_dir() - it cannot "
+                "be constructed directly"
+            )
 
 
 @dataclass(frozen=True)
@@ -115,7 +141,8 @@ def create_staging_dir(
         encoding="utf-8",
     )
     return StagingHandle(
-        path=path, scan_id=validated_scan_id, owner_token=lock_handle.owner_token)
+        path=path, scan_id=validated_scan_id, owner_token=lock_handle.owner_token,
+        _issued_by=_ISSUED_BY_THIS_MODULE)
 
 
 def _validate_owner_doc(doc: Any) -> dict:

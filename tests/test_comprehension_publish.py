@@ -119,31 +119,56 @@ def test_rename_refuses_a_staging_handle_from_a_different_lock(
     lockmod.release_scan_lock(lock2)
 
 
-def test_rename_refuses_a_forged_handle_naming_an_external_directory(
+def test_rename_refuses_a_handle_whose_path_names_an_external_directory(
     comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
 ) -> None:
     """reviewer-1 cold-read finding 2 on PR-A, round 2 (rq-6cc5560b62f6),
-    reproduced: ``StagingHandle`` is a public, trivially-constructible
-    dataclass — a handle naming an EXTERNAL directory (never created by
+    reproduced: a handle naming an EXTERNAL directory (never created by
     ``create_staging_dir``, outside ``.staging/`` entirely), carrying a
     COPIED real ``owner_token``, was previously accepted by the
     owner-token string comparison alone; the external directory was
     removed from its own location and its content published under
-    ``runs/``. The fix must confine the source and re-derive trust from
-    the actual owner.json on disk, so this is refused even though the
-    forged handle's ``owner_token`` field genuinely matches the lock."""
+    ``runs/``. ``StagingHandle`` is no longer publicly constructible (see
+    the test above), so this defense-in-depth path is exercised via a
+    legitimately-issued handle whose frozen ``path`` field is tampered
+    with post-construction — the confine-and-cross-check-against-disk fix
+    must catch this regardless of how ``path`` came to disagree with
+    where the handle was actually created."""
     lock = lockmod.acquire_scan_lock(
         comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    real = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
     external = comprehension_dir.parent.parent / "outside-comprehension-entirely"
     external.mkdir(parents=True)
     (external / "scan.json").write_text("stolen content", encoding="utf-8")
-    forged = stg.StagingHandle(path=external, scan_id="scan-1", owner_token=lock.owner_token)
+    object.__setattr__(real, "path", external)
 
     with pytest.raises(pub.StagingSourceEscapesRoot):
-        pub.rename_staging_to_run(forged, lock)
+        pub.rename_staging_to_run(real, lock)
 
     assert external.exists()  # never moved
     assert (external / "scan.json").read_text(encoding="utf-8") == "stolen content"
+    assert not (comprehension_dir / "runs" / "scan-1").exists()
+    lockmod.release_scan_lock(lock)
+
+
+def test_rename_refuses_a_handle_whose_path_name_has_the_wrong_scan_id_nonce_shape(
+    comprehension_dir: Path, comprehension_privacy: PrivacyPreflightResult,
+) -> None:
+    """A handle confined correctly under ``.staging/`` but whose directory
+    name does not match the exact ``<scan_id>-<nonce>`` shape
+    ``create_staging_dir`` names it with must also be refused — confinement
+    alone does not prove the directory is what it claims to be."""
+    lock = lockmod.acquire_scan_lock(
+        comprehension_dir, privacy=comprehension_privacy, predecessor_index_digest=None)
+    real = stg.create_staging_dir(scan_id="scan-1", lock_handle=lock)
+    wrongly_named = real.path.parent / "scan-1-not-a-hex-nonce"
+    real.path.rename(wrongly_named)
+    object.__setattr__(real, "path", wrongly_named)
+
+    with pytest.raises(pub.StagingSourceEscapesRoot, match="nonce"):
+        pub.rename_staging_to_run(real, lock)
+
+    assert wrongly_named.exists()  # never moved
     assert not (comprehension_dir / "runs" / "scan-1").exists()
     lockmod.release_scan_lock(lock)
 
