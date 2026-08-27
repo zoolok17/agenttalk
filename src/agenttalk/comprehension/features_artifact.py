@@ -1,0 +1,145 @@
+"""``features.json`` record assembly (DESIGN-55-comprehension-plane.md,
+Artifact 3: feature and entry-point map).
+
+"A detector may create only a candidate. Confirmation requires an explicit
+local declaration in `config.json` or a supported pointer to confirmed
+onboarding evidence; confidence alone never promotes a feature." Per the
+lead's decided plan disposition #2 for this slice: v1 confirmation is a
+versioned ``config.json`` declaration only (onboarding-record confirmation
+is deferred). ``config.json`` parsing itself lands with CLI wiring (item
+9); this module accepts an already-parsed set of confirmed labels so it
+does not need to know that format yet.
+
+Grouping heuristic for this slice (Java-only, flagged for review, not a
+blocking fork): one CANDIDATE feature per owning unit that has at least
+one detected entry point, labeled with that unit's own display name. This
+keeps every entry point linked to exactly one feature by construction (the
+design's other reportable gap - "an entry point with no feature link" -
+cannot occur under this heuristic) without guessing at a broader,
+semantically-grouped feature boundary a detector cannot actually evidence.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from . import digests
+from .adapters import java as java_adapter
+from .dependencies_artifact import _build_registry, _java_file_unit_id
+
+
+@dataclass(frozen=True)
+class EntryPointRecord:
+    entry_point_id: str
+    kind: str
+    name: str
+    owning_unit_id: str
+    feature_ids: list[str]
+    evidence_class: str
+    producers: list[dict[str, Any]] = field(default_factory=list)
+    conflict_id: str | None = None
+    confidence: str | None = None
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "entry_point_id": self.entry_point_id,
+            "kind": self.kind,
+            "name": self.name,
+            "owning_unit_id": self.owning_unit_id,
+            "feature_ids": sorted(self.feature_ids),
+            "evidence_class": self.evidence_class,
+            "producers": self.producers,
+            "conflict_id": self.conflict_id,
+            "confidence": self.confidence,
+            "evidence": self.evidence,
+        }
+
+
+@dataclass(frozen=True)
+class FeatureRecord:
+    feature_id: str
+    label: str
+    state: str
+    origin: str
+    unit_ids: list[str]
+    entry_point_ids: list[str]
+    producers: list[dict[str, Any]] = field(default_factory=list)
+    conflict_id: str | None = None
+    confidence: str | None = None
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "feature_id": self.feature_id,
+            "label": self.label,
+            "state": self.state,
+            "origin": self.origin,
+            "unit_ids": sorted(self.unit_ids),
+            "entry_point_ids": sorted(self.entry_point_ids),
+            "producers": self.producers,
+            "conflict_id": self.conflict_id,
+            "confidence": self.confidence,
+            "evidence": self.evidence,
+        }
+
+
+def _producer(source_digest: str | None) -> dict[str, Any]:
+    return {
+        "producer": java_adapter.ADAPTER_NAME, "producer_version": java_adapter.ADAPTER_VERSION,
+        "rule_version": java_adapter.RULE_VERSION, "basis": "extracted",
+        "source_digest": source_digest,
+    }
+
+
+def build_features(
+    java_results: dict[str, java_adapter.JavaFileResult],
+    *, confirmed_labels: frozenset[str] = frozenset(),
+) -> tuple[list[EntryPointRecord], list[FeatureRecord]]:
+    """Returns ``(entry_points, features)``. ``confirmed_labels`` names
+    which candidate feature labels a ``config.json`` declaration confirms
+    (state -> ``confirmed``) - an empty set (the default) means every
+    feature stays ``candidate``, matching "a detector may create only a
+    candidate.\""""
+    by_qualified_name, _by_simple_name, _file_unit_ids = _build_registry(java_results)
+
+    owning_unit_by_qualified_name = by_qualified_name
+    entry_points_by_owner: dict[str, list[tuple[str, java_adapter.JavaEntryPointClaim]]] = {}
+
+    for path, result in java_results.items():
+        for claim in result.entry_points:
+            owning_unit_id = owning_unit_by_qualified_name.get(
+                claim.qualified_name, _java_file_unit_id(path),
+            )
+            entry_points_by_owner.setdefault(owning_unit_id, []).append((path, claim))
+
+    entry_point_records: list[EntryPointRecord] = []
+    features: list[FeatureRecord] = []
+
+    for owning_unit_id, claims in entry_points_by_owner.items():
+        owner_path, first_claim = claims[0]
+        label = first_claim.qualified_name.rsplit(".", 1)[-1]
+        feature_id = digests.feature_id(label=label, unit_ids=[owning_unit_id])
+        entry_point_ids_for_feature: list[str] = []
+
+        for _path, claim in claims:
+            entry_point_id = digests.entry_point_id(
+                kind=claim.kind, owning_unit_id=owning_unit_id, name=claim.name,
+            )
+            entry_point_ids_for_feature.append(entry_point_id)
+            entry_point_records.append(EntryPointRecord(
+                entry_point_id=entry_point_id, kind=claim.kind, name=claim.name,
+                owning_unit_id=owning_unit_id, feature_ids=[feature_id],
+                evidence_class=claim.evidence_class,
+                producers=[_producer(None)],
+            ))
+
+        state = "confirmed" if label in confirmed_labels else "candidate"
+        features.append(FeatureRecord(
+            feature_id=feature_id, label=label, state=state, origin="detected",
+            unit_ids=[owning_unit_id], entry_point_ids=entry_point_ids_for_feature,
+            producers=[_producer(None)],
+        ))
+
+    return entry_point_records, features
