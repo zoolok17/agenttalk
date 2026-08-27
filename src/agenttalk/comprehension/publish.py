@@ -39,6 +39,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .ceilings import enforce_artifact_ceilings, measure_staging_artifacts
 from .digests import canonical_content_digest
 from .envelope import read_json_document, validate_envelope
 from .errors import ComprehensionError
@@ -234,16 +235,29 @@ def publish_run(
     run_summary: dict,
     predecessor_index_digest: str | None,
     now: datetime | None = None,
+    record_counts: dict[str, int] | None = None,
 ) -> dict:
-    """The ordinary end-to-end orchestrator: rename, CAS-write the index,
-    then always release the lock — on success AND on any REPORTED
-    (caught) failure alike (design step 3). A real process crash mid-
-    sequence never reaches the ``finally`` below at all, which is exactly
-    what leaves the lock file behind for the next scanner's stale-recovery
-    path to reason about; tests exercise that by calling the individual
-    step functions directly instead of this orchestrator.
+    """The ordinary end-to-end orchestrator: enforce the durable-artifact
+    ceilings, rename, CAS-write the index, then always release the lock —
+    on success AND on any REPORTED (caught) failure alike (design step 3).
+    A real process crash mid-sequence never reaches the ``finally`` below
+    at all, which is exactly what leaves the lock file behind for the next
+    scanner's stale-recovery path to reason about; tests exercise that by
+    calling the individual step functions directly instead of this
+    orchestrator.
+
+    ``record_counts`` maps each staged artifact filename to its record
+    count for the ceiling check (design: "16 MiB and 100,000 records per
+    artifact, and 64 MiB and 250,000 records for all durable artifacts in
+    one run") — omit it (or a given filename) to measure that artifact's
+    record count as 0, which only makes the record ceiling MORE permissive
+    for a caller that has not measured it, never less; the byte ceiling is
+    always measured directly from disk regardless.
     """
     try:
+        measurements = measure_staging_artifacts(
+            staging_handle.path, record_counts=record_counts or {})
+        enforce_artifact_ceilings(measurements)
         rename_staging_to_run(comprehension_dir, staging_handle, scan_id=scan_id)
         return publish_index_cas(
             comprehension_dir, scan_id=scan_id, run_summary=run_summary,
