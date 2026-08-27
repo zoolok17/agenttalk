@@ -28,6 +28,7 @@ evidence this module's stale-recovery path reasons about.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 import uuid
@@ -48,6 +49,32 @@ LOCK_SCHEMA_VERSION = 1
 _VALID_VCS_PRIVACY = ("ignored", "acknowledged_unignored", "no_vcs_acknowledged")
 
 
+def _windows_computer_name() -> str | None:
+    """Query the OS directly for this Windows host's NetBIOS computer name
+    via ``kernel32!GetComputerNameW`` — no ``socket``, and critically no
+    dependence on any inherited PROCESS ENVIRONMENT VARIABLE (reviewer-1
+    cold-read finding 3 on PR-A, rq-6cc5560b62f6, round 3, reproduced: the
+    prior ``os.environ.get("COMPUTERNAME")``-only implementation raised
+    unconditionally under ``dev_gate.py``'s own allowlisted subprocess
+    environment, which never forwards ``COMPUTERNAME`` to the pytest
+    child process it spawns — every comprehension test that calls
+    ``acquire_scan_lock``/``create_staging_dir`` failed on Windows CI as a
+    result). The Win32 API call itself is unaffected by what the parent
+    process chose to pass through; only the caller's own read of
+    ``os.environ`` was ever strippable. Returns ``None`` on any failure so
+    the caller can fall back, never raising here directly.
+    """
+    get_computer_name = ctypes.windll.kernel32.GetComputerNameW  # type: ignore[attr-defined]
+    size = ctypes.c_ulong(0)
+    get_computer_name(None, ctypes.byref(size))  # discover the required buffer size
+    if size.value == 0:
+        return None
+    buffer = ctypes.create_unicode_buffer(size.value)
+    if not get_computer_name(buffer, ctypes.byref(size)):
+        return None
+    return buffer.value or None
+
+
 def host_identity() -> str:
     """The current host's identity for the lock record. A function (not a
     module-level constant) so tests can monkeypatch it to simulate a
@@ -63,15 +90,24 @@ def host_identity() -> str:
     process at the prior SHA. The design's offline contract prohibits both
     importing AND calling into a network-capable module, so a module that
     is merely socket-free ITSELF is not enough if a stdlib helper it calls
-    imports one transitively). On POSIX, ``os.uname().nodename`` queries
-    the kernel directly (no ``socket`` involved at all); on Windows,
-    ``COMPUTERNAME`` is the OS's own environment variable for this same
-    value, requiring no OS call at all. Either way this is stable for the
-    lifetime of the host between reboots — exactly the determinism
+    imports one transitively).
+
+    The PRIMARY source on each platform is an OS-level query, never a
+    process environment variable (reviewer-1 cold-read finding 3, round 3,
+    reproduced: reading ``COMPUTERNAME`` as the ONLY Windows source broke
+    unconditionally under ``dev_gate.py``'s allowlisted CI subprocess
+    environment, which never forwards it — a single strippable env var is
+    not a robust identity source). On Windows, :func:`_windows_computer_name`
+    queries ``GetComputerNameW`` directly (socket-free, environment-
+    independent). On POSIX, ``os.uname().nodename`` queries the kernel
+    directly (no ``socket``, no environment either). ``COMPUTERNAME``/
+    ``HOSTNAME`` are consulted only as a LAST-RESORT FALLBACK if the OS
+    query itself fails — never the primary path. Either way this is stable
+    for the lifetime of the host between reboots — exactly the determinism
     scan.lock's cross-host detection needs.
     """
     if os.name == "nt":
-        node = os.environ.get("COMPUTERNAME")
+        node = _windows_computer_name()
     elif hasattr(os, "uname"):
         node = os.uname().nodename
     else:
@@ -81,7 +117,7 @@ def host_identity() -> str:
     if node:
         return node
     raise ScanLockUnrecoverable(
-        "this host's identity could not be determined (os.uname()/COMPUTERNAME and the "
+        "this host's identity could not be determined (the OS-level query and the "
         "COMPUTERNAME/HOSTNAME environment variables are all empty)")
 
 

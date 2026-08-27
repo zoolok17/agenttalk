@@ -474,3 +474,47 @@ def test_host_identity_never_transitively_imports_socket_at_runtime() -> None:
     observed = json.loads(result.stdout.strip().splitlines()[-1])
     assert observed == {"before": False, "after": False}, (
         f"host_identity() transitively imported socket: {observed}\nstderr: {result.stderr}")
+
+
+def test_host_identity_succeeds_under_the_dev_gates_allowlisted_environment(
+    tmp_path: Path,
+) -> None:
+    """reviewer-1 cold-read finding 3 on PR-A, round 3 (rq-6cc5560b62f6):
+    ``host_identity()`` reading ``os.environ.get("COMPUTERNAME")`` as its
+    ONLY Windows source broke unconditionally under ``dev_gate.py``'s own
+    allowlisted subprocess environment — the gate's ``_base_env`` never
+    forwards ``COMPUTERNAME``/``HOSTNAME`` to the pytest child process it
+    spawns for either the source or wheel leg, so every comprehension test
+    calling ``acquire_scan_lock``/``create_staging_dir`` failed on Windows
+    CI. This is the #76 "close the channel, not the instance" gap: the
+    comprehension suite had never once run under the gate's own stripped
+    environment on a dev host, so nothing caught it locally before CI did.
+
+    Reuses ``dev_gate._base_env`` DIRECTLY (never a hand-rolled
+    approximation of it) so this test can never drift out of sync with the
+    real gate's environment contract — if the allowlist ever changes,
+    this test inherits that change automatically. Explicitly pops
+    ``COMPUTERNAME``/``HOSTNAME`` in addition (defense in depth: they are
+    not currently in the allowlist, but if a future change added one back,
+    this test would still exercise the true worst case).
+    """
+    import subprocess
+    import sys
+
+    from agenttalk.dev_gate import _base_env
+
+    env = _base_env(tmp_path)
+    env.pop("COMPUTERNAME", None)
+    env.pop("HOSTNAME", None)
+    # The gate's real "source" leg sets PYTHONPATH itself (source_environment);
+    # here we point it at whatever import root THIS test process's own
+    # agenttalk.comprehension.lock actually resolved from, so the probe
+    # exercises the exact code under test rather than a stale installed copy.
+    env["PYTHONPATH"] = str(Path(lockmod.__file__).resolve().parents[2])
+    probe = "from agenttalk.comprehension.lock import host_identity\nprint(host_identity())\n"
+    result = subprocess.run(  # noqa: S603  # nosec B603
+        [sys.executable, "-c", probe], capture_output=True, text=True, env=env)
+    assert result.returncode == 0, (
+        "host_identity() failed under the dev-gate's allowlisted environment "
+        f"(COMPUTERNAME/HOSTNAME both absent): {result.stderr}")
+    assert result.stdout.strip()
