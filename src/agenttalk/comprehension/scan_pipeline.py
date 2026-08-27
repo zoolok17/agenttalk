@@ -159,24 +159,19 @@ def run_scan(
         relative_paths = [f.relative_path for f in discovery_result.files]
         worker_result = worker.run_sanitized_worker(root, relative_paths)
 
+        # B-3 (reviewer-3, PR-B delta review): pom.xml build-relation
+        # extraction is dispatched INSIDE the sanitized worker now (same as
+        # every other adapter path) - worker_result.java_results already
+        # carries a pom.xml's parsed build edges keyed by its own relative
+        # path, so no separate parent-process read or separate
+        # build_edges_by_path threading is needed here anymore.
         java_results = {
             path: java_adapter.file_result_from_json(payload)
             for path, payload in worker_result.java_results.items()
         }
-        build_edges_by_path: dict[str, list[java_adapter.JavaEdgeClaim]] = {}
-        for file_entry in discovery_result.files:
-            if file_entry.relative_path.endswith("pom.xml"):
-                pom_path = root / file_entry.relative_path
-                try:
-                    pom_text = pom_path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                build_edges_by_path[file_entry.relative_path] = java_adapter.parse_maven_pom(
-                    file_entry.relative_path, pom_text)
 
         modules = modules_artifact.build_modules(discovery_result, java_results)
-        dependencies = dependencies_artifact.build_dependencies(
-            java_results, build_edges_by_path=build_edges_by_path)
+        dependencies = dependencies_artifact.build_dependencies(java_results)
         entry_points, features = features_artifact.build_features(java_results)
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
             modules, dependencies, features)
@@ -260,8 +255,18 @@ def run_scan(
         record_counts["scan.json"] = 1
 
         run_summary = {"scan_id": scan_id, "status": status}
-    except BaseException:
-        lock.release_scan_lock(lock_handle)
+    except BaseException as original_exc:
+        # F-2 (reviewer-3, PR-B delta review): if the release itself
+        # refuses (e.g. ScanLockUnrecoverable), a bare `raise` here would
+        # let that NEW exception replace the original failure that
+        # triggered this handler, masking the real reason from the
+        # operator. Chain instead, so the original failure is always what
+        # surfaces, with the release refusal attached as its cause - never
+        # replaced by it.
+        try:
+            lock.release_scan_lock(lock_handle)
+        except Exception as release_exc:  # noqa: BLE001 - the ORIGINAL failure must still surface
+            raise original_exc from release_exc
         raise
 
     index = publish.publish_run(

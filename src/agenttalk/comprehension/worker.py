@@ -180,6 +180,26 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                     detail=f"{adapter.ADAPTER_NAME} adapter failed: {exc}"))
             else:
                 java_results[rel] = adapter.file_result_to_json(result)
+        elif Path(rel).name == "pom.xml":
+            # reviewer-3 B-3 (PR-B delta review): a pom.xml's build-relation
+            # extraction used to happen in the PARENT process, reading the
+            # file directly and bypassing this worker entirely - the one
+            # content path where the design's "adapters run inside the
+            # sanitized worker, stdin/stdout is the sole channel" boundary
+            # statement did not hold. Route it through the SAME already-read
+            # bytes and the SAME java_results channel every other adapter
+            # claim uses, wrapped as a JavaFileResult with no units/entry
+            # points of its own.
+            try:
+                text = data.decode("utf-8", errors="replace")
+                build_edges = java_adapter.parse_maven_pom(rel, text)
+            except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
+                problems.append(WorkerProblem(
+                    reason_code="parse_failed", relative_path=rel,
+                    detail=f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}"))
+            else:
+                java_results[rel] = java_adapter.file_result_to_json(
+                    java_adapter.JavaFileResult(edges=build_edges))
 
     return WorkerResult(
         schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,
@@ -206,6 +226,17 @@ def _result_to_json(result: WorkerResult) -> dict[str, Any]:
             }
             for problem in result.problems
         ],
+        # reviewer-3 B-1 (PR-B delta review): this field was previously
+        # missing here entirely - the worker computed adapter claims
+        # correctly, held them on its in-memory result, but never emitted
+        # them across the stdout channel, so the reader always
+        # reconstructed an empty dict regardless of what was actually
+        # parsed. A scan run through the REAL worker therefore reported
+        # `complete` while silently carrying no adapter-derived units,
+        # edges, or entry points at all. Every WorkerResult field must
+        # round-trip - see test_worker_result_json_round_trip_preserves_
+        # every_field, the reviewer's repro made permanent.
+        "java_results": result.java_results,
     }
 
 
@@ -233,9 +264,13 @@ def _result_from_json(payload: Any) -> WorkerResult:
             )
             for item in payload["problems"]
         ]
+        java_results = dict(payload.get("java_results", {}))
     except (KeyError, TypeError) as exc:
         raise WorkerError(f"worker output is malformed: {exc}") from exc
-    return WorkerResult(schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems)
+    return WorkerResult(
+        schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,
+        java_results=java_results,
+    )
 
 
 def run_sanitized_worker(

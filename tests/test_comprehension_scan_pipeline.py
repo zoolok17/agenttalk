@@ -77,6 +77,18 @@ def test_run_scan_publishes_a_complete_run(java_repo: Path) -> None:
     assert (outcome.run_dir / "scan.json").exists()
 
 
+def test_run_scan_carries_the_pom_xml_build_edge_through_the_worker(java_repo: Path) -> None:
+    """B-3 (reviewer-3, PR-B delta review): pom.xml's build edge must
+    reach dependencies.json via the sanitized worker's own java_results
+    channel - not a direct parent-process read of the file."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    build_edges = [e for e in doc["edges"] if e["relation"] == "build"]
+    assert build_edges and build_edges[0]["target_external"] == "org.springframework:spring-core"
+
+
 def test_run_scan_refuses_without_privacy_proof_and_writes_nothing(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     (tmp_path / ".gitignore").write_text("build/\n", encoding="utf-8")  # does NOT ignore .agenttalk/
@@ -174,6 +186,39 @@ def test_validate_run_reports_valid_for_a_healthy_run(java_repo: Path) -> None:
 def test_validate_run_before_any_scan_raises_not_scanned(tmp_path: Path) -> None:
     with pytest.raises(scan_pipeline.NotScanned):
         scan_pipeline.validate_run(tmp_path)
+
+
+# ----------------------------------------------------------- failure-path lock release (F-2)
+
+def test_run_scan_failure_surfaces_the_original_error_even_if_release_also_fails(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """F-2 (reviewer-3, PR-B delta review): if the lock release ITSELF
+    refuses while unwinding from an original failure, the ORIGINAL failure
+    must still be what the caller sees - never silently replaced by the
+    release refusal. The release refusal is attached as the cause, not
+    substituted for the original exception."""
+    from agenttalk.comprehension import lock as lockmod
+    from agenttalk.comprehension import modules_artifact
+
+    class _OriginalFailure(RuntimeError):
+        pass
+
+    class _ReleaseFailure(RuntimeError):
+        pass
+
+    def _boom_build_modules(*_args, **_kwargs):
+        raise _OriginalFailure("original pipeline failure")
+
+    def _boom_release(*_args, **_kwargs):
+        raise _ReleaseFailure("release also refused")
+
+    monkeypatch.setattr(modules_artifact, "build_modules", _boom_build_modules)
+    monkeypatch.setattr(lockmod, "release_scan_lock", _boom_release)
+
+    with pytest.raises(_OriginalFailure) as excinfo:
+        scan_pipeline.run_scan(java_repo)
+    assert isinstance(excinfo.value.__cause__, _ReleaseFailure)
 
 
 # ----------------------------------------------------------- ceilings integration

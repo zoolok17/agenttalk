@@ -87,6 +87,26 @@ def test_process_paths_reports_an_unreadable_path_as_a_problem(tmp_path: Path) -
     assert result.problems[0].reason_code == "parse_failed"
 
 
+def test_process_paths_dispatches_pom_xml_through_the_java_results_channel(
+    tmp_path: Path,
+) -> None:
+    """B-3 (reviewer-3, PR-B delta review): pom.xml build-relation
+    extraction must happen INSIDE this worker, on the same bytes already
+    read here - never a second, separate read in the parent process."""
+    (tmp_path / "pom.xml").write_text(
+        "<project><dependencies><dependency>"
+        "<groupId>org.springframework</groupId><artifactId>spring-core</artifactId>"
+        "</dependency></dependencies></project>",
+        encoding="utf-8",
+    )
+    result = worker.process_paths(tmp_path, ["pom.xml"])
+    assert result.problems == []
+    assert "pom.xml" in result.java_results
+    edges = result.java_results["pom.xml"]["edges"]
+    assert edges and edges[0]["target"] == "org.springframework:spring-core"
+    assert edges[0]["relation"] == "build"
+
+
 def test_process_paths_is_deterministic_regardless_of_input_order(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_bytes(b"hello")
     (tmp_path / "b.txt").write_bytes(b"world!")
@@ -134,6 +154,38 @@ class _FakeStdin:
 
     def read(self) -> str:
         return self._text
+
+
+# ----------------------------------------------------------- JSON round-trip (B-1 regression)
+
+def test_worker_result_json_round_trip_preserves_every_field(tmp_path: Path) -> None:
+    """reviewer-3's B-1 repro, made permanent: adapter claims computed by
+    process_paths must survive _result_to_json -> _result_from_json intact.
+    Before this fix, java_results was silently dropped by both functions -
+    process_paths computed it correctly, but a real scan run through the
+    REAL subprocess (which must serialize/deserialize across stdout) always
+    reconstructed an empty dict regardless of what was actually parsed."""
+    (tmp_path / "A.java").write_text(
+        "package p;\nclass A {\n  public static void main(String[] a) {}\n}\n",
+        encoding="utf-8",
+    )
+    computed = worker.process_paths(tmp_path, ["A.java"])
+    assert computed.java_results, "process_paths itself must have produced a java_results entry"
+
+    round_tripped = worker._result_from_json(worker._result_to_json(computed))
+
+    assert round_tripped.java_results == computed.java_results
+    assert round_tripped.file_claims == computed.file_claims
+    assert round_tripped.problems == computed.problems
+
+
+def test_worker_result_json_round_trip_of_an_empty_java_results_stays_empty(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    computed = worker.process_paths(tmp_path, ["a.txt"])
+    round_tripped = worker._result_from_json(worker._result_to_json(computed))
+    assert round_tripped.java_results == {}
 
 
 # ----------------------------------------------------------- run_sanitized_worker (mocked subprocess)
