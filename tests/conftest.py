@@ -18,12 +18,26 @@ from agenttalk.store import Store
 
 _SYMLINK_DEVMODE_SUBKEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
 _SYMLINK_DEVMODE_VALUE = "AllowDevelopmentWithoutDevicePrivilege"
+#: Dedicated, repo-specific opt-in - required IN ADDITION to CI/
+#: GITHUB_ACTIONS (C-1a, reviewer-3 PR-B delta review round 2): those two
+#: platform variables are also set by common local Actions emulators
+#: (e.g. `act`), which would otherwise mutate a maintainer's real machine
+#: - exactly the outcome this gate exists to prevent. Same dedicated-
+#: opt-in-variable pattern test_comprehension_network_deny.py already
+#: uses for its own OS-mutating tests; set explicitly only in the CI
+#: job(s) that need the symlink tests to execute (tests.yml's Windows leg).
+_SYMLINK_DEVMODE_AUTH_VAR = "AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE"
+
+#: Sentinel for "reading the prior value failed unexpectedly" (C-1b) -
+#: distinct from `None`, which means "confirmed absent".
+_READ_FAILED = object()
 
 
-def _running_on_github_actions() -> bool:
+def _symlink_devmode_authorized() -> bool:
     return (
         os.environ.get("CI", "").lower() == "true"
         and os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+        and os.environ.get(_SYMLINK_DEVMODE_AUTH_VAR) == "1"
     )
 
 
@@ -36,7 +50,7 @@ def _windows_symlink_devmode_session(winreg_module=None):
 
     Exactly one ``yield`` on every path (required for a generator-based
     pytest fixture) - setup runs before it, teardown/restore after."""
-    if sys.platform != "win32" or not _running_on_github_actions():
+    if sys.platform != "win32" or not _symlink_devmode_authorized():
         yield
         return
     winreg = winreg_module
@@ -58,11 +72,19 @@ def _windows_symlink_devmode_session(winreg_module=None):
             prior_value, prior_type = winreg.QueryValueEx(key, _SYMLINK_DEVMODE_VALUE)
         except FileNotFoundError:
             prior_value, prior_type = None, None
-        try:
-            winreg.SetValueEx(key, _SYMLINK_DEVMODE_VALUE, 0, winreg.REG_DWORD, 1)
-            wrote = True
         except OSError:
-            pass
+            # C-1b (reviewer-3, PR-B delta review round 2): an unexpected
+            # read failure here (not "value absent", something else) means
+            # nothing has been written yet - degrade to a graceful no-op
+            # exactly like the neighbouring CreateKeyEx failure path above,
+            # never error the whole test session over it.
+            prior_value = _READ_FAILED
+        if prior_value is not _READ_FAILED:
+            try:
+                winreg.SetValueEx(key, _SYMLINK_DEVMODE_VALUE, 0, winreg.REG_DWORD, 1)
+                wrote = True
+            except OSError:
+                pass
     finally:
         winreg.CloseKey(key)
 
@@ -115,15 +137,18 @@ def _enable_windows_symlink_creation_without_elevation():
     ``SeCreateSymbolicLinkPrivilege`` - takes effect immediately, no
     reboot.
 
-    STRICTLY gated on actually running under GitHub Actions
-    (``CI=true`` and ``GITHUB_ACTIONS=true``, both set by the platform
-    itself, never by this repo) - the same opt-in discipline
-    test_comprehension_network_deny.py uses for its own OS-mutating tests.
-    A local run, even an elevated one on a maintainer's real machine, MUST
-    NOT mutate a machine-global registry policy as a side effect of
-    running the test suite - that was the lead's correction to this
-    fixture's first version, which wrote unconditionally whenever it
-    happened to have the rights to.
+    STRICTLY gated on actually running under GitHub Actions (``CI=true``
+    and ``GITHUB_ACTIONS=true``) AND this repo's own dedicated opt-in
+    variable (``AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE=1``, set explicitly
+    only in the CI job(s) that need these tests to execute) - the same
+    dedicated-opt-in-variable discipline test_comprehension_network_deny.py
+    uses for its own OS-mutating tests. A local run, even an elevated one
+    on a maintainer's real machine, MUST NOT mutate a machine-global
+    registry policy as a side effect of running the test suite - that was
+    the lead's first correction to this fixture. The dedicated variable is
+    a SECOND correction (C-1a): ``CI``/``GITHUB_ACTIONS`` alone are also
+    set by common local Actions emulators (e.g. `act`), which would
+    otherwise trip the same unwanted mutation on a maintainer's machine.
 
     Restores whatever this exact value was before this session touched it
     (absent, or some other value) once the session ends - best-effort,
