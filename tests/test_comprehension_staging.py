@@ -1,0 +1,186 @@
+"""#55 slice-1 PR-A: .staging/<scan-id>-<nonce>/ + owner.json reclaim/prune
+(DESIGN-55-comprehension-plane.md, "Local storage model").
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from agenttalk.comprehension import staging as stg
+
+
+# ----------------------------------------------------------- create_staging_dir
+
+def test_create_staging_dir_creates_directory_and_owner_json(tmp_path: Path) -> None:
+    handle = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token="tok-1")
+    assert handle.path.is_dir()
+    assert handle.path.parent == tmp_path / ".staging"
+    assert handle.path.name.startswith("scan-1-")
+    owner = json.loads((handle.path / "owner.json").read_text(encoding="utf-8"))
+    assert owner["scan_id"] == "scan-1"
+    assert owner["owner_token"] == "tok-1"
+    assert owner["pid"] == os.getpid()
+
+
+def test_create_staging_dir_nonces_are_unique(tmp_path: Path) -> None:
+    first = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token="tok-1")
+    second = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token="tok-2")
+    assert first.path != second.path
+    assert first.path.exists() and second.path.exists()
+
+
+# ----------------------------------------------------------- reclaim: empty/absent
+
+def test_reclaim_on_absent_staging_dir_is_a_silent_no_op(tmp_path: Path) -> None:
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert report.retained == []
+
+
+def test_reclaim_on_empty_staging_dir_is_a_no_op(tmp_path: Path) -> None:
+    (tmp_path / ".staging").mkdir()
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert report.retained == []
+
+
+# ----------------------------------------------------------- reclaim: live owner retained
+
+def test_reclaim_retains_a_live_owners_staging_dir(tmp_path: Path) -> None:
+    handle = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token="tok-1")
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert report.retained == [(handle.path.name, f"owner pid {os.getpid()} is alive")]
+    assert handle.path.exists()
+
+
+# ----------------------------------------------------------- reclaim: definitely dead
+
+def test_reclaim_removes_a_definitely_dead_owners_staging_dir(tmp_path: Path, monkeypatch) -> None:
+    handle = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token="tok-1")
+    monkeypatch.setattr(stg, "process_observation", lambda pid: ("dead", None))
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == [handle.path.name]
+    assert report.retained == []
+    assert not handle.path.exists()
+
+
+def test_reclaim_removes_only_the_dead_ones_among_several(tmp_path: Path, monkeypatch) -> None:
+    dead = stg.create_staging_dir(tmp_path, scan_id="scan-dead", owner_token="tok-a")
+    alive = stg.create_staging_dir(tmp_path, scan_id="scan-alive", owner_token="tok-b")
+
+    # Both fixtures recorded THIS test process's real (alive) pid at
+    # creation time; give "dead" a distinct, guaranteed-fake pid so the two
+    # fixtures can be told apart by a single process_observation stub.
+    owner_file = dead.path / "owner.json"
+    doc = json.loads(owner_file.read_text(encoding="utf-8"))
+    doc["pid"] = 999999
+    owner_file.write_text(json.dumps(doc), encoding="utf-8")
+
+    monkeypatch.setattr(
+        stg, "process_observation",
+        lambda pid: ("dead", None) if pid == 999999 else ("alive", None),
+    )
+
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == [dead.path.name]
+    assert not dead.path.exists()
+    assert alive.path.exists()
+
+
+# ----------------------------------------------------------- reclaim: ambiguous retained
+
+def test_reclaim_retains_a_directory_with_missing_owner_json(tmp_path: Path) -> None:
+    staging = tmp_path / ".staging" / "scan-x-abcdef"
+    staging.mkdir(parents=True)
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert len(report.retained) == 1
+    name, reason = report.retained[0]
+    assert name == "scan-x-abcdef"
+    assert "missing or malformed" in reason
+    assert staging.exists()
+
+
+def test_reclaim_retains_a_directory_with_malformed_owner_json(tmp_path: Path) -> None:
+    staging = tmp_path / ".staging" / "scan-x-abcdef"
+    staging.mkdir(parents=True)
+    (staging / "owner.json").write_text("not json", encoding="utf-8")
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert "missing or malformed" in report.retained[0][1]
+    assert staging.exists()
+
+
+def test_reclaim_retains_a_directory_recorded_on_a_different_host(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(stg, "host_identity", lambda: "host-a")
+    handle = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token="tok-1")
+    monkeypatch.setattr(stg, "host_identity", lambda: "host-b")
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert "different host" in report.retained[0][1]
+    assert handle.path.exists()
+
+
+def test_reclaim_retains_a_directory_with_unknown_liveness(tmp_path: Path, monkeypatch) -> None:
+    handle = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token="tok-1")
+    monkeypatch.setattr(stg, "process_observation", lambda pid: ("unknown", None))
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert "could not be observed" in report.retained[0][1]
+    assert handle.path.exists()
+
+
+def test_reclaim_retains_a_non_directory_entry(tmp_path: Path) -> None:
+    staging_root = tmp_path / ".staging"
+    staging_root.mkdir()
+    (staging_root / "stray-file").write_text("x", encoding="utf-8")
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert report.retained == [("stray-file", "not a directory")]
+
+
+def test_reclaim_never_touches_runs(tmp_path: Path, monkeypatch) -> None:
+    """Reclaim is scoped to .staging/ only — a same-named directory under
+    runs/ (published, immutable project memory) must never be inspected or
+    removed."""
+    runs_scan_dir = tmp_path / "runs" / "scan-1-abcdef"
+    runs_scan_dir.mkdir(parents=True)
+    (runs_scan_dir / "scan.json").write_text("{}", encoding="utf-8")
+    handle = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token="tok-1")
+    monkeypatch.setattr(stg, "process_observation", lambda pid: ("dead", None))
+    stg.reclaim_abandoned_staging(tmp_path)
+    assert not handle.path.exists()
+    assert runs_scan_dir.exists()
+    assert (runs_scan_dir / "scan.json").exists()
+
+
+def test_reclaim_retains_an_entry_that_resolves_outside_staging(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    staging_root = tmp_path / ".staging"
+    staging_root.mkdir()
+    link = staging_root / "scan-1-abcdef"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not permitted in this environment")
+    report = stg.reclaim_abandoned_staging(tmp_path)
+    assert report.reclaimed == []
+    assert outside.exists()
+
+
+# ----------------------------------------------------------- prune_staging
+
+def test_prune_staging_delegates_to_the_same_reclaim_logic(tmp_path: Path, monkeypatch) -> None:
+    handle = stg.create_staging_dir(tmp_path, scan_id="scan-1", owner_token="tok-1")
+    monkeypatch.setattr(stg, "process_observation", lambda pid: ("dead", None))
+    report = stg.prune_staging(tmp_path)
+    assert report.reclaimed == [handle.path.name]
+    assert not handle.path.exists()
