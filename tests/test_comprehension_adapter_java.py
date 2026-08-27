@@ -33,6 +33,15 @@ class Foo {
     assert all(e.evidence_class == "extracted" for e in imports)
     assert result.units[0].qualified_name == "com.example.app.Foo"
 
+    # D-1 (reviewer-3, PR-B delta review round 2): a plain import gets a
+    # shot at exact internal resolution; a static import's target is a
+    # member path, and a wildcard import names a package - neither is a
+    # single type, so both stay plain external.
+    by_target = {e.target: e for e in imports}
+    assert by_target["java.util.List"].target_kind == "internal_exact_or_external"
+    assert by_target["java.util.Collections.emptyList"].target_kind == "external"
+    assert by_target["com.example.other.*"].target_kind == "external"
+
 
 def test_import_inside_a_comment_is_not_extracted():
     src = """

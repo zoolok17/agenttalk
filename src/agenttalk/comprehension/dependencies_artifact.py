@@ -111,6 +111,21 @@ def _build_registry(
     return by_qualified_name, by_simple_name, file_unit_id_by_path
 
 
+def _exact_qualified_lookup(target: str, by_qualified_name: dict[str, str]) -> str | None:
+    """The exact, non-fuzzy half of internal resolution: ``target`` names
+    an in-scan type's fully-qualified name, verbatim - never a similarity
+    guess. Shared verbatim by both :func:`_resolve_internal_candidate`
+    (whose ``extends``/``implements``/test-pairing callers also need the
+    simple-name fallback below, for unqualified references like a bare
+    ``extends Base``) and the import path (D-1, reviewer-3 PR-B delta
+    review round 2), whose target is already fully qualified and so never
+    needs - and must never receive - that fallback: reusing it for imports
+    would risk a genuinely-external import matching a same-named LOCAL
+    type by coincidence, a false positive the import path must not
+    produce."""
+    return by_qualified_name.get(target)
+
+
 def _resolve_internal_candidate(
     target: str, by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
 ) -> tuple[str, str | None, str | None, str | None]:
@@ -120,8 +135,9 @@ def _resolve_internal_candidate(
     guess at which one was meant (design: "The scanner never invents an
     internal target because names look similar. Ambiguous resolution
     creates an unresolved edge with candidates.")."""
-    if target in by_qualified_name:
-        return "resolved", by_qualified_name[target], None, "high"
+    exact = _exact_qualified_lookup(target, by_qualified_name)
+    if exact is not None:
+        return "resolved", exact, None, "high"
     simple = target.rsplit(".", 1)[-1]
     candidates = by_simple_name.get(simple, [])
     if len(candidates) == 1:
@@ -192,6 +208,17 @@ def _edge_claim_to_record(
         resolution_state, target_unit_id, target_unresolved, confidence = (
             _resolve_internal_candidate(edge.target, by_qualified_name, by_simple_name)
         )
+    elif edge.target_kind == "internal_exact_or_external":
+        # D-1 (reviewer-3, PR-B delta review round 2): an import's target
+        # is already fully qualified - an EXACT registry hit means it
+        # names an in-scan type and resolves internally exactly like the
+        # identical name would via `extends`; anything else is a genuinely
+        # external dependency, never a simple-name guess.
+        exact_unit_id = _exact_qualified_lookup(edge.target, by_qualified_name)
+        if exact_unit_id is not None:
+            resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
+        else:
+            resolution_state, target_external = "resolved", edge.target
     else:
         resolution_state = "resolved"
         target_external = edge.target

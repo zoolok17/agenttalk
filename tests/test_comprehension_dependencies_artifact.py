@@ -28,6 +28,55 @@ def test_import_edge_resolves_as_external():
     assert imports[0].target_unit_id is None
 
 
+def test_import_of_an_in_scan_type_resolves_to_the_same_unit_inheritance_would():
+    """D-1 (reviewer-3, PR-B delta review round 2): importing an in-scan
+    type must resolve internally, exactly like the identical type would
+    via `extends` - not be recorded as external with no link to the unit,
+    which was a conditional whose two branches produced the same value
+    (an unfinished intention, not a decision)."""
+    results = {
+        "p/Base.java": _parse("p/Base.java", "package p;\nclass Base {}\n"),
+        "p/Foo.java": _parse(
+            "p/Foo.java", "package p;\nimport p.Base;\nclass Foo {}\n"),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "resolved"
+    assert import_edge.confidence == "high"
+    assert import_edge.target_external is None
+    base_unit_id = da._java_component_unit_id("p/Base.java", "p.Base")
+    assert import_edge.target_unit_id == base_unit_id
+
+    # Prove it against the SAME unit the inheritance path resolves to.
+    inherit_results = {
+        "p/Base.java": _parse("p/Base.java", "package p;\nclass Base {}\n"),
+        "p/Bar.java": _parse("p/Bar.java", "package p;\nclass Bar extends p.Base {}\n"),
+    }
+    inherit_records = da.build_dependencies(inherit_results)
+    inherit_edge = next(r for r in inherit_records if r.relation == "inherit")
+    assert import_edge.target_unit_id == inherit_edge.target_unit_id
+
+
+def test_import_with_a_simple_name_collision_still_classifies_external():
+    """The fix must not overcorrect into similarity guessing: a genuinely
+    external import (no exact qualified-name match in this scan) stays
+    external even when its bare SIMPLE name happens to collide with an
+    unrelated in-scan type's simple name - imports get the exact registry
+    lookup only, never the inheritance path's simple-name fallback."""
+    results = {
+        # An in-scan type that just happens to share java.util.List's
+        # simple name, under a different package.
+        "q/List.java": _parse("q/List.java", "package q;\nclass List {}\n"),
+        "p/Foo.java": _parse(
+            "p/Foo.java", "package p;\nimport java.util.List;\nclass Foo {}\n"),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "resolved"
+    assert import_edge.target_external == "java.util.List"
+    assert import_edge.target_unit_id is None
+
+
 # ----------------------------------------------------------- inherit (cross-file resolution)
 
 def test_inherit_edge_resolves_to_a_type_declared_in_a_different_file():

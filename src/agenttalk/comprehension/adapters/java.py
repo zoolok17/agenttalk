@@ -95,7 +95,10 @@ class JavaEdgeClaim:
     from_qualified_name: str
     relation: str
     target: str
-    target_kind: str  # "internal_candidate" | "external" | "external_route"
+    # "internal_candidate" | "internal_exact_or_external" | "external" |
+    # "external_route" - see dependencies_artifact._edge_claim_to_record
+    # for how each is resolved.
+    target_kind: str
     evidence_class: str
     line: int | None
     phase: str
@@ -278,10 +281,22 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     edges: list[JavaEdgeClaim] = []
     entry_points: list[JavaEntryPointClaim] = []
 
-    for target, _is_static, line in imports:
+    for target, is_static, line in imports:
+        # D-1 (reviewer-3, PR-B delta review round 2): a plain (non-static,
+        # non-wildcard) import names a fully-qualified type that MAY be
+        # declared inside this same scan - give it the same shot at
+        # resolving internally that `extends`/`implements`/test-pairing
+        # already get, via the exact same registry, never a guess. A
+        # static import's target is a member path (ClassName.MEMBER), not
+        # a type's own qualified name, and a wildcard import names a
+        # package, not a type - neither can be exact-matched against the
+        # unit registry, so both stay plain external.
+        target_kind = (
+            "external" if is_static or target.endswith(".*") else "internal_exact_or_external"
+        )
         edges.append(JavaEdgeClaim(
             from_qualified_name=primary_qualified, relation="import", target=target,
-            target_kind="external" if not target.endswith(".*") else "external",
+            target_kind=target_kind,
             evidence_class="extracted", line=line, phase="runtime",
         ))
 
