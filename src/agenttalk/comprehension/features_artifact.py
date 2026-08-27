@@ -57,6 +57,16 @@ class EntryPointRecord:
         }
 
 
+def entry_point_record_from_json(payload: dict[str, Any]) -> EntryPointRecord:
+    return EntryPointRecord(
+        entry_point_id=payload["entry_point_id"], kind=payload["kind"], name=payload["name"],
+        owning_unit_id=payload["owning_unit_id"], feature_ids=list(payload["feature_ids"]),
+        evidence_class=payload["evidence_class"], producers=list(payload.get("producers", [])),
+        conflict_id=payload.get("conflict_id"), confidence=payload.get("confidence"),
+        evidence=list(payload.get("evidence", [])),
+    )
+
+
 @dataclass(frozen=True)
 class FeatureRecord:
     feature_id: str
@@ -143,3 +153,13 @@ def build_features(
         ))
 
     return entry_point_records, features
+
+
+def feature_record_from_json(payload: dict[str, Any]) -> FeatureRecord:
+    return FeatureRecord(
+        feature_id=payload["feature_id"], label=payload["label"], state=payload["state"],
+        origin=payload["origin"], unit_ids=list(payload["unit_ids"]),
+        entry_point_ids=list(payload["entry_point_ids"]), producers=list(payload.get("producers", [])),
+        conflict_id=payload.get("conflict_id"), confidence=payload.get("confidence"),
+        evidence=list(payload.get("evidence", [])),
+    )

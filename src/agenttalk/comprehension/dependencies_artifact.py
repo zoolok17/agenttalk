@@ -75,6 +75,19 @@ class DependencyRecord:
         }
 
 
+def dependency_record_from_json(payload: dict[str, Any]) -> DependencyRecord:
+    """The inverse of :meth:`DependencyRecord.to_json`."""
+    return DependencyRecord(
+        edge_id=payload["edge_id"], from_unit_id=payload["from_unit_id"],
+        relation=payload["relation"], phase=payload["phase"], optional=payload["optional"],
+        evidence_class=payload["evidence_class"], resolution_state=payload["resolution_state"],
+        target_unit_id=payload.get("target_unit_id"), target_external=payload.get("target_external"),
+        target_unresolved=payload.get("target_unresolved"), confidence=payload.get("confidence"),
+        producers=list(payload.get("producers", [])), conflict_id=payload.get("conflict_id"),
+        evidence=list(payload.get("evidence", [])),
+    )
+
+
 def _java_component_unit_id(relative_path: str, qualified_name: str) -> str:
     return digests.unit_id(kind="component", paths=[relative_path], qualified_name=qualified_name)
 

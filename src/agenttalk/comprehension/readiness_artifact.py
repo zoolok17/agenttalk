@@ -97,6 +97,22 @@ class UnitReadinessSummary:
         return {"unit_id": self.unit_id, "stored_assessment_state": self.stored_assessment_state}
 
 
+def readiness_signal_from_json(payload: dict[str, Any]) -> ReadinessSignal:
+    return ReadinessSignal(
+        signal_id=payload["signal_id"], unit_id=payload["unit_id"], check=payload["check"],
+        stored_status=payload["stored_status"], severity=payload["severity"],
+        basis=payload["basis"], reason_code=payload["reason_code"],
+        confidence=payload.get("confidence"), producers=list(payload.get("producers", [])),
+        evidence=list(payload.get("evidence", [])), policy=dict(payload.get("policy", {})),
+    )
+
+
+def unit_readiness_summary_from_json(payload: dict[str, Any]) -> UnitReadinessSummary:
+    return UnitReadinessSummary(
+        unit_id=payload["unit_id"], stored_assessment_state=payload["stored_assessment_state"],
+    )
+
+
 def _signal(unit_id: str, check: str, stored_status: str, basis: str, reason_code: str) -> ReadinessSignal:
     return ReadinessSignal(
         signal_id=digests.signal_id(unit_id=unit_id, check=check, policy_version=POLICY_VERSION),

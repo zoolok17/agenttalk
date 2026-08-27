@@ -1936,6 +1936,204 @@ def cmd_check(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _comprehension_root(args: argparse.Namespace) -> Path:
+    return Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+
+
+def _comprehension_confirm_attended(prompt_lines: list[str]) -> bool:
+    """DESIGN-55-comprehension-plane.md: the attended overrides require
+    "an interactive terminal" and "explicit confirmation" - checked here,
+    never assumed. Requires BOTH stdin and stdout to be a real terminal
+    (a script piping stdin, or output redirected to a file, is not an
+    attended operator) and never satisfiable by a headless/scripted
+    invocation (design: "Scripts and wrappers cannot supply the
+    acknowledgement")."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    for line in prompt_lines:
+        print(line)
+    try:
+        response = input("Type 'yes' to confirm, anything else to abort: ")
+    except EOFError:
+        return False
+    return response.strip().lower() == "yes"
+
+
+def _comprehension_escalate(
+    args: argparse.Namespace, *, action: str, error: Exception, work_id: str | None = None,
+) -> int:
+    """Headless fallback when an attended action is needed but no
+    interactive terminal is available: escalate to the operator instead of
+    blocking forever or silently proceeding (design: "Scripts and wrappers
+    cannot supply the acknowledgement"). Reuses PR-A's
+    comprehension.escalation module, which mirrors cmd_escalate's own
+    routing."""
+    from agenttalk.comprehension import escalation
+
+    sender = os.environ.get("AGENTTALK_SELF")
+    if not sender:
+        sys.stderr.write(
+            f"agenttalk: {error}\n"
+            "agenttalk: no interactive terminal for attended confirmation, and no "
+            "AGENTTALK_SELF set to escalate to the operator instead\n"
+        )
+        return 2
+    try:
+        store = _get_store(args, must_exist=False)
+        if action == "recover-stale-lock":
+            result = escalation.escalate_scan_lock_unrecoverable(store, sender=sender, error=error)
+        else:
+            result = escalation.escalate_vcs_privacy_refused(
+                store, sender=sender, error=error, work_id=work_id)
+    except Exception as exc:  # noqa: BLE001 - escalation itself must never crash the CLI
+        sys.stderr.write(f"agenttalk: {error}\nagenttalk: escalation also failed: {exc}\n")
+        return 2
+    sys.stderr.write(
+        f"agenttalk: attended confirmation required for {action}; escalated to "
+        f"{result.recipient} (request {result.request_id})\n"
+    )
+    return 2
+
+
+def cmd_comprehension(args: argparse.Namespace) -> int:
+    """Local, offline static comprehension inventory (task #55 slice-1).
+    Scope simplifications this slice (named, not silent): no config.json
+    parsing yet (no --scope/--exclude narrowing, no declared feature
+    confirmation); `report`'s human-readable mode prints the same JSON
+    projection as --json (a friendlier rendering is a later refinement,
+    per the design: "report --json is the stable automation contract.
+    Human output may evolve")."""
+    from agenttalk.comprehension import scan_pipeline
+    from agenttalk.comprehension.ceilings import ArtifactLimitExceeded
+    from agenttalk.comprehension.errors import (
+        ComprehensionError,
+        ScanLockContended,
+        ScanLockUnrecoverable,
+    )
+    from agenttalk.comprehension.privacy import VcsPrivacyRefused
+
+    action = getattr(args, "comprehension_cmd", None)
+    if action is None:
+        sys.stderr.write(
+            "agenttalk: comprehension requires a subcommand (scan/status/report/validate)\n")
+        return 2
+
+    root = _comprehension_root(args)
+
+    if action == "scan":
+        outcome = None
+        try:
+            outcome = scan_pipeline.run_scan(root, recover_stale_lock=args.recover_stale_lock)
+        except VcsPrivacyRefused as exc:
+            if not args.acknowledge_unignored_private_store:
+                sys.stderr.write(f"agenttalk: {exc}\n")
+                return 2
+            if not args.work_id:
+                sys.stderr.write(
+                    "agenttalk: --acknowledge-unignored-private-store requires --work-id\n")
+                return 2
+            confirmed = _comprehension_confirm_attended([
+                f"ATTENDED ACTION: acknowledge-unignored-private-store at {root}",
+                "The private comprehension store is not proven ignored by your VCS.",
+                "Proceeding risks staging it via a plain `git add -A`.",
+                f"Bound work item: {args.work_id}",
+            ])
+            if not confirmed:
+                return _comprehension_escalate(
+                    args, action="acknowledge-unignored-private-store", error=exc,
+                    work_id=args.work_id)
+            try:
+                outcome = scan_pipeline.run_scan(
+                    root, acknowledge_unignored=True, work_id=args.work_id,
+                    recover_stale_lock=args.recover_stale_lock)
+            except ComprehensionError as exc2:
+                sys.stderr.write(f"agenttalk: {exc2}\n")
+                return 2
+        except ScanLockContended as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        except ScanLockUnrecoverable as exc:
+            if args.recover_stale_lock:
+                sys.stderr.write(f"agenttalk: {exc}\n")
+                return 2
+            confirmed = _comprehension_confirm_attended([
+                f"ATTENDED ACTION: recover-stale-lock at {root}",
+                exc.detail,
+                "This unconditionally clears the existing scan.lock.",
+            ])
+            if not confirmed:
+                return _comprehension_escalate(args, action="recover-stale-lock", error=exc)
+            try:
+                outcome = scan_pipeline.run_scan(root, recover_stale_lock=True)
+            except ComprehensionError as exc2:
+                sys.stderr.write(f"agenttalk: {exc2}\n")
+                return 2
+        except (ArtifactLimitExceeded, ComprehensionError) as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        if outcome is None:
+            return 2
+        payload = {
+            "scan_id": outcome.scan_id, "status": outcome.status, "run_dir": str(outcome.run_dir),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"scan_id: {outcome.scan_id}")
+            print(f"status:  {outcome.status}")
+            print(f"run_dir: {outcome.run_dir}")
+        return 0
+
+    if action == "status":
+        try:
+            payload = scan_pipeline.get_status(root, run_id=args.run)
+        except scan_pipeline.NotScanned:
+            if args.json:
+                print(json.dumps({"status": "not_scanned"}, indent=2))
+            else:
+                print("status: not_scanned")
+            return 0
+        except ComprehensionError as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"latest_scan_id: {payload['latest_scan_id']}")
+            print(f"status:         {payload['status']}")
+            print(f"problems:       {payload['problem_count']}")
+        return 0
+
+    if action == "report":
+        try:
+            payload = scan_pipeline.get_report(
+                root, run_id=args.run, unit_id=args.unit_id, feature_id=args.feature_id,
+                readiness_state=args.readiness_state, dependencies_only=args.dependencies_only,
+            )
+        except (scan_pipeline.NotScanned, ComprehensionError) as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    if action == "validate":
+        try:
+            payload = scan_pipeline.validate_run(root, run_id=args.run)
+        except scan_pipeline.NotScanned as exc:
+            sys.stderr.write(f"agenttalk: {exc}\n")
+            return 2
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"scan_id: {payload['scan_id']}")
+            print(f"valid:   {payload['valid']}")
+            print(f"detail:  {payload['detail']}")
+        return 0 if payload["valid"] else 1
+
+    sys.stderr.write(f"agenttalk: unknown comprehension subcommand {action!r}\n")
+    return 2
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     """Manage lightweight assurance gates."""
     store = _get_store(args)
@@ -13707,6 +13905,56 @@ def build_parser() -> argparse.ArgumentParser:
     gwaive.add_argument("--date", help="Decision date (defaults to now).")
     gwaive.add_argument("--json", action="store_true", help="Emit the stored gate object.")
     gwaive.set_defaults(func=cmd_gate)
+
+    # ----- comprehension (task #55 slice-1: local static inventory) -----
+    pcomp = sub.add_parser(
+        "comprehension",
+        help="Local, offline static comprehension inventory for one legacy repository (task #55).",
+    )
+    pcomp.set_defaults(func=cmd_comprehension, comprehension_cmd=None)
+    compsub = pcomp.add_subparsers(dest="comprehension_cmd")
+
+    cscan = compsub.add_parser("scan", help="Create and publish one immutable comprehension run.")
+    cscan.add_argument(
+        "--work-id",
+        help="Work item ID bound to an attended --acknowledge-unignored-private-store run.")
+    cscan.add_argument(
+        "--acknowledge-unignored-private-store", action="store_true",
+        dest="acknowledge_unignored_private_store",
+        help="Attended override: proceed for one run even though the private "
+             "comprehension store is not proven VCS-ignored. Requires an interactive "
+             "terminal, explicit confirmation, and --work-id.")
+    cscan.add_argument(
+        "--recover-stale-lock", action="store_true",
+        help="Attended override: unconditionally clear an existing scan.lock before scanning.")
+    cscan.add_argument("--json", action="store_true", help="Emit the scan outcome as JSON.")
+    cscan.set_defaults(func=cmd_comprehension)
+
+    cstatus = compsub.add_parser(
+        "status", help="Show the latest (or one named) comprehension run's summary.")
+    cstatus.add_argument("--run", help="Show this scan_id instead of the latest.")
+    cstatus.add_argument("--json", action="store_true")
+    cstatus.set_defaults(func=cmd_comprehension)
+
+    creport = compsub.add_parser(
+        "report", help="Answer fixed single-run migration questions from one comprehension run.")
+    creport.add_argument("--run", help="Report on this scan_id instead of the latest.")
+    creport.add_argument("--unit", dest="unit_id", help="Filter to one unit ID.")
+    creport.add_argument("--feature", dest="feature_id", help="Filter to one feature ID.")
+    creport.add_argument(
+        "--readiness", dest="readiness_state",
+        help="Filter to units with this stored_assessment_state.")
+    creport.add_argument(
+        "--dependencies", action="store_true", dest="dependencies_only",
+        help="Report only the dependency-edge view.")
+    creport.add_argument("--json", action="store_true", help="Emit the validated projection.")
+    creport.set_defaults(func=cmd_comprehension)
+
+    cvalidate = compsub.add_parser(
+        "validate", help="Perform full-run integrity validation for one comprehension run.")
+    cvalidate.add_argument("--run", help="Validate this scan_id instead of the latest.")
+    cvalidate.add_argument("--json", action="store_true")
+    cvalidate.set_defaults(func=cmd_comprehension)
 
     # ----- close (assurance P2 milestone/release close; advisory, opt-in) -----
     pclose = sub.add_parser(

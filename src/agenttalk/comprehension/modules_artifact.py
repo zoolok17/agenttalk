@@ -62,6 +62,20 @@ class ModuleRecord:
         }
 
 
+def module_record_from_json(payload: dict[str, Any]) -> ModuleRecord:
+    """The inverse of :meth:`ModuleRecord.to_json` - reconstructs a record
+    from a persisted ``modules.json`` row, e.g. for ``report``/``status``
+    to feed back into :func:`projector.project_comprehension`."""
+    return ModuleRecord(
+        unit_id=payload["unit_id"], kind=payload["kind"], display_name=payload["display_name"],
+        language=payload["language"], paths=list(payload["paths"]),
+        source_digests=dict(payload["source_digests"]),
+        classification=list(payload["classification"]),
+        container_unit_id=payload["container_unit_id"], producers=list(payload["producers"]),
+        conflict_id=payload.get("conflict_id"), evidence=list(payload.get("evidence", [])),
+    )
+
+
 def _language_for_path(relative_path: str) -> str:
     for ext, lang in _LANGUAGE_BY_EXTENSION.items():
         if relative_path.endswith(ext):

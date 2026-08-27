@@ -22,12 +22,12 @@ travels over stdout as one JSON object. Neither uses an environment
 variable, a shared temp file outside the caller's own control, or any IPC
 mechanism that could carry ambient configuration.
 
-This module is deliberately narrow for this commit: it establishes the
-process boundary, the environment allowlist, and the "every non-excluded
-file remains an addressable file unit regardless of adapter support"
-guarantee (design, Artifact 1) with NO adapter wired in yet - adapters
-dispatch on top of ``process_paths`` in a later commit, inspecting the same
-bytes this worker already reads once.
+Adapters dispatch INSIDE this worker (item 9), on the same bytes already
+read for the default file claim - never a second, separate read, and
+never outside this sanitized process boundary. The Java adapter itself
+(``adapters.java``) has no knowledge of the worker/subprocess boundary at
+all; it is a pure function from (path, text) to claims, so it works
+identically whether called here or directly in a unit test.
 """
 
 from __future__ import annotations
@@ -41,8 +41,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .adapters import java as java_adapter
 from .envelope import EnvelopeError, resolve_under_root
 from .errors import ComprehensionError
+
+_ADAPTER_EXTENSIONS = {".java": java_adapter}
 
 WORKER_SCHEMA_VERSION = 1
 _WORKER_TIMEOUT_SECONDS = 300.0
@@ -126,6 +129,9 @@ class WorkerResult:
     schema_version: int
     file_claims: list[WorkerFileClaim] = field(default_factory=list)
     problems: list[WorkerProblem] = field(default_factory=list)
+    #: relative_path -> adapters.java.file_result_to_json(...) payload, for
+    #: every recognized-extension file an adapter successfully parsed.
+    java_results: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _hash_bytes(data: bytes) -> str:
@@ -134,13 +140,18 @@ def _hash_bytes(data: bytes) -> str:
 
 def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
     """The worker's unit of work: read each of ``relative_paths`` under
-    ``root`` and produce its default file-unit claim. Re-confines every
-    path under ``root`` itself (defense in depth - the caller has already
-    validated and confined these paths during enumeration, but this
-    process boundary never trusts an upstream check blindly for a
-    security-relevant operation)."""
+    ``root``, produce its default file-unit claim, AND - for a recognized
+    extension - dispatch the SAME already-read bytes to that language's
+    bundled adapter, in-process, right here (design: "Adapters run
+    in-process inside that worker"). Re-confines every path under ``root``
+    itself (defense in depth - the caller has already validated and
+    confined these paths during enumeration, but this process boundary
+    never trusts an upstream check blindly for a security-relevant
+    operation). An adapter parse failure is a bounded problem, exactly
+    like an unreadable file - it never aborts the rest of the scan."""
     claims: list[WorkerFileClaim] = []
     problems: list[WorkerProblem] = []
+    java_results: dict[str, dict[str, Any]] = {}
     for rel in relative_paths:
         try:
             resolved = resolve_under_root(rel, root=root, label="worker input path")
@@ -156,7 +167,24 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             continue
         claims.append(WorkerFileClaim(
             relative_path=rel, byte_count=len(data), content_digest=_hash_bytes(data)))
-    return WorkerResult(schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems)
+
+        adapter = next(
+            (mod for ext, mod in _ADAPTER_EXTENSIONS.items() if rel.endswith(ext)), None)
+        if adapter is not None:
+            try:
+                text = data.decode("utf-8", errors="replace")
+                result = adapter.parse_java_source(rel, text)
+            except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
+                problems.append(WorkerProblem(
+                    reason_code="parse_failed", relative_path=rel,
+                    detail=f"{adapter.ADAPTER_NAME} adapter failed: {exc}"))
+            else:
+                java_results[rel] = adapter.file_result_to_json(result)
+
+    return WorkerResult(
+        schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,
+        java_results=java_results,
+    )
 
 
 def _result_to_json(result: WorkerResult) -> dict[str, Any]:

@@ -37,7 +37,8 @@ grammar/AST parser - this is coarse S1 evidence per the design's own
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 ADAPTER_NAME = "java"
 ADAPTER_VERSION = 1
@@ -398,3 +399,24 @@ def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
             name=url_pattern, line=_line_at(text, match.start()), evidence_class="declared",
         ))
     return entry_points
+
+
+def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:
+    """Serializes a :class:`JavaFileResult` for the sanitized worker's
+    stdout JSON channel (design: adapters run IN-PROCESS inside the
+    worker, so their claims must cross the worker/parent process boundary
+    the same way the worker's own file claims do - JSON over stdout, never
+    a pickle or other code-carrying channel)."""
+    return {
+        "units": [asdict(u) for u in result.units],
+        "edges": [asdict(e) for e in result.edges],
+        "entry_points": [asdict(p) for p in result.entry_points],
+    }
+
+
+def file_result_from_json(payload: dict[str, Any]) -> JavaFileResult:
+    return JavaFileResult(
+        units=[JavaUnitClaim(**u) for u in payload["units"]],
+        edges=[JavaEdgeClaim(**e) for e in payload["edges"]],
+        entry_points=[JavaEntryPointClaim(**p) for p in payload["entry_points"]],
+    )
