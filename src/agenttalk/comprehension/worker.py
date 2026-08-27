@@ -273,6 +273,48 @@ def _result_from_json(payload: Any) -> WorkerResult:
     )
 
 
+def _derive_child_import_root() -> str:
+    """Derive the path the CHILD needs on its module search path to import
+    ``agenttalk`` exactly as THIS process resolved it - computed from this
+    interpreter's OWN already-resolved package location, never inherited
+    from an environment variable.
+
+    B-2 (reviewer-3, PR-B delta review): the sanitized environment
+    deliberately never allowlists ``PYTHONPATH`` - both the reviewer and
+    the lead flagged it as an injection vector, since a compromised or
+    merely unexpected parent environment could point it anywhere. But
+    without it, the child cannot import ``agenttalk`` at all when this
+    process only resolves the package via a source-tree ``PYTHONPATH``
+    (not a real install), so the worker could never start from a source
+    checkout. The fix is a derived, validated route instead of ambient
+    inheritance: this process already knows exactly where its OWN
+    ``agenttalk`` package lives (``agenttalk.__file__``); the directory
+    ABOVE that package is the root the child needs. Validated with the
+    same resolve-under-known-root machinery every other confined path in
+    this package uses, and re-confirmed to actually contain THIS worker
+    module, before it is ever handed to the child - not merely trusted
+    because it was computed here.
+    """
+    import agenttalk
+
+    import_root = Path(agenttalk.__file__).resolve().parent.parent
+    try:
+        worker_module = resolve_under_root(
+            "agenttalk/comprehension/worker.py", root=import_root,
+            label="derived child import root",
+        )
+    except EnvelopeError as exc:
+        raise WorkerError(
+            f"could not derive a valid child import root from this process's own "
+            f"agenttalk package location ({import_root}): {exc}") from exc
+    if not worker_module.is_file():
+        raise WorkerError(
+            f"derived child import root {import_root} does not contain "
+            f"agenttalk.comprehension.worker - refusing to launch the worker from an "
+            f"unverified location")
+    return str(import_root)
+
+
 def run_sanitized_worker(
     root: Path, relative_paths: list[str], *, timeout_seconds: float = _WORKER_TIMEOUT_SECONDS,
 ) -> WorkerResult:
@@ -282,7 +324,15 @@ def run_sanitized_worker(
     :class:`WorkerError` if the process cannot be started, times out, exits
     non-zero, or returns output that does not parse as a valid result;
     never raised for one file's own read/parse failure (see
-    :class:`WorkerProblem`)."""
+    :class:`WorkerProblem`).
+
+    The child's ``PYTHONPATH`` is set explicitly here, to a value THIS
+    function derives and validates itself (:func:`_derive_child_import_root`)
+    - never inherited from the caller's own environment, which
+    :func:`sanitized_worker_env`'s allowlist deliberately excludes it from
+    (B-2, reviewer-3, PR-B delta review)."""
+    env = sanitized_worker_env()
+    env["PYTHONPATH"] = _derive_child_import_root()
     payload = json.dumps({"root": str(root), "relative_paths": list(relative_paths)})
     try:
         completed = subprocess.run(  # noqa: S603  # nosec B603
@@ -290,7 +340,7 @@ def run_sanitized_worker(
             input=payload,
             capture_output=True,
             text=True,
-            env=sanitized_worker_env(),
+            env=env,
             timeout=timeout_seconds,
             check=False,
         )

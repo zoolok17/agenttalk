@@ -265,22 +265,73 @@ def test_run_sanitized_worker_raises_worker_error_on_malformed_output(
 
 def test_run_sanitized_worker_end_to_end_real_subprocess(tmp_path: Path) -> None:
     """The one test that actually spawns the real child process under the
-    real sanitized (allowlisted) environment. Skips, rather than fails,
-    when this dev environment's installed ``agenttalk`` package predates
-    this module (e.g. a stale non-editable install with no ``comprehension``
-    subpackage at all) - the sanitized environment deliberately excludes
-    PYTHONPATH, so this test can only exercise the true child-process
-    boundary when agenttalk is genuinely installed, which is exactly the
-    condition real deployments and CI's own pip-install step satisfy."""
+    real sanitized (allowlisted) environment.
+
+    B-2 (reviewer-3, PR-B delta review): this used to skip whenever this
+    dev environment's installed ``agenttalk`` predated this module, since
+    the sanitized environment deliberately excludes PYTHONPATH and the
+    child had no other way to resolve the package from a source checkout.
+    That reasoning was right about *why* it skipped locally, but wrong to
+    conclude the real-install case was unaffected: B-1 meant that wherever
+    the child COULD start, its adapter results were silently dropped
+    anyway. Now that run_sanitized_worker derives and validates the
+    child's import root itself (:func:`worker._derive_child_import_root`)
+    rather than relying on inherited PYTHONPATH, this must EXECUTE, not
+    skip, regardless of how ``agenttalk`` happens to be installed on the
+    machine running this test."""
     (tmp_path / "a.txt").write_bytes(b"hello")
-    try:
-        result = worker.run_sanitized_worker(tmp_path, ["a.txt"])
-    except worker.WorkerError as exc:
-        if "No module named" in str(exc):
-            pytest.skip(
-                "agenttalk is not installed without PYTHONPATH in this dev "
-                "environment - the sanitized child process cannot see this "
-                "checkout; unaffected in a real install (see docstring)")
-        raise
+    result = worker.run_sanitized_worker(tmp_path, ["a.txt"])
+    assert result.file_claims[0].relative_path == "a.txt"
+    assert result.file_claims[0].byte_count == 5
+
+
+def test_run_sanitized_worker_end_to_end_real_subprocess_carries_java_results(
+    tmp_path: Path,
+) -> None:
+    """B-1 + B-2 together, through the REAL subprocess (not process_paths
+    called in-process): adapter claims computed by the real child must
+    survive the actual stdin/stdout JSON channel, and the child must
+    actually be able to start from this source checkout to prove it."""
+    (tmp_path / "A.java").write_text(
+        "package p;\nclass A {\n  public static void main(String[] a) {}\n}\n",
+        encoding="utf-8",
+    )
+    result = worker.run_sanitized_worker(tmp_path, ["A.java"])
+    assert result.java_results, "adapter claims must survive the real subprocess round-trip"
+    assert result.java_results["A.java"]["units"][0]["qualified_name"] == "p.A"
+
+
+def test_run_sanitized_worker_derives_the_child_import_root_from_this_process(
+    tmp_path: Path,
+) -> None:
+    """The child's PYTHONPATH must be THIS function's own derived,
+    validated value - never inherited from the caller's ambient
+    environment (B-2: an inherited PYTHONPATH is itself an injection
+    vector)."""
+    import agenttalk
+
+    expected_root = str(Path(agenttalk.__file__).resolve().parent.parent)
+    assert worker._derive_child_import_root() == expected_root
+
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    result = worker.run_sanitized_worker(tmp_path, ["a.txt"], timeout_seconds=30.0)
+    assert result.file_claims[0].relative_path == "a.txt"
+
+
+def test_run_sanitized_worker_starts_from_a_source_tree_layout_with_no_ambient_pythonpath(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """B-2 (reviewer-3, PR-B delta review), regression test in the same
+    shape as PR-A's
+    test_host_identity_succeeds_under_the_dev_gates_allowlisted_environment:
+    spawn the real child under the real sanitized env, from exactly the
+    layout that broke before this fix - agenttalk importable ONLY via
+    PYTHONPATH in a source checkout, with the PARENT's own ambient
+    PYTHONPATH removed first, so the child could only start if this
+    process derives the import root itself rather than happening to
+    inherit a pre-set value."""
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    result = worker.run_sanitized_worker(tmp_path, ["a.txt"])
     assert result.file_claims[0].relative_path == "a.txt"
     assert result.file_claims[0].byte_count == 5
