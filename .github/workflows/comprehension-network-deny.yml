@@ -1,0 +1,105 @@
+name: comprehension-network-deny
+
+# DESIGN-55-comprehension-plane.md, "Privacy and offline enforcement":
+# "Release evidence must additionally run the end-to-end scanner with
+# networking denied outside the process: a network namespace or
+# --network=none container on Linux, and a dedicated Windows runner with
+# an outbound firewall rule scoped to the worker executable... The test
+# places provider keys and proxy variables in the parent environment and
+# asserts both zero connection attempts and their absence in the worker."
+#
+# Deliberately its OWN narrow workflow, not folded into tests.yml's full
+# dev-gate matrix (approved PR-B plan, item 10: "keep these jobs narrow
+# (worker + adapter tests only, not the whole matrix)") - one Python
+# version, one OS each, and only the comprehension worker/adapter/
+# network-deny tests, not the whole suite.
+#
+# These tests mutate real OS-level state (a Linux network namespace, a
+# Windows Firewall rule) and are opt-in only
+# (AGENTTALK_AUTHORIZE_NETWORK_DENY_TEST=1, set ONLY here) - see
+# tests/test_comprehension_network_deny.py's module docstring.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: network-deny (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      AGENTTALK_AUTHORIZE_NETWORK_DENY_TEST: '1'
+      # Canary credentials: the design's own release-evidence contract -
+      # these must never reach the sanitized worker, and this job proves
+      # both that the worker's own env allowlist strips them AND that the
+      # OS-level network denial would catch an attempt even if it didn't.
+      ANTHROPIC_API_KEY: canary-should-never-reach-the-worker
+      HTTP_PROXY: http://canary-proxy.invalid:8080
+      HTTPS_PROXY: http://canary-proxy.invalid:8080
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install package + pytest
+        run: |
+          python -I -m pip install --upgrade pip
+          python -I -m pip install -r dev-gate-requirements.txt
+          python -I -m pip install --no-deps --no-build-isolation .
+      - name: Confirm passwordless sudo (required for unshare --net)
+        run: sudo -n true
+      - name: Run worker + adapter + network-deny tests
+        run: >
+          python -I -m pytest -v
+          tests/test_comprehension_worker.py
+          tests/test_comprehension_adapter_java.py
+          tests/test_comprehension_network_deny.py
+
+  windows:
+    name: network-deny (windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      AGENTTALK_AUTHORIZE_NETWORK_DENY_TEST: '1'
+      ANTHROPIC_API_KEY: canary-should-never-reach-the-worker
+      HTTP_PROXY: http://canary-proxy.invalid:8080
+      HTTPS_PROXY: http://canary-proxy.invalid:8080
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install package + pytest
+        run: |
+          python -I -m pip install --upgrade pip
+          python -I -m pip install -r dev-gate-requirements.txt
+          python -I -m pip install --no-deps --no-build-isolation .
+      - name: Run worker + adapter + network-deny tests
+        run: >
+          python -I -m pytest -v
+          tests/test_comprehension_worker.py
+          tests/test_comprehension_adapter_java.py
+          tests/test_comprehension_network_deny.py
+      - name: Remove any leftover canary firewall rule (belt and suspenders)
+        if: always()
+        run: |
+          Get-NetFirewallRule -DisplayName "agenttalk-network-deny-*" -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        shell: pwsh
