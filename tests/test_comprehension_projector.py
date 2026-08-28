@@ -242,6 +242,40 @@ def test_no_projection_list_anywhere_exceeds_the_row_cap(monkeypatch):
     _assert_no_list_exceeds_cap(payload, "payload")
 
     assert payload["truncated"] is True
+
+    def _list_section_names(node: object, prefix: str, found: set) -> None:
+        # M2 invariant, structural version (fifth cold read, fix round
+        # 7): the reviewer DEMONSTRATED this test's own blind spot - a
+        # hard-sliced, unregistered NEW section (a list with no
+        # omitted_counts entry at all, exactly M2's own bug shape)
+        # passed all twelve existing assertions here, because they only
+        # ever checked the HAND-MAINTAINED omitted_counts dict against
+        # itself, never against the payload's own shape. This walks the
+        # payload instead: every list-valued key (joined with its parent
+        # key for one level of nesting, e.g. readiness.signals ->
+        # "readiness_signals", matching the flat omitted_counts naming)
+        # must have a matching entry - an assertion ABOUT the payload,
+        # not about this hand-maintained registry. Deliberately does NOT
+        # recurse into a list's own row contents (a row's internal
+        # fields are data, not further sections).
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            name = f"{prefix}_{key}" if prefix else key
+            if isinstance(value, list):
+                found.add(name)
+            elif isinstance(value, dict):
+                _list_section_names(value, name, found)
+
+    list_section_names: set = set()
+    _list_section_names(payload, "", list_section_names)
+    missing = list_section_names - set(payload["omitted_counts"])
+    assert not missing, (
+        f"payload section(s) with no matching omitted_counts entry: {missing} - "
+        "a new bounded list must be routed through the same cap+omitted-count "
+        "mechanism every existing section already uses"
+    )
+
     # Every section whose real input exceeded the cap must report it -
     # never silently leave omitted_counts at 0 for a section that WAS
     # actually truncated.
