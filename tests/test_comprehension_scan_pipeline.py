@@ -571,6 +571,30 @@ def test_run_scan_does_not_flag_package_info_java_as_a_type_extraction_problem(
     assert package_info_unit["adapter_problem_reason"] is None
 
 
+def test_run_scan_does_not_flag_module_info_java_as_a_type_extraction_problem(
+    java_repo: Path,
+) -> None:
+    """MAJOR 2 (sixth cold read, fix round 9), end to end: module-info.java
+    must never flip an otherwise-clean run to degraded via the new
+    no_types_extracted problem - it legitimately declares a `module`
+    block, not a class/interface/enum/record."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "module-info.java").write_text(
+        "module com.acme.app {\n    requires java.base;\n}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not [p for p in problems_doc["problems"] if p["reason_code"] == "no_types_extracted"]
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    module_info_unit = next(
+        u for u in modules_doc["units"]
+        if u["paths"] == ["src/main/java/module-info.java"])
+    assert module_info_unit["adapter_problem_reason"] is None
+
+
 def test_scan_json_record_counts_includes_itself(java_repo: Path) -> None:
     """N6-record_counts (cold-read, PR-B fix round 3): scan.json's own
     record_counts field must count scan.json itself (always exactly 1) -

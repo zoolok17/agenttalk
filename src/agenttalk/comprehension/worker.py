@@ -45,6 +45,14 @@ from .envelope import EnvelopeError, resolve_under_root
 from .errors import ComprehensionError, bounded_detail, bounded_os_error_detail
 
 _ADAPTER_EXTENSIONS = {".java": java_adapter}
+#: MAJOR 2 (sixth cold read, fix round 9): both are real, common
+#: declarations this adapter's class/interface/enum/record extractor
+#: does not recognize at all (package-info.java carries only a package
+#: statement, possibly with a package-level annotation; module-info.java
+#: declares a `module ... { ... }` block) - both ALWAYS legitimately
+#: yield zero units, never a header shape this adapter merely failed to
+#: recognize.
+_LEGITIMATELY_TYPELESS_BASENAMES = frozenset({"package-info.java", "module-info.java"})
 
 WORKER_SCHEMA_VERSION = 1
 _WORKER_TIMEOUT_SECONDS = 300.0
@@ -240,13 +248,21 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # understood (a header shape its coarse pattern-based
                 # extractor could not recognize is indistinguishable,
                 # from here, from a legitimately typeless file). The two
-                # legitimate typeless shapes - package-info.java by name,
-                # and a genuinely blank/comment-only file by content -
-                # are recognized explicitly and exempted; anything else
-                # with zero units is a real, named problem.
+                # legitimate typeless shapes - package-info.java and
+                # module-info.java by name (MAJOR 2, sixth cold read,
+                # fix round 9: module-info.java flipped an otherwise-
+                # clean run to degraded with a factually wrong problem
+                # detail - it declares a `module ... { ... }` block, a
+                # keyword this adapter's class/interface/enum/record
+                # extractor does not recognize at all, so it ALWAYS
+                # yields zero units, the same legitimately-typeless
+                # shape package-info.java already is), and a genuinely
+                # blank/comment-only file by content - are recognized
+                # explicitly and exempted; anything else with zero
+                # units is a real, named problem.
                 if (
                     not result.units
-                    and rel_name_lower != "package-info.java"
+                    and rel_name_lower not in _LEGITIMATELY_TYPELESS_BASENAMES
                     and not adapter.is_effectively_empty_java_source(text)
                 ):
                     problems.append(WorkerProblem(

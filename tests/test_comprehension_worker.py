@@ -205,6 +205,20 @@ def test_process_paths_does_not_flag_package_info_java(tmp_path: Path) -> None:
     assert result.problems == []
 
 
+def test_process_paths_does_not_flag_module_info_java(tmp_path: Path) -> None:
+    """MAJOR 2 (sixth cold read, fix round 9): module-info.java legitimately
+    declares a `module ... { ... }` block, not a class/interface/enum/
+    record - a keyword shape this adapter's extractor does not recognize
+    at all, so it ALWAYS yields zero units, the same legitimately-
+    typeless shape package-info.java already is. Flipping an otherwise-
+    clean run to degraded over this is a factually wrong problem."""
+    (tmp_path / "module-info.java").write_text(
+        "module com.acme.app {\n    requires java.base;\n    exports com.acme.app;\n}\n",
+        encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["module-info.java"])
+    assert result.problems == []
+
+
 def test_process_paths_does_not_flag_an_empty_or_comment_only_java_file(
     tmp_path: Path,
 ) -> None:
