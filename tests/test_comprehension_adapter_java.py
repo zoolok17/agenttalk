@@ -417,8 +417,14 @@ def test_route_value_with_an_escaped_quote_is_not_truncated():
     used to truncate the captured content at the escape (the old
     `[^"]*` capture has no concept of escaping). _java_string_literal_content
     reuses _strip_comments_and_strings's own escaped-quote skip, so the
-    literal's FULL content - escape sequence included, raw - is now
-    recovered."""
+    literal's FULL content is now recovered.
+
+    Minor 6 (fifth cold read, fix round 7): round 6 published the RAW
+    source spelling (`\\"`, backslash included - two characters) as the
+    route's target and stable ID, rather than the ONE character it
+    actually represents at runtime. Asserting exact equality (not a
+    substring check, which cannot distinguish a correctly-decoded value
+    from a malformed/raw one) against the properly UNESCAPED value."""
     src = r"""
 package p;
 class Controller {
@@ -429,7 +435,7 @@ class Controller {
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
     assert len(routes) == 1
-    assert routes[0].target == '/api/\\"quoted\\"/thing'
+    assert routes[0].target == '/api/"quoted"/thing'
 
 
 def test_route_value_as_a_text_block_is_recovered():
@@ -438,7 +444,14 @@ def test_route_value_as_a_text_block_is_recovered():
     `\"\"\"`, not a single `"`) - _java_string_literal_content handles it
     the same way _strip_comments_and_strings already does when
     sanitizing, so this is recovered rather than mis-parsed as an empty
-    or truncated ordinary literal."""
+    or truncated ordinary literal.
+
+    Minor 6 (fifth cold read, fix round 7): round 6 published the RAW
+    substring between the `\"\"\"` markers - leading newline and
+    indentation included - rather than Java's own incidental-whitespace-
+    stripped value (JEP 378). Asserting EXACT equality (a substring
+    check cannot distinguish the correctly-normalized value from a
+    malformed one that merely happens to contain it)."""
     src = '''
 package p;
 class Controller {
@@ -450,7 +463,7 @@ class Controller {
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
     assert len(routes) == 1
-    assert "/api/textblock" in routes[0].target
+    assert routes[0].target == "/api/textblock"
 
 
 def test_request_mapping_path_attribute_is_recovered_ahead_of_an_unrelated_literal():
@@ -463,6 +476,27 @@ class Controller {
 """
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
+    assert routes[0].target == "/orders"
+
+
+def test_route_value_recovery_continues_past_a_non_literal_named_attribute_match():
+    """Minor 5 (fifth cold read, fix round 7): round 6 took only the
+    FIRST value|path attribute-name match and required an IMMEDIATELY
+    following literal - a non-literal path attribute (here, a call
+    expression) ahead of the real, literal value attribute made the
+    whole function give up where it previously recovered a route (a
+    coverage narrowing versus pre-round-6 behavior). Recovery must
+    continue searching past the non-literal match instead."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(path = someExpr(), value = "/orders")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
     assert routes[0].target == "/orders"
 
 

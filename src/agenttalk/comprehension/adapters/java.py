@@ -384,12 +384,72 @@ def _matching_close_paren(sanitized: str, open_pos: int) -> int | None:
     return None
 
 
+#: Minor 6 (fifth cold read, fix round 7): Java's own single-character
+#: escape sequences (JLS 3.10.7) - each maps to the ONE character it
+#: actually represents, never the two-character raw spelling.
+_JAVA_SIMPLE_ESCAPES = {
+    "n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f",
+    "s": " ", "0": "\0", '"': '"', "'": "'", "\\": "\\",
+}
+_JAVA_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _decode_java_string_escapes(raw: str) -> str:
+    """Unescapes a Java string/text-block literal's raw source spelling
+    into the character sequence it actually represents (JLS 3.10.6/
+    3.10.7) - a `\\"` in source is ONE quote character at runtime, not
+    two literal characters; an unrecognized escape is left as-is rather
+    than guessed at."""
+    result: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "\\" and i + 1 < n:
+            unicode_match = _JAVA_UNICODE_ESCAPE_RE.match(raw, i)
+            if unicode_match is not None:
+                result.append(chr(int(unicode_match.group(1), 16)))
+                i = unicode_match.end()
+                continue
+            simple = _JAVA_SIMPLE_ESCAPES.get(raw[i + 1])
+            if simple is not None:
+                result.append(simple)
+                i += 2
+                continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+def _normalize_java_text_block(content: str) -> str:
+    """Approximates JEP 378's text-block incidental-whitespace algorithm:
+    a line terminator immediately after the opening ``\"\"\"`` is not
+    part of the content, every line's common leading whitespace (the
+    LEAST indented non-blank line, closing delimiter's own line
+    included per the JLS) is stripped, and each line's trailing
+    whitespace is stripped - then the same escape sequences an ordinary
+    literal supports are decoded. Not a byte-for-byte javac
+    reimplementation (this adapter is coarse S1 evidence, not a full
+    grammar), but no longer the raw, unindented-for-nothing source
+    substring round 6 published."""
+    if content.startswith("\r\n"):
+        content = content[2:]
+    elif content.startswith("\n"):
+        content = content[1:]
+    lines = content.split("\n")
+    indents = [len(line) - len(line.lstrip(" \t")) for line in lines if line.strip()]
+    min_indent = min(indents) if indents else 0
+    dedented = [line[min_indent:] if len(line) >= min_indent else line.lstrip(" \t") for line in lines]
+    stripped = [line.rstrip(" \t") for line in dedented]
+    return _decode_java_string_escapes("\n".join(stripped))
+
+
 def _java_string_literal_content(text: str, quote_pos: int) -> str | None:
     """Given ``text[quote_pos] == '"'``, returns the string literal's
-    inner content (excluding delimiters) - a triple-quoted text block's
-    content between the ``\"\"\"`` markers, or an ordinary literal's
-    content up to its own unescaped closing quote. ``None`` if the
-    literal is never closed before end of file.
+    DECODED value (excluding delimiters) - a triple-quoted text block's
+    incidental whitespace stripped and its escapes decoded per JEP 378,
+    or an ordinary literal's escapes decoded per JLS 3.10.7. ``None`` if
+    the literal is never closed before end of file.
 
     B1 (fourth cold read, fix round 6): mirrors ``_strip_comments_and_
     strings``'s OWN boundary-finding logic exactly (same escaped-quote
@@ -397,20 +457,27 @@ def _java_string_literal_content(text: str, quote_pos: int) -> str | None:
     a string ends for SANITIZATION purposes now also decides what its
     content IS for route-value extraction, closing the escaped-quote and
     text-block members of the nested-paren truncation family as a side
-    effect of reusing one mechanism, not as separate fixes."""
+    effect of reusing one mechanism, not as separate fixes.
+
+    Minor 6 (fifth cold read, fix round 7): round 6 returned this RAW
+    source substring - a text block's own leading newline/indentation,
+    and an ordinary literal's escape sequences (`\\"` published as two
+    literal characters, backslash included, never as the one character
+    it represents) - as the published route AND its stable ID. Both
+    branches now decode per Java's own semantics before returning."""
     n = len(text)
     if text[quote_pos:quote_pos + 3] == '"""':
         content_start = quote_pos + 3
         close = text.find('"""', content_start)
         if close == -1:
             return None
-        return text[content_start:close]
+        return _normalize_java_text_block(text[content_start:close])
     end = quote_pos + 1
     while end < n and text[end] != '"':
         end += 2 if text[end] == "\\" and end + 1 < n else 1
     if end >= n:
         return None
-    return text[quote_pos + 1:end]
+    return _decode_java_string_escapes(text[quote_pos + 1:end])
 
 
 def _route_path(sanitized: str, original: str, group_start: int, group_end: int) -> str | None:
@@ -435,22 +502,35 @@ def _route_path(sanitized: str, original: str, group_start: int, group_end: int)
     (position-independent - Spring allows any attribute order), falling
     back to a bare positional string only when it leads the argument
     list. The result is length-bounded (invariant 3), never an unbounded
-    raw excerpt."""
+    raw excerpt.
+
+    Minor 5 (fifth cold read, fix round 7): round 6 took only the FIRST
+    named-attribute match and required it to be immediately followed by
+    a literal - a non-literal attribute occurrence (e.g. an unrelated
+    identifier the sanitized text still matches `value|path` against)
+    ahead of the real, literal-valued one made the whole function give
+    up where it previously recovered a route. Every named match is now
+    tried in turn, falling back to the positional literal only once none
+    of them panned out - a strictly WIDER recovery than round 6's, never
+    narrower."""
     sanitized_segment = sanitized[group_start:group_end]
-    match = _ROUTE_NAMED_ATTR_RE.search(sanitized_segment)
-    if match is None:
-        match = _ROUTE_POSITIONAL_ANCHOR_RE.match(sanitized_segment)
-    if match is None:
-        return None
-    anchor = group_start + match.end()
+    for match in _ROUTE_NAMED_ATTR_RE.finditer(sanitized_segment):
+        content = _route_literal_at(original, group_start + match.end())
+        if content is not None:
+            return _bounded_route_target(content)
+    positional_match = _ROUTE_POSITIONAL_ANCHOR_RE.match(sanitized_segment)
+    if positional_match is not None:
+        content = _route_literal_at(original, group_start + positional_match.end())
+        if content is not None:
+            return _bounded_route_target(content)
+    return None
+
+
+def _route_literal_at(original: str, anchor: int) -> str | None:
     quote_match = _ROUTE_VALUE_QUOTE_RE.match(original, anchor)
     if quote_match is None:
         return None
-    quote_pos = quote_match.end() - 1
-    content = _java_string_literal_content(original, quote_pos)
-    if content is None:
-        return None
-    return _bounded_route_target(content)
+    return _java_string_literal_content(original, quote_match.end() - 1)
 
 
 def _bounded_route_target(value: str) -> str:
