@@ -2015,7 +2015,8 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
     action = getattr(args, "comprehension_cmd", None)
     if action is None:
         sys.stderr.write(
-            "agenttalk: comprehension requires a subcommand (scan/status/report/validate)\n")
+            "agenttalk: comprehension requires a subcommand "
+            "(scan/status/report/validate/prune)\n")
         return 2
 
     root = _comprehension_root(args)
@@ -2129,6 +2130,37 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
             print(f"valid:   {payload['valid']}")
             print(f"detail:  {payload['detail']}")
         return 0 if payload["valid"] else 1
+
+    if action == "prune":
+        # M-5 (second cold read, PR-B fix round 4): the design's own
+        # command table names `agenttalk comprehension prune --staging`
+        # ("Reclaim only definitely abandoned, unpublished staging
+        # directories. It never deletes runs or packs.") and staging.py's
+        # own docstring already claimed this call site existed - neither
+        # the automatic (lock-acquisition) nor the manual (this command)
+        # remedy actually existed until this fix.
+        if not args.staging:
+            sys.stderr.write("agenttalk: comprehension prune requires --staging\n")
+            return 2
+        from agenttalk.comprehension import paths as comprehension_paths
+        from agenttalk.comprehension import staging as staging_mod
+
+        comprehension_dir = comprehension_paths.comprehension_dir(root / ".agenttalk")
+        report = staging_mod.prune_staging(comprehension_dir)
+        payload = {
+            "reclaimed": report.reclaimed,
+            "retained": [{"name": name, "reason": reason} for name, reason in report.retained],
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"reclaimed: {len(report.reclaimed)}")
+            for name in report.reclaimed:
+                print(f"  - {name}")
+            print(f"retained:  {len(report.retained)}")
+            for name, reason in report.retained:
+                print(f"  - {name}: {reason}")
+        return 0
 
     sys.stderr.write(f"agenttalk: unknown comprehension subcommand {action!r}\n")
     return 2
@@ -13955,6 +13987,16 @@ def build_parser() -> argparse.ArgumentParser:
     cvalidate.add_argument("--run", help="Validate this scan_id instead of the latest.")
     cvalidate.add_argument("--json", action="store_true")
     cvalidate.set_defaults(func=cmd_comprehension)
+
+    cprune = compsub.add_parser(
+        "prune",
+        help="Reclaim only definitely abandoned, unpublished staging directories. "
+             "Never deletes runs or packs.")
+    cprune.add_argument(
+        "--staging", action="store_true",
+        help="Required: names what this command prunes (staging only, this slice).")
+    cprune.add_argument("--json", action="store_true")
+    cprune.set_defaults(func=cmd_comprehension)
 
     # ----- close (assurance P2 milestone/release close; advisory, opt-in) -----
     pclose = sub.add_parser(

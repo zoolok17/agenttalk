@@ -190,12 +190,26 @@ def run_scan(
     lock_handle = lock.acquire_scan_lock(
         comprehension_dir, privacy=privacy_result, predecessor_index_digest=predecessor_digest,
     )
+    # M-5 (second cold read, PR-B fix round 4): staging.reclaim_abandoned_
+    # staging had ZERO production callers despite its own docstring
+    # claiming "called automatically at lock acquisition" - wired here,
+    # matching both that docstring and the design's own phrasing ("At
+    # lock acquisition, the scanner reclaims only unpublished staging
+    # directories..."). Cleans up whatever a PRIOR crashed or refused run
+    # left behind before this run adds its own.
+    staging.reclaim_abandoned_staging(comprehension_dir)
 
     try:
         scan_id = _generate_scan_id(now)
-        staging_handle = staging.create_staging_dir(scan_id=scan_id, lock_handle=lock_handle)
-        generated_at = _utc_now_iso(now)
 
+        # M-5 (second cold read, PR-B fix round 4): discovery and the
+        # empty-scope refusal now run BEFORE staging is created - the
+        # staging directory used to be created first, so every refusal
+        # past this point (empty scope, and anything else that used to
+        # follow) left an abandoned .staging/<scan_id>-<nonce>/ directory
+        # behind with no automatic or manual remedy. Neither depends on
+        # the other, so this reorder changes nothing about what a
+        # successful scan actually does.
         discovery_result = discovery.enumerate_scope(root, comprehension_dir)
         if not discovery_result.files:
             # M3 (cold-read, PR-B fix round 3): an empty scope (nothing
@@ -207,6 +221,9 @@ def run_scan(
             raise ScanRefused(
                 f"no files were enumerated under {root} - refusing to publish a "
                 "vacuous zero-unit run; check --root and the exclusion policy")
+
+        staging_handle = staging.create_staging_dir(scan_id=scan_id, lock_handle=lock_handle)
+        generated_at = _utc_now_iso(now)
         relative_paths = [f.relative_path for f in discovery_result.files]
         worker_result = worker.run_sanitized_worker(root, relative_paths)
 

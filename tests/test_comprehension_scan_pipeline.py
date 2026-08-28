@@ -277,6 +277,44 @@ def test_run_scan_refuses_an_empty_scope(tmp_path: Path) -> None:
     comp_dir = scan_pipeline.paths.comprehension_dir(tmp_path / ".agenttalk")
     doc, _digest = publish.read_current_index(comp_dir)
     assert doc is None  # no run published
+    # M-5 (second cold read, PR-B fix round 4): staging used to be
+    # created BEFORE this refusal ran, leaking an abandoned
+    # .staging/<scan_id>-<nonce>/ directory on every refused scan.
+    staging_root = scan_pipeline.paths.staging_dir(comp_dir)
+    assert not staging_root.is_dir() or list(staging_root.iterdir()) == []
+
+
+def test_run_scan_reclaims_an_abandoned_staging_dir_from_a_prior_crash(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """M-5 (second cold read, PR-B fix round 4): reclaim_abandoned_staging
+    had ZERO production callers - an abandoned staging directory (the
+    shape a crashed or refused prior scan would leave behind) was never
+    cleaned up automatically. Now wired at lock acquisition, matching
+    both staging.py's own docstring and the design's own phrasing ("At
+    lock acquisition, the scanner reclaims only unpublished staging
+    directories...")."""
+    from agenttalk.comprehension import lock as lockmod
+    from agenttalk.comprehension import privacy as privacymod
+    from agenttalk.comprehension import staging as stagingmod
+
+    comp_dir = scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk")
+    privacy_result = privacymod.run_privacy_preflight(java_repo)
+    abandoned_lock = lockmod.acquire_scan_lock(
+        comp_dir, privacy=privacy_result, predecessor_index_digest=None)
+    abandoned_handle = stagingmod.create_staging_dir(
+        scan_id="20260101T000000Z-abcd1234", lock_handle=abandoned_lock)
+    lockmod.release_scan_lock(abandoned_lock)
+    assert abandoned_handle.path.exists()
+
+    # The abandoned directory's owner.json names THIS test process's own
+    # pid (a real, live process) - simulate it being definitely dead, the
+    # same way test_comprehension_staging.py's own reclaim tests do.
+    monkeypatch.setattr(stagingmod, "process_observation", lambda pid: ("dead", None))
+
+    scan_pipeline.run_scan(java_repo)
+
+    assert not abandoned_handle.path.exists()
 
 
 # ----------------------------------------------------------- M1: read-path run-id confinement

@@ -166,6 +166,41 @@ def test_validate_after_a_scan(java_repo: Path, capsys) -> None:
     assert payload["valid"] is True
 
 
+# ----------------------------------------------------------- prune --staging (M-5)
+
+def test_prune_staging_reclaims_a_dead_owners_abandoned_directory(
+    java_repo: Path, capsys, monkeypatch,
+) -> None:
+    """M-5 (second cold read, PR-B fix round 4): the design's own command
+    table names ``agenttalk comprehension prune --staging``, but the CLI
+    only ever wired scan/status/report/validate - the manual remedy for
+    an abandoned staging directory did not exist at all."""
+    from agenttalk.comprehension import lock as lockmod
+    from agenttalk.comprehension import privacy as privacymod
+    from agenttalk.comprehension import staging as stagingmod
+
+    comp_dir = scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk")
+    privacy_result = privacymod.run_privacy_preflight(java_repo)
+    abandoned_lock = lockmod.acquire_scan_lock(
+        comp_dir, privacy=privacy_result, predecessor_index_digest=None)
+    abandoned_handle = stagingmod.create_staging_dir(
+        scan_id="20260101T000000Z-abcd1234", lock_handle=abandoned_lock)
+    lockmod.release_scan_lock(abandoned_lock)
+    monkeypatch.setattr(stagingmod, "process_observation", lambda pid: ("dead", None))
+
+    exit_code = _run(["comprehension", "prune", "--staging", "--json"], java_repo)
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reclaimed"] == [abandoned_handle.path.name]
+    assert not abandoned_handle.path.exists()
+
+
+def test_prune_without_staging_flag_refuses(tmp_path: Path, capsys) -> None:
+    exit_code = _run(["comprehension", "prune"], tmp_path)
+    assert exit_code == 2
+    assert "--staging" in capsys.readouterr().err
+
+
 # ----------------------------------------------------------- bare subcommand
 
 def test_bare_comprehension_with_no_subcommand_refuses(tmp_path: Path, capsys) -> None:
