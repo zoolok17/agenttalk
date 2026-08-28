@@ -495,6 +495,51 @@ class Controller {
     assert routes[0].target == "p.Controller#RequestMapping"
 
 
+def test_class_level_request_mapping_composes_with_a_method_level_route():
+    """M5 (fourth cold read, fix round 6): a class-level @RequestMapping
+    prefix and a method-level route value used to publish as two
+    INDEPENDENT routes - the method's own published value was a bare
+    fragment of the actually-served path ("/list" published, "/api/
+    orders/list" actually served) in the field named for the whole
+    route. Composition is Spring's own declared semantics, not
+    inference. The bare class-level annotation itself (no method mapping
+    of its own) must not ALSO publish as its own route."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert len(http_entry_points) == 1
+    assert http_entry_points[0].name == "GET /api/orders/list"
+
+
+def test_method_level_route_with_no_class_level_mapping_is_unchanged():
+    """M5 (fourth cold read, fix round 6): a class with no class-level
+    route annotation at all must publish the method's own route exactly
+    as before - composition only applies when a class-level prefix
+    genuinely exists."""
+    src = """
+package p;
+class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /list"
+
+
 # ----------------------------------------------------------- entry points
 
 def test_main_method_is_a_cli_main_entry_point():

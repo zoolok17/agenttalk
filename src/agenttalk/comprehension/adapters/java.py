@@ -458,6 +458,49 @@ def _bounded_route_target(value: str) -> str:
     return value[:_MAX_ROUTE_TARGET_LENGTH] + "...(truncated)"
 
 
+#: M5 (fourth cold read, fix round 6): only whitespace and OTHER bare/
+#: simple annotations may separate a class-level route annotation from
+#: the type header it decorates (Java allows several annotations to
+#: stack directly above one declaration, e.g. ``@RestController
+#: @RequestMapping("/api/orders")``) - this is deliberately simpler than
+#: the depth-tracking scan _matching_close_paren uses (no nested parens
+#: inside one of these OTHER, skipped-over annotations): a real one
+#: (`@SuppressWarnings({"x"})`) would fail this match and safely fall
+#: back to treating the route annotation as method-level instead of
+#: guessing at a class-level composition.
+_ANNOTATION_TRIVIA_RE = re.compile(r"@\w+(?:\([^()]*\))?\s*|\s+")
+
+
+def _class_level_route_target(
+    sanitized: str, end_pos: int,
+    types: list[tuple[str, str, str, int, str | None, str | None, int]],
+) -> str | None:
+    """If the annotation ending at ``end_pos`` sits DIRECTLY on a
+    declared type - only trivia (whitespace, other stacked annotations)
+    between it and that type's own header - returns the type's qualified
+    name. ``None`` means this route annotation is on a method (or
+    anything else), not a class."""
+    header_starts = {start: qualified for qualified, _s, _c, start, _e, _i, _end in types}
+    pos = end_pos
+    n = len(sanitized)
+    while pos < n:
+        if pos in header_starts:
+            return header_starts[pos]
+        match = _ANNOTATION_TRIVIA_RE.match(sanitized, pos)
+        if match is None or match.end() == pos:
+            return None
+        pos = match.end()
+    return None
+
+
+def _compose_route_path(prefix: str, path: str) -> str:
+    """Spring's OWN declared composition semantics for a class-level
+    ``@RequestMapping`` prefix plus a method-level route value - not
+    inference (M5, fourth cold read, fix round 6): exactly one ``/``
+    between the two, regardless of which side already has one."""
+    return f"{prefix.rstrip('/')}/{path.lstrip('/')}"
+
+
 def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     """Parse one ``.java`` file's TEXT (already read by the sanitized
     worker - this function never touches the filesystem itself)."""
@@ -584,22 +627,55 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             line=_line_at(newline_offsets, match.start()), phase="runtime",
         ))
 
-    for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
-        line = _line_at(newline_offsets, match.start())
-        enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
+    def _route_annotation_span(match: re.Match) -> tuple[int, str | None]:
         # N10 (third cold read, fix round 5): find the annotation's own
         # argument-list parens by tracking nesting depth (below), rather
         # than a regex that stopped at the FIRST close-paren anywhere in
         # the argument list - see _matching_close_paren's docstring for
-        # the truncation this replaces.
+        # the truncation this replaces. Returns (position right after
+        # this annotation's own span, path-or-None) - the position is
+        # what a class-level check must resume from, never match.end()
+        # (which sits BEFORE this annotation's own arguments, not after
+        # them).
         arg_pos = match.end()
         while arg_pos < len(sanitized) and sanitized[arg_pos].isspace():
             arg_pos += 1
-        path = None
         if arg_pos < len(sanitized) and sanitized[arg_pos] == "(":
             close_pos = _matching_close_paren(sanitized, arg_pos)
             if close_pos is not None:
-                path = _route_path(sanitized, text, arg_pos, close_pos + 1)
+                return close_pos + 1, _route_path(sanitized, text, arg_pos, close_pos + 1)
+        return match.end(), None
+
+    # M5 (fourth cold read, fix round 6): a class-level @RequestMapping is
+    # a PREFIX for every method-level route inside that class - Spring's
+    # own declared composition semantics, not inference (composing them
+    # was previously never attempted at all: a class-level "/api/orders"
+    # plus a method-level "/list" published as two independent routes,
+    # the method's own published value "/list" a bare FRAGMENT of the
+    # actually-served "/api/orders/list" in the field named for the whole
+    # route). First pass: find every class-level route annotation (one
+    # sitting directly on a type, not a method - see
+    # _class_level_route_target) and record its literal prefix, only when
+    # that literal was itself confidently extracted.
+    class_route_prefix: dict[str, str] = {}
+    for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
+        span_end, path = _route_annotation_span(match)
+        target_type = _class_level_route_target(sanitized, span_end, types)
+        if target_type is not None and path is not None:
+            class_route_prefix[target_type] = path
+
+    for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
+        line = _line_at(newline_offsets, match.start())
+        enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
+        span_end, path = _route_annotation_span(match)
+        if _class_level_route_target(sanitized, span_end, types) is not None:
+            # A bare class-level annotation with no method-level mapping
+            # inside that class represents no invocable route on its own
+            # - already captured as a prefix above, never its own edge/
+            # entry point.
+            continue
+        if path is not None and enclosing in class_route_prefix:
+            path = _compose_route_path(class_route_prefix[enclosing], path)
         method = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1))
         if path is not None:
             target = f"{method} {path}" if method else path
