@@ -180,11 +180,20 @@ def build_modules(
             unit_id_by_qualified_name[unit_claim.qualified_name] = digests.unit_id(
                 kind="component", paths=[relative_path], qualified_name=unit_claim.qualified_name,
             )
+        file_unit_id = digests.unit_id(kind="file", paths=[relative_path], qualified_name=None)
 
         for unit_claim in java_result.units:
             parent_name = _parent_qualified_name(unit_claim.qualified_name, qualified_names_in_file)
+            # Note 3 (second cold read, fix round 4): a NESTED type is
+            # contained by its outer type (unchanged); a TOP-LEVEL type
+            # (parent_name is None) is contained by the FILE it is
+            # declared in - previously it got container_unit_id=None here
+            # while the FILE record below claimed the inverse (the file
+            # "contained by" the first type declared inside it), backwards
+            # containment that was never cyclic only because a file
+            # doesn't point back to itself.
             container_unit_id = (
-                unit_id_by_qualified_name[parent_name] if parent_name is not None else None
+                unit_id_by_qualified_name[parent_name] if parent_name is not None else file_unit_id
             )
             records.append(ModuleRecord(
                 unit_id=unit_id_by_qualified_name[unit_claim.qualified_name],
@@ -202,17 +211,15 @@ def build_modules(
                 )],
             ))
 
-        primary_qualified_name = java_result.units[0].qualified_name
-        top_level_container = unit_id_by_qualified_name.get(primary_qualified_name)
         records.append(ModuleRecord(
-            unit_id=digests.unit_id(kind="file", paths=[relative_path], qualified_name=None),
+            unit_id=file_unit_id,
             kind="file",
             display_name=relative_path.rsplit("/", 1)[-1],
             language="java",
             paths=[relative_path],
             source_digests={relative_path: file_entry.content_digest},
             classification=[java_result.units[0].classification],
-            container_unit_id=top_level_container,
+            container_unit_id=None,  # a file is the top of its own containment chain
             producers=[_producer(
                 name="discovery", version=1, source_digest=file_entry.content_digest,
                 basis="extracted",

@@ -50,6 +50,29 @@ def test_source_digest_defaults_to_none_without_file_digests():
     assert entry_points[0].producers[0]["source_digest"] is None
 
 
+def test_web_xml_entry_point_gets_a_clean_label_not_the_file_extension():
+    """Note 4 (second cold read, fix round 4): web.xml's synthetic
+    qualified_name (f"{relative_path}#{servlet_name}") is not a dotted
+    Java type name - splitting on "." landed in the middle of the file
+    path's own ".xml" extension, producing a garbage label like
+    "xml#legacy" instead of the actual servlet name."""
+    entry_points = java_adapter.parse_web_xml(
+        "WEB-INF/web.xml",
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>legacy</servlet-name>\n"
+        "    <url-pattern>/legacy/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+    )
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+    }
+    _entry_point_records, features = fa.build_features(results)
+    assert len(features) == 1
+    assert features[0].label == "legacy"
+
+
 def test_two_routes_on_the_same_controller_group_into_one_feature():
     source = (
         "package p;\nclass Controller {\n"

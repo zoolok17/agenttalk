@@ -315,7 +315,15 @@ def run_scan(
             "modules.json": len(modules_doc["units"]),
             "dependencies.json": len(dependencies_doc["edges"]),
             "features.json": len(features_doc["entry_points"]) + len(features_doc["features"]),
-            "readiness.json": len(readiness_doc["signals"]),
+            # Note 2 (second cold read, fix round 4): this previously
+            # counted signals only, not summaries - features.json already
+            # sums both of ITS record kinds (entry_points + features), so
+            # readiness.json's declared count understated its true record
+            # count (42 vs 49 on the reviewer's fixture). The publish
+            # ceiling was therefore enforced against an understated count -
+            # the fail-OPEN direction ceilings.py itself explicitly refuses
+            # for other cases (an unmeasured/negative count).
+            "readiness.json": len(readiness_doc["signals"]) + len(readiness_doc["summaries"]),
             "problems.json": len(problems_doc["problems"]),
             # N6 (cold-read, PR-B fix round 3): scan.json's own record must
             # be counted BEFORE scan_doc is built (never after writing it) -
@@ -475,6 +483,11 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         "problem_count": scan_doc["problem_count"],
         "record_counts": scan_doc["record_counts"],
         "root_binding": scan_doc["root_binding"],
+        # Note 1 (second cold read, fix round 4): this function's own
+        # docstring cites the design's "source revision/fingerprint" as
+        # part of what status shows - it was never actually returned.
+        "whole_scope_fingerprint": scan_doc["whole_scope_fingerprint"],
+        "fingerprint_complete": scan_doc["fingerprint_complete"],
         "freshness": {
             "state": "not_evaluated", "reason_code": "freshness_not_implemented_this_slice",
         },

@@ -103,6 +103,20 @@ def _producer(source_digest: str | None) -> dict[str, Any]:
     }
 
 
+def _feature_label(qualified_name: str) -> str:
+    """Note 4 (second cold read, fix round 4): a Java-style dotted
+    qualified name (``p.App``) uses its simple (rightmost) segment as the
+    label - but a non-Java producer's SYNTHETIC qualified name (web.xml's
+    servlet-mapping entry points: ``f"{relative_path}#{servlet_name}"``,
+    e.g. ``WEB-INF/web.xml#dispatcher``) is not a dotted type name at all;
+    splitting on "." there lands in the middle of the FILE PATH's own
+    extension, producing garbage like "xml#legacy" instead of the actual
+    servlet name. Splits on "#" first when present."""
+    if "#" in qualified_name:
+        return qualified_name.rsplit("#", 1)[-1]
+    return qualified_name.rsplit(".", 1)[-1]
+
+
 def build_features(
     java_results: dict[str, java_adapter.JavaFileResult],
     *, confirmed_labels: frozenset[str] = frozenset(),
@@ -138,7 +152,7 @@ def build_features(
 
     for owning_unit_id, claims in entry_points_by_owner.items():
         owner_path, first_claim = claims[0]
-        label = first_claim.qualified_name.rsplit(".", 1)[-1]
+        label = _feature_label(first_claim.qualified_name)
         feature_id = digests.feature_id(label=label, unit_ids=[owning_unit_id])
         entry_point_ids_for_feature: list[str] = []
 

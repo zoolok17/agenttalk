@@ -107,6 +107,27 @@ def test_process_paths_caps_adapter_work_and_degrades_instead_of_aborting(
     assert result.problems[0].relative_path == "Big.java"
 
 
+def test_process_paths_dispatch_is_not_extension_case_sensitive(tmp_path: Path) -> None:
+    """Note 10 (second cold read, fix round 4): Windows and default macOS
+    filesystems are case-insensitive/case-preserving - `Foo.JAVA` and
+    `POM.XML` are perfectly reachable real files there, and a case-
+    sensitive dispatch check would silently skip adapter dispatch for
+    them."""
+    (tmp_path / "Foo.JAVA").write_text("package p;\nclass Foo {}\n", encoding="utf-8")
+    (tmp_path / "POM.XML").write_text(
+        "<project><dependencies><dependency>"
+        "<groupId>g</groupId><artifactId>a</artifactId>"
+        "</dependency></dependencies></project>",
+        encoding="utf-8",
+    )
+    result = worker.process_paths(tmp_path, ["Foo.JAVA", "POM.XML"])
+    assert result.problems == []
+    assert "Foo.JAVA" in result.java_results
+    assert result.java_results["Foo.JAVA"]["units"][0]["qualified_name"] == "p.Foo"
+    assert "POM.XML" in result.java_results
+    assert result.java_results["POM.XML"]["edges"][0]["target"] == "g:a"
+
+
 def test_process_paths_dispatches_pom_xml_through_the_java_results_channel(
     tmp_path: Path,
 ) -> None:

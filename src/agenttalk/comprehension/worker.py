@@ -101,6 +101,17 @@ def sanitized_worker_env(source_env: dict[str, str] | None = None) -> dict[str, 
     this returns a new, filtered dict) using the fixed allowlist above.
     Exposed as its own function so a test can assert exactly what the
     worker process would see without actually spawning one.
+
+    Note 7 (second cold read, fix round 4): matching is deliberately
+    CASE-INSENSITIVE (``key.upper() in _ALLOWED_ENV_VARS``), never a
+    strict, exact-case match - Windows itself treats environment variable
+    names case-insensitively and does not guarantee any one casing
+    convention for what ``os.environ`` reports (``Path`` and ``PATH`` are
+    the same variable there), so a strict-case allowlist would risk
+    silently dropping an allowed variable on some Windows hosts. This can
+    only ever ADMIT a source key whose UPPERCASED form is already in the
+    fixed allowlist - it never widens what family of variables can pass,
+    only how their casing is spelled.
     """
     source = source_env if source_env is not None else os.environ
     return {key: value for key, value in source.items() if key.upper() in _ALLOWED_ENV_VARS}
@@ -176,9 +187,17 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
         claims.append(WorkerFileClaim(
             relative_path=rel, byte_count=len(data), content_digest=_hash_bytes(data)))
 
+        # Note 10 (second cold read, fix round 4): dispatch must not be
+        # extension-case-sensitive - Windows and default macOS
+        # filesystems are case-insensitive/case-preserving, so `Foo.JAVA`
+        # or `POM.XML` are perfectly reachable real files there, and a
+        # case-sensitive check would silently skip adapter dispatch for
+        # them.
+        rel_lower = rel.lower()
+        rel_name_lower = Path(rel).name.lower()
         adapter = next(
-            (mod for ext, mod in _ADAPTER_EXTENSIONS.items() if rel.endswith(ext)), None)
-        adapter_eligible = adapter is not None or Path(rel).name in ("pom.xml", "web.xml")
+            (mod for ext, mod in _ADAPTER_EXTENSIONS.items() if rel_lower.endswith(ext)), None)
+        adapter_eligible = adapter is not None or rel_name_lower in ("pom.xml", "web.xml")
         if adapter_eligible and len(data) > _MAX_ADAPTER_INPUT_BYTES:
             # M11 (cold-read, PR-B fix round 3): the design lists adapter
             # work among the resource caps, but none existed - a
@@ -204,7 +223,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                     detail=f"{adapter.ADAPTER_NAME} adapter failed: {exc}"))
             else:
                 java_results[rel] = adapter.file_result_to_json(result)
-        elif Path(rel).name == "pom.xml":
+        elif rel_name_lower == "pom.xml":
             # reviewer-3 B-3 (PR-B delta review): a pom.xml's build-relation
             # extraction used to happen in the PARENT process, reading the
             # file directly and bypassing this worker entirely - the one
@@ -224,7 +243,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             else:
                 java_results[rel] = java_adapter.file_result_to_json(
                     java_adapter.JavaFileResult(edges=build_edges))
-        elif Path(rel).name == "web.xml":
+        elif rel_name_lower == "web.xml":
             # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a
             # producer with its own passing unit tests but no dispatch
             # anywhere in the pipeline - the suite reported a capability

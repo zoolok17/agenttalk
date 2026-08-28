@@ -98,8 +98,12 @@ def test_a_java_file_with_one_top_level_type_produces_a_component_and_a_file_uni
     file_record = next(r for r in records if r.kind == "file")
     assert component.display_name == "Foo"
     assert component.language == "java"
-    assert component.container_unit_id is None  # top-level, nothing contains it
-    assert file_record.container_unit_id == component.unit_id  # the component contains the file
+    # Note 3 (second cold read, fix round 4): the FILE contains the
+    # top-level type declared inside it, never the reverse - the file is
+    # the top of its own containment chain (container_unit_id=None), and
+    # the component's own container points AT the file.
+    assert component.container_unit_id == file_record.unit_id
+    assert file_record.container_unit_id is None
 
 
 def test_a_nested_class_is_contained_by_its_outer_class():
@@ -114,9 +118,12 @@ def test_a_nested_class_is_contained_by_its_outer_class():
     inner = next(r for r in records if r.display_name == "Inner")
     file_record = next(r for r in records if r.kind == "file")
 
-    assert outer.container_unit_id is None
+    # Note 3 (second cold read, fix round 4): the outer (top-level) type
+    # is contained by the FILE, not the reverse; the inner type is
+    # contained by its outer type, unchanged.
+    assert outer.container_unit_id == file_record.unit_id
     assert inner.container_unit_id == outer.unit_id
-    assert file_record.container_unit_id == outer.unit_id
+    assert file_record.container_unit_id is None
 
 
 def test_unit_id_is_deterministic_across_two_builds():
