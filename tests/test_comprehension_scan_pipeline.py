@@ -660,6 +660,60 @@ def test_validate_run_before_any_scan_raises_not_scanned(tmp_path: Path) -> None
         scan_pipeline.validate_run(tmp_path)
 
 
+def _corrupt_modules_json_missing_unit_id(run_dir: Path) -> None:
+    """Envelope-valid (schema_version/artifact_type/scan_id/generated_at
+    are all still present and correct) but one record inside "units" is
+    missing its own required "unit_id" key - the exact malformed-but-
+    envelope-valid shape M-1 (fourth cold read, fix round 6) named."""
+    import json
+
+    modules_path = run_dir / "modules.json"
+    doc = json.loads(modules_path.read_text(encoding="utf-8"))
+    del doc["units"][0]["unit_id"]
+    modules_path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_get_report_refuses_a_malformed_record_instead_of_crashing(java_repo: Path) -> None:
+    """M-1 (fourth cold read, fix round 6): a record missing a required
+    key raised an untyped KeyError straight through report - record
+    conversion happened before validate's own digest check ever got a
+    chance to run. Must now raise the same typed ComprehensionError every
+    other malformed-input shape already raises, never a traceback."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _corrupt_modules_json_missing_unit_id(outcome.run_dir)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="malformed record"):
+        scan_pipeline.get_report(java_repo)
+
+
+def test_get_status_refuses_a_malformed_record_instead_of_crashing(java_repo: Path) -> None:
+    """M-1 (fourth cold read, fix round 6): same class as report, via
+    status's own full-run digest verification (M-1, round 5) which also
+    goes through _load_run_records's record conversion first."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _corrupt_modules_json_missing_unit_id(outcome.run_dir)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="malformed record"):
+        scan_pipeline.get_status(java_repo)
+
+
+def test_validate_run_reports_valid_false_for_a_malformed_record_not_a_crash(
+    java_repo: Path,
+) -> None:
+    """M-1 (fourth cold read, fix round 6): validate's own purpose is to
+    report on a doubtful run - a raw traceback (exit 1) is indistinguishable
+    from validate's own legitimate valid:false (also exit 1) to a scripted
+    caller. validate must return valid:false naming the artifact, never
+    crash."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _corrupt_modules_json_missing_unit_id(outcome.run_dir)
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "modules.json" in result["detail"]
+    assert "malformed record" in result["detail"]
+
+
 def _tamper_modules_json(run_dir: Path) -> None:
     import json
 

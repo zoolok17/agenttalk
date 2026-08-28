@@ -184,6 +184,46 @@ def test_validate_on_a_malformed_index_refuses_typed_instead_of_crashing(
     assert "agenttalk:" in capsys.readouterr().err
 
 
+def test_all_three_read_commands_refuse_a_malformed_artifact_record_via_the_real_cli(
+    java_repo: Path, capsys,
+) -> None:
+    """M-1 (fourth cold read, fix round 6): a record inside an envelope-
+    valid artifact missing a required key used to raise an untyped
+    KeyError straight through status/report/validate via the real CLI.
+    status/report must now exit 2 with a typed stderr message, never a
+    traceback. validate is different by design - it CATCHES this
+    internally and reports valid:false (a legitimate outcome, exit 1),
+    naming the malformed artifact in its own detail field rather than
+    letting the exception escape as a second, indistinguishable exit 1
+    (a raw traceback happened to also exit 1, which is exactly the
+    ambiguity this fix removes)."""
+    import json
+
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    scan_id = json.loads(
+        (java_repo / ".agenttalk" / "comprehension" / "index.json").read_text(encoding="utf-8"),
+    )["latest_scan_id"]
+    modules_path = java_repo / ".agenttalk" / "comprehension" / "runs" / scan_id / "modules.json"
+    doc = json.loads(modules_path.read_text(encoding="utf-8"))
+    del doc["units"][0]["unit_id"]
+    modules_path.write_text(json.dumps(doc), encoding="utf-8")
+
+    for action in ("status", "report"):
+        exit_code = _run(["comprehension", action, "--json"], java_repo)
+        err = capsys.readouterr().err
+        assert exit_code == 2, f"{action} exited {exit_code}, expected 2 (typed refusal)"
+        assert "agenttalk:" in err, f"{action} produced no typed stderr message: {err!r}"
+
+    exit_code = _run(["comprehension", "validate", "--json"], java_repo)
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    payload = json.loads(out)
+    assert payload["valid"] is False
+    assert "modules.json" in payload["detail"]
+    assert "malformed record" in payload["detail"]
+
+
 # ----------------------------------------------------------- prune --staging (M-5)
 
 def test_prune_staging_reclaims_a_dead_owners_abandoned_directory(

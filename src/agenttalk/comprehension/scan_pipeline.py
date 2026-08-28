@@ -569,6 +569,26 @@ def _load_run_records(comprehension_dir: Path, scan_id: str) -> dict[str, Any]:
             raise ComprehensionError(f"{scan_id}'s {name} could not be read: {exc}") from exc
         return validate_envelope(doc, artifact_type=artifact_type, schema_version=schema_version)
 
+    # M1 (fourth cold read, fix round 6): validate_envelope only checks the
+    # COMMON envelope fields (schema_version/artifact_type/scan_id/
+    # generated_at) - an artifact that passes it can still be missing a
+    # section key (e.g. modules.json with no "units") or have one record
+    # inside a section missing a required field. Every record-conversion
+    # call site used to index straight into the raw doc/record with no
+    # guard, raising an untyped KeyError through every read command
+    # (status/report/validate) via the real CLI - BEFORE the digest check
+    # that would have caught genuine tamper ever ran, since record loading
+    # happens first. Round 5's N2 closed this exact class one layer up,
+    # for index.json; this closes the artifact layer, at the one place
+    # every record conversion already funnels through - not per call site.
+    def _records(doc: dict[str, Any], key: str, name: str, converter) -> list:
+        try:
+            items = doc[key]
+            return [converter(item) for item in items]
+        except (KeyError, TypeError) as exc:
+            raise ComprehensionError(
+                f"{scan_id}'s {name} contains a malformed record: {exc}") from exc
+
     scan_doc = _load("scan.json", SCAN_ARTIFACT_TYPE, SCAN_SCHEMA_VERSION)
     modules_doc = _load("modules.json", MODULES_ARTIFACT_TYPE, modules_artifact.MODULES_SCHEMA_VERSION)
     dependencies_doc = _load(
@@ -587,21 +607,22 @@ def _load_run_records(comprehension_dir: Path, scan_id: str) -> dict[str, Any]:
             "readiness.json": readiness_doc,
             "problems.json": problems_doc,
         },
-        "modules": [modules_artifact.module_record_from_json(u) for u in modules_doc["units"]],
-        "dependencies": [
-            dependencies_artifact.dependency_record_from_json(e) for e in dependencies_doc["edges"]
-        ],
-        "entry_points": [
-            features_artifact.entry_point_record_from_json(e) for e in features_doc["entry_points"]
-        ],
-        "features": [features_artifact.feature_record_from_json(f) for f in features_doc["features"]],
-        "readiness_signals": [
-            readiness_artifact.readiness_signal_from_json(s) for s in readiness_doc["signals"]
-        ],
-        "readiness_summaries": [
-            readiness_artifact.unit_readiness_summary_from_json(s) for s in readiness_doc["summaries"]
-        ],
-        "problems": list(problems_doc["problems"]),
+        "modules": _records(
+            modules_doc, "units", "modules.json", modules_artifact.module_record_from_json),
+        "dependencies": _records(
+            dependencies_doc, "edges", "dependencies.json",
+            dependencies_artifact.dependency_record_from_json),
+        "entry_points": _records(
+            features_doc, "entry_points", "features.json",
+            features_artifact.entry_point_record_from_json),
+        "features": _records(
+            features_doc, "features", "features.json", features_artifact.feature_record_from_json),
+        "readiness_signals": _records(
+            readiness_doc, "signals", "readiness.json", readiness_artifact.readiness_signal_from_json),
+        "readiness_summaries": _records(
+            readiness_doc, "summaries", "readiness.json",
+            readiness_artifact.unit_readiness_summary_from_json),
+        "problems": _records(problems_doc, "problems", "problems.json", lambda item: item),
     }
 
 
