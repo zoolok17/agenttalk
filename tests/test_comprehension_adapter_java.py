@@ -558,6 +558,37 @@ def test_parse_maven_pom_extracts_dependency_build_edges():
     assert {e.target for e in edges} == {"org.springframework:spring-core", "junit:junit"}
     assert all(e.relation == "build" for e in edges)
     assert all(e.evidence_class == "declared" for e in edges)
+    assert all(e.phase == "build" and e.optional is False for e in edges)
+
+
+def test_parse_maven_pom_reads_optional_and_test_scope_instead_of_asserting_defaults():
+    """M3 (fourth cold read, fix round 6): <optional>/<scope> were read
+    past and discarded - every edge asserted optional:false, phase:build
+    as a positive fact regardless of what the pom actually declared.
+    Reproduced pre-fix: an optional=true, scope=test dependency still
+    published optional:false, phase:build."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <scope>test</scope>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    edges = {e.target: e for e in java.parse_maven_pom("pom.xml", pom)}
+    mockito = edges["org.mockito:mockito-core"]
+    assert mockito.optional is True
+    assert mockito.phase == "test"
+    spring = edges["org.springframework:spring-core"]
+    assert spring.optional is False
+    assert spring.phase == "build"
 
 
 def test_parse_maven_pom_ignores_a_commented_out_dependency():

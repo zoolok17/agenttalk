@@ -151,6 +151,14 @@ class JavaEdgeClaim:
     evidence_class: str
     line: int | None
     phase: str
+    #: M3 (fourth cold read, fix round 6): a Maven ``<dependency>``'s own
+    #: ``<optional>true</optional>`` element - the ONE edge shape this
+    #: adapter parses that has a declared optionality at all. False by
+    #: default (every non-pom edge - import/inherit/invoke/route/test -
+    #: has no such concept and stays False), never a guess for the pom
+    #: case: unset or ``false`` in the pom is False, only an explicit
+    #: ``true`` element flips it.
+    optional: bool = False
 
 
 @dataclass(frozen=True)
@@ -644,28 +652,62 @@ def _strip_xml_comments(text: str) -> str:
     return _XML_COMMENT_RE.sub(_blank, text)
 
 
-_DEPENDENCY_RE = re.compile(
-    r"<dependency>\s*"
-    r"<groupId>([^<]+)</groupId>\s*"
-    r"<artifactId>([^<]+)</artifactId>",
-)
+#: M3 (fourth cold read, fix round 6): captures the WHOLE dependency
+#: block rather than anchoring on groupId immediately followed by
+#: artifactId - <optional>/<scope> (and <version>, ignored) can appear in
+#: any order alongside them, the same "named attribute, any order" shape
+#: the Spring route annotations already handle (M8, round 3). Non-greedy
+#: so it stops at THIS dependency's own closing tag, never spanning into
+#: a sibling <dependency> block.
+_DEPENDENCY_BLOCK_RE = re.compile(r"<dependency>(.*?)</dependency>", re.DOTALL)
+_DEPENDENCY_GROUP_ID_RE = re.compile(r"<groupId>\s*([^<]+?)\s*</groupId>")
+_DEPENDENCY_ARTIFACT_ID_RE = re.compile(r"<artifactId>\s*([^<]+?)\s*</artifactId>")
+#: Maven's own boolean spelling - never assumed False for anything but a
+#: genuinely absent or explicit ``false`` element; only an explicit
+#: ``true`` element makes an edge optional.
+_DEPENDENCY_OPTIONAL_RE = re.compile(r"<optional>\s*(true|false)\s*</optional>", re.IGNORECASE)
+#: Maven's own scope vocabulary (compile/provided/runtime/test/system/
+#: import) - this slice maps only the one the design names explicitly
+#: ("scope test -> phase test"); every other spelling (including no
+#: <scope> at all, Maven's own "compile" default) stays this adapter's
+#: existing "build" phase.
+_DEPENDENCY_SCOPE_RE = re.compile(r"<scope>\s*([\w.-]+)\s*</scope>")
 
 
 def parse_maven_pom(relative_path: str, text: str) -> list[JavaEdgeClaim]:
     """Direct-dependency ``build`` edges from a ``pom.xml``'s
     ``<dependency>`` blocks. Plain regex over a small, well-known XML
     shape - no XML parser (and its entity-expansion surface) needed for
-    two flat child elements."""
+    a handful of flat child elements.
+
+    M3 (fourth cold read, fix round 6): ``<optional>``/``<scope>`` were
+    read PAST and discarded - every edge asserted ``optional: false``,
+    ``phase: build`` as a positive, hardcoded fact regardless of what the
+    pom actually declared. Both are now parsed from the evidence already
+    in the file: an explicit ``<optional>true</optional>`` sets
+    ``optional``; ``<scope>test</scope>`` sets ``phase: test`` rather
+    than the default ``build``."""
     from_name = relative_path
     sanitized = _strip_xml_comments(text)
     newline_offsets = _newline_offsets(sanitized)
     edges = []
-    for match in _DEPENDENCY_RE.finditer(sanitized):
-        group_id, artifact_id = match.group(1).strip(), match.group(2).strip()
+    for match in _DEPENDENCY_BLOCK_RE.finditer(sanitized):
+        block = match.group(1)
+        group_match = _DEPENDENCY_GROUP_ID_RE.search(block)
+        artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block)
+        if group_match is None or artifact_match is None:
+            continue
+        group_id, artifact_id = group_match.group(1).strip(), artifact_match.group(1).strip()
+        optional_match = _DEPENDENCY_OPTIONAL_RE.search(block)
+        optional = optional_match is not None and optional_match.group(1).lower() == "true"
+        scope_match = _DEPENDENCY_SCOPE_RE.search(block)
+        scope = scope_match.group(1).strip().lower() if scope_match else None
+        phase = "test" if scope == "test" else "build"
         edges.append(JavaEdgeClaim(
             from_qualified_name=from_name, relation="build",
             target=f"{group_id}:{artifact_id}", target_kind="external",
-            evidence_class="declared", line=_line_at(newline_offsets, match.start()), phase="build",
+            evidence_class="declared", line=_line_at(newline_offsets, match.start()), phase=phase,
+            optional=optional,
         ))
     return edges
 

@@ -331,6 +331,25 @@ def test_build_edges_from_pom_xml_are_attributed_to_the_pom_file():
         kind="file", paths=["pom.xml"], qualified_name=None)
 
 
+def test_optional_and_scope_test_thread_through_to_the_dependency_record():
+    """M3 (fourth cold read, fix round 6): DependencyRecord.optional was
+    hardcoded False in _edge_claim_to_record regardless of what the
+    adapter's own claim said - the field existed and was in the published
+    schema, but nothing ever set it from real evidence."""
+    pom_edges = java_adapter.parse_maven_pom(
+        "pom.xml",
+        "<project><dependencies><dependency>"
+        "<groupId>org.mockito</groupId><artifactId>mockito-core</artifactId>"
+        "<scope>test</scope><optional>true</optional>"
+        "</dependency></dependencies></project>",
+    )
+    results = {"pom.xml": java_adapter.JavaFileResult(edges=pom_edges)}
+    records = da.build_dependencies(results)
+    assert len(records) == 1
+    assert records[0].optional is True
+    assert records[0].phase == "test"
+
+
 # ----------------------------------------------------------- determinism / integrity
 
 def test_edge_id_is_deterministic_across_two_builds():

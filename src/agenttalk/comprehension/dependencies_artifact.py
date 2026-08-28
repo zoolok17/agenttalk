@@ -297,7 +297,11 @@ def _edge_claim_to_record(
         from_unit_id=from_unit_id,
         relation=edge.relation,
         phase=edge.phase,
-        optional=False,
+        # M3 (fourth cold read, fix round 6): hardcoded False regardless
+        # of what the adapter actually claimed - a Maven <dependency>'s
+        # own <optional>true</optional> was read past and discarded,
+        # publishing every pom edge as a positive "not optional" fact.
+        optional=edge.optional,
         evidence_class=edge.evidence_class,
         resolution_state=resolution_state,
         target_unit_id=target_unit_id,
