@@ -68,7 +68,7 @@ _ROUTE_ANNOTATIONS = (
     "DeleteMapping", "PatchMapping",
 )
 _ROUTE_ANNOTATION_RE = re.compile(
-    r"@(" + "|".join(_ROUTE_ANNOTATIONS) + r")\s*(\([^)]*\))?"
+    r"@(" + "|".join(_ROUTE_ANNOTATIONS) + r")\b"
 )
 #: M-5 (third cold read, fix round 5): a verb-specific annotation names its
 #: own HTTP method unambiguously; plain ``@RequestMapping`` does not (it
@@ -329,6 +329,33 @@ def _split_type_list(raw: str) -> list[str]:
     return [p for p in parts if p]
 
 
+def _matching_close_paren(sanitized: str, open_pos: int) -> int | None:
+    """Returns the index of the ``)`` that BALANCES the ``(`` at
+    ``open_pos`` in ``sanitized``, tracking nesting depth - or ``None`` if
+    the parens never close before end of file. ``sanitized`` has already
+    had every string/char literal's CONTENT blanked to spaces (by
+    :func:`_strip_comments_and_strings`), so a paren character found here
+    is always a real one, never one hiding inside a string literal.
+
+    N10 (third cold read, fix round 5): the previous ``\\([^)]*\\)``
+    regex captured up to the FIRST ``)`` found ANYWHERE in the argument
+    list, with no awareness of nesting - an annotation argument
+    containing its own nested call (``@RequestMapping(produces =
+    someHelper(x, y), value = "/api/widgets")``) truncated the captured
+    span right after that nested call's OWN closing paren, silently
+    losing every attribute that followed it - including, in that
+    example, the real ``value`` this whole mechanism exists to find."""
+    depth = 0
+    for i in range(open_pos, len(sanitized)):
+        if sanitized[i] == "(":
+            depth += 1
+        elif sanitized[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
 def _route_path(original: str, group_start: int, group_end: int) -> str | None:
     """Recover the annotation's literal path/value string from the
     ORIGINAL (un-sanitized) text at the SAME offsets the sanitized match's
@@ -485,7 +512,19 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
-        path = _route_path(text, match.start(2), match.end(2)) if match.group(2) else None
+        # N10 (third cold read, fix round 5): find the annotation's own
+        # argument-list parens by tracking nesting depth (below), rather
+        # than a regex that stopped at the FIRST close-paren anywhere in
+        # the argument list - see _matching_close_paren's docstring for
+        # the truncation this replaces.
+        arg_pos = match.end()
+        while arg_pos < len(sanitized) and sanitized[arg_pos].isspace():
+            arg_pos += 1
+        path = None
+        if arg_pos < len(sanitized) and sanitized[arg_pos] == "(":
+            close_pos = _matching_close_paren(sanitized, arg_pos)
+            if close_pos is not None:
+                path = _route_path(text, arg_pos, close_pos + 1)
         method = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1))
         if path is not None:
             target = f"{method} {path}" if method else path

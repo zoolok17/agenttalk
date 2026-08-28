@@ -344,6 +344,28 @@ class Controller {
     assert routes[0].target == "/orders"
 
 
+def test_route_value_after_a_nested_call_argument_is_not_truncated_away():
+    """N10 (third cold read, fix round 5): the old ``\\([^)]*\\)`` regex
+    captured up to the FIRST ``)`` found ANYWHERE in the argument list -
+    an earlier attribute containing its OWN nested call
+    (``someHelper(x, y)``) closed that regex's capture right after its
+    own paren, silently losing every attribute after it, including the
+    real ``value`` this whole mechanism exists to find. Reproduced
+    pre-fix: this fell back to the bare annotation label
+    ("p.Controller#RequestMapping"), with "/api/widgets" entirely lost."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(produces = someHelper(x, y), value = "/api/widgets")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/api/widgets"
+
+
 def test_request_mapping_path_attribute_is_recovered_ahead_of_an_unrelated_literal():
     src = """
 package p;
