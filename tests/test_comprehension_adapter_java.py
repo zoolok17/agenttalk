@@ -232,6 +232,77 @@ record Pair<A, B>(A first, B second) {
     assert [u.qualified_name for u in result.units] == ["p.Pair"]
 
 
+# --------------------------------------- MINOR 4 (sixth cold read, fix round
+# 9): "record" is a CONTEXTUAL keyword - unlike class/interface/enum (fully
+# reserved), it remains legal as an ordinary identifier. The keyword+
+# identifier anchor previously accepted "record" followed by any word as a
+# declaration regardless of context, most concretely: a parameter/variable
+# literally named "record" immediately followed by the "instanceof" operator
+# published a phantom unit named "instanceof". A real record declaration
+# always has a component parameter list (even an empty one); requiring it
+# closes this false-positive family without narrowing real record support.
+
+def test_record_used_as_a_parameter_name_before_instanceof_is_not_a_phantom_type():
+    src = """
+package p;
+class Controller {
+    void process(Object record) {
+        if (record instanceof String s) {
+            System.out.println(s);
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
+def test_record_used_as_a_local_variable_name_before_instanceof_is_not_a_phantom_type():
+    src = """
+package p;
+class Controller {
+    void process() {
+        Object record = compute();
+        if (record instanceof String) { }
+    }
+    Object compute() { return null; }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
+def test_record_used_as_a_field_name_is_not_a_phantom_type():
+    src = """
+package p;
+class Controller {
+    private Object record;
+    void use() {
+        Object x = record;
+    }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
+def test_record_used_as_an_instanceof_pattern_variable_name_is_not_a_phantom_type():
+    """Java 16+ instanceof pattern variables can be named "record" too
+    (still just an ordinary identifier position)."""
+    src = """
+package p;
+class Controller {
+    void process(Object obj) {
+        if (obj instanceof String record) {
+            System.out.println(record);
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
 def test_class_level_request_mapping_composes_on_a_bounded_generic_controller():
     """The end-to-end proving case: a class-level route prefix on a
     header shape the OLD regex could not match must still compose with
@@ -251,6 +322,41 @@ public class Controller<T extends Comparable<T>> {
     routes = _edges(result, "route")
     assert len(routes) == 1
     assert routes[0].target == "GET /api/base/list"
+
+
+def test_a_file_with_zero_extracted_types_publishes_no_route_or_entry_point_claims():
+    """BLOCKER (sixth cold read, fix round 9): route/entry-point emission
+    never consulted whether the file actually yielded any types - a file
+    that degrades honestly (zero units, no_types_extracted, unknown,
+    degraded) still published the class-level route prefix as its own
+    invocable route and the method value as the whole route, declared-
+    class, as stable entry-point IDs, all attributed to a SYNTHESIZED
+    fallback owner that names no real unit at all.
+
+    Proven with valid Java this adapter cannot see the body of: the
+    language decodes \\uXXXX unicode escapes BEFORE lexing (real javac
+    compiles this fine - a class body delimited by \\u007B/\\u007D braces
+    instead of literal `{`/`}`), but this adapter's sanitizer does not
+    decode them, so its own brace-matching never finds the type's body
+    at all - zero units - while every OTHER extraction loop (route
+    annotations included) keeps scanning the surrounding text
+    regardless. Must now publish zero edges/entry points from this file,
+    not launder them under a synthesized owner."""
+    backslash = chr(92)
+    open_brace = backslash + "u007B"
+    close_brace = backslash + "u007D"
+    src = (
+        "package p;\n"
+        '@RequestMapping("/api/orders")\n'
+        "public class Controller " + open_brace + "\n"
+        '    @GetMapping("/list")\n'
+        "    void list() " + open_brace + close_brace + "\n"
+        + close_brace + "\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    assert result.units == []
+    assert result.edges == []
+    assert result.entry_points == []
 
 
 # ----------------------------------------------------------- test classification + relation

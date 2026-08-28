@@ -422,6 +422,23 @@ def _extract_types(
     for name_match in _TYPE_NAME_ANCHOR_RE.finditer(sanitized):
         clause_start = _skip_bracketed(sanitized, name_match.end(), "<", _matching_close_angle)
         if name_match.group(1) == "record":
+            # MINOR 4 (sixth cold read, fix round 9): "record" is a
+            # CONTEXTUAL keyword - unlike class/interface/enum (fully
+            # reserved), it remains legal as an ordinary identifier (a
+            # variable/parameter literally named "record"). A REAL
+            # record declaration always has a component parameter list,
+            # even an empty one (`record Foo() {}` is the minimal valid
+            # form; `record Foo {}` is not valid Java at all) - requiring
+            # it here rejects "record" used as a plain identifier
+            # immediately followed by another word (most plausibly the
+            # "instanceof" operator: "void m(Object record) { if (record
+            # instanceof String s) ... }" previously matched, publishing
+            # a phantom unit named after whatever word followed).
+            probe = clause_start
+            while probe < len(sanitized) and sanitized[probe].isspace():
+                probe += 1
+            if probe >= len(sanitized) or sanitized[probe] != "(":
+                continue
             clause_start = _skip_bracketed(sanitized, clause_start, "(", _matching_close_paren)
         brace_pos = _find_type_header_brace(sanitized, clause_start)
         if brace_pos is None:
@@ -1075,6 +1092,31 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             line=_line_at(newline_offsets, main_match.start()), evidence_class="extracted",
         ))
 
+    if not units:
+        # BLOCKER (sixth cold read, fix round 9): route/entry-point
+        # emission (and every other edge kind above) never consulted
+        # whether this file actually yielded any types - a file that
+        # degrades honestly (zero units published, the worker's own
+        # no_types_extracted problem recorded, round 8's BLOCKER 1b)
+        # STILL published the class-level route prefix as an invocable
+        # route, the method value as the whole route, declared-class,
+        # as stable entry-point IDs - every extraction loop above
+        # (imports, invoke, route, cli_main) runs regardless of whether
+        # ANY type was found, all falling back to the same SYNTHESIZED
+        # owner (primary_qualified) that names no real unit at all.
+        # Proven with valid, unicode-escaped-brace Java source: the
+        # LANGUAGE decodes \uXXXX escapes before lexing (so real javac
+        # compiles it fine); this adapter's sanitizer does not, so its
+        # own brace-matching never even sees the type's body, while
+        # every other loop keeps running on the surrounding text
+        # regardless. Under-claim over guess: when a file yields no
+        # types, suppress every edge/entry-point claim from it - the
+        # problem record already carries visibility; a synthesized
+        # owner would only launder unattributable claims into the
+        # published artifacts. The suppression lives here, at the one
+        # place this function actually returns its result, not as a
+        # filter a future caller could forget to apply.
+        return JavaFileResult(units=[], edges=[], entry_points=[])
     return JavaFileResult(units=units, edges=edges, entry_points=entry_points)
 
 

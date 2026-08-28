@@ -506,12 +506,47 @@ def test_run_scan_degrades_and_reports_unknown_for_a_java_file_with_no_recognize
         u for u in modules_doc["units"] if u["paths"] == ["src/main/java/p/Garbage.java"])
     assert garbage_unit["adapter_problem_reason"] == "no_types_extracted"
 
-    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
-    signal = next(
-        s for s in readiness_doc["signals"]
-        if s["unit_id"] == garbage_unit["unit_id"] and s["check"] == "source_understood"
+
+def test_run_scan_publishes_no_route_claims_from_a_zero_type_java_file(java_repo: Path) -> None:
+    """BLOCKER (sixth cold read, fix round 9), end to end: a file that
+    degrades honestly (zero units, no_types_extracted, degraded) must
+    not ALSO publish a route edge/entry point attributed to a
+    synthesized owner. Reproduced with valid, unicode-escaped-brace Java
+    source (the language decodes \\uXXXX escapes before lexing; this
+    adapter's sanitizer does not, so its own brace-matching never finds
+    the type's body at all) - the pre-fix behavior published the class-
+    level route prefix and the method's own route despite zero units."""
+    import json
+
+    backslash = chr(92)
+    open_brace = backslash + "u007B"
+    close_brace = backslash + "u007D"
+    src = (
+        "package p;\n"
+        '@RequestMapping("/api/orders")\n'
+        "public class Controller " + open_brace + "\n"
+        '    @GetMapping("/list")\n'
+        "    void list() " + open_brace + close_brace + "\n"
+        + close_brace + "\n"
     )
-    assert signal["stored_status"] == "unknown"
+    (java_repo / "src" / "main" / "java" / "p" / "Controller2.java").write_text(
+        src, encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "no_types_extracted"]
+    assert any(p["path"] == "src/main/java/p/Controller2.java" for p in matching)
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    route_edges = [e for e in dependencies_doc["edges"] if e["relation"] == "route"]
+    assert route_edges == []
+
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    http_route_entry_points = [
+        e for e in features_doc["entry_points"] if e["kind"] == "http_route"]
+    assert http_route_entry_points == []
 
 
 def test_run_scan_does_not_flag_package_info_java_as_a_type_extraction_problem(
