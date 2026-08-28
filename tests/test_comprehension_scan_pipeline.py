@@ -800,6 +800,37 @@ def test_a_second_scan_chains_the_predecessor_digest(java_repo: Path) -> None:
     assert second.scan_id != first.scan_id
 
 
+def test_scan_json_content_digest_is_stable_across_two_real_content_identical_scans(
+    java_repo: Path,
+) -> None:
+    """MAJOR 3 (sixth cold read, fix round 9): round 8's own fix (added
+    started_at/completed_at to GENERATION_IDENTITY_KEYS) was NOT
+    sufficient - field-diffing two REAL scans of this same, unchanged
+    repo isolated scan.json's own artifacts[].byte_sha256: each OTHER
+    artifact's byte digest is computed over that artifact's own on-disk
+    bytes, which embed ITS OWN envelope's scan_id/generated_at - so
+    byte_sha256 is generation identity, one level removed, and hashing
+    it into scan.json's canonical content digest imported that variance
+    right back in. Round 8's own determinism test used a hand-built
+    fixture that omitted the "artifacts" key entirely - the exact shape
+    that would have caught this - so it passed while the real bug
+    remained (fixture-conceals-the-defect, instance four). This test
+    runs the real pipeline TWICE and compares the real, on-disk
+    documents, not a hand-built stand-in."""
+    import json
+
+    from agenttalk.comprehension import digests as digestsmod
+
+    first = scan_pipeline.run_scan(java_repo)
+    second = scan_pipeline.run_scan(java_repo)
+
+    first_doc = json.loads((first.run_dir / "scan.json").read_text(encoding="utf-8"))
+    second_doc = json.loads((second.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert first_doc["scan_id"] != second_doc["scan_id"]
+    assert first_doc["artifacts"] != second_doc["artifacts"]  # byte_sha256 genuinely differs
+    assert digestsmod.canonical_content_digest(first_doc) == digestsmod.canonical_content_digest(second_doc)
+
+
 def test_recover_stale_lock_flag_clears_an_existing_lock(java_repo: Path) -> None:
     from agenttalk.comprehension import lock as lockmod
     from agenttalk.comprehension import paths as pathsmod

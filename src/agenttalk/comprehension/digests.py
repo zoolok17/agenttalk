@@ -39,9 +39,23 @@ from typing import Any
 #: not merely a latent one (run_content_digest never included scan.json
 #: itself, so this never affected the RUN-level digest - only scan.json's
 #: own).
+#: MAJOR 3 (sixth cold read, fix round 9): round 8's fix (started_at/
+#: completed_at above) was NOT sufficient - field-diffing two REAL
+#: scans isolated scan.json's own artifacts[].byte_sha256: each OTHER
+#: artifact's byte digest is computed over that artifact's OWN on-disk
+#: bytes, which embed ITS OWN envelope's scan_id/generated_at - so
+#: byte_sha256 IS generation identity, one level removed, and hashing
+#: it into scan.json's canonical content digest imported that variance
+#: right back in. Round 8's own determinism test used a hand-built
+#: scan.json-shaped fixture that omitted the "artifacts" key entirely -
+#: the exact shape that would have caught this - so it passed while the
+#: real bug remained (fixture-conceals-the-defect, instance four).
+#: byte_sha256 has no consumer outside scan_pipeline.py's own scan.json
+#: artifacts summary (no other artifact shape uses this field name), so
+#: stripping it here is unconditional and safe.
 GENERATION_IDENTITY_KEYS = frozenset({
     "scan_id", "generated_at", "capture_time", "lock_token", "owner_token",
-    "started_at", "completed_at",
+    "started_at", "completed_at", "byte_sha256",
 })
 
 _ROOT_BINDING_DOMAIN = b"agenttalk.comprehension.root_binding.v1\x00"
