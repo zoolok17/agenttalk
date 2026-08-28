@@ -228,6 +228,68 @@ def test_invoke_on_an_unrecognized_qualifier_does_not_capture_an_unrelated_same_
     assert invoke.target_unresolved == "Optional"
 
 
+# ----------------------------------------------------------- second cold read B-1: import-mediated invoke
+
+def test_import_mediated_invoke_of_an_in_scan_type_resolves_to_the_same_internal_unit():
+    """Second cold read B-1 (fix round 4, BLOCKER): a call whose qualifier
+    resolves through an import was stamped external unconditionally,
+    never consulting the registry - so calling an imported IN-SCAN type
+    (the normal cross-package case in Java) filed a real internal
+    dependency as third-party, emptied it from fan-in, and let readiness
+    claim dependencies_resolved=satisfied over nothing. The import edge
+    and the invoke edge for the SAME imported name must resolve to the
+    SAME internal unit - proven directly against each other, not just
+    against a separately-computed unit id."""
+    results = {
+        "p/OrderService.java": _parse(
+            "p/OrderService.java", "package p;\nclass OrderService {}\n"),
+        "q/OrderController.java": _parse(
+            "q/OrderController.java",
+            "package q;\n"
+            "import p.OrderService;\n"
+            "class OrderController {\n"
+            "  void run() {\n"
+            "    OrderService.create();\n"
+            "  }\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    invoke_edge = next(r for r in records if r.relation == "invoke")
+    assert import_edge.resolution_state == "resolved"
+    assert import_edge.target_external is None
+    assert invoke_edge.resolution_state == "resolved"
+    assert invoke_edge.target_external is None
+    assert invoke_edge.target_unit_id == import_edge.target_unit_id
+    assert invoke_edge.target_unit_id == da._java_component_unit_id(
+        "p/OrderService.java", "p.OrderService")
+
+
+def test_import_mediated_invoke_of_a_genuinely_external_type_still_classifies_external():
+    """Second cold read B-1 (fix round 4): the fix must not overcorrect -
+    a call through an import of a type that is NOT declared anywhere in
+    this scan (the ordinary JDK/library case) must still resolve
+    external, exactly as before."""
+    results = {
+        "p/Foo.java": _parse(
+            "p/Foo.java",
+            "package p;\n"
+            "import java.util.Collections;\n"
+            "class Foo {\n"
+            "  void run() {\n"
+            "    Collections.emptyList();\n"
+            "  }\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    invoke_edge = next(r for r in records if r.relation == "invoke")
+    assert invoke_edge.resolution_state == "resolved"
+    assert invoke_edge.target_external == "java.util.Collections"
+    assert invoke_edge.target_unit_id is None
+
+
 # ----------------------------------------------------------- route (external)
 
 def test_route_edge_resolves_as_external_with_declared_evidence():

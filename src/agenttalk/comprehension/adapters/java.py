@@ -387,7 +387,19 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # local reference, safe to resolve with the full registry.
             target_kind = "internal_candidate"
         elif qualifier in import_simple_names:
-            target_kind = "external"
+            # Second cold read, B-1 (fix round 4): the qualifier resolves
+            # through an import to a fully-qualified name - exactly the
+            # shape D-1 already gives the SAME exact-match-or-external
+            # treatment for the import edge itself. An import is how Java
+            # spells "this call crosses a package boundary" - it does NOT
+            # mean the target is external; it means the target is FULLY
+            # QUALIFIED, which makes an EXACT registry lookup possible and
+            # correct. Stamping this "external" unconditionally emptied
+            # every cross-package internal call into the external bucket
+            # (the NORMAL case in a real multi-package codebase), losing
+            # the edge from fan-in and letting readiness claim
+            # dependencies_resolved=satisfied over nothing.
+            target_kind = "internal_exact_or_external"
             qualifier = import_simple_names[qualifier]
         else:
             # M12 (cold-read, PR-B fix round 3): neither locally declared

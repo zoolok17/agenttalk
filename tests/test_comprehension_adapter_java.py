@@ -152,7 +152,14 @@ class Foo {
     invoke = _edges(result, "invoke")
     assert len(invoke) == 1
     assert invoke[0].target == "java.util.Collections"
-    assert invoke[0].target_kind == "external"
+    # Second cold read, B-1 (fix round 4): an import-mediated call gets the
+    # SAME target_kind an import edge itself gets (internal_exact_or_
+    # external) - java.util.Collections isn't declared in-scan, so it
+    # still resolves external at the dependencies_artifact layer (see
+    # test_comprehension_dependencies_artifact.py's coverage of that), but
+    # the adapter must never hand out a confident "external" stamp before
+    # the registry has even had a chance to look.
+    assert invoke[0].target_kind == "internal_exact_or_external"
     assert invoke[0].evidence_class == "extracted"
 
 
