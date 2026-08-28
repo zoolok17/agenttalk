@@ -200,6 +200,26 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             else:
                 java_results[rel] = java_adapter.file_result_to_json(
                     java_adapter.JavaFileResult(edges=build_edges))
+        elif Path(rel).name == "web.xml":
+            # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a
+            # producer with its own passing unit tests but no dispatch
+            # anywhere in the pipeline - the suite reported a capability
+            # (servlet-mapping routes) the pipeline did not actually have.
+            # The approved item-3 relation scope already names this exact
+            # case ("plain-XML web.xml servlet-mapping declarations when
+            # trivially present") as in-scope; wiring it in, not deleting
+            # it, is what that decision calls for. Same already-read-bytes
+            # / same java_results channel as pom.xml's build edges.
+            try:
+                text = data.decode("utf-8", errors="replace")
+                web_entry_points = java_adapter.parse_web_xml(rel, text)
+            except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
+                problems.append(WorkerProblem(
+                    reason_code="parse_failed", relative_path=rel,
+                    detail=f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}"))
+            else:
+                java_results[rel] = java_adapter.file_result_to_json(
+                    java_adapter.JavaFileResult(entry_points=web_entry_points))
 
     return WorkerResult(
         schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,

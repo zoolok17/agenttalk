@@ -89,6 +89,30 @@ def test_run_scan_carries_the_pom_xml_build_edge_through_the_worker(java_repo: P
     assert build_edges and build_edges[0]["target_external"] == "org.springframework:spring-core"
 
 
+def test_run_scan_carries_a_web_xml_servlet_route_through_the_worker(
+    java_repo: Path,
+) -> None:
+    """M9 (cold-read, PR-B fix round 3): parse_web_xml existed with its
+    own passing unit tests but no dispatch anywhere in the pipeline. Prove
+    it end to end: a servlet-mapping route in web.xml must reach
+    features.json's entry_points."""
+    import json
+
+    (java_repo / "WEB-INF").mkdir()
+    (java_repo / "WEB-INF" / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+    outcome = scan_pipeline.run_scan(java_repo)
+    doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    assert any(e["name"] == "/api/*" and e["kind"] == "http_route" for e in doc["entry_points"])
+
+
 def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
     java_repo: Path, monkeypatch,
 ) -> None:

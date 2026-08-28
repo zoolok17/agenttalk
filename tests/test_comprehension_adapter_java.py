@@ -207,6 +207,59 @@ class Controller {
     assert routes[0].target == "/api/widgets/{id}"
 
 
+def test_request_mapping_finds_value_even_when_a_different_attribute_comes_first():
+    """M8 (cold-read, PR-B fix round 3): the FIRST string literal in the
+    argument list is not necessarily the route path - Spring allows any
+    attribute order. Reproduced pre-fix: `produces` before `value` yielded
+    an http_route named "application/json", with the real "/orders" route
+    absent entirely."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(produces = "application/json", value = "/orders")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/orders"
+
+
+def test_request_mapping_path_attribute_is_recovered_ahead_of_an_unrelated_literal():
+    src = """
+package p;
+class Controller {
+    @RequestMapping(method = "GET", path = "/orders")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert routes[0].target == "/orders"
+
+
+def test_route_target_is_length_bounded_not_stored_as_an_unbounded_raw_excerpt():
+    """invariant 3 (design: "must not store... string-literal bodies") -
+    a route target is a normalized identifier, never an unbounded raw
+    source excerpt; an oversized literal is truncated rather than copied
+    verbatim regardless of size."""
+    from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
+
+    oversized = "/" + ("x" * (_MAX_ROUTE_TARGET_LENGTH + 50))
+    src = f"""
+package p;
+class Controller {{
+    @RequestMapping("{oversized}")
+    void list() {{}}
+}}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes[0].target) <= _MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")
+    assert routes[0].target != oversized
+
+
 def test_bare_request_mapping_with_no_path_still_produces_a_named_route():
     src = """
 package p;

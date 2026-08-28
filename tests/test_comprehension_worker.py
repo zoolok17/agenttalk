@@ -107,6 +107,31 @@ def test_process_paths_dispatches_pom_xml_through_the_java_results_channel(
     assert edges[0]["relation"] == "build"
 
 
+def test_process_paths_dispatches_web_xml_through_the_java_results_channel(
+    tmp_path: Path,
+) -> None:
+    """M9 (cold-read, PR-B fix round 3): parse_web_xml existed with its
+    own passing unit tests but no dispatch anywhere in the pipeline - a
+    valid servlet-mapping web.xml produced no route at all. Wired in the
+    same shape as pom.xml's build edges: same already-read bytes, same
+    java_results channel."""
+    (tmp_path / "web.xml").write_text(
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+        encoding="utf-8",
+    )
+    result = worker.process_paths(tmp_path, ["web.xml"])
+    assert result.problems == []
+    assert "web.xml" in result.java_results
+    entry_points = result.java_results["web.xml"]["entry_points"]
+    assert entry_points and entry_points[0]["name"] == "/api/*"
+    assert entry_points[0]["kind"] == "http_route"
+
+
 def test_process_paths_is_deterministic_regardless_of_input_order(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_bytes(b"hello")
     (tmp_path / "b.txt").write_bytes(b"world!")

@@ -69,7 +69,23 @@ _ROUTE_ANNOTATIONS = (
 _ROUTE_ANNOTATION_RE = re.compile(
     r"@(" + "|".join(_ROUTE_ANNOTATIONS) + r")\s*(\([^)]*\))?"
 )
-_STRING_LITERAL_RE = re.compile(r'"([^"]*)"')
+#: M8 (cold-read, PR-B fix round 3): the route path/value attribute, by
+#: NAME (Spring allows any attribute order - `produces = "...", value =
+#: "/orders"` - blindly taking the first string literal in the argument
+#: list previously captured the wrong one) or as a bare POSITIONAL string
+#: (Spring's single-attribute shorthand, `@GetMapping("/orders")`, is
+#: exactly `value`) - the latter only when it is the very first token, so
+#: it can never be confused with a later, unrelated attribute's literal.
+_ROUTE_NAMED_VALUE_RE = re.compile(r'\b(?:value|path)\s*=\s*\{?\s*"([^"]*)"')
+# The captured span includes the annotation's own enclosing parentheses
+# (see _ROUTE_ANNOTATION_RE's group 2), so a bare positional literal is
+# preceded by "(", not just whitespace/brace.
+_ROUTE_POSITIONAL_VALUE_RE = re.compile(r'\A\(\s*\{?\s*"([^"]*)"')
+#: invariant 3 (design: "must not store... string-literal bodies"): a
+#: route target is captured as a normalized route IDENTIFIER, never an
+#: unbounded raw excerpt - truncated past this length rather than stored
+#: verbatim regardless of source size.
+_MAX_ROUTE_TARGET_LENGTH = 200
 
 
 @dataclass(frozen=True)
@@ -242,10 +258,26 @@ def _route_path(original: str, group_start: int, group_end: int) -> str | None:
     ORIGINAL (un-sanitized) text at the SAME offsets the sanitized match's
     parenthesized argument group spans - sanitization preserves
     length/position exactly, so this is always the true source position,
-    even though the sanitized copy blanked the string literal's content."""
+    even though the sanitized copy blanked the string literal's content.
+
+    M8 (cold-read, PR-B fix round 3): previously took the FIRST string
+    literal in the argument list unconditionally, which is wrong whenever
+    a different attribute's literal (e.g. `produces = "application/json"`)
+    precedes the real `value`/`path` in source order. Looks up the named
+    attribute first (position-independent), falling back to a bare
+    positional string only when it leads the argument list. The result is
+    length-bounded (invariant 3), never an unbounded raw excerpt."""
     segment = original[group_start:group_end]
-    literal = _STRING_LITERAL_RE.search(segment)
-    return literal.group(1) if literal else None
+    match = _ROUTE_NAMED_VALUE_RE.search(segment) or _ROUTE_POSITIONAL_VALUE_RE.match(segment)
+    if match is None:
+        return None
+    return _bounded_route_target(match.group(1))
+
+
+def _bounded_route_target(value: str) -> str:
+    if len(value) <= _MAX_ROUTE_TARGET_LENGTH:
+        return value
+    return value[:_MAX_ROUTE_TARGET_LENGTH] + "...(truncated)"
 
 
 def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
