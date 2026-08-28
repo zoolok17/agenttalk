@@ -12,11 +12,14 @@ from agenttalk.comprehension.features_artifact import FeatureRecord
 from agenttalk.comprehension.modules_artifact import ModuleRecord
 
 
-def _unit(unit_id: str, *, language: str = "java", classification: str = "production") -> ModuleRecord:
+def _unit(
+    unit_id: str, *, language: str = "java", classification: str = "production",
+    adapter_parse_failed: bool = False,
+) -> ModuleRecord:
     return ModuleRecord(
         unit_id=unit_id, kind="component", display_name=unit_id, language=language,
         paths=[f"{unit_id}.java"], source_digests={}, classification=[classification],
-        container_unit_id=None, producers=[],
+        container_unit_id=None, producers=[], adapter_parse_failed=adapter_parse_failed,
     )
 
 
@@ -72,6 +75,19 @@ def test_source_understood_unsatisfied_and_blocks_the_unit():
     signals, summaries = ra.build_readiness([_unit("u1", language="unknown")], [], [])
     assert _signal_by_check(signals, "source_understood").stored_status == "unsatisfied"
     assert summaries[0].stored_assessment_state == "blocked"
+
+
+def test_source_understood_unknown_when_the_adapter_failed_to_parse():
+    """B3 (cold-read, PR-B fix round 3): a file the adapter attempted and
+    failed to parse (or could not even read) must be genuinely UNKNOWN,
+    never "satisfied" just because its extension maps to a known
+    language - "satisfied" is a positive claim this unit never earned."""
+    signals, summaries = ra.build_readiness(
+        [_unit("u1", language="java", adapter_parse_failed=True)], [], [])
+    signal = _signal_by_check(signals, "source_understood")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "adapter_parse_failed"
+    assert summaries[0].stored_assessment_state == "needs_evidence"
 
 
 # ----------------------------------------------------------- dependencies_resolved

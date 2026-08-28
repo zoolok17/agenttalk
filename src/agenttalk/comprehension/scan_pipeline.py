@@ -47,7 +47,7 @@ from . import (
     worker,
 )
 from .adapters import java as java_adapter
-from .envelope import read_json_document, validate_envelope, validate_scan_id
+from .envelope import read_json_document, resolve_under_root, validate_envelope, validate_scan_id
 from .errors import ComprehensionError, EnvelopeError
 from .privacy import PrivacyPreflightResult, VcsPrivacyRefused
 
@@ -57,9 +57,11 @@ MODULES_ARTIFACT_TYPE = modules_artifact.MODULES_ARTIFACT_TYPE
 DEPENDENCIES_ARTIFACT_TYPE = dependencies_artifact.DEPENDENCIES_ARTIFACT_TYPE
 FEATURES_ARTIFACT_TYPE = "agenttalk.comprehension.features"
 READINESS_ARTIFACT_TYPE = "agenttalk.comprehension.readiness"
+PROBLEMS_ARTIFACT_TYPE = "agenttalk.comprehension.problems"
 SCAN_ARTIFACT_TYPE = "agenttalk.comprehension.scan"
 FEATURES_SCHEMA_VERSION = 1
 READINESS_SCHEMA_VERSION = 1
+PROBLEMS_SCHEMA_VERSION = 1
 SCAN_SCHEMA_VERSION = 1
 
 
@@ -102,6 +104,21 @@ class ScanOutcome:
     status: str
     index: dict[str, Any]
     run_dir: Path
+
+
+def _resolved_run_dir(comprehension_dir: Path, scan_id: str) -> Path:
+    """M1 (cold-read, PR-B fix round 3): the WRITE path (publish.py's
+    ``rename_staging_to_run``) validates and resolve-confines a scan_id
+    under ``runs/`` before it ever touches disk; every READ path
+    (``get_status``/``get_report``/``validate_run``) passed a caller-
+    supplied ``--run`` value straight into ``paths.run_dir`` with no such
+    check, so a run identifier resolving OUTSIDE the published-runs
+    directory was accepted and its document read and reported as if it
+    were a real, immutable run. Mirrors the write path exactly: reject
+    against the closed scan-ID grammar first, then resolve-confine under
+    ``runs/`` as defense in depth, before any read is attempted."""
+    validate_scan_id(scan_id)
+    return resolve_under_root(scan_id, root=paths.runs_dir(comprehension_dir), label="run identifier")
 
 
 def _obtain_privacy(
@@ -156,6 +173,16 @@ def run_scan(
         generated_at = _utc_now_iso(now)
 
         discovery_result = discovery.enumerate_scope(root, comprehension_dir)
+        if not discovery_result.files:
+            # M3 (cold-read, PR-B fix round 3): an empty scope (nothing
+            # addressable was enumerated at all) is a command error, not a
+            # valid, publishable, complete zero-unit run - the design
+            # names this a caller mistake (wrong --root, or an
+            # over-broad exclusion policy), never a legitimate result to
+            # publish and hand back as "complete".
+            raise ScanRefused(
+                f"no files were enumerated under {root} - refusing to publish a "
+                "vacuous zero-unit run; check --root and the exclusion policy")
         relative_paths = [f.relative_path for f in discovery_result.files]
         worker_result = worker.run_sanitized_worker(root, relative_paths)
 
@@ -169,8 +196,17 @@ def run_scan(
             path: java_adapter.file_result_from_json(payload)
             for path, payload in worker_result.java_results.items()
         }
+        # B3 (cold-read, PR-B fix round 3): a file the adapter failed to
+        # parse (or the worker could not even read) must never be
+        # reported as source_understood=satisfied just because its
+        # extension maps to a known language - readiness needs to know
+        # WHICH paths degraded, not just which paths parsed.
+        parse_failed_paths = frozenset(
+            p.relative_path for p in worker_result.problems if p.reason_code == "parse_failed"
+        )
 
-        modules = modules_artifact.build_modules(discovery_result, java_results)
+        modules = modules_artifact.build_modules(
+            discovery_result, java_results, parse_failed_paths=parse_failed_paths)
         dependencies = dependencies_artifact.build_dependencies(java_results)
         entry_points, features = features_artifact.build_features(java_results)
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
@@ -212,17 +248,25 @@ def run_scan(
             "signals": [s.to_json() for s in readiness_signals],
             "summaries": [s.to_json() for s in readiness_summaries],
         }
+        problems_doc = {
+            **_envelope(
+                artifact_type=PROBLEMS_ARTIFACT_TYPE, schema_version=PROBLEMS_SCHEMA_VERSION,
+                scan_id=scan_id, generated_at=generated_at),
+            "problems": problems,
+        }
 
         _write_json_document(staging_handle.path / "modules.json", modules_doc)
         _write_json_document(staging_handle.path / "dependencies.json", dependencies_doc)
         _write_json_document(staging_handle.path / "features.json", features_doc)
         _write_json_document(staging_handle.path / "readiness.json", readiness_doc)
+        _write_json_document(staging_handle.path / "problems.json", problems_doc)
 
         record_counts = {
             "modules.json": len(modules_doc["units"]),
             "dependencies.json": len(dependencies_doc["edges"]),
             "features.json": len(features_doc["entry_points"]) + len(features_doc["features"]),
             "readiness.json": len(readiness_doc["signals"]),
+            "problems.json": len(problems_doc["problems"]),
         }
 
         scan_doc = {
@@ -296,7 +340,7 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root}")
     scan_id = run_id or index_doc["latest_scan_id"]
-    run_dir = paths.run_dir(comprehension_dir, scan_id)
+    run_dir = _resolved_run_dir(comprehension_dir, scan_id)
     scan_path = run_dir / "scan.json"
     try:
         scan_doc = validate_envelope(
@@ -323,7 +367,7 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
 
 
 def _load_run_records(comprehension_dir: Path, scan_id: str) -> dict[str, Any]:
-    run_dir = paths.run_dir(comprehension_dir, scan_id)
+    run_dir = _resolved_run_dir(comprehension_dir, scan_id)
 
     def _load(name: str, artifact_type: str, schema_version: int) -> dict[str, Any]:
         try:
@@ -338,6 +382,7 @@ def _load_run_records(comprehension_dir: Path, scan_id: str) -> dict[str, Any]:
         "dependencies.json", DEPENDENCIES_ARTIFACT_TYPE, dependencies_artifact.DEPENDENCIES_SCHEMA_VERSION)
     features_doc = _load("features.json", FEATURES_ARTIFACT_TYPE, FEATURES_SCHEMA_VERSION)
     readiness_doc = _load("readiness.json", READINESS_ARTIFACT_TYPE, READINESS_SCHEMA_VERSION)
+    problems_doc = _load("problems.json", PROBLEMS_ARTIFACT_TYPE, PROBLEMS_SCHEMA_VERSION)
 
     return {
         "scan": scan_doc,
@@ -355,6 +400,7 @@ def _load_run_records(comprehension_dir: Path, scan_id: str) -> dict[str, Any]:
         "readiness_summaries": [
             readiness_artifact.unit_readiness_summary_from_json(s) for s in readiness_doc["summaries"]
         ],
+        "problems": list(problems_doc["problems"]),
     }
 
 
@@ -384,6 +430,7 @@ def get_report(
         entry_points=records["entry_points"], features=records["features"],
         readiness_signals=records["readiness_signals"],
         readiness_summaries=records["readiness_summaries"],
+        problems=records["problems"],
         unit_id=unit_id, feature_id=feature_id, readiness_state=readiness_state,
         dependencies_only=dependencies_only,
     )

@@ -193,12 +193,14 @@ def rename_staging_to_run(
     dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not _is_windows():
         os.rename(staging_handle.path, dst)
+        _strip_owner_file(dst)
         return dst
     deadline = time.monotonic() + _RENAME_RETRY_TIMEOUT_SECONDS
     delay = 0.01
     while True:
         try:
             os.rename(staging_handle.path, dst)
+            _strip_owner_file(dst)
             return dst
         except PermissionError as exc:
             if time.monotonic() >= deadline:
@@ -208,6 +210,19 @@ def rename_staging_to_run(
                 ) from exc
             time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             delay = min(delay * 2, 0.25)
+
+
+def _strip_owner_file(run_dir: Path) -> None:
+    """M4 (cold-read, PR-B fix round 3): ``owner.json`` (host identity,
+    PID, and the lock's owner token) repeats the writer lock's own
+    identity so an abandoned ``.staging/`` directory can be reclaimed
+    (staging.py) - it is never scan CONTENT, and must not survive into
+    the published, immutable ``runs/<scan_id>/`` directory it just got
+    renamed into whole. Removing it here, immediately after the rename
+    succeeds, is the one place both the POSIX and Windows-retry paths
+    converge, so there is no second call site to keep in sync."""
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(run_dir / _OWNER_FILENAME)
 
 
 def read_current_index(comprehension_dir: Path) -> tuple[dict | None, str | None]:

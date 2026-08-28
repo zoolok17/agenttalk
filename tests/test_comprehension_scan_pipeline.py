@@ -89,6 +89,108 @@ def test_run_scan_carries_the_pom_xml_build_edge_through_the_worker(java_repo: P
     assert build_edges and build_edges[0]["target_external"] == "org.springframework:spring-core"
 
 
+def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """B2 (cold-read, PR-B fix round 3): every problem record used to be
+    computed then discarded - problems.json was never written, and a
+    degraded run published no account of what degraded it. Force a
+    problem by making the worker report one, and assert it survives all
+    the way through to get_report()."""
+    from agenttalk.comprehension import worker as workermod2
+
+    real_run = workermod2.process_paths
+
+    def _inject_a_problem(root, relative_paths, **_kwargs):
+        result = real_run(root, relative_paths)
+        result.problems.append(workermod2.WorkerProblem(
+            reason_code="parse_failed", relative_path="src/main/java/p/App.java",
+            detail="synthetic problem for the B2 regression test"))
+        return result
+
+    monkeypatch.setattr(scan_pipeline.worker, "run_sanitized_worker", _inject_a_problem)
+
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+    assert (outcome.run_dir / "problems.json").exists()
+    doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert doc["problems"] == [{
+        "reason_code": "parse_failed", "path": "src/main/java/p/App.java",
+        "detail": "synthetic problem for the B2 regression test",
+    }]
+
+    report = scan_pipeline.get_report(java_repo)
+    assert report["problems"] == doc["problems"]
+    assert report["counts"]["problems"] == 1
+
+
+def test_run_scan_does_not_publish_owner_json_into_the_run(java_repo: Path) -> None:
+    """M4 (cold-read, PR-B fix round 3): owner.json (host identity, PID,
+    and the writer lock's own owner token) repeats the lock's identity
+    for staging reclaim - it must never survive into the published,
+    immutable run directory."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert not (outcome.run_dir / "owner.json").exists()
+
+
+def test_run_scan_refuses_an_empty_scope(tmp_path: Path) -> None:
+    """M3 (cold-read, PR-B fix round 3): a scope with nothing addressable
+    enumerated at all is a command error (wrong --root, or an over-broad
+    exclusion policy), never a valid, publishable, complete zero-unit
+    run. Privacy proof comes from ``.git/info/exclude`` (private git
+    metadata, never tracked content) rather than a ``.gitignore`` file -
+    the latter would itself be one enumerable file, defeating the "truly
+    empty scope" scenario this test needs."""
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)  # noqa: S603,S607  # nosec B603 B607
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    (tmp_path / ".git" / "info" / "exclude").write_text(".agenttalk/\n", encoding="utf-8")
+
+    with pytest.raises(scan_pipeline.ScanRefused, match="no files were enumerated"):
+        scan_pipeline.run_scan(tmp_path)
+    from agenttalk.comprehension import publish
+
+    comp_dir = scan_pipeline.paths.comprehension_dir(tmp_path / ".agenttalk")
+    doc, _digest = publish.read_current_index(comp_dir)
+    assert doc is None  # no run published
+
+
+# ----------------------------------------------------------- M1: read-path run-id confinement
+
+def test_get_status_rejects_a_run_id_outside_the_runs_tree(java_repo: Path, tmp_path: Path) -> None:
+    """M1 (cold-read, PR-B fix round 3): the write path validates and
+    resolve-confines a scan_id under runs/ before it ever touches disk -
+    every read path must do the same, so a caller-supplied --run value
+    can never open a document sitting outside the published-runs tree."""
+    scan_pipeline.run_scan(java_repo)
+    outside = tmp_path / "outside-runs-tree"
+    outside.mkdir()
+    (outside / "scan.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(scan_pipeline.EnvelopeError):
+        scan_pipeline.get_status(java_repo, run_id="../../outside-runs-tree")
+
+
+def test_get_report_rejects_a_malformed_run_id(java_repo: Path) -> None:
+    scan_pipeline.run_scan(java_repo)
+    with pytest.raises(scan_pipeline.EnvelopeError):
+        scan_pipeline.get_report(java_repo, run_id="../../../etc/passwd")
+
+
+def test_validate_run_reports_invalid_for_a_malformed_run_id(java_repo: Path) -> None:
+    """validate_run's own contract catches ComprehensionError (which
+    EnvelopeError is a subclass of) and reports it via the return value
+    rather than raising - M1's confinement still holds here: the
+    malformed id is rejected before any document outside runs/ is ever
+    opened, just surfaced as valid=False instead of a raised exception."""
+    scan_pipeline.run_scan(java_repo)
+    result = scan_pipeline.validate_run(java_repo, run_id="not/a/real/scan/id")
+    assert result["valid"] is False
+
+
 def test_run_scan_refuses_without_privacy_proof_and_writes_nothing(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     (tmp_path / ".gitignore").write_text("build/\n", encoding="utf-8")  # does NOT ignore .agenttalk/

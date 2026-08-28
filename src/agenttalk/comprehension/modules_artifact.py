@@ -45,6 +45,13 @@ class ModuleRecord:
     producers: list[dict[str, Any]]
     conflict_id: str | None = None
     evidence: list[dict[str, Any]] = field(default_factory=list)
+    #: True only for a "file" unit whose adapter attempted and FAILED to
+    #: parse it (or whose bytes the worker could not even read) - distinct
+    #: from "no adapter exists for this extension at all" (cold-read B3,
+    #: PR-B fix round 3). Readiness's source_understood check must see
+    #: this as genuinely UNKNOWN, never a confident "satisfied" merely
+    #: because the file's extension happens to map to a known language.
+    adapter_parse_failed: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -59,6 +66,7 @@ class ModuleRecord:
             "producers": self.producers,
             "conflict_id": self.conflict_id,
             "evidence": self.evidence,
+            "adapter_parse_failed": self.adapter_parse_failed,
         }
 
 
@@ -73,6 +81,7 @@ def module_record_from_json(payload: dict[str, Any]) -> ModuleRecord:
         classification=list(payload["classification"]),
         container_unit_id=payload["container_unit_id"], producers=list(payload["producers"]),
         conflict_id=payload.get("conflict_id"), evidence=list(payload.get("evidence", [])),
+        adapter_parse_failed=payload.get("adapter_parse_failed", False),
     )
 
 
@@ -115,11 +124,21 @@ def _parent_qualified_name(qualified_name: str, known_names: set[str]) -> str | 
 
 def build_modules(
     discovery: DiscoveryResult, java_results: dict[str, java_adapter.JavaFileResult],
+    *, parse_failed_paths: frozenset[str] = frozenset(),
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
     already-parsed :class:`~.adapters.java.JavaFileResult` (item 3) -
     parsing happens once, upstream; this function only assembles records
-    from what was already extracted."""
+    from what was already extracted.
+
+    ``parse_failed_paths`` names every relative path the worker recorded a
+    ``parse_failed`` problem for (cold-read B3, PR-B fix round 3) - a file
+    absent from ``java_results`` is either "no adapter for this
+    extension" (a confident negative) or "the adapter tried and failed /
+    the bytes could not even be read" (genuinely unknown); this
+    distinguishes the two so readiness never reports the latter as
+    understood.
+    """
     records: list[ModuleRecord] = []
 
     for file_entry in discovery.files:
@@ -140,6 +159,7 @@ def build_modules(
                     name="discovery", version=1, source_digest=file_entry.content_digest,
                     basis="extracted",
                 )],
+                adapter_parse_failed=java_result is None and relative_path in parse_failed_paths,
             ))
             continue
 

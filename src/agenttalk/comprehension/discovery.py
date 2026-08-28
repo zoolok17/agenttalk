@@ -49,6 +49,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat as stat_module
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -214,6 +215,37 @@ def detect_platform_identity(comprehension_dir: Path) -> PlatformIdentity:
     )
 
 
+def _boundary_kind(entry: Path) -> str | None:
+    """Returns a boundary kind (``"symlink"`` or ``"reparse_point"``) if
+    ``entry`` must be recorded and never followed; ``None`` for an
+    ordinary entry.
+
+    Cold-read B1 (reviewer, PR-B fix round 3): ``entry.is_symlink()``
+    alone is not the whole boundary surface on Windows. A directory
+    JUNCTION (mount point) is a reparse point but NOT a symlink proper -
+    ``is_symlink()`` returns ``False`` for one, so the walker would
+    otherwise descend into it, hash content living outside the project
+    root, and fold it into the whole-scope fingerprint before the
+    worker's own re-confinement ever gets a chance to catch it. Detected
+    via ``st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT`` - the same
+    attribute Windows Explorer and ``dir`` use to identify a reparse
+    point regardless of its specific reparse tag (symlink, junction, or
+    otherwise unrecognized), so this also catches reparse tags this
+    module has never heard of, not just the ones named here.
+    """
+    if entry.is_symlink():
+        return "symlink"
+    if os.name != "nt":
+        return None
+    try:
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if st.st_file_attributes & stat_module.FILE_ATTRIBUTE_REPARSE_POINT:
+        return "reparse_point"
+    return None
+
+
 def _looks_binary(data: bytes) -> bool:
     """A NUL byte anywhere in the sniffed prefix is the same heuristic
     Git itself uses to classify a blob as binary - simple, well
@@ -303,8 +335,9 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
             if entry_cap_hit:
                 return
             relative = entry.relative_to(root).as_posix()
-            if entry.is_symlink():
-                boundaries.append(BoundaryEntry(relative_path=relative, boundary_kind="symlink"))
+            boundary_kind = _boundary_kind(entry)
+            if boundary_kind is not None:
+                boundaries.append(BoundaryEntry(relative_path=relative, boundary_kind=boundary_kind))
                 continue
             if entry.is_dir():
                 category = _exclusion_category(entry.name, is_dir=True)

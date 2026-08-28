@@ -122,6 +122,14 @@ def _signal(unit_id: str, check: str, stored_status: str, basis: str, reason_cod
 
 
 def _check_source_understood(unit: ModuleRecord) -> ReadinessSignal:
+    if unit.adapter_parse_failed:
+        # B3 (cold-read, PR-B fix round 3): the adapter attempted (or the
+        # worker could not even read the bytes) and failed - genuinely
+        # UNKNOWN whether the source is understood, never a confident
+        # "satisfied" merely because the extension maps to a known
+        # language, and never a confident "unsatisfied" either (unlike
+        # "no adapter for this language", where we KNOW there is none).
+        return _signal(unit.unit_id, "source_understood", "unknown", "detected", "adapter_parse_failed")
     if unit.language != "unknown":
         return _signal(unit.unit_id, "source_understood", "satisfied", "detected", "adapter_understood")
     return _signal(unit.unit_id, "source_understood", "unsatisfied", "detected", "no_adapter_for_language")

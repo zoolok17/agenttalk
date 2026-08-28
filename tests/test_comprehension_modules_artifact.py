@@ -39,6 +39,23 @@ def test_a_file_under_a_test_path_is_classified_test():
     assert records[0].classification == ["test"]
 
 
+def test_a_parse_failed_java_file_is_flagged_distinctly_from_no_adapter():
+    """B3 (cold-read, PR-B fix round 3): a .java file absent from
+    java_results because the adapter failed (or the bytes could not be
+    read) must be distinguishable from an ordinary non-java file with no
+    adapter at all - only the former sets adapter_parse_failed."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="p/Broken.java", byte_count=1, content_digest="a"),
+        EnumeratedFile(relative_path="README.md", byte_count=1, content_digest="b"),
+    ])
+    records = ma.build_modules(
+        discovery, {}, parse_failed_paths=frozenset({"p/Broken.java"}))
+    by_path = {r.paths[0]: r for r in records}
+    assert by_path["p/Broken.java"].adapter_parse_failed is True
+    assert by_path["p/Broken.java"].language == "java"
+    assert by_path["README.md"].adapter_parse_failed is False
+
+
 # ----------------------------------------------------------- java files
 
 def _java_result(relative_path: str, source: str) -> java_adapter.JavaFileResult:

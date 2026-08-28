@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -136,6 +138,34 @@ def test_enumerate_scope_records_a_symlink_as_a_boundary_and_never_follows_it(
     assert len(result.boundaries) == 1
     assert result.boundaries[0].relative_path == "link-to-outside"
     assert result.boundaries[0].boundary_kind == "symlink"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows directory junctions only")
+def test_enumerate_scope_records_a_windows_junction_as_a_boundary_and_never_follows_it(
+    tmp_path: Path,
+) -> None:
+    """Cold-read B1 (reviewer, PR-B fix round 3): a directory JUNCTION is a
+    reparse point but NOT a symlink proper - ``Path.is_symlink()`` returns
+    False for one, so a boundary check keyed on that alone would descend
+    into it, hash content living outside the project root, and fold it
+    into the whole-scope fingerprint. Needs no special privilege on
+    Windows (unlike a real symlink) - ``mklink /J`` works for any local
+    user - so this executes unconditionally on every Windows leg, no skip
+    possible."""
+    outside = tmp_path.parent / "outside-discovery-junction-target"
+    outside.mkdir(exist_ok=True)
+    (outside / "secret.txt").write_bytes(b"outside content")
+    junction = tmp_path / "junction-to-outside"
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=True, capture_output=True, text=True,
+    )
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.files == []
+    assert len(result.boundaries) == 1
+    assert result.boundaries[0].relative_path == "junction-to-outside"
+    assert result.boundaries[0].boundary_kind == "reparse_point"
 
 
 def test_enumerate_scope_records_a_submodule_as_a_boundary_and_never_enters_it(
