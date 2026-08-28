@@ -29,6 +29,14 @@ MODULES_ARTIFACT_TYPE = "agenttalk.comprehension.modules"
 MODULES_SCHEMA_VERSION = 1
 
 _LANGUAGE_BY_EXTENSION = {".java": "java"}
+#: M-2 (second cold read, fix round 4): pom.xml/web.xml go THROUGH the
+#: java adapter package (build_dependencies/build_features already
+#: consume their edges/entry points) but named no language of their own -
+#: _language_for_path fell through to "unknown" purely by extension,
+#: making a file the adapter demonstrably understood indistinguishable
+#: from one no adapter has ever touched. Named here, by basename (these
+#: are fixed, well-known filenames, not a language-by-extension family).
+_LANGUAGE_BY_BASENAME = {"pom.xml": "xml", "web.xml": "xml"}
 _TEST_PATH_SEGMENT = re.compile(r"(?:^|/)(?:src/test|test)/")
 
 
@@ -86,6 +94,9 @@ def module_record_from_json(payload: dict[str, Any]) -> ModuleRecord:
 
 
 def _language_for_path(relative_path: str) -> str:
+    basename = relative_path.rsplit("/", 1)[-1]
+    if basename in _LANGUAGE_BY_BASENAME:
+        return _LANGUAGE_BY_BASENAME[basename]
     for ext, lang in _LANGUAGE_BY_EXTENSION.items():
         if relative_path.endswith(ext):
             return lang

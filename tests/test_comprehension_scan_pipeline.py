@@ -89,6 +89,32 @@ def test_run_scan_carries_the_pom_xml_build_edge_through_the_worker(java_repo: P
     assert build_edges and build_edges[0]["target_external"] == "org.springframework:spring-core"
 
 
+def test_run_scan_does_not_block_readiness_for_the_pom_xml_it_understood(
+    java_repo: Path,
+) -> None:
+    """M-2 (second cold read, fix round 4): pom.xml goes THROUGH the java
+    adapter package (it produced a real build edge - see the sibling test
+    above) yet previously rolled up as source_understood=unsatisfied/
+    no_adapter_for_language/severity=blocker - a self-contradiction. Its
+    readiness signal must now be satisfied, and its unit must never be
+    "blocked" purely because of that one (previously self-contradictory)
+    signal."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    pom_unit = next(u for u in modules_doc["units"] if u["paths"] == ["pom.xml"])
+    assert pom_unit["language"] == "xml"
+    source_understood = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == pom_unit["unit_id"] and s["check"] == "source_understood"
+    )
+    assert source_understood["stored_status"] == "satisfied"
+    summary = next(s for s in readiness_doc["summaries"] if s["unit_id"] == pom_unit["unit_id"])
+    assert summary["stored_assessment_state"] != "blocked"
+
+
 def test_run_scan_populates_source_digest_on_dependency_and_feature_producers(
     java_repo: Path,
 ) -> None:

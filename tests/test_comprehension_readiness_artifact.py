@@ -71,10 +71,22 @@ def test_assessed_is_currently_unreachable_this_slice() -> None:
     assert summaries[0].stored_assessment_state == "needs_evidence"
 
 
-def test_source_understood_unsatisfied_and_blocks_the_unit():
+def test_source_understood_unknown_and_needs_evidence_with_no_adapter():
+    """M-2 (second cold read, fix round 4): "no adapter for this
+    language" is an ABSENCE of positive evidence, not a positive claim
+    that the source is definitely not understood - the design's own
+    rollup rule draws this exact line (DESIGN-55-comprehension-plane.md,
+    Artifact 4: "any required scan-time blocker that is UNSATISFIED
+    yields blocked; any required scan-time UNKNOWN yields
+    needs_evidence"). Reports unknown/needs_evidence, never the stronger
+    unsatisfied/blocked - a confident blocker for every non-code file
+    would make blocked the default headline state on a real repo, where
+    most files are non-code."""
     signals, summaries = ra.build_readiness([_unit("u1", language="unknown")], [], [])
-    assert _signal_by_check(signals, "source_understood").stored_status == "unsatisfied"
-    assert summaries[0].stored_assessment_state == "blocked"
+    signal = _signal_by_check(signals, "source_understood")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "no_adapter_for_language"
+    assert summaries[0].stored_assessment_state == "needs_evidence"
 
 
 def test_source_understood_unknown_when_the_adapter_failed_to_parse():

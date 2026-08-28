@@ -56,6 +56,27 @@ def test_a_parse_failed_java_file_is_flagged_distinctly_from_no_adapter():
     assert by_path["README.md"].adapter_parse_failed is False
 
 
+def test_pom_xml_and_web_xml_are_recognized_as_adapter_understood():
+    """M-2 (second cold read, fix round 4): pom.xml/web.xml go THROUGH the
+    java adapter package (build_dependencies/build_features already
+    consume their edges/entry points) but previously named no language of
+    their own, so build_modules classified them "unknown" - identical to
+    a file no adapter has ever touched - even though java_results proves
+    an adapter demonstrably understood them."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="pom.xml", byte_count=1, content_digest="a"),
+        EnumeratedFile(relative_path="WEB-INF/web.xml", byte_count=1, content_digest="b"),
+    ])
+    java_results = {
+        "pom.xml": java_adapter.JavaFileResult(),
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(),
+    }
+    records = ma.build_modules(discovery, java_results)
+    by_path = {r.paths[0]: r for r in records}
+    assert by_path["pom.xml"].language == "xml"
+    assert by_path["WEB-INF/web.xml"].language == "xml"
+
+
 # ----------------------------------------------------------- java files
 
 def _java_result(relative_path: str, source: str) -> java_adapter.JavaFileResult:

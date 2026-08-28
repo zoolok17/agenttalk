@@ -449,6 +449,26 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     return JavaFileResult(units=units, edges=edges, entry_points=entry_points)
 
 
+_XML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _strip_xml_comments(text: str) -> str:
+    """Blanks XML comment content with spaces while preserving every
+    newline and the overall length/offsets - mirrors
+    ``_strip_comments_and_strings``'s Java-comment handling exactly.
+
+    M-1 (second cold read, fix round 4): ``parse_maven_pom`` and
+    ``parse_web_xml`` regexed the RAW xml with no comment stripping at
+    all (unlike the Java path, which sanitizes first and has the proving
+    test) - a commented-out ``<dependency>``/``<servlet-mapping>`` block
+    published exactly as if it were live, declared evidence. Commented-out
+    dependencies are common in legacy poms.
+    """
+    def _blank(match: re.Match) -> str:
+        return "".join(c if c == "\n" else " " for c in match.group(0))
+    return _XML_COMMENT_RE.sub(_blank, text)
+
+
 _DEPENDENCY_RE = re.compile(
     r"<dependency>\s*"
     r"<groupId>([^<]+)</groupId>\s*"
@@ -462,9 +482,10 @@ def parse_maven_pom(relative_path: str, text: str) -> list[JavaEdgeClaim]:
     shape - no XML parser (and its entity-expansion surface) needed for
     two flat child elements."""
     from_name = relative_path
-    newline_offsets = _newline_offsets(text)
+    sanitized = _strip_xml_comments(text)
+    newline_offsets = _newline_offsets(sanitized)
     edges = []
-    for match in _DEPENDENCY_RE.finditer(text):
+    for match in _DEPENDENCY_RE.finditer(sanitized):
         group_id, artifact_id = match.group(1).strip(), match.group(2).strip()
         edges.append(JavaEdgeClaim(
             from_qualified_name=from_name, relation="build",
@@ -486,8 +507,9 @@ def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
     ``<url-pattern>`` pairs in a ``web.xml`` - the same "trivially present,
     named, no inference" bar as the annotation-based routes above."""
     entry_points = []
-    newline_offsets = _newline_offsets(text)
-    for match in _SERVLET_MAPPING_RE.finditer(text):
+    sanitized = _strip_xml_comments(text)
+    newline_offsets = _newline_offsets(sanitized)
+    for match in _SERVLET_MAPPING_RE.finditer(sanitized):
         servlet_name, url_pattern = match.group(1).strip(), match.group(2).strip()
         entry_points.append(JavaEntryPointClaim(
             qualified_name=f"{relative_path}#{servlet_name}", kind="http_route",

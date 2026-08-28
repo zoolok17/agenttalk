@@ -326,6 +326,29 @@ def test_parse_maven_pom_extracts_dependency_build_edges():
     assert all(e.evidence_class == "declared" for e in edges)
 
 
+def test_parse_maven_pom_ignores_a_commented_out_dependency():
+    """M-1 (second cold read, fix round 4): a dependency block inside an
+    XML comment must not publish as evidence_class=declared alongside a
+    live one - commented-out dependencies are common in legacy poms."""
+    pom = """<project>
+  <dependencies>
+    <!--
+    <dependency>
+      <groupId>commented</groupId>
+      <artifactId>out-dependency</artifactId>
+    </dependency>
+    -->
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    edges = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"org.springframework:spring-core"}
+
+
 # ----------------------------------------------------------- web.xml (route)
 
 def test_parse_web_xml_extracts_servlet_mapping_routes():
@@ -341,6 +364,26 @@ def test_parse_web_xml_extracts_servlet_mapping_routes():
     assert entry_points[0].name == "/api/*"
     assert entry_points[0].kind == "http_route"
     assert entry_points[0].evidence_class == "declared"
+
+
+def test_parse_web_xml_ignores_a_commented_out_servlet_mapping():
+    """M-1 (second cold read, fix round 4): same fix as parse_maven_pom -
+    a servlet-mapping inside an XML comment must not publish as a route."""
+    web_xml = """<web-app>
+  <!--
+  <servlet-mapping>
+    <servlet-name>disabled</servlet-name>
+    <url-pattern>/disabled/*</url-pattern>
+  </servlet-mapping>
+  -->
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>/api/*</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert [e.name for e in entry_points] == ["/api/*"]
 
 
 # ----------------------------------------------------------- honest gaps
