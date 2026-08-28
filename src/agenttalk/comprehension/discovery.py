@@ -344,8 +344,13 @@ def _submodule_boundary_paths(root: Path) -> frozenset[str]:
         return frozenset()
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith("path") and "=" in stripped:
-            _, _, value = stripped.partition("=")
+        # N7 (fourth cold read, fix round 6): startswith("path") also
+        # matched a DIFFERENT git-config key that merely starts with the
+        # same letters (e.g. "pathspec = ..."), silently treating an
+        # unrelated key's value as if it were a submodule path. The key
+        # (everything before "=", trimmed) must equal "path" exactly.
+        key, sep, value = stripped.partition("=")
+        if sep and key.strip() == "path":
             value = value.strip().replace("\\", "/")
             if value:
                 paths.add(value)

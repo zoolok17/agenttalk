@@ -188,6 +188,30 @@ def test_enumerate_scope_records_a_submodule_as_a_boundary_and_never_enters_it(
     assert result.boundaries[0].boundary_kind == "submodule"
 
 
+def test_gitmodules_parsing_does_not_match_a_pathspec_key_as_path(tmp_path: Path) -> None:
+    """N7 (fourth cold read, fix round 6): the old check was
+    stripped.startswith("path") - a DIFFERENT git-config key that merely
+    starts with the same letters (pathspec is a real git config key)
+    would be silently treated as if it were a submodule's own path. The
+    key must equal "path" exactly. A real directory sits at the
+    "pathspec" line's own value, so the old bug would have skipped its
+    contents entirely - this proves they are enumerated normally
+    instead."""
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "lib"]\n'
+        "\tpathspec = decoy\n"
+        "\turl = https://example.invalid/lib.git\n",
+        encoding="utf-8",
+    )
+    decoy_dir = tmp_path / "decoy"
+    decoy_dir.mkdir()
+    (decoy_dir / "inner.txt").write_bytes(b"must be enumerated normally")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.boundaries == []
+    assert sorted(f.relative_path for f in result.files) == [".gitmodules", "decoy/inner.txt"]
+
+
 # ----------------------------------------------------------- resource caps
 
 def test_per_file_size_cap_fires_before_binary_sniffing(tmp_path: Path, monkeypatch) -> None:
