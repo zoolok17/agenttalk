@@ -328,8 +328,21 @@ def run_scan(
         # one reason; a resource-cap skip or a re-confinement rejection
         # went unthreaded the same way, twice more). Every worker problem,
         # by whatever reason_code, is threaded here.
+        #
+        # N3 (fifth cold read, fix round 8): a plain dict comprehension
+        # over ``worker_result.problems`` is LAST-WINS for a path with
+        # more than one recorded problem - whichever happened to be
+        # listed last silently overwrote every earlier reason for that
+        # SAME path, with no ordering guarantee callers should rely on.
+        # Reasons are collected per path and joined, sorted and
+        # deduplicated, so the result is both deterministic (never
+        # depends on worker_result.problems's own list order) and
+        # lossless (every distinct reason survives, not just one).
+        reasons_by_path: dict[str, set[str]] = {}
+        for p in worker_result.problems:
+            reasons_by_path.setdefault(p.relative_path, set()).add(p.reason_code)
         worker_problem_reason_by_path = {
-            p.relative_path: p.reason_code for p in worker_result.problems
+            path: "+".join(sorted(reasons)) for path, reasons in reasons_by_path.items()
         }
 
         modules = modules_artifact.build_modules(

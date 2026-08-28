@@ -436,6 +436,46 @@ def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
     assert report["counts"]["problems"] == 1
 
 
+def test_worker_problem_reason_by_path_joins_sorted_unique_reasons_for_one_path(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """N3 (fifth cold read, fix round 8): a plain dict comprehension over
+    the worker's own problem list was LAST-WINS for a path with more
+    than one recorded problem - whichever happened to be listed last
+    silently discarded every earlier reason for that same path, with no
+    ordering guarantee. A genuinely unrecognized-content .java file
+    already organically records "no_types_extracted" (round 8's own
+    BLOCKER 1b) - a SECOND, synthetic problem is injected for that SAME
+    path in deliberately non-alphabetical order, and the published
+    adapter_problem_reason must contain BOTH, sorted - deterministic
+    regardless of the worker's own list order, and lossless (neither
+    reason is silently dropped)."""
+    import json
+
+    from agenttalk.comprehension import worker as workermod2
+
+    (java_repo / "src" / "main" / "java" / "p" / "Garbage.java").write_text(
+        "package p;\nfoo bar baz;\n", encoding="utf-8")
+
+    real_run = workermod2.process_paths
+
+    def _inject_a_second_problem_for_the_same_path(root, relative_paths, **_kwargs):
+        result = real_run(root, relative_paths)
+        result.problems.append(workermod2.WorkerProblem(
+            reason_code="resource_limit", relative_path="src/main/java/p/Garbage.java",
+            detail="synthetic second problem for the same path"))
+        return result
+
+    monkeypatch.setattr(
+        scan_pipeline.worker, "run_sanitized_worker", _inject_a_second_problem_for_the_same_path)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    garbage_unit = next(
+        u for u in modules_doc["units"] if u["paths"] == ["src/main/java/p/Garbage.java"])
+    assert garbage_unit["adapter_problem_reason"] == "no_types_extracted+resource_limit"
+
+
 def test_run_scan_degrades_and_reports_unknown_for_a_java_file_with_no_recognized_declaration(
     java_repo: Path,
 ) -> None:
