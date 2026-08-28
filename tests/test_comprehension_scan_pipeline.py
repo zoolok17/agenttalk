@@ -719,17 +719,6 @@ def test_get_report_refuses_a_malformed_record_instead_of_crashing(java_repo: Pa
         scan_pipeline.get_report(java_repo)
 
 
-def test_get_status_refuses_a_malformed_record_instead_of_crashing(java_repo: Path) -> None:
-    """M-1 (fourth cold read, fix round 6): same class as report, via
-    status's own full-run digest verification (M-1, round 5) which also
-    goes through _load_run_records's record conversion first."""
-    outcome = scan_pipeline.run_scan(java_repo)
-    _corrupt_modules_json_missing_unit_id(outcome.run_dir)
-
-    with pytest.raises(scan_pipeline.ComprehensionError, match="malformed record"):
-        scan_pipeline.get_status(java_repo)
-
-
 def test_validate_run_reports_valid_false_for_a_malformed_record_not_a_crash(
     java_repo: Path,
 ) -> None:
@@ -773,20 +762,28 @@ def test_get_report_refuses_a_tampered_artifact_instead_of_projecting_it_as_trut
         scan_pipeline.get_report(java_repo)
 
 
-def test_get_status_refuses_a_tampered_artifact_instead_of_reporting_it_healthy(
+def test_get_status_does_not_verify_unrelated_artifacts_by_design(
     java_repo: Path,
 ) -> None:
-    """M-1 (third cold read, fix round 5): ``status`` verified only
-    scan.json's own envelope/schema - a tampered modules.json (or any of
-    the other four declared artifacts) went completely unchecked, so a
-    tampered run reported ``status: healthy`` right alongside a
-    ``validate`` that would have caught it. ``status`` must refuse the
-    same way."""
+    """N1 (fourth cold read, fix round 6): round 5's M-1 fix made
+    ``status`` perform the SAME full per-artifact digest verification
+    ``report``/``validate`` do - but the design states an explicit,
+    narrower read-cost tier for status: "status verifies the index and
+    scan.json... they do not rescan unrelated artifacts on every
+    response" (DESIGN-55-comprehension-plane.md, "Validation tiers and
+    size ceilings"). A tampered modules.json is therefore NOT caught by
+    status (a named, accepted bounded-cost trade-off) - ``report`` and
+    ``validate`` still catch the SAME tamper every time, in full."""
     outcome = scan_pipeline.run_scan(java_repo)
     _tamper_modules_json(outcome.run_dir)
 
+    payload = scan_pipeline.get_status(java_repo)
+    assert payload["status"] == "complete"
+
     with pytest.raises(scan_pipeline.ComprehensionError, match="content_digest|byte_sha256"):
-        scan_pipeline.get_status(java_repo)
+        scan_pipeline.get_report(java_repo)
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
 
 
 # ----------------------------------------------------------- failure-path lock release (F-2)

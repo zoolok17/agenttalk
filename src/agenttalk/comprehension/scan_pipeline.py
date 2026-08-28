@@ -527,28 +527,28 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     """design: "Show the latest run, completeness, source revision/
     fingerprint, freshness, adapter coverage, and problem counts."
 
-    M-1 (third cold read, fix round 5): this used to verify only the
-    index and scan.json's own envelope/schema - a tampered modules.json,
-    dependencies.json, features.json, readiness.json or problems.json
-    (scan.json's own declared per-artifact digests exist precisely to
-    catch this) went completely unchecked, so ``status`` reported a
-    tampered run as healthy; only ``validate`` ever looked. The design's
-    read-path rule is that ANY caller projecting a run's health verifies
-    the exact-byte digest and schema of what that run declares, not just
-    what it happens to display - a status snapshot that asserts "this run
-    is fine" without checking is exactly the read-path gap the design
-    forbids. This now reuses the same full per-artifact digest
-    verification :func:`get_report`/:func:`validate_run` perform (via
-    ``_load_run_records`` + ``_verify_artifact_digests``) rather than a
-    scan.json-only envelope check."""
+    N1 (fourth cold read, fix round 6): round 5's M-1 fix made this call
+    the SAME full per-artifact digest verification report/validate
+    perform - but the design states an explicit, narrower read-cost tier
+    for status specifically: "status verifies the index and scan.json.
+    report, pack construction, and /api/comprehension then verify the
+    exact-byte digest and schema of each artifact they actually load;
+    they do not rescan unrelated artifacts on every response"
+    (DESIGN-55-comprehension-plane.md, "Validation tiers and size
+    ceilings"). Round 5's fix was a genuine, deliberate, FAIL-CLOSED
+    overshoot of that tier, not a security regression fixed here - a
+    named, accepted bounded-read-cost trade-off restored to what the
+    design actually specifies: status does not verify (and so cannot
+    catch tamper in) modules/dependencies/features/readiness/problems;
+    report and validate still do, in full, every time."""
     comprehension_dir = paths.comprehension_dir(Path(root).resolve() / ".agenttalk")
     index_doc, index_digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root}")
     scan_id = run_id or index_doc["latest_scan_id"]
-    records = _load_run_records(comprehension_dir, scan_id)
-    _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
-    scan_doc = records["scan"]
+    run_dir = _resolved_run_dir(comprehension_dir, scan_id)
+    scan_doc = _load_single_artifact(
+        run_dir, scan_id, "scan.json", SCAN_ARTIFACT_TYPE, SCAN_SCHEMA_VERSION)
     return {
         "latest_scan_id": index_doc["latest_scan_id"],
         "index_digest": index_digest,
@@ -571,15 +571,25 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     }
 
 
+def _load_single_artifact(
+    run_dir: Path, scan_id: str, name: str, artifact_type: str, schema_version: int,
+) -> dict[str, Any]:
+    """Read and envelope/schema-validate ONE artifact document - shared
+    by :func:`get_status` (which, per the design's own read-cost tier,
+    loads scan.json only) and :func:`_load_run_records` (which loads
+    every artifact, for callers that verify what they actually load)."""
+    try:
+        doc = read_json_document(run_dir / name)
+    except EnvelopeError as exc:
+        raise ComprehensionError(f"{scan_id}'s {name} could not be read: {exc}") from exc
+    return validate_envelope(doc, artifact_type=artifact_type, schema_version=schema_version)
+
+
 def _load_run_records(comprehension_dir: Path, scan_id: str) -> dict[str, Any]:
     run_dir = _resolved_run_dir(comprehension_dir, scan_id)
 
     def _load(name: str, artifact_type: str, schema_version: int) -> dict[str, Any]:
-        try:
-            doc = read_json_document(run_dir / name)
-        except EnvelopeError as exc:
-            raise ComprehensionError(f"{scan_id}'s {name} could not be read: {exc}") from exc
-        return validate_envelope(doc, artifact_type=artifact_type, schema_version=schema_version)
+        return _load_single_artifact(run_dir, scan_id, name, artifact_type, schema_version)
 
     # M1 (fourth cold read, fix round 6): validate_envelope only checks the
     # COMMON envelope fields (schema_version/artifact_type/scan_id/
