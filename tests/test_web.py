@@ -6285,6 +6285,48 @@ def _attention(base: str) -> dict:
         return json.loads(resp.read())
 
 
+def test_api_attention_renders_unlisted_source_generically_instead_of_dropping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#130: web.py's _ATTENTION_SOURCE_MAP is a private allowlist the CLI
+    does not have - an item from a source not yet in that map used to be
+    silently dropped by `if mapped is None: continue`, so `agenttalk
+    attention` showed it in the terminal while the console showed nothing
+    for the exact same store. A NOVEL/unlisted source must render under a
+    generic category end-to-end, never vanish."""
+    from agenttalk import attention as att
+
+    s = _make_store(tmp_path)
+    novel_source = "future_source_not_yet_in_the_console_allowlist"
+    novel_item = att._mk_item(
+        novel_source, att.item_id(novel_source, "alpha"),
+        title="a brand-new kind of attention item",
+        ident_content={"agent": "alpha"},
+        human_can_unblock_now=False,
+        fields={"why_it_matters": "exercises the #130 fallback path"},
+    )
+    novel_item["dedupe_key"] = att.dedupe_key(novel_source, identity="alpha")
+
+    real_collect = web._collect_web_attention_items
+
+    def collect_plus_novel(store, roster, for_agent):
+        return [*real_collect(store, roster, for_agent), novel_item]
+
+    monkeypatch.setattr(web, "_collect_web_attention_items", collect_plus_novel)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+        matches = [it for it in payload["items"] if it["id"] == novel_item["item_id"]]
+        assert matches, (
+            f"unlisted source vanished instead of rendering generically: {payload}")
+        assert matches[0]["source"] == "other"
+        assert matches[0]["source_label"] == "OTHER"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_attention_surfaces_process_tree_hold_without_liaison(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8414,6 +8456,45 @@ def test_api_risk_register_stays_partial_when_source_error_is_deferred(
             f"a DEFERRED source_error must still mark the register partial - the source "
             f"is still genuinely unreadable even though the warning item is hidden: {payload}")
         assert any("dead_letter" in d for d in payload["degraded_sources"]), payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_renders_unlisted_source_generically_instead_of_dropping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#130 companion: the risk register has the SAME private allowlist
+    (shared _ATTENTION_SOURCE_MAP) and the same silent-drop bug - a novel
+    source must appear under the register's "Other" category, not vanish."""
+    from agenttalk import attention as att
+
+    s = _make_store(tmp_path)
+    novel_source = "future_source_not_yet_in_the_console_allowlist"
+    novel_item = att._mk_item(
+        novel_source, att.item_id(novel_source, "alpha"),
+        title="a brand-new kind of attention item",
+        ident_content={"agent": "alpha"},
+        human_can_unblock_now=False,
+        fields={"why_it_matters": "exercises the #130 fallback path"},
+    )
+    novel_item["dedupe_key"] = att.dedupe_key(novel_source, identity="alpha")
+
+    real_collect = web._collect_web_attention_items
+
+    def collect_plus_novel(store, roster, for_agent):
+        return [*real_collect(store, roster, for_agent), novel_item]
+
+    monkeypatch.setattr(web, "_collect_web_attention_items", collect_plus_novel)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        matches = [it for it in payload["items"] if it["id"] == novel_item["item_id"]]
+        assert matches, (
+            f"unlisted source vanished instead of rendering generically: {payload}")
+        assert matches[0]["category"] == "other"
+        assert matches[0]["category_label"] == "Other"
     finally:
         srv.shutdown()
         srv.server_close()

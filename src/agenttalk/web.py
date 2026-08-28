@@ -2381,6 +2381,13 @@ _ATTENTION_SOURCE_MAP: dict[str, tuple[str, str, str]] = {
     _attention.SOURCE_ERROR: ("supervisor", "SUPERVISOR", "low"),
 }
 
+# #130: an internal source with no entry above must not vanish from the
+# console - the CLI has no such allowlist, so the SAME store showed items in
+# the terminal and nothing in the console, silently. Render it under a
+# generic category rather than dropping it. (Kept out of the map itself so
+# a genuinely new named source can still get a purpose-built label later.)
+_ATTENTION_SOURCE_FALLBACK: tuple[str, str, str] = ("other", "OTHER", "low")
+
 
 def _attention_agent(item: dict) -> str | None:
     """Best-effort agent the item concerns, from its envelope source_refs
@@ -2638,10 +2645,12 @@ def build_attention(desc: RootDescriptor,
         wire: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
-            mapped = _ATTENTION_SOURCE_MAP.get(src)
-            if mapped is None:
-                continue  # unknown internal source — skip rather than mislabel
-            wire_source, source_label, severity = mapped
+            # #130: an unlisted source is rendered generically, never dropped
+            # (a silent drop here — but not in the CLI, which has no such
+            # allowlist — showed items in the terminal and nothing in the
+            # console for the exact same store).
+            wire_source, source_label, severity = (
+                _ATTENTION_SOURCE_MAP.get(src) or _ATTENTION_SOURCE_FALLBACK)
             title = it.get("title") or "attention needed"
             detail = it.get("why_it_matters") or ""
             entry = {
@@ -3179,10 +3188,10 @@ def build_risk_register(desc: RootDescriptor) -> dict:
         risks: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
-            mapped = _ATTENTION_SOURCE_MAP.get(src)
-            if mapped is None:
-                continue  # unknown internal source — skip rather than mislabel
-            wire_source, _label, coarse_severity = mapped
+            # #130: an unlisted source is rendered generically (category_label
+            # already falls back to "Other" below), never dropped.
+            wire_source, _label, coarse_severity = (
+                _ATTENTION_SOURCE_MAP.get(src) or _ATTENTION_SOURCE_FALLBACK)
             # Prefer the item's OWN typed risk assessment (an operator-authored
             # escalation's meta.attention.risk_severity) over the coarse
             # per-source default - a low-risk escalation must not be forced to
