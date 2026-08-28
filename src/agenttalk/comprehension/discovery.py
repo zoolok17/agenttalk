@@ -86,6 +86,29 @@ _BINARY_SNIFF_BYTES = 8192
 _PLATFORM_PROBE_RELATIVE_DIR = f"{RELATIVE_COMPREHENSION_DIR}/.platform-probe"
 
 
+def effective_exclude_rule_digest() -> str:
+    """SHA-256 over the CURRENT default-exclude rule sets (hard-excluded/
+    VCS/dependency-cache/generated-vendor directory names, secret file
+    patterns) - published in scan.json (N2, fourth cold read, fix round
+    6) so a future change to any of these hardcoded lists is
+    independently detectable even before ``config.json`` exists to make
+    them caller-configurable. Without this, changing what these lists
+    exclude silently changes what ``whole_scope_fingerprint`` means, with
+    no recorded rule identity to explain why two scans of the identical
+    tree, at different points in this codebase's own history, now
+    disagree."""
+    payload = {
+        "hard_excluded_dirs": sorted(_HARD_EXCLUDE_DIR_NAMES),
+        "vcs_dirs": sorted(_VCS_DIR_NAMES),
+        "dependency_cache_dirs": sorted(_DEPENDENCY_CACHE_DIR_NAMES),
+        "generated_vendor_dirs": sorted(_GENERATED_VENDOR_DIR_NAMES),
+        "secret_file_patterns": sorted(_SECRET_FILE_PATTERNS),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 @dataclass(frozen=True)
 class PlatformIdentity:
     """DESIGN-55-comprehension-plane.md, "Scan manifest": "platform

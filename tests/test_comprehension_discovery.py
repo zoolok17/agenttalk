@@ -432,3 +432,23 @@ def test_whole_scope_fingerprint_changes_when_a_new_file_is_added(tmp_path: Path
     (tmp_path / "b.txt").write_bytes(b"world")
     after = discovery.enumerate_scope(tmp_path, comp_dir)
     assert before.whole_scope_fingerprint != after.whole_scope_fingerprint
+
+
+# ------------------------- effective exclude-rule digest (N2, round 6)
+
+def test_effective_exclude_rule_digest_is_deterministic() -> None:
+    """N2 (fourth cold read, fix round 6): scan.json now publishes a
+    digest over the CURRENT hardcoded exclude-rule sets, so a future
+    change to any of them is independently detectable even before
+    config.json exists to make them caller-configurable."""
+    assert discovery.effective_exclude_rule_digest() == discovery.effective_exclude_rule_digest()
+
+
+def test_effective_exclude_rule_digest_changes_when_a_rule_set_changes(monkeypatch) -> None:
+    before = discovery.effective_exclude_rule_digest()
+    monkeypatch.setattr(
+        discovery, "_GENERATED_VENDOR_DIR_NAMES",
+        frozenset({*discovery._GENERATED_VENDOR_DIR_NAMES, "a-new-vendor-dir"}),
+    )
+    after = discovery.effective_exclude_rule_digest()
+    assert before != after

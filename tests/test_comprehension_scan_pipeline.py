@@ -77,6 +77,27 @@ def test_run_scan_publishes_a_complete_run(java_repo: Path) -> None:
     assert (outcome.run_dir / "scan.json").exists()
 
 
+def test_scan_json_publishes_start_completion_times_and_exclude_rule_digest(
+    java_repo: Path,
+) -> None:
+    """N2 (fourth cold read, fix round 6): the design names scan.json
+    fields this run never populated - "start and completion times"
+    (distinct from generated_at, a single envelope-generation snapshot)
+    and "the effective... exclude rules... configuration digest" (without
+    it, a future change to the hardcoded exclude lists silently changes
+    what whole_scope_fingerprint means, with no recorded explanation)."""
+    import json
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["started_at"]
+    assert scan_doc["completed_at"]
+    assert scan_doc["started_at"] <= scan_doc["completed_at"]
+    assert scan_doc["exclude_rule_digest"] == discoverymod.effective_exclude_rule_digest()
+
+
 def test_run_scan_carries_the_pom_xml_build_edge_through_the_worker(java_repo: Path) -> None:
     """B-3 (reviewer-3, PR-B delta review): pom.xml's build edge must
     reach dependencies.json via the sanitized worker's own java_results

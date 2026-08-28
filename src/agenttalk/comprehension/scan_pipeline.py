@@ -215,6 +215,12 @@ def run_scan(
     ...) - this function never converts one refusal into another; the CLI
     layer decides how to present each one (including routing to the
     escalation module for a headless caller)."""
+    # N2 (fourth cold read, fix round 6): the design names "start and
+    # completion times" as scan.json fields, distinct from generated_at
+    # (each artifact's own envelope-generation snapshot) - captured here,
+    # at the true start of this call, before privacy/lock/discovery ever
+    # run.
+    started_at = _utc_now_iso(now)
     root = Path(root).resolve()
     agenttalk_dir = root / ".agenttalk"
     comprehension_dir = paths.comprehension_dir(agenttalk_dir)
@@ -437,11 +443,14 @@ def run_scan(
             ),
         ]
         run_digest = digests.run_content_digest(artifact_summaries)
+        completed_at = _utc_now_iso(now)
 
         scan_doc = {
             **_envelope(
                 artifact_type=SCAN_ARTIFACT_TYPE, schema_version=SCAN_SCHEMA_VERSION,
                 scan_id=scan_id, generated_at=generated_at),
+            "started_at": started_at,
+            "completed_at": completed_at,
             "status": status,
             "generator_version": GENERATOR_VERSION,
             "adapters": [{
@@ -470,6 +479,16 @@ def run_scan(
             },
             "whole_scope_fingerprint": discovery_result.whole_scope_fingerprint,
             "fingerprint_complete": discovery_result.fingerprint_complete,
+            # N2 (fourth cold read, fix round 6): the design names "the
+            # effective include/exclude rules... and their configuration
+            # digest" as a scan.json field. config.json parsing itself is
+            # out of scope this slice (no caller-configurable rules exist
+            # yet - a separate, named decision), but the CURRENT hardcoded
+            # default-exclude rule sets already exist and already shape
+            # whole_scope_fingerprint - without this, a future change to
+            # them silently changes what the fingerprint means, with no
+            # recorded rule identity to explain why.
+            "exclude_rule_digest": discovery.effective_exclude_rule_digest(),
             "exclusions": dict(sorted(discovery_result.exclusions.items())),
             # M4 (fourth cold read, fix round 6): a bare integer count hid
             # WHAT was actually skipped - the design names "excluded roots
