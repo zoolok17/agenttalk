@@ -385,6 +385,31 @@ def _derive_child_import_root() -> str:
     return str(import_root)
 
 
+def _worker_subprocess_argv() -> list[str]:
+    """The exact argv :func:`run_sanitized_worker` launches the child
+    with. Factored out to its own function (N6, third cold read, fix
+    round 5) so ``test_comprehension_network_deny.py``'s own hand-built
+    replica of this launch - it cannot call ``run_sanitized_worker``
+    itself, since that has no sudo/unshare wrapping point - imports and
+    calls this SAME function instead of maintaining its own separate
+    copy of the flag list. Round 4's ``-s``/``-S`` addition here silently
+    drifted out of sync with that test's copy until a cold read caught
+    it; a shared function makes that class of drift structurally
+    impossible instead of merely reviewable.
+
+    -s (skip the user site-packages directory) and -S (skip the `site`
+    module's own startup entirely - site-packages/.pth processing AND
+    sitecustomize.py/usercustomize.py, which would otherwise execute
+    inside this sanitized process) close exactly the channel the
+    module's own claim of a closed input boundary is about. Never the
+    fuller -I (isolated mode): -I also strips PYTHONPATH, which this
+    launch sets EXPLICITLY and deliberately (_derive_child_import_root,
+    above) so the child can resolve `agenttalk` from a source checkout -
+    -I would undo the one thing this whole function exists to arrange.
+    """
+    return [sys.executable, "-s", "-S", "-m", "agenttalk.comprehension.worker"]
+
+
 def run_sanitized_worker(
     root: Path, relative_paths: list[str], *, timeout_seconds: float = _WORKER_TIMEOUT_SECONDS,
 ) -> WorkerResult:
@@ -406,18 +431,7 @@ def run_sanitized_worker(
     payload = json.dumps({"root": str(root), "relative_paths": list(relative_paths)})
     try:
         completed = subprocess.run(  # noqa: S603  # nosec B603
-            # Note 8 (second cold read, fix round 4): -s (skip the user
-            # site-packages directory) and -S (skip the `site` module's
-            # own startup entirely - site-packages/.pth processing AND
-            # sitecustomize.py/usercustomize.py, which would otherwise
-            # execute inside this sanitized process) - closing exactly the
-            # channel the module's own claim of a closed input boundary is
-            # about. Never the fuller -I (isolated mode): -I also strips
-            # PYTHONPATH, which this launch sets EXPLICITLY and
-            # deliberately (_derive_child_import_root, above) so the child
-            # can resolve `agenttalk` from a source checkout - -I would
-            # undo the one thing this whole function exists to arrange.
-            [sys.executable, "-s", "-S", "-m", "agenttalk.comprehension.worker"],
+            _worker_subprocess_argv(),
             input=payload,
             capture_output=True,
             text=True,

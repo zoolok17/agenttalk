@@ -94,21 +94,24 @@ def _run_probe(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def _worker_probe_argv(root: Path) -> tuple[list[str], str, dict[str, str]]:
-    """Note 8 (second cold read, fix round 4): this must build the EXACT
-    same env and argv shape ``worker.run_sanitized_worker`` itself does -
-    it previously omitted the PYTHONPATH production explicitly adds
-    (``_derive_child_import_root``) and the ``-s -S`` interpreter flags,
-    so this module's own docstring claim ("the exact env-allowlist and
-    subprocess invocation production uses") was overstated. Cannot call
+    """This must build the EXACT same env and argv shape
+    ``worker.run_sanitized_worker`` itself does. Cannot call
     ``run_sanitized_worker`` directly - it has no sudo/unshare wrapping
-    point - so this replicates it instead, deliberately kept side by side
-    with worker.py's own construction rather than duplicated silently."""
+    point - so this replicates it instead. N6 (third cold read, fix round
+    5): the argv half of that replica used to be a hand-copied literal
+    (``[sys.executable, "-s", "-S", "-m", ...]``) that silently drifted
+    out of sync with production's own list when round 4 added ``-s``/
+    ``-S`` there - exactly the "test proves a replica, not production"
+    gap a cold read had to catch by hand. Calling
+    ``workermod._worker_subprocess_argv()`` here instead makes that class
+    of drift structurally impossible: this is no longer A copy, it is
+    THE list production itself launches with."""
     relative_paths = ["a.java"]
     (root / "a.java").write_text("package p;\nclass A {}\n", encoding="utf-8")
     payload = json.dumps({"root": str(root), "relative_paths": relative_paths})
     env = workermod.sanitized_worker_env({**os.environ, **_FAKE_CREDENTIAL_ENV})
     env["PYTHONPATH"] = workermod._derive_child_import_root()
-    argv = [sys.executable, "-s", "-S", "-m", "agenttalk.comprehension.worker"]
+    argv = workermod._worker_subprocess_argv()
     return argv, payload, env
 
 
