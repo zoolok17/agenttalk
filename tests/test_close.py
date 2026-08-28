@@ -510,6 +510,43 @@ def test_cli_full_go_lifecycle(tmp_path: Path) -> None:
     assert rec["final"]["verdict"] == close.VERDICT_GO
 
 
+def test_cli_counter_decide_accepts_and_rejects_through_the_real_argv_path(
+        tmp_path: Path) -> None:
+    """Field bug (v0.86.0): `close counter decide --decision accept|reject`
+    was refused every time - the CLI's operator-facing accept/reject never
+    got mapped to close.py's stored accepted/rejected vocabulary before
+    reaching decide_counter. This exercises the real CLI entrypoint (real
+    argv, real store), not decide_counter() directly, so it would have
+    caught the mismatch between the two layers."""
+    root = _init(tmp_path)
+    assert _open(root) == 0
+
+    assert _run(["close", "ack", "--id", "rel", "--lens", "sec", "--status",
+                 "counter", "--from", "codex", "--counter", "ctr-accept",
+                 "--finding", "needs a closer look"], root) == 0
+    assert _run(["close", "counter", "decide", "--id", "rel",
+                 "--counter", "ctr-accept", "--decision", "accept",
+                 "--from", "lead", "--reason", "confirmed, fixing",
+                 "--rem-owner", "dev2", "--rem-fix", "patched the gap",
+                 "--rem-verification", "regression test added"], root) == 0
+
+    assert _run(["close", "ack", "--id", "rel", "--lens", "sec", "--status",
+                 "counter", "--from", "codex", "--counter", "ctr-reject",
+                 "--finding", "turned out to be a non-issue"], root) == 0
+    assert _run(["close", "counter", "decide", "--id", "rel",
+                 "--counter", "ctr-reject", "--decision", "reject",
+                 "--from", "lead", "--reason", "not applicable"], root) == 0
+
+    rec = close.load_close(Store(root), "rel")
+    accepted = rec["counters"]["ctr-accept"]
+    assert accepted["decision"] == close.COUNTER_ACCEPTED
+    remediation_id = accepted["remediation_id"]
+    assert rec["remediation_items"][remediation_id]["fix"] == "patched the gap"
+
+    rejected = rec["counters"]["ctr-reject"]
+    assert rejected["decision"] == close.COUNTER_REJECTED
+
+
 @pytest.mark.parametrize("mutation", ["ack", "counter"])
 def test_cli_publish_serializes_against_ack_and_counter(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:

@@ -3092,6 +3092,14 @@ def cmd_close(args: argparse.Namespace) -> int:
             return 2
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "counter decide")
+        # args.decision is the operator-facing accept/reject CLI spelling;
+        # decide_counter requires the stored accepted/rejected vocabulary
+        # (close_mod.COUNTER_ACCEPTED/COUNTER_REJECTED). Map explicitly here,
+        # at the one call site, so the two spellings cannot silently drift
+        # apart again (v0.86.0 field bug: every counter decision was refused).
+        decision = (
+            close_mod.COUNTER_ACCEPTED if args.decision == "accept" else close_mod.COUNTER_REJECTED
+        )
         remediation = None
         if args.decision == "accept":
             remediation = {
@@ -3106,7 +3114,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
                 close_mod.decide_counter(
-                    record, counter_id=args.counter, decision=args.decision, by=actor,
+                    record, counter_id=args.counter, decision=decision, by=actor,
                     at=_iso_now(), reason=args.reason, remediation=remediation)
                 transaction.commit()
         except (close_mod.CloseConflict, TimeoutError) as e:
@@ -3114,7 +3122,7 @@ def cmd_close(args: argparse.Namespace) -> int:
         except close_mod.CloseError as e:
             sys.stderr.write(f"agenttalk close counter decide: {e}\n")
             return 2
-        print(f"counter {args.counter} {args.decision}ed on {args.id} by {actor}")
+        print(f"counter {args.counter} {decision} on {args.id} by {actor}")
         return 0
 
     if action == "check":
