@@ -61,6 +61,14 @@ PATH_NORMALIZATION_VERSION = 1
 MAX_FILESYSTEM_ENTRIES = 100_000
 MAX_PER_FILE_BYTES = 64 * 1024 * 1024
 MAX_HASHED_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+#: N6-nesting (cold-read, PR-B fix round 3): the design lists nesting
+#: among the resource caps, but _walk recursed with no depth limit at
+#: all, and only caught OSError - a pathologically deep directory tree
+#: could raise a bare RecursionError that propagated uncaught, crashing
+#: the whole scan rather than degrading it with a bounded problem. Well
+#: short of Python's own default recursion limit (~1000), leaving ample
+#: headroom for this function's own call-stack frames above it.
+MAX_NESTING_DEPTH = 200
 
 _HARD_EXCLUDE_DIR_NAMES = frozenset({".git", ".agenttalk"})
 _VCS_DIR_NAMES = frozenset({".hg", ".svn"})
@@ -320,8 +328,17 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
     def _record_exclusion(category: str) -> None:
         exclusions[category] = exclusions.get(category, 0) + 1
 
-    def _walk(directory: Path) -> None:
+    def _walk(directory: Path, depth: int = 0) -> None:
         nonlocal entry_count, hashed_total, fingerprint_complete, degraded, entry_cap_hit
+        if depth > MAX_NESTING_DEPTH:
+            fingerprint_complete = False
+            degraded = True
+            problems.append({
+                "reason_code": "resource_limit",
+                "path": directory.relative_to(root).as_posix(),
+                "detail": f"exceeded the {MAX_NESTING_DEPTH}-level nesting cap",
+            })
+            return
         try:
             entries = sorted(directory.iterdir(), key=lambda p: p.name)
         except OSError as exc:
@@ -348,7 +365,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                     boundaries.append(
                         BoundaryEntry(relative_path=relative, boundary_kind="submodule"))
                     continue
-                _walk(entry)
+                _walk(entry, depth + 1)
                 continue
             # A regular file.
             category = _exclusion_category(entry.name, is_dir=False)

@@ -267,6 +267,16 @@ def run_scan(
             "features.json": len(features_doc["entry_points"]) + len(features_doc["features"]),
             "readiness.json": len(readiness_doc["signals"]),
             "problems.json": len(problems_doc["problems"]),
+            # N6 (cold-read, PR-B fix round 3): scan.json's own record must
+            # be counted BEFORE scan_doc is built (never after writing it) -
+            # scan.json embeds this SAME dict by reference, so adding the
+            # entry only after _write_json_document had already serialized
+            # the document meant the PUBLISHED record_counts field always
+            # disagreed with what ceilings.py actually enforced (which used
+            # this dict's post-mutation state, one entry richer). scan.json
+            # always contains exactly one scan record, so this is knowable
+            # up front, not something that needs the document to exist first.
+            "scan.json": 1,
         }
 
         scan_doc = {
@@ -296,7 +306,6 @@ def run_scan(
             "problem_count": len(problems),
         }
         _write_json_document(staging_handle.path / "scan.json", scan_doc)
-        record_counts["scan.json"] = 1
 
         run_summary = {"scan_id": scan_id, "status": status}
     except BaseException as original_exc:

@@ -150,6 +150,22 @@ def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
     assert report["counts"]["problems"] == 1
 
 
+def test_scan_json_record_counts_includes_itself(java_repo: Path) -> None:
+    """N6-record_counts (cold-read, PR-B fix round 3): scan.json's own
+    record_counts field must count scan.json itself (always exactly 1) -
+    it previously only gained that entry in the in-memory dict AFTER
+    scan.json was already written to disk, so the PUBLISHED document's
+    own record_counts disagreed with what ceilings.py actually enforced
+    (post-mutation, one entry richer)."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert doc["record_counts"]["scan.json"] == 1
+    status = scan_pipeline.get_status(java_repo)
+    assert status["record_counts"]["scan.json"] == 1
+
+
 def test_run_scan_does_not_publish_owner_json_into_the_run(java_repo: Path) -> None:
     """M4 (cold-read, PR-B fix round 3): owner.json (host identity, PID,
     and the writer lock's own owner token) repeats the lock's identity

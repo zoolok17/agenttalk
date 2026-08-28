@@ -235,6 +235,26 @@ def test_entry_count_cap_stops_enumeration_and_degrades(tmp_path: Path, monkeypa
     assert any(p["reason_code"] == "resource_limit" for p in result.problems)
 
 
+def test_nesting_depth_cap_degrades_instead_of_crashing(tmp_path: Path, monkeypatch) -> None:
+    """N6-nesting (cold-read, PR-B fix round 3): _walk recursed with no
+    depth limit and only caught OSError - a pathologically deep directory
+    tree could raise a bare RecursionError that propagated uncaught,
+    crashing the whole scan rather than degrading it with a bounded
+    problem."""
+    monkeypatch.setattr(discovery, "MAX_NESTING_DEPTH", 3)
+    current = tmp_path
+    for i in range(6):
+        current = current / f"d{i}"
+        current.mkdir()
+    (current / "deep.txt").write_bytes(b"x")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.files == []
+    assert result.degraded is True
+    assert result.fingerprint_complete is False
+    assert any(p["reason_code"] == "resource_limit" for p in result.problems)
+
+
 def test_total_hashed_bytes_cap_excludes_files_once_exceeded(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(discovery, "MAX_HASHED_TOTAL_BYTES", 10)
     (tmp_path / "a.txt").write_bytes(b"1234567")
