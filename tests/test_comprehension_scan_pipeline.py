@@ -521,7 +521,22 @@ def test_run_scan_publishes_no_route_claims_from_a_zero_type_java_file(java_repo
     source (the language decodes \\uXXXX escapes before lexing; this
     adapter's sanitizer does not, so its own brace-matching never finds
     the type's body at all) - the pre-fix behavior published the class-
-    level route prefix and the method's own route despite zero units."""
+    level route prefix and the method's own route despite zero units.
+
+    ROUND 9b (honesty tightening): the original version of this
+    assertion checked for zero route edges/entry points RUN-WIDE - a
+    multi-file fixture with even one OTHER, legitimately-routed file
+    could either mask a real per-file leak (if that file's own routes
+    happened to also be absent) or fail this test for an unrelated
+    reason (if it had routes of its own). Scoped instead to what the
+    leak actually attaches to: a zero-type file still gets its own
+    default FILE-kind unit in modules.json (every enumerated file does),
+    and _enclosing_qualified_name's synthesized fallback resolves to
+    exactly that same file unit - NOT a dangling/unknown one, so a
+    "no edge references an unknown unit" check would not have caught
+    this. The scoped check instead asserts no edge/entry point is
+    attributed to THIS file's own unit_id specifically, regardless of
+    what any other file in the fixture happens to contain."""
     import json
 
     backslash = chr(92)
@@ -545,14 +560,20 @@ def test_run_scan_publishes_no_route_claims_from_a_zero_type_java_file(java_repo
     matching = [p for p in problems_doc["problems"] if p["reason_code"] == "no_types_extracted"]
     assert any(p["path"] == "src/main/java/p/Controller2.java" for p in matching)
 
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    zero_type_file_unit_id = next(
+        u["unit_id"] for u in modules_doc["units"]
+        if u["paths"] == ["src/main/java/p/Controller2.java"])
+
     dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
-    route_edges = [e for e in dependencies_doc["edges"] if e["relation"] == "route"]
-    assert route_edges == []
+    edges_from_the_zero_type_file = [
+        e for e in dependencies_doc["edges"] if e["from_unit_id"] == zero_type_file_unit_id]
+    assert edges_from_the_zero_type_file == []
 
     features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
-    http_route_entry_points = [
-        e for e in features_doc["entry_points"] if e["kind"] == "http_route"]
-    assert http_route_entry_points == []
+    entry_points_owned_by_the_zero_type_file = [
+        e for e in features_doc["entry_points"] if e["owning_unit_id"] == zero_type_file_unit_id]
+    assert entry_points_owned_by_the_zero_type_file == []
 
 
 def test_run_scan_does_not_flag_package_info_java_as_a_type_extraction_problem(
@@ -973,6 +994,38 @@ def test_validate_run_reports_valid_for_a_healthy_run(java_repo: Path) -> None:
     assert result["external_revalidation"] == {
         "performed": False, "reason_code": "no_external_evidence_pointers_this_slice",
     }
+
+
+def test_validate_run_flags_an_entry_point_with_an_unknown_owning_unit(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """ROUND 9b (sixth cold read, honesty tightening): validate already
+    flagged an EDGE referencing an unknown from_unit_id (dangling_edges)
+    but never an ENTRY POINT referencing an unknown owning_unit_id - the
+    same "unattributable synthesized owner" shape round 9's own BLOCKER
+    fixed at the adapter level could still slip past validate
+    undetected on the entry-point side. Injects a synthetic entry point
+    via features_artifact.build_features's own return value (so the
+    artifact is digested consistently from the start, not mutated after
+    publication) rather than corrupting an on-disk artifact."""
+    from agenttalk.comprehension import features_artifact as featuresmod
+
+    real_build_features = featuresmod.build_features
+
+    def _inject_a_dangling_entry_point(*args, **kwargs):
+        entry_points, features = real_build_features(*args, **kwargs)
+        orphan = featuresmod.EntryPointRecord(
+            entry_point_id="orphan-entry-point", kind="http_route", name="GET /orphan",
+            owning_unit_id="does-not-exist", feature_ids=[], evidence_class="declared",
+        )
+        return [*entry_points, orphan], features
+
+    monkeypatch.setattr(scan_pipeline.features_artifact, "build_features", _inject_a_dangling_entry_point)
+
+    scan_pipeline.run_scan(java_repo)
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "owning_unit_id" in result["detail"]
 
 
 def test_scan_json_carries_per_artifact_and_run_level_digests(java_repo: Path) -> None:

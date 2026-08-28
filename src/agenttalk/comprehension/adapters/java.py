@@ -420,6 +420,23 @@ def _extract_types(
     old single fixed-shape regex could not match at all."""
     header_by_brace_pos: dict[int, tuple[int, str, str | None, str | None]] = {}
     for name_match in _TYPE_NAME_ANCHOR_RE.finditer(sanitized):
+        # BLOCKER, second report (sixth cold read, fix round 9b): round
+        # 9's own fix tightened the "record" anchor (a mandatory
+        # component list) but left a DIFFERENT, also real variant open -
+        # a CLASS LITERAL (`Foo.class`) is itself valid Java grammar in
+        # any expression position (e.g. `String.class instanceof
+        # Object`), and "class" there is followed by whitespace then an
+        # ordinary identifier ("instanceof") the SAME shape a real
+        # declaration has. The reviewer's own guard: reject a type-name
+        # anchor immediately preceded (skipping whitespace) by a member-
+        # access dot - class/interface/enum/record are NEVER legitimately
+        # preceded by "." in a real declaration, so this never narrows
+        # real support, only rejects a literal/member-access reading.
+        dot_probe = name_match.start() - 1
+        while dot_probe >= 0 and sanitized[dot_probe].isspace():
+            dot_probe -= 1
+        if dot_probe >= 0 and sanitized[dot_probe] == ".":
+            continue
         clause_start = _skip_bracketed(sanitized, name_match.end(), "<", _matching_close_angle)
         if name_match.group(1) == "record":
             # MINOR 4 (sixth cold read, fix round 9): "record" is a

@@ -118,17 +118,20 @@ def _fake_scan_json(
     }
 
 
-def test_scan_json_content_digest_is_deterministic_across_two_content_identical_scans() -> None:
-    """MAJOR 3 (fifth cold read, fix round 8): round 6's own N2 fix added
-    started_at/completed_at to scan.json (the design's "start and
-    completion times" field, distinct from generated_at) but never added
-    them to GENERATION_IDENTITY_KEYS - two content-identical scans, run
-    at different wall-clock moments, produced DIFFERENT
-    canonical_content_digest(scan_doc) values, contradicting this
-    module's own docstring ("two byte-identical scans... produce the
-    SAME canonical content digest") and invariant 7's equivalence claim,
-    for the ONE document scan_json_anchor_state (round 7's MAJOR 3)
-    anchors index.json's own recorded digest against."""
+def test_canonical_content_digest_strips_started_at_and_completed_at_from_a_fixed_scan_json_shape() -> None:
+    """Round 8's own MAJOR 3 added started_at/completed_at to
+    GENERATION_IDENTITY_KEYS. This test ONLY proves the strip mechanism
+    on a hand-built, fixed scan.json SHAPE - it cannot and does not
+    prove run-to-run determinism of a REAL scan.json (that fixture has
+    no "artifacts" list, the exact field round 9's own MAJOR 3 found
+    still varying between two real scans via artifacts[].byte_sha256,
+    which this fixture cannot exercise). round 8's version of this test
+    was named as if it verified real determinism and did not - renamed
+    to what it actually checks (a fixed shape's serialization), per the
+    sixth cold read's ROUND 9b ask. The real verifier is
+    test_scan_json_content_digest_is_stable_across_two_real_content_
+    identical_scans in test_comprehension_scan_pipeline.py, which runs
+    the real pipeline twice and compares the real, on-disk documents."""
     first = _fake_scan_json(
         "20260826T091530Z-a1b2c3d4", "2026-08-26T09:15:30Z",
         "2026-08-26T09:15:28Z", "2026-08-26T09:15:30Z")

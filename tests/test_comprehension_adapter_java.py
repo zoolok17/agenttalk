@@ -303,6 +303,31 @@ class Controller {
     assert [u.qualified_name for u in result.units] == ["p.Controller"]
 
 
+def test_class_literal_followed_by_instanceof_is_not_a_phantom_type():
+    """BLOCKER, second report (sixth cold read, fix round 9b): round 9's
+    own fix tightened the "record" anchor (a mandatory component list)
+    but left a DIFFERENT, also real variant open - a CLASS LITERAL
+    (`Foo.class`) is valid Java grammar in any expression position (e.g.
+    `String.class instanceof Object`), and "class" there is followed by
+    whitespace then an ordinary identifier ("instanceof") - the SAME
+    shape a real declaration has. This is the reviewer's own reported
+    shape, reproduced exactly (not a cousin): a class-literal
+    `instanceof` check inside a normal method body published a phantom
+    unit named "instanceof"."""
+    src = """
+package p;
+class Controller {
+    void check() {
+        if (String.class instanceof Object) {
+            System.out.println("weird");
+        }
+    }
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Controller"]
+
+
 def test_class_level_request_mapping_composes_on_a_bounded_generic_controller():
     """The end-to-end proving case: a class-level route prefix on a
     header shape the OLD regex could not match must still compose with

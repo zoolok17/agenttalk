@@ -1036,10 +1036,35 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         e.edge_id for e in (records["dependencies"] if records else [])
         if e.from_unit_id not in unit_ids
     ] if records else []
+    # ROUND 9b (sixth cold read, honesty tightening): dangling EDGES were
+    # already flagged (above) - dangling ENTRY POINTS (an owning_unit_id
+    # naming no real unit, exactly the same "unattributable synthesized
+    # owner" shape round 9's own BLOCKER fixed at the adapter level) were
+    # not, so a THIS class of wrong-data could still slip past validate
+    # undetected on the entry-point side even though the edge side would
+    # have caught its own instance.
+    dangling_entry_points = [
+        e.entry_point_id for e in (records["entry_points"] if records else [])
+        if e.owning_unit_id not in unit_ids
+    ] if records else []
+    invalid = dangling_edges or dangling_entry_points
+    if dangling_edges and dangling_entry_points:
+        dangling_detail = (
+            f"{len(dangling_edges)} edge(s) reference an unknown from_unit_id and "
+            f"{len(dangling_entry_points)} entry point(s) reference an unknown owning_unit_id"
+        )
+    elif dangling_edges:
+        dangling_detail = f"{len(dangling_edges)} edge(s) reference an unknown from_unit_id"
+    elif dangling_entry_points:
+        dangling_detail = (
+            f"{len(dangling_entry_points)} entry point(s) reference an unknown owning_unit_id"
+        )
+    else:
+        dangling_detail = None
     return {
         "scan_id": scan_id,
-        "valid": valid and not dangling_edges,
-        "detail": detail if not dangling_edges else f"{len(dangling_edges)} edge(s) reference an unknown from_unit_id",
+        "valid": valid and not invalid,
+        "detail": detail if not invalid else dangling_detail,
         "scan_json_integrity": anchor_state,
         "external_revalidation": {
             "performed": False,
