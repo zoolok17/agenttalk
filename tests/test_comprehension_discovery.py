@@ -287,6 +287,32 @@ def test_total_hashed_bytes_cap_excludes_files_once_exceeded(tmp_path: Path, mon
     assert result.exclusions.get("resource_limit_total_bytes") == 1
 
 
+# ----------------------------------------------------------- non-UTF-8 paths (note 5)
+
+def test_non_utf8_path_problem_detail_recognizes_a_lone_surrogate():
+    """Note 5 (second cold read, fix round 4): on POSIX, a filename with
+    bytes that are not valid UTF-8 decodes (via surrogateescape) to a
+    string containing lone surrogates - encode("utf-8") on that string
+    raises UnicodeEncodeError, which previously surfaced as an unhandled
+    traceback at artifact-write time rather than a typed, bounded problem.
+    Tested at the function level (not via a real non-UTF-8 filename on
+    disk, which is POSIX-only and not reliably constructible from every
+    dev/CI platform) - _non_utf8_path_problem_detail is factored out of
+    the enumeration walk specifically to make this possible."""
+    surrogate_laden = "weird-\udcff-name.txt"
+    with pytest.raises(UnicodeEncodeError):
+        surrogate_laden.encode("utf-8")  # sanity: this IS the failure mode
+
+    result = discovery._non_utf8_path_problem_detail(surrogate_laden)
+    assert result is not None
+    assert result["path"].encode("ascii")  # the returned path is ASCII-safe, unlike the input
+    assert "not valid UTF-8" in result["detail"]
+
+
+def test_non_utf8_path_problem_detail_is_none_for_an_ordinary_path():
+    assert discovery._non_utf8_path_problem_detail("p/Foo.java") is None
+
+
 # ----------------------------------------------------------- determinism
 
 def test_whole_scope_fingerprint_is_deterministic_across_scans(tmp_path: Path) -> None:

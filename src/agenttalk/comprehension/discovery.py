@@ -254,6 +254,31 @@ def _boundary_kind(entry: Path) -> str | None:
     return None
 
 
+def _non_utf8_path_problem_detail(relative: str) -> dict[str, str] | None:
+    """Returns a bounded problem's ``path``/``detail`` pair if ``relative``
+    cannot be represented as UTF-8 (the encoding every published artifact
+    uses), else ``None``. Factored out of ``_walk`` (an inner closure, not
+    independently callable) specifically so this exact check is directly
+    unit-testable against a manually-constructed surrogate string, without
+    needing a real non-UTF-8 filename on disk (POSIX-only, and not
+    reliably constructible from every dev/CI platform).
+
+    The returned ``path`` is a backslash-escaped, ASCII-safe
+    representation of the same bytes - never the raw un-encodable string
+    itself, which would trip the identical failure the moment this
+    problem record's OWN containing document gets serialized.
+    """
+    try:
+        relative.encode("utf-8")
+    except UnicodeEncodeError:
+        return {
+            "path": relative.encode("utf-8", errors="backslashreplace").decode("ascii"),
+            "detail": "path contains bytes that are not valid UTF-8 and cannot be "
+                      "represented in this artifact format",
+        }
+    return None
+
+
 def _looks_binary(data: bytes) -> bool:
     """A NUL byte anywhere in the sniffed prefix is the same heuristic
     Git itself uses to classify a blob as binary - simple, well
@@ -352,6 +377,24 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
             if entry_cap_hit:
                 return
             relative = entry.relative_to(root).as_posix()
+            # Note 5 (second cold read, fix round 4): on POSIX, a filename
+            # with bytes that are not valid UTF-8 decodes (via Python's
+            # surrogateescape handling) to a string containing lone
+            # surrogates - canonical_json_bytes' `.encode("utf-8")` later
+            # raises UnicodeEncodeError on that string, an UNHANDLED
+            # traceback surfacing late, at artifact-write time, well after
+            # the lock and all the scan's own work. Caught here instead, at
+            # the EARLIEST possible point (this is also where every other
+            # bounded, reported exclusion in this walk already happens) -
+            # this one entry is excluded with a named problem; the scan
+            # degrades, it never crashes wholesale.
+            non_utf8_detail = _non_utf8_path_problem_detail(relative)
+            if non_utf8_detail is not None:
+                problems.append({
+                    "reason_code": "non_utf8_path", "path": non_utf8_detail["path"],
+                    "detail": non_utf8_detail["detail"],
+                })
+                continue
             boundary_kind = _boundary_kind(entry)
             if boundary_kind is not None:
                 boundaries.append(BoundaryEntry(relative_path=relative, boundary_kind=boundary_kind))
