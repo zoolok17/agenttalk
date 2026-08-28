@@ -211,17 +211,37 @@ def test_per_file_size_cap_fires_before_binary_sniffing(tmp_path: Path, monkeypa
 def test_per_file_size_cap_does_not_read_the_oversized_files_content(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """Verified by construction: stat() alone must decide this, so a file
-    this test cannot actually read (permission-denied simulation isn't
-    portable) is still safely skippable in principle. Here we assert the
-    cheaper, equally conclusive property: the returned claim carries no
-    digest for an oversized entry, because content was genuinely never
-    read."""
+    """N5 (cold-read, PR-B fix round 3): the previous version of this
+    test asserted only `result.files == []`, which a read-then-discard
+    implementation would ALSO satisfy just as well as one that genuinely
+    never reads oversized content - the assertion could not tell the two
+    apart, despite the test's own name and docstring claiming otherwise.
+    Directly instruments Path.read_bytes to prove the oversized file is
+    never read at all (with a sanity check that the tracking wrapper
+    itself does observe the small file's real read, so a no-op wrapper
+    could not silently pass this test either)."""
     monkeypatch.setattr(discovery, "MAX_PER_FILE_BYTES", 4)
     (tmp_path / "big.txt").write_bytes(b"more than four bytes")
+    (tmp_path / "small.txt").write_bytes(b"ok")
+
+    read_names: list[str] = []
+    real_read_bytes = Path.read_bytes
+
+    def _tracking_read_bytes(self: Path) -> bytes:
+        read_names.append(self.name)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _tracking_read_bytes)
+
     comp_dir = _comprehension_dir(tmp_path)
     result = discovery.enumerate_scope(tmp_path, comp_dir)
-    assert result.files == []
+    assert [f.relative_path for f in result.files] == ["small.txt"]
+    assert "big.txt" not in read_names, (
+        "the oversized file's content was read despite the per-file size cap")
+    assert "small.txt" in read_names, (
+        "sanity check: the tracking wrapper must observe a real read, or this test "
+        "would pass even with a no-op wrapper"
+    )
 
 
 def test_entry_count_cap_stops_enumeration_and_degrades(tmp_path: Path, monkeypatch) -> None:

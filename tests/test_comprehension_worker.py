@@ -153,12 +153,26 @@ def test_process_paths_dispatches_web_xml_through_the_java_results_channel(
 
 
 def test_process_paths_is_deterministic_regardless_of_input_order(tmp_path: Path) -> None:
+    """N4 (cold-read, PR-B fix round 3): comparing bare SETS of digests
+    cannot detect a cross-contamination bug (e.g. a.txt's claim
+    accidentally getting b.txt's digest) - as long as both digests appear
+    SOMEWHERE across the results, a set comparison passes vacuously
+    regardless of which file each is actually attributed to. Comparing
+    the relative_path -> content_digest MAPPING is strictly stronger: it
+    fails if any single file's digest differs from its OWN expected value
+    depending on what order it happened to be processed in."""
+    import hashlib
+
     (tmp_path / "a.txt").write_bytes(b"hello")
     (tmp_path / "b.txt").write_bytes(b"world!")
     forward = worker.process_paths(tmp_path, ["a.txt", "b.txt"])
     backward = worker.process_paths(tmp_path, ["b.txt", "a.txt"])
-    assert {c.content_digest for c in forward.file_claims} == {
-        c.content_digest for c in backward.file_claims
+    forward_by_path = {c.relative_path: c.content_digest for c in forward.file_claims}
+    backward_by_path = {c.relative_path: c.content_digest for c in backward.file_claims}
+    assert forward_by_path == backward_by_path
+    assert forward_by_path == {
+        "a.txt": hashlib.sha256(b"hello").hexdigest(),
+        "b.txt": hashlib.sha256(b"world!").hexdigest(),
     }
 
 
