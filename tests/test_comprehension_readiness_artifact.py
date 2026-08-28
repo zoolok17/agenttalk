@@ -145,6 +145,65 @@ def test_dependencies_resolved_satisfied_when_all_edges_resolved():
     assert _signal_by_check(signals, "dependencies_resolved").stored_status == "satisfied"
 
 
+def _file_unit(unit_id: str) -> ModuleRecord:
+    return ModuleRecord(
+        unit_id=unit_id, kind="file", display_name=unit_id, language="java",
+        paths=[f"{unit_id}.java"], source_digests={}, classification=["production"],
+        container_unit_id=None, producers=[],
+    )
+
+
+# ------------------------------------------- dependencies_resolved, file units (N6, round 6)
+
+def test_file_units_dependencies_resolved_derives_from_contained_units_not_vacuously_satisfied():
+    """N6 (fourth cold read, fix round 6): edges attach to the declared
+    TYPE, never the FILE that contains it - a file unit's own
+    dependencies_resolved used to always be satisfied/no_dependencies
+    (it never receives outgoing edges directly), a structurally
+    always-on positive signal that was never actually evidence of
+    anything. A file whose CONTAINED component unit has an unresolved
+    edge must roll that up onto the file's own signal, not report a
+    vacuous satisfied."""
+    component = ModuleRecord(
+        unit_id="comp1", kind="component", display_name="comp1", language="java",
+        paths=["file1.java"], source_digests={}, classification=["production"],
+        container_unit_id="file1", producers=[],
+    )
+    file_unit = _file_unit("file1")
+    edges = [_edge("comp1", resolution_state="unresolved")]
+    signals, _ = ra.build_readiness([file_unit, component], edges, [])
+    file_signal = next(
+        s for s in signals if s.unit_id == "file1" and s.check == "dependencies_resolved")
+    assert file_signal.stored_status == "unsatisfied"
+
+
+def test_file_units_with_no_contained_units_and_no_direct_edges_are_not_applicable():
+    """N6 (fourth cold read, fix round 6): a plain non-code file (or one
+    the adapter never understood) has no meaningful "dependencies"
+    concept at all - not_applicable, never a confident positive earned
+    by nothing."""
+    file_unit = _file_unit("file1")
+    signals, _ = ra.build_readiness([file_unit], [], [])
+    file_signal = next(
+        s for s in signals if s.unit_id == "file1" and s.check == "dependencies_resolved")
+    assert file_signal.stored_status == "not_applicable"
+
+
+def test_file_units_with_a_direct_edge_of_their_own_are_still_evaluated():
+    """N6 (fourth cold read, fix round 6): a pom.xml-style file has no
+    component children at all, yet build edges attach DIRECTLY to its
+    own file unit (there being no component-level unit for that
+    producer) - this must still be evaluated on its own direct edges,
+    not swept into not_applicable just because it has no CONTAINED
+    units."""
+    file_unit = _file_unit("pom_xml")
+    edges = [_edge("pom_xml", relation="build", resolution_state="unresolved")]
+    signals, _ = ra.build_readiness([file_unit], edges, [])
+    file_signal = next(
+        s for s in signals if s.unit_id == "pom_xml" and s.check == "dependencies_resolved")
+    assert file_signal.stored_status == "unsatisfied"
+
+
 # ----------------------------------------------------------- entry_points_mapped / feature_linked
 
 def test_entry_points_mapped_not_applicable_without_a_feature_link():

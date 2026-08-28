@@ -162,6 +162,36 @@ def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRe
     return _signal(unit.unit_id, "dependencies_resolved", "satisfied", "detected", "dependencies_resolved")
 
 
+def _check_dependencies_resolved_for_file(
+    unit: ModuleRecord, direct_outgoing: list[DependencyRecord], contained_unit_ids: set[str],
+    outgoing_by_unit: dict[str, list[DependencyRecord]],
+) -> ReadinessSignal:
+    """N6 (fourth cold read, fix round 6): edges attach to the declared
+    TYPE a call/import/route site lives in, never to the FILE that
+    happens to contain it (M-4, round 5's own containment fix didn't
+    change edge attribution) - a Java file's own "file" unit therefore
+    NEVER receives outgoing edges directly and always reported
+    dependencies_resolved satisfied/no_dependencies, a structurally
+    always-on positive signal that was never actually evidence of
+    anything. Derives the file's own signal from the UNION of its
+    contained units' edges instead (recursing through nested types),
+    PLUS any edge attributed directly to the file itself (the pom.xml/
+    web.xml shape, where build/route edges attach to the file unit
+    directly - there being no component-level unit for those producers).
+    A file with neither any contained unit nor any direct edge of its
+    own (a plain non-code file, or one the adapter never understood) is
+    ``not_applicable`` - the concept of "dependencies" does not
+    meaningfully apply to it, so a confident positive would be exactly
+    the un-evidenced satisfied this check exists to avoid."""
+    if not contained_unit_ids and not direct_outgoing:
+        return _signal(
+            unit.unit_id, "dependencies_resolved", "not_applicable", "detected", "no_contained_units")
+    outgoing = list(direct_outgoing)
+    for contained_id in contained_unit_ids:
+        outgoing.extend(outgoing_by_unit.get(contained_id, []))
+    return _check_dependencies_resolved(unit, outgoing)
+
+
 def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> ReadinessSignal:
     if not has_entry_point:
         return _signal(
@@ -211,6 +241,26 @@ def build_readiness(
     for edge in dependencies:
         outgoing_by_unit.setdefault(edge.from_unit_id, []).append(edge)
 
+    # N6 (fourth cold read, fix round 6): direct children only (container_
+    # unit_id -> unit_id) - _transitive_descendants below walks this to
+    # collect a file's full descendant set, since a nested type's own
+    # container is its OUTER type, not the file directly.
+    children_by_container: dict[str, list[str]] = {}
+    for m in modules:
+        if m.container_unit_id is not None:
+            children_by_container.setdefault(m.container_unit_id, []).append(m.unit_id)
+
+    def _transitive_descendants(root_id: str) -> set[str]:
+        seen: set[str] = set()
+        stack = list(children_by_container.get(root_id, []))
+        while stack:
+            candidate = stack.pop()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            stack.extend(children_by_container.get(candidate, []))
+        return seen
+
     tested_unit_ids = {
         edge.target_unit_id for edge in dependencies
         if edge.relation == "test" and edge.target_unit_id is not None
@@ -228,9 +278,17 @@ def build_readiness(
     summaries: list[UnitReadinessSummary] = []
 
     for unit in modules:
+        if unit.kind == "file":
+            dependencies_signal = _check_dependencies_resolved_for_file(
+                unit, outgoing_by_unit.get(unit.unit_id, []),
+                _transitive_descendants(unit.unit_id), outgoing_by_unit,
+            )
+        else:
+            dependencies_signal = _check_dependencies_resolved(
+                unit, outgoing_by_unit.get(unit.unit_id, []))
         unit_signals = [
             _check_source_understood(unit),
-            _check_dependencies_resolved(unit, outgoing_by_unit.get(unit.unit_id, [])),
+            dependencies_signal,
             _check_entry_points_mapped(unit, unit.unit_id in entry_point_owner_ids),
             _check_feature_linked(unit, feature_states_by_unit.get(unit.unit_id, [])),
             _check_test_evidence_located(unit, unit.unit_id in tested_unit_ids),
