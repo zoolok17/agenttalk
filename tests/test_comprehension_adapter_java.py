@@ -34,12 +34,18 @@ class Foo {
     assert result.units[0].qualified_name == "com.example.app.Foo"
 
     # D-1 (reviewer-3, PR-B delta review round 2): a plain import gets a
-    # shot at exact internal resolution; a static import's target is a
-    # member path, and a wildcard import names a package - neither is a
-    # single type, so both stay plain external.
+    # shot at exact internal resolution. N5 (fourth cold read, fix round
+    # 6): a static import's target is a member path - not itself a shot
+    # at exact resolution, but its TYPE PREFIX is - java.util.Collections
+    # (not itself in-scan here) still classifies external once resolved.
+    # A wildcard NON-static import names a package, never a single type,
+    # so it alone stays plain external unconditionally.
     by_target = {e.target: e for e in imports}
     assert by_target["java.util.List"].target_kind == "internal_exact_or_external"
-    assert by_target["java.util.Collections.emptyList"].target_kind == "external"
+    assert (
+        by_target["java.util.Collections.emptyList"].target_kind
+        == "internal_static_import_exact_or_external"
+    )
     assert by_target["com.example.other.*"].target_kind == "external"
 
 

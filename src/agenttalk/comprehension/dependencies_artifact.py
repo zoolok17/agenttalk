@@ -272,6 +272,21 @@ def _edge_claim_to_record(
             resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
         else:
             resolution_state, target_external = "resolved", edge.target
+    elif edge.target_kind == "internal_static_import_exact_or_external":
+        # N5 (fourth cold read, fix round 6): a static import's target is
+        # a member path (Type.MEMBER) or a static-member wildcard
+        # (Type.*) - the TYPE PREFIX (everything but the last segment) is
+        # what might be in-scan, exact-matched the same way D-1 already
+        # does for a plain import; the member itself is never resolved
+        # (out of scope). The published target keeps the full original
+        # spelling either way, for evidence - only the LOOKUP key strips
+        # the trailing member/wildcard segment.
+        type_prefix = edge.target[:-2] if edge.target.endswith(".*") else edge.target.rsplit(".", 1)[0]
+        exact_unit_id = _exact_qualified_lookup(type_prefix, by_qualified_name)
+        if exact_unit_id is not None:
+            resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
+        else:
+            resolution_state, target_external = "resolved", edge.target
     elif edge.target_kind == "internal_unqualified_call_candidate":
         # M12 (cold-read, PR-B fix round 3): an invoke call whose qualifier
         # is neither locally declared nor import-recognized - could be a

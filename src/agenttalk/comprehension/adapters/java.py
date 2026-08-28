@@ -144,6 +144,7 @@ class JavaEdgeClaim:
     relation: str
     target: str
     # "internal_candidate" | "internal_exact_or_external" |
+    # "internal_static_import_exact_or_external" |
     # "internal_unqualified_call_candidate" | "external" |
     # "external_route" - see dependencies_artifact._edge_claim_to_record
     # for how each is resolved.
@@ -542,13 +543,29 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # declared inside this same scan - give it the same shot at
         # resolving internally that `extends`/`implements`/test-pairing
         # already get, via the exact same registry, never a guess. A
-        # static import's target is a member path (ClassName.MEMBER), not
-        # a type's own qualified name, and a wildcard import names a
-        # package, not a type - neither can be exact-matched against the
-        # unit registry, so both stay plain external.
-        target_kind = (
-            "external" if is_static or target.endswith(".*") else "internal_exact_or_external"
-        )
+        # wildcard NON-static import names a package, not a type - the
+        # part before ".*" can never be exact-matched against the unit
+        # registry, so it stays plain external.
+        #
+        # N5 (fourth cold read, fix round 6): a STATIC import's target is
+        # a member path (Type.MEMBER) or a static-member wildcard
+        # (Type.*) - never itself a type's own qualified name - but in
+        # BOTH cases the TYPE PREFIX (everything but the last segment) IS
+        # itself fully qualified and exact-matchable, the exact same way
+        # D-1 already established for a plain import. Stamping every
+        # static import "external" unconditionally counted an internal
+        # dependency (`import static com.acme.Foo.BAR` where `Foo` is
+        # in-scan) as external, the same fan-in loss D-1 fixed for plain
+        # imports. Member resolution itself stays out of scope - this
+        # tracks the TYPE dependency, not which specific static member -
+        # and the published target keeps the ORIGINAL full spelling
+        # either way, for evidence.
+        if is_static:
+            target_kind = "internal_static_import_exact_or_external"
+        elif target.endswith(".*"):
+            target_kind = "external"
+        else:
+            target_kind = "internal_exact_or_external"
         edges.append(JavaEdgeClaim(
             from_qualified_name=primary_qualified, relation="import", target=target,
             target_kind=target_kind,

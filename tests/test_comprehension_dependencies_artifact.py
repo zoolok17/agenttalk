@@ -290,6 +290,57 @@ def test_import_mediated_invoke_of_a_genuinely_external_type_still_classifies_ex
     assert invoke_edge.target_unit_id is None
 
 
+# ----------------------------------------------------------- fourth cold read N5: static imports
+
+def test_static_import_of_an_in_scan_type_resolves_internally():
+    """N5 (fourth cold read, fix round 6): a static import's target is a
+    member path (Type.MEMBER), never itself a type's own qualified name -
+    but the TYPE PREFIX (everything but the last segment) is itself
+    fully qualified and exact-matchable, the same way D-1 already
+    established for a plain import. Stamping every static import
+    "external" unconditionally counted this in-scan dependency
+    (`import static p.OrderService.create` where OrderService IS in-scan)
+    as external, the same fan-in loss D-1 fixed for plain imports."""
+    results = {
+        "p/OrderService.java": _parse(
+            "p/OrderService.java", "package p;\nclass OrderService {\n  static void create() {}\n}\n"),
+        "q/OrderController.java": _parse(
+            "q/OrderController.java",
+            "package q;\n"
+            "import static p.OrderService.create;\n"
+            "class OrderController {\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "resolved"
+    assert import_edge.target_external is None
+    assert import_edge.target_unit_id == da._java_component_unit_id(
+        "p/OrderService.java", "p.OrderService")
+
+
+def test_static_import_of_a_genuinely_external_member_still_classifies_external():
+    """N5 (fourth cold read, fix round 6): the fix must not overcorrect -
+    a static import of a type genuinely not declared anywhere in this
+    scan (the ordinary JDK/library case) must still resolve external,
+    with the FULL original member-path spelling preserved as evidence."""
+    results = {
+        "p/Foo.java": _parse(
+            "p/Foo.java",
+            "package p;\n"
+            "import static java.util.Collections.emptyList;\n"
+            "class Foo {\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    assert import_edge.resolution_state == "resolved"
+    assert import_edge.target_external == "java.util.Collections.emptyList"
+    assert import_edge.target_unit_id is None
+
+
 # ----------------------------------------------------------- route (external)
 
 def test_route_edge_resolves_as_external_with_declared_evidence():
