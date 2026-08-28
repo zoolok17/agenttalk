@@ -142,6 +142,77 @@ def test_test_edge_resolves_to_the_unit_under_test_in_another_file():
     assert test_edge.target_unit_id == foo_unit_id
 
 
+# ----------------------------------------------------------- coalescing (M6)
+
+def test_byte_identical_invoke_edges_coalesce_to_one_record_with_merged_producers():
+    """M6 (cold-read, PR-B fix round 3): three identical call sites to the
+    same target from the same unit produce the SAME edge_id (the adapter
+    records no per-call-site distinguishing evidence this slice) - the
+    design's merge rule requires these coalesce to ONE record with merged
+    producers, not three duplicate records inflating record_counts,
+    ceilings, and every fan-in/fan-out count. Reproduced pre-fix: 3 call
+    sites gave 3 records, 1 unique edge_id."""
+    source = (
+        "package p;\n"
+        "class Caller {\n"
+        "  void run() {\n"
+        "    Foo.bar();\n"
+        "    Foo.bar();\n"
+        "    Foo.bar();\n"
+        "  }\n"
+        "}\n"
+    )
+    results = {"p/Caller.java": _parse("p/Caller.java", source)}
+    records = da.build_dependencies(results)
+    invoke_records = [r for r in records if r.relation == "invoke"]
+    assert len(invoke_records) == 1
+    assert len({r.edge_id for r in invoke_records}) == 1
+    assert len(invoke_records[0].producers) == 1
+
+
+# ----------------------------------------------------------- M12: registry collisions and invoke over-reach
+
+def test_duplicate_qualified_name_never_resolves_confidently_to_either_claimant():
+    """M12 (cold-read, PR-B fix round 3): two files DECLARING the exact
+    same fully-qualified name used to last-wins in the registry - a
+    scan-order-dependent, silently wrong resolution. Now neither
+    claimant is offered by exact lookup; resolution falls through to the
+    existing simple-name-ambiguity path, which correctly reports
+    ambiguous (2 candidates sharing that simple name - themselves)."""
+    results = {
+        "a/Dup.java": _parse("a/Dup.java", "package p;\nclass Dup {}\n"),
+        "b/Dup.java": _parse("b/Dup.java", "package p;\nclass Dup {}\n"),
+        "c/Foo.java": _parse("c/Foo.java", "package p;\nclass Foo extends p.Dup {}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "ambiguous"
+    assert inherit.target_unit_id is None
+
+
+def test_invoke_on_an_unrecognized_qualifier_does_not_capture_an_unrelated_same_named_class():
+    """M12 (cold-read, PR-B fix round 3): a call like `Optional.of(...)`
+    with no local declaration and no import must NOT resolve against an
+    unrelated same-named class declared elsewhere in the scan (a
+    JDK-shadowing or common test-helper name) - the design's own "never
+    invents an internal target because names look similar" invariant,
+    previously violated because the invoke else-branch fed the GLOBAL
+    simple-name matcher unconditionally."""
+    results = {
+        "unrelated/pkg/Optional.java": _parse(
+            "unrelated/pkg/Optional.java", "package unrelated.pkg;\nclass Optional {}\n"),
+        "p/Caller.java": _parse(
+            "p/Caller.java",
+            "package p;\nclass Caller {\n  void run() {\n    Optional.of(1);\n  }\n}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    invoke = next(r for r in records if r.relation == "invoke")
+    assert invoke.resolution_state == "unresolved"
+    assert invoke.target_unit_id is None
+    assert invoke.target_unresolved == "Optional"
+
+
 # ----------------------------------------------------------- route (external)
 
 def test_route_edge_resolves_as_external_with_declared_evidence():

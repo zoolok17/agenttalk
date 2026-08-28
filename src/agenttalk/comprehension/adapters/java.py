@@ -95,7 +95,8 @@ class JavaEdgeClaim:
     from_qualified_name: str
     relation: str
     target: str
-    # "internal_candidate" | "internal_exact_or_external" | "external" |
+    # "internal_candidate" | "internal_exact_or_external" |
+    # "internal_unqualified_call_candidate" | "external" |
     # "external_route" - see dependencies_artifact._edge_claim_to_record
     # for how each is resolved.
     target_kind: str
@@ -332,12 +333,27 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     for match in _QUALIFIED_CALL_RE.finditer(sanitized):
         qualifier, _method = match.group(1), match.group(2)
         if qualifier in local_simple_names:
+            # A type declared IN THIS SAME FILE - a known, non-ambiguous
+            # local reference, safe to resolve with the full registry.
             target_kind = "internal_candidate"
         elif qualifier in import_simple_names:
             target_kind = "external"
             qualifier = import_simple_names[qualifier]
         else:
-            target_kind = "internal_candidate"
+            # M12 (cold-read, PR-B fix round 3): neither locally declared
+            # nor import-recognized - could be a genuine same-package
+            # sibling (Java needs no import for that), but could equally
+            # be a JDK/library type this extractor has no import evidence
+            # for. Deliberately NOT "internal_candidate" here: that would
+            # feed the GLOBAL simple-name matcher, and one same-named
+            # class anywhere else in the whole scan (a JDK-shadowing name
+            # like `Optional`, or a common test-helper name like `Assert`)
+            # would then silently capture every unrelated call to that
+            # name, codebase-wide - exactly the "invents an internal
+            # target because names look similar" the design forbids. This
+            # narrower kind only resolves via an EXACT qualified-name
+            # match; otherwise it stays unresolved, never a guess.
+            target_kind = "internal_unqualified_call_candidate"
         edges.append(JavaEdgeClaim(
             from_qualified_name=primary_qualified, relation="invoke", target=qualifier,
             target_kind=target_kind, evidence_class="extracted",

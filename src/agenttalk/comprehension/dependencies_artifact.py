@@ -13,7 +13,7 @@ reconciles them against every file's declared types in the same scan.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import digests
@@ -99,15 +99,36 @@ def _java_file_unit_id(relative_path: str) -> str:
 def _build_registry(
     java_results: dict[str, java_adapter.JavaFileResult],
 ) -> tuple[dict[str, str], dict[str, list[str]], dict[str, str]]:
+    """M12 (cold-read, PR-B fix round 3): two units DECLARING the same
+    fully-qualified name (a real collision, not merely a same-SIMPLE-name
+    coincidence) used to last-wins into ``by_qualified_name`` with no
+    collision handling - a later scan-order-dependent unit would silently
+    replace an earlier one, and every edge resolving to that name would
+    confidently pick whichever happened to win, never reporting the
+    conflict. The full conflict/merge machinery (``conflict_id``) stays
+    out of this slice (named PR-C entry item), but a duplicate qualified
+    name must never resolve confidently either way: it is removed from
+    ``by_qualified_name`` entirely once a second claimant is seen, so an
+    exact-name lookup finds nothing there and any resolution instead falls
+    through to the existing simple-name-ambiguity path below (which
+    already reports ``ambiguous`` for 2+ same-simple-name candidates -
+    true here by construction, since a duplicate qualified name shares its
+    own simple name with itself)."""
     by_qualified_name: dict[str, str] = {}
+    duplicate_qualified_names: set[str] = set()
     by_simple_name: dict[str, list[str]] = {}
     file_unit_id_by_path: dict[str, str] = {}
     for path, result in java_results.items():
         file_unit_id_by_path[path] = _java_file_unit_id(path)
         for unit_claim in result.units:
             uid = _java_component_unit_id(path, unit_claim.qualified_name)
-            by_qualified_name[unit_claim.qualified_name] = uid
+            if unit_claim.qualified_name in by_qualified_name:
+                duplicate_qualified_names.add(unit_claim.qualified_name)
+            else:
+                by_qualified_name[unit_claim.qualified_name] = uid
             by_simple_name.setdefault(unit_claim.simple_name, []).append(uid)
+    for name in duplicate_qualified_names:
+        by_qualified_name.pop(name, None)
     return by_qualified_name, by_simple_name, file_unit_id_by_path
 
 
@@ -194,7 +215,32 @@ def build_dependencies(
             )
             records.append(record)
 
-    return records
+    return _coalesce_by_edge_id(records)
+
+
+def _coalesce_by_edge_id(records: list[DependencyRecord]) -> list[DependencyRecord]:
+    """M6 (cold-read, PR-B fix round 3): "byte-identical claims must
+    coalesce to one record per edge_id with merged producer lists" (design
+    merge rule) - e.g. three identical calls to the same method at the
+    same call site pattern (``Foo.bar(); Foo.bar(); Foo.bar();``) all
+    produce the SAME ``edge_id`` (from_unit_id + relation + target +
+    phase - the adapter records no per-call-site distinguishing evidence
+    this slice), so without this step they inflated record_counts,
+    ceilings, and every fan-in/fan-out count with pure duplicates.
+    Preserves first-seen order (a plain dict is insertion-ordered) so
+    coalescing never perturbs an otherwise-deterministic record order."""
+    merged: dict[str, DependencyRecord] = {}
+    for record in records:
+        existing = merged.get(record.edge_id)
+        if existing is None:
+            merged[record.edge_id] = record
+            continue
+        combined_producers = list(existing.producers)
+        for producer in record.producers:
+            if producer not in combined_producers:
+                combined_producers.append(producer)
+        merged[record.edge_id] = replace(existing, producers=combined_producers)
+    return list(merged.values())
 
 
 def _edge_claim_to_record(
@@ -217,6 +263,19 @@ def _edge_claim_to_record(
             resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
         else:
             resolution_state, target_external = "resolved", edge.target
+    elif edge.target_kind == "internal_unqualified_call_candidate":
+        # M12 (cold-read, PR-B fix round 3): an invoke call whose qualifier
+        # is neither locally declared nor import-recognized - could be a
+        # genuine same-package sibling (Java needs no import for that),
+        # but the GLOBAL simple-name matcher would let an unrelated
+        # same-named class ANYWHERE in the whole scan silently capture it
+        # (a JDK-shadowing name, or a common test-helper name). Exact
+        # qualified match only; otherwise unresolved, never a guess.
+        exact_unit_id = _exact_qualified_lookup(edge.target, by_qualified_name)
+        if exact_unit_id is not None:
+            resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
+        else:
+            resolution_state, target_unresolved = "unresolved", edge.target
     else:
         resolution_state = "resolved"
         target_external = edge.target
