@@ -445,6 +445,32 @@ def test_validate_run_catches_a_tampered_artifact_via_its_digest(java_repo: Path
     assert "content_digest" in result["detail"] or "byte_sha256" in result["detail"]
 
 
+def test_validate_run_catches_a_whitespace_only_rewrite_of_an_artifact(
+    java_repo: Path,
+) -> None:
+    """M-3 (second cold read, fix round 4): the byte SHA-256 check
+    previously recomputed sha256(canonical_json_bytes(doc)) from the
+    PARSED document, not the file's real bytes - a whitespace-only
+    rewrite (identical parsed content, different bytes on disk) passed
+    validation because the re-canonicalized bytes matched the declared
+    value regardless of what was actually on disk. Reproduced: rewriting
+    modules.json with extra indentation/spacing (same units, same JSON
+    value) must now be caught."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_path = outcome.run_dir / "modules.json"
+    doc = json.loads(modules_path.read_text(encoding="utf-8"))
+    # Pretty-printed with extra whitespace - parses to the IDENTICAL
+    # value as the canonical, compact form scan.json's byte_sha256 was
+    # computed from, but the bytes on disk are now different.
+    modules_path.write_text(json.dumps(doc, indent=4, sort_keys=True), encoding="utf-8")
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "byte_sha256" in result["detail"]
+
+
 def test_validate_run_before_any_scan_raises_not_scanned(tmp_path: Path) -> None:
     with pytest.raises(scan_pipeline.NotScanned):
         scan_pipeline.validate_run(tmp_path)

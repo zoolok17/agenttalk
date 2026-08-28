@@ -484,6 +484,7 @@ def _load_run_records(comprehension_dir: Path, scan_id: str) -> dict[str, Any]:
 
     return {
         "scan": scan_doc,
+        "run_dir": run_dir,
         "raw_docs": {
             "modules.json": modules_doc,
             "dependencies.json": dependencies_doc,
@@ -541,18 +542,32 @@ def get_report(
     )
 
 
-def _verify_artifact_digests(scan_doc: dict[str, Any], raw_docs: dict[str, dict[str, Any]]) -> None:
+def _verify_artifact_digests(
+    scan_doc: dict[str, Any], raw_docs: dict[str, dict[str, Any]], run_dir: Path,
+) -> None:
     """M2 (cold-read, PR-B fix round 3): validate_run claimed "full-run
     integrity" while only checking envelope/schema/scan_id consistency -
     never the per-artifact/run-level digests the design actually requires
     (invariant 7). Recomputes each artifact's canonical content digest
-    and byte SHA-256 from the document ACTUALLY ON DISK and compares
-    against what scan.json declared, then recomputes the run-level
-    content_digest from those same declared summaries and compares
-    against scan.json's own declared value. Raises ComprehensionError on
-    any mismatch - the design's own "two byte-identical scans must
-    produce the same canonical content digest" acceptance property now
-    has something to check against."""
+    from the document ACTUALLY ON DISK and compares against what
+    scan.json declared, then recomputes the run-level content_digest from
+    those same declared summaries and compares against scan.json's own
+    declared value. Raises ComprehensionError on any mismatch - the
+    design's own "two byte-identical scans must produce the same
+    canonical content digest" acceptance property now has something to
+    check against.
+
+    M-3 (second cold read, fix round 4): the byte SHA-256 check must read
+    the file's ACTUAL BYTES ON DISK (``digests.sha256_file``) - the first
+    version recomputed it from ``canonical_json_bytes(doc)``, i.e. the
+    PARSED-then-RE-SERIALIZED document, which normalizes away any
+    byte-level difference (whitespace, formatting) that doesn't change
+    the parsed content. That silently defeated the entire point of a
+    byte-level digest: a whitespace-only rewrite of a published artifact
+    passed validation because the re-canonicalized bytes matched, even
+    though the file on disk no longer did. The content-digest check above
+    is unaffected by this fix - it is deliberately insensitive to exactly
+    that class of byte-level-only difference."""
     declared_artifacts = scan_doc.get("artifacts")
     if not declared_artifacts:
         raise ComprehensionError("scan.json is missing its artifacts digest summary")
@@ -564,7 +579,11 @@ def _verify_artifact_digests(scan_doc: dict[str, Any], raw_docs: dict[str, dict[
         if digests.canonical_content_digest(doc) != entry["content_digest"]:
             raise ComprehensionError(
                 f"{name}'s content_digest does not match its declared value in scan.json")
-        if digests.sha256_bytes(digests.canonical_json_bytes(doc)) != entry["byte_sha256"]:
+        try:
+            actual_byte_sha256 = digests.sha256_file(run_dir / name)
+        except OSError as exc:
+            raise ComprehensionError(f"{name}'s bytes could not be read for verification: {exc}") from exc
+        if actual_byte_sha256 != entry["byte_sha256"]:
             raise ComprehensionError(
                 f"{name}'s byte_sha256 does not match its declared value in scan.json")
     if digests.run_content_digest(declared_artifacts) != scan_doc.get("content_digest"):
@@ -586,7 +605,7 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     scan_id = run_id or index_doc["latest_scan_id"]
     try:
         records = _load_run_records(comprehension_dir, scan_id)
-        _verify_artifact_digests(records["scan"], records["raw_docs"])
+        _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
         valid = True
         detail = (
             "all artifacts verified: schema, envelope identity, scan_id consistency, and "
