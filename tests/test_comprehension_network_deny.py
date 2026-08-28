@@ -101,6 +101,37 @@ def _worker_probe_argv(root: Path) -> tuple[list[str], str, dict[str, str]]:
     return [sys.executable, "-m", "agenttalk.comprehension.worker"], payload, env
 
 
+def _linux_env_delivery_argv(env: dict[str, str], inner_argv: list[str]) -> list[str]:
+    """N1 (cold-read, PR-B fix round 3): `sudo`'s default `env_reset`
+    sudoers policy (the default on Debian/Ubuntu, including GitHub's
+    hosted runners) discards whatever ``subprocess.run``'s own ``env=``
+    parameter sets for the ``sudo`` invocation itself before it execs the
+    target command - it does NOT propagate through to the worker
+    regardless of what env dict this test process passed, so the prior
+    version of this test almost certainly exercised only sudo's own
+    reset environment, never the sanitized one. ``env -i KEY=value ...``
+    (coreutils, present on every POSIX system) sets the child's
+    environment EXPLICITLY at the argv level, evaluated by ``env`` itself
+    AFTER sudo/unshare have already applied their own privilege/namespace
+    changes - policy-independent, unlike relying on ``sudo -E`` or a
+    sudoers ``env_keep`` entry that may or may not be configured on a
+    given runner."""
+    assignments = [f"{key}={value}" for key, value in sorted(env.items())]
+    return ["env", "-i", *assignments, *inner_argv]
+
+
+def _env_report_argv() -> list[str]:
+    """N2 (cold-read, PR-B fix round 3): "the harness must assert the
+    canary variables are ABSENT inside the worker" - the worker itself
+    never reports its own environment (nor should it gain a test-only
+    introspection mode), so this runs the SAME env-delivery mechanism
+    (sudo/unshare/env -i) with a small script that self-reports instead
+    of the real worker - positive proof of what this exact mechanism
+    delivers to whatever it wraps, equivalent to the worker's own view."""
+    probe = "import json, os\nprint(json.dumps(dict(os.environ)))\n"
+    return [sys.executable, "-c", probe]
+
+
 # ----------------------------------------------------------- Linux: network namespace
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux-only network-deny mechanism")
@@ -128,13 +159,43 @@ def test_sanitized_worker_completes_normally_under_linux_network_denial(
     """The worker's own view: fake provider credentials/proxy variables in
     the PARENT environment, the real sanitized_worker_env() allowlist, AND
     a real OS-level network namespace with no route out - the worker must
-    still complete its (genuinely offline) job normally."""
+    still complete its (genuinely offline) job normally.
+
+    N1 (cold-read, PR-B fix round 3): the env is now delivered via
+    ``env -i KEY=value ...`` on the argv itself (see
+    ``_linux_env_delivery_argv``), never via ``subprocess.run``'s own
+    ``env=`` parameter on the ``sudo`` invocation - the latter is silently
+    discarded by sudo's default env_reset policy before it ever reaches
+    the worker."""
     argv, payload, env = _worker_probe_argv(tmp_path)
-    result = _run_probe(["sudo", "-n", "unshare", "--net", "--", *argv], input=payload, env=env)
+    delivery_argv = _linux_env_delivery_argv(env, argv)
+    result = _run_probe(["sudo", "-n", "unshare", "--net", "--", *delivery_argv], input=payload)
     assert result.returncode == 0, f"worker failed under network denial: {result.stderr}"
     out = json.loads(result.stdout)
     assert out["schema_version"] == workermod.WORKER_SCHEMA_VERSION
     assert [c["relative_path"] for c in out["file_claims"]] == ["a.java"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux-only network-deny mechanism")
+def test_worker_env_delivery_excludes_the_canary_credentials_on_linux() -> None:
+    """N2 (cold-read, PR-B fix round 3): positive proof that the canary
+    provider-key/proxy variables are ABSENT from what this exact
+    sudo/unshare/env delivery mechanism hands to a child process - not
+    merely that the worker happened to complete successfully (which it
+    would do regardless of whether the canary leaked, since the worker
+    never reads those variables itself either way)."""
+    env = workermod.sanitized_worker_env({**os.environ, **_FAKE_CREDENTIAL_ENV})
+    delivery_argv = _linux_env_delivery_argv(env, _env_report_argv())
+    result = _run_probe(["sudo", "-n", "unshare", "--net", "--", *delivery_argv])
+    assert result.returncode == 0, f"env-report probe failed: {result.stderr}"
+    observed_env = json.loads(result.stdout)
+    for key in _FAKE_CREDENTIAL_ENV:
+        assert key not in observed_env, (
+            f"{key} leaked through the sudo/unshare/env delivery mechanism into the "
+            f"child process - the canary must never reach it")
+    assert set(observed_env) <= set(env), (
+        f"the child process observed variables beyond what was explicitly delivered: "
+        f"{set(observed_env) - set(env)}")
 
 
 # ----------------------------------------------------------- Windows: firewall rule
@@ -177,6 +238,27 @@ def test_network_denial_boundary_actually_blocks_egress_on_windows() -> None:
             f"not working: stdout={denied.stdout!r} stderr={denied.stderr!r}")
     finally:
         _remove_windows_block_rule(rule_name=rule_name)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only network-deny mechanism")
+def test_worker_env_delivery_excludes_the_canary_credentials_on_windows() -> None:
+    """N2 (cold-read, PR-B fix round 3): the Windows leg has no sudo/
+    env_reset concern (subprocess.run's own env= parameter sets the child
+    process's environment directly, with no intermediate reset-happy
+    layer), but the same positive proof is still owed here - the worker
+    completing successfully does not by itself demonstrate the canary
+    never reached it, since the worker never reads those variables
+    either way."""
+    env = workermod.sanitized_worker_env({**os.environ, **_FAKE_CREDENTIAL_ENV})
+    result = _run_probe(_env_report_argv(), env=env)
+    assert result.returncode == 0, f"env-report probe failed: {result.stderr}"
+    observed_env = json.loads(result.stdout)
+    for key in _FAKE_CREDENTIAL_ENV:
+        assert key not in observed_env, (
+            f"{key} leaked through to the child process - the canary must never reach it")
+    assert set(observed_env) <= set(env), (
+        f"the child process observed variables beyond what sanitized_worker_env allowed: "
+        f"{set(observed_env) - set(env)}")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only network-deny mechanism")
