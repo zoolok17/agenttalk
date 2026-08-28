@@ -334,20 +334,34 @@ def run_scan(
         # more than one recorded problem - whichever happened to be
         # listed last silently overwrote every earlier reason for that
         # SAME path, with no ordering guarantee callers should rely on.
-        # Reasons are collected per path and joined, sorted and
-        # deduplicated, so the result is both deterministic (never
-        # depends on worker_result.problems's own list order) and
-        # lossless (every distinct reason survives, not just one).
-        reasons_by_path: dict[str, set[str]] = {}
-        for p in worker_result.problems:
-            reasons_by_path.setdefault(p.relative_path, set()).add(p.reason_code)
-        worker_problem_reason_by_path = {
-            path: "+".join(sorted(reasons)) for path, reasons in reasons_by_path.items()
+        # Reasons are collected per path, sorted and deduplicated, so
+        # the result is both deterministic (never depends on
+        # worker_result.problems's own list order) and lossless (every
+        # distinct reason survives, not just one).
+        #
+        # MINOR 5 (sixth cold read, fix round 9): round 8's own fix
+        # joined those reasons into ONE string with "+" and published it
+        # as ``adapter_problem_reason`` - a value OUTSIDE the enumerated
+        # reason-code vocabulary every reader of that field expects
+        # (readiness's own ``f"adapter_{reason}"`` construction, and any
+        # future consumer matching against the known set). The
+        # vocabulary stays CLOSED: each path maps to its full SORTED
+        # LIST of reasons here; modules_artifact picks the first as the
+        # single enumerated ``adapter_problem_reason`` and publishes the
+        # complete list separately, losing nothing.
+        worker_problem_reasons_by_path: dict[str, list[str]] = {
+            p.relative_path: [] for p in worker_result.problems
         }
+        for p in worker_result.problems:
+            reasons = worker_problem_reasons_by_path[p.relative_path]
+            if p.reason_code not in reasons:
+                reasons.append(p.reason_code)
+        for reasons in worker_problem_reasons_by_path.values():
+            reasons.sort()
 
         modules = modules_artifact.build_modules(
             discovery_result, java_results,
-            worker_problem_reason_by_path=worker_problem_reason_by_path,
+            worker_problem_reasons_by_path=worker_problem_reasons_by_path,
         )
         # M7 (cold-read, PR-B fix round 3): discovery already computed
         # each file's own content digest - dependencies_artifact.py and

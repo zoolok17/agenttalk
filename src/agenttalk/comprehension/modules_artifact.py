@@ -68,6 +68,18 @@ class ModuleRecord:
     #: fifth reason the worker invents needs no readiness-side change at
     #: all to be seen as unknown.
     adapter_problem_reason: str | None = None
+    #: MINOR 5 (sixth cold read, fix round 9): round 8's own N3 fix
+    #: joined every distinct reason the worker recorded for one path
+    #: into a SINGLE compound string ("no_types_extracted+resource_
+    #: limit") and published it as ``adapter_problem_reason`` - a value
+    #: OUTSIDE the closed, enumerated reason-code vocabulary every
+    #: reader of that field expects (readiness's own
+    #: ``f"adapter_{reason}"`` construction, and any future consumer
+    #: matching against the known set). ``adapter_problem_reason`` stays
+    #: a single enumerated value (the FIRST reason, sorted) again; the
+    #: full sorted, deduplicated list - lossless, just as round 8
+    #: intended - lives here instead, a separate list-valued field.
+    adapter_problem_reasons: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -83,6 +95,7 @@ class ModuleRecord:
             "conflict_id": self.conflict_id,
             "evidence": self.evidence,
             "adapter_problem_reason": self.adapter_problem_reason,
+            "adapter_problem_reasons": self.adapter_problem_reasons,
         }
 
 
@@ -98,6 +111,7 @@ def module_record_from_json(payload: dict[str, Any]) -> ModuleRecord:
         container_unit_id=payload["container_unit_id"], producers=list(payload["producers"]),
         conflict_id=payload.get("conflict_id"), evidence=list(payload.get("evidence", [])),
         adapter_problem_reason=payload.get("adapter_problem_reason"),
+        adapter_problem_reasons=list(payload.get("adapter_problem_reasons", [])),
     )
 
 
@@ -143,32 +157,38 @@ def _parent_qualified_name(qualified_name: str, known_names: set[str]) -> str | 
 
 def build_modules(
     discovery: DiscoveryResult, java_results: dict[str, java_adapter.JavaFileResult],
-    *, worker_problem_reason_by_path: dict[str, str] | None = None,
+    *, worker_problem_reasons_by_path: dict[str, list[str]] | None = None,
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
     already-parsed :class:`~.adapters.java.JavaFileResult` (item 3) -
     parsing happens once, upstream; this function only assembles records
     from what was already extracted.
 
-    ``worker_problem_reason_by_path`` names every relative path the worker
-    recorded ANY problem for, with that problem's own reason_code (M-2,
-    third cold read, fix round 5 - closes the class B3/round-3's
-    ``parse_failed_paths`` started but only covered one reason: a file
-    absent from ``java_results`` is either "no adapter for this
-    extension" (a confident negative, no problem recorded at all) or "the
-    adapter was eligible but has no positive result" for SOME worker
+    ``worker_problem_reasons_by_path`` names every relative path the worker
+    recorded ANY problem for, with EVERY distinct reason_code it recorded
+    for that path, sorted (M-2, third cold read, fix round 5 - closes the
+    class B3/round-3's ``parse_failed_paths`` started but only covered one
+    reason: a file absent from ``java_results`` is either "no adapter for
+    this extension" (a confident negative, no problem recorded at all) or
+    "the adapter was eligible but has no positive result" for SOME worker
     reason - parse failure, the per-file resource cap, or a re-confinement
     rejection - all genuinely unknown, never a confident understood
     merely because the extension maps to a known language.
-    """
+
+    MINOR 5 (sixth cold read, fix round 9): a path can legitimately have
+    MORE than one distinct reason recorded (round 8's N3) - the closed,
+    single-value ``adapter_problem_reason`` vocabulary takes only the
+    FIRST (sorted) of them; the full list is never discarded, published
+    separately as ``adapter_problem_reasons``."""
     records: list[ModuleRecord] = []
-    worker_problem_reason_by_path = worker_problem_reason_by_path or {}
+    worker_problem_reasons_by_path = worker_problem_reasons_by_path or {}
 
     for file_entry in discovery.files:
         relative_path = file_entry.relative_path
         java_result = java_results.get(relative_path)
 
         if java_result is None or not java_result.units:
+            reasons = worker_problem_reasons_by_path.get(relative_path, [])
             records.append(ModuleRecord(
                 unit_id=digests.unit_id(kind="file", paths=[relative_path], qualified_name=None),
                 kind="file",
@@ -194,8 +214,9 @@ def build_modules(
                 # understood. pom.xml/web.xml legitimately have zero
                 # units with no problem recorded either way, so this
                 # unconditional lookup is safe for them too - it simply
-                # returns None where nothing was ever recorded.
-                adapter_problem_reason=worker_problem_reason_by_path.get(relative_path),
+                # returns an empty list where nothing was ever recorded.
+                adapter_problem_reason=reasons[0] if reasons else None,
+                adapter_problem_reasons=list(reasons),
             ))
             continue
 

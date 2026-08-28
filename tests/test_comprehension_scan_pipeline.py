@@ -446,10 +446,15 @@ def test_worker_problem_reason_by_path_joins_sorted_unique_reasons_for_one_path(
     ordering guarantee. A genuinely unrecognized-content .java file
     already organically records "no_types_extracted" (round 8's own
     BLOCKER 1b) - a SECOND, synthetic problem is injected for that SAME
-    path in deliberately non-alphabetical order, and the published
-    adapter_problem_reason must contain BOTH, sorted - deterministic
-    regardless of the worker's own list order, and lossless (neither
-    reason is silently dropped)."""
+    path in deliberately non-alphabetical order.
+
+    MINOR 5 (sixth cold read, fix round 9): round 8's own fix joined
+    both reasons into ONE compound string and published it as
+    adapter_problem_reason - a value outside the closed, enumerated
+    reason-code vocabulary. adapter_problem_reason must now stay a
+    single enumerated value (the first, sorted); the full
+    sorted-deduplicated list, still lossless, publishes separately as
+    adapter_problem_reasons."""
     import json
 
     from agenttalk.comprehension import worker as workermod2
@@ -473,7 +478,8 @@ def test_worker_problem_reason_by_path_joins_sorted_unique_reasons_for_one_path(
     modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
     garbage_unit = next(
         u for u in modules_doc["units"] if u["paths"] == ["src/main/java/p/Garbage.java"])
-    assert garbage_unit["adapter_problem_reason"] == "no_types_extracted+resource_limit"
+    assert garbage_unit["adapter_problem_reason"] == "no_types_extracted"
+    assert garbage_unit["adapter_problem_reasons"] == ["no_types_extracted", "resource_limit"]
 
 
 def test_run_scan_degrades_and_reports_unknown_for_a_java_file_with_no_recognized_declaration(

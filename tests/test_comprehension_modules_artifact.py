@@ -49,11 +49,13 @@ def test_a_parse_failed_java_file_is_flagged_distinctly_from_no_adapter():
         EnumeratedFile(relative_path="README.md", byte_count=1, content_digest="b"),
     ])
     records = ma.build_modules(
-        discovery, {}, worker_problem_reason_by_path={"p/Broken.java": "parse_failed"})
+        discovery, {}, worker_problem_reasons_by_path={"p/Broken.java": ["parse_failed"]})
     by_path = {r.paths[0]: r for r in records}
     assert by_path["p/Broken.java"].adapter_problem_reason == "parse_failed"
+    assert by_path["p/Broken.java"].adapter_problem_reasons == ["parse_failed"]
     assert by_path["p/Broken.java"].language == "java"
     assert by_path["README.md"].adapter_problem_reason is None
+    assert by_path["README.md"].adapter_problem_reasons == []
 
 
 def test_a_resource_capped_java_file_also_carries_its_own_problem_reason():
@@ -69,13 +71,32 @@ def test_a_resource_capped_java_file_also_carries_its_own_problem_reason():
     ])
     records = ma.build_modules(
         discovery, {},
-        worker_problem_reason_by_path={
-            "p/Huge.java": "resource_limit", "p/Skipped.java": "path_excluded",
+        worker_problem_reasons_by_path={
+            "p/Huge.java": ["resource_limit"], "p/Skipped.java": ["path_excluded"],
         },
     )
     by_path = {r.paths[0]: r for r in records}
     assert by_path["p/Huge.java"].adapter_problem_reason == "resource_limit"
     assert by_path["p/Skipped.java"].adapter_problem_reason == "path_excluded"
+
+
+def test_a_java_file_with_more_than_one_recorded_problem_publishes_a_single_reason_and_the_full_list():
+    """MINOR 5 (sixth cold read, fix round 9): a path can legitimately
+    have more than one distinct worker-recorded reason - the closed,
+    enumerated adapter_problem_reason vocabulary must stay a SINGLE
+    value (never a compound string like "no_types_extracted+
+    resource_limit"), while the full sorted, deduplicated list is
+    published separately, losing nothing."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="p/Multi.java", byte_count=1, content_digest="a"),
+    ])
+    records = ma.build_modules(
+        discovery, {},
+        worker_problem_reasons_by_path={"p/Multi.java": ["no_types_extracted", "resource_limit"]},
+    )
+    record = records[0]
+    assert record.adapter_problem_reason == "no_types_extracted"
+    assert record.adapter_problem_reasons == ["no_types_extracted", "resource_limit"]
 
 
 def test_pom_xml_and_web_xml_are_recognized_as_adapter_understood():
