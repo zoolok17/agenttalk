@@ -767,20 +767,57 @@ def _read_supervisor_snapshot(store: Store, path_value: str | None = None) -> li
     return raw if isinstance(raw, list) else None
 
 
+def _supervisor_snapshot_path(store: Store, path_value: str | None = None) -> Path:
+    return Path(path_value) if path_value else store.dir / "supervisor-snapshot.json"
+
+
+def _fresh_supervisor_snapshot(store: Store, now_epoch: float,
+                               path_value: str | None = None
+                               ) -> tuple[list[dict] | None, str | None]:
+    """#124: the snapshot carries no internal timestamp of its own - an
+    external writer (the generated PowerShell poll loop) refreshes the file
+    every ``poll_seconds``, so the FILE's mtime is the only freshness signal
+    available. A snapshot older than ``STALE_THRESHOLD_SECONDS`` (the same
+    threshold `status` already uses for heartbeat/lead-liveness staleness -
+    one convention, not two) is treated as absent rather than as current
+    truth: this mirrors #105's ``strict_child_verdicts`` degrade-safe
+    contract exactly (``snapshot=None`` -> an ACTIVE-phase child degrades to
+    ``CLI_CHILD_UNKNOWN`` instead of trusting stale process facts), plus a
+    warning so the stale read is visible rather than silent.
+
+    Returns ``(snapshot_or_none, warning_or_none)``.
+    """
+    snapshot = _read_supervisor_snapshot(store, path_value)
+    if snapshot is None:
+        return None, None
+    path = _supervisor_snapshot_path(store, path_value)
+    try:
+        age = max(0.0, now_epoch - path.stat().st_mtime)
+    except OSError:
+        return None, None
+    if age > STALE_THRESHOLD_SECONDS:
+        return None, f"supervisor_snapshot_stale:{int(age)}s"
+    return snapshot, None
+
+
 def _status_supervisor_summaries(store: Store, now_epoch: float,
                                  sup_cfg: dict) -> tuple[dict[str, dict], list[str]]:
+    snapshot, staleness_warning = _fresh_supervisor_snapshot(store, now_epoch)
     try:
         obs = sup.build_supervisor_observation(
             store,
             now_epoch=now_epoch,
             state=_read_supervisor_state(store),
             supervisor_config=sup_cfg,
-            snapshot=_read_supervisor_snapshot(store),
+            snapshot=snapshot,
             event_limit=0,
             lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )
     except Exception as exc:
-        return {}, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
+        warnings = [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
+        if staleness_warning:
+            warnings.append(staleness_warning)
+        return {}, warnings
     rows: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -801,6 +838,8 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
             row["lead_liveness"] = lead_liveness
         rows[item["name"]] = row
     warnings = []
+    if staleness_warning:
+        warnings.append(staleness_warning)
     ring = obs.get("event_ring") if isinstance(obs.get("event_ring"), dict) else {}
     for warning in ring.get("warnings") or []:
         if isinstance(warning, str):
@@ -1350,13 +1389,14 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
     store = _get_store(args)
     now = args.now if args.now is not None else time.time()
     config = _load_supervisor_config(store)
+    snapshot, staleness_warning = _fresh_supervisor_snapshot(store, now, args.snapshot_file)
     try:
         payload = sup.build_supervisor_observation(
             store,
             now_epoch=now,
             state=_read_supervisor_state(store, args.state_file),
             supervisor_config=config,
-            snapshot=_read_supervisor_snapshot(store, args.snapshot_file),
+            snapshot=snapshot,
             event_limit=max(0, int(args.events)),
             lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )
@@ -1376,6 +1416,10 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
                 "warnings": [f"supervisor_read_unavailable:{type(exc).__name__}"],
             },
         }
+    if staleness_warning and isinstance(payload.get("event_ring"), dict):
+        payload["event_ring"].setdefault("warnings", [])
+        if staleness_warning not in payload["event_ring"]["warnings"]:
+            payload["event_ring"]["warnings"].append(staleness_warning)
     if args.json:
         try:
             rendered = json.dumps(payload, indent=2, allow_nan=False)

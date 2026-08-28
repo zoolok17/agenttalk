@@ -589,6 +589,67 @@ def test_status_human_output_primary_health_is_strict_verdict_when_present(
     assert "health=idle_waiting" not in alpha_line
 
 
+def test_status_marks_stale_supervisor_snapshot_and_ignores_its_process_data(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#124: the supervisor-snapshot.json file carries no timestamp of its
+    own - the file's mtime is the ONLY freshness signal. `status` used to
+    read+trust it regardless of age, so a snapshot from a supervisor that
+    stalled or died minutes ago would render as current process truth. A
+    stale snapshot must (a) surface a warning naming it stale and (b) be
+    treated as ABSENT - never handed to the planner as live process facts -
+    mirroring #105's degrade-safe `snapshot=None` contract exactly."""
+    snap_path = Store(store_root).dir / "supervisor-snapshot.json"
+    snap_path.write_text(json.dumps([{"pid": 4242}]), encoding="utf-8")
+    old = time.time() - 999
+    os.utime(snap_path, (old, old))
+
+    captured: dict[str, object] = {}
+
+    def spy_observation(store, *, now_epoch, state, supervisor_config,
+                        snapshot, event_limit, lead_liveness_stale_after_seconds):
+        captured["snapshot"] = snapshot
+        return {"agents": [], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", spy_observation)
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert any(w.startswith("supervisor_snapshot_stale:") for w in payload["warnings"]), (
+        payload["warnings"]
+    )
+    assert captured["snapshot"] is None
+
+
+def test_status_fresh_supervisor_snapshot_passes_through_unstaled(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#124 companion: a snapshot written just now is NOT penalized - the
+    fix must gate on age, not reject every snapshot outright."""
+    snap_path = Store(store_root).dir / "supervisor-snapshot.json"
+    snap_path.write_text(json.dumps([{"pid": 4242}]), encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    def spy_observation(store, *, now_epoch, state, supervisor_config,
+                        snapshot, event_limit, lead_liveness_stale_after_seconds):
+        captured["snapshot"] = snapshot
+        return {"agents": [], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", spy_observation)
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert not any(w.startswith("supervisor_snapshot_stale:") for w in payload["warnings"])
+    assert captured["snapshot"] == [{"pid": 4242}]
+
+
 # ---------------------------------------------------------- cmd_end / transcript
 
 def test_end_sends_kind_end_to_peers_and_exports_transcript(
