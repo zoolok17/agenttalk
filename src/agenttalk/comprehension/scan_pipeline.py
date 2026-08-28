@@ -454,24 +454,30 @@ class NotScanned(ComprehensionError):
 
 def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     """design: "Show the latest run, completeness, source revision/
-    fingerprint, freshness, adapter coverage, and problem counts." Verifies
-    only the index and scan.json (design's validation-tiers "ordinary
-    reads are bounded and demand-driven" - status does not read the other
-    four artifacts)."""
+    fingerprint, freshness, adapter coverage, and problem counts."
+
+    M-1 (third cold read, fix round 5): this used to verify only the
+    index and scan.json's own envelope/schema - a tampered modules.json,
+    dependencies.json, features.json, readiness.json or problems.json
+    (scan.json's own declared per-artifact digests exist precisely to
+    catch this) went completely unchecked, so ``status`` reported a
+    tampered run as healthy; only ``validate`` ever looked. The design's
+    read-path rule is that ANY caller projecting a run's health verifies
+    the exact-byte digest and schema of what that run declares, not just
+    what it happens to display - a status snapshot that asserts "this run
+    is fine" without checking is exactly the read-path gap the design
+    forbids. This now reuses the same full per-artifact digest
+    verification :func:`get_report`/:func:`validate_run` perform (via
+    ``_load_run_records`` + ``_verify_artifact_digests``) rather than a
+    scan.json-only envelope check."""
     comprehension_dir = paths.comprehension_dir(Path(root).resolve() / ".agenttalk")
     index_doc, index_digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root}")
     scan_id = run_id or index_doc["latest_scan_id"]
-    run_dir = _resolved_run_dir(comprehension_dir, scan_id)
-    scan_path = run_dir / "scan.json"
-    try:
-        scan_doc = validate_envelope(
-            read_json_document(scan_path),
-            artifact_type=SCAN_ARTIFACT_TYPE, schema_version=SCAN_SCHEMA_VERSION,
-        )
-    except (EnvelopeError, OSError) as exc:
-        raise ComprehensionError(f"{scan_id}'s scan.json could not be verified: {exc}") from exc
+    records = _load_run_records(comprehension_dir, scan_id)
+    _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
+    scan_doc = records["scan"]
     return {
         "latest_scan_id": index_doc["latest_scan_id"],
         "index_digest": index_digest,
@@ -552,13 +558,24 @@ def get_report(
     project_comprehension` - reads the persisted run back into the same
     record shapes items 4-7 build in memory, so this is provably the same
     projection PR-D's future route will also call (single-projector
-    parity, C-2)."""
+    parity, C-2).
+
+    M-1 (third cold read, fix round 5): this projected every loaded
+    artifact as truth with no digest check at all - only ``validate``
+    ever verified a run's declared per-artifact digests, so a tampered
+    modules.json (or any of the other four) silently flowed straight
+    into a "report" a caller has no reason to distrust. The design's
+    read-path rule is that report verifies the exact-byte digest and
+    schema of what it actually loads before projecting it; a mismatch
+    now raises the same typed :class:`ComprehensionError` ``validate``
+    raises, rather than projecting tampered content as fact."""
     comprehension_dir = paths.comprehension_dir(Path(root).resolve() / ".agenttalk")
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root}")
     scan_id = run_id or index_doc["latest_scan_id"]
     records = _load_run_records(comprehension_dir, scan_id)
+    _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
     return projector.project_comprehension(
         scan_id=records["scan"]["scan_id"], generated_at=records["scan"]["generated_at"],
         manifest_digest=None, status=records["scan"]["status"],

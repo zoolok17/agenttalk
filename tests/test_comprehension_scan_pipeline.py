@@ -514,6 +514,48 @@ def test_validate_run_before_any_scan_raises_not_scanned(tmp_path: Path) -> None
         scan_pipeline.validate_run(tmp_path)
 
 
+def _tamper_modules_json(run_dir: Path) -> None:
+    import json
+
+    modules_path = run_dir / "modules.json"
+    doc = json.loads(modules_path.read_text(encoding="utf-8"))
+    doc["units"] = []
+    modules_path.write_text(
+        scan_pipeline.digests.canonical_json_bytes(doc).decode("utf-8"), encoding="utf-8")
+
+
+def test_get_report_refuses_a_tampered_artifact_instead_of_projecting_it_as_truth(
+    java_repo: Path,
+) -> None:
+    """M-1 (third cold read, fix round 5): only ``validate`` ever checked
+    a run's declared per-artifact digests - ``report`` projected whatever
+    was on disk as truth, with no digest check at all. A tampered
+    modules.json must now make ``report`` refuse with the same typed
+    error ``validate`` already raises, not silently project the tampered
+    content."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _tamper_modules_json(outcome.run_dir)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="content_digest|byte_sha256"):
+        scan_pipeline.get_report(java_repo)
+
+
+def test_get_status_refuses_a_tampered_artifact_instead_of_reporting_it_healthy(
+    java_repo: Path,
+) -> None:
+    """M-1 (third cold read, fix round 5): ``status`` verified only
+    scan.json's own envelope/schema - a tampered modules.json (or any of
+    the other four declared artifacts) went completely unchecked, so a
+    tampered run reported ``status: healthy`` right alongside a
+    ``validate`` that would have caught it. ``status`` must refuse the
+    same way."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _tamper_modules_json(outcome.run_dir)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="content_digest|byte_sha256"):
+        scan_pipeline.get_status(java_repo)
+
+
 # ----------------------------------------------------------- failure-path lock release (F-2)
 
 def test_run_scan_failure_surfaces_the_original_error_even_if_release_also_fails(
