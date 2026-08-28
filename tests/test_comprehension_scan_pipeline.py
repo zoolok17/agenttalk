@@ -89,6 +89,42 @@ def test_run_scan_carries_the_pom_xml_build_edge_through_the_worker(java_repo: P
     assert build_edges and build_edges[0]["target_external"] == "org.springframework:spring-core"
 
 
+def test_run_scan_reports_a_case_collision_between_two_enumerated_paths(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """N1 (third cold read, fix round 5): envelope.find_case_fold_collisions
+    existed with its own passing unit tests and zero production callers -
+    the same dead-code shape round 3's M9 found for parse_web_xml. Wires it
+    into the scan so two enumerated paths that collide once case-folded (a
+    real risk once a run crosses to/from a case-insensitive filesystem)
+    actually publish the design-named case_collision problem, instead of
+    silently never being checked at all. Injects the second, colliding
+    path via discovery.enumerate_scope's own return value - two really
+    differently-cased files cannot coexist on this dev host's own
+    (case-insensitive) filesystem, so this is the only portable way to
+    prove the collision without one."""
+    import dataclasses
+    import json
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    real_enumerate_scope = discoverymod.enumerate_scope
+
+    def _enumerate_scope(root, comprehension_dir):
+        result = real_enumerate_scope(root, comprehension_dir)
+        colliding = discoverymod.EnumeratedFile(
+            relative_path="src/main/java/p/APP.JAVA", byte_count=1, content_digest="deadbeef")
+        return dataclasses.replace(result, files=[*result.files, colliding])
+
+    monkeypatch.setattr(scan_pipeline.discovery, "enumerate_scope", _enumerate_scope)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    collisions = [p for p in problems_doc["problems"] if p["reason_code"] == "case_collision"]
+    assert len(collisions) == 1
+    assert collisions[0]["path"] == "src/main/java/p/APP.JAVA"
+
+
 def test_canary_sweep_no_artifact_or_report_leaks_the_absolute_root_or_a_planted_canary(
     java_repo: Path, monkeypatch,
 ) -> None:

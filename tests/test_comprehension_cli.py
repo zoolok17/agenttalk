@@ -166,6 +166,24 @@ def test_validate_after_a_scan(java_repo: Path, capsys) -> None:
     assert payload["valid"] is True
 
 
+def test_validate_on_a_malformed_index_refuses_typed_instead_of_crashing(
+    java_repo: Path, capsys,
+) -> None:
+    """N2 (third cold read, fix round 5): the validate action caught only
+    NotScanned - a malformed index.json raises a typed ComprehensionError
+    (EnvelopeError, from validate_envelope) that this catch clause let
+    propagate as an unhandled traceback, unlike every sibling action
+    (status/report), which both already catch ComprehensionError too."""
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    index_path = java_repo / ".agenttalk" / "comprehension" / "index.json"
+    index_path.write_text('{"not": "a valid index envelope"}', encoding="utf-8")
+
+    exit_code = _run(["comprehension", "validate", "--json"], java_repo)
+    assert exit_code == 2
+    assert "agenttalk:" in capsys.readouterr().err
+
+
 # ----------------------------------------------------------- prune --staging (M-5)
 
 def test_prune_staging_reclaims_a_dead_owners_abandoned_directory(

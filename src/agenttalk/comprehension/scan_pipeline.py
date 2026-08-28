@@ -47,8 +47,14 @@ from . import (
     worker,
 )
 from .adapters import java as java_adapter
-from .envelope import read_json_document, resolve_under_root, validate_envelope, validate_scan_id
-from .errors import ComprehensionError, EnvelopeError
+from .envelope import (
+    find_case_fold_collisions,
+    read_json_document,
+    resolve_under_root,
+    validate_envelope,
+    validate_scan_id,
+)
+from .errors import ComprehensionError, EnvelopeError, bounded_detail
 from .privacy import PrivacyPreflightResult, VcsPrivacyRefused
 
 GENERATOR_VERSION = 1
@@ -267,12 +273,27 @@ def run_scan(
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
             modules, dependencies, features)
 
+        # N1 (third cold read, fix round 5): find_case_fold_collisions
+        # existed with its own passing unit tests and zero production
+        # callers - the same dead-code shape round 3's M9 found for
+        # parse_web_xml. Two paths that collide once case-folded (a real
+        # risk once a run crosses to/from a case-insensitive filesystem)
+        # is a named problem code the design itself expects; it was never
+        # actually emitted anywhere in the pipeline.
+        case_collisions = find_case_fold_collisions(relative_paths)
+
         problems = [
             {"reason_code": p["reason_code"], "path": p.get("path"), "detail": p["detail"]}
             for p in discovery_result.problems
         ] + [
             {"reason_code": p.reason_code, "path": p.relative_path, "detail": p.detail}
             for p in worker_result.problems
+        ] + [
+            {
+                "reason_code": "case_collision", "path": second,
+                "detail": bounded_detail(f"case-folds identically to {first!r}"),
+            }
+            for first, second in case_collisions
         ]
         status = "degraded" if (discovery_result.degraded or problems) else "complete"
 

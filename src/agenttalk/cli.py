@@ -2120,7 +2120,12 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
     if action == "validate":
         try:
             payload = scan_pipeline.validate_run(root, run_id=args.run)
-        except scan_pipeline.NotScanned as exc:
+        # N2 (third cold read, fix round 5): this caught NotScanned only -
+        # a malformed index.json (or any other typed ComprehensionError
+        # validate_run's own read path can raise) surfaced as an unhandled
+        # traceback instead of the same typed, actionable stderr message
+        # every sibling action (status/report) already gives.
+        except (scan_pipeline.NotScanned, ComprehensionError) as exc:
             sys.stderr.write(f"agenttalk: {exc}\n")
             return 2
         if args.json:
