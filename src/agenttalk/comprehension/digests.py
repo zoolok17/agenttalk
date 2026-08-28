@@ -26,8 +26,22 @@ from typing import Any
 #: `scan_id`, `generated_at`, capture times, lock/owner tokens, and any
 #: other generation identity"). A caller with additional generation-identity
 #: fields for its own artifact shape passes a wider ``strip_keys`` set.
+#: MAJOR 3 (fifth cold read, fix round 8): round 6's N2 fix added
+#: "started_at"/"completed_at" to scan.json (the design's own "start and
+#: completion times" field, distinct from generated_at) but never added
+#: them here - two content-identical scans, run at different wall-clock
+#: moments, produced DIFFERENT canonical_content_digest(scan_doc) values,
+#: contradicting this module's own docstring ("two byte-identical scans
+#: two seconds apart produce... the SAME canonical content digest") and
+#: invariant 7's equivalence claim for the ONE document this now anchors
+#: (scan_json_anchor_state's own content_digest check, round 7's MAJOR
+#: 3) - a real determinism gap published under a name that promises it,
+#: not merely a latent one (run_content_digest never included scan.json
+#: itself, so this never affected the RUN-level digest - only scan.json's
+#: own).
 GENERATION_IDENTITY_KEYS = frozenset({
     "scan_id", "generated_at", "capture_time", "lock_token", "owner_token",
+    "started_at", "completed_at",
 })
 
 _ROOT_BINDING_DOMAIN = b"agenttalk.comprehension.root_binding.v1\x00"
