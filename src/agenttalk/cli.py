@@ -1995,6 +1995,20 @@ def _comprehension_escalate(
     return 2
 
 
+def _print_scan_json_integrity_if_not_verified(payload: dict) -> None:
+    """Round 7c (reviewer-3 delta on 95d9cd8): the round-7b "unverified"
+    integrity state (an aged-out or never-recorded scan.json anchor)
+    existed ONLY in the JSON payload - status's default human output
+    printed a normal-looking healthy run, and validate's printed
+    valid:true with no caution anywhere a human actually looks, even
+    with a falsified fingerprint/completeness and the anchor keys
+    removed. Printed on default human output ONLY when not verified -
+    no new noise on the happy (verified) path."""
+    integrity = payload.get("scan_json_integrity") or {}
+    if integrity.get("state") != "verified":
+        print(f"scan_json_integrity: {integrity.get('state')} ({integrity.get('reason_code')})")
+
+
 def cmd_comprehension(args: argparse.Namespace) -> int:
     """Local, offline static comprehension inventory (task #55 slice-1).
     Scope simplifications this slice (named, not silent): no config.json
@@ -2103,6 +2117,7 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
             print(f"latest_scan_id: {payload['latest_scan_id']}")
             print(f"status:         {payload['status']}")
             print(f"problems:       {payload['problem_count']}")
+            _print_scan_json_integrity_if_not_verified(payload)
         return 0
 
     if action == "report":
@@ -2134,6 +2149,7 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
             print(f"scan_id: {payload['scan_id']}")
             print(f"valid:   {payload['valid']}")
             print(f"detail:  {payload['detail']}")
+            _print_scan_json_integrity_if_not_verified(payload)
         return 0 if payload["valid"] else 1
 
     if action == "prune":

@@ -466,6 +466,52 @@ class Controller {
     assert routes[0].target == "/api/textblock"
 
 
+def test_route_value_as_a_text_block_dedents_using_the_closing_delimiters_own_indentation():
+    """LOW-3 (round 7c, reviewer-3 delta on 95d9cd8): the JLS text-block
+    algorithm counts the CLOSING DELIMITER's own line toward the common
+    minimal indentation even though that line is blank - an earlier
+    version excluded it (only non-blank lines counted), diverging from
+    javac exactly when the delimiter's own line is indented LESS than
+    every content line. Here the delimiter sits at 6 spaces while both
+    content lines sit at 8 - each published line must retain exactly the
+    2-space difference, not be fully dedented to zero."""
+    src = '''
+package p;
+class Controller {
+    @RequestMapping(value = """
+        line1
+        line2
+      """)
+    void list() {}
+}
+'''
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/  line1\n  line2"
+
+
+def test_standalone_method_route_without_a_leading_slash_is_normalized_like_a_composed_one():
+    """LOW-2 (round 7c, reviewer-3 delta on 95d9cd8): leading-slash
+    normalization previously lived ONLY inside _compose_route_path (the
+    class-prefix half) - a STANDALONE method route (no class-level
+    prefix at all) with no leading ``/`` of its own published exactly as
+    written, while an otherwise-identical route composed with even an
+    empty class prefix got normalized. Two spellings for the same served
+    path depending on something the route itself has no say over."""
+    src = """
+package p;
+class Controller {
+    @GetMapping("list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /list"
+
+
 def test_request_mapping_path_attribute_is_recovered_ahead_of_an_unrelated_literal():
     src = """
 package p;

@@ -426,20 +426,38 @@ def _normalize_java_text_block(content: str) -> str:
     a line terminator immediately after the opening ``\"\"\"`` is not
     part of the content, every line's common leading whitespace (the
     LEAST indented non-blank line, closing delimiter's own line
-    included per the JLS) is stripped, and each line's trailing
-    whitespace is stripped - then the same escape sequences an ordinary
-    literal supports are decoded. Not a byte-for-byte javac
-    reimplementation (this adapter is coarse S1 evidence, not a full
-    grammar), but no longer the raw, unindented-for-nothing source
-    substring round 6 published."""
+    included per the JLS - LOW-3, round 7c, reviewer-3 delta on
+    95d9cd8: an earlier version excluded the closing delimiter's line
+    from this computation entirely, diverging from javac exactly when
+    that line is indented LESS than every content line, now handled)
+    is stripped, and each line's trailing whitespace is stripped - then
+    the same escape sequences an ordinary literal supports are decoded.
+    Not a byte-for-byte javac reimplementation (this adapter is coarse
+    S1 evidence, not a full grammar), but no longer the raw, unindented-
+    for-nothing source substring round 6 published."""
     if content.startswith("\r\n"):
         content = content[2:]
     elif content.startswith("\n"):
         content = content[1:]
     lines = content.split("\n")
-    indents = [len(line) - len(line.lstrip(" \t")) for line in lines if line.strip()]
+    # The closing delimiter sits on its OWN line exactly when this
+    # content's last split segment is whitespace-only AND there is a
+    # preceding line to end at (a single-line block has the delimiter
+    # immediately after its own content, no separate line at all). That
+    # line's OWN indentation counts toward the common minimum per the
+    # JLS, even though it is blank - but the line itself is positional
+    # only and never part of the published value.
+    closing_line_is_delimiter_only = len(lines) > 1 and lines[-1].strip() == ""
+    last_index = len(lines) - 1
+    indents = [
+        len(line) - len(line.lstrip(" \t"))
+        for i, line in enumerate(lines)
+        if line.strip() or (closing_line_is_delimiter_only and i == last_index)
+    ]
     min_indent = min(indents) if indents else 0
     dedented = [line[min_indent:] if len(line) >= min_indent else line.lstrip(" \t") for line in lines]
+    if closing_line_is_delimiter_only:
+        dedented = dedented[:-1]
     stripped = [line.rstrip(" \t") for line in dedented]
     return _decode_java_string_escapes("\n".join(stripped))
 
@@ -610,6 +628,22 @@ def _class_level_route_target(
     return None
 
 
+def _normalize_route_leading_slash(path: str) -> str:
+    """A published route target is always an absolute path. Shared by
+    :func:`_compose_route_path` (the prefix half) and its caller (a
+    STANDALONE method route with no class-level prefix at all) - LOW-2
+    (round 7c, reviewer-3 delta on 95d9cd8): this normalization used to
+    live ONLY inside composition, so a bare method-only route lacking
+    its own leading ``/`` published exactly as written while an
+    otherwise-identical route that happened to have a (even empty)
+    class-level prefix got normalized - two spellings for the same
+    served path, depending on something the route itself has no say
+    over. One normalization point now covers both shapes."""
+    if not path or path.startswith("/"):
+        return path
+    return "/" + path
+
+
 def _compose_route_path(prefix: str, path: str) -> str:
     """Spring's OWN declared composition semantics for a class-level
     ``@RequestMapping`` prefix plus a method-level route value - not
@@ -620,9 +654,7 @@ def _compose_route_path(prefix: str, path: str) -> str:
     always an absolute path), and an EMPTY method-level value (a
     valueless method annotation, composed by the caller as ``""``)
     yields the prefix alone - never a spurious trailing ``/``."""
-    prefix_part = prefix.rstrip("/")
-    if not prefix_part.startswith("/"):
-        prefix_part = "/" + prefix_part
+    prefix_part = _normalize_route_leading_slash(prefix.rstrip("/"))
     path_part = path.lstrip("/")
     if not path_part:
         return prefix_part
@@ -827,6 +859,13 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # falling through to the synthetic fallback below and
             # silently losing the prefix entirely.
             path = _compose_route_path(class_route_prefix[enclosing], path or "")
+        elif path is not None:
+            # LOW-2 (round 7c): the same leading-slash normalization
+            # _compose_route_path applies to a class prefix, applied
+            # here too - a STANDALONE method route (no class-level
+            # prefix at all) must not publish a different spelling of
+            # the same served path just because it lacked one.
+            path = _normalize_route_leading_slash(path)
         method = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1))
         if path is not None:
             target = f"{method} {path}" if method else path

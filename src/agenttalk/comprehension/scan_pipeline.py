@@ -112,6 +112,14 @@ def _write_json_document(path: Path, document: dict[str, Any]) -> bytes:
 #: section - scan.json's "boundaries" list is written here, at scan
 #: time, not by projector.py, so it needs its own small instance of the
 #: same mechanism rather than an unbounded raw list.
+#:
+#: LOW-1 (round 7c, reviewer-3 delta on 95d9cd8): PROVISIONAL, same as
+#: every other cap this package enforces (discovery.py's three resource
+#: caps, ceilings.py's per-artifact/run byte-and-record limits) - pending
+#: the PR-B exit-gate measurement against a representative corpus (task
+#: #55 slice-1 dispatch, C-6). One discipline in one place: that
+#: measurement re-tunes every cap it covers, this one included, rather
+#: than a sixth cap quietly living outside it.
 _MAX_BOUNDARIES = 1000
 
 
@@ -915,8 +923,11 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     # Round 7b: a default the anchor state stays at if an EARLIER step in
     # the try block below (record loading/conversion, the required-field
     # check) fails first - this run's scan.json integrity genuinely was
-    # never evaluated in that case, distinct from both "verified" and
-    # "unverified" (aged-out anchor, still evaluated).
+    # never evaluated in that case. Filed under the SAME "unverified"
+    # state an aged-out anchor uses (round 7c: this comment previously
+    # described it as a distinct third state; the code's choice - one
+    # state, a distinguishing reason_code - is the better one, so the
+    # comment is corrected to match the code, not the other way around).
     anchor_state: dict[str, Any] = {
         "state": "unverified", "reason_code": "not_evaluated_before_an_earlier_failure",
     }
@@ -935,6 +946,19 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
             "all artifacts verified: schema, envelope identity, scan_id consistency, and "
             "per-artifact/run-level content digests"
         )
+        # Round 7c (reviewer-3 delta on 95d9cd8): valid:true's own detail
+        # sentence claimed "all artifacts verified" even when scan.json's
+        # OWN anchor is unverified (aged out or never recorded) - the
+        # state existed only in the JSON payload's separate
+        # "scan_json_integrity" field, invisible anywhere a human
+        # actually reads. valid stays true (the boolean is right - an
+        # unverified anchor is not evidence of a bad run) but the
+        # sentence itself must now say so, not overclaim.
+        if anchor_state.get("state") != "verified":
+            detail += (
+                f"; scan.json's own integrity is UNVERIFIED "
+                f"({anchor_state.get('reason_code')}) - not checked against a recorded anchor"
+            )
     except ComprehensionError as exc:
         valid = False
         detail = str(exc)

@@ -138,6 +138,44 @@ def test_status_after_a_scan(java_repo: Path, capsys) -> None:
     assert payload["latest_scan_id"]
 
 
+def test_status_human_output_is_silent_about_integrity_when_verified(
+    java_repo: Path, capsys,
+) -> None:
+    """No new noise on the happy path (round 7c, reviewer-3 delta on
+    95d9cd8) - a normally-scanned, freshly-anchored run's default human
+    output must NOT print anything about scan_json_integrity at all."""
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    exit_code = _run(["comprehension", "status"], java_repo)
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "scan_json_integrity" not in out
+
+
+def test_status_human_output_names_an_unverified_integrity_state(
+    java_repo: Path, capsys, monkeypatch,
+) -> None:
+    """BLOCKER (round 7c, reviewer-3 delta on 95d9cd8): the round-7b
+    "unverified" integrity state existed ONLY in the JSON payload -
+    status's default human output printed a normal-looking healthy run
+    with zero words of caution, even with an aged-out/never-recorded
+    anchor. Must now name the state on default human output."""
+    monkeypatch.setattr(scan_pipeline.publish, "_INDEX_RUNS_MAX", 1)
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    index_path = scan_pipeline.paths.index_path(
+        scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk"))
+    aged_out_scan_id = json.loads(index_path.read_text(encoding="utf-8"))["latest_scan_id"]
+    _run(["comprehension", "scan", "--json"], java_repo)  # ages the first run's anchor out
+    capsys.readouterr()
+
+    exit_code = _run(["comprehension", "status", "--run", aged_out_scan_id], java_repo)
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "scan_json_integrity: unverified" in out
+    assert "scan_json_index_anchor_not_recorded" in out
+
+
 # ----------------------------------------------------------- report
 
 def test_report_after_a_scan(java_repo: Path, capsys) -> None:
@@ -164,6 +202,43 @@ def test_validate_after_a_scan(java_repo: Path, capsys) -> None:
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["valid"] is True
+
+
+def test_validate_human_output_is_silent_about_integrity_when_verified(
+    java_repo: Path, capsys,
+) -> None:
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    exit_code = _run(["comprehension", "validate"], java_repo)
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "scan_json_integrity" not in out
+
+
+def test_validate_human_output_names_an_unverified_integrity_state(
+    java_repo: Path, capsys, monkeypatch,
+) -> None:
+    """BLOCKER (round 7c, reviewer-3 delta on 95d9cd8): validate's
+    default human output printed valid:true with the FULL all-artifacts-
+    verified sentence even with a falsified fingerprint/completeness and
+    the anchor keys removed - zero words of caution anywhere a human
+    looks. valid stays true (the boolean is right); the output must now
+    name the unverified state."""
+    monkeypatch.setattr(scan_pipeline.publish, "_INDEX_RUNS_MAX", 1)
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    index_path = scan_pipeline.paths.index_path(
+        scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk"))
+    aged_out_scan_id = json.loads(index_path.read_text(encoding="utf-8"))["latest_scan_id"]
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+
+    exit_code = _run(["comprehension", "validate", "--run", aged_out_scan_id], java_repo)
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "valid:   True" in out
+    assert "UNVERIFIED" in out
+    assert "scan_json_integrity: unverified" in out
 
 
 def test_validate_on_a_malformed_index_refuses_typed_instead_of_crashing(

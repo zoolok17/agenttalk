@@ -972,6 +972,14 @@ def test_validate_run_degrades_to_unverified_and_stays_valid_when_the_index_anch
     assert result["scan_json_integrity"] == {
         "state": "unverified", "reason_code": "scan_json_index_anchor_not_recorded",
     }
+    # BLOCKER (round 7c, reviewer-3 delta on 95d9cd8): valid:true's own
+    # detail sentence used to claim "all artifacts verified" unqualified
+    # even when scan.json's own anchor was never checked - the state
+    # existed only in the separate JSON field, invisible anywhere a
+    # human actually reads. valid stays true; the sentence must now say
+    # so.
+    assert "UNVERIFIED" in result["detail"]
+    assert "scan_json_index_anchor_not_recorded" in result["detail"]
 
 
 def test_get_report_degrades_to_unverified_when_the_index_anchor_has_aged_out(
