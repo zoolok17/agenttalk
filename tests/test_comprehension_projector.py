@@ -177,14 +177,45 @@ def test_no_projection_list_anywhere_exceeds_the_row_cap(monkeypatch):
     (reproduced: 2401 entries on a 1200-file repo, scaling 1:1 with unit
     count). Walks the ENTIRE payload recursively instead of naming
     sections: no list anywhere may exceed the cap, and every section
-    whose real input exceeded it must report a nonzero omitted count."""
+    whose real input exceeded it must report a nonzero omitted count.
+
+    M2 (fourth cold read, fix round 6): this test's own fixture left
+    high_fan_out_units/high_fan_in_units EMPTY (no unit's fan-out/fan-in
+    ever exceeded the >5 threshold with only 2 edges) - an empty section
+    produces no list to walk and a correctly-zero omitted count either
+    way, so this invariant test COULD NOT have caught high_fan_out_units/
+    high_fan_in_units bypassing _bounded entirely (hard-sliced to [:20],
+    no omitted_counts entry, truncated never set). Every section is now
+    populated well past the cap - including features, bumped from one
+    item to two, the one section that previously sat AT the cap with a
+    legitimately-zero omitted count, indistinguishable from "never
+    populated" by omitted_counts alone - and a meta-assertion below
+    checks every omitted_counts entry is nonzero, so a future fixture
+    that forgets to populate ANY section (fan or otherwise) fails this
+    test instead of silently passing over an empty one."""
     monkeypatch.setattr(pr, "_MAX_ROWS_PER_SECTION", 1)
     modules = [_unit("u1"), _unit("u2"), _unit("u3")]
     edges = [
         _edge("e1", "u1", resolution_state="resolved", target_unit_id="u2"),
         _edge("e2", "u1", resolution_state="resolved", target_unit_id="u3"),
     ]
-    features = [_feature("f1", ["u1"])]  # u2, u3 have no feature link
+    # Pushes u1 and u2 both past the fan-OUT threshold (>5), and u3/u4
+    # both past the fan-IN threshold - two qualifying units per section,
+    # so the (monkeypatched) cap of 1 actually clips one from each.
+    fan_out_edges = [
+        _edge(f"fo1-{i}", "u1", resolution_state="unresolved") for i in range(5)
+    ] + [
+        _edge(f"fo2-{i}", "u2", resolution_state="unresolved") for i in range(6)
+    ]
+    fan_in_edges = [
+        _edge(f"fi1-{i}", f"src1-{i}", resolution_state="resolved", target_unit_id="u3")
+        for i in range(6)
+    ] + [
+        _edge(f"fi2-{i}", f"src2-{i}", resolution_state="resolved", target_unit_id="u4")
+        for i in range(6)
+    ]
+    edges = edges + fan_out_edges + fan_in_edges
+    features = [_feature("f1", ["u1"]), _feature("f2", ["u1"])]  # u2, u3 have no feature link
     entry_points = [_entry_point("ep1", "u2", []), _entry_point("ep2", "u3", [])]  # both unmapped
     signals = [_signal("u1"), _signal("u2")]
     summaries = [_summary("u1", "blocked"), _summary("u2", "assessed")]
@@ -215,11 +246,20 @@ def test_no_projection_list_anywhere_exceeds_the_row_cap(monkeypatch):
     # never silently leave omitted_counts at 0 for a section that WAS
     # actually truncated.
     assert payload["omitted_counts"] == {
-        "units": 2, "dependencies": 1, "problems": 1,
-        "features": 0, "entry_points": 1,
+        "units": 2, "dependencies": len(edges) - 1, "problems": 1,
+        "features": 1, "entry_points": 1,
         "readiness_signals": 1, "readiness_summaries": 1,
         "units_without_feature": 1, "unmapped_entry_points": 1,
+        "high_fan_out_units": 1, "high_fan_in_units": 1,
     }
+    # Meta-assertion (M2, fourth cold read, fix round 6): every capped
+    # section in this fixture must actually have been exercised - a
+    # section left at omitted_counts == 0 here would mean either the cap
+    # was never really hit (a fixture bug) or the section itself was
+    # silently empty (exactly how M2 slipped past this same test before).
+    assert all(count > 0 for count in payload["omitted_counts"].values()), (
+        f"a section was never actually exercised by this fixture: {payload['omitted_counts']}"
+    )
 
 
 def test_counts_section_states_its_whole_run_scope():

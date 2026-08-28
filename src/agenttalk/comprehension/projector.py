@@ -167,6 +167,14 @@ def project_comprehension(
         sorted(units_without_feature))
     unmapped_entry_points_rows, unmapped_entry_points_omitted = _bounded(
         sorted(unmapped_entry_points))
+    # M2 (fourth cold read, fix round 6): these two were hard-sliced to a
+    # literal [:20] - not routed through _bounded at all, so they got no
+    # omitted_counts entry and never set truncated, even when far more
+    # than 20 units actually qualified. Same enumeration-vs-invariant
+    # lesson as M-4/round 4 and round 3's own M10: a fixed slice bypasses
+    # the SAME mechanism every other section already goes through.
+    high_fan_out_rows, high_fan_out_omitted = _bounded(high_fan_out)
+    high_fan_in_rows, high_fan_in_omitted = _bounded(high_fan_in)
 
     payload: dict[str, Any] = {
         "schema_version": PROJECTION_SCHEMA_VERSION,
@@ -196,8 +204,8 @@ def project_comprehension(
             "problems": len(problems),
         },
         "dependency_summary": _dependency_summary(dependencies),
-        "high_fan_out_units": high_fan_out[:20],
-        "high_fan_in_units": high_fan_in[:20],
+        "high_fan_out_units": high_fan_out_rows,
+        "high_fan_in_units": high_fan_in_rows,
         "units_without_feature": units_without_feature_rows,
         "unmapped_entry_points": unmapped_entry_points_rows,
         "problems": problem_rows,
@@ -206,6 +214,7 @@ def project_comprehension(
             or feature_omitted or entry_point_omitted
             or readiness_signal_omitted or readiness_summary_omitted
             or units_without_feature_omitted or unmapped_entry_points_omitted
+            or high_fan_out_omitted or high_fan_in_omitted
         ),
         "omitted_counts": {
             "units": units_omitted, "dependencies": dependency_omitted, "problems": problem_omitted,
@@ -214,6 +223,8 @@ def project_comprehension(
             "readiness_summaries": readiness_summary_omitted,
             "units_without_feature": units_without_feature_omitted,
             "unmapped_entry_points": unmapped_entry_points_omitted,
+            "high_fan_out_units": high_fan_out_omitted,
+            "high_fan_in_units": high_fan_in_omitted,
         },
     }
 
