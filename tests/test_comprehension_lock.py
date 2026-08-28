@@ -449,6 +449,31 @@ def test_comprehension_package_imports_no_socket_or_network_module() -> None:
                 names = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom):
                 names = [node.module] if node.module else []
+            elif isinstance(node, ast.Call):
+                # N9 (fourth cold read, fix round 6): the static Import/
+                # ImportFrom scan above is blind to the DYNAMIC import
+                # spellings - importlib.import_module("socket") and
+                # __import__("socket") are ordinary function calls, not
+                # import statements at all, and would sail straight
+                # through the check above even though they achieve
+                # exactly what it exists to ban. Only a literal string
+                # argument can be checked statically; anything else
+                # (a computed module name) is a residual this static
+                # scan cannot see either way, same as any static analysis.
+                is_import_module_call = (
+                    isinstance(node.func, ast.Attribute) and node.func.attr == "import_module"
+                )
+                is_dunder_import_call = (
+                    isinstance(node.func, ast.Name) and node.func.id == "__import__"
+                )
+                if not (is_import_module_call or is_dunder_import_call) or not node.args:
+                    continue
+                first_arg = node.args[0]
+                names = (
+                    [first_arg.value]
+                    if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str)
+                    else []
+                )
             else:
                 continue
             for name in names:
