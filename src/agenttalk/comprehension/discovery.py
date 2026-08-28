@@ -59,6 +59,23 @@ from .paths import RELATIVE_COMPREHENSION_DIR
 PATH_NORMALIZATION_VERSION = 1
 
 #: PROVISIONAL - see module docstring.
+#:
+#: N10 (fourth cold read, fix round 6, judged): the design's own wording
+#: ("100,000 filesystem entries per scope") reads as EVERY entry walked -
+#: directories, boundaries, and default-excluded files/dirs included.
+#: This counts only non-excluded REGULAR FILES (the ``entry_count += 1``
+#: below sits in the "regular file" branch, after every exclusion check
+#: has already run) - a directory, a boundary, or an excluded file is
+#: free against this cap. Declared here as a deliberate reading, not a
+#: silent divergence: this cap's own PURPOSE is to bound the EXPENSIVE
+#: work enumeration does (stat-ing, reading, hashing a regular file,
+#: each backed by the separate per-file/total-byte caps below) - a
+#: directory node or an already-excluded entry costs one cheap
+#: ``iterdir()``/name-match and is never read or hashed, so counting it
+#: toward the SAME limit would trip a monorepo's cap on directory or
+#: dependency-cache SPRAWL alone, never on actual scan cost. Fail-open
+#: relative to the design's literal wording, bounded anyway by the
+#: byte caps; revisit if review wants the wording taken literally.
 MAX_FILESYSTEM_ENTRIES = 100_000
 MAX_PER_FILE_BYTES = 64 * 1024 * 1024
 MAX_HASHED_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
@@ -129,13 +146,23 @@ class PlatformIdentity:
 @dataclass(frozen=True)
 class EnumeratedFile:
     """One addressable ``file`` unit candidate (design, Artifact 1: "Every
-    non-excluded file remains an addressable `file` unit"). ``content_digest``
-    is ``None`` only when a resource cap prevented reading this specific
-    file's bytes (see ``problems``) - never silently defaulted."""
+    non-excluded file remains an addressable `file` unit").
+
+    N4 (fourth cold read, fix round 6): ``content_digest`` previously
+    documented (and typed) a ``None`` case for "a resource cap prevented
+    reading this specific file's bytes" - that case cannot occur HERE:
+    every resource-cap/read-failure exit in ``_walk`` (below) returns or
+    ``continue``s BEFORE constructing an ``EnumeratedFile`` at all (the
+    problem is recorded via ``problems``/``exclusions`` instead, and no
+    file candidate is ever created for it). The single construction site
+    always supplies a real digest from bytes it just successfully read
+    and hashed - documenting a null case nothing produces would have let
+    a caller silently accept (and modules.json silently publish) a null
+    digest, had one ever slipped through undetected."""
 
     relative_path: str
     byte_count: int
-    content_digest: str | None
+    content_digest: str
 
 
 @dataclass(frozen=True)
