@@ -109,6 +109,25 @@ _ROUTE_METHOD_BY_ANNOTATION = {
     "GetMapping": "GET", "PostMapping": "POST", "PutMapping": "PUT",
     "DeleteMapping": "DELETE", "PatchMapping": "PATCH",
 }
+#: N2 (fifth cold read, fix round 8): a plain @RequestMapping's own
+#: ``method = RequestMethod.X`` attribute was never parsed at all - two
+#: @RequestMapping routes on the SAME path, differing only by this
+#: attribute, both published with no method prefix (unlike
+#: @GetMapping/@PostMapping, which fold their own verb implicitly) and
+#: silently COALESCED into one entry point by round 5's own coalescing
+#: rule - correct for a genuine duplicate, wrong here since these are
+#: two different handlers. Adjacent machinery (_ROUTE_METHOD_BY_
+#: ANNOTATION) already folds the method into the route's identity for
+#: the verb-specific annotations; this closes the one shape it did not
+#: cover, rather than merely declaring the gap.
+_ROUTE_METHOD_ATTR_RE = re.compile(r"\bmethod\s*=\s*RequestMethod\.([A-Za-z]+)")
+
+
+def _route_method_attribute(sanitized_segment: str) -> str | None:
+    match = _ROUTE_METHOD_ATTR_RE.search(sanitized_segment)
+    return match.group(1).upper() if match else None
+
+
 #: M8 (cold-read, PR-B fix round 3): the route path/value attribute, by
 #: NAME (Spring allows any attribute order - `produces = "...", value =
 #: "/orders"` - blindly taking the first string literal in the argument
@@ -952,24 +971,28 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             line=_line_at(newline_offsets, match.start()), phase="runtime",
         ))
 
-    def _route_annotation_span(match: re.Match) -> tuple[int, str | None]:
+    def _route_annotation_span(match: re.Match) -> tuple[int, str | None, str | None]:
         # N10 (third cold read, fix round 5): find the annotation's own
         # argument-list parens by tracking nesting depth (below), rather
         # than a regex that stopped at the FIRST close-paren anywhere in
         # the argument list - see _matching_close_paren's docstring for
         # the truncation this replaces. Returns (position right after
-        # this annotation's own span, path-or-None) - the position is
-        # what a class-level check must resume from, never match.end()
-        # (which sits BEFORE this annotation's own arguments, not after
-        # them).
+        # this annotation's own span, path-or-None, explicit-method-or-
+        # None) - the position is what a class-level check must resume
+        # from, never match.end() (which sits BEFORE this annotation's
+        # own arguments, not after them).
         arg_pos = match.end()
         while arg_pos < len(sanitized) and sanitized[arg_pos].isspace():
             arg_pos += 1
         if arg_pos < len(sanitized) and sanitized[arg_pos] == "(":
             close_pos = _matching_close_paren(sanitized, arg_pos)
             if close_pos is not None:
-                return close_pos + 1, _route_path(sanitized, text, arg_pos, close_pos + 1)
-        return match.end(), None
+                return (
+                    close_pos + 1,
+                    _route_path(sanitized, text, arg_pos, close_pos + 1),
+                    _route_method_attribute(sanitized[arg_pos:close_pos + 1]),
+                )
+        return match.end(), None, None
 
     # M5 (fourth cold read, fix round 6): a class-level @RequestMapping is
     # a PREFIX for every method-level route inside that class - Spring's
@@ -984,7 +1007,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # that literal was itself confidently extracted.
     class_route_prefix: dict[str, str] = {}
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
-        span_end, path = _route_annotation_span(match)
+        span_end, path, _explicit_method = _route_annotation_span(match)
         target_type = _class_level_route_target(sanitized, span_end, types)
         if target_type is not None and path is not None:
             class_route_prefix[target_type] = path
@@ -992,7 +1015,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
-        span_end, path = _route_annotation_span(match)
+        span_end, path, explicit_method = _route_annotation_span(match)
         if _class_level_route_target(sanitized, span_end, types) is not None:
             # A bare class-level annotation with no method-level mapping
             # inside that class represents no invocable route on its own
@@ -1015,7 +1038,15 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # prefix at all) must not publish a different spelling of
             # the same served path just because it lacked one.
             path = _normalize_route_leading_slash(path)
-        method = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1))
+        # N2 (fifth cold read, fix round 8): a verb-specific annotation's
+        # own implied method (GetMapping -> GET, ...) always wins when
+        # known; a plain @RequestMapping has none of its own, so its
+        # explicit method=RequestMethod.X attribute (if present) is
+        # what distinguishes it from another @RequestMapping on the
+        # same path - without this, two such routes collapse into one
+        # coalesced entry point (round 5's M-5), silently losing that
+        # they are two different handlers.
+        method = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1)) or explicit_method
         if path is not None:
             target = f"{method} {path}" if method else path
         else:

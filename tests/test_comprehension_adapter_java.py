@@ -615,6 +615,32 @@ class Controller {
     assert routes[0].target == "/orders"
 
 
+def test_two_request_mappings_on_one_path_distinguished_by_method_attribute_do_not_coalesce():
+    """N2 (fifth cold read, fix round 8): a plain @RequestMapping's own
+    method = RequestMethod.X attribute was never parsed at all - two
+    @RequestMapping routes on the SAME path, differing only by this
+    attribute, both published with no method prefix (unlike
+    @GetMapping/@PostMapping, which fold their own verb implicitly) and
+    silently coalesced into ONE entry point by round 5's own coalescing
+    rule - correct for a genuine duplicate, wrong here since these are
+    two different handlers."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(value = "/orders", method = RequestMethod.GET)
+    void list() {}
+
+    @RequestMapping(value = "/orders", method = RequestMethod.POST)
+    void create() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /orders", "POST /orders"}
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert {e.name for e in http_entry_points} == {"GET /orders", "POST /orders"}
+
+
 def test_route_value_recovery_continues_past_a_non_literal_named_attribute_match():
     """Minor 5 (fifth cold read, fix round 7): round 6 took only the
     FIRST value|path attribute-name match and required an IMMEDIATELY
