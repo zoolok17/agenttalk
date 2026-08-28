@@ -1,0 +1,46 @@
+name: diag-symlink-devmode-proof
+
+# TEMPORARY, one-off diagnostic - NOT part of the committed gate.
+# workflow_dispatch only, added to produce positive per-test proof (not
+# just "leg is green") that the four symlink-dependent comprehension
+# tests actually EXECUTE (not silently skip) on a hosted Windows runner
+# under tests.yml's real env (AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE=1, the
+# same CI/GITHUB_ACTIONS platform vars), requested for PR #132's review.
+# Mirrors tests.yml's windows leg env exactly, but runs `pytest -v` on
+# just these four tests so pass/skip is visible per test name - the
+# committed gate's own `-q` mode compresses this to dots + aggregate
+# counts, which cannot distinguish "these four passed" from "these four
+# skipped, something else passed". Intended to be removed once its
+# output is captured.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-symlink-proof:
+    name: symlink-devmode proof (windows)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      PYTHONDONTWRITEBYTECODE: '1'
+      AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install pytest only (no full gate dependency set needed for this proof)
+        run: python -I -m pip install pytest
+      - name: Run the four symlink-dependent tests verbosely
+        run: >
+          python -I -m pytest -v -rA
+          tests/test_comprehension_ceilings.py::test_measure_staging_artifacts_rejects_a_symlinked_artifact
+          tests/test_comprehension_discovery.py::test_enumerate_scope_records_a_symlink_as_a_boundary_and_never_follows_it
+          tests/test_comprehension_envelope.py::test_resolve_under_root_rejects_a_path_that_escapes_via_symlink
+          tests/test_comprehension_staging.py::test_reclaim_retains_an_entry_that_resolves_outside_staging
