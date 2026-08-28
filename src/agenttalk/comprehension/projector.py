@@ -157,6 +157,16 @@ def project_comprehension(
         [s.to_json() for s in filtered_signals])
     readiness_summary_rows, readiness_summary_omitted = _bounded(
         [s.to_json() for s in filtered_summaries])
+    # M-4 (second cold read, fix round 4): round 3's own bounding fix
+    # enumerated the four sections it fixed rather than asserting a
+    # payload-wide invariant - these two, both plain lists of ids rather
+    # than lists of row dicts, slipped through uncapped (reproduced:
+    # units_without_feature returned 2401 entries on a 1200-file repo,
+    # scaling 1:1 with unit count).
+    units_without_feature_rows, units_without_feature_omitted = _bounded(
+        sorted(units_without_feature))
+    unmapped_entry_points_rows, unmapped_entry_points_omitted = _bounded(
+        sorted(unmapped_entry_points))
 
     payload: dict[str, Any] = {
         "schema_version": PROJECTION_SCHEMA_VERSION,
@@ -188,19 +198,22 @@ def project_comprehension(
         "dependency_summary": _dependency_summary(dependencies),
         "high_fan_out_units": high_fan_out[:20],
         "high_fan_in_units": high_fan_in[:20],
-        "units_without_feature": sorted(units_without_feature),
-        "unmapped_entry_points": sorted(unmapped_entry_points),
+        "units_without_feature": units_without_feature_rows,
+        "unmapped_entry_points": unmapped_entry_points_rows,
         "problems": problem_rows,
         "truncated": bool(
             units_omitted or dependency_omitted or problem_omitted
             or feature_omitted or entry_point_omitted
             or readiness_signal_omitted or readiness_summary_omitted
+            or units_without_feature_omitted or unmapped_entry_points_omitted
         ),
         "omitted_counts": {
             "units": units_omitted, "dependencies": dependency_omitted, "problems": problem_omitted,
             "features": feature_omitted, "entry_points": entry_point_omitted,
             "readiness_signals": readiness_signal_omitted,
             "readiness_summaries": readiness_summary_omitted,
+            "units_without_feature": units_without_feature_omitted,
+            "unmapped_entry_points": unmapped_entry_points_omitted,
         },
     }
 

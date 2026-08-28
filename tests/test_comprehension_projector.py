@@ -168,29 +168,58 @@ def test_truncation_reports_omitted_counts(monkeypatch):
     assert len(payload["units"]) == 1
 
 
-def test_features_entry_points_and_readiness_are_also_bounded(monkeypatch):
-    """M10 (cold-read, PR-B fix round 3): features/entry_points/readiness
-    signals+summaries previously had no row cap and no truncation/omitted
-    count at all - unbounded on a large repo. Now bounded the same way
-    every other section already was."""
+def test_no_projection_list_anywhere_exceeds_the_row_cap(monkeypatch):
+    """M-4 (second cold read, fix round 4): round 3's own M10 bounding fix
+    enumerated the four sections it fixed rather than asserting a
+    payload-wide invariant - which is exactly why units_without_feature
+    and unmapped_entry_points (both plain lists of ids, not lists of row
+    dicts, introduced earlier than M10) slipped through uncapped
+    (reproduced: 2401 entries on a 1200-file repo, scaling 1:1 with unit
+    count). Walks the ENTIRE payload recursively instead of naming
+    sections: no list anywhere may exceed the cap, and every section
+    whose real input exceeded it must report a nonzero omitted count."""
     monkeypatch.setattr(pr, "_MAX_ROWS_PER_SECTION", 1)
-    features = [_feature("f1", ["u1"]), _feature("f2", ["u2"])]
-    entry_points = [_entry_point("ep1", "u1", ["f1"]), _entry_point("ep2", "u2", ["f2"])]
+    modules = [_unit("u1"), _unit("u2"), _unit("u3")]
+    edges = [
+        _edge("e1", "u1", resolution_state="resolved", target_unit_id="u2"),
+        _edge("e2", "u1", resolution_state="resolved", target_unit_id="u3"),
+    ]
+    features = [_feature("f1", ["u1"])]  # u2, u3 have no feature link
+    entry_points = [_entry_point("ep1", "u2", []), _entry_point("ep2", "u3", [])]  # both unmapped
     signals = [_signal("u1"), _signal("u2")]
     summaries = [_summary("u1", "blocked"), _summary("u2", "assessed")]
+    problems = [
+        {"reason_code": "parse_failed", "path": "a", "detail": "x"},
+        {"reason_code": "parse_failed", "path": "b", "detail": "y"},
+    ]
+
     payload = pr.project_comprehension(**_base_kwargs(
-        features=features, entry_points=entry_points,
-        readiness_signals=signals, readiness_summaries=summaries,
+        modules=modules, dependencies=edges, features=features,
+        entry_points=entry_points, readiness_signals=signals,
+        readiness_summaries=summaries, problems=problems,
     ))
+
+    def _assert_no_list_exceeds_cap(value: object, path: str) -> None:
+        if isinstance(value, list):
+            assert len(value) <= 1, f"{path}: list of {len(value)} exceeds the row cap"
+            for i, item in enumerate(value):
+                _assert_no_list_exceeds_cap(item, f"{path}[{i}]")
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                _assert_no_list_exceeds_cap(item, f"{path}.{key}")
+
+    _assert_no_list_exceeds_cap(payload, "payload")
+
     assert payload["truncated"] is True
-    assert len(payload["features"]) == 1
-    assert len(payload["entry_points"]) == 1
-    assert len(payload["readiness"]["signals"]) == 1
-    assert len(payload["readiness"]["summaries"]) == 1
-    assert payload["omitted_counts"]["features"] == 1
-    assert payload["omitted_counts"]["entry_points"] == 1
-    assert payload["omitted_counts"]["readiness_signals"] == 1
-    assert payload["omitted_counts"]["readiness_summaries"] == 1
+    # Every section whose real input exceeded the cap must report it -
+    # never silently leave omitted_counts at 0 for a section that WAS
+    # actually truncated.
+    assert payload["omitted_counts"] == {
+        "units": 2, "dependencies": 1, "problems": 1,
+        "features": 0, "entry_points": 1,
+        "readiness_signals": 1, "readiness_summaries": 1,
+        "units_without_feature": 1, "unmapped_entry_points": 1,
+    }
 
 
 def test_counts_section_states_its_whole_run_scope():
