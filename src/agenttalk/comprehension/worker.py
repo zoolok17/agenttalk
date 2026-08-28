@@ -399,7 +399,18 @@ def run_sanitized_worker(
     payload = json.dumps({"root": str(root), "relative_paths": list(relative_paths)})
     try:
         completed = subprocess.run(  # noqa: S603  # nosec B603
-            [sys.executable, "-m", "agenttalk.comprehension.worker"],
+            # Note 8 (second cold read, fix round 4): -s (skip the user
+            # site-packages directory) and -S (skip the `site` module's
+            # own startup entirely - site-packages/.pth processing AND
+            # sitecustomize.py/usercustomize.py, which would otherwise
+            # execute inside this sanitized process) - closing exactly the
+            # channel the module's own claim of a closed input boundary is
+            # about. Never the fuller -I (isolated mode): -I also strips
+            # PYTHONPATH, which this launch sets EXPLICITLY and
+            # deliberately (_derive_child_import_root, above) so the child
+            # can resolve `agenttalk` from a source checkout - -I would
+            # undo the one thing this whole function exists to arrange.
+            [sys.executable, "-s", "-S", "-m", "agenttalk.comprehension.worker"],
             input=payload,
             capture_output=True,
             text=True,

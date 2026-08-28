@@ -94,11 +94,22 @@ def _run_probe(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def _worker_probe_argv(root: Path) -> tuple[list[str], str, dict[str, str]]:
+    """Note 8 (second cold read, fix round 4): this must build the EXACT
+    same env and argv shape ``worker.run_sanitized_worker`` itself does -
+    it previously omitted the PYTHONPATH production explicitly adds
+    (``_derive_child_import_root``) and the ``-s -S`` interpreter flags,
+    so this module's own docstring claim ("the exact env-allowlist and
+    subprocess invocation production uses") was overstated. Cannot call
+    ``run_sanitized_worker`` directly - it has no sudo/unshare wrapping
+    point - so this replicates it instead, deliberately kept side by side
+    with worker.py's own construction rather than duplicated silently."""
     relative_paths = ["a.java"]
     (root / "a.java").write_text("package p;\nclass A {}\n", encoding="utf-8")
     payload = json.dumps({"root": str(root), "relative_paths": relative_paths})
     env = workermod.sanitized_worker_env({**os.environ, **_FAKE_CREDENTIAL_ENV})
-    return [sys.executable, "-m", "agenttalk.comprehension.worker"], payload, env
+    env["PYTHONPATH"] = workermod._derive_child_import_root()
+    argv = [sys.executable, "-s", "-S", "-m", "agenttalk.comprehension.worker"]
+    return argv, payload, env
 
 
 def _linux_env_delivery_argv(env: dict[str, str], inner_argv: list[str]) -> list[str]:

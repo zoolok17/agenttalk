@@ -292,7 +292,9 @@ def test_run_sanitized_worker_launches_with_the_sanitized_environment_only(
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
     result = worker.run_sanitized_worker(tmp_path, ["a.txt"])
 
-    assert captured["argv"] == [sys.executable, "-m", "agenttalk.comprehension.worker"]
+    assert captured["argv"] == [
+        sys.executable, "-s", "-S", "-m", "agenttalk.comprehension.worker",
+    ]
     assert "ANTHROPIC_API_KEY" not in captured["env"]
     assert json.loads(captured["input"]) == {"root": str(tmp_path), "relative_paths": ["a.txt"]}
     assert result.schema_version == worker.WORKER_SCHEMA_VERSION
