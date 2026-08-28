@@ -166,6 +166,35 @@ def test_scan_json_record_counts_includes_itself(java_repo: Path) -> None:
     assert status["record_counts"]["scan.json"] == 1
 
 
+def test_scan_json_records_the_privacy_disposition(java_repo: Path) -> None:
+    """M5 (cold-read, PR-B fix round 3): the privacy disposition this run
+    acted under used to live only in scan.lock, deleted at release - the
+    audit trail the attended override exists to create did not survive
+    the run at all."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert doc["privacy"]["vcs_privacy"] == "ignored"
+    assert doc["privacy"]["vcs_kind"] == "git"
+    assert doc["privacy"]["work_id"] is None
+
+
+def test_scan_json_records_an_acknowledged_privacy_disposition_with_work_id(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("build/\n", encoding="utf-8")
+    _write_sample_java_project(tmp_path)
+    outcome = scan_pipeline.run_scan(
+        tmp_path, acknowledge_unignored=True, work_id="migrate-app")
+    import json
+
+    doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert doc["privacy"]["vcs_privacy"] == "acknowledged_unignored"
+    assert doc["privacy"]["work_id"] == "migrate-app"
+
+
 def test_run_scan_does_not_publish_owner_json_into_the_run(java_repo: Path) -> None:
     """M4 (cold-read, PR-B fix round 3): owner.json (host identity, PID,
     and the writer lock's own owner token) repeats the lock's identity
@@ -323,6 +352,46 @@ def test_validate_run_reports_valid_for_a_healthy_run(java_repo: Path) -> None:
     assert result["external_revalidation"] == {
         "performed": False, "reason_code": "no_external_evidence_pointers_this_slice",
     }
+
+
+def test_scan_json_carries_per_artifact_and_run_level_digests(java_repo: Path) -> None:
+    """M2 (cold-read, PR-B fix round 3): scan.json must carry per-artifact
+    byte SHA-256 + canonical content digest + record count + schema
+    version, and a run-level content_digest - digests.py's own machinery
+    for this existed with no production caller."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    names = {a["name"] for a in doc["artifacts"]}
+    assert names == {
+        "modules.json", "dependencies.json", "features.json", "readiness.json", "problems.json",
+    }
+    for artifact in doc["artifacts"]:
+        assert artifact["byte_sha256"]
+        assert artifact["content_digest"]
+        assert artifact["record_count"] >= 0
+        assert artifact["schema_version"] >= 1
+    assert doc["content_digest"]
+
+
+def test_validate_run_catches_a_tampered_artifact_via_its_digest(java_repo: Path) -> None:
+    """M2 (cold-read, PR-B fix round 3): validate_run must actually detect
+    a mismatch between an artifact's declared digest and its real
+    on-disk content - the design's own "full-run integrity" claim,
+    exercised end to end rather than just at the unit level."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    modules_path = outcome.run_dir / "modules.json"
+    doc = json.loads(modules_path.read_text(encoding="utf-8"))
+    doc["units"] = []  # tamper: content no longer matches the declared digest
+    modules_path.write_text(
+        scan_pipeline.digests.canonical_json_bytes(doc).decode("utf-8"), encoding="utf-8")
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "content_digest" in result["detail"] or "byte_sha256" in result["detail"]
 
 
 def test_validate_run_before_any_scan_raises_not_scanned(tmp_path: Path) -> None:

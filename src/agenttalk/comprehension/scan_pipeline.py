@@ -92,10 +92,34 @@ def _envelope(*, artifact_type: str, schema_version: int, scan_id: str, generate
     }
 
 
-def _write_json_document(path: Path, document: dict[str, Any]) -> None:
-    path.write_text(
-        digests.canonical_json_bytes(document).decode("utf-8"), encoding="utf-8",
-    )
+def _write_json_document(path: Path, document: dict[str, Any]) -> bytes:
+    """Returns the exact canonical bytes written, so the caller can
+    compute this artifact's byte SHA-256 (M2, cold-read PR-B fix round 3)
+    without a second, separate read of what was just written."""
+    canonical = digests.canonical_json_bytes(document)
+    path.write_text(canonical.decode("utf-8"), encoding="utf-8")
+    return canonical
+
+
+def _artifact_summary(
+    *, name: str, artifact_type: str, schema_version: int, record_count: int,
+    doc: dict[str, Any], canonical_bytes: bytes,
+) -> dict[str, Any]:
+    """M2 (cold-read, PR-B fix round 3): the design requires "per-artifact
+    relative path, byte SHA-256, canonical content digest, record count,
+    schema version" for every durable artifact - digests.sha256_bytes and
+    digests.canonical_content_digest already existed with no production
+    caller. The run-level content_digest below is computed from exactly
+    this shape (digests.run_content_digest reads artifact_type/
+    schema_version/record_count/content_digest from each entry)."""
+    return {
+        "name": name,
+        "artifact_type": artifact_type,
+        "schema_version": schema_version,
+        "record_count": record_count,
+        "byte_sha256": digests.sha256_bytes(canonical_bytes),
+        "content_digest": digests.canonical_content_digest(doc),
+    }
 
 
 @dataclass(frozen=True)
@@ -255,11 +279,13 @@ def run_scan(
             "problems": problems,
         }
 
-        _write_json_document(staging_handle.path / "modules.json", modules_doc)
-        _write_json_document(staging_handle.path / "dependencies.json", dependencies_doc)
-        _write_json_document(staging_handle.path / "features.json", features_doc)
-        _write_json_document(staging_handle.path / "readiness.json", readiness_doc)
-        _write_json_document(staging_handle.path / "problems.json", problems_doc)
+        modules_bytes = _write_json_document(staging_handle.path / "modules.json", modules_doc)
+        dependencies_bytes = _write_json_document(
+            staging_handle.path / "dependencies.json", dependencies_doc)
+        features_bytes = _write_json_document(staging_handle.path / "features.json", features_doc)
+        readiness_bytes = _write_json_document(
+            staging_handle.path / "readiness.json", readiness_doc)
+        problems_bytes = _write_json_document(staging_handle.path / "problems.json", problems_doc)
 
         record_counts = {
             "modules.json": len(modules_doc["units"]),
@@ -279,6 +305,48 @@ def run_scan(
             "scan.json": 1,
         }
 
+        # M2 (cold-read, PR-B fix round 3): per-artifact byte/content
+        # digests + the run-level content_digest - digests.py's own
+        # sha256_bytes/canonical_content_digest/run_content_digest existed
+        # with no production caller, and validate_run claimed "full-run
+        # integrity" while only checking envelope/schema/scan_id
+        # consistency. scan.json itself is the SUMMARY of these five
+        # artifacts, not a sixth entry in its own digest - a self-
+        # referential digest has no fixed point.
+        artifact_summaries = [
+            _artifact_summary(
+                name="modules.json", artifact_type=MODULES_ARTIFACT_TYPE,
+                schema_version=modules_artifact.MODULES_SCHEMA_VERSION,
+                record_count=record_counts["modules.json"], doc=modules_doc,
+                canonical_bytes=modules_bytes,
+            ),
+            _artifact_summary(
+                name="dependencies.json", artifact_type=DEPENDENCIES_ARTIFACT_TYPE,
+                schema_version=dependencies_artifact.DEPENDENCIES_SCHEMA_VERSION,
+                record_count=record_counts["dependencies.json"], doc=dependencies_doc,
+                canonical_bytes=dependencies_bytes,
+            ),
+            _artifact_summary(
+                name="features.json", artifact_type=FEATURES_ARTIFACT_TYPE,
+                schema_version=FEATURES_SCHEMA_VERSION,
+                record_count=record_counts["features.json"], doc=features_doc,
+                canonical_bytes=features_bytes,
+            ),
+            _artifact_summary(
+                name="readiness.json", artifact_type=READINESS_ARTIFACT_TYPE,
+                schema_version=READINESS_SCHEMA_VERSION,
+                record_count=record_counts["readiness.json"], doc=readiness_doc,
+                canonical_bytes=readiness_bytes,
+            ),
+            _artifact_summary(
+                name="problems.json", artifact_type=PROBLEMS_ARTIFACT_TYPE,
+                schema_version=PROBLEMS_SCHEMA_VERSION,
+                record_count=record_counts["problems.json"], doc=problems_doc,
+                canonical_bytes=problems_bytes,
+            ),
+        ]
+        run_digest = digests.run_content_digest(artifact_summaries)
+
         scan_doc = {
             **_envelope(
                 artifact_type=SCAN_ARTIFACT_TYPE, schema_version=SCAN_SCHEMA_VERSION,
@@ -290,6 +358,18 @@ def run_scan(
                 "rule_version": java_adapter.RULE_VERSION,
             }],
             "root_binding": privacy_result.root_binding,
+            # M5 (cold-read, PR-B fix round 3): the privacy disposition
+            # this run acted under lived only in scan.lock, deleted at
+            # release - the audit trail the attended override
+            # (--acknowledge-unignored-private-store --work-id) exists to
+            # create did not survive the run at all. Recorded here so it
+            # does.
+            "privacy": {
+                "vcs_privacy": privacy_result.vcs_privacy,
+                "vcs_kind": privacy_result.vcs_kind,
+                "matched_rule": privacy_result.matched_rule,
+                "work_id": privacy_result.work_id,
+            },
             "platform_identity": {
                 "os_family": discovery_result.platform_identity.os_family,
                 "architecture": discovery_result.platform_identity.architecture,
@@ -304,6 +384,8 @@ def run_scan(
             "unsupported_relations": list(java_adapter.UNSUPPORTED_RELATIONS),
             "record_counts": record_counts,
             "problem_count": len(problems),
+            "artifacts": artifact_summaries,
+            "content_digest": run_digest,
         }
         _write_json_document(staging_handle.path / "scan.json", scan_doc)
 
@@ -395,6 +477,13 @@ def _load_run_records(comprehension_dir: Path, scan_id: str) -> dict[str, Any]:
 
     return {
         "scan": scan_doc,
+        "raw_docs": {
+            "modules.json": modules_doc,
+            "dependencies.json": dependencies_doc,
+            "features.json": features_doc,
+            "readiness.json": readiness_doc,
+            "problems.json": problems_doc,
+        },
         "modules": [modules_artifact.module_record_from_json(u) for u in modules_doc["units"]],
         "dependencies": [
             dependencies_artifact.dependency_record_from_json(e) for e in dependencies_doc["edges"]
@@ -445,12 +534,44 @@ def get_report(
     )
 
 
+def _verify_artifact_digests(scan_doc: dict[str, Any], raw_docs: dict[str, dict[str, Any]]) -> None:
+    """M2 (cold-read, PR-B fix round 3): validate_run claimed "full-run
+    integrity" while only checking envelope/schema/scan_id consistency -
+    never the per-artifact/run-level digests the design actually requires
+    (invariant 7). Recomputes each artifact's canonical content digest
+    and byte SHA-256 from the document ACTUALLY ON DISK and compares
+    against what scan.json declared, then recomputes the run-level
+    content_digest from those same declared summaries and compares
+    against scan.json's own declared value. Raises ComprehensionError on
+    any mismatch - the design's own "two byte-identical scans must
+    produce the same canonical content digest" acceptance property now
+    has something to check against."""
+    declared_artifacts = scan_doc.get("artifacts")
+    if not declared_artifacts:
+        raise ComprehensionError("scan.json is missing its artifacts digest summary")
+    for entry in declared_artifacts:
+        name = entry["name"]
+        doc = raw_docs.get(name)
+        if doc is None:
+            raise ComprehensionError(f"scan.json names an artifact {name!r} that was never loaded")
+        if digests.canonical_content_digest(doc) != entry["content_digest"]:
+            raise ComprehensionError(
+                f"{name}'s content_digest does not match its declared value in scan.json")
+        if digests.sha256_bytes(digests.canonical_json_bytes(doc)) != entry["byte_sha256"]:
+            raise ComprehensionError(
+                f"{name}'s byte_sha256 does not match its declared value in scan.json")
+    if digests.run_content_digest(declared_artifacts) != scan_doc.get("content_digest"):
+        raise ComprehensionError(
+            "scan.json's run-level content_digest does not match its declared artifacts")
+
+
 def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     """design: "Perform full-run integrity validation." Reads and verifies
-    every artifact's envelope/schema; the design's separate EXTERNAL-
-    evidence-pointer revalidation step has nothing to revalidate yet in
-    this slice (see module docstring) - ``external_revalidation`` is
-    reported as an explicit, named gap rather than silently omitted."""
+    every artifact's envelope/schema AND the per-artifact/run-level
+    digests (M2, cold-read PR-B fix round 3); the design's separate
+    EXTERNAL-evidence-pointer revalidation step has nothing to revalidate
+    yet in this slice (see module docstring) - ``external_revalidation``
+    is reported as an explicit, named gap rather than silently omitted."""
     comprehension_dir = paths.comprehension_dir(Path(root).resolve() / ".agenttalk")
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
@@ -458,8 +579,12 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     scan_id = run_id or index_doc["latest_scan_id"]
     try:
         records = _load_run_records(comprehension_dir, scan_id)
+        _verify_artifact_digests(records["scan"], records["raw_docs"])
         valid = True
-        detail = "all artifacts verified: schema, envelope identity, and scan_id consistency"
+        detail = (
+            "all artifacts verified: schema, envelope identity, scan_id consistency, and "
+            "per-artifact/run-level content digests"
+        )
     except ComprehensionError as exc:
         valid = False
         detail = str(exc)
