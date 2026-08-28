@@ -37,6 +37,7 @@ _ENTRY_POINT_ID_DOMAIN = b"agenttalk.comprehension.entry_point_id.v1\x00"
 _FEATURE_ID_DOMAIN = b"agenttalk.comprehension.feature_id.v1\x00"
 _SIGNAL_ID_DOMAIN = b"agenttalk.comprehension.signal_id.v1\x00"
 _CONFLICT_ID_DOMAIN = b"agenttalk.comprehension.conflict_id.v1\x00"
+_PROBLEM_ID_DOMAIN = b"agenttalk.comprehension.problem_id.v1\x00"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -162,6 +163,18 @@ def conflict_id(*, conflict_kind: str, anchor: str, claim_digests: list[str]) ->
     return _domain_separated_id(
         _CONFLICT_ID_DOMAIN,
         {"conflict_kind": conflict_kind, "anchor": anchor, "claim_digests": sorted(claim_digests)},
+    )
+
+
+def problem_id(*, reason_code: str, path: str | None, detail: str) -> str:
+    """N3 (third cold read, fix round 5): DESIGN-55-comprehension-plane.md's
+    ``problems.json`` section: "Each record has a stable ID and reason
+    code, severity, producers, optional relative path and line, and a
+    generated message." A stable ID over the record's own identifying
+    fields, the same domain-separated-hash pattern every other artifact's
+    stable ID already uses here."""
+    return _domain_separated_id(
+        _PROBLEM_ID_DOMAIN, {"reason_code": reason_code, "path": path, "detail": detail},
     )
 
 

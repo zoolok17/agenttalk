@@ -202,3 +202,16 @@ def test_conflict_id_is_claim_order_independent() -> None:
     a = dg.conflict_id(conflict_kind="unit_kind", anchor="p.Foo", claim_digests=["d2", "d1"])
     b = dg.conflict_id(conflict_kind="unit_kind", anchor="p.Foo", claim_digests=["d1", "d2"])
     assert a == b
+
+
+def test_problem_id_is_deterministic() -> None:
+    a = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x")
+    b = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x")
+    assert a == b
+
+
+def test_problem_id_differs_by_reason_code_path_or_detail() -> None:
+    base = dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="x")
+    assert dg.problem_id(reason_code="resource_limit", path="p/Foo.java", detail="x") != base
+    assert dg.problem_id(reason_code="parse_failed", path="p/Bar.java", detail="x") != base
+    assert dg.problem_id(reason_code="parse_failed", path="p/Foo.java", detail="y") != base

@@ -107,6 +107,39 @@ def _write_json_document(path: Path, document: dict[str, Any]) -> bytes:
     return canonical
 
 
+#: N3 (third cold read, fix round 5): DESIGN-55-comprehension-plane.md's
+#: problems.json section names ``severity`` as part of the record shape
+#: (#208 downstream consumes it) but no severity was ever assigned - this
+#: module's own judgment call (the design names the three severities but
+#: does not pin one to each reason code, the same open call
+#: readiness_artifact.py's per-check severities already are). None of
+#: this slice's reason codes ever stop the SCAN from publishing (that
+#: class of failure - a fatal confinement/publication error - publishes
+#: no run and no problems.json at all) - every one instead means "one
+#: entry was omitted, or one adapter's evidence is missing", real
+#: degradation, never merely informational. All warning, pending a
+#: future distinction if review wants one; PROVISIONAL like every other
+#: not-yet-measured judgment call in this module.
+_PROBLEM_SEVERITY_BY_REASON_CODE = {
+    "parse_failed": "warning",
+    "path_excluded": "warning",
+    "resource_limit": "warning",
+    "non_utf8_path": "warning",
+    "case_collision": "warning",
+}
+_DEFAULT_PROBLEM_SEVERITY = "warning"
+
+
+def _problem_record(reason_code: str, path: str | None, detail: str) -> dict[str, Any]:
+    return {
+        "problem_id": digests.problem_id(reason_code=reason_code, path=path, detail=detail),
+        "reason_code": reason_code,
+        "severity": _PROBLEM_SEVERITY_BY_REASON_CODE.get(reason_code, _DEFAULT_PROBLEM_SEVERITY),
+        "path": path,
+        "detail": detail,
+    }
+
+
 def _artifact_summary(
     *, name: str, artifact_type: str, schema_version: int, record_count: int,
     doc: dict[str, Any], canonical_bytes: bytes,
@@ -283,16 +316,14 @@ def run_scan(
         case_collisions = find_case_fold_collisions(relative_paths)
 
         problems = [
-            {"reason_code": p["reason_code"], "path": p.get("path"), "detail": p["detail"]}
+            _problem_record(p["reason_code"], p.get("path"), p["detail"])
             for p in discovery_result.problems
         ] + [
-            {"reason_code": p.reason_code, "path": p.relative_path, "detail": p.detail}
+            _problem_record(p.reason_code, p.relative_path, p.detail)
             for p in worker_result.problems
         ] + [
-            {
-                "reason_code": "case_collision", "path": second,
-                "detail": bounded_detail(f"case-folds identically to {first!r}"),
-            }
+            _problem_record(
+                "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
             for first, second in case_collisions
         ]
         status = "degraded" if (discovery_result.degraded or problems) else "complete"

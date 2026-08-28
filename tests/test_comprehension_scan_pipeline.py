@@ -329,10 +329,18 @@ def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
     assert outcome.status == "degraded"
     assert (outcome.run_dir / "problems.json").exists()
     doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
-    assert doc["problems"] == [{
-        "reason_code": "parse_failed", "path": "src/main/java/p/App.java",
-        "detail": "synthetic problem for the B2 regression test",
-    }]
+    # N3 (third cold read, fix round 5): problem_id/severity are now part
+    # of the record shape (the design's own "stable ID... severity"
+    # requirement) - checked individually rather than folded into one
+    # dict-equality assertion, so this test still reads as "the synthetic
+    # problem survived to problems.json" rather than as a schema pin.
+    assert len(doc["problems"]) == 1
+    problem = doc["problems"][0]
+    assert problem["reason_code"] == "parse_failed"
+    assert problem["path"] == "src/main/java/p/App.java"
+    assert problem["detail"] == "synthetic problem for the B2 regression test"
+    assert problem["severity"] == "warning"
+    assert problem["problem_id"]
 
     report = scan_pipeline.get_report(java_repo)
     assert report["problems"] == doc["problems"]
