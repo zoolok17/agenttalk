@@ -579,6 +579,27 @@ def test_run_scan_refuses_an_empty_scope(tmp_path: Path) -> None:
     assert not staging_root.is_dir() or list(staging_root.iterdir()) == []
 
 
+def test_empty_scope_refusal_names_the_global_roots_actual_position(tmp_path: Path) -> None:
+    """N1 (fifth cold read, fix round 8): "--root" is the GLOBAL flag
+    (registered on the top-level parser before subparsers), not a
+    comprehension subcommand option - empirically verified:
+    `agenttalk --root <path> comprehension scan` works, while
+    `agenttalk comprehension scan --root <path>` fails with
+    "unrecognized arguments" (comprehension's own subparser defines no
+    --root of its own). The bare word "--root" invited a reader to place
+    it after the subcommand instead; the refusal now names where it
+    actually has to go."""
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)  # noqa: S603,S607  # nosec B603 B607
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    (tmp_path / ".git" / "info" / "exclude").write_text(".agenttalk/\n", encoding="utf-8")
+
+    with pytest.raises(scan_pipeline.ScanRefused, match=r"agenttalk --root <path> comprehension scan"):
+        scan_pipeline.run_scan(tmp_path)
+
+
 def test_run_scan_reclaims_an_abandoned_staging_dir_from_a_prior_crash(
     java_repo: Path, monkeypatch,
 ) -> None:

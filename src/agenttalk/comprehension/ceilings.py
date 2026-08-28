@@ -124,9 +124,20 @@ def measure_staging_artifacts(
 #: deferred gap - see scan_pipeline.py's own module docstring). Naming a
 #: nonexistent remedy is worse than naming none; this states what IS
 #: actually true and actionable this slice.
+#:
+#: N1 (fifth cold read, fix round 8): "--root" is the GLOBAL flag (added
+#: by launch_admission.add_agenttalk_launch_arguments to the top-level
+#: parser, before subparsers) - it must precede the "comprehension"
+#: subcommand itself (empirically verified: `agenttalk --root <path>
+#: comprehension scan` works; `agenttalk comprehension scan --root
+#: <path>` fails with "unrecognized arguments", since comprehension's
+#: own subparser defines no --root of its own). Bare "--root" invited a
+#: reader to place it after the subcommand instead - named explicitly
+#: here so this refusal's own remedy actually works if followed.
 _NARROW_SCOPE_HINT = (
-    "this slice has no --scope/--exclude narrowing yet - point --root at a "
-    "smaller project, or split the scan"
+    "this slice has no --scope/--exclude narrowing yet - point the global --root at a "
+    "smaller project (e.g. `agenttalk --root <path> comprehension scan` - --root must "
+    "precede the comprehension subcommand), or split the scan"
 )
 
 

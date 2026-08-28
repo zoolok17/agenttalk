@@ -290,9 +290,18 @@ def run_scan(
             # names this a caller mistake (wrong --root, or an
             # over-broad exclusion policy), never a legitimate result to
             # publish and hand back as "complete".
+            #
+            # N1 (fifth cold read, fix round 8): "--root" is the GLOBAL
+            # flag, not a comprehension subcommand option - it must
+            # precede "comprehension" itself (`agenttalk --root <path>
+            # comprehension scan`; placed after, it is an "unrecognized
+            # argument"). The resolved root is already named above; this
+            # names the remedy's actual shape too, empirically verified.
             raise ScanRefused(
                 f"no files were enumerated under {root} - refusing to publish a "
-                "vacuous zero-unit run; check --root and the exclusion policy")
+                "vacuous zero-unit run; check the global --root (it must precede the "
+                "comprehension subcommand, e.g. `agenttalk --root <path> comprehension "
+                "scan`) and the exclusion policy")
 
         staging_handle = staging.create_staging_dir(scan_id=scan_id, lock_handle=lock_handle)
         generated_at = _utc_now_iso(now)
