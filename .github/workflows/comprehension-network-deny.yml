@@ -41,13 +41,6 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       AGENTTALK_AUTHORIZE_NETWORK_DENY_TEST: '1'
-      # Canary credentials: the design's own release-evidence contract -
-      # these must never reach the sanitized worker, and this job proves
-      # both that the worker's own env allowlist strips them AND that the
-      # OS-level network denial would catch an attempt even if it didn't.
-      ANTHROPIC_API_KEY: canary-should-never-reach-the-worker
-      HTTP_PROXY: http://canary-proxy.invalid:8080
-      HTTPS_PROXY: http://canary-proxy.invalid:8080
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -63,6 +56,19 @@ jobs:
       - name: Confirm passwordless sudo (required for unshare --net)
         run: sudo -n true
       - name: Run worker + adapter + network-deny tests
+        # Canary credentials scoped to THIS STEP ONLY (lead's fix-round
+        # finding, 2026-08-28): at job level, checkout/setup-python/pip
+        # install also inherited HTTP_PROXY/HTTPS_PROXY and failed
+        # resolving canary-proxy.invalid before any test ever ran - the
+        # network-deny mechanism worked, it just strangled the wrong
+        # process. These are the design's own release-evidence contract
+        # (provider keys and proxy variables in the PARENT environment,
+        # never reaching the sanitized worker) - they must reach only the
+        # test invocation, never the steps that set the job up.
+        env:
+          ANTHROPIC_API_KEY: canary-should-never-reach-the-worker
+          HTTP_PROXY: http://canary-proxy.invalid:8080
+          HTTPS_PROXY: http://canary-proxy.invalid:8080
         run: >
           python -I -m pytest -v
           tests/test_comprehension_worker.py
@@ -76,9 +82,6 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       AGENTTALK_AUTHORIZE_NETWORK_DENY_TEST: '1'
-      ANTHROPIC_API_KEY: canary-should-never-reach-the-worker
-      HTTP_PROXY: http://canary-proxy.invalid:8080
-      HTTPS_PROXY: http://canary-proxy.invalid:8080
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -92,6 +95,13 @@ jobs:
           python -I -m pip install -r dev-gate-requirements.txt
           python -I -m pip install --no-deps --no-build-isolation .
       - name: Run worker + adapter + network-deny tests
+        # Canary credentials scoped to THIS STEP ONLY - see the linux
+        # job's identical comment; job-level env broke checkout/setup/pip
+        # install here the same way.
+        env:
+          ANTHROPIC_API_KEY: canary-should-never-reach-the-worker
+          HTTP_PROXY: http://canary-proxy.invalid:8080
+          HTTPS_PROXY: http://canary-proxy.invalid:8080
         run: >
           python -I -m pytest -v
           tests/test_comprehension_worker.py
