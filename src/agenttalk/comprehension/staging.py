@@ -15,6 +15,17 @@ The owner-death classification mirrors ``lock.py``'s exactly (same
 provably-dead-or-leave-it-alone contract) — a staging directory is never
 guessed away, only ever removed when its owner.json names a definitely
 dead local process on this same host.
+
+Note 10 (third cold read, PR-B fix round 5): a scan that fails at or
+after staging creation, while its own process is still alive (has not
+yet crashed or exited), leaves a staging directory that prune correctly
+RETAINS — this is DESIGNED, not a leak: the directory is bounded (one
+per failed attempt) and self-clearing the moment the creating process
+actually ends (the next reclaim, automatic or via ``prune --staging``,
+sees a dead owner and removes it then). The design's own dead-or-leave-
+it-alone contract forbids removing a live owner's directory even when
+that owner's scan has already failed internally; there is no unbounded
+accumulation risk this doesn't already resolve on its own.
 """
 
 from __future__ import annotations
