@@ -45,6 +45,7 @@ from .digests import canonical_content_digest
 from .envelope import (
     EnvelopeError,
     read_json_document,
+    require_field,
     resolve_under_root,
     validate_envelope,
     validate_scan_id,
@@ -242,7 +243,14 @@ def _build_successor_index(
     prior_doc: dict | None, *, scan_id: str, run_summary: dict,
     predecessor_digest: str | None, now: datetime | None,
 ) -> dict:
-    prior_runs = list(prior_doc["runs"]) if prior_doc else []
+    # MAJOR 2 (fifth cold read, fix round 8): the WRITE path is exposed
+    # to the exact same malformed-document risk every READ path already
+    # guards against - a prior index.json missing its own "runs" key
+    # (envelope-valid otherwise) raised an untyped KeyError here, in the
+    # middle of publishing a brand-new, otherwise-healthy scan, rather
+    # than the same typed refusal a malformed document gets everywhere
+    # else in this package.
+    prior_runs = list(require_field(prior_doc, "runs", doc_name="index.json")) if prior_doc else []
     runs = ([dict(run_summary)] + prior_runs)[:_INDEX_RUNS_MAX]
     return {
         "schema_version": INDEX_SCHEMA_VERSION,

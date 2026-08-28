@@ -50,6 +50,7 @@ from .adapters import java as java_adapter
 from .envelope import (
     find_case_fold_collisions,
     read_json_document,
+    require_field,
     resolve_under_root,
     validate_envelope,
     validate_scan_id,
@@ -602,12 +603,25 @@ def _scan_field(scan_doc: dict[str, Any], key: str, scan_id: str) -> Any:
     never a bare KeyError. round 6's N1 fix moved status off the record-
     conversion loop entirely (the one place M1's guard lived), leaving
     scan.json - the ONE artifact status still reads - with no guard of its
-    own on the exact same malformed-body shape."""
-    try:
-        return scan_doc[key]
-    except KeyError as exc:
-        raise ComprehensionError(
-            f"{scan_id}'s scan.json is missing required field {key!r}") from exc
+    own on the exact same malformed-body shape.
+
+    MAJOR 2 (fifth cold read, fix round 8): now a thin wrapper around
+    envelope.require_field, the ONE typed-access helper for every field
+    read off any loaded published document - closing this class for
+    good rather than growing a fourth/fifth hand-rolled per-document
+    guard."""
+    return require_field(scan_doc, key, doc_name=f"{scan_id}'s scan.json")
+
+
+def _index_field(index_doc: dict[str, Any], key: str) -> Any:
+    """MAJOR 2 (fifth cold read, fix round 8): index.json's own body
+    fields (``latest_scan_id``, ``runs``) were read with raw, unguarded
+    subscripts in get_status/get_report/validate_run - a malformed-but-
+    envelope-valid index.json (a real, on-disk scenario every OTHER
+    loaded document in this package already guards against) raised an
+    untyped KeyError straight through the real CLI. Mirrors _scan_field
+    for the other loaded document every read command starts from."""
+    return require_field(index_doc, key, doc_name="index.json")
 
 
 #: Round 7b (reviewer-3 delta on 84ef111): the index run-summary
@@ -707,15 +721,15 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     index_doc, index_digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root}")
-    scan_id = run_id or index_doc["latest_scan_id"]
+    scan_id = run_id or _index_field(index_doc, "latest_scan_id")
     run_dir = _resolved_run_dir(comprehension_dir, scan_id)
     scan_doc = _load_single_artifact(
         run_dir, scan_id, "scan.json", SCAN_ARTIFACT_TYPE, SCAN_SCHEMA_VERSION)
     anchor_state = _scan_json_anchor_state(index_doc, scan_id, scan_doc, run_dir)
     return {
-        "latest_scan_id": index_doc["latest_scan_id"],
+        "latest_scan_id": _index_field(index_doc, "latest_scan_id"),
         "index_digest": index_digest,
-        "run_summaries": index_doc["runs"],
+        "run_summaries": _index_field(index_doc, "runs"),
         "scan_id": _scan_field(scan_doc, "scan_id", scan_id),
         "status": _scan_field(scan_doc, "status", scan_id),
         "generated_at": _scan_field(scan_doc, "generated_at", scan_id),
@@ -839,7 +853,7 @@ def get_report(
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root}")
-    scan_id = run_id or index_doc["latest_scan_id"]
+    scan_id = run_id or _index_field(index_doc, "latest_scan_id")
     records = _load_run_records(comprehension_dir, scan_id)
     anchor_state = _scan_json_anchor_state(index_doc, scan_id, records["scan"], records["run_dir"])
     _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
@@ -893,20 +907,34 @@ def _verify_artifact_digests(
     if not declared_artifacts:
         raise ComprehensionError("scan.json is missing its artifacts digest summary")
     for entry in declared_artifacts:
-        name = entry["name"]
+        # MAJOR 2 (fifth cold read, fix round 8): every field this loop -
+        # and digests.run_content_digest below, over these SAME entries -
+        # reads off a loaded scan.json artifacts entry now goes through
+        # require_field, never a raw subscript. digests.py stays
+        # dependency-free (it never imports envelope.py); validating
+        # every field it will need UP FRONT here means a missing one
+        # raises with a clear, typed message before ever reaching that
+        # generic helper's own bare subscript.
+        name = require_field(entry, "name", doc_name="scan.json's artifacts entry")
+        entry_label = f"scan.json's {name} artifacts entry"
         doc = raw_docs.get(name)
         if doc is None:
             raise ComprehensionError(f"scan.json names an artifact {name!r} that was never loaded")
-        if digests.canonical_content_digest(doc) != entry["content_digest"]:
+        if digests.canonical_content_digest(doc) != require_field(
+            entry, "content_digest", doc_name=entry_label,
+        ):
             raise ComprehensionError(
                 f"{name}'s content_digest does not match its declared value in scan.json")
         try:
             actual_byte_sha256 = digests.sha256_file(run_dir / name)
         except OSError as exc:
             raise ComprehensionError(f"{name}'s bytes could not be read for verification: {exc}") from exc
-        if actual_byte_sha256 != entry["byte_sha256"]:
+        if actual_byte_sha256 != require_field(entry, "byte_sha256", doc_name=entry_label):
             raise ComprehensionError(
                 f"{name}'s byte_sha256 does not match its declared value in scan.json")
+        require_field(entry, "artifact_type", doc_name=entry_label)
+        require_field(entry, "schema_version", doc_name=entry_label)
+        require_field(entry, "record_count", doc_name=entry_label)
     if digests.run_content_digest(declared_artifacts) != scan_doc.get("content_digest"):
         raise ComprehensionError(
             "scan.json's run-level content_digest does not match its declared artifacts")
@@ -923,7 +951,7 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root}")
-    scan_id = run_id or index_doc["latest_scan_id"]
+    scan_id = run_id or _index_field(index_doc, "latest_scan_id")
     # Round 7b: a default the anchor state stays at if an EARLIER step in
     # the try block below (record loading/conversion, the required-field
     # check) fails first - this run's scan.json integrity genuinely was

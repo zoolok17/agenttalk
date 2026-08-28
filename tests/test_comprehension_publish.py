@@ -100,6 +100,37 @@ def test_index_runs_list_is_bounded(tmp_path: Path, monkeypatch) -> None:
     assert [r["scan_id"] for r in doc["runs"]] == ["scan-4", "scan-3", "scan-2"]
 
 
+def test_publish_index_cas_refuses_a_prior_index_missing_runs_instead_of_crashing(
+    tmp_path: Path,
+) -> None:
+    """MAJOR 2 (fifth cold read, fix round 8): the WRITE path
+    (_build_successor_index) read a PRIOR index.json's own "runs" field
+    with a raw, unguarded subscript - a malformed-but-envelope-valid
+    prior index.json missing "runs" (envelope validation only requires
+    schema_version/artifact_type/scan_id/generated_at, never index.json's
+    OWN fields) raised an untyped KeyError in the middle of publishing a
+    brand-new, otherwise-healthy scan, rather than the same typed
+    refusal a malformed document gets everywhere else in this package."""
+    index_path = tmp_path / "index.json"
+    malformed = {
+        "schema_version": pub.INDEX_SCHEMA_VERSION,
+        "artifact_type": pub.INDEX_ARTIFACT_TYPE,
+        "scan_id": "scan-0",
+        "generated_at": "2026-01-01T00:00:00Z",
+        "latest_scan_id": "scan-0",
+        "predecessor_digest": None,
+        # "runs" deliberately omitted.
+    }
+    index_path.write_text(json.dumps(malformed), encoding="utf-8")
+    _doc, digest = pub.read_current_index(tmp_path)
+
+    with pytest.raises(ComprehensionError, match="runs"):
+        pub.publish_index_cas(
+            tmp_path, scan_id="scan-1", run_summary={"scan_id": "scan-1"},
+            predecessor_index_digest=digest,
+        )
+
+
 # ----------------------------------------------------------- ownership cross-check (finding 2)
 
 def test_rename_refuses_a_staging_handle_from_a_different_lock(

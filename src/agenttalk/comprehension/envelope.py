@@ -40,6 +40,28 @@ _REQUIRED_ENVELOPE_FIELDS = ("schema_version", "artifact_type", "scan_id", "gene
 _SCAN_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
+def require_field(doc: dict[str, Any], key: str, *, doc_name: str) -> Any:
+    """MAJOR 2 (fifth cold read, fix round 8): the ONE typed-access
+    helper for every field read off an already-loaded, previously-
+    published document (scan.json, index.json, a per-artifact digest-
+    summary entry inside scan.json, ...) - a missing key raises the
+    same typed :class:`EnvelopeError` every other malformed-document
+    shape this package already raises, never a bare ``KeyError``. Round
+    6 closed this class for per-artifact RECORD conversion
+    (``_records``); round 7 closed it for scan.json's own top-level
+    scalar fields (``_scan_field``); round 8 closes it AS A CLASS: every
+    remaining raw subscript into a loaded document - on both the READ
+    path (``get_status``/``get_report``/``validate_run``,
+    ``_verify_artifact_digests``'s per-artifact digest-summary entries)
+    and the WRITE path (``publish._build_successor_index``'s own read of
+    a prior index) - routes through this one helper instead of a
+    fourth, fifth, and sixth hand-rolled guard."""
+    try:
+        return doc[key]
+    except KeyError as exc:
+        raise EnvelopeError(f"{doc_name} is missing required field {key!r}") from exc
+
+
 def _reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """``object_pairs_hook`` for :func:`json.loads` — mirrors the existing
     per-module convention (e.g. ``gates._reject_duplicate_members``): a

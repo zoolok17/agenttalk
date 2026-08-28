@@ -709,6 +709,86 @@ def test_get_status_before_any_scan_raises_not_scanned(tmp_path: Path) -> None:
         scan_pipeline.get_status(tmp_path)
 
 
+def _delete_index_field(java_repo: Path, key: str) -> None:
+    import json
+
+    index_path = scan_pipeline.paths.index_path(
+        scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk"))
+    doc = json.loads(index_path.read_text(encoding="utf-8"))
+    del doc[key]
+    index_path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_get_status_refuses_an_index_json_missing_latest_scan_id_instead_of_crashing(
+    java_repo: Path,
+) -> None:
+    """MAJOR 2 (fifth cold read, fix round 8): index.json's own body
+    fields (latest_scan_id/runs) were read with raw, unguarded subscripts
+    in get_status/get_report/validate_run - envelope validation only
+    requires schema_version/artifact_type/scan_id/generated_at, never
+    index.json's OWN fields, so a malformed-but-envelope-valid index.json
+    missing latest_scan_id raised an untyped KeyError straight through
+    every read command."""
+    scan_pipeline.run_scan(java_repo)
+    _delete_index_field(java_repo, "latest_scan_id")
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="latest_scan_id"):
+        scan_pipeline.get_status(java_repo)
+    with pytest.raises(scan_pipeline.ComprehensionError, match="latest_scan_id"):
+        scan_pipeline.get_report(java_repo)
+    with pytest.raises(scan_pipeline.ComprehensionError, match="latest_scan_id"):
+        scan_pipeline.validate_run(java_repo)
+
+
+def test_get_status_refuses_an_index_json_missing_runs_instead_of_crashing(
+    java_repo: Path,
+) -> None:
+    scan_pipeline.run_scan(java_repo)
+    _delete_index_field(java_repo, "runs")
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="runs"):
+        scan_pipeline.get_status(java_repo)
+
+
+def _delete_scan_json_artifact_field(java_repo: Path, run_dir: Path, key: str) -> None:
+    import json
+
+    scan_path = run_dir / "scan.json"
+    doc = json.loads(scan_path.read_text(encoding="utf-8"))
+    del doc["artifacts"][0][key]
+    canonical_bytes = scan_pipeline.digests.canonical_json_bytes(doc)
+    scan_path.write_bytes(canonical_bytes)
+    # Re-sign the index anchor so this isolates the artifacts-entry
+    # guard from the separate scan.json anchor-mismatch check.
+    index_path = scan_pipeline.paths.index_path(
+        scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk"))
+    index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+    for run_summary in index_doc["runs"]:
+        run_summary["scan_json_byte_sha256"] = scan_pipeline.digests.sha256_bytes(canonical_bytes)
+        run_summary["scan_json_content_digest"] = scan_pipeline.digests.canonical_content_digest(doc)
+    index_path.write_text(json.dumps(index_doc), encoding="utf-8")
+
+
+def test_get_report_and_validate_refuse_a_scan_json_artifacts_entry_missing_byte_sha256(
+    java_repo: Path,
+) -> None:
+    """MAJOR 2 (fifth cold read, fix round 8): _verify_artifact_digests
+    indexed scan.json's own "artifacts" digest-summary entries with raw,
+    unguarded subscripts - an entry missing byte_sha256 (envelope-valid
+    otherwise) raised an untyped KeyError through report, and through
+    validate too (whose crash-as-exit-1 was indistinguishable from its
+    own legitimate valid:false, also exit 1)."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _delete_scan_json_artifact_field(java_repo, outcome.run_dir, "byte_sha256")
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="byte_sha256"):
+        scan_pipeline.get_report(java_repo)
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "byte_sha256" in result["detail"]
+
+
 # ----------------------------------------------------------- get_report
 
 def test_get_report_returns_the_projection(java_repo: Path) -> None:
