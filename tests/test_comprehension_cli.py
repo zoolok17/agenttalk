@@ -228,6 +228,53 @@ def test_report_and_validate_refuse_a_malformed_artifact_record_via_the_real_cli
     assert "malformed record" in payload["detail"]
 
 
+def test_status_refuses_a_malformed_scan_json_body_via_the_real_cli(
+    java_repo: Path, capsys,
+) -> None:
+    """MAJOR 2 (fifth cold read, fix round 7): round 6's N1 fix moved
+    status off the shared record-conversion loop (the one place M1's
+    guard lived) so it never loads modules/dependencies/features/
+    readiness/problems at all - but that exclusion left scan.json, the
+    ONE artifact status still reads, with no guard of its own on the
+    exact same malformed-body shape M1 fixed for everything else. status
+    used to raise an untyped KeyError straight through the real CLI on a
+    scan.json that is envelope-valid but missing a required body field;
+    it must now exit 2 with a typed stderr message instead.
+
+    The mutated scan.json is re-signed against index.json's own anchor
+    (MAJOR 3, this same round) so this test isolates the missing-field
+    guard from that separate anchor-mismatch guard - both are legitimate
+    typed refusals, but a body genuinely missing a required key (e.g. a
+    future writer bug) is a distinct scenario from a tampered/stale
+    on-disk file, and each needs its own proof."""
+    import json as jsonmod
+
+    from agenttalk.comprehension import digests as digestmod
+
+    _run(["comprehension", "scan", "--json"], java_repo)
+    capsys.readouterr()
+    comp_dir = java_repo / ".agenttalk" / "comprehension"
+    index_path = comp_dir / "index.json"
+    index_doc = jsonmod.loads(index_path.read_text(encoding="utf-8"))
+    scan_id = index_doc["latest_scan_id"]
+    scan_path = comp_dir / "runs" / scan_id / "scan.json"
+    doc = jsonmod.loads(scan_path.read_text(encoding="utf-8"))
+    del doc["problem_count"]
+    canonical_bytes = digestmod.canonical_json_bytes(doc)
+    scan_path.write_bytes(canonical_bytes)
+    for run_summary in index_doc["runs"]:
+        if run_summary["scan_id"] == scan_id:
+            run_summary["scan_json_byte_sha256"] = digestmod.sha256_bytes(canonical_bytes)
+            run_summary["scan_json_content_digest"] = digestmod.canonical_content_digest(doc)
+    index_path.write_text(jsonmod.dumps(index_doc), encoding="utf-8")
+
+    exit_code = _run(["comprehension", "status", "--json"], java_repo)
+    err = capsys.readouterr().err
+    assert exit_code == 2, f"status exited {exit_code}, expected 2 (typed refusal)"
+    assert "agenttalk:" in err, f"status produced no typed stderr message: {err!r}"
+    assert "problem_count" in err
+
+
 # ----------------------------------------------------------- prune --staging (M-5)
 
 def test_prune_staging_reclaims_a_dead_owners_abandoned_directory(

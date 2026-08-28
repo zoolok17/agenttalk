@@ -807,6 +807,94 @@ def test_get_status_does_not_verify_unrelated_artifacts_by_design(
     assert result["valid"] is False
 
 
+# ------------------------------------------ MAJOR 3 (fifth cold read, fix round 7):
+# scan.json integrity anchoring
+
+def _rewrite_scan_json_whitespace_only(run_dir: Path) -> None:
+    """A bytes-only tamper: identical parsed value, different bytes on
+    disk - mirrors _rewrite... for modules.json above
+    (test_validate_run_catches_a_whitespace_only_rewrite_of_an_artifact),
+    now applied to scan.json itself, which nothing previously anchored."""
+    import json
+
+    scan_path = run_dir / "scan.json"
+    doc = json.loads(scan_path.read_text(encoding="utf-8"))
+    scan_path.write_text(json.dumps(doc, indent=4, sort_keys=True), encoding="utf-8")
+
+
+def _falsify_scan_json_semantically(run_dir: Path) -> None:
+    """A semantic tamper: a genuinely different parsed value - falsifies
+    completeness and the fingerprint, the strongest positive claim
+    status/validate make, exactly the shape the dispatch names."""
+    import json
+
+    scan_path = run_dir / "scan.json"
+    doc = json.loads(scan_path.read_text(encoding="utf-8"))
+    doc["fingerprint_complete"] = True
+    doc["whole_scope_fingerprint"] = "0" * 64
+    scan_path.write_text(
+        scan_pipeline.digests.canonical_json_bytes(doc).decode("utf-8"), encoding="utf-8")
+
+
+def test_get_status_catches_a_bytes_only_tamper_of_scan_json(java_repo: Path) -> None:
+    """MAJOR 3 (fifth cold read, fix round 7): scan.json is the ROOT of
+    the integrity chain - every other artifact is verified against a
+    digest scan.json itself declares, but nothing external to scan.json
+    ever recorded what ITS OWN digest should be. A bytes-only rewrite of
+    scan.json (identical parsed content) used to pass status healthy;
+    it must now be caught against the byte_sha256 anchor index.json
+    records at publish time."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _rewrite_scan_json_whitespace_only(outcome.run_dir)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="byte_sha256"):
+        scan_pipeline.get_status(java_repo)
+
+
+def test_get_status_catches_a_semantic_tamper_of_scan_json(java_repo: Path) -> None:
+    """MAJOR 3 (fifth cold read, fix round 7): a semantic tamper -
+    falsifying fingerprint_complete/whole_scope_fingerprint - used to
+    pass status healthy and would have made validate report VALID:TRUE,
+    its all-verified message, on a modified run. A semantic tamper
+    necessarily changes the on-disk bytes too (re-canonicalized from the
+    falsified value), so either anchor check catching it is a correct,
+    sufficient outcome - not specifically content_digest."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _falsify_scan_json_semantically(outcome.run_dir)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="content_digest|byte_sha256"):
+        scan_pipeline.get_status(java_repo)
+
+
+def test_validate_run_catches_a_bytes_only_tamper_of_scan_json(java_repo: Path) -> None:
+    outcome = scan_pipeline.run_scan(java_repo)
+    _rewrite_scan_json_whitespace_only(outcome.run_dir)
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "byte_sha256" in result["detail"]
+
+
+def test_validate_run_catches_a_semantic_tamper_of_scan_json(java_repo: Path) -> None:
+    outcome = scan_pipeline.run_scan(java_repo)
+    _falsify_scan_json_semantically(outcome.run_dir)
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "content_digest" in result["detail"] or "byte_sha256" in result["detail"]
+
+
+def test_get_report_catches_a_semantic_tamper_of_scan_json(java_repo: Path) -> None:
+    """The design's own read-path sentence extends this same anchor
+    check to report (it verifies "the exact-byte digest... of each
+    artifact [it] actually loads", and it loads scan.json)."""
+    outcome = scan_pipeline.run_scan(java_repo)
+    _falsify_scan_json_semantically(outcome.run_dir)
+
+    with pytest.raises(scan_pipeline.ComprehensionError, match="content_digest|byte_sha256"):
+        scan_pipeline.get_report(java_repo)
+
+
 # ----------------------------------------------------------- failure-path lock release (F-2)
 
 def test_run_scan_failure_surfaces_the_original_error_even_if_release_also_fails(

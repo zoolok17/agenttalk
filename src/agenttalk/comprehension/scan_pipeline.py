@@ -509,9 +509,24 @@ def run_scan(
             "artifacts": artifact_summaries,
             "content_digest": run_digest,
         }
-        _write_json_document(staging_handle.path / "scan.json", scan_doc)
+        scan_bytes = _write_json_document(staging_handle.path / "scan.json", scan_doc)
 
-        run_summary = {"scan_id": scan_id, "status": status}
+        # MAJOR 3 (fifth cold read, fix round 7): scan.json is the ROOT of
+        # the integrity chain - every other artifact is verified against a
+        # digest scan.json itself declares (_verify_artifact_digests), but
+        # nothing anchors scan.json's own digest anywhere. index.json's
+        # existing compare-and-set write path is the reviewer's proposed
+        # anchor point: recording scan.json's byte_sha256 and canonical
+        # content_digest here, in the SAME run_summary dict that already
+        # flows unchanged into each index run entry (publish.py's
+        # _build_successor_index), gives status/validate something
+        # external to scan.json to verify it against.
+        run_summary = {
+            "scan_id": scan_id,
+            "status": status,
+            "scan_json_byte_sha256": digests.sha256_bytes(scan_bytes),
+            "scan_json_content_digest": digests.canonical_content_digest(scan_doc),
+        }
     except BaseException as original_exc:
         # F-2 (reviewer-3, PR-B delta review): if the release itself
         # refuses (e.g. ScanLockUnrecoverable), a bare `raise` here would
@@ -542,6 +557,62 @@ class NotScanned(ComprehensionError):
     reason_code = "comprehension_not_scanned"
 
 
+def _scan_field(scan_doc: dict[str, Any], key: str, scan_id: str) -> Any:
+    """MAJOR 2 (fifth cold read, fix round 7): mirrors _load_run_records's
+    own ``_records`` typed-malformed contract (M1, round 6) for scan.json's
+    top-level scalar fields - a missing key raises the same typed
+    ComprehensionError every other malformed-artifact path already raises,
+    never a bare KeyError. round 6's N1 fix moved status off the record-
+    conversion loop entirely (the one place M1's guard lived), leaving
+    scan.json - the ONE artifact status still reads - with no guard of its
+    own on the exact same malformed-body shape."""
+    try:
+        return scan_doc[key]
+    except KeyError as exc:
+        raise ComprehensionError(
+            f"{scan_id}'s scan.json is missing required field {key!r}") from exc
+
+
+def _scan_json_index_anchor(index_doc: dict[str, Any], scan_id: str) -> dict[str, Any]:
+    for run_summary in index_doc.get("runs") or []:
+        if run_summary.get("scan_id") == scan_id:
+            return run_summary
+    raise ComprehensionError(
+        f"{scan_id} has no recorded index anchor for scan.json - its run summary is not "
+        "present in index.json (aged out of the retained window, or the index predates "
+        "this anchor)")
+
+
+def _verify_scan_json_anchor(
+    index_doc: dict[str, Any], scan_id: str, scan_doc: dict[str, Any], run_dir: Path,
+) -> None:
+    """MAJOR 3 (fifth cold read, fix round 7): scan.json is the ROOT of
+    the integrity chain - every OTHER artifact is verified against a
+    digest scan.json itself declares (_verify_artifact_digests), but
+    nothing external to scan.json ever recorded what ITS OWN digest
+    should be, so status/report/validate all implicitly trusted
+    scan.json's on-disk bytes/content as ground truth with no
+    verification step: a bytes-only tamper AND a semantic tamper
+    (falsifying completeness/the fingerprint) both passed status
+    healthy, report clean, and validate VALID:TRUE - the strongest
+    positive claim the plane makes, false on a modified run. run_scan
+    now records scan.json's byte_sha256 and canonical content_digest in
+    index.json's run summary at publish time; this verifies the CURRENT
+    on-disk scan.json against those recorded values, closing the one
+    artifact nothing else anchored."""
+    anchor = _scan_json_index_anchor(index_doc, scan_id)
+    try:
+        actual_byte_sha256 = digests.sha256_file(run_dir / "scan.json")
+    except OSError as exc:
+        raise ComprehensionError(f"scan.json's bytes could not be read for verification: {exc}") from exc
+    if actual_byte_sha256 != anchor.get("scan_json_byte_sha256"):
+        raise ComprehensionError(
+            "scan.json's byte_sha256 does not match its anchor recorded in index.json")
+    if digests.canonical_content_digest(scan_doc) != anchor.get("scan_json_content_digest"):
+        raise ComprehensionError(
+            "scan.json's content_digest does not match its anchor recorded in index.json")
+
+
 def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     """design: "Show the latest run, completeness, source revision/
     fingerprint, freshness, adapter coverage, and problem counts."
@@ -568,22 +639,23 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     run_dir = _resolved_run_dir(comprehension_dir, scan_id)
     scan_doc = _load_single_artifact(
         run_dir, scan_id, "scan.json", SCAN_ARTIFACT_TYPE, SCAN_SCHEMA_VERSION)
+    _verify_scan_json_anchor(index_doc, scan_id, scan_doc, run_dir)
     return {
         "latest_scan_id": index_doc["latest_scan_id"],
         "index_digest": index_digest,
         "run_summaries": index_doc["runs"],
-        "scan_id": scan_doc["scan_id"],
-        "status": scan_doc["status"],
-        "generated_at": scan_doc["generated_at"],
-        "adapters": scan_doc["adapters"],
-        "problem_count": scan_doc["problem_count"],
-        "record_counts": scan_doc["record_counts"],
-        "root_binding": scan_doc["root_binding"],
+        "scan_id": _scan_field(scan_doc, "scan_id", scan_id),
+        "status": _scan_field(scan_doc, "status", scan_id),
+        "generated_at": _scan_field(scan_doc, "generated_at", scan_id),
+        "adapters": _scan_field(scan_doc, "adapters", scan_id),
+        "problem_count": _scan_field(scan_doc, "problem_count", scan_id),
+        "record_counts": _scan_field(scan_doc, "record_counts", scan_id),
+        "root_binding": _scan_field(scan_doc, "root_binding", scan_id),
         # Note 1 (second cold read, fix round 4): this function's own
         # docstring cites the design's "source revision/fingerprint" as
         # part of what status shows - it was never actually returned.
-        "whole_scope_fingerprint": scan_doc["whole_scope_fingerprint"],
-        "fingerprint_complete": scan_doc["fingerprint_complete"],
+        "whole_scope_fingerprint": _scan_field(scan_doc, "whole_scope_fingerprint", scan_id),
+        "fingerprint_complete": _scan_field(scan_doc, "fingerprint_complete", scan_id),
         "freshness": {
             "state": "not_evaluated", "reason_code": "freshness_not_implemented_this_slice",
         },
@@ -696,10 +768,12 @@ def get_report(
         raise NotScanned(f"no comprehension run has ever been published under {root}")
     scan_id = run_id or index_doc["latest_scan_id"]
     records = _load_run_records(comprehension_dir, scan_id)
+    _verify_scan_json_anchor(index_doc, scan_id, records["scan"], records["run_dir"])
     _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
     return projector.project_comprehension(
-        scan_id=records["scan"]["scan_id"], generated_at=records["scan"]["generated_at"],
-        manifest_digest=None, status=records["scan"]["status"],
+        scan_id=_scan_field(records["scan"], "scan_id", scan_id),
+        generated_at=_scan_field(records["scan"], "generated_at", scan_id),
+        manifest_digest=None, status=_scan_field(records["scan"], "status", scan_id),
         modules=records["modules"], dependencies=records["dependencies"],
         entry_points=records["entry_points"], features=records["features"],
         readiness_signals=records["readiness_signals"],
@@ -773,6 +847,7 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     scan_id = run_id or index_doc["latest_scan_id"]
     try:
         records = _load_run_records(comprehension_dir, scan_id)
+        _verify_scan_json_anchor(index_doc, scan_id, records["scan"], records["run_dir"])
         _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
         valid = True
         detail = (
