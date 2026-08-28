@@ -36,6 +36,7 @@ grammar/AST parser - this is coarse S1 evidence per the design's own
 
 from __future__ import annotations
 
+import bisect
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -185,8 +186,24 @@ def _strip_comments_and_strings(text: str) -> str:
     return "".join(result)
 
 
-def _line_at(text: str, offset: int) -> int:
-    return text.count("\n", 0, offset) + 1
+def _newline_offsets(text: str) -> list[int]:
+    """Every newline's offset in ``text``, ascending - built ONCE per file
+    so every per-claim line lookup (:func:`_line_at`) is O(log n), not
+    O(file size) (M11, cold-read PR-B fix round 3: recomputing
+    ``text.count("\\n", 0, offset)`` from offset 0 on every single call -
+    once per import, per type, per invocation, per route match - made the
+    adapter's total cost quadratic in file size; measured 0.27 MiB in
+    0.79s, 0.53 MiB in 3.02s, 1.07 MiB in 12.33s, ~4x per doubling)."""
+    return [i for i, ch in enumerate(text) if ch == "\n"]
+
+
+def _line_at(newline_offsets: list[int], offset: int) -> int:
+    # bisect_LEFT, not bisect_right: matches the original
+    # `text.count("\n", 0, offset) + 1` semantics exactly - a newline AT
+    # `offset` itself must not count as ending its own line early (a
+    # position pointing AT a newline character is still on the line that
+    # newline terminates).
+    return bisect.bisect_left(newline_offsets, offset) + 1
 
 
 def _classify(relative_path: str, simple_name: str | None) -> str:
@@ -284,6 +301,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     """Parse one ``.java`` file's TEXT (already read by the sanitized
     worker - this function never touches the filesystem itself)."""
     sanitized = _strip_comments_and_strings(text)
+    newline_offsets = _newline_offsets(sanitized)
     package_match = _PACKAGE_RE.search(sanitized)
     package = package_match.group(1) if package_match else None
 
@@ -292,7 +310,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     for match in _IMPORT_RE.finditer(sanitized):
         is_static = bool(match.group(1))
         target = match.group(2)
-        imports.append((target, is_static, _line_at(sanitized, match.start())))
+        imports.append((target, is_static, _line_at(newline_offsets, match.start())))
         if not target.endswith(".*"):
             import_simple_names[target.rsplit(".", 1)[-1]] = target
 
@@ -305,7 +323,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             relative_path=relative_path,
             qualified_name=qualified,
             simple_name=simple,
-            line=_line_at(sanitized, brace_pos),
+            line=_line_at(newline_offsets, brace_pos),
             classification=_classify(relative_path, simple),
         )
         for qualified, simple, _container, brace_pos, _extends, _implements in types
@@ -334,7 +352,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         ))
 
     for qualified, simple, _container, brace_pos, extends, implements_raw in types:
-        line = _line_at(sanitized, brace_pos)
+        line = _line_at(newline_offsets, brace_pos)
         if extends:
             for name in _split_type_list(extends):
                 base = name.split("<", 1)[0].strip()
@@ -389,11 +407,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         edges.append(JavaEdgeClaim(
             from_qualified_name=primary_qualified, relation="invoke", target=qualifier,
             target_kind=target_kind, evidence_class="extracted",
-            line=_line_at(sanitized, match.start()), phase="runtime",
+            line=_line_at(newline_offsets, match.start()), phase="runtime",
         ))
 
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
-        line = _line_at(sanitized, match.start())
+        line = _line_at(newline_offsets, match.start())
         path = _route_path(text, match.start(2), match.end(2)) if match.group(2) else None
         target = path or f"{primary_qualified}#{match.group(1)}"
         edges.append(JavaEdgeClaim(
@@ -413,7 +431,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     if main_match is not None:
         entry_points.append(JavaEntryPointClaim(
             qualified_name=primary_qualified, kind="cli_main", name="main",
-            line=_line_at(sanitized, main_match.start()), evidence_class="extracted",
+            line=_line_at(newline_offsets, main_match.start()), evidence_class="extracted",
         ))
 
     return JavaFileResult(units=units, edges=edges, entry_points=entry_points)
@@ -432,13 +450,14 @@ def parse_maven_pom(relative_path: str, text: str) -> list[JavaEdgeClaim]:
     shape - no XML parser (and its entity-expansion surface) needed for
     two flat child elements."""
     from_name = relative_path
+    newline_offsets = _newline_offsets(text)
     edges = []
     for match in _DEPENDENCY_RE.finditer(text):
         group_id, artifact_id = match.group(1).strip(), match.group(2).strip()
         edges.append(JavaEdgeClaim(
             from_qualified_name=from_name, relation="build",
             target=f"{group_id}:{artifact_id}", target_kind="external",
-            evidence_class="declared", line=_line_at(text, match.start()), phase="build",
+            evidence_class="declared", line=_line_at(newline_offsets, match.start()), phase="build",
         ))
     return edges
 
@@ -455,11 +474,12 @@ def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
     ``<url-pattern>`` pairs in a ``web.xml`` - the same "trivially present,
     named, no inference" bar as the annotation-based routes above."""
     entry_points = []
+    newline_offsets = _newline_offsets(text)
     for match in _SERVLET_MAPPING_RE.finditer(text):
         servlet_name, url_pattern = match.group(1).strip(), match.group(2).strip()
         entry_points.append(JavaEntryPointClaim(
             qualified_name=f"{relative_path}#{servlet_name}", kind="http_route",
-            name=url_pattern, line=_line_at(text, match.start()), evidence_class="declared",
+            name=url_pattern, line=_line_at(newline_offsets, match.start()), evidence_class="declared",
         ))
     return entry_points
 

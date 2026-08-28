@@ -50,6 +50,14 @@ _ADAPTER_EXTENSIONS = {".java": java_adapter}
 WORKER_SCHEMA_VERSION = 1
 _WORKER_TIMEOUT_SECONDS = 300.0
 
+#: M11 (cold-read, PR-B fix round 3): the design lists "adapter work"
+#: among the resource caps (alongside file count/bytes/nesting), but none
+#: existed - only the whole-worker _WORKER_TIMEOUT_SECONDS, which aborts
+#: the ENTIRE scan (no published run at all) rather than degrading just
+#: the one problematic file. PROVISIONAL, like the other caps in
+#: discovery.py, pending the PR-B exit-gate measurement.
+_MAX_ADAPTER_INPUT_BYTES = 8 * 1024 * 1024
+
 #: The worker gets ONLY what a pure, offline, file-reading Python process
 #: needs to start - never provider credentials, proxy variables, bus/session
 #: state, or any other ambient configuration a network-capable tool could
@@ -170,6 +178,22 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
 
         adapter = next(
             (mod for ext, mod in _ADAPTER_EXTENSIONS.items() if rel.endswith(ext)), None)
+        adapter_eligible = adapter is not None or Path(rel).name in ("pom.xml", "web.xml")
+        if adapter_eligible and len(data) > _MAX_ADAPTER_INPUT_BYTES:
+            # M11 (cold-read, PR-B fix round 3): the design lists adapter
+            # work among the resource caps, but none existed - a
+            # pathologically large file could only be caught by the
+            # WHOLE-WORKER 300s timeout, which aborts the ENTIRE scan with
+            # no published run at all, not a bounded, degraded one. This
+            # file still gets its base WorkerFileClaim above (still
+            # addressable); only adapter analysis is skipped, as a named,
+            # bounded resource_limit problem - a scan cap degrades the
+            # run, it never silently samples or aborts wholesale.
+            problems.append(WorkerProblem(
+                reason_code="resource_limit", relative_path=rel,
+                detail=f"{len(data)} bytes exceeds the {_MAX_ADAPTER_INPUT_BYTES}-byte "
+                       "per-file adapter-work cap - adapter analysis skipped"))
+            continue
         if adapter is not None:
             try:
                 text = data.decode("utf-8", errors="replace")

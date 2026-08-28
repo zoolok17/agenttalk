@@ -87,6 +87,26 @@ def test_process_paths_reports_an_unreadable_path_as_a_problem(tmp_path: Path) -
     assert result.problems[0].reason_code == "parse_failed"
 
 
+def test_process_paths_caps_adapter_work_and_degrades_instead_of_aborting(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """M11 (cold-read, PR-B fix round 3): the design lists "adapter work"
+    among the resource caps, but none existed - the file still gets its
+    base WorkerFileClaim (still addressable), and the scan degrades via a
+    bounded resource_limit problem, instead of the only prior option (the
+    whole-worker timeout aborting the entire scan with no published run
+    at all)."""
+    monkeypatch.setattr(worker, "_MAX_ADAPTER_INPUT_BYTES", 10)
+    (tmp_path / "Big.java").write_text(
+        "package p;\nclass Big {\n  void run() { Foo.bar(); }\n}\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["Big.java"])
+    assert result.file_claims[0].relative_path == "Big.java"  # still addressable
+    assert "Big.java" not in result.java_results  # adapter analysis skipped
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "resource_limit"
+    assert result.problems[0].relative_path == "Big.java"
+
+
 def test_process_paths_dispatches_pom_xml_through_the_java_results_channel(
     tmp_path: Path,
 ) -> None:

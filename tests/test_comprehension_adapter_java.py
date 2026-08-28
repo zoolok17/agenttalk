@@ -340,3 +340,33 @@ def test_parse_web_xml_extracts_servlet_mapping_routes():
 
 def test_unsupported_relations_are_named_not_silently_omitted():
     assert java.UNSUPPORTED_RELATIONS == ("data", "configuration")
+
+
+# ----------------------------------------------------------- line lookup perf (M11)
+
+def test_line_at_matches_naive_line_counting_for_every_offset():
+    text = "line1\nline2\nline3\nline4\n"
+    offsets = java._newline_offsets(text)
+    for probe in range(len(text)):
+        assert java._line_at(offsets, probe) == text.count("\n", 0, probe) + 1
+
+
+def test_parsing_a_large_file_completes_well_under_a_generous_bound():
+    """M11 (cold-read, PR-B fix round 3): _line_at previously recomputed a
+    line count from offset 0 on EVERY call - once per import, per type,
+    per invocation, per route match - making the adapter's total cost
+    quadratic in file size (measured pre-fix: 0.27 MiB in 0.79s, 0.53 MiB
+    in 3.02s, 1.07 MiB in 12.33s, ~4x per doubling; the 64 MiB per-file cap
+    extrapolates to hours). A generous bound here (not a tight benchmark,
+    to avoid CI flakiness) would fail hard under the old quadratic
+    behavior but comfortably passes under the fixed O(n) + O(log n)-per-
+    lookup behavior - this file parses in well under a second locally."""
+    import time
+
+    many_imports = "".join(f"import p.C{i};\n" for i in range(20_000))
+    source = "package p;\n" + many_imports + "class Big {}\n"
+    start = time.monotonic()
+    result = java.parse_java_source("Big.java", source)
+    elapsed = time.monotonic() - start
+    assert len(_edges(result, "import")) == 20_000
+    assert elapsed < 5.0, f"parsing took {elapsed:.2f}s - possible quadratic regression"
