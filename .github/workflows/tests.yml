@@ -93,6 +93,21 @@ jobs:
           --profile release
           --ci-leg "${{ matrix.os.id }}/${{ matrix.python-version }}"
           --evidence "${{ runner.temp }}/dev-gate-evidence.json"
+      # TEMPORARY, informational only (continue-on-error, never affects the
+      # gate result above) - the committed gate runs pytest in -q mode,
+      # which compresses per-test names to dots + aggregate counts and
+      # cannot distinguish "these four symlink tests passed" from "these
+      # four silently skipped, something else passed". One-off evidence
+      # step for PR #132's review; remove once its output is captured.
+      - name: PROOF - verbose symlink-devmode test names (windows only, informational)
+        if: matrix.os.id == 'windows'
+        continue-on-error: true
+        run: >
+          python -I -m pytest -v -rA
+          tests/test_comprehension_ceilings.py::test_measure_staging_artifacts_rejects_a_symlinked_artifact
+          tests/test_comprehension_discovery.py::test_enumerate_scope_records_a_symlink_as_a_boundary_and_never_follows_it
+          tests/test_comprehension_envelope.py::test_resolve_under_root_rejects_a_path_that_escapes_via_symlink
+          tests/test_comprehension_staging.py::test_reclaim_retains_an_entry_that_resolves_outside_staging
       - name: Upload leg evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
