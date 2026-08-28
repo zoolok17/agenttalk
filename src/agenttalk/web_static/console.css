@@ -719,6 +719,20 @@ body {
 .status-unknown.tc-dot,
 .status-unknown.tc-legend-dot { background: var(--gray); }
 
+/* #105: the supervisor's strict CLI-child verdict, when it overrides the
+   wrapper's own self-reported health — must never read as healthy/green. */
+.status-stuck_or_dead.tc-chip { color: var(--danger); background: var(--danger-soft); }
+.status-stuck_or_dead.tc-dot,
+.status-stuck_or_dead.tc-legend-dot { background: var(--danger); }
+
+.status-turn_failed.tc-chip { color: var(--danger); background: var(--danger-soft); }
+.status-turn_failed.tc-dot,
+.status-turn_failed.tc-legend-dot { background: var(--danger); }
+
+.status-cli_child_unknown.tc-chip { color: var(--gray); background: var(--gray-soft); }
+.status-cli_child_unknown.tc-dot,
+.status-cli_child_unknown.tc-legend-dot { background: var(--gray); }
+
 /* --- Kind chip color map (message kinds) --- */
 .kind-review-request { color: var(--accent); background: var(--accent-soft); }
 .kind-review-result  { color: var(--ok); background: var(--ok-soft); }

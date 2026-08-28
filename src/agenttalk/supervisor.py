@@ -2191,6 +2191,57 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
         "plan": _redacted_observation_plan(plan),
     }
 
+
+# #105: the strict per-agent CLI-child verdict (STUCK_OR_DEAD/CLI_CHILD_UNKNOWN/
+# TURN_FAILED/etc., computed by _plan_one for every auto_restart agent) never
+# reached the Team Console or `agenttalk doctor`/`status` - both rendered from
+# the wrapper's own self-reported (and therefore unable to notice its own
+# death) raw health file instead. This is the shared, read-only accessor both
+# surfaces call so a dead/unverifiable CLI child can never render as healthy.
+CLI_CHILD_CONFIRMED_DEAD_STATES = frozenset({"STUCK_OR_DEAD", "TURN_FAILED"})
+CLI_CHILD_UNVERIFIABLE_STATES = frozenset({"CLI_CHILD_UNKNOWN"})
+
+
+def strict_child_verdicts(store: Store, *, now_epoch: float) -> dict[str, dict]:
+    """Per-agent #72 strict CLI-child verdict: ``{name: {"state", "action"}}``.
+
+    Deliberately never passes a process ``snapshot`` - this must stay a cheap
+    read for a live GET (no OS process enumeration), and the classifier
+    already degrades an ACTIVE-phase agent it cannot verify without one to
+    ``CLI_CHILD_UNKNOWN`` rather than crashing. Only agents configured
+    ``auto_restart`` get a verdict; every other agent is simply absent from
+    the returned dict, so callers naturally fall back to raw wrapper health.
+    Best-effort: any read/parse failure degrades to ``{}`` (same fallback),
+    never raises.
+    """
+    try:
+        config = load_supervisor_config(store.dir / "supervisor.json")
+    except Exception:  # noqa: BLE001 - degrade to no verdict, not a 500/crash
+        config = {}
+    try:
+        state = load_supervisor_state(store.dir / "supervisor-state.json")
+    except Exception:  # noqa: BLE001
+        state = {}
+    try:
+        obs = build_supervisor_observation(
+            store, now_epoch=now_epoch, state=state,
+            supervisor_config=config, snapshot=None, event_limit=0,
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, dict] = {}
+    for item in obs.get("agents") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        decision = item.get("decision")
+        if isinstance(decision, dict) and isinstance(decision.get("state"), str):
+            out[item["name"]] = {
+                "state": decision["state"],
+                "action": decision.get("action"),
+            }
+    return out
+
+
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
 # generated PowerShell uses an array-of-literals ArgumentList - single-quoted
 # PS literals do NOT expand `$`, so the Codex `$agenttalk-listen` prompt and

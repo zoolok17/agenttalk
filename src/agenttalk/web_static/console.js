@@ -587,7 +587,32 @@
       ? Math.max(0, monotonicNow() - agent._receivedAt) / 1000 : 0;
     return (age + elapsed) <= UNWRAPPED_LIVE_STALE_AFTER_SECONDS;
   }
+  // #105: agent.health above is the WRAPPER'S OWN self-report - it cannot
+  // notice its own CLI child dying, so it can (and does) keep reporting a
+  // healthy-looking state after the child is gone. agent.cli_child_verdict
+  // is the supervisor's independently-verified strict verdict (present only
+  // for auto_restart-managed agents); when it says the child is confirmed
+  // dead or unverifiable, that MUST win over the self-report, never the
+  // reverse. Raw health is demoted to a secondary `rawHealthState` detail.
+  var CLI_CHILD_VERDICT_INFO = {
+    STUCK_OR_DEAD: { label: 'Dead', color: 'danger', desc: 'The supervisor confirmed this agent’s CLI child is not running — the wrapper may still look alive' },
+    TURN_FAILED: { label: 'Turn failed', color: 'danger', desc: 'The supervisor recorded a failed turn for this agent’s CLI child' },
+    CLI_CHILD_UNKNOWN: { label: 'Unverifiable', color: 'gray', desc: 'The supervisor could not verify this agent’s CLI child is alive — treat as NOT confirmed healthy' }
+  };
   function agentStateInfo(agent) {
+    var verdictState = agent && agent.cli_child_verdict && typeof agent.cli_child_verdict === 'object'
+      ? agent.cli_child_verdict.state : null;
+    var verdictInfo = typeof verdictState === 'string' ? CLI_CHILD_VERDICT_INFO[verdictState] : null;
+    if (verdictInfo) {
+      return {
+        label: verdictInfo.label,
+        key: verdictState.toLowerCase(),
+        color: verdictInfo.color,
+        grp: 'attn',
+        desc: verdictInfo.desc,
+        rawHealthState: ((agent && agent.health) || {}).state
+      };
+    }
     var raw = ((agent && agent.health) || {}).state;
     var info = stateInfo(raw);
     if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
@@ -1111,7 +1136,14 @@
   }
   function statusChip(st) {
     var info = stateInfoFrom(st);
-    return titled(el('span', 'tc-chip ' + statusClass(info), info.label), info.desc);
+    // #105: when a strict CLI-child verdict overrode the self-reported
+    // health, surface that raw state as a demoted secondary detail in the
+    // tooltip rather than dropping it silently.
+    var desc = info.desc;
+    if (info.rawHealthState) {
+      desc = desc + ' (wrapper self-reports: ' + info.rawHealthState + ')';
+    }
+    return titled(el('span', 'tc-chip ' + statusClass(info), info.label), desc);
   }
   function kindChip(kind) {
     var info = kindInfo(kind);

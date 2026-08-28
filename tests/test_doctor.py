@@ -590,6 +590,49 @@ def test_doctor_heartbeat_check_distinguishes_fresh_stale_missing(
     assert "no heartbeat" in hb_by_name["heartbeat.absent"].details
 
 
+def test_doctor_heartbeat_check_downgrades_on_strict_cli_child_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#105: a fresh heartbeat is the wrapper's OWN self-report - it cannot
+    notice its own CLI child dying, so `doctor` would otherwise keep calling
+    it "ok". A confirmed-dead strict verdict from the supervisor must
+    downgrade this to `error` (never stay green); an unverifiable one must
+    downgrade to at least `warn`, distinct from a genuinely healthy agent.
+    The heartbeat detail is kept as secondary context, not dropped."""
+    s = Store(tmp_path)
+    s.init(["dead", "unverifiable", "fine"])
+    s.write_heartbeat("dead")
+    s.write_heartbeat("unverifiable")
+    s.write_heartbeat("fine")
+
+    def fake_observation(store, *, now_epoch, state, supervisor_config,
+                         snapshot, event_limit):
+        assert snapshot is None, "#105: must never scan the OS process tree"
+        return {"agents": [
+            {"name": "dead", "decision": {"state": "STUCK_OR_DEAD", "action": "warn_only"}},
+            {"name": "unverifiable", "decision": {"state": "CLI_CHILD_UNKNOWN", "action": "none"}},
+        ]}
+
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", fake_observation)
+    report = doctor.run(tmp_path)
+    hb_by_name = {c.name: c for c in report.checks if c.name.startswith("heartbeat.")}
+
+    assert hb_by_name["heartbeat.dead"].status == "error"
+    assert "STUCK_OR_DEAD" in hb_by_name["heartbeat.dead"].details
+    assert "last seen" in hb_by_name["heartbeat.dead"].details  # demoted, not dropped
+
+    assert hb_by_name["heartbeat.unverifiable"].status == "warn"
+    assert "CLI_CHILD_UNKNOWN" in hb_by_name["heartbeat.unverifiable"].details
+
+    # An agent with no strict verdict at all (unmanaged) keeps today's
+    # heartbeat-only behavior - a fresh heartbeat is still "ok".
+    assert hb_by_name["heartbeat.fine"].status == "ok"
+
+    # A confirmed-dead heartbeat check must fail the whole run (exit 2).
+    assert report.overall == "error"
+
+
 def test_doctor_skill_check_warns_when_target_differs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

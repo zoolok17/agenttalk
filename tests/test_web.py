@@ -2923,6 +2923,94 @@ if (JSON.stringify(names) !== JSON.stringify(expected)) {
                    capture_output=True, text=True)
 
 
+def test_console_cli_child_verdict_overrides_self_reported_health_color(tmp_path: Path) -> None:
+    """#105: agent.health is the wrapper's OWN self-report - it cannot notice
+    its own CLI child dying. When agent.cli_child_verdict says the child is
+    confirmed dead or unverifiable, the client must render THAT (never a
+    healthy-looking self-report), and it must never be colored the same as a
+    genuinely healthy agent."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console cli_child_verdict test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    agentStateInfo: agentStateInfo\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-cli-child-verdict.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-cli-child-verdict.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+
+var HEALTHY_COLORS = { ok: 1, info: 1, warn: 1, teal: 1 };
+
+// A dead CLI child under an otherwise healthy-looking wrapper: the verdict
+// must win, and it must not render like a healthy agent.
+var dead = hooks.agentStateInfo({
+  health: { state: 'idle_waiting' },
+  cli_child_verdict: { state: 'STUCK_OR_DEAD', action: 'warn_only' },
+});
+if (HEALTHY_COLORS[dead.color]) {
+  throw new Error(`confirmed-dead CLI child rendered as healthy: color=${dead.color}`);
+}
+if (dead.rawHealthState !== 'idle_waiting') {
+  throw new Error(`raw self-report was dropped, not demoted: ${JSON.stringify(dead)}`);
+}
+
+// Unverifiable must be visibly distinct from healthy too (never green/ok).
+var unverifiable = hooks.agentStateInfo({
+  health: { state: 'working_turn' },
+  cli_child_verdict: { state: 'CLI_CHILD_UNKNOWN' },
+});
+if (HEALTHY_COLORS[unverifiable.color]) {
+  throw new Error(`unverifiable CLI child rendered as healthy: color=${unverifiable.color}`);
+}
+if (unverifiable.key === dead.key) {
+  throw new Error('unverifiable and confirmed-dead must not collapse to the same state');
+}
+
+// No verdict at all (unmanaged agent) -> unchanged raw-health rendering.
+var unmanaged = hooks.agentStateInfo({ health: { state: 'working_turn' } });
+if (unmanaged.color !== 'ok' || unmanaged.key !== 'working_turn') {
+  throw new Error(`unmanaged agent rendering regressed: ${JSON.stringify(unmanaged)}`);
+}
+
+// A HEALTHY verdict must not be forced into the unhealthy path.
+var healthy = hooks.agentStateInfo({
+  health: { state: 'idle_waiting' },
+  cli_child_verdict: { state: 'HEALTHY_IDLE', action: 'none' },
+});
+if (healthy.key !== 'idle_waiting') {
+  throw new Error(`a HEALTHY_IDLE verdict should defer to raw health rendering: ${JSON.stringify(healthy)}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def test_console_poll_waits_for_slow_endpoint_before_rescheduling(tmp_path: Path) -> None:
     """#207: each endpoint gets one in-flight request and its next cadence starts
     after settlement, so a response slower than POLL_MS cannot stack requests."""
@@ -5343,6 +5431,47 @@ def test_api_state_wrapped_from_managed_lead_loop_when_health_unknown(tmp_path: 
         beta = next(a for a in root["agents"] if a["name"] == "beta")
         assert "wrapped" not in beta
         assert "restartable" not in beta
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_cli_child_verdict_overrides_self_reported_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#105: the wrapper's own health file is a SELF-report - it cannot notice
+    its own CLI child dying, so it keeps reporting a healthy-looking state
+    after the child is gone. When the supervisor's independently-verified
+    strict verdict says the child is confirmed dead, the Team Console must
+    carry that verdict alongside (never instead of dropping) the still-fine
+    self-report, and never scan the OS process tree to get it."""
+    from agenttalk import supervisor as supervisor_mod
+
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_IDLE_WAITING, cli="claude", mode="wrapper-loop")
+
+    def fake_observation(store, *, now_epoch, state, supervisor_config,
+                         snapshot, event_limit):
+        assert snapshot is None, "#105: must never scan the OS process tree"
+        return {"agents": [
+            {"name": "alpha",
+             "decision": {"state": "STUCK_OR_DEAD", "action": "warn_only"}},
+        ]}
+
+    monkeypatch.setattr(supervisor_mod, "build_supervisor_observation", fake_observation)
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        # Raw self-report is kept, unchanged - demoted, not deleted.
+        assert alpha["health"]["state"] == _hm.STATE_IDLE_WAITING
+        assert alpha["cli_child_verdict"] == {
+            "state": "STUCK_OR_DEAD", "action": "warn_only",
+        }
+        # 'beta' has no supervisor decision -> field OMITTED (absent-not-null).
+        beta = next(a for a in root["agents"] if a["name"] == "beta")
+        assert "cli_child_verdict" not in beta
     finally:
         srv.shutdown()
         srv.server_close()

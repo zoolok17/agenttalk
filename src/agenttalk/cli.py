@@ -1317,11 +1317,24 @@ def cmd_status(args: argparse.Namespace) -> int:
             h.get("state") if isinstance(h.get("state"), str) else "unknown"
         )
         h_age = h.get("age_seconds")
-        seen += f" health={h_state}"
-        if isinstance(h_age, (int, float)):
-            seen += f"/{_format_age(h_age)}"
         sv = a.get("supervisor") if isinstance(a.get("supervisor"), dict) else {}
         dec = sv.get("decision") if isinstance(sv.get("decision"), dict) else None
+        dec_state = dec.get("state") if isinstance(dec, dict) else None
+        # #105: h_state is the wrapper's OWN self-report - it cannot notice its
+        # own CLI child dying, so it keeps reporting a healthy-looking state
+        # after the child is gone. When the supervisor's independently-verified
+        # strict verdict says the child is confirmed dead or unverifiable, that
+        # MUST be the primary `health=` indicator, never the self-report; the
+        # self-report is demoted to a parenthetical instead of dropped.
+        if isinstance(dec_state, str) and (
+            dec_state in sup.CLI_CHILD_CONFIRMED_DEAD_STATES
+            or dec_state in sup.CLI_CHILD_UNVERIFIABLE_STATES
+        ):
+            seen += f" health={dec_state} (wrapper self-reports {h_state})"
+        else:
+            seen += f" health={h_state}"
+            if isinstance(h_age, (int, float)):
+                seen += f"/{_format_age(h_age)}"
         if dec:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
         role = f" role={a['role']}" if a.get("role") else ""

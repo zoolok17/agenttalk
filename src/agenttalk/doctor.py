@@ -1753,32 +1753,44 @@ def _check_hmac(store: Store, project_root: Path) -> Check:
 
 
 def _check_heartbeats(store: Store) -> list[Check]:
-    """One check per agent — is anyone actually listening right now?"""
+    """One check per agent — is anyone actually listening right now?
+
+    #105: a fresh heartbeat alone is the WRAPPER'S OWN self-report - it
+    cannot notice its own CLI child dying, so it keeps ticking "ok" after the
+    child is gone. When the supervisor has an independently-verified strict
+    verdict for this agent (auto_restart-managed agents only), a confirmed
+    dead child downgrades this check to ``error`` and an unverifiable one to
+    at least ``warn``, regardless of how fresh the heartbeat looks; the
+    heartbeat detail is kept, not dropped, as secondary context.
+    """
     cfg = store.load_config()
     now = datetime.now(timezone.utc)
+    verdicts = sup.strict_child_verdicts(store, now_epoch=now.timestamp())
     out: list[Check] = []
     for a in cfg.get("agents", []):
         hb = store.read_heartbeat(a)
         if hb is None:
-            out.append(Check(
-                name=f"heartbeat.{a}",
-                status="warn",
-                details="no heartbeat — agent has never run `agenttalk wait`",
-            ))
-            continue
-        age = (now - hb).total_seconds()
-        if age > 300:  # 5 min
-            out.append(Check(
-                name=f"heartbeat.{a}",
-                status="warn",
-                details=f"stale (last seen {int(age)}s ago); peer probably not listening",
-            ))
+            status = "warn"
+            details = "no heartbeat — agent has never run `agenttalk wait`"
         else:
-            out.append(Check(
-                name=f"heartbeat.{a}",
-                status="ok",
-                details=f"last seen {int(age)}s ago",
-            ))
+            age = (now - hb).total_seconds()
+            if age > 300:  # 5 min
+                status = "warn"
+                details = f"stale (last seen {int(age)}s ago); peer probably not listening"
+            else:
+                status = "ok"
+                details = f"last seen {int(age)}s ago"
+        verdict_state = verdicts.get(a, {}).get("state")
+        if verdict_state in sup.CLI_CHILD_CONFIRMED_DEAD_STATES:
+            status = "error"
+            details = (f"supervisor confirms the CLI child is {verdict_state} "
+                       f"(heartbeat alone is not proof of life: {details})")
+        elif verdict_state in sup.CLI_CHILD_UNVERIFIABLE_STATES:
+            if status == "ok":
+                status = "warn"
+            details = (f"supervisor could not verify the CLI child is alive "
+                       f"({verdict_state}); heartbeat: {details}")
+        out.append(Check(name=f"heartbeat.{a}", status=status, details=details))
     return out
 
 

@@ -552,6 +552,43 @@ def test_status_human_output_unchanged_for_no_heartbeat(
     assert "(no heartbeat)" in out
 
 
+def test_status_human_output_primary_health_is_strict_verdict_when_present(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#105: `health=` in the human `status` line is the wrapper's OWN
+    self-report - it cannot notice its own CLI child dying, so a fresh
+    heartbeat + healthy-looking self-report can coexist with a confirmed-dead
+    CLI child. When the supervisor has an independently-verified strict
+    verdict, it must be the PRIMARY `health=` value (never the self-report),
+    with the self-report demoted to a parenthetical, not dropped."""
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="codex", mode="wrapped",
+        state=hm.STATE_IDLE_WAITING,
+        updated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        since=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        reason_code="idle_waiting",
+    ))
+
+    def fake_observation(store, *, now_epoch, state, supervisor_config,
+                         snapshot, event_limit, lead_liveness_stale_after_seconds):
+        return {"schema_version": 1, "agents": [
+            {"name": "alpha", "decision": {"state": "STUCK_OR_DEAD", "action": "warn_only"}},
+        ], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", fake_observation)
+    _run(["status"], store_root)
+    out = capsys.readouterr().out
+    alpha_line = next(line for line in out.splitlines() if line.strip().startswith("alpha"))
+    assert "health=STUCK_OR_DEAD" in alpha_line
+    assert "wrapper self-reports idle_waiting" in alpha_line
+    # Never the bare self-reported state as the primary indicator.
+    assert "health=idle_waiting" not in alpha_line
+
+
 # ---------------------------------------------------------- cmd_end / transcript
 
 def test_end_sends_kind_end_to_peers_and_exports_transcript(
