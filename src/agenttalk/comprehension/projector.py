@@ -144,6 +144,19 @@ def project_comprehension(
     units_rows, units_omitted = _bounded([m.to_json() for m in filtered_modules])
     dependency_rows, dependency_omitted = _bounded([e.to_json() for e in filtered_dependencies])
     problem_rows, problem_omitted = _bounded(problems)
+    # M10 (cold-read, PR-B fix round 3): features/entry_points/readiness
+    # signals+summaries had no row cap and no truncation/omitted count at
+    # all - unbounded on a large repo (the reviewer measured readiness
+    # alone as 6 signals per unit, ~60k rows on a 5k-file repo,
+    # `truncated: false` regardless). Bounded the same way every other
+    # section already is.
+    feature_rows, feature_omitted = _bounded([f.to_json() for f in filtered_features])
+    entry_point_rows, entry_point_omitted = _bounded(
+        [e.to_json() for e in filtered_entry_points])
+    readiness_signal_rows, readiness_signal_omitted = _bounded(
+        [s.to_json() for s in filtered_signals])
+    readiness_summary_rows, readiness_summary_omitted = _bounded(
+        [s.to_json() for s in filtered_summaries])
 
     payload: dict[str, Any] = {
         "schema_version": PROJECTION_SCHEMA_VERSION,
@@ -156,6 +169,15 @@ def project_comprehension(
             "reason_code": "freshness_not_implemented_this_slice",
         },
         "counts": {
+            # M10 (cold-read, PR-B fix round 3): these are WHOLE-RUN
+            # totals - deliberately unaffected by unit_id/feature_id/
+            # readiness_state row-level filters, since dependency_summary/
+            # high_fan_*/units_without_feature below are cross-cutting
+            # aggregate statistics describing the ENTIRE scan, not just
+            # whatever rows this particular filtered response returns.
+            # "scope" makes that explicit rather than leaving a caller to
+            # infer it from a mismatch against the returned row counts.
+            "scope": "whole_run",
             "units": len(modules),
             "dependencies": len(dependencies),
             "features": len(features),
@@ -169,19 +191,26 @@ def project_comprehension(
         "units_without_feature": sorted(units_without_feature),
         "unmapped_entry_points": sorted(unmapped_entry_points),
         "problems": problem_rows,
-        "truncated": bool(units_omitted or dependency_omitted or problem_omitted),
+        "truncated": bool(
+            units_omitted or dependency_omitted or problem_omitted
+            or feature_omitted or entry_point_omitted
+            or readiness_signal_omitted or readiness_summary_omitted
+        ),
         "omitted_counts": {
             "units": units_omitted, "dependencies": dependency_omitted, "problems": problem_omitted,
+            "features": feature_omitted, "entry_points": entry_point_omitted,
+            "readiness_signals": readiness_signal_omitted,
+            "readiness_summaries": readiness_summary_omitted,
         },
     }
 
     if not dependencies_only:
         payload["units"] = units_rows
-        payload["features"] = [f.to_json() for f in filtered_features]
-        payload["entry_points"] = [e.to_json() for e in filtered_entry_points]
+        payload["features"] = feature_rows
+        payload["entry_points"] = entry_point_rows
         payload["readiness"] = {
-            "signals": [s.to_json() for s in filtered_signals],
-            "summaries": [s.to_json() for s in filtered_summaries],
+            "signals": readiness_signal_rows,
+            "summaries": readiness_summary_rows,
         }
     payload["dependencies"] = dependency_rows
 

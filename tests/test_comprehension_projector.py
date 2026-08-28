@@ -166,3 +166,41 @@ def test_truncation_reports_omitted_counts(monkeypatch):
     assert payload["truncated"] is True
     assert payload["omitted_counts"]["units"] == 1
     assert len(payload["units"]) == 1
+
+
+def test_features_entry_points_and_readiness_are_also_bounded(monkeypatch):
+    """M10 (cold-read, PR-B fix round 3): features/entry_points/readiness
+    signals+summaries previously had no row cap and no truncation/omitted
+    count at all - unbounded on a large repo. Now bounded the same way
+    every other section already was."""
+    monkeypatch.setattr(pr, "_MAX_ROWS_PER_SECTION", 1)
+    features = [_feature("f1", ["u1"]), _feature("f2", ["u2"])]
+    entry_points = [_entry_point("ep1", "u1", ["f1"]), _entry_point("ep2", "u2", ["f2"])]
+    signals = [_signal("u1"), _signal("u2")]
+    summaries = [_summary("u1", "blocked"), _summary("u2", "assessed")]
+    payload = pr.project_comprehension(**_base_kwargs(
+        features=features, entry_points=entry_points,
+        readiness_signals=signals, readiness_summaries=summaries,
+    ))
+    assert payload["truncated"] is True
+    assert len(payload["features"]) == 1
+    assert len(payload["entry_points"]) == 1
+    assert len(payload["readiness"]["signals"]) == 1
+    assert len(payload["readiness"]["summaries"]) == 1
+    assert payload["omitted_counts"]["features"] == 1
+    assert payload["omitted_counts"]["entry_points"] == 1
+    assert payload["omitted_counts"]["readiness_signals"] == 1
+    assert payload["omitted_counts"]["readiness_summaries"] == 1
+
+
+def test_counts_section_states_its_whole_run_scope():
+    """M10 (cold-read, PR-B fix round 3): counts/dependency_summary/
+    high_fan_*/units_without_feature are computed over the UNFILTERED,
+    whole-run sets even when unit_id/feature_id/readiness_state narrows
+    the actual returned rows - a caller must not have to infer that
+    mismatch, so "scope" states it explicitly."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1"), _unit("u2")], unit_id="u1"))
+    assert payload["counts"]["scope"] == "whole_run"
+    assert payload["counts"]["units"] == 2  # whole-run, not the 1 row unit_id actually returns
+    assert len(payload["units"]) == 1
