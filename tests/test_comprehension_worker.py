@@ -56,7 +56,13 @@ def test_sanitized_worker_env_defaults_to_the_real_process_environment(monkeypat
 
 # ----------------------------------------------------------- process_paths
 
-def test_process_paths_claims_every_file_with_size_and_digest(tmp_path: Path) -> None:
+def test_process_paths_claims_every_file_with_its_size(tmp_path: Path) -> None:
+    """N3 (fourth cold read, fix round 6): WorkerFileClaim used to also
+    carry a content_digest - a second hash of every file's bytes, on top
+    of the one discovery.py already computes for the whole-scope
+    fingerprint - with zero consumers outside this module. Dropped along
+    with the hashing that produced it; byte_count (still genuinely used
+    to prove "this file is still addressable") remains."""
     (tmp_path / "a.txt").write_bytes(b"hello")
     (tmp_path / "b.txt").write_bytes(b"world!")
     result = worker.process_paths(tmp_path, ["a.txt", "b.txt"])
@@ -64,8 +70,6 @@ def test_process_paths_claims_every_file_with_size_and_digest(tmp_path: Path) ->
     by_path = {c.relative_path: c for c in result.file_claims}
     assert by_path["a.txt"].byte_count == 5
     assert by_path["b.txt"].byte_count == 6
-    import hashlib
-    assert by_path["a.txt"].content_digest == hashlib.sha256(b"hello").hexdigest()
     assert result.problems == []
 
 
@@ -174,27 +178,27 @@ def test_process_paths_dispatches_web_xml_through_the_java_results_channel(
 
 
 def test_process_paths_is_deterministic_regardless_of_input_order(tmp_path: Path) -> None:
-    """N4 (cold-read, PR-B fix round 3): comparing bare SETS of digests
+    """N4 (cold-read, PR-B fix round 3): comparing bare SETS of sizes
     cannot detect a cross-contamination bug (e.g. a.txt's claim
-    accidentally getting b.txt's digest) - as long as both digests appear
+    accidentally getting b.txt's size) - as long as both sizes appear
     SOMEWHERE across the results, a set comparison passes vacuously
     regardless of which file each is actually attributed to. Comparing
-    the relative_path -> content_digest MAPPING is strictly stronger: it
-    fails if any single file's digest differs from its OWN expected value
-    depending on what order it happened to be processed in."""
-    import hashlib
+    the relative_path -> byte_count MAPPING is strictly stronger: it
+    fails if any single file's size differs from its OWN expected value
+    depending on what order it happened to be processed in.
 
+    N3 (fourth cold read, fix round 6): this originally keyed on
+    content_digest, since dropped (dead - see WorkerFileClaim); a.txt
+    and b.txt are deliberately different SIZES so byte_count alone still
+    proves per-file attribution, not just per-file existence."""
     (tmp_path / "a.txt").write_bytes(b"hello")
     (tmp_path / "b.txt").write_bytes(b"world!")
     forward = worker.process_paths(tmp_path, ["a.txt", "b.txt"])
     backward = worker.process_paths(tmp_path, ["b.txt", "a.txt"])
-    forward_by_path = {c.relative_path: c.content_digest for c in forward.file_claims}
-    backward_by_path = {c.relative_path: c.content_digest for c in backward.file_claims}
+    forward_by_path = {c.relative_path: c.byte_count for c in forward.file_claims}
+    backward_by_path = {c.relative_path: c.byte_count for c in backward.file_claims}
     assert forward_by_path == backward_by_path
-    assert forward_by_path == {
-        "a.txt": hashlib.sha256(b"hello").hexdigest(),
-        "b.txt": hashlib.sha256(b"world!").hexdigest(),
-    }
+    assert forward_by_path == {"a.txt": 5, "b.txt": 6}
 
 
 # ----------------------------------------------------------- _main (worker entrypoint)

@@ -32,7 +32,6 @@ identically whether called here or directly in a unit test.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess  # nosec B404 - launches only the bundled worker module, argv fixed, shell disabled
@@ -120,14 +119,22 @@ def sanitized_worker_env(source_env: dict[str, str] | None = None) -> dict[str, 
 @dataclass(frozen=True)
 class WorkerFileClaim:
     """The default, adapter-independent claim for one enumerated file: it
-    exists, and this is its size and content digest. Every non-excluded
-    file gets exactly one of these regardless of whether any adapter
-    understands it (design, Artifact 1: "Every non-excluded file remains an
-    addressable `file` unit")."""
+    exists, and this is its size. Every non-excluded file gets exactly
+    one of these regardless of whether any adapter understands it
+    (design, Artifact 1: "Every non-excluded file remains an addressable
+    `file` unit").
+
+    N3 (fourth cold read, fix round 6): this used to also carry a
+    ``content_digest`` - a SECOND hash of every file's bytes, on top of
+    the one discovery.py already computes for the whole-scope
+    fingerprint - with zero consumers outside this module: modules.json's
+    ``source_digests`` publish discovery's own digest, never this one.
+    Dropped, along with the hashing that produced it (``_hash_bytes``);
+    reading the bytes themselves stays, since the adapter dispatch below
+    still needs them."""
 
     relative_path: str
     byte_count: int
-    content_digest: str
 
 
 @dataclass(frozen=True)
@@ -151,10 +158,6 @@ class WorkerResult:
     #: relative_path -> adapters.java.file_result_to_json(...) payload, for
     #: every recognized-extension file an adapter successfully parsed.
     java_results: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-
-def _hash_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
@@ -191,8 +194,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 detail=bounded_os_error_detail("could not read the file's bytes", exc),
             ))
             continue
-        claims.append(WorkerFileClaim(
-            relative_path=rel, byte_count=len(data), content_digest=_hash_bytes(data)))
+        claims.append(WorkerFileClaim(relative_path=rel, byte_count=len(data)))
 
         # Note 10 (second cold read, fix round 4): dispatch must not be
         # extension-case-sensitive - Windows and default macOS
@@ -284,7 +286,6 @@ def _result_to_json(result: WorkerResult) -> dict[str, Any]:
             {
                 "relative_path": claim.relative_path,
                 "byte_count": claim.byte_count,
-                "content_digest": claim.content_digest,
             }
             for claim in result.file_claims
         ],
@@ -322,7 +323,6 @@ def _result_from_json(payload: Any) -> WorkerResult:
             WorkerFileClaim(
                 relative_path=item["relative_path"],
                 byte_count=item["byte_count"],
-                content_digest=item["content_digest"],
             )
             for item in payload["file_claims"]
         ]
