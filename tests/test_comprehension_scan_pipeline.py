@@ -930,6 +930,96 @@ def test_get_report_catches_a_semantic_tamper_of_scan_json(java_repo: Path) -> N
         scan_pipeline.get_report(java_repo)
 
 
+# --------------------------------- MAJOR (round 7b): aged-out anchor must degrade
+
+def test_get_status_degrades_to_unverified_when_the_index_anchor_has_aged_out(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """MAJOR, availability (round 7b, reviewer-3 delta on 84ef111): the
+    index run-summary retention cap (publish._INDEX_RUNS_MAX) can age an
+    older run's anchor out of index.json entirely - after which status
+    raised the SAME hard refusal a genuine tamper does, PERMANENTLY, for
+    an otherwise-untouched, immutable on-disk run (bookkeeping retention
+    is not evidence of tampering). A missing anchor must degrade to an
+    explicit, labeled unverified outcome and the run must stay readable -
+    a present-but-mismatched anchor (verified below) still refuses hard."""
+    monkeypatch.setattr(scan_pipeline.publish, "_INDEX_RUNS_MAX", 1)
+    aged_out = scan_pipeline.run_scan(java_repo)
+    current = scan_pipeline.run_scan(java_repo)  # pushes aged_out's anchor out of the retained window
+
+    status = scan_pipeline.get_status(java_repo, run_id=aged_out.scan_id)
+    assert status["scan_json_integrity"] == {
+        "state": "unverified", "reason_code": "scan_json_index_anchor_not_recorded",
+    }
+
+    # The CURRENT run's own anchor is very much present - a real tamper
+    # against IT must still refuse hard; the degrade above applies only
+    # to a genuinely missing anchor, never a present-but-wrong one.
+    _rewrite_scan_json_whitespace_only(current.run_dir)
+    with pytest.raises(scan_pipeline.ComprehensionError, match="byte_sha256"):
+        scan_pipeline.get_status(java_repo, run_id=current.scan_id)
+
+
+def test_validate_run_degrades_to_unverified_and_stays_valid_when_the_index_anchor_has_aged_out(
+    java_repo: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(scan_pipeline.publish, "_INDEX_RUNS_MAX", 1)
+    aged_out = scan_pipeline.run_scan(java_repo)
+    scan_pipeline.run_scan(java_repo)
+
+    result = scan_pipeline.validate_run(java_repo, run_id=aged_out.scan_id)
+    assert result["valid"] is True
+    assert result["scan_json_integrity"] == {
+        "state": "unverified", "reason_code": "scan_json_index_anchor_not_recorded",
+    }
+
+
+def test_get_report_degrades_to_unverified_when_the_index_anchor_has_aged_out(
+    java_repo: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(scan_pipeline.publish, "_INDEX_RUNS_MAX", 1)
+    aged_out = scan_pipeline.run_scan(java_repo)
+    scan_pipeline.run_scan(java_repo)
+
+    payload = scan_pipeline.get_report(java_repo, run_id=aged_out.scan_id)
+    assert payload["scan_json_integrity"] == {
+        "state": "unverified", "reason_code": "scan_json_index_anchor_not_recorded",
+    }
+
+
+def test_validate_run_reports_invalid_for_a_scan_json_missing_a_required_field(
+    java_repo: Path,
+) -> None:
+    """Minor 2 (round 7b): validate never checked scan.json's own scalar
+    fields at all (only the separate "artifacts" digest-summary list) -
+    it reported valid:true for a scan.json missing a required field
+    where status/report both exit 2 typed on the identical input."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_path = outcome.run_dir / "scan.json"
+    doc = json.loads(scan_path.read_text(encoding="utf-8"))
+    del doc["problem_count"]
+    canonical_bytes = scan_pipeline.digests.canonical_json_bytes(doc)
+    scan_path.write_bytes(canonical_bytes)
+    # Re-sign the index anchor so this test isolates the required-field
+    # check from the separate anchor-mismatch check (both are legitimate
+    # typed refusals, but this proves the field check specifically).
+    comp_dir = scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk")
+    index_path = scan_pipeline.paths.index_path(comp_dir)
+    index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+    for run_summary in index_doc["runs"]:
+        if run_summary["scan_id"] == outcome.scan_id:
+            run_summary["scan_json_byte_sha256"] = scan_pipeline.digests.sha256_bytes(canonical_bytes)
+            run_summary["scan_json_content_digest"] = scan_pipeline.digests.canonical_content_digest(doc)
+    index_path.write_text(json.dumps(index_doc), encoding="utf-8")
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "scan.json" in result["detail"]
+    assert "problem_count" in result["detail"]
+
+
 # ----------------------------------------------------------- failure-path lock release (F-2)
 
 def test_run_scan_failure_surfaces_the_original_error_even_if_release_also_fails(

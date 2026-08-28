@@ -598,44 +598,79 @@ def _scan_field(scan_doc: dict[str, Any], key: str, scan_id: str) -> Any:
             f"{scan_id}'s scan.json is missing required field {key!r}") from exc
 
 
-def _scan_json_index_anchor(index_doc: dict[str, Any], scan_id: str) -> dict[str, Any]:
-    for run_summary in index_doc.get("runs") or []:
-        if run_summary.get("scan_id") == scan_id:
-            return run_summary
-    raise ComprehensionError(
-        f"{scan_id} has no recorded index anchor for scan.json - its run summary is not "
-        "present in index.json (aged out of the retained window, or the index predates "
-        "this anchor)")
+#: Round 7b (reviewer-3 delta on 84ef111): the index run-summary
+#: retention cap (``_INDEX_RUNS_MAX`` in publish.py) can age an older
+#: run's anchor entry out of ``index.json`` entirely - after which
+#: status/report/validate all raised the SAME hard refusal a genuine
+#: tamper does, permanently, for an otherwise-untouched, immutable
+#: on-disk run. A missing anchor is bookkeeping retention, not evidence
+#: of tampering, and must never brick a real run forever - it degrades
+#: to this explicit, labeled "unverified" outcome instead. A run summary
+#: that IS present but PREDATES this anchor (a legacy index entry with
+#: neither key at all, from a run published before round 7) gets the
+#: exact same treatment - genuinely no anchor to check against, not a
+#: mismatch. Only a run summary present WITH both keys, whose values
+#: disagree with what is actually on disk, is real, distinguishable
+#: tamper evidence and still refuses hard.
+_SCAN_JSON_ANCHOR_NOT_RECORDED = "scan_json_index_anchor_not_recorded"
 
 
-def _verify_scan_json_anchor(
+def _scan_json_anchor_state(
     index_doc: dict[str, Any], scan_id: str, scan_doc: dict[str, Any], run_dir: Path,
-) -> None:
-    """MAJOR 3 (fifth cold read, fix round 7): scan.json is the ROOT of
-    the integrity chain - every OTHER artifact is verified against a
-    digest scan.json itself declares (_verify_artifact_digests), but
-    nothing external to scan.json ever recorded what ITS OWN digest
-    should be, so status/report/validate all implicitly trusted
-    scan.json's on-disk bytes/content as ground truth with no
-    verification step: a bytes-only tamper AND a semantic tamper
-    (falsifying completeness/the fingerprint) both passed status
+) -> dict[str, Any]:
+    """MAJOR 3 (fifth cold read, fix round 7), degraded per round 7b:
+    scan.json is the ROOT of the integrity chain - every OTHER artifact
+    is verified against a digest scan.json itself declares
+    (_verify_artifact_digests), but nothing external to scan.json ever
+    recorded what ITS OWN digest should be, so status/report/validate
+    all implicitly trusted scan.json's on-disk bytes/content as ground
+    truth with no verification step: a bytes-only tamper AND a semantic
+    tamper (falsifying completeness/the fingerprint) both passed status
     healthy, report clean, and validate VALID:TRUE - the strongest
     positive claim the plane makes, false on a modified run. run_scan
-    now records scan.json's byte_sha256 and canonical content_digest in
+    records scan.json's byte_sha256 and canonical content_digest in
     index.json's run summary at publish time; this verifies the CURRENT
-    on-disk scan.json against those recorded values, closing the one
-    artifact nothing else anchored."""
-    anchor = _scan_json_index_anchor(index_doc, scan_id)
+    on-disk scan.json against those recorded values when they exist,
+    and reports an explicit ``{"state": "unverified", ...}`` outcome
+    (never a refusal) when they do not - see _SCAN_JSON_ANCHOR_NOT_
+    RECORDED's own comment for why a missing anchor must degrade rather
+    than brick the run."""
+    anchor = None
+    for run_summary in index_doc.get("runs") or []:
+        if run_summary.get("scan_id") == scan_id:
+            anchor = run_summary
+            break
+    recorded_byte_sha256 = anchor.get("scan_json_byte_sha256") if anchor else None
+    recorded_content_digest = anchor.get("scan_json_content_digest") if anchor else None
+    if recorded_byte_sha256 is None or recorded_content_digest is None:
+        return {"state": "unverified", "reason_code": _SCAN_JSON_ANCHOR_NOT_RECORDED}
     try:
         actual_byte_sha256 = digests.sha256_file(run_dir / "scan.json")
     except OSError as exc:
         raise ComprehensionError(f"scan.json's bytes could not be read for verification: {exc}") from exc
-    if actual_byte_sha256 != anchor.get("scan_json_byte_sha256"):
+    if actual_byte_sha256 != recorded_byte_sha256:
         raise ComprehensionError(
             "scan.json's byte_sha256 does not match its anchor recorded in index.json")
-    if digests.canonical_content_digest(scan_doc) != anchor.get("scan_json_content_digest"):
+    if digests.canonical_content_digest(scan_doc) != recorded_content_digest:
         raise ComprehensionError(
             "scan.json's content_digest does not match its anchor recorded in index.json")
+    return {"state": "verified"}
+
+
+#: Minor 2 (round 7b): the same required-body-field contract _scan_field
+#: enforces for status/report - validate never checked scan.json's own
+#: scalar fields at all (only the separate "artifacts" digest-summary
+#: list), so it reported valid:true for a scan.json missing a required
+#: field where status/report both exit 2 typed on the identical input.
+_SCAN_JSON_REQUIRED_BODY_FIELDS = (
+    "scan_id", "status", "generated_at", "adapters", "problem_count",
+    "record_counts", "root_binding", "whole_scope_fingerprint", "fingerprint_complete",
+)
+
+
+def _require_scan_json_body_fields(scan_doc: dict[str, Any], scan_id: str) -> None:
+    for key in _SCAN_JSON_REQUIRED_BODY_FIELDS:
+        _scan_field(scan_doc, key, scan_id)
 
 
 def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
@@ -664,7 +699,7 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     run_dir = _resolved_run_dir(comprehension_dir, scan_id)
     scan_doc = _load_single_artifact(
         run_dir, scan_id, "scan.json", SCAN_ARTIFACT_TYPE, SCAN_SCHEMA_VERSION)
-    _verify_scan_json_anchor(index_doc, scan_id, scan_doc, run_dir)
+    anchor_state = _scan_json_anchor_state(index_doc, scan_id, scan_doc, run_dir)
     return {
         "latest_scan_id": index_doc["latest_scan_id"],
         "index_digest": index_digest,
@@ -681,6 +716,7 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         # part of what status shows - it was never actually returned.
         "whole_scope_fingerprint": _scan_field(scan_doc, "whole_scope_fingerprint", scan_id),
         "fingerprint_complete": _scan_field(scan_doc, "fingerprint_complete", scan_id),
+        "scan_json_integrity": anchor_state,
         "freshness": {
             "state": "not_evaluated", "reason_code": "freshness_not_implemented_this_slice",
         },
@@ -793,9 +829,9 @@ def get_report(
         raise NotScanned(f"no comprehension run has ever been published under {root}")
     scan_id = run_id or index_doc["latest_scan_id"]
     records = _load_run_records(comprehension_dir, scan_id)
-    _verify_scan_json_anchor(index_doc, scan_id, records["scan"], records["run_dir"])
+    anchor_state = _scan_json_anchor_state(index_doc, scan_id, records["scan"], records["run_dir"])
     _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
-    return projector.project_comprehension(
+    payload = projector.project_comprehension(
         scan_id=_scan_field(records["scan"], "scan_id", scan_id),
         generated_at=_scan_field(records["scan"], "generated_at", scan_id),
         manifest_digest=None, status=_scan_field(records["scan"], "status", scan_id),
@@ -807,6 +843,12 @@ def get_report(
         unit_id=unit_id, feature_id=feature_id, readiness_state=readiness_state,
         dependencies_only=dependencies_only,
     )
+    # Round 7b: layered onto the projection here, not threaded through
+    # projector.project_comprehension's own signature - the anchor is a
+    # scan_pipeline (index-lookup) concern, not something the pure
+    # projector function has any business knowing about.
+    payload["scan_json_integrity"] = anchor_state
+    return payload
 
 
 def _verify_artifact_digests(
@@ -870,9 +912,23 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     if index_doc is None:
         raise NotScanned(f"no comprehension run has ever been published under {root}")
     scan_id = run_id or index_doc["latest_scan_id"]
+    # Round 7b: a default the anchor state stays at if an EARLIER step in
+    # the try block below (record loading/conversion, the required-field
+    # check) fails first - this run's scan.json integrity genuinely was
+    # never evaluated in that case, distinct from both "verified" and
+    # "unverified" (aged-out anchor, still evaluated).
+    anchor_state: dict[str, Any] = {
+        "state": "unverified", "reason_code": "not_evaluated_before_an_earlier_failure",
+    }
     try:
         records = _load_run_records(comprehension_dir, scan_id)
-        _verify_scan_json_anchor(index_doc, scan_id, records["scan"], records["run_dir"])
+        # Minor 2 (round 7b): validate never checked scan.json's OWN
+        # scalar fields at all (only the separate "artifacts" digest
+        # list _verify_artifact_digests checks) - a scan.json missing a
+        # required field reported valid:true here where status/report
+        # both exit 2 typed on the identical input.
+        _require_scan_json_body_fields(records["scan"], scan_id)
+        anchor_state = _scan_json_anchor_state(index_doc, scan_id, records["scan"], records["run_dir"])
         _verify_artifact_digests(records["scan"], records["raw_docs"], records["run_dir"])
         valid = True
         detail = (
@@ -892,6 +948,7 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
         "scan_id": scan_id,
         "valid": valid and not dangling_edges,
         "detail": detail if not dangling_edges else f"{len(dangling_edges)} edge(s) reference an unknown from_unit_id",
+        "scan_json_integrity": anchor_state,
         "external_revalidation": {
             "performed": False,
             "reason_code": "no_external_evidence_pointers_this_slice",
