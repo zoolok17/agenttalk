@@ -122,28 +122,29 @@ def _signal(unit_id: str, check: str, stored_status: str, basis: str, reason_cod
 
 
 def _check_source_understood(unit: ModuleRecord) -> ReadinessSignal:
-    """M-2 (second cold read, fix round 4): a file with no adapter at all
-    reports ``unknown``, not a confident ``unsatisfied`` - the design's
-    own rollup rule draws exactly this line: "Any required scan-time
-    blocker that is unsatisfied yields `blocked`; any required scan-time
-    UNKNOWN yields `needs_evidence`" (DESIGN-55-comprehension-plane.md,
-    Artifact 4, the `stored_assessment_state` paragraph). "No adapter
-    exists for this file" is an absence of positive evidence, not a
-    positive claim that the source is definitely NOT understood - on a
-    real repo, most files are non-code (docs, config, `.gitignore`), and
-    reporting a confident blocker for every one of them would make
-    `blocked` the default headline state for most units, a stronger
-    negative than this slice's own "nothing reaches assessed" narrative
-    (every unit's rollup routes through the same any-required-unknown
-    path `boundaries_identified` already keeps permanently open this
-    slice)."""
-    if unit.adapter_parse_failed:
-        # B3 (cold-read, PR-B fix round 3): the adapter attempted (or the
-        # worker could not even read the bytes) and failed - also
-        # genuinely unknown, for the same reason as the no-adapter case
-        # below, never a confident "satisfied" merely because the
-        # extension maps to a known language.
-        return _signal(unit.unit_id, "source_understood", "unknown", "detected", "adapter_parse_failed")
+    """M-2 (second cold read, fix round 4; CLOSED as a class, third cold
+    read, fix round 5): a file with no adapter at all reports ``unknown``,
+    not a confident ``unsatisfied`` - the design's own rollup rule draws
+    exactly this line: "Any required scan-time blocker that is unsatisfied
+    yields `blocked`; any required scan-time UNKNOWN yields
+    `needs_evidence`" (DESIGN-55-comprehension-plane.md, Artifact 4, the
+    `stored_assessment_state` paragraph). "No adapter exists for this
+    file" is an absence of positive evidence, not a positive claim that
+    the source is definitely NOT understood.
+
+    ``satisfied`` requires POSITIVE adapter evidence
+    (``unit.adapter_problem_reason is None``, meaning a real
+    :class:`~.adapters.java.JavaFileResult` exists for this unit) AND a
+    known ``language`` - never derived from the mere ABSENCE of a
+    specific, named failure. That inversion is what closes the class: a
+    fourth worker failure kind this check has never heard of still comes
+    through as unknown (its own reason_code, prefixed), because the
+    default without positive evidence is unknown, not satisfied."""
+    if unit.adapter_problem_reason is not None:
+        return _signal(
+            unit.unit_id, "source_understood", "unknown", "detected",
+            f"adapter_{unit.adapter_problem_reason}",
+        )
     if unit.language != "unknown":
         return _signal(unit.unit_id, "source_understood", "satisfied", "detected", "adapter_understood")
     return _signal(unit.unit_id, "source_understood", "unknown", "detected", "no_adapter_for_language")

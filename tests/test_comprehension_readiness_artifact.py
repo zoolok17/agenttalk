@@ -14,12 +14,12 @@ from agenttalk.comprehension.modules_artifact import ModuleRecord
 
 def _unit(
     unit_id: str, *, language: str = "java", classification: str = "production",
-    adapter_parse_failed: bool = False,
+    adapter_problem_reason: str | None = None,
 ) -> ModuleRecord:
     return ModuleRecord(
         unit_id=unit_id, kind="component", display_name=unit_id, language=language,
         paths=[f"{unit_id}.java"], source_digests={}, classification=[classification],
-        container_unit_id=None, producers=[], adapter_parse_failed=adapter_parse_failed,
+        container_unit_id=None, producers=[], adapter_problem_reason=adapter_problem_reason,
     )
 
 
@@ -95,10 +95,28 @@ def test_source_understood_unknown_when_the_adapter_failed_to_parse():
     never "satisfied" just because its extension maps to a known
     language - "satisfied" is a positive claim this unit never earned."""
     signals, summaries = ra.build_readiness(
-        [_unit("u1", language="java", adapter_parse_failed=True)], [], [])
+        [_unit("u1", language="java", adapter_problem_reason="parse_failed")], [], [])
     signal = _signal_by_check(signals, "source_understood")
     assert signal.stored_status == "unknown"
     assert signal.reason_code == "adapter_parse_failed"
+    assert summaries[0].stored_assessment_state == "needs_evidence"
+
+
+def test_source_understood_unknown_when_the_adapter_work_resource_cap_skipped_it():
+    """M-2 (third cold read, fix round 5): CLOSES THE CLASS - round 3
+    threaded ONLY the ``parse_failed`` reason; a file the worker skipped
+    for the per-file adapter-work resource cap fell through the exact
+    same "no positive evidence, but reported satisfied anyway" gap a
+    second time. source_understood must derive from the PRESENCE of
+    positive adapter evidence, never from the absence of one specific,
+    named failure kind - so this (and any future worker failure reason)
+    is unknown by construction, with a reason_code that still names the
+    real cause."""
+    signals, summaries = ra.build_readiness(
+        [_unit("u1", language="java", adapter_problem_reason="resource_limit")], [], [])
+    signal = _signal_by_check(signals, "source_understood")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "adapter_resource_limit"
     assert summaries[0].stored_assessment_state == "needs_evidence"
 
 

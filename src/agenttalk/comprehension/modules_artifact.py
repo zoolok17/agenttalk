@@ -53,13 +53,21 @@ class ModuleRecord:
     producers: list[dict[str, Any]]
     conflict_id: str | None = None
     evidence: list[dict[str, Any]] = field(default_factory=list)
-    #: True only for a "file" unit whose adapter attempted and FAILED to
-    #: parse it (or whose bytes the worker could not even read) - distinct
-    #: from "no adapter exists for this extension at all" (cold-read B3,
-    #: PR-B fix round 3). Readiness's source_understood check must see
-    #: this as genuinely UNKNOWN, never a confident "satisfied" merely
-    #: because the file's extension happens to map to a known language.
-    adapter_parse_failed: bool = False
+    #: M-2 (third cold read, fix round 5): CLOSES THE CLASS - the THIRD
+    #: instance of a file that no adapter ever actually analyzed
+    #: publishing as source_understood=satisfied anyway (round 3: parse
+    #: failures; round 4: no-adapter-for-language; round 5: adapter-work
+    #: resource cap). Rather than adding a fourth manually-threaded
+    #: negative flag for the next such case, this carries the worker's
+    #: OWN reason_code (``"parse_failed"``, ``"resource_limit"``,
+    #: ``"path_excluded"``, or any future one) whenever a "file" unit has
+    #: NO positive adapter evidence (no entry in ``java_results``) AND the
+    #: worker recorded a problem for it - readiness derives
+    #: ``source_understood`` from the PRESENCE of positive evidence, never
+    #: from the absence of a specific, named failure kind, so a future
+    #: fifth reason the worker invents needs no readiness-side change at
+    #: all to be seen as unknown.
+    adapter_problem_reason: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -74,7 +82,7 @@ class ModuleRecord:
             "producers": self.producers,
             "conflict_id": self.conflict_id,
             "evidence": self.evidence,
-            "adapter_parse_failed": self.adapter_parse_failed,
+            "adapter_problem_reason": self.adapter_problem_reason,
         }
 
 
@@ -89,7 +97,7 @@ def module_record_from_json(payload: dict[str, Any]) -> ModuleRecord:
         classification=list(payload["classification"]),
         container_unit_id=payload["container_unit_id"], producers=list(payload["producers"]),
         conflict_id=payload.get("conflict_id"), evidence=list(payload.get("evidence", [])),
-        adapter_parse_failed=payload.get("adapter_parse_failed", False),
+        adapter_problem_reason=payload.get("adapter_problem_reason"),
     )
 
 
@@ -135,22 +143,26 @@ def _parent_qualified_name(qualified_name: str, known_names: set[str]) -> str | 
 
 def build_modules(
     discovery: DiscoveryResult, java_results: dict[str, java_adapter.JavaFileResult],
-    *, parse_failed_paths: frozenset[str] = frozenset(),
+    *, worker_problem_reason_by_path: dict[str, str] | None = None,
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
     already-parsed :class:`~.adapters.java.JavaFileResult` (item 3) -
     parsing happens once, upstream; this function only assembles records
     from what was already extracted.
 
-    ``parse_failed_paths`` names every relative path the worker recorded a
-    ``parse_failed`` problem for (cold-read B3, PR-B fix round 3) - a file
+    ``worker_problem_reason_by_path`` names every relative path the worker
+    recorded ANY problem for, with that problem's own reason_code (M-2,
+    third cold read, fix round 5 - closes the class B3/round-3's
+    ``parse_failed_paths`` started but only covered one reason: a file
     absent from ``java_results`` is either "no adapter for this
-    extension" (a confident negative) or "the adapter tried and failed /
-    the bytes could not even be read" (genuinely unknown); this
-    distinguishes the two so readiness never reports the latter as
-    understood.
+    extension" (a confident negative, no problem recorded at all) or "the
+    adapter was eligible but has no positive result" for SOME worker
+    reason - parse failure, the per-file resource cap, or a re-confinement
+    rejection - all genuinely unknown, never a confident understood
+    merely because the extension maps to a known language.
     """
     records: list[ModuleRecord] = []
+    worker_problem_reason_by_path = worker_problem_reason_by_path or {}
 
     for file_entry in discovery.files:
         relative_path = file_entry.relative_path
@@ -170,7 +182,9 @@ def build_modules(
                     name="discovery", version=1, source_digest=file_entry.content_digest,
                     basis="extracted",
                 )],
-                adapter_parse_failed=java_result is None and relative_path in parse_failed_paths,
+                adapter_problem_reason=(
+                    worker_problem_reason_by_path.get(relative_path) if java_result is None else None
+                ),
             ))
             continue
 

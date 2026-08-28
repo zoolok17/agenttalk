@@ -115,6 +115,39 @@ def test_run_scan_does_not_block_readiness_for_the_pom_xml_it_understood(
     assert summary["stored_assessment_state"] != "blocked"
 
 
+def test_run_scan_reports_unknown_not_satisfied_for_a_resource_capped_java_file(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """M-2 (third cold read, fix round 5): CLOSES THE CLASS - round 3
+    threaded only the ``parse_failed`` worker reason into readiness;
+    a .java file the worker skipped for the per-file adapter-work
+    resource cap (``resource_limit``) fell through the same "no positive
+    adapter evidence, but reported satisfied anyway" gap a second time
+    (round 4 fixed a third instance, the no-adapter-for-language case).
+    Its extension still maps to a known language, but the adapter never
+    actually looked at its content - source_understood must be unknown,
+    with a reason_code that names the real (resource_limit) cause, never
+    a confident satisfied."""
+    monkeypatch.setattr(workermod, "_MAX_ADAPTER_INPUT_BYTES", 10)
+    (java_repo / "src" / "main" / "java" / "p" / "Huge.java").write_text(
+        "package p;\nclass Huge {\n  void run() { Foo.bar(); }\n}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    huge_unit = next(u for u in modules_doc["units"] if u["paths"] == ["src/main/java/p/Huge.java"])
+    assert huge_unit["language"] == "java"
+    assert huge_unit["adapter_problem_reason"] == "resource_limit"
+    source_understood = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == huge_unit["unit_id"] and s["check"] == "source_understood"
+    )
+    assert source_understood["stored_status"] == "unknown"
+    assert source_understood["reason_code"] == "adapter_resource_limit"
+
+
 def test_run_scan_populates_source_digest_on_dependency_and_feature_producers(
     java_repo: Path,
 ) -> None:

@@ -43,17 +43,39 @@ def test_a_parse_failed_java_file_is_flagged_distinctly_from_no_adapter():
     """B3 (cold-read, PR-B fix round 3): a .java file absent from
     java_results because the adapter failed (or the bytes could not be
     read) must be distinguishable from an ordinary non-java file with no
-    adapter at all - only the former sets adapter_parse_failed."""
+    adapter at all - only the former carries an adapter_problem_reason."""
     discovery = _discovery([
         EnumeratedFile(relative_path="p/Broken.java", byte_count=1, content_digest="a"),
         EnumeratedFile(relative_path="README.md", byte_count=1, content_digest="b"),
     ])
     records = ma.build_modules(
-        discovery, {}, parse_failed_paths=frozenset({"p/Broken.java"}))
+        discovery, {}, worker_problem_reason_by_path={"p/Broken.java": "parse_failed"})
     by_path = {r.paths[0]: r for r in records}
-    assert by_path["p/Broken.java"].adapter_parse_failed is True
+    assert by_path["p/Broken.java"].adapter_problem_reason == "parse_failed"
     assert by_path["p/Broken.java"].language == "java"
-    assert by_path["README.md"].adapter_parse_failed is False
+    assert by_path["README.md"].adapter_problem_reason is None
+
+
+def test_a_resource_capped_java_file_also_carries_its_own_problem_reason():
+    """M-2 (third cold read, fix round 5): round 3 threaded ONLY the
+    ``parse_failed`` reason - a file the worker skipped for a DIFFERENT
+    reason (the per-file adapter-work resource cap; a re-confinement
+    rejection) fell through this exact same gap a second and third time.
+    Threading EVERY worker problem, by its own reason_code, closes the
+    class instead of adding a fourth manually-tracked negative case."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="p/Huge.java", byte_count=1, content_digest="a"),
+        EnumeratedFile(relative_path="p/Skipped.java", byte_count=1, content_digest="b"),
+    ])
+    records = ma.build_modules(
+        discovery, {},
+        worker_problem_reason_by_path={
+            "p/Huge.java": "resource_limit", "p/Skipped.java": "path_excluded",
+        },
+    )
+    by_path = {r.paths[0]: r for r in records}
+    assert by_path["p/Huge.java"].adapter_problem_reason == "resource_limit"
+    assert by_path["p/Skipped.java"].adapter_problem_reason == "path_excluded"
 
 
 def test_pom_xml_and_web_xml_are_recognized_as_adapter_understood():

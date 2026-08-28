@@ -237,17 +237,24 @@ def run_scan(
             path: java_adapter.file_result_from_json(payload)
             for path, payload in worker_result.java_results.items()
         }
-        # B3 (cold-read, PR-B fix round 3): a file the adapter failed to
-        # parse (or the worker could not even read) must never be
-        # reported as source_understood=satisfied just because its
-        # extension maps to a known language - readiness needs to know
-        # WHICH paths degraded, not just which paths parsed.
-        parse_failed_paths = frozenset(
-            p.relative_path for p in worker_result.problems if p.reason_code == "parse_failed"
-        )
+        # B3 (cold-read, PR-B fix round 3); closed as a class, M-2 (third
+        # cold read, fix round 5): a file the adapter never produced a
+        # positive result for must never be reported as
+        # source_understood=satisfied just because its extension maps to
+        # a known language - readiness needs to know WHICH paths degraded
+        # and WHY, not just which ones the worker reported a
+        # ``parse_failed`` for specifically (round 3 threaded only that
+        # one reason; a resource-cap skip or a re-confinement rejection
+        # went unthreaded the same way, twice more). Every worker problem,
+        # by whatever reason_code, is threaded here.
+        worker_problem_reason_by_path = {
+            p.relative_path: p.reason_code for p in worker_result.problems
+        }
 
         modules = modules_artifact.build_modules(
-            discovery_result, java_results, parse_failed_paths=parse_failed_paths)
+            discovery_result, java_results,
+            worker_problem_reason_by_path=worker_problem_reason_by_path,
+        )
         # M7 (cold-read, PR-B fix round 3): discovery already computed
         # each file's own content digest - dependencies_artifact.py and
         # features_artifact.py's producers carried source_digest=None
