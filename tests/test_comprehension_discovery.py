@@ -287,6 +287,77 @@ def test_total_hashed_bytes_cap_excludes_files_once_exceeded(tmp_path: Path, mon
     assert result.exclusions.get("resource_limit_total_bytes") == 1
 
 
+# ----------------------- fingerprint completeness on error/exclusion exits (B-1, round 5)
+
+def test_an_unlistable_directory_marks_the_fingerprint_incomplete(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """B-1 (third cold read, fix round 5): only the four resource-cap exits
+    used to clear ``fingerprint_complete``; the other four bounded-problem
+    exits (unlistable directory, stat failure, unreadable bytes,
+    unrepresentable filename) recorded a problem and left the flag True -
+    a fingerprint computed over a provably incomplete file set published
+    as complete, the exact fail-open the design forbids."""
+    (tmp_path / "ok.txt").write_bytes(b"fine")
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "inside.txt").write_bytes(b"never seen")
+
+    real_iterdir = Path.iterdir
+
+    def _iterdir(self: Path):
+        if self == blocked:
+            raise OSError("permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _iterdir)
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert any(p["reason_code"] == "parse_failed" for p in result.problems)
+    assert result.fingerprint_complete is False
+    assert result.whole_scope_fingerprint is None
+
+
+def test_an_unreadable_files_bytes_mark_the_fingerprint_incomplete(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    (tmp_path / "ok.txt").write_bytes(b"fine")
+    (tmp_path / "bad.txt").write_bytes(b"content")
+
+    real_read_bytes = Path.read_bytes
+
+    def _read_bytes(self: Path):
+        if self.name == "bad.txt":
+            raise OSError("cannot read")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _read_bytes)
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert any(p["reason_code"] == "parse_failed" for p in result.problems)
+    assert result.fingerprint_complete is False
+    assert result.whole_scope_fingerprint is None
+
+
+def test_an_unrepresentable_filename_marks_the_fingerprint_incomplete(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    (tmp_path / "ok.txt").write_bytes(b"fine")
+    comp_dir = _comprehension_dir(tmp_path)
+    monkeypatch.setattr(
+        discovery, "_non_utf8_path_problem_detail",
+        lambda relative: (
+            {"path": relative, "detail": "simulated non-utf8 path"}
+            if relative == "ok.txt" else None
+        ),
+    )
+    (tmp_path / "ordinary.txt").write_bytes(b"also fine")
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert any(p["reason_code"] == "non_utf8_path" for p in result.problems)
+    assert result.fingerprint_complete is False
+    assert result.whole_scope_fingerprint is None
+
+
 # ----------------------------------------------------------- non-UTF-8 paths (note 5)
 
 def test_non_utf8_path_problem_detail_recognizes_a_lone_surrogate():

@@ -344,7 +344,6 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
     boundaries: list[BoundaryEntry] = []
     exclusions: dict[str, int] = {}
     problems: list[dict[str, str]] = []
-    fingerprint_complete = True
     degraded = False
     entry_count = 0
     hashed_total = 0
@@ -354,9 +353,8 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
         exclusions[category] = exclusions.get(category, 0) + 1
 
     def _walk(directory: Path, depth: int = 0) -> None:
-        nonlocal entry_count, hashed_total, fingerprint_complete, degraded, entry_cap_hit
+        nonlocal entry_count, hashed_total, degraded, entry_cap_hit
         if depth > MAX_NESTING_DEPTH:
-            fingerprint_complete = False
             degraded = True
             problems.append({
                 "reason_code": "resource_limit",
@@ -418,7 +416,6 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
             entry_count += 1
             if entry_count > MAX_FILESYSTEM_ENTRIES:
                 entry_cap_hit = True
-                fingerprint_complete = False
                 degraded = True
                 problems.append({
                     "reason_code": "resource_limit",
@@ -436,7 +433,6 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
             # content is read - a large binary must trip this, never be
             # silently removed by a later binary-sniff exclusion first.
             if size > MAX_PER_FILE_BYTES:
-                fingerprint_complete = False
                 degraded = True
                 _record_exclusion("resource_limit_oversized")
                 problems.append({
@@ -455,7 +451,6 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 _record_exclusion("binary")
                 continue
             if hashed_total + len(data) > MAX_HASHED_TOTAL_BYTES:
-                fingerprint_complete = False
                 degraded = True
                 _record_exclusion("resource_limit_total_bytes")
                 problems.append({
@@ -473,6 +468,16 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
             ))
 
     _walk(root)
+
+    # B-1 (third cold read, fix round 5): every problem this walk records -
+    # an unlistable directory, a stat/read failure, an unrepresentable
+    # filename, or a resource cap - means one entry that would otherwise
+    # have contributed to `files`/`boundaries` was OMITTED from what got
+    # walked and hashed. A single choke point here (rather than a manual
+    # `fingerprint_complete = False` at each of the eight problem-raising
+    # sites above) makes a ninth future exit incomplete-by-construction
+    # instead of relying on every future editor to remember the flag.
+    fingerprint_complete = not problems
 
     fingerprint = None
     if fingerprint_complete:
