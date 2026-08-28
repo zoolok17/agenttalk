@@ -107,6 +107,20 @@ def _write_json_document(path: Path, document: dict[str, Any]) -> bytes:
     return canonical
 
 
+#: Minor 7 (fifth cold read, fix round 7): the same cap + omitted-count
+#: discipline projector.py's own _bounded applies to every REPORT
+#: section - scan.json's "boundaries" list is written here, at scan
+#: time, not by projector.py, so it needs its own small instance of the
+#: same mechanism rather than an unbounded raw list.
+_MAX_BOUNDARIES = 1000
+
+
+def _bounded_boundaries(entries: list[dict[str, str]]) -> tuple[list[dict[str, str]], int]:
+    if len(entries) <= _MAX_BOUNDARIES:
+        return entries, 0
+    return entries[:_MAX_BOUNDARIES], len(entries) - _MAX_BOUNDARIES
+
+
 #: N3 (third cold read, fix round 5): DESIGN-55-comprehension-plane.md's
 #: problems.json section names ``severity`` as part of the record shape
 #: (#208 downstream consumes it) but no severity was ever assigned - this
@@ -444,6 +458,10 @@ def run_scan(
         ]
         run_digest = digests.run_content_digest(artifact_summaries)
         completed_at = _utc_now_iso(now)
+        boundary_rows, boundaries_omitted = _bounded_boundaries([
+            {"path": b.relative_path, "kind": b.boundary_kind}
+            for b in discovery_result.boundaries
+        ])
 
         scan_doc = {
             **_envelope(
@@ -499,10 +517,17 @@ def run_scan(
             # projection-exposure half (report/status surfacing this) is
             # a separate, larger question - named as a carry, not fixed
             # here (see the PR description, R-15a).
-            "boundaries": [
-                {"path": b.relative_path, "kind": b.boundary_kind}
-                for b in discovery_result.boundaries
-            ],
+            #
+            # Minor 7 (fifth cold read, fix round 7): this list was
+            # published fully UNBOUNDED - every other list-shaped section
+            # has been progressively capped across three prior rounds
+            # (M10 round 3, M-4 round 4, M2 round 6); this one, added the
+            # same round as M2, broke that same discipline one list, one
+            # round later. Bounded the same way (cap + omitted count),
+            # just via a local helper - scan.json is written here, not by
+            # projector.py, which only bounds the separate REPORT payload.
+            "boundaries": boundary_rows,
+            "boundaries_omitted_count": boundaries_omitted,
             "unsupported_relations": list(java_adapter.UNSUPPORTED_RELATIONS),
             "record_counts": record_counts,
             "problem_count": len(problems),

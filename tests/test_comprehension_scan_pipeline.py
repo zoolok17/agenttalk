@@ -177,6 +177,41 @@ def test_scan_json_publishes_boundary_path_and_kind_not_just_a_count(
     outcome = scan_pipeline.run_scan(java_repo)
     scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
     assert scan_doc["boundaries"] == [{"path": "vendor/external-link", "kind": "symlink"}]
+    assert scan_doc["boundaries_omitted_count"] == 0
+
+
+def test_scan_json_boundaries_list_is_bounded_not_unbounded(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """Minor 7 (fifth cold read, fix round 7): every list-shaped
+    scan.json/report section has been progressively capped across three
+    prior rounds (M10 round 3, M-4 round 4, M2 round 6) - this list,
+    added the same round as M2, was published fully unbounded, breaking
+    that same discipline one list, one round later. Injects more
+    synthetic boundaries than a monkeypatched cap allows and confirms
+    both the cap and the omitted count actually apply."""
+    import dataclasses
+    import json
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    real_enumerate_scope = discoverymod.enumerate_scope
+
+    def _enumerate_scope(root, comprehension_dir):
+        result = real_enumerate_scope(root, comprehension_dir)
+        extra = [
+            discoverymod.BoundaryEntry(relative_path=f"vendor/link-{i}", boundary_kind="symlink")
+            for i in range(3)
+        ]
+        return dataclasses.replace(result, boundaries=[*result.boundaries, *extra])
+
+    monkeypatch.setattr(scan_pipeline.discovery, "enumerate_scope", _enumerate_scope)
+    monkeypatch.setattr(scan_pipeline, "_MAX_BOUNDARIES", 2)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert len(scan_doc["boundaries"]) == 2
+    assert scan_doc["boundaries_omitted_count"] == 1
 
 
 def test_canary_sweep_no_artifact_or_report_leaks_the_absolute_root_or_a_planted_canary(
