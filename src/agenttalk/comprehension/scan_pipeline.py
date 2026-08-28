@@ -471,7 +471,19 @@ def run_scan(
             "whole_scope_fingerprint": discovery_result.whole_scope_fingerprint,
             "fingerprint_complete": discovery_result.fingerprint_complete,
             "exclusions": dict(sorted(discovery_result.exclusions.items())),
-            "boundaries": len(discovery_result.boundaries),
+            # M4 (fourth cold read, fix round 6): a bare integer count hid
+            # WHAT was actually skipped - the design names "excluded roots
+            # with an explicit boundary reason" as a scan.json field, not
+            # a count. discovery.py already computes each boundary's own
+            # root-relative path and kind (BoundaryEntry); this was
+            # discarded down to len(...) rather than published. The
+            # projection-exposure half (report/status surfacing this) is
+            # a separate, larger question - named as a carry, not fixed
+            # here (see the PR description, R-15a).
+            "boundaries": [
+                {"path": b.relative_path, "kind": b.boundary_kind}
+                for b in discovery_result.boundaries
+            ],
             "unsupported_relations": list(java_adapter.UNSUPPORTED_RELATIONS),
             "record_counts": record_counts,
             "problem_count": len(problems),

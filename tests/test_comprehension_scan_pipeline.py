@@ -125,6 +125,39 @@ def test_run_scan_reports_a_case_collision_between_two_enumerated_paths(
     assert collisions[0]["path"] == "src/main/java/p/APP.JAVA"
 
 
+def test_scan_json_publishes_boundary_path_and_kind_not_just_a_count(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """M4 (fourth cold read, fix round 6, scan.json half): scan.json's
+    "boundaries" field used to be a bare integer count
+    (len(discovery_result.boundaries)) - the design names "excluded roots
+    with an explicit boundary reason" as a scan.json field, not a count.
+    A caller reading scan.json had no way to know WHICH path was a
+    boundary or WHY (reproduced with a real junction: status complete,
+    problems [], boundaries: 1, the junction's own name absent from
+    every published artifact). Injects a synthetic boundary via
+    discovery.enumerate_scope's own return value (symlink/junction
+    creation is not permitted in this sandbox)."""
+    import dataclasses
+    import json
+
+    from agenttalk.comprehension import discovery as discoverymod
+
+    real_enumerate_scope = discoverymod.enumerate_scope
+
+    def _enumerate_scope(root, comprehension_dir):
+        result = real_enumerate_scope(root, comprehension_dir)
+        boundary = discoverymod.BoundaryEntry(
+            relative_path="vendor/external-link", boundary_kind="symlink")
+        return dataclasses.replace(result, boundaries=[*result.boundaries, boundary])
+
+    monkeypatch.setattr(scan_pipeline.discovery, "enumerate_scope", _enumerate_scope)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["boundaries"] == [{"path": "vendor/external-link", "kind": "symlink"}]
+
+
 def test_canary_sweep_no_artifact_or_report_leaks_the_absolute_root_or_a_planted_canary(
     java_repo: Path, monkeypatch,
 ) -> None:
