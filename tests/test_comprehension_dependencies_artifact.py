@@ -18,6 +18,21 @@ def _parse(relative_path: str, source: str) -> java_adapter.JavaFileResult:
 
 # ----------------------------------------------------------- import (external)
 
+def test_source_digest_is_populated_from_file_digests():
+    """M7 (cold-read, PR-B fix round 3): source_digest was set to None
+    once per file and never actually assigned from discovery's already-
+    computed content digest."""
+    results = {"p/Foo.java": _parse("p/Foo.java", "package p;\nimport java.util.List;\nclass Foo {}\n")}
+    records = da.build_dependencies(results, file_digests={"p/Foo.java": "deadbeef"})
+    assert records[0].producers[0]["source_digest"] == "deadbeef"
+
+
+def test_source_digest_defaults_to_none_without_file_digests():
+    results = {"p/Foo.java": _parse("p/Foo.java", "package p;\nimport java.util.List;\nclass Foo {}\n")}
+    records = da.build_dependencies(results)
+    assert records[0].producers[0]["source_digest"] is None
+
+
 def test_import_edge_resolves_as_external():
     results = {"p/Foo.java": _parse("p/Foo.java", "package p;\nimport java.util.List;\nclass Foo {}\n")}
     records = da.build_dependencies(results)

@@ -26,6 +26,30 @@ def test_a_main_method_produces_one_candidate_feature_with_one_entry_point():
     assert entry_points[0].feature_ids == [features[0].feature_id]
 
 
+def test_source_digest_is_populated_from_file_digests():
+    """M7 (cold-read, PR-B fix round 3): every producer here carried
+    source_digest=None unconditionally - the design's per-fact producer
+    identity, source content digest included, was never actually
+    populated even though the digest was already available upstream."""
+    results = {"App.java": _parse(
+        "App.java",
+        "package p;\nclass App {\n  public static void main(String[] args) {}\n}\n",
+    )}
+    entry_points, features = fa.build_features(
+        results, file_digests={"App.java": "deadbeef"})
+    assert entry_points[0].producers[0]["source_digest"] == "deadbeef"
+    assert features[0].producers[0]["source_digest"] == "deadbeef"
+
+
+def test_source_digest_defaults_to_none_without_file_digests():
+    results = {"App.java": _parse(
+        "App.java",
+        "package p;\nclass App {\n  public static void main(String[] args) {}\n}\n",
+    )}
+    entry_points, features = fa.build_features(results)
+    assert entry_points[0].producers[0]["source_digest"] is None
+
+
 def test_two_routes_on_the_same_controller_group_into_one_feature():
     source = (
         "package p;\nclass Controller {\n"

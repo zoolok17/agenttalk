@@ -106,12 +106,21 @@ def _producer(source_digest: str | None) -> dict[str, Any]:
 def build_features(
     java_results: dict[str, java_adapter.JavaFileResult],
     *, confirmed_labels: frozenset[str] = frozenset(),
+    file_digests: dict[str, str] | None = None,
 ) -> tuple[list[EntryPointRecord], list[FeatureRecord]]:
     """Returns ``(entry_points, features)``. ``confirmed_labels`` names
     which candidate feature labels a ``config.json`` declaration confirms
     (state -> ``confirmed``) - an empty set (the default) means every
     feature stays ``candidate``, matching "a detector may create only a
-    candidate.\""""
+    candidate."
+
+    ``file_digests`` maps a relative path to discovery's own content
+    digest for that file (M7, cold-read PR-B fix round 3: every producer
+    here carried ``source_digest=None`` unconditionally - the design's
+    per-fact producer identity, source content digest included, was never
+    actually populated even though the digest was already computed and
+    available upstream)."""
+    file_digests = file_digests or {}
     by_qualified_name, _by_simple_name, _file_unit_ids = _build_registry(java_results)
 
     owning_unit_by_qualified_name = by_qualified_name
@@ -142,14 +151,14 @@ def build_features(
                 entry_point_id=entry_point_id, kind=claim.kind, name=claim.name,
                 owning_unit_id=owning_unit_id, feature_ids=[feature_id],
                 evidence_class=claim.evidence_class,
-                producers=[_producer(None)],
+                producers=[_producer(file_digests.get(_path))],
             ))
 
         state = "confirmed" if label in confirmed_labels else "candidate"
         features.append(FeatureRecord(
             feature_id=feature_id, label=label, state=state, origin="detected",
             unit_ids=[owning_unit_id], entry_point_ids=entry_point_ids_for_feature,
-            producers=[_producer(None)],
+            producers=[_producer(file_digests.get(owner_path))],
         ))
 
     return entry_point_records, features

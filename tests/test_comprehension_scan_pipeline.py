@@ -89,6 +89,31 @@ def test_run_scan_carries_the_pom_xml_build_edge_through_the_worker(java_repo: P
     assert build_edges and build_edges[0]["target_external"] == "org.springframework:spring-core"
 
 
+def test_run_scan_populates_source_digest_on_dependency_and_feature_producers(
+    java_repo: Path,
+) -> None:
+    """M7 (cold-read, PR-B fix round 3): end to end, not just at the
+    builder-unit level - every producer in dependencies.json and
+    features.json must carry a real, non-null source_digest."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    dependencies_doc = json.loads(
+        (outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    assert dependencies_doc["edges"]
+    for edge in dependencies_doc["edges"]:
+        for producer in edge["producers"]:
+            assert producer["source_digest"] is not None
+    assert features_doc["entry_points"]
+    for entry_point in features_doc["entry_points"]:
+        for producer in entry_point["producers"]:
+            assert producer["source_digest"] is not None
+    for feature in features_doc["features"]:
+        for producer in feature["producers"]:
+            assert producer["source_digest"] is not None
+
+
 def test_run_scan_carries_a_web_xml_servlet_route_through_the_worker(
     java_repo: Path,
 ) -> None:

@@ -231,8 +231,15 @@ def run_scan(
 
         modules = modules_artifact.build_modules(
             discovery_result, java_results, parse_failed_paths=parse_failed_paths)
-        dependencies = dependencies_artifact.build_dependencies(java_results)
-        entry_points, features = features_artifact.build_features(java_results)
+        # M7 (cold-read, PR-B fix round 3): discovery already computed
+        # each file's own content digest - dependencies_artifact.py and
+        # features_artifact.py's producers carried source_digest=None
+        # unconditionally, never wired to it.
+        file_digests = {f.relative_path: f.content_digest for f in discovery_result.files}
+        dependencies = dependencies_artifact.build_dependencies(
+            java_results, file_digests=file_digests)
+        entry_points, features = features_artifact.build_features(
+            java_results, file_digests=file_digests)
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
             modules, dependencies, features)
 

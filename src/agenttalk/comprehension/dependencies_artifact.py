@@ -177,6 +177,7 @@ def _producer(*, name: str, version: int, rule_version: int, source_digest: str 
 
 def build_dependencies(
     java_results: dict[str, java_adapter.JavaFileResult],
+    *, file_digests: dict[str, str] | None = None,
 ) -> list[DependencyRecord]:
     """``java_results`` carries every producer's claims uniformly, keyed
     by relative path - including a ``pom.xml``'s ``build`` edges (B-3,
@@ -194,12 +195,20 @@ def build_dependencies(
     read pom.xml directly in the parent process; once B-3 routed it
     through the worker instead, that parameter had no production caller
     left.)
+
+    ``file_digests`` maps a relative path to discovery's own content
+    digest for that file (M7, cold-read PR-B fix round 3: ``source_digest``
+    was set to ``None`` once per file and never actually assigned from it -
+    easy to miss since modules_artifact.py populates its OWN producers'
+    source_digest correctly, so only this module's own producers stayed
+    silently unpopulated).
     """
+    file_digests = file_digests or {}
     by_qualified_name, by_simple_name, file_unit_id_by_path = _build_registry(java_results)
     records: list[DependencyRecord] = []
 
     for path, result in java_results.items():
-        source_digest = None
+        source_digest = file_digests.get(path)
         for edge in result.edges:
             if edge.relation not in CLOSED_RELATIONS:
                 raise UnsupportedRelationClaimed(
