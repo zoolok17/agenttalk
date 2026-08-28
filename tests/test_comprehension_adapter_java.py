@@ -298,7 +298,31 @@ class Controller {
 """
     result = java.parse_java_source("Controller.java", src)
     routes = _edges(result, "route")
-    assert routes[0].target == "/api/widgets/{id}"
+    # M-5 (third cold read, fix round 5): a verb-specific annotation's own
+    # HTTP method is now folded into the route's identity.
+    assert routes[0].target == "GET /api/widgets/{id}"
+
+
+def test_get_and_post_on_the_same_path_produce_distinct_route_targets():
+    """M-5 (third cold read, fix round 5): a GET and a POST handler on the
+    identical path are two different code paths to a migration reader -
+    without the HTTP method folded into the route's own identity, both
+    produced the SAME target string, and downstream (features_artifact.py)
+    the SAME entry_point_id for two genuinely distinct entry points."""
+    src = """
+package p;
+class Controller {
+    @GetMapping("/orders")
+    void list() {}
+
+    @PostMapping("/orders")
+    void create() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    targets = {r.target for r in routes}
+    assert targets == {"GET /orders", "POST /orders"}
 
 
 def test_request_mapping_finds_value_even_when_a_different_attribute_comes_first():

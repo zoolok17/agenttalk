@@ -70,6 +70,18 @@ _ROUTE_ANNOTATIONS = (
 _ROUTE_ANNOTATION_RE = re.compile(
     r"@(" + "|".join(_ROUTE_ANNOTATIONS) + r")\s*(\([^)]*\))?"
 )
+#: M-5 (third cold read, fix round 5): a verb-specific annotation names its
+#: own HTTP method unambiguously; plain ``@RequestMapping`` does not (it
+#: may carry a ``method = ...`` attribute this slice does not parse, or
+#: default to every method) - ``None`` there rather than guessing. Two
+#: different verbs on the SAME path are two distinct entry points to a
+#: migration reader (a GET and a POST handler are different code), so the
+#: method - when known - is folded into the route's own identity, not just
+#: its path.
+_ROUTE_METHOD_BY_ANNOTATION = {
+    "GetMapping": "GET", "PostMapping": "POST", "PutMapping": "PUT",
+    "DeleteMapping": "DELETE", "PatchMapping": "PATCH",
+}
 #: M8 (cold-read, PR-B fix round 3): the route path/value attribute, by
 #: NAME (Spring allows any attribute order - `produces = "...", value =
 #: "/orders"` - blindly taking the first string literal in the argument
@@ -474,7 +486,11 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
         path = _route_path(text, match.start(2), match.end(2)) if match.group(2) else None
-        target = path or f"{enclosing}#{match.group(1)}"
+        method = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1))
+        if path is not None:
+            target = f"{method} {path}" if method else path
+        else:
+            target = f"{enclosing}#{match.group(1)}"
         edges.append(JavaEdgeClaim(
             from_qualified_name=enclosing, relation="route", target=target,
             target_kind="external_route", evidence_class="declared",

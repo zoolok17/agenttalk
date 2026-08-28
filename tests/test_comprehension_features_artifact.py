@@ -87,6 +87,51 @@ def test_two_routes_on_the_same_controller_group_into_one_feature():
     assert sorted(features[0].entry_point_ids) == sorted(e.entry_point_id for e in entry_points)
 
 
+def test_get_and_post_on_the_same_path_are_two_distinct_entry_points_not_a_duplicate_id():
+    """M-5 (third cold read, fix round 5): GET and POST on the identical
+    path used to compute the SAME entry_point_id (the HTTP method was not
+    part of its identity) - the sibling test above only ever counted RAW
+    entry-point records, which stayed 2 either way, so it never actually
+    proved the two entry points were DISTINCT rather than a duplicate
+    primary key published twice. Two methods on one route are two entry
+    points to a migration reader, never collapsed into one."""
+    source = (
+        "package p;\nclass Controller {\n"
+        '  @GetMapping("/orders")\n  void list() {}\n'
+        '  @PostMapping("/orders")\n  void create() {}\n'
+        "}\n"
+    )
+    results = {"Controller.java": _parse("Controller.java", source)}
+    entry_points, features = fa.build_features(results)
+    ids = [e.entry_point_id for e in entry_points]
+    assert len(ids) == len(set(ids)), "two distinct routes published the SAME entry_point_id"
+    assert {e.name for e in entry_points} == {"GET /orders", "POST /orders"}
+    assert sorted(features[0].entry_point_ids) == sorted(ids)
+
+
+def test_duplicate_entry_point_claims_coalesce_to_one_record_with_merged_producers():
+    """M-5 (third cold read, fix round 5): two claims that genuinely
+    normalize to the SAME entry_point_id (kind+owning_unit_id+name) must
+    coalesce to one record with merged producers - the same merge rule
+    dependencies_artifact.py's edge coalescing already applies (M6, round
+    3) - never publish a duplicate "primary key" twice, and never list
+    the same ID twice on the owning feature."""
+    claim = java_adapter.JavaEntryPointClaim(
+        qualified_name="p.App", kind="cli_main", name="main", line=3, evidence_class="extracted")
+    result = java_adapter.JavaFileResult(
+        units=[java_adapter.JavaUnitClaim(
+            relative_path="App.java", qualified_name="p.App", simple_name="App",
+            line=1, classification="production",
+        )],
+        entry_points=[claim, claim],
+    )
+    entry_points, features = fa.build_features(
+        {"App.java": result}, file_digests={"App.java": "deadbeef"})
+    assert len(entry_points) == 1
+    assert len(features[0].entry_point_ids) == 1
+    assert len(entry_points[0].producers) == 1
+
+
 def test_entry_points_on_different_classes_produce_separate_features():
     results = {
         "App.java": _parse(

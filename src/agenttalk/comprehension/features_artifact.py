@@ -21,7 +21,7 @@ semantically-grouped feature boundary a detector cannot actually evidence.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import digests
@@ -154,24 +154,40 @@ def build_features(
         owner_path, first_claim = claims[0]
         label = _feature_label(first_claim.qualified_name)
         feature_id = digests.feature_id(label=label, unit_ids=[owning_unit_id])
-        entry_point_ids_for_feature: list[str] = []
 
-        for _path, claim in claims:
+        # M-5 (third cold read, fix round 5): two claims that normalize to
+        # the SAME entry_point_id (kind+owning_unit_id+name) - e.g. a
+        # duplicate declaration, or a raw claim shape this adapter has not
+        # been taught to distinguish yet - used to publish as two SEPARATE
+        # EntryPointRecords sharing one entry_point_id (a duplicate
+        # "primary key" in a published artifact), and the owning feature's
+        # entry_point_ids listed that ID twice (not the set the pack
+        # contract's exact sorted sets assume). Coalesced by ID here, with
+        # merged producer lists - the SAME rule dependencies_artifact.py's
+        # _coalesce_by_edge_id already applies to edges (M6, round 3).
+        entry_points_by_id: dict[str, EntryPointRecord] = {}
+        for path, claim in claims:
             entry_point_id = digests.entry_point_id(
                 kind=claim.kind, owning_unit_id=owning_unit_id, name=claim.name,
             )
-            entry_point_ids_for_feature.append(entry_point_id)
-            entry_point_records.append(EntryPointRecord(
-                entry_point_id=entry_point_id, kind=claim.kind, name=claim.name,
-                owning_unit_id=owning_unit_id, feature_ids=[feature_id],
-                evidence_class=claim.evidence_class,
-                producers=[_producer(file_digests.get(_path))],
-            ))
+            producer = _producer(file_digests.get(path))
+            existing = entry_points_by_id.get(entry_point_id)
+            if existing is None:
+                entry_points_by_id[entry_point_id] = EntryPointRecord(
+                    entry_point_id=entry_point_id, kind=claim.kind, name=claim.name,
+                    owning_unit_id=owning_unit_id, feature_ids=[feature_id],
+                    evidence_class=claim.evidence_class, producers=[producer],
+                )
+            elif producer not in existing.producers:
+                entry_points_by_id[entry_point_id] = replace(
+                    existing, producers=[*existing.producers, producer])
+
+        entry_point_records.extend(entry_points_by_id.values())
 
         state = "confirmed" if label in confirmed_labels else "candidate"
         features.append(FeatureRecord(
             feature_id=feature_id, label=label, state=state, origin="detected",
-            unit_ids=[owning_unit_id], entry_point_ids=entry_point_ids_for_feature,
+            unit_ids=[owning_unit_id], entry_point_ids=list(entry_points_by_id),
             producers=[_producer(file_digests.get(owner_path))],
         ))
 
