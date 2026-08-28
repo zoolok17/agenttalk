@@ -89,11 +89,30 @@ _ROUTE_METHOD_BY_ANNOTATION = {
 #: (Spring's single-attribute shorthand, `@GetMapping("/orders")`, is
 #: exactly `value`) - the latter only when it is the very first token, so
 #: it can never be confused with a later, unrelated attribute's literal.
-_ROUTE_NAMED_VALUE_RE = re.compile(r'\b(?:value|path)\s*=\s*\{?\s*"([^"]*)"')
-# The captured span includes the annotation's own enclosing parentheses
-# (see _ROUTE_ANNOTATION_RE's group 2), so a bare positional literal is
-# preceded by "(", not just whitespace/brace.
-_ROUTE_POSITIONAL_VALUE_RE = re.compile(r'\A\(\s*\{?\s*"([^"]*)"')
+#:
+#: B1 (fourth cold read, fix round 6): these ONLY locate the attribute
+#: NAME/equals-sign (or the leading "(" for the positional case) - never
+#: the quote or its content. That match runs against the SANITIZED
+#: segment (comments/strings already blanked there), so a commented-out
+#: `value = "..."` can never match this regex at all - its letters are
+#: blanked to spaces along with the rest of the comment. The quote and
+#: its content are recovered SEPARATELY, from the ORIGINAL text, starting
+#: exactly at this match's end position (sanitization preserves length/
+#: position exactly). See _route_path.
+_ROUTE_NAMED_ATTR_RE = re.compile(r"\b(?:value|path)\s*=")
+# The segment always starts with the annotation's own opening "(" (see
+# _matching_close_paren's caller) - a bare positional literal is
+# recognized only when it leads the argument list.
+_ROUTE_POSITIONAL_ANCHOR_RE = re.compile(r"\A\(")
+#: Recovers the quote that opens the target string literal, scanning the
+#: ORIGINAL text from a position ALREADY PROVEN live (the end of a
+#: _ROUTE_NAMED_ATTR_RE/_ROUTE_POSITIONAL_ANCHOR_RE match against the
+#: sanitized segment) - only real whitespace/`{` may separate the two, so
+#: this deliberately does NOT match through a comment wedged between the
+#: attribute and its literal (a pathological case beyond this slice's
+#: scope; the honest failure there is "no route found", never a
+#: truncated or wrong one).
+_ROUTE_VALUE_QUOTE_RE = re.compile(r'\s*\{?\s*"')
 #: invariant 3 (design: "must not store... string-literal bodies"): a
 #: route target is captured as a normalized route IDENTIFIER, never an
 #: unbounded raw excerpt - truncated past this length rather than stored
@@ -356,25 +375,73 @@ def _matching_close_paren(sanitized: str, open_pos: int) -> int | None:
     return None
 
 
-def _route_path(original: str, group_start: int, group_end: int) -> str | None:
-    """Recover the annotation's literal path/value string from the
-    ORIGINAL (un-sanitized) text at the SAME offsets the sanitized match's
-    parenthesized argument group spans - sanitization preserves
-    length/position exactly, so this is always the true source position,
-    even though the sanitized copy blanked the string literal's content.
+def _java_string_literal_content(text: str, quote_pos: int) -> str | None:
+    """Given ``text[quote_pos] == '"'``, returns the string literal's
+    inner content (excluding delimiters) - a triple-quoted text block's
+    content between the ``\"\"\"`` markers, or an ordinary literal's
+    content up to its own unescaped closing quote. ``None`` if the
+    literal is never closed before end of file.
 
-    M8 (cold-read, PR-B fix round 3): previously took the FIRST string
-    literal in the argument list unconditionally, which is wrong whenever
-    a different attribute's literal (e.g. `produces = "application/json"`)
-    precedes the real `value`/`path` in source order. Looks up the named
-    attribute first (position-independent), falling back to a bare
-    positional string only when it leads the argument list. The result is
-    length-bounded (invariant 3), never an unbounded raw excerpt."""
-    segment = original[group_start:group_end]
-    match = _ROUTE_NAMED_VALUE_RE.search(segment) or _ROUTE_POSITIONAL_VALUE_RE.match(segment)
+    B1 (fourth cold read, fix round 6): mirrors ``_strip_comments_and_
+    strings``'s OWN boundary-finding logic exactly (same escaped-quote
+    skip, same triple-quote handling) - the same rule that decides where
+    a string ends for SANITIZATION purposes now also decides what its
+    content IS for route-value extraction, closing the escaped-quote and
+    text-block members of the nested-paren truncation family as a side
+    effect of reusing one mechanism, not as separate fixes."""
+    n = len(text)
+    if text[quote_pos:quote_pos + 3] == '"""':
+        content_start = quote_pos + 3
+        close = text.find('"""', content_start)
+        if close == -1:
+            return None
+        return text[content_start:close]
+    end = quote_pos + 1
+    while end < n and text[end] != '"':
+        end += 2 if text[end] == "\\" and end + 1 < n else 1
+    if end >= n:
+        return None
+    return text[quote_pos + 1:end]
+
+
+def _route_path(sanitized: str, original: str, group_start: int, group_end: int) -> str | None:
+    """Recover the annotation's literal path/value string. LOCATES the
+    attribute (by name, or the leading positional literal) against the
+    SANITIZED segment - comments and string content are already blanked
+    there, so a commented-out ``value = "..."`` cannot match at all, its
+    letters erased along with the rest of the comment. Then reads the
+    literal's actual CONTENT from the ORIGINAL text, starting exactly at
+    that match's end position (sanitization preserves length/position
+    exactly).
+
+    B1 (fourth cold read, fix round 6): the previous version matched the
+    WHOLE named-attribute-plus-quoted-literal pattern against the
+    ORIGINAL (unsanitized) text directly - comments are live text to that
+    match, so a commented-out `value = "..."` preceding the real one won
+    outright, publishing dead code as declared-class evidence AND as the
+    entry point's own stable ID. Detection now happens where comments are
+    already invisible; only content recovery ever touches the original.
+
+    M8 (cold-read, PR-B fix round 3): looks up the named attribute first
+    (position-independent - Spring allows any attribute order), falling
+    back to a bare positional string only when it leads the argument
+    list. The result is length-bounded (invariant 3), never an unbounded
+    raw excerpt."""
+    sanitized_segment = sanitized[group_start:group_end]
+    match = _ROUTE_NAMED_ATTR_RE.search(sanitized_segment)
+    if match is None:
+        match = _ROUTE_POSITIONAL_ANCHOR_RE.match(sanitized_segment)
     if match is None:
         return None
-    return _bounded_route_target(match.group(1))
+    anchor = group_start + match.end()
+    quote_match = _ROUTE_VALUE_QUOTE_RE.match(original, anchor)
+    if quote_match is None:
+        return None
+    quote_pos = quote_match.end() - 1
+    content = _java_string_literal_content(original, quote_pos)
+    if content is None:
+        return None
+    return _bounded_route_target(content)
 
 
 def _bounded_route_target(value: str) -> str:
@@ -524,7 +591,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         if arg_pos < len(sanitized) and sanitized[arg_pos] == "(":
             close_pos = _matching_close_paren(sanitized, arg_pos)
             if close_pos is not None:
-                path = _route_path(text, arg_pos, close_pos + 1)
+                path = _route_path(sanitized, text, arg_pos, close_pos + 1)
         method = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1))
         if path is not None:
             target = f"{method} {path}" if method else path

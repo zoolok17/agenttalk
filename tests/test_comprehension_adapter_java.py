@@ -366,6 +366,87 @@ class Controller {
     assert routes[0].target == "/api/widgets"
 
 
+def test_route_value_ignores_a_commented_out_line_before_the_live_one():
+    """B1 (fourth cold read, fix round 6): value extraction used to match
+    the ORIGINAL (unsanitized) text directly - a commented-out `value =`
+    line is live text to that match, so it won outright over the real
+    one below it, publishing dead code as declared-class evidence AND as
+    the entry point's own stable ID. Reproduced pre-fix: this returned
+    "/v1/legacy-removed" (the commented-out value), never "/v2/orders"."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(
+        // value = "/v1/legacy-removed"
+        value = "/v2/orders"
+    )
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "/v2/orders"
+
+
+def test_route_value_ignores_a_block_comment_before_the_live_attribute():
+    """B1 (fourth cold read, fix round 6): same class as the line-comment
+    case, via a block comment wedged directly in the argument list."""
+    src = """
+package p;
+class Controller {
+    @GetMapping(/* value = "/OLD" */ value = "/NEW")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /NEW"
+
+
+def test_route_value_with_an_escaped_quote_is_not_truncated():
+    """B1 (fourth cold read, fix round 6), closing the KNOWN ISSUE named
+    in round 5's PR description: an escaped quote inside the route value
+    used to truncate the captured content at the escape (the old
+    `[^"]*` capture has no concept of escaping). _java_string_literal_content
+    reuses _strip_comments_and_strings's own escaped-quote skip, so the
+    literal's FULL content - escape sequence included, raw - is now
+    recovered."""
+    src = r"""
+package p;
+class Controller {
+    @RequestMapping(value = "/api/\"quoted\"/thing")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == '/api/\\"quoted\\"/thing'
+
+
+def test_route_value_as_a_text_block_is_recovered():
+    """B1 (fourth cold read, fix round 6): a Java 15+ triple-quoted text
+    block is a different string-literal shape entirely (delimited by
+    `\"\"\"`, not a single `"`) - _java_string_literal_content handles it
+    the same way _strip_comments_and_strings already does when
+    sanitizing, so this is recovered rather than mis-parsed as an empty
+    or truncated ordinary literal."""
+    src = '''
+package p;
+class Controller {
+    @RequestMapping(value = """
+        /api/textblock""")
+    void list() {}
+}
+'''
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert "/api/textblock" in routes[0].target
+
+
 def test_request_mapping_path_attribute_is_recovered_ahead_of_an_unrelated_literal():
     src = """
 package p;
