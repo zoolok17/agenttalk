@@ -180,6 +180,44 @@ class Foo {
     assert any(e.target == "Helper" and e.target_kind == "internal_candidate" for e in invoke)
 
 
+def test_invoke_edge_is_attributed_to_the_enclosing_type_not_the_first_declared_type():
+    src = """
+package p;
+class Helper {
+    static void doWork() {}
+}
+class Foo {
+    void run() {
+        Helper.doWork();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = next(e for e in _edges(result, "invoke") if e.target == "Helper")
+    # Note 10 (second cold read, fix round 4): the call is textually inside
+    # Foo.run(), not Helper (the FIRST declared type in the file) - a file
+    # with more than one top-level type must attribute the edge to the type
+    # whose body actually contains the call, not always to the first one.
+    assert invoke.from_qualified_name == "p.Foo"
+
+
+def test_route_edge_and_entry_point_are_attributed_to_the_enclosing_type():
+    src = """
+package p;
+class Other {
+}
+class Controller {
+    @RequestMapping("/api/widgets")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert routes[0].from_qualified_name == "p.Controller"
+    http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
+    assert http_entry_points[0].qualified_name == "p.Controller"
+
+
 # ----------------------------------------------------------- route (declared only)
 
 def test_request_mapping_with_literal_path_produces_a_declared_route():
@@ -301,6 +339,26 @@ def test_no_main_method_means_no_cli_main_entry_point():
     src = "package p;\nclass Widget {\n}\n"
     result = java.parse_java_source("Widget.java", src)
     assert [e for e in result.entry_points if e.kind == "cli_main"] == []
+
+
+def test_second_top_level_type_with_its_own_main_gets_its_own_cli_main_entry_point():
+    src = """
+package p;
+class First {
+    public static void main(String[] args) {
+    }
+}
+class Second {
+    public static void main(String[] args) {
+    }
+}
+"""
+    result = java.parse_java_source("Multi.java", src)
+    mains = {e.qualified_name for e in result.entry_points if e.kind == "cli_main"}
+    # Note 10 (second cold read, fix round 4): a single re.search kept only
+    # the FIRST main method in the whole file - a second top-level type's
+    # own main was silently dropped as an entry point entirely.
+    assert mains == {"p.First", "p.Second"}
 
 
 # ----------------------------------------------------------- pom.xml (build)

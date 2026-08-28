@@ -216,38 +216,69 @@ def _classify(relative_path: str, simple_name: str | None) -> str:
 
 def _extract_types(
     sanitized: str, package: str | None,
-) -> list[tuple[str, str, str, int, str | None, str | None]]:
+) -> list[tuple[str, str, str, int, str | None, str | None, int]]:
     """Returns ``(qualified_name, simple_name, container_prefix, brace_pos,
-    extends, implements_raw)`` for every declared type, correctly nested by
-    tracking brace depth against each type header's own opening brace."""
+    extends, implements_raw, end_brace_pos)`` for every declared type,
+    correctly nested by tracking brace depth against each type header's own
+    opening brace. ``end_brace_pos`` (the position of the type's OWN closing
+    brace) is what :func:`_enclosing_qualified_name` uses to attribute a
+    later match (a call, an annotation, a main method) to the innermost
+    declared type whose body actually contains it, rather than to whichever
+    type happened to be declared first in the file."""
     headers = list(_TYPE_HEADER_RE.finditer(sanitized))
     header_by_brace_pos = {m.end() - 1: m for m in headers}
-    stack: list[tuple[int, str]] = []
+    stack: list[tuple[int, str, int]] = []
     depth = 0
-    results: list[tuple[str, str, str, int, str | None, str | None]] = []
+    results: list[list[Any]] = []
     for i, ch in enumerate(sanitized):
         if ch == "{":
             match = header_by_brace_pos.get(i)
             if match is not None:
                 simple_name = match.group(2)
-                container_prefix = ".".join(name for _, name in stack)
+                container_prefix = ".".join(name for _, name, _ in stack)
                 if container_prefix:
                     qualified = f"{container_prefix}.{simple_name}"
                 elif package:
                     qualified = f"{package}.{simple_name}"
                 else:
                     qualified = simple_name
-                results.append((
+                result_index = len(results)
+                results.append([
                     qualified, simple_name, container_prefix,
-                    match.start(), match.group(3), match.group(4),
-                ))
-                stack.append((depth, qualified))
+                    match.start(), match.group(3), match.group(4), i,
+                ])
+                stack.append((depth, qualified, result_index))
             depth += 1
         elif ch == "}":
             depth -= 1
             if stack and stack[-1][0] == depth:
-                stack.pop()
-    return results
+                _, _, result_index = stack.pop()
+                results[result_index][6] = i
+    return [tuple(result) for result in results]
+
+
+def _enclosing_qualified_name(
+    position: int,
+    types: list[tuple[str, str, str, int, str | None, str | None, int]],
+    fallback: str,
+) -> str:
+    """The innermost declared type whose ``[brace_pos, end_brace_pos]``
+    span contains ``position`` - never just "the first type in the file"
+    (Note 10, second cold read, fix round 4: a file with more than one
+    top-level type attributed EVERY edge and entry point - regardless of
+    which type's body the underlying call/annotation/main method actually
+    appeared in - to the first declared type, misfiling real fan-in/fan-out
+    and entry points onto the wrong unit whenever a second top-level type
+    was present). Falls back to ``fallback`` (the file's primary type) for a
+    position outside every known type body - e.g. an import statement,
+    which precedes every type header and is legitimately file-scoped."""
+    best: str | None = None
+    best_span = None
+    for qualified, _simple, _container, start, _extends, _implements, end in types:
+        if start <= position <= end and (best_span is None or (end - start) < best_span):
+            best = qualified
+            best_span = end - start
+    return best if best is not None else fallback
 
 
 def _split_type_list(raw: str) -> list[str]:
@@ -326,7 +357,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             line=_line_at(newline_offsets, brace_pos),
             classification=_classify(relative_path, simple),
         )
-        for qualified, simple, _container, brace_pos, _extends, _implements in types
+        for qualified, simple, _container, brace_pos, _extends, _implements, _end in types
     ]
 
     edges: list[JavaEdgeClaim] = []
@@ -351,7 +382,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             evidence_class="extracted", line=line, phase="runtime",
         ))
 
-    for qualified, simple, _container, brace_pos, extends, implements_raw in types:
+    for qualified, simple, _container, brace_pos, extends, implements_raw, _end in types:
         line = _line_at(newline_offsets, brace_pos)
         if extends:
             for name in _split_type_list(extends):
@@ -417,32 +448,38 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # match; otherwise it stays unresolved, never a guess.
             target_kind = "internal_unqualified_call_candidate"
         edges.append(JavaEdgeClaim(
-            from_qualified_name=primary_qualified, relation="invoke", target=qualifier,
+            from_qualified_name=_enclosing_qualified_name(match.start(), types, primary_qualified),
+            relation="invoke", target=qualifier,
             target_kind=target_kind, evidence_class="extracted",
             line=_line_at(newline_offsets, match.start()), phase="runtime",
         ))
 
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
+        enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
         path = _route_path(text, match.start(2), match.end(2)) if match.group(2) else None
-        target = path or f"{primary_qualified}#{match.group(1)}"
+        target = path or f"{enclosing}#{match.group(1)}"
         edges.append(JavaEdgeClaim(
-            from_qualified_name=primary_qualified, relation="route", target=target,
+            from_qualified_name=enclosing, relation="route", target=target,
             target_kind="external_route", evidence_class="declared",
             line=line, phase="runtime",
         ))
         entry_points.append(JavaEntryPointClaim(
-            qualified_name=primary_qualified, kind="http_route",
+            qualified_name=enclosing, kind="http_route",
             name=target, line=line, evidence_class="declared",
         ))
 
-    main_match = re.search(
+    # Note 10 (second cold read, fix round 4): finditer, not search - a
+    # file with more than one top-level type can declare more than one
+    # `main` method (e.g. two separate CLI entry classes in one file), and
+    # the old single re.search silently kept only the first.
+    for main_match in re.finditer(
         r"\bpublic\s+static\s+void\s+main\s*\(\s*String(?:\s*\[\s*\]|\.\.\.)\s+\w+\s*\)",
         sanitized,
-    )
-    if main_match is not None:
+    ):
         entry_points.append(JavaEntryPointClaim(
-            qualified_name=primary_qualified, kind="cli_main", name="main",
+            qualified_name=_enclosing_qualified_name(main_match.start(), types, primary_qualified),
+            kind="cli_main", name="main",
             line=_line_at(newline_offsets, main_match.start()), evidence_class="extracted",
         ))
 
