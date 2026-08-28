@@ -235,7 +235,23 @@ def _extract_types(
             match = header_by_brace_pos.get(i)
             if match is not None:
                 simple_name = match.group(2)
-                container_prefix = ".".join(name for _, name, _ in stack)
+                # M-4 (third cold read, fix round 5): each stack entry's
+                # own `name` is ALREADY that ancestor's full qualified
+                # name (it was computed the same way, one level up) - the
+                # immediate (innermost) enclosing entry alone IS the
+                # correct prefix. Joining every entry's already-qualified
+                # name together (the previous ".".join(...) over the
+                # whole stack) instead concatenated each ancestor's own
+                # full lineage AGAIN at every nesting level: a 3-deep type
+                # (Outer/Inner/Innermost in package com.acme) qualified as
+                # "com.acme.Outer.com.acme.Outer.Inner.Innermost" - wrong
+                # from the second nesting level down, corrupting unit_id
+                # (a hash of this string) and containment lookups for
+                # every type nested 3+ deep. Invisible at depth 2, where
+                # the stack holds only one entry and joining it with
+                # nothing already happened to look identical to using it
+                # directly.
+                container_prefix = stack[-1][1] if stack else ""
                 if container_prefix:
                     qualified = f"{container_prefix}.{simple_name}"
                 elif package:

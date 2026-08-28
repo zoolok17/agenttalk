@@ -70,6 +70,55 @@ class Outer {
     assert names == {"com.example.Outer", "com.example.Outer.Inner"}
 
 
+def test_a_type_nested_three_deep_gets_an_uncorrupted_qualified_name():
+    """M-4 (third cold read, fix round 5): a depth-2 nested type's
+    container_prefix (one stack entry) happens to look correct even with
+    the OLD ``".".join(all stack entries)`` bug, since joining a single
+    entry with nothing is a no-op - the bug is invisible exactly where
+    the old test stopped. At depth 3, Innermost's prefix used to
+    concatenate BOTH Outer's and Inner's already-fully-qualified names
+    together: "com.acme.Outer.com.acme.Outer.Inner.Innermost", not
+    "com.acme.Outer.Inner.Innermost"."""
+    src = """
+package com.acme;
+
+class Outer {
+    class Inner {
+        class Innermost {
+        }
+    }
+}
+"""
+    result = java.parse_java_source("com/acme/Outer.java", src)
+    names = {u.qualified_name for u in result.units}
+    assert names == {
+        "com.acme.Outer", "com.acme.Outer.Inner", "com.acme.Outer.Inner.Innermost",
+    }
+
+
+def test_a_type_nested_four_deep_gets_an_uncorrupted_qualified_name():
+    """M-4: depth 4 compounds the same corruption further at every
+    additional level if the bug is present at all - a second, deeper
+    data point confirming the fix holds beyond the minimum repro."""
+    src = """
+package com.acme;
+
+class A {
+    class B {
+        class C {
+            class D {
+            }
+        }
+    }
+}
+"""
+    result = java.parse_java_source("com/acme/A.java", src)
+    names = {u.qualified_name for u in result.units}
+    assert names == {
+        "com.acme.A", "com.acme.A.B", "com.acme.A.B.C", "com.acme.A.B.C.D",
+    }
+
+
 def test_class_name_inside_a_string_literal_is_not_extracted_as_a_type():
     src = """
 package p;

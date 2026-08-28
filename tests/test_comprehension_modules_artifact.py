@@ -148,6 +148,35 @@ def test_a_nested_class_is_contained_by_its_outer_class():
     assert file_record.container_unit_id is None
 
 
+def test_a_type_nested_three_deep_is_contained_by_its_immediate_outer_type():
+    """M-4 (third cold read, fix round 5): the depth-2 test above stops
+    exactly where the adapter's qualified-name corruption starts (a
+    single stack entry, joined with nothing, happens to look correct
+    either way) - this exercises the containment CHAIN one level deeper,
+    where a corrupted qualified name would make _parent_qualified_name's
+    rsplit("." , 1) lookup fail to find its immediate parent among the
+    known names, and Innermost would fall back to being contained by the
+    FILE instead of by Inner."""
+    source = (
+        "package p;\nclass Outer {\n  class Inner {\n  class Innermost {\n  }\n  }\n}\n"
+    )
+    discovery = _discovery([
+        EnumeratedFile(relative_path="p/Outer.java", byte_count=len(source), content_digest="d3"),
+    ])
+    java_results = {"p/Outer.java": _java_result("p/Outer.java", source)}
+    records = ma.build_modules(discovery, java_results)
+
+    outer = next(r for r in records if r.display_name == "Outer")
+    inner = next(r for r in records if r.display_name == "Inner")
+    innermost = next(r for r in records if r.display_name == "Innermost")
+    file_record = next(r for r in records if r.kind == "file")
+
+    assert innermost.unit_id != file_record.unit_id
+    assert innermost.container_unit_id == inner.unit_id
+    assert inner.container_unit_id == outer.unit_id
+    assert outer.container_unit_id == file_record.unit_id
+
+
 def test_unit_id_is_deterministic_across_two_builds():
     source = "package p;\nclass Foo {\n}\n"
     discovery = _discovery([
