@@ -502,19 +502,29 @@ class Controller {
 
 
 def test_class_level_request_mapping_composes_with_a_method_level_route():
-    """M5 (fourth cold read, fix round 6): a class-level @RequestMapping
-    prefix and a method-level route value used to publish as two
-    INDEPENDENT routes - the method's own published value was a bare
-    fragment of the actually-served path ("/list" published, "/api/
-    orders/list" actually served) in the field named for the whole
-    route. Composition is Spring's own declared semantics, not
-    inference. The bare class-level annotation itself (no method mapping
-    of its own) must not ALSO publish as its own route."""
+    """M5 (fourth cold read, fix round 6; fixture corrected fifth cold
+    read, fix round 7): a class-level @RequestMapping prefix and a
+    method-level route value used to publish as two INDEPENDENT routes -
+    the method's own published value was a bare fragment of the actually
+    -served path ("/list" published, "/api/orders/list" actually
+    served) in the field named for the whole route. Composition is
+    Spring's own declared semantics, not inference. The bare class-level
+    annotation itself (no method mapping of its own) must not ALSO
+    publish as its own route.
+
+    Round 7: the header carries a modifier (``public``) deliberately -
+    round 6's own fixture used a BARE ``class Controller {`` with no
+    modifier, which accidentally never exercised the walk's failure mode
+    (the type header's match position sits AFTER any modifier keyword;
+    round 6's walk only skipped whitespace and bare annotations, landing
+    short of the header - and silently failing - on every MODIFIED
+    declaration, i.e. almost every real one). A bare declaration cannot
+    prove this fix; this one can and does."""
     src = """
 package p;
 
 @RequestMapping("/api/orders")
-class Controller {
+public class Controller {
     @GetMapping("/list")
     void list() {}
 }
@@ -526,6 +536,27 @@ class Controller {
     http_entry_points = [e for e in result.entry_points if e.kind == "http_route"]
     assert len(http_entry_points) == 1
     assert http_entry_points[0].name == "GET /api/orders/list"
+
+
+def test_class_level_request_mapping_composes_on_a_modified_interface():
+    """M5 (fifth cold read, fix round 7): the type header regex matches
+    ``class``, ``interface``, or ``enum`` alike, and Spring's own
+    declared composition semantics apply the same way to an interface
+    carrying a class-level mapping - the dispatch's explicit second
+    fixture shape ("plus an interface case")."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public interface Controller {
+    @GetMapping("/list")
+    void list();
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
 
 
 def test_method_level_route_with_no_class_level_mapping_is_unchanged():
@@ -544,6 +575,72 @@ class Controller {
     routes = _edges(result, "route")
     assert len(routes) == 1
     assert routes[0].target == "GET /list"
+
+
+def test_class_level_request_mapping_with_a_valueless_method_annotation_uses_the_prefix_alone():
+    """M5 composition note (fifth cold read, fix round 7): a bare
+    ``@GetMapping`` (no value of its own) inside a prefixed class still
+    serves the class's own prefix in Spring - round 6 gated composition
+    on the method having its own literal, so a valueless method
+    annotation fell through to the synthetic ``Type#Annotation``
+    fallback and LOST the class prefix entirely rather than publishing
+    it alone."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller {
+    @GetMapping
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders"
+
+
+def test_class_level_request_mapping_prefix_without_a_leading_slash_still_composes():
+    """M5 composition note (fifth cold read, fix round 7): a class-level
+    prefix lacking its own leading ``/`` (unusual but syntactically
+    valid) must still compose into an absolute-looking route, not a
+    relative fragment."""
+    src = """
+package p;
+
+@RequestMapping("orders")
+public final class Controller {
+    @GetMapping("list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /orders/list"
+
+
+def test_class_level_request_mapping_survives_a_stacked_annotation_with_nested_parens():
+    """M5 composition note (fifth cold read, fix round 7): a stacked
+    annotation between the route annotation and the type header may
+    carry its OWN nested-paren argument (e.g. a static-method-call
+    default) - the walk must skip it depth-aware, exactly like
+    _matching_close_paren already does for the route annotation's own
+    arguments, not give up and silently drop the composition."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@ConditionalOnProperty(name = "x", havingValue = String.valueOf(true))
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
 
 
 # ----------------------------------------------------------- entry points

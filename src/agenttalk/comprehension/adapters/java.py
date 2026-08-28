@@ -459,17 +459,20 @@ def _bounded_route_target(value: str) -> str:
     return value[:_MAX_ROUTE_TARGET_LENGTH] + "...(truncated)"
 
 
-#: M5 (fourth cold read, fix round 6): only whitespace and OTHER bare/
-#: simple annotations may separate a class-level route annotation from
-#: the type header it decorates (Java allows several annotations to
-#: stack directly above one declaration, e.g. ``@RestController
-#: @RequestMapping("/api/orders")``) - this is deliberately simpler than
-#: the depth-tracking scan _matching_close_paren uses (no nested parens
-#: inside one of these OTHER, skipped-over annotations): a real one
-#: (`@SuppressWarnings({"x"})`) would fail this match and safely fall
-#: back to treating the route annotation as method-level instead of
-#: guessing at a class-level composition.
-_ANNOTATION_TRIVIA_RE = re.compile(r"@\w+(?:\([^()]*\))?\s*|\s+")
+#: M5 (fifth cold read, fix round 7): the type header's own position
+#: (``_TYPE_HEADER_RE`` matches starting AT ``class``/``interface``/
+#: ``enum`` itself, never at any preceding modifier) sits AFTER every
+#: modifier keyword a declaration carries (``public``, ``final``,
+#: ``abstract``, ...). Round 6's walk only skipped whitespace and OTHER
+#: bare/simple annotations, so it landed short of the header - and
+#: failed - on any modified declaration, i.e. almost every real one:
+#: composition never fired at all, silently, on the ordinary case.
+_JAVA_TYPE_MODIFIERS = frozenset({
+    "public", "private", "protected", "static",
+    "final", "abstract", "strictfp", "sealed",
+})
+_IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+_BARE_ANNOTATION_NAME_RE = re.compile(r"@\w+")
 
 
 def _class_level_route_target(
@@ -477,29 +480,73 @@ def _class_level_route_target(
     types: list[tuple[str, str, str, int, str | None, str | None, int]],
 ) -> str | None:
     """If the annotation ending at ``end_pos`` sits DIRECTLY on a
-    declared type - only trivia (whitespace, other stacked annotations)
-    between it and that type's own header - returns the type's qualified
-    name. ``None`` means this route annotation is on a method (or
-    anything else), not a class."""
+    declared type - only trivia (whitespace, modifier keywords, other
+    stacked annotations - including ones with their OWN nested-paren
+    argument lists, skipped depth-aware via :func:`_matching_close_paren`
+    exactly like the route annotation's own arguments) between it and
+    that type's own header - returns the type's qualified name. ``None``
+    means this route annotation is on a method (or anything else), not a
+    class.
+
+    M5 (fifth cold read, fix round 7): round 6's version matched a fixed
+    "bare annotation or whitespace" regex - it landed short of the
+    header on any MODIFIED declaration (composition never fired on a
+    real ``public class ...``, only a bare unmodified one) and safely
+    but unnecessarily gave up on a stacked annotation with its own
+    nested parens. This version walks token-by-token: whitespace, a
+    known modifier keyword, or an annotation (name plus, if present, its
+    OWN properly-nested argument list) - anything else halts the walk
+    and returns ``None``, the same safe non-guess round 6 already made
+    for a genuinely unrecognized shape."""
     header_starts = {start: qualified for qualified, _s, _c, start, _e, _i, _end in types}
     pos = end_pos
     n = len(sanitized)
     while pos < n:
         if pos in header_starts:
             return header_starts[pos]
-        match = _ANNOTATION_TRIVIA_RE.match(sanitized, pos)
-        if match is None or match.end() == pos:
-            return None
-        pos = match.end()
+        ch = sanitized[pos]
+        if ch.isspace():
+            pos += 1
+            continue
+        if ch == "@":
+            name_match = _BARE_ANNOTATION_NAME_RE.match(sanitized, pos)
+            if name_match is None:
+                return None
+            pos = name_match.end()
+            arg_pos = pos
+            while arg_pos < n and sanitized[arg_pos].isspace():
+                arg_pos += 1
+            if arg_pos < n and sanitized[arg_pos] == "(":
+                close_pos = _matching_close_paren(sanitized, arg_pos)
+                if close_pos is None:
+                    return None
+                pos = close_pos + 1
+            continue
+        token_match = _IDENTIFIER_TOKEN_RE.match(sanitized, pos)
+        if token_match is not None and token_match.group(0) in _JAVA_TYPE_MODIFIERS:
+            pos = token_match.end()
+            continue
+        return None
     return None
 
 
 def _compose_route_path(prefix: str, path: str) -> str:
     """Spring's OWN declared composition semantics for a class-level
     ``@RequestMapping`` prefix plus a method-level route value - not
-    inference (M5, fourth cold read, fix round 6): exactly one ``/``
-    between the two, regardless of which side already has one."""
-    return f"{prefix.rstrip('/')}/{path.lstrip('/')}"
+    inference (M5, fourth cold read, fix round 6).
+
+    M5 composition notes (fifth cold read, fix round 7): a class prefix
+    lacking its own leading ``/`` is normalized to one (a route target is
+    always an absolute path), and an EMPTY method-level value (a
+    valueless method annotation, composed by the caller as ``""``)
+    yields the prefix alone - never a spurious trailing ``/``."""
+    prefix_part = prefix.rstrip("/")
+    if not prefix_part.startswith("/"):
+        prefix_part = "/" + prefix_part
+    path_part = path.lstrip("/")
+    if not path_part:
+        return prefix_part
+    return f"{prefix_part}/{path_part}"
 
 
 def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
@@ -691,8 +738,15 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # - already captured as a prefix above, never its own edge/
             # entry point.
             continue
-        if path is not None and enclosing in class_route_prefix:
-            path = _compose_route_path(class_route_prefix[enclosing], path)
+        if enclosing in class_route_prefix:
+            # M5 composition note (fifth cold read, fix round 7): a
+            # valueless method annotation (bare ``@GetMapping``) still
+            # serves the class's own prefix in Spring - composing with
+            # an empty method value (never skipping composition just
+            # because there is no method-level literal) instead of
+            # falling through to the synthetic fallback below and
+            # silently losing the prefix entirely.
+            path = _compose_route_path(class_route_prefix[enclosing], path or "")
         method = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1))
         if path is not None:
             target = f"{method} {path}" if method else path
