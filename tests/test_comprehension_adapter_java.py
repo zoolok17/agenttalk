@@ -163,6 +163,96 @@ interface Combo extends Foo, Bar {
     assert {e.target for e in inherit} == {"Foo", "Bar"}
 
 
+# ------------------------------------------------- BLOCKER 1a header battery
+# (fifth cold read, fix round 8): _TYPE_HEADER_RE (the old, single fixed-
+# shape regex) could not match a bounded/intersection generic parameter
+# list, a sealed+permits header, or a record declaration - an unmatched
+# header dropped the type SILENTLY: zero units, status complete,
+# problem_count 0, on a file this adapter never actually understood. Each
+# case below is exactly one of the reviewer's battery shapes; every one
+# must extract a real unit, never silently zero.
+
+def test_bounded_generic_type_parameter_is_extracted():
+    src = """
+package p;
+class Box<T extends Comparable<T>> {
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Box.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Box"]
+
+
+def test_intersection_bounded_generic_type_parameter_is_extracted():
+    src = """
+package p;
+class Pair<T extends Number & Comparable<T>> {
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Pair.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Pair"]
+
+
+def test_sealed_class_with_permits_is_extracted():
+    src = """
+package p;
+public sealed class Shape permits Circle, Square {
+    void list() {}
+}
+final class Circle extends Shape {}
+final class Square extends Shape {}
+"""
+    result = java.parse_java_source("Shape.java", src)
+    assert {u.qualified_name for u in result.units} == {"p.Shape", "p.Circle", "p.Square"}
+    inherit = _edges(result, "inherit")
+    assert {e.target for e in inherit if e.from_qualified_name == "p.Circle"} == {"Shape"}
+
+
+def test_record_declaration_is_extracted():
+    src = """
+package p;
+record Point(int x, int y) implements Comparable<Point> {
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Point.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Point"]
+    inherit = _edges(result, "inherit")
+    assert {e.target for e in inherit} == {"Comparable"}
+
+
+def test_generic_record_declaration_is_extracted():
+    src = """
+package p;
+record Pair<A, B>(A first, B second) {
+}
+"""
+    result = java.parse_java_source("Pair.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.Pair"]
+
+
+def test_class_level_request_mapping_composes_on_a_bounded_generic_controller():
+    """The end-to-end proving case: a class-level route prefix on a
+    header shape the OLD regex could not match must still compose with
+    its method-level route - not publish the prefix as its own served
+    entry point (the exact pre-M5 wrong shape an unmatched header used
+    to reproduce)."""
+    src = """
+package p;
+
+@RequestMapping("/api/base")
+public class Controller<T extends Comparable<T>> {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/base/list"
+
+
 # ----------------------------------------------------------- test classification + relation
 
 def test_test_suffixed_class_is_classified_test_and_produces_a_test_edge():

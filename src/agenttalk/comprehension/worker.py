@@ -232,6 +232,29 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                     detail=bounded_detail(f"{adapter.ADAPTER_NAME} adapter failed: {exc}")))
             else:
                 java_results[rel] = adapter.file_result_to_json(result)
+                # BLOCKER 1b (fifth cold read, fix round 8): a parse that
+                # SUCCEEDS but extracts ZERO units used to count as
+                # positive adapter evidence with no problem recorded at
+                # all - readiness then reported source_understood
+                # satisfied for a file this adapter never actually
+                # understood (a header shape its coarse pattern-based
+                # extractor could not recognize is indistinguishable,
+                # from here, from a legitimately typeless file). The two
+                # legitimate typeless shapes - package-info.java by name,
+                # and a genuinely blank/comment-only file by content -
+                # are recognized explicitly and exempted; anything else
+                # with zero units is a real, named problem.
+                if (
+                    not result.units
+                    and rel_name_lower != "package-info.java"
+                    and not adapter.is_effectively_empty_java_source(text)
+                ):
+                    problems.append(WorkerProblem(
+                        reason_code="no_types_extracted", relative_path=rel,
+                        detail="the java adapter parsed this file but extracted no declared "
+                               "types - an unrecognized header shape, not a legitimate "
+                               "empty/typeless file",
+                    ))
         elif rel_name_lower == "pom.xml":
             # reviewer-3 B-3 (PR-B delta review): a pom.xml's build-relation
             # extraction used to happen in the PARENT process, reading the

@@ -148,6 +148,10 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     "resource_limit": "warning",
     "non_utf8_path": "warning",
     "case_collision": "warning",
+    # BLOCKER 1b (fifth cold read, fix round 8): a .java file whose parse
+    # succeeded but extracted zero declared types - closing the zero-
+    # extraction evidence hole as a class (worker.py).
+    "no_types_extracted": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 

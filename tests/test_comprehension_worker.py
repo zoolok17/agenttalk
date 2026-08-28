@@ -177,6 +177,43 @@ def test_process_paths_dispatches_web_xml_through_the_java_results_channel(
     assert entry_points[0]["kind"] == "http_route"
 
 
+def test_process_paths_flags_a_java_file_that_parses_but_extracts_no_types(
+    tmp_path: Path,
+) -> None:
+    """BLOCKER 1b (fifth cold read, fix round 8): a .java file whose
+    parse SUCCEEDS but extracts ZERO declared types used to count as
+    positive adapter evidence with no problem recorded at all -
+    readiness then reported source_understood satisfied for a file this
+    adapter never actually understood. Genuinely unrecognized top-level
+    content (not a comment, not a package/import statement, not any
+    known declaration keyword) must now be a named, explicit problem."""
+    (tmp_path / "Garbage.java").write_text("package p;\nfoo bar baz;\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["Garbage.java"])
+    assert "Garbage.java" in result.java_results
+    assert [p.reason_code for p in result.problems] == ["no_types_extracted"]
+    assert result.problems[0].relative_path == "Garbage.java"
+
+
+def test_process_paths_does_not_flag_package_info_java(tmp_path: Path) -> None:
+    """package-info.java legitimately declares no class/interface/enum/
+    record at all - even carrying its own package-level annotation
+    (a common real-world shape) - and must never be flagged as an
+    unrecognized header."""
+    (tmp_path / "package-info.java").write_text(
+        "/**\n * Javadoc.\n */\n@Deprecated\npackage p;\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["package-info.java"])
+    assert result.problems == []
+
+
+def test_process_paths_does_not_flag_an_empty_or_comment_only_java_file(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "Empty.java").write_text(
+        "package p;\n// nothing else here\n", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["Empty.java"])
+    assert result.problems == []
+
+
 def test_process_paths_is_deterministic_regardless_of_input_order(tmp_path: Path) -> None:
     """N4 (cold-read, PR-B fix round 3): comparing bare SETS of sizes
     cannot detect a cross-contamination bug (e.g. a.txt's claim

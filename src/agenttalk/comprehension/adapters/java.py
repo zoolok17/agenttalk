@@ -54,14 +54,41 @@ _TEST_NAME_SUFFIX = re.compile(r"(Test|Tests|IT)$")
 
 _PACKAGE_RE = re.compile(r"(?m)^\s*package\s+([\w.]+)\s*;")
 _IMPORT_RE = re.compile(r"(?m)^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;")
-_TYPE_HEADER_RE = re.compile(
-    r"\b(class|interface|enum)\s+(\w+)"
-    r"(?:\s*<[^>{]*>)?"
-    r"(?:\s+extends\s+([\w.<>,\s]+?))?"
-    r"(?:\s+implements\s+([\w.<>,\s]+?))?"
-    r"\s*\{",
-    re.DOTALL,
-)
+#: BLOCKER 1a (fifth cold read, fix round 8): the OLD single fixed-shape
+#: regex (`\b(class|interface|enum)\s+(\w+)(?:\s*<[^>{]*>)?(?:\s+
+#: extends\s+([\w.<>,\s]+?))?(?:\s+implements\s+([\w.<>,\s]+?))?\s*\{`)
+#: could not match a type-parameter list containing a NESTED generic
+#: bound (`class Box<T extends Comparable<T>>` - `[^>{]*` cannot cross
+#: the inner `<T>`'s own closing `>`, so the whole regex fails to match
+#: at that position), an INTERSECTION bound (`class A<T extends Number &
+#: Comparable<T>>` - same nested-`<>` problem), a `sealed ... permits
+#: ...` header (nothing in the old pattern accounted for a `permits`
+#: clause between `implements` and the body brace), or a `record`
+#: declaration (not in the keyword alternation at all, and records have
+#: their OWN parenthesized component list before the body brace). An
+#: unmatched header dropped the type SILENTLY: zero units, the class-
+#: level route prefix published as its own served entry point, the
+#: method fragment published as the WHOLE route (the exact pre-M5 wrong
+#: shapes), and readiness reported source_understood satisfied - status
+#: complete, problem_count 0, on a file this adapter never actually
+#: understood.
+#:
+#: Replaced with a two-stage scan: this anchor only locates the
+#: KEYWORD and the type's own NAME (never a generic bound, a record
+#: component, or a clause list) - genuinely nested/bracketed content is
+#: then walked DEPTH-AWARE by _find_type_header_brace, exactly the
+#: technique _matching_close_paren already uses for an annotation's own
+#: argument list, rather than asking one fixed-shape regex to describe
+#: everything between a type's name and its body in one shot.
+_TYPE_NAME_ANCHOR_RE = re.compile(r"\b(class|interface|enum|record)\s+(\w+)")
+#: Applied only to the CLAUSE ZONE _extract_types isolates (the text
+#: between a type's own generic-parameter list/record-component list and
+#: its body brace) - by that point a type parameter's own bound (which
+#: may itself contain the word "extends") has already been skipped past
+#: depth-aware, so these can safely take the first top-level match
+#: without confusing a generic bound for the class's own superclass.
+_HEADER_EXTENDS_RE = re.compile(r"\bextends\s+(.+?)(?=\s*\b(?:implements|permits)\b|\Z)", re.DOTALL)
+_HEADER_IMPLEMENTS_RE = re.compile(r"\bimplements\s+(.+?)(?=\s*\bpermits\b|\Z)", re.DOTALL)
 _QUALIFIED_CALL_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*)\.([a-zA-Z_][A-Za-z0-9_]*)\s*\(")
 _ROUTE_ANNOTATIONS = (
     "RequestMapping", "GetMapping", "PostMapping", "PutMapping",
@@ -226,6 +253,24 @@ def _strip_comments_and_strings(text: str) -> str:
     return "".join(result)
 
 
+def is_effectively_empty_java_source(text: str) -> bool:
+    """BLOCKER 1b (fifth cold read, fix round 8): True when NOTHING
+    remains once comments/strings are blanked and any package/import
+    statements are removed - genuinely no top-level declaration for an
+    adapter to have understood (a legitimately typeless file: blank,
+    comment-only, or package/import statements alone), never a real
+    declaration whose header this adapter's coarse pattern-based
+    extractor simply failed to recognize. The worker calls this to
+    distinguish the two before deciding whether a zero-unit parse result
+    is a named, explicit non-problem or a real ``no_types_extracted``
+    problem - closing the zero-extraction evidence hole as a class
+    without silently exempting every legitimately typeless file too."""
+    sanitized = _strip_comments_and_strings(text)
+    remainder = _PACKAGE_RE.sub("", sanitized)
+    remainder = _IMPORT_RE.sub("", remainder)
+    return remainder.strip() == ""
+
+
 def _newline_offsets(text: str) -> list[int]:
     """Every newline's offset in ``text``, ascending - built ONCE per file
     so every per-claim line lookup (:func:`_line_at`) is O(log n), not
@@ -254,6 +299,85 @@ def _classify(relative_path: str, simple_name: str | None) -> str:
     return "production"
 
 
+def _matching_close_angle(sanitized: str, open_pos: int) -> int | None:
+    """Mirrors :func:`_matching_close_paren` for a type's own generic
+    parameter list - depth-aware over ``<``/``>`` so a BOUNDED
+    (``<T extends Comparable<T>>``) or INTERSECTION (``<T extends
+    Number & Comparable<T>>``) bound's own nested ``<...>`` does not
+    truncate the scan at the bound's inner closing ``>`` (BLOCKER 1a,
+    fifth cold read, fix round 8). Bails out (``None``) on a top-level
+    ``;`` before ever closing - a real generic parameter list never
+    contains a bare statement terminator; reaching one means this was
+    never really one (a `<` used as a less-than operator, or malformed
+    input), the same safe non-guess this adapter makes everywhere else."""
+    depth = 0
+    for i in range(open_pos, len(sanitized)):
+        ch = sanitized[i]
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch == ";" and depth == 1:
+            return None
+    return None
+
+
+def _skip_bracketed(sanitized: str, pos: int, open_ch: str, matcher) -> int:
+    """If the next non-whitespace character at/after ``pos`` is
+    ``open_ch``, returns the position right after its DEPTH-AWARE
+    matching close (via ``matcher``, one of :func:`_matching_close_angle`
+    or :func:`_matching_close_paren`) - otherwise returns ``pos``
+    unchanged (there was nothing to skip)."""
+    n = len(sanitized)
+    p = pos
+    while p < n and sanitized[p].isspace():
+        p += 1
+    if p < n and sanitized[p] == open_ch:
+        close = matcher(sanitized, p)
+        if close is not None:
+            return close + 1
+    return pos
+
+
+def _find_type_header_brace(sanitized: str, clause_start: int) -> int | None:
+    """BLOCKER 1a (fifth cold read, fix round 8): starting right AFTER a
+    type's own generic-parameter list and (for a record) its component
+    list have already been skipped, finds this type's own opening brace
+    - depth-aware over both ``<...>`` (a generic bound inside an
+    ``extends``/``implements``/``permits`` clause, e.g. ``implements
+    Comparable<Foo<Bar>>``) and ``(...)`` (defensive: a record's
+    component list already skipped by the caller, or any other
+    parenthesized construct that might otherwise hide a stray brace)
+    so neither construct's own characters are mistaken for the type's
+    REAL body brace. ``None`` if a top-level ``{`` is never reached
+    before a top-level ``;`` or end of file - not a real type header
+    (a false-positive keyword match on sanitized text, or a shape this
+    adapter does not resolve), never a guess at where the body begins."""
+    n = len(sanitized)
+    angle_depth = 0
+    paren_depth = 0
+    for i in range(clause_start, n):
+        ch = sanitized[i]
+        if ch == "<":
+            angle_depth += 1
+        elif ch == ">":
+            if angle_depth > 0:
+                angle_depth -= 1
+        elif ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            if paren_depth > 0:
+                paren_depth -= 1
+        elif angle_depth == 0 and paren_depth == 0:
+            if ch == "{":
+                return i
+            if ch == ";":
+                return None
+    return None
+
+
 def _extract_types(
     sanitized: str, package: str | None,
 ) -> list[tuple[str, str, str, int, str | None, str | None, int]]:
@@ -264,17 +388,42 @@ def _extract_types(
     brace) is what :func:`_enclosing_qualified_name` uses to attribute a
     later match (a call, an annotation, a main method) to the innermost
     declared type whose body actually contains it, rather than to whichever
-    type happened to be declared first in the file."""
-    headers = list(_TYPE_HEADER_RE.finditer(sanitized))
-    header_by_brace_pos = {m.end() - 1: m for m in headers}
+    type happened to be declared first in the file.
+
+    BLOCKER 1a (fifth cold read, fix round 8): each candidate header is
+    now located in two stages - _TYPE_NAME_ANCHOR_RE anchors only the
+    keyword and the type's own name (a fixed, simple shape that can
+    never itself be ambiguous), then a depth-aware scan (_skip_bracketed
+    + _find_type_header_brace) walks past a possibly-nested generic
+    parameter list, a record's own component list, and any extends/
+    implements/permits clause to the type's real body brace - closing
+    the generic-bounded, sealed+permits, and record header shapes the
+    old single fixed-shape regex could not match at all."""
+    header_by_brace_pos: dict[int, tuple[int, str, str | None, str | None]] = {}
+    for name_match in _TYPE_NAME_ANCHOR_RE.finditer(sanitized):
+        clause_start = _skip_bracketed(sanitized, name_match.end(), "<", _matching_close_angle)
+        if name_match.group(1) == "record":
+            clause_start = _skip_bracketed(sanitized, clause_start, "(", _matching_close_paren)
+        brace_pos = _find_type_header_brace(sanitized, clause_start)
+        if brace_pos is None:
+            continue
+        clause_text = sanitized[clause_start:brace_pos]
+        extends_match = _HEADER_EXTENDS_RE.search(clause_text)
+        implements_match = _HEADER_IMPLEMENTS_RE.search(clause_text)
+        header_by_brace_pos[brace_pos] = (
+            name_match.start(), name_match.group(2),
+            extends_match.group(1).strip() if extends_match else None,
+            implements_match.group(1).strip() if implements_match else None,
+        )
+
     stack: list[tuple[int, str, int]] = []
     depth = 0
     results: list[list[Any]] = []
     for i, ch in enumerate(sanitized):
         if ch == "{":
-            match = header_by_brace_pos.get(i)
-            if match is not None:
-                simple_name = match.group(2)
+            header = header_by_brace_pos.get(i)
+            if header is not None:
+                header_start, simple_name, extends_raw, implements_raw = header
                 # M-4 (third cold read, fix round 5): each stack entry's
                 # own `name` is ALREADY that ancestor's full qualified
                 # name (it was computed the same way, one level up) - the
@@ -301,7 +450,7 @@ def _extract_types(
                 result_index = len(results)
                 results.append([
                     qualified, simple_name, container_prefix,
-                    match.start(), match.group(3), match.group(4), i,
+                    header_start, extends_raw, implements_raw, i,
                 ])
                 stack.append((depth, qualified, result_index))
             depth += 1

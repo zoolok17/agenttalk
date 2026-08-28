@@ -182,9 +182,20 @@ def build_modules(
                     name="discovery", version=1, source_digest=file_entry.content_digest,
                     basis="extracted",
                 )],
-                adapter_problem_reason=(
-                    worker_problem_reason_by_path.get(relative_path) if java_result is None else None
-                ),
+                # BLOCKER 1b (fifth cold read, fix round 8): this used to
+                # look up a worker-recorded problem ONLY when java_result
+                # was None - a file whose parse SUCCEEDED but extracted
+                # zero units (java_result is not None, java_result.units
+                # is empty) always got None here regardless of whether
+                # the worker had just recorded a real problem for it
+                # (the worker's own new "no_types_extracted" check, or
+                # any future one), silently discarding it and reporting
+                # positive adapter evidence for a file never actually
+                # understood. pom.xml/web.xml legitimately have zero
+                # units with no problem recorded either way, so this
+                # unconditional lookup is safe for them too - it simply
+                # returns None where nothing was ever recorded.
+                adapter_problem_reason=worker_problem_reason_by_path.get(relative_path),
             ))
             continue
 

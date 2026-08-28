@@ -436,6 +436,66 @@ def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
     assert report["counts"]["problems"] == 1
 
 
+def test_run_scan_degrades_and_reports_unknown_for_a_java_file_with_no_recognized_declaration(
+    java_repo: Path,
+) -> None:
+    """BLOCKER 1b (fifth cold read, fix round 8), end to end: a .java
+    file whose parse succeeds but extracts zero declared types used to
+    publish status:complete, problem_count:0, and readiness
+    source_understood:satisfied - positive evidence for a file this
+    adapter never actually understood. Reproduced with genuinely
+    unrecognized top-level content (not a comment, not an import, not
+    any known declaration keyword) - must now degrade the scan, publish
+    an explicit problem, and report source_understood unknown for that
+    file's own unit."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Garbage.java").write_text(
+        "package p;\nfoo bar baz;\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matching = [p for p in problems_doc["problems"] if p["reason_code"] == "no_types_extracted"]
+    assert len(matching) == 1
+    assert matching[0]["path"] == "src/main/java/p/Garbage.java"
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    garbage_unit = next(
+        u for u in modules_doc["units"] if u["paths"] == ["src/main/java/p/Garbage.java"])
+    assert garbage_unit["adapter_problem_reason"] == "no_types_extracted"
+
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    signal = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == garbage_unit["unit_id"] and s["check"] == "source_understood"
+    )
+    assert signal["stored_status"] == "unknown"
+
+
+def test_run_scan_does_not_flag_package_info_java_as_a_type_extraction_problem(
+    java_repo: Path,
+) -> None:
+    """The legitimate typeless case, end to end - package-info.java, even
+    with its own package-level annotation, must never be reported as
+    source_understood unknown via the new no_types_extracted problem."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "package-info.java").write_text(
+        "/**\n * Javadoc.\n */\n@Deprecated\npackage p;\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not [p for p in problems_doc["problems"] if p["reason_code"] == "no_types_extracted"]
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    package_info_unit = next(
+        u for u in modules_doc["units"]
+        if u["paths"] == ["src/main/java/p/package-info.java"])
+    assert package_info_unit["adapter_problem_reason"] is None
+
+
 def test_scan_json_record_counts_includes_itself(java_repo: Path) -> None:
     """N6-record_counts (cold-read, PR-B fix round 3): scan.json's own
     record_counts field must count scan.json itself (always exactly 1) -
