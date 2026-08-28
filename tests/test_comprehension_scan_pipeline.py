@@ -89,6 +89,75 @@ def test_run_scan_carries_the_pom_xml_build_edge_through_the_worker(java_repo: P
     assert build_edges and build_edges[0]["target_external"] == "org.springframework:spring-core"
 
 
+def test_canary_sweep_no_artifact_or_report_leaks_the_absolute_root_or_a_planted_canary(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """M-3 / Note 5 (third cold read, fix round 5): the design's
+    targeted-evidence list names unique canaries that must never appear
+    in any published artifact, report, or pack - the mechanism that would
+    have caught M-3 (an OSError's own absolute-path text leaking into
+    problems.json via ``str(exc)``) before a reviewer had to find it by
+    hand. Plants a canary in a Java comment (content no producer this
+    slice ever copies verbatim) AND forces one file's read to fail (the
+    exact M-3 shape, reproduced via discovery's own read_bytes call) so a
+    problem record with a ``detail`` is actually exercised, then sweeps
+    every published artifact's raw bytes plus ``report``'s own serialized
+    output for either the canary or the absolute root path string."""
+    import json
+
+    canary = "CANARY_SECRET_9f21ac6b4e2d"
+    (java_repo / "src" / "main" / "java" / "p" / "Marked.java").write_text(
+        f"package p;\n// {canary}\nclass Marked {{}}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Unreadable.java").write_text(
+        "package p;\nclass Unreadable {}\n", encoding="utf-8")
+
+    real_read_bytes = Path.read_bytes
+
+    def _read_bytes(self: Path):
+        if self.name == "Unreadable.java":
+            # A REAL OSError from a failed OS call carries its own
+            # filename (str(exc) then embeds it, e.g. "[Errno 13]
+            # Permission denied: 'C:\\...\\Unreadable.java'") - a plain
+            # OSError("message") does not, and would not reproduce the
+            # M-3 leak mechanism at all.
+            raise OSError(13, "Permission denied", str(self))
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _read_bytes)
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    # A plain, alphanumeric marker unique to this run's absolute root -
+    # NOT the raw path string. On Windows, str(OSError(...))'s own
+    # formatting already backslash-escapes the filename it embeds, and
+    # JSON serialization escapes it AGAIN - a literal `str(root) in
+    # haystack` check would never match regardless of a leak, since the
+    # separators are doubled (or quadrupled) by the time either fires.
+    # pytest's own tmp_path leaf name has no such special characters, so
+    # it survives both escaping passes unchanged and still proves the
+    # same thing: this run's own absolute, machine-local root path must
+    # never appear in a published artifact.
+    root_marker = java_repo.resolve().name
+
+    artifact_names = (
+        "modules.json", "dependencies.json", "features.json",
+        "readiness.json", "problems.json", "scan.json",
+    )
+    haystacks = {
+        name: (outcome.run_dir / name).read_text(encoding="utf-8") for name in artifact_names
+    }
+    haystacks["report --json"] = json.dumps(scan_pipeline.get_report(java_repo))
+
+    problems_doc = json.loads(haystacks["problems.json"])
+    assert any(p["reason_code"] == "parse_failed" for p in problems_doc["problems"]), (
+        "sanity check: the simulated read failure must actually produce a problem "
+        "with a detail, or this test proves nothing"
+    )
+
+    for name, haystack in haystacks.items():
+        assert canary not in haystack, f"planted canary leaked into {name}"
+        assert root_marker not in haystack, f"absolute root path leaked into {name}"
+
+
 def test_run_scan_does_not_block_readiness_for_the_pom_xml_it_understood(
     java_repo: Path,
 ) -> None:

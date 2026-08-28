@@ -15,6 +15,39 @@ class ComprehensionError(RuntimeError):
     reason_code = "comprehension_error"
 
 
+#: M-3 (third cold read, fix round 5): a problem's persisted ``detail``
+#: must be reason-coded and bounded, templated free text - never raw
+#: parser/OS-exception output copied wholesale (design: "reason codes;
+#: bounded templated free text; the projection exposes no raw source,
+#: absolute paths, or parser logs"). PROVISIONAL, like this package's
+#: other bound constants.
+MAX_PROBLEM_DETAIL_LENGTH = 200
+
+
+def bounded_os_error_detail(action: str, exc: OSError) -> str:
+    """A templated, length-bounded problem detail for an ``OSError`` -
+    never ``str(exc)`` verbatim. ``str(exc)`` on an ``OSError`` embeds the
+    exception's OWN absolute filename (``exc.filename``) by construction
+    (e.g. ``"[Errno 13] Permission denied: 'C:\\\\Users\\\\...\\\\blocked"``)
+    - exactly the machine-local absolute-path leak M-3 found flowing into
+    ``problems.json``. This uses only ``action`` (a fixed, named template
+    the caller already knows is path-free) and the OS's own short
+    ``strerror``, neither of which can carry a filesystem path - the
+    caller supplies the file's already-project-relative path separately,
+    in the problem record's own ``path`` field."""
+    reason = exc.strerror or exc.__class__.__name__
+    return f"{action}: {reason}"[:MAX_PROBLEM_DETAIL_LENGTH]
+
+
+def bounded_detail(text: str) -> str:
+    """Length-bounds an already path-free detail string (an adapter's own
+    parse-failure message, or an :class:`EnvelopeError`'s message) before
+    it is persisted - defense in depth against an unbounded exception
+    message of any origin, current or future, ballooning a problem
+    record."""
+    return text[:MAX_PROBLEM_DETAIL_LENGTH]
+
+
 class EnvelopeError(ComprehensionError):
     """A JSON document failed strict envelope, schema, or path-safety checks."""
 

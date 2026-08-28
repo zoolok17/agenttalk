@@ -339,6 +339,36 @@ def test_an_unreadable_files_bytes_mark_the_fingerprint_incomplete(
     assert result.whole_scope_fingerprint is None
 
 
+def test_an_unreadable_files_problem_detail_never_embeds_the_absolute_path(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """M-3 (third cold read, fix round 5): str(exc) on a REAL OSError
+    embeds the exception's own absolute filename (unlike a bare
+    OSError("message"), which does not - a test using one would not
+    reproduce the leak at all). ``detail`` must carry only a fixed,
+    named template and the OS's own short strerror, never that
+    filename. Checked via a plain alphanumeric marker (tmp_path's own
+    leaf name), not the raw path string: on Windows, str(exc)'s own
+    formatting already backslash-escapes the embedded filename, so a
+    literal ``str(tmp_path) in detail`` check would never match the
+    escaped form either way - the marker has no such special characters
+    and survives that escaping unchanged."""
+    (tmp_path / "bad.txt").write_bytes(b"content")
+    root_marker = tmp_path.resolve().name
+
+    def _read_bytes(self: Path):
+        if self.name == "bad.txt":
+            raise OSError(13, "Permission denied", str(self))
+        raise AssertionError("unexpected read of a different file")
+
+    monkeypatch.setattr(Path, "read_bytes", _read_bytes)
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    problem = next(p for p in result.problems if p["path"] == "bad.txt")
+    assert root_marker not in problem["detail"]
+    assert "Permission denied" in problem["detail"]
+
+
 def test_an_unrepresentable_filename_marks_the_fingerprint_incomplete(
     tmp_path: Path, monkeypatch,
 ) -> None:

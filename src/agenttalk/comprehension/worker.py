@@ -43,7 +43,7 @@ from typing import Any
 
 from .adapters import java as java_adapter
 from .envelope import EnvelopeError, resolve_under_root
-from .errors import ComprehensionError
+from .errors import ComprehensionError, bounded_detail, bounded_os_error_detail
 
 _ADAPTER_EXTENSIONS = {".java": java_adapter}
 
@@ -175,14 +175,21 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
         try:
             resolved = resolve_under_root(rel, root=root, label="worker input path")
         except EnvelopeError as exc:
+            # M-3 (third cold read, fix round 5): resolve_under_root's own
+            # message already names only the RELATIVE value, never the
+            # resolved absolute path - bounded_detail here is defense in
+            # depth (length only), not a path scrub.
             problems.append(WorkerProblem(
-                reason_code="path_excluded", relative_path=rel, detail=str(exc)))
+                reason_code="path_excluded", relative_path=rel, detail=bounded_detail(str(exc))))
             continue
         try:
             data = resolved.read_bytes()
         except OSError as exc:
+            # M-3: never str(exc) - it embeds resolved's ABSOLUTE path.
             problems.append(WorkerProblem(
-                reason_code="parse_failed", relative_path=rel, detail=str(exc)))
+                reason_code="parse_failed", relative_path=rel,
+                detail=bounded_os_error_detail("could not read the file's bytes", exc),
+            ))
             continue
         claims.append(WorkerFileClaim(
             relative_path=rel, byte_count=len(data), content_digest=_hash_bytes(data)))
@@ -220,7 +227,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
-                    detail=f"{adapter.ADAPTER_NAME} adapter failed: {exc}"))
+                    detail=bounded_detail(f"{adapter.ADAPTER_NAME} adapter failed: {exc}")))
             else:
                 java_results[rel] = adapter.file_result_to_json(result)
         elif rel_name_lower == "pom.xml":
@@ -239,7 +246,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
-                    detail=f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}"))
+                    detail=bounded_detail(f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}")))
             else:
                 java_results[rel] = java_adapter.file_result_to_json(
                     java_adapter.JavaFileResult(edges=build_edges))
@@ -259,7 +266,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
-                    detail=f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}"))
+                    detail=bounded_detail(f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}")))
             else:
                 java_results[rel] = java_adapter.file_result_to_json(
                     java_adapter.JavaFileResult(entry_points=web_entry_points))

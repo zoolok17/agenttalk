@@ -53,6 +53,7 @@ import stat as stat_module
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .errors import bounded_os_error_detail
 from .paths import RELATIVE_COMPREHENSION_DIR
 
 PATH_NORMALIZATION_VERSION = 1
@@ -368,7 +369,9 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
             problems.append({
                 "reason_code": "parse_failed",
                 "path": str(directory.relative_to(root).as_posix()),
-                "detail": str(exc),
+                # M-3 (third cold read, fix round 5): never str(exc) - an
+                # OSError's own string embeds its ABSOLUTE filename.
+                "detail": bounded_os_error_detail("directory could not be listed", exc),
             })
             return
         for entry in entries:
@@ -427,7 +430,9 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 size = entry.stat().st_size
             except OSError as exc:
                 problems.append({
-                    "reason_code": "parse_failed", "path": relative, "detail": str(exc)})
+                    "reason_code": "parse_failed", "path": relative,
+                    "detail": bounded_os_error_detail("could not stat the file", exc),
+                })
                 continue
             # The per-file size cap is checked from stat() ALONE, before any
             # content is read - a large binary must trip this, never be
@@ -445,7 +450,9 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 data = entry.read_bytes()
             except OSError as exc:
                 problems.append({
-                    "reason_code": "parse_failed", "path": relative, "detail": str(exc)})
+                    "reason_code": "parse_failed", "path": relative,
+                    "detail": bounded_os_error_detail("could not read the file's bytes", exc),
+                })
                 continue
             if _looks_binary(data):
                 _record_exclusion("binary")
