@@ -166,6 +166,14 @@ class WorkerResult:
     #: relative_path -> adapters.java.file_result_to_json(...) payload, for
     #: every recognized-extension file an adapter successfully parsed.
     java_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Round 11c (reviewer-3 delta on round 11b, vehicle change):
+    #: adapter-level exclusion counts, whole-run-aggregated, category ->
+    #: count - the SAME idiom discovery.py's own ``exclusions`` map
+    #: already uses for enumeration-level categories, extended here to a
+    #: DECLARED, deliberate scope limitation (a pom's profile-scoped
+    #: dependency) that must be visible without driving the run to
+    #: degraded the way a real problem does.
+    exclusions: dict[str, int] = field(default_factory=dict)
 
 
 def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
@@ -182,6 +190,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
     claims: list[WorkerFileClaim] = []
     problems: list[WorkerProblem] = []
     java_results: dict[str, dict[str, Any]] = {}
+    exclusions: dict[str, int] = {}
     for rel in relative_paths:
         try:
             resolved = resolve_under_root(rel, root=root, label="worker input path")
@@ -297,23 +306,24 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # points of its own.
             try:
                 text = data.decode("utf-8", errors="replace")
-                build_edges, build_problems = java_adapter.parse_maven_pom(rel, text)
+                build_edges, profile_scoped_dependency_count = java_adapter.parse_maven_pom(rel, text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
                     detail=bounded_detail(f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}")))
             else:
                 java_results[rel] = java_adapter.file_result_to_json(
-                    java_adapter.JavaFileResult(edges=build_edges, problems=build_problems))
-                # Round 11b (reviewer-3 delta on round 11): a profile-
-                # scoped dependency this adapter silently excluded (a
-                # profile may be active by default) - never a cost-free
-                # omission the way managed/plugin scoping is.
-                for problem in build_problems:
-                    problems.append(WorkerProblem(
-                        reason_code=problem.reason_code, relative_path=rel,
-                        detail=problem.detail,
-                    ))
+                    java_adapter.JavaFileResult(edges=build_edges))
+                # Round 11c (reviewer-3 delta on round 11b, vehicle
+                # change): a profile-scoped dependency this adapter
+                # excludes (a profile may be active by default) is a
+                # DECLARED scope limitation, not a run-degrading problem
+                # - an exclusion count, never added to `problems`.
+                if profile_scoped_dependency_count:
+                    exclusions["profile_scoped_dependencies"] = (
+                        exclusions.get("profile_scoped_dependencies", 0)
+                        + profile_scoped_dependency_count
+                    )
         elif rel_name_lower == "web.xml":
             # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a
             # producer with its own passing unit tests but no dispatch
@@ -337,13 +347,14 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
 
     return WorkerResult(
         schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,
-        java_results=java_results,
+        java_results=java_results, exclusions=exclusions,
     )
 
 
 def _result_to_json(result: WorkerResult) -> dict[str, Any]:
     return {
         "schema_version": result.schema_version,
+        "exclusions": dict(result.exclusions),
         "file_claims": [
             {
                 "relative_path": claim.relative_path,
@@ -397,11 +408,12 @@ def _result_from_json(payload: Any) -> WorkerResult:
             for item in payload["problems"]
         ]
         java_results = dict(payload.get("java_results", {}))
+        exclusions = dict(payload.get("exclusions", {}))
     except (KeyError, TypeError) as exc:
         raise WorkerError(f"worker output is malformed: {exc}") from exc
     return WorkerResult(
         schema_version=WORKER_SCHEMA_VERSION, file_claims=claims, problems=problems,
-        java_results=java_results,
+        java_results=java_results, exclusions=exclusions,
     )
 
 

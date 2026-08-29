@@ -108,6 +108,47 @@ def test_run_scan_carries_the_pom_xml_build_edge_through_the_worker(java_repo: P
     doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
     build_edges = [e for e in doc["edges"] if e["relation"] == "build"]
     assert build_edges and build_edges[0]["target_external"] == "org.springframework:spring-core"
+    # Round 11c: the fixture pom has no profile-scoped dependency at all -
+    # no exclusion count, no dilution of an otherwise-empty exclusions map.
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert "profile_scoped_dependencies" not in scan_doc["exclusions"]
+
+
+def test_run_scan_counts_profile_scoped_pom_dependencies_and_stays_complete(
+    java_repo: Path,
+) -> None:
+    """Round 11c (reviewer-3 delta on round 11b, VEHICLE CHANGE), end to
+    end: a pom's profile-scoped dependency must be visible as a named
+    exclusion COUNT in scan.json's manifest - never a run-degrading
+    problem. Maven profiles are common enough in real repos that the
+    round-11b problem-based vehicle would have scanned a large share of
+    them degraded PERMANENTLY over a DECLARED, deliberate scope
+    limitation - not the same kind of thing as an unreadable
+    .gitmodules or an unrecoverable route value."""
+    import json
+
+    (java_repo / "pom.xml").write_text(
+        "<project><dependencies><dependency>"
+        "<groupId>org.springframework</groupId><artifactId>spring-core</artifactId>"
+        "</dependency></dependencies>"
+        "<profiles><profile><dependencies><dependency>"
+        "<groupId>com.acme</groupId><artifactId>profile-dep</artifactId>"
+        "</dependency></dependencies></profile></profiles>"
+        "</project>",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["exclusions"]["profile_scoped_dependencies"] == 1
+
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert problems_doc["problems"] == []
+
+    report = scan_pipeline.get_report(java_repo)
+    assert report["exclusions"]["profile_scoped_dependencies"] == 1
 
 
 def test_run_scan_reports_a_case_collision_between_two_enumerated_paths(

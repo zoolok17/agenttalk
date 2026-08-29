@@ -1594,34 +1594,48 @@ def _module_own_dependency_blocks(sanitized: str) -> list[re.Match]:
             sanitized, deps_match.start(1), deps_match.end(1))
 
 
-def _has_profile_scoped_dependency(sanitized: str) -> bool:
-    """MINOR (seventh cold read delta review, fix round 11b): whether
-    this pom declares at least one ``<dependency>`` inside a
-    ``<profile>``'s own ``<dependencies>`` element. Round 11's own M1
-    fix excludes profile-scoped dependencies from the direct-dependency
-    edges SILENTLY, the same as managed/plugin-scoped ones - but a
-    profile can be ACTIVE BY DEFAULT (``activeByDefault``/JDK/property/
-    OS activation), so its dependency is a potentially LIVE dependency
-    of the module, not a cost-free exclusion the way managed/plugin
-    scoping is. Under-claiming is fine; under-claiming SILENTLY is not -
-    every other omission on this branch records something."""
+def _count_profile_scoped_dependencies(sanitized: str) -> int:
+    """Round 11c (reviewer-3 delta on round 11b, VEHICLE CHANGE): every
+    ``<dependency>`` block inside a ``<profile>``'s own ``<dependencies>``
+    element, counted. Round 11's own M1 fix excludes profile-scoped
+    dependencies from the direct-dependency edges - a profile can be
+    ACTIVE BY DEFAULT (``activeByDefault``/JDK/property/OS activation),
+    so this may be a potentially LIVE dependency of the module, not a
+    cost-free exclusion the way managed/plugin scoping is.
+
+    Round 11b published this as a run-degrading PROBLEM - but Maven
+    profiles are common enough in real repos that a large share of them
+    would scan degraded PERMANENTLY over a DECLARED, deliberate scope
+    limitation - not the same kind of thing as an unreadable
+    ``.gitmodules`` or an unrecoverable route value, and diluting what
+    "degraded" means by putting both in the same bucket. Surfaced
+    instead as a named exclusion COUNT (the same idiom
+    ``scan.json``'s own ``exclusions`` map already uses for discovery-
+    level categories) - visible without touching run status at all."""
+    count = 0
     for deps_match in _DEPENDENCIES_ELEMENT_RE.finditer(sanitized):
         if _enclosing_tag_stack(sanitized, deps_match.start()) != ["project", "profiles", "profile"]:
             continue
-        if _DEPENDENCY_BLOCK_RE.search(sanitized, deps_match.start(1), deps_match.end(1)):
-            return True
-    return False
+        count += sum(
+            1 for _ in _DEPENDENCY_BLOCK_RE.finditer(
+                sanitized, deps_match.start(1), deps_match.end(1))
+        )
+    return count
 
 
 def parse_maven_pom(
     relative_path: str, text: str,
-) -> tuple[list[JavaEdgeClaim], list[JavaAdapterProblem]]:
+) -> tuple[list[JavaEdgeClaim], int]:
     """Direct-dependency ``build`` edges from a ``pom.xml``'s module-own,
     top-level ``<dependency>`` blocks (see ``_module_own_dependency_
     blocks`` for the M1/round-11 scoping fix and its named plugin/
     profile decision). Plain regex over a small, well-known XML shape -
     no XML parser (and its entity-expansion surface) needed for a
-    handful of flat child elements.
+    handful of flat child elements. Returns ``(edges,
+    profile_scoped_dependency_count)`` - see
+    ``_count_profile_scoped_dependencies`` for round 11c's exclusion-
+    count vehicle (managed/plugin scoping needs no count at all: judged
+    not-omissions, cost-free, never the module's own dependency graph).
 
     M3 (fourth cold read, fix round 6): ``<optional>``/``<scope>`` were
     read PAST and discarded - every edge asserted ``optional: false``,
@@ -1629,16 +1643,7 @@ def parse_maven_pom(
     pom actually declared. Both are now parsed from the evidence already
     in the file: an explicit ``<optional>true</optional>`` sets
     ``optional``; ``<scope>test</scope>`` sets ``phase: test`` rather
-    than the default ``build``.
-
-    Round 11b (reviewer-3 delta on round 11): M1's own exclusion of
-    profile-scoped dependencies is silent, same as managed/plugin - but
-    unlike those two (cost-free: never the module's own graph), a
-    profile can be active BY DEFAULT, so its dependency is a potentially
-    live one this adapter is silently dropping. Managed/plugin need
-    nothing (judged not-omissions); a profile-scoped dependency earns
-    its own named problem, once per pom, regardless of how many such
-    dependencies it declares."""
+    than the default ``build``."""
     from_name = relative_path
     sanitized = _strip_xml_comments(text)
     newline_offsets = _newline_offsets(sanitized)
@@ -1661,16 +1666,7 @@ def parse_maven_pom(
             evidence_class="declared", line=_line_at(newline_offsets, match.start()), phase=phase,
             optional=optional,
         ))
-    problems: list[JavaAdapterProblem] = []
-    if _has_profile_scoped_dependency(sanitized):
-        problems.append(JavaAdapterProblem(
-            reason_code="pom_profile_dependency_excluded",
-            detail="this pom declares at least one <profile>-scoped dependency, excluded from "
-                   "direct-dependency edges - a profile may be active by default (activeByDefault/"
-                   "JDK/property/OS activation), so this may be a live dependency of the module, "
-                   "never silently dropped without a record",
-        ))
-    return edges, problems
+    return edges, _count_profile_scoped_dependencies(sanitized)
 
 
 _SERVLET_MAPPING_RE = re.compile(

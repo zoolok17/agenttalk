@@ -1481,8 +1481,9 @@ def test_parse_maven_pom_extracts_dependency_build_edges():
   </dependencies>
 </project>
 """
-    edges, problems = java.parse_maven_pom("pom.xml", pom)
+    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"org.springframework:spring-core", "junit:junit"}
+    assert profile_scoped_count == 0
     assert all(e.relation == "build" for e in edges)
     assert all(e.evidence_class == "declared" for e in edges)
     assert all(e.phase == "build" and e.optional is False for e in edges)
@@ -1537,9 +1538,9 @@ def test_parse_maven_pom_ignores_a_commented_out_dependency():
   </dependencies>
 </project>
 """
-    edges, problems = java.parse_maven_pom("pom.xml", pom)
+    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"org.springframework:spring-core"}
-    assert problems == []
+    assert profile_scoped_count == 0
 
 
 def test_parse_maven_pom_excludes_dependency_management_entries():
@@ -1564,17 +1565,26 @@ def test_parse_maven_pom_excludes_dependency_management_entries():
   </dependencies>
 </project>
 """
-    edges, problems = java.parse_maven_pom("pom.xml", pom)
+    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"com.acme:real-dep"}
     # M1 (round 11b): managed-scoped exclusion is cost-free (never the
-    # module's own graph) - never a named problem.
-    assert problems == []
+    # module's own graph) - never counted.
+    assert profile_scoped_count == 0
 
 
-def test_parse_maven_pom_excludes_profile_scoped_dependencies():
+def test_parse_maven_pom_counts_profile_scoped_dependencies():
     """M1: a <profile>'s own dependencies are conditionally active, not
-    unconditional direct dependencies of the module - excluded (named
-    decision), never published undifferentiated alongside real ones."""
+    unconditional direct dependencies of the module - excluded from the
+    edges (named decision), never published undifferentiated alongside
+    real ones.
+
+    Round 11c (reviewer-3 delta on round 11b, VEHICLE CHANGE): a profile
+    CAN be active by default, so its dependency is a potentially live
+    one - the exclusion must be visible, but as a named exclusion COUNT
+    (scan.json's existing idiom), never a run-degrading problem the way
+    round 11b's own fix made it (Maven profiles are common enough that a
+    large share of real repos would scan degraded permanently over a
+    DECLARED, deliberate scope limitation)."""
     pom = """<project>
   <dependencies>
     <dependency>
@@ -1594,21 +1604,16 @@ def test_parse_maven_pom_excludes_profile_scoped_dependencies():
   </profiles>
 </project>
 """
-    edges, problems = java.parse_maven_pom("pom.xml", pom)
+    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"com.acme:real-dep"}
-    # Round 11b (reviewer-3 delta on round 11): unlike managed/plugin
-    # (cost-free, never the module's graph), a profile CAN be active by
-    # default - its dependency is a potentially live one, so the
-    # exclusion must be visible, never silent.
-    assert len(problems) == 1
-    assert problems[0].reason_code == "pom_profile_dependency_excluded"
+    assert profile_scoped_count == 1
 
 
 def test_parse_maven_pom_with_only_managed_and_plugin_scoped_dependencies_is_silent():
-    """Round 11b: the reviewer's own second test shape - managed and
+    """Round 11b/11c: the reviewer's own second test shape - managed and
     plugin exclusion is judged cost-free (never the module's own
     dependency graph), so a pom containing ONLY those two (no
-    profile-scoped dependency at all) must yield no problem."""
+    profile-scoped dependency at all) must yield no count."""
     pom = """<project>
   <dependencyManagement>
     <dependencies>
@@ -1632,9 +1637,9 @@ def test_parse_maven_pom_with_only_managed_and_plugin_scoped_dependencies_is_sil
   </build>
 </project>
 """
-    edges, problems = java.parse_maven_pom("pom.xml", pom)
+    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert edges == []
-    assert problems == []
+    assert profile_scoped_count == 0
 
 
 def test_parse_maven_pom_excludes_plugin_scoped_dependencies():
@@ -1662,11 +1667,11 @@ def test_parse_maven_pom_excludes_plugin_scoped_dependencies():
   </build>
 </project>
 """
-    edges, problems = java.parse_maven_pom("pom.xml", pom)
+    edges, profile_scoped_count = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"com.acme:real-dep"}
     # M1 (round 11b): plugin-scoped exclusion is cost-free (the build
-    # tool's own dependency, never the module's) - never a named problem.
-    assert problems == []
+    # tool's own dependency, never the module's) - never counted.
+    assert profile_scoped_count == 0
 
 
 # ----------------------------------------------------------- web.xml (route)

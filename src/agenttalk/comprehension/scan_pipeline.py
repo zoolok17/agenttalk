@@ -162,11 +162,6 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # could not be recovered as a literal - under-claimed rather than
     # composed against a guessed/implicit-empty value.
     "route_value_unrecoverable": "warning",
-    # MINOR (seventh cold read delta review, fix round 11b): a pom's
-    # profile-scoped dependency, excluded from direct-dependency edges -
-    # a profile may be active by default, so a potentially live
-    # dependency is under-claimed, never silently.
-    "pom_profile_dependency_excluded": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
@@ -570,7 +565,17 @@ def run_scan(
             # them silently changes what the fingerprint means, with no
             # recorded rule identity to explain why.
             "exclude_rule_digest": discovery.effective_exclude_rule_digest(),
-            "exclusions": dict(sorted(discovery_result.exclusions.items())),
+            # Round 11c (reviewer-3 delta on round 11b, vehicle change):
+            # merges discovery's own enumeration-level exclusion counts
+            # with the worker's adapter-level ones (currently: a pom's
+            # profile-scoped dependency, a DECLARED scope limitation -
+            # never a run-degrading problem the way an unreadable
+            # .gitmodules or an unrecoverable route value is). Same flat
+            # category -> count idiom either way; no key collision
+            # today (the two counters never share a category name).
+            "exclusions": dict(sorted({
+                **discovery_result.exclusions, **worker_result.exclusions,
+            }.items())),
             # M4 (fourth cold read, fix round 6): a bare integer count hid
             # WHAT was actually skipped - the design names "excluded roots
             # with an explicit boundary reason" as a scan.json field, not
@@ -924,6 +929,11 @@ def get_report(
     # scan_pipeline (index-lookup) concern, not something the pure
     # projector function has any business knowing about.
     payload["scan_json_integrity"] = anchor_state
+    # Round 11c (reviewer-3 delta on round 11b): a DECLARED, deliberate
+    # exclusion (e.g. a pom's profile-scoped dependency) must be visible
+    # in the projection, not just the manifest (scan.json) - layered the
+    # same way, straight off the already-verified loaded document.
+    payload["exclusions"] = _scan_field(records["scan"], "exclusions", scan_id)
     return payload
 
 
