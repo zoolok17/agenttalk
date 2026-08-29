@@ -951,6 +951,27 @@ def _verify_artifact_digests(
     declared_artifacts = scan_doc.get("artifacts")
     if not declared_artifacts:
         raise ComprehensionError("scan.json is missing its artifacts digest summary")
+    # N4 (seventh cold read, fix round 11 - defense in depth): this loop
+    # only ever verifies what scan.json ITSELF declares - an artifact
+    # that was LOADED (and is feeding status/report/validate's own
+    # output) but silently absent from a tampered/truncated declared
+    # list would never reach a digest check at all. Asserting the
+    # loaded and declared NAME SETS match exactly closes that gap: a
+    # loaded-but-undeclared artifact is caught here, before its content
+    # is ever trusted, rather than only if its digest ALSO happens to be
+    # declared (and then checked) elsewhere.
+    declared_names = {
+        require_field(entry, "name", doc_name="scan.json's artifacts entry")
+        for entry in declared_artifacts
+    }
+    if declared_names != set(raw_docs):
+        undeclared = sorted(set(raw_docs) - declared_names)
+        unloaded = sorted(declared_names - set(raw_docs))
+        raise ComprehensionError(
+            "scan.json's declared artifacts do not match what this run actually loaded - "
+            f"loaded but undeclared: {undeclared or 'none'}; declared but never loaded: "
+            f"{unloaded or 'none'}"
+        )
     for entry in declared_artifacts:
         # MAJOR 2 (fifth cold read, fix round 8): every field this loop -
         # and digests.run_content_digest below, over these SAME entries -

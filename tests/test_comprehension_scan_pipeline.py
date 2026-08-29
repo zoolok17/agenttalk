@@ -1130,6 +1130,64 @@ def test_validate_run_catches_a_whitespace_only_rewrite_of_an_artifact(
     assert "byte_sha256" in result["detail"]
 
 
+def test_validate_run_catches_a_loaded_artifact_silently_dropped_from_scan_jsons_declared_list(
+    java_repo: Path,
+) -> None:
+    """N4 (seventh cold read, fix round 11 - defense in depth):
+    _verify_artifact_digests only ever checked what scan.json ITSELF
+    declares - an artifact removed from a tampered/truncated declared
+    list (while the file itself is ALSO tampered) would never reach a
+    digest check at all, since the verification loop only iterates
+    declared entries. Reproduced: drop problems.json's own entry from
+    scan.json's declared artifacts AND tamper problems.json's real
+    content - the old code would have silently accepted this (nothing
+    left to check problems.json against); the new loaded-vs-declared
+    assertion catches the drop itself, independent of whatever content
+    tamper rides along with it."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    problems_path = outcome.run_dir / "problems.json"
+    doc = json.loads(problems_path.read_text(encoding="utf-8"))
+    doc["problems"] = [{"problem_id": "fake", "reason_code": "parse_failed",
+                         "severity": "warning", "path": None, "detail": "tampered"}]
+    problems_path.write_text(
+        scan_pipeline.digests.canonical_json_bytes(doc).decode("utf-8"), encoding="utf-8")
+
+    scan_path = outcome.run_dir / "scan.json"
+    scan_doc = json.loads(scan_path.read_text(encoding="utf-8"))
+    scan_doc["artifacts"] = [
+        a for a in scan_doc["artifacts"] if a["name"] != "problems.json"
+    ]
+    # Also re-derive the run-level content_digest from the now-truncated
+    # artifacts list, so it stays SELF-CONSISTENT - isolating that the
+    # loaded-vs-declared assertion is what catches this, not the
+    # (already separately tested) run-level digest mismatch that a
+    # naive truncation would otherwise trip instead.
+    scan_doc["content_digest"] = scan_pipeline.digests.run_content_digest(scan_doc["artifacts"])
+    new_scan_bytes = scan_pipeline.digests.canonical_json_bytes(scan_doc)
+    scan_path.write_text(new_scan_bytes.decode("utf-8"), encoding="utf-8")
+
+    # Re-anchor index.json to the rewritten scan.json's own real bytes/
+    # content, so THIS test isolates the loaded-vs-declared assertion
+    # specifically - not the (already separately tested) scan.json-own-
+    # integrity anchor check that would otherwise fire first on ANY
+    # scan.json rewrite.
+    index_path = scan_pipeline.paths.index_path(
+        scan_pipeline.paths.comprehension_dir(java_repo / ".agenttalk"))
+    index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+    for run_summary in index_doc["runs"]:
+        if run_summary["scan_id"] == outcome.scan_id:
+            run_summary["scan_json_byte_sha256"] = scan_pipeline.digests.sha256_bytes(new_scan_bytes)
+            run_summary["scan_json_content_digest"] = scan_pipeline.digests.canonical_content_digest(scan_doc)
+    index_path.write_text(
+        scan_pipeline.digests.canonical_json_bytes(index_doc).decode("utf-8"), encoding="utf-8")
+
+    result = scan_pipeline.validate_run(java_repo)
+    assert result["valid"] is False
+    assert "problems.json" in result["detail"]
+
+
 def test_validate_run_before_any_scan_raises_not_scanned(tmp_path: Path) -> None:
     with pytest.raises(scan_pipeline.NotScanned):
         scan_pipeline.validate_run(tmp_path)
