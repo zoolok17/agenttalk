@@ -104,6 +104,52 @@ def test_feature_id_filter_narrows_units_features_and_entry_points():
     assert [e["entry_point_id"] for e in payload["entry_points"]] == ["ep1"]
 
 
+def test_feature_id_filter_narrows_dependencies_and_readiness_too():
+    """FIX ROUND 15 (eleventh cold read, F2 MAJOR, wrong-data): --feature
+    narrowed units/features/entry_points but published the WHOLE RUN's
+    dependencies and readiness sections unfiltered, contradicting
+    whole_run_sections's own claim that only those three stay whole-run
+    (the design's own worked example is `report --feature checkout
+    --dependencies`). Scoped by the feature's member unit set: an edge
+    touching EITHER a member unit (u1) or an unrelated one (u3/u4) - only
+    the member-touching edge survives; readiness rows for the
+    unrelated unit (u2) are dropped too."""
+    features = [_feature("f1", ["u1"])]
+    edges = [
+        _edge("e1", "u1", resolution_state="resolved", target_unit_id="u2"),
+        _edge("e2", "u3", resolution_state="resolved", target_unit_id="u4"),
+    ]
+    summaries = [_summary("u1", "assessed"), _summary("u2", "assessed")]
+    signals = [_signal("u1"), _signal("u2")]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1"), _unit("u2"), _unit("u3"), _unit("u4")],
+        features=features, dependencies=edges,
+        readiness_signals=signals, readiness_summaries=summaries, feature_id="f1"))
+    assert [d["edge_id"] for d in payload["dependencies"]] == ["e1"]
+    assert [s["unit_id"] for s in payload["readiness"]["summaries"]] == ["u1"]
+    assert [s["unit_id"] for s in payload["readiness"]["signals"]] == ["u1"]
+
+
+def test_a_nonexistent_feature_id_yields_empty_scoped_sections():
+    """FIX ROUND 15 (eleventh cold read, F2 MAJOR, wrong-data): even a
+    feature_id that matches NO real feature returned every dependency
+    and readiness row run-wide - the projection asserted a scoping it
+    never actually performed. An unmatched selector now yields EMPTY
+    scoped sections, never a silent fallback to "everything"."""
+    features = [_feature("f1", ["u1"])]
+    edges = [_edge("e1", "u1", resolution_state="resolved", target_unit_id="u2")]
+    summaries = [_summary("u1", "assessed")]
+    signals = [_signal("u1")]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1")], features=features, dependencies=edges,
+        readiness_signals=signals, readiness_summaries=summaries,
+        feature_id="does-not-exist"))
+    assert payload["units"] == []
+    assert payload["dependencies"] == []
+    assert payload["readiness"]["summaries"] == []
+    assert payload["readiness"]["signals"] == []
+
+
 def test_readiness_state_filter_narrows_signals_and_summaries():
     summaries = [_summary("u1", "blocked"), _summary("u2", "assessed")]
     signals = [_signal("u1"), _signal("u2")]

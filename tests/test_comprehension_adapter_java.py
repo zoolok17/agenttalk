@@ -2118,6 +2118,27 @@ def test_parse_web_xml_ignores_a_commented_out_servlet_mapping():
     assert [e.name for e in entry_points] == ["/api/*"]
 
 
+def test_parse_web_xml_captures_every_url_pattern_in_one_servlet_mapping():
+    """FIX ROUND 15 (eleventh cold read, F1 MAJOR, wrong-data): a single
+    <servlet-mapping> may carry SEVERAL <url-pattern> children (legal,
+    and legacy apps routinely do it) - only the FIRST used to publish,
+    the rest silently vanished with no problem recorded. Reviewer's own
+    cr11-fx2 shape verbatim: /legacy/*, /old/*, *.do in one mapping."""
+    web_xml = """<web-app>
+  <servlet-mapping>
+    <servlet-name>legacy</servlet-name>
+    <url-pattern>/legacy/*</url-pattern>
+    <url-pattern>/old/*</url-pattern>
+    <url-pattern>*.do</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert sorted(e.name for e in entry_points) == ["*.do", "/legacy/*", "/old/*"]
+    assert len({e.qualified_name for e in entry_points}) == 1
+    assert all(e.kind == "http_route" and e.evidence_class == "declared" for e in entry_points)
+
+
 def test_parse_web_xml_url_pattern_is_length_bounded():
     """FIX ROUND 13 (ninth cold read, CR9-6, judged completeness): a
     url-pattern published VERBATIM, UNBOUNDED, while every Java route

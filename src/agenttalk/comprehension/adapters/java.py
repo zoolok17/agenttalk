@@ -2113,11 +2113,20 @@ def parse_maven_pom(
     return edges, _count_profile_scoped_dependencies(sanitized)
 
 
-_SERVLET_MAPPING_RE = re.compile(
-    r"<servlet-mapping>\s*"
-    r"<servlet-name>([^<]+)</servlet-name>\s*"
-    r"<url-pattern>([^<]+)</url-pattern>",
-)
+#: FIX ROUND 15 (eleventh cold read, F1 MAJOR, wrong-data): a single
+#: <servlet-mapping> element may carry SEVERAL <url-pattern> children
+#: (legal per the servlet spec, and legacy apps routinely do it - one
+#: servlet answering several path/extension patterns). The prior regex
+#: anchored servlet-name immediately followed by exactly one url-pattern,
+#: so only the FIRST of several sibling url-patterns ever matched -
+#: every additional pattern silently vanished, no problem recorded. Now
+#: matches the WHOLE mapping block, then recovers its own servlet-name
+#: once and EVERY url-pattern inside it - the same "recover every
+#: array element, don't stop at the first" shape round 10's M1 already
+#: applied to Spring route arrays.
+_SERVLET_MAPPING_BLOCK_RE = re.compile(r"<servlet-mapping>(.*?)</servlet-mapping>", re.DOTALL)
+_SERVLET_MAPPING_NAME_RE = re.compile(r"<servlet-name>([^<]+)</servlet-name>")
+_SERVLET_MAPPING_URL_PATTERN_RE = re.compile(r"<url-pattern>([^<]+)</url-pattern>")
 
 
 def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
@@ -2127,16 +2136,23 @@ def parse_web_xml(relative_path: str, text: str) -> list[JavaEntryPointClaim]:
     entry_points = []
     sanitized = _strip_xml_comments(text)
     newline_offsets = _newline_offsets(sanitized)
-    for match in _SERVLET_MAPPING_RE.finditer(sanitized):
-        servlet_name = match.group(1).strip()
-        # CR9-6 (ninth cold read, judged, completeness): same per-field
-        # bounding discipline as the pom producer above and every Java
-        # route target - a url-pattern published verbatim, unbounded.
-        url_pattern = _bounded_route_target(match.group(2).strip())
-        entry_points.append(JavaEntryPointClaim(
-            qualified_name=f"{relative_path}#{servlet_name}", kind="http_route",
-            name=url_pattern, line=_line_at(newline_offsets, match.start()), evidence_class="declared",
-        ))
+    for block_match in _SERVLET_MAPPING_BLOCK_RE.finditer(sanitized):
+        block = block_match.group(1)
+        name_match = _SERVLET_MAPPING_NAME_RE.search(block)
+        if name_match is None:
+            continue
+        servlet_name = name_match.group(1).strip()
+        for pattern_match in _SERVLET_MAPPING_URL_PATTERN_RE.finditer(block):
+            # CR9-6 (ninth cold read, judged, completeness): same per-field
+            # bounding discipline as the pom producer above and every Java
+            # route target - a url-pattern published verbatim, unbounded.
+            url_pattern = _bounded_route_target(pattern_match.group(1).strip())
+            absolute_offset = block_match.start(1) + pattern_match.start()
+            entry_points.append(JavaEntryPointClaim(
+                qualified_name=f"{relative_path}#{servlet_name}", kind="http_route",
+                name=url_pattern, line=_line_at(newline_offsets, absolute_offset),
+                evidence_class="declared",
+            ))
     return entry_points
 
 

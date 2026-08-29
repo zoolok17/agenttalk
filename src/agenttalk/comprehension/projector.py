@@ -148,13 +148,25 @@ def project_comprehension(
     if readiness_state is not None and readiness_state not in ASSESSMENT_STATES:
         raise InvalidReadinessStateFilter(readiness_state, ASSESSMENT_STATES)
 
-    filtered_modules = modules
-    if unit_id is not None:
-        filtered_modules = [m for m in filtered_modules if m.unit_id == unit_id]
+    # FIX ROUND 15 (eleventh cold read, F2 MAJOR, wrong-data): computed
+    # once, shared - report --feature <id> published the design's own
+    # worked example (`report --feature checkout --dependencies`) while
+    # actually returning the WHOLE RUN's dependencies and readiness
+    # sections unfiltered, contradicting whole_run_sections's own claim
+    # that only units/features/entry_points stay whole-run. An unmatched
+    # feature_id yields an EMPTY set here (no feature's unit_ids
+    # contribute), so every section scoped by it below correctly narrows
+    # to nothing rather than silently falling back to "everything".
+    feature_unit_ids: set[str] | None = None
     if feature_id is not None:
         feature_unit_ids = {
             u for f in features if f.feature_id == feature_id for u in f.unit_ids
         }
+
+    filtered_modules = modules
+    if unit_id is not None:
+        filtered_modules = [m for m in filtered_modules if m.unit_id == unit_id]
+    if feature_unit_ids is not None:
         filtered_modules = [m for m in filtered_modules if m.unit_id in feature_unit_ids]
 
     filtered_dependencies = dependencies
@@ -162,6 +174,11 @@ def project_comprehension(
         filtered_dependencies = [
             e for e in filtered_dependencies
             if e.from_unit_id == unit_id or e.target_unit_id == unit_id
+        ]
+    if feature_unit_ids is not None:
+        filtered_dependencies = [
+            e for e in filtered_dependencies
+            if e.from_unit_id in feature_unit_ids or e.target_unit_id in feature_unit_ids
         ]
 
     filtered_features = features
@@ -176,6 +193,12 @@ def project_comprehension(
 
     filtered_summaries = readiness_summaries
     filtered_signals = readiness_signals
+    # FIX ROUND 15 (eleventh cold read, F2 MAJOR, wrong-data): same gap
+    # as dependencies above - readiness signals/summaries never narrowed
+    # by --feature either.
+    if feature_unit_ids is not None:
+        filtered_summaries = [s for s in filtered_summaries if s.unit_id in feature_unit_ids]
+        filtered_signals = [s for s in filtered_signals if s.unit_id in feature_unit_ids]
     if readiness_state is not None:
         # M3 (sixth cold read, fix round 10): filters on the design's
         # projection-level assessment_state (this slice: equal to
