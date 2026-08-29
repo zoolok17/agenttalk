@@ -251,8 +251,36 @@ def _check_source_understood(unit: ModuleRecord) -> ReadinessSignal:
 _DEPENDENCY_RESOLUTION_RELATIONS = frozenset({"import", "inherit", "build"})
 
 
+#: FIX ROUND 15 (eleventh cold read, M6 JUDGE - taken): round 12's F2
+#: scoped this check away from ``invoke`` specifically to stop ordinary
+#: JDK/library calls (``Math.max``, ``String.valueOf``) - which always
+#: resolve ``unresolved`` (a java.lang/javax call has ZERO in-scan
+#: candidates to tie on) - from crying a false ``unsatisfied`` on
+#: entirely healthy code. An ``ambiguous`` resolution is a fundamentally
+#: DIFFERENT claim: it only ever fires when the scanner found 2+ REAL,
+#: same-simple-name in-scan candidates and genuinely could not tell
+#: which one a call targets - never JDK noise, always a substantive
+#: uncertainty about this codebase's own structure. A unit whose only
+#: cross-unit dependency happens to be an ambiguous invoke/inherit
+#: reported satisfied/no_declared_dependencies - an honest reason code
+#: over a real unknown. Checked across relations regardless of
+#: ``_DEPENDENCY_RESOLUTION_RELATIONS`` scoping, EXCEPT ``test``: a test
+#: edge is a name-derived CONVENTION GUESS (F4), never a real declared
+#: dependency of the unit it is attached to - its own ambiguity is a
+#: fact about the pairing guess, not about this unit's dependency
+#: surface, and must not flip an otherwise-unrelated check.
+_AMBIGUOUS_DEPENDENCY_EXCLUDED_RELATIONS = frozenset({"test"})
+
+
 def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRecord]) -> ReadinessSignal:
     relevant = [edge for edge in outgoing if edge.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
+    any_ambiguous = any(
+        edge.resolution_state == "ambiguous"
+        and edge.relation not in _AMBIGUOUS_DEPENDENCY_EXCLUDED_RELATIONS
+        for edge in outgoing
+    )
+    if any_ambiguous:
+        return _signal(unit.unit_id, "dependencies_resolved", "unknown", "detected", "ambiguous_dependency")
     if not relevant:
         # FIX ROUND 12b (reviewer-3 delta on round 12): renamed from
         # "no_dependencies" - that wording, read alone by a #208 consumer,
@@ -266,8 +294,6 @@ def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRe
             unit.unit_id, "dependencies_resolved", "satisfied", "detected",
             "no_declared_dependencies")
     states = {edge.resolution_state for edge in relevant}
-    if "ambiguous" in states:
-        return _signal(unit.unit_id, "dependencies_resolved", "unknown", "detected", "ambiguous_dependency")
     if "unresolved" in states:
         return _signal(
             unit.unit_id, "dependencies_resolved", "unsatisfied", "detected", "unresolved_dependency")

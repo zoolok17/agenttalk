@@ -207,6 +207,36 @@ def test_dependencies_resolved_satisfied_when_an_unresolved_edge_is_invoke_only(
     assert signal.reason_code == "no_declared_dependencies"
 
 
+def test_dependencies_resolved_unknown_when_the_only_edge_is_an_ambiguous_invoke():
+    """FIX ROUND 15 (eleventh cold read, M6 JUDGE - taken): a unit whose
+    ONLY cross-unit dependency is an ambiguous INVOKE used to report
+    satisfied/no_declared_dependencies - an honest reason code over a
+    real unknown. An ambiguous resolution is never JDK/library noise
+    (that's always "unresolved", zero in-scan candidates to tie on) -
+    it only fires when the scanner found 2+ REAL in-scan candidates and
+    genuinely could not tell which one this call targets, a substantive
+    uncertainty about the codebase's own structure. Checked regardless
+    of _DEPENDENCY_RESOLUTION_RELATIONS scoping."""
+    edges = [_edge("u1", relation="invoke", resolution_state="ambiguous")]
+    signals, _ = ra.build_readiness([_unit("u1")], edges, [])
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "ambiguous_dependency"
+
+
+def test_dependencies_resolved_unaffected_by_an_ambiguous_test_edge():
+    """FIX ROUND 15 (M6 control): a "test" edge is a name-derived
+    CONVENTION GUESS (F4), never a real declared dependency of the unit
+    it is attached to - its own ambiguity is a fact about the pairing
+    guess, not about this unit's dependency surface, and must not flip
+    an otherwise-clean dependencies_resolved."""
+    edges = [_edge("u1", relation="test", resolution_state="ambiguous")]
+    signals, _ = ra.build_readiness([_unit("u1")], edges, [])
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "satisfied"
+    assert signal.reason_code == "no_declared_dependencies"
+
+
 def test_dependencies_resolved_satisfied_when_all_edges_resolved():
     """FIX ROUND 12b (reviewer-3): this used to rely on `_edge`'s default
     relation ("invoke") - post-scoping (round 12's F2/F5 fix), an invoke

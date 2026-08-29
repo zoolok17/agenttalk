@@ -91,6 +91,14 @@ class ModuleRecord:
     #: full sorted, deduplicated list - lossless, just as round 8
     #: intended - lives here instead, a separate list-valued field.
     adapter_problem_reasons: list[str] = field(default_factory=list)
+    #: FIX ROUND 15 (eleventh cold read, N2 MINOR): a consumer previously
+    #: had no way to recover a "component"-kind unit's own FULLY
+    #: QUALIFIED name from this artifact - only `display_name` (the
+    #: rightmost simple-name segment), which a same-named class in a
+    #: different package makes ambiguous on its own. `None` for a
+    #: "file"-kind unit (no qualified name of its own) and for any
+    #: default-classified non-Java/no-adapter-evidence file.
+    qualified_name: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -107,6 +115,7 @@ class ModuleRecord:
             "evidence": self.evidence,
             "adapter_problem_reason": self.adapter_problem_reason,
             "adapter_problem_reasons": self.adapter_problem_reasons,
+            "qualified_name": self.qualified_name,
         }
 
 
@@ -123,6 +132,7 @@ def module_record_from_json(payload: dict[str, Any]) -> ModuleRecord:
         conflict_id=payload.get("conflict_id"), evidence=list(payload.get("evidence", [])),
         adapter_problem_reason=payload.get("adapter_problem_reason"),
         adapter_problem_reasons=list(payload.get("adapter_problem_reasons", [])),
+        qualified_name=payload.get("qualified_name"),
     )
 
 
@@ -303,6 +313,7 @@ def build_modules(
                 )],
                 adapter_problem_reason=unit_reasons[0] if unit_reasons else None,
                 adapter_problem_reasons=unit_reasons,
+                qualified_name=unit_claim.qualified_name,
             ))
 
         records.append(ModuleRecord(

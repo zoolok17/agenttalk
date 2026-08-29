@@ -165,6 +165,24 @@ def test_a_java_file_with_one_top_level_type_produces_a_component_and_a_file_uni
     assert file_record.container_unit_id is None
 
 
+def test_a_component_publishes_its_own_fully_qualified_name():
+    """FIX ROUND 15 (eleventh cold read, N2 MINOR): a consumer had no way
+    to recover a component's own FULLY QUALIFIED name from this artifact
+    - only display_name (the rightmost simple-name segment), ambiguous
+    the moment two same-named classes exist in different packages. A
+    file-kind unit has no qualified name of its own - stays None."""
+    source = "package p;\nclass Foo {\n}\n"
+    discovery = _discovery([
+        EnumeratedFile(relative_path="p/Foo.java", byte_count=len(source), content_digest="digest1"),
+    ])
+    java_results = {"p/Foo.java": _java_result("p/Foo.java", source)}
+    records = ma.build_modules(discovery, java_results)
+    component = next(r for r in records if r.kind == "component")
+    file_record = next(r for r in records if r.kind == "file")
+    assert component.qualified_name == "p.Foo"
+    assert file_record.qualified_name is None
+
+
 def test_a_nested_class_is_contained_by_its_outer_class():
     source = "package p;\nclass Outer {\n  class Inner {\n  }\n}\n"
     discovery = _discovery([

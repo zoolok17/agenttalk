@@ -302,6 +302,11 @@ def test_inherit_edge_via_a_wildcard_import_lands_unresolved_a_named_limit():
 
 
 def test_inherit_edge_is_ambiguous_when_two_files_declare_the_same_simple_name():
+    """FIX ROUND 15 (eleventh cold read, M4 JUDGE - taken): the design's
+    own text names an ambiguous edge as carrying candidates ("unresolved
+    edge with candidates") - the registry knows the tied units at
+    resolution time, so publishing them is asserted here too, not just
+    the bare unresolved spelling."""
     results = {
         "p/Base.java": _parse("p/Base.java", "package p;\nclass Base {}\n"),
         "q/Base.java": _parse("q/Base.java", "package q;\nclass Base {}\n"),
@@ -312,6 +317,33 @@ def test_inherit_edge_is_ambiguous_when_two_files_declare_the_same_simple_name()
     assert inherit.resolution_state == "ambiguous"
     assert inherit.target_unit_id is None
     assert inherit.target_unresolved == "Base"
+    assert sorted(inherit.candidate_unit_ids) == sorted([
+        da._java_component_unit_id("p/Base.java", "p.Base"),
+        da._java_component_unit_id("q/Base.java", "q.Base"),
+    ])
+
+
+def test_inherit_edge_is_ambiguous_with_candidates_on_a_genuine_registry_collision():
+    """FIX ROUND 15 (M4 JUDGE - taken, registry-collision shape): two
+    units declaring the IDENTICAL fully-qualified name (not merely a
+    same-simple-name coincidence across packages) is the other ambiguous
+    path (M12) - by_qualified_name drops the name entirely on a second
+    claimant, so candidates must come from the separate accumulator that
+    never drops anything."""
+    results = {
+        "a/p/Base.java": _parse("a/p/Base.java", "package p;\nclass Base {}\n"),
+        "b/p/Base.java": _parse("b/p/Base.java", "package p;\nclass Base {}\n"),
+        "r/Foo.java": _parse("r/Foo.java", "package r;\nclass Foo extends p.Base {}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "ambiguous"
+    assert inherit.target_unit_id is None
+    assert inherit.target_unresolved == "p.Base"
+    assert sorted(inherit.candidate_unit_ids) == sorted([
+        da._java_component_unit_id("a/p/Base.java", "p.Base"),
+        da._java_component_unit_id("b/p/Base.java", "p.Base"),
+    ])
 
 
 def test_inherit_edge_is_unresolved_when_no_candidate_exists():
@@ -537,8 +569,14 @@ def test_static_import_of_an_in_scan_type_resolves_internally():
 def test_static_import_of_a_genuinely_external_member_still_classifies_external():
     """N5 (fourth cold read, fix round 6): the fix must not overcorrect -
     a static import of a type genuinely not declared anywhere in this
-    scan (the ordinary JDK/library case) must still resolve external,
-    with the FULL original member-path spelling preserved as evidence."""
+    scan (the ordinary JDK/library case) must still resolve external.
+
+    FIX ROUND 15 (eleventh cold read, N1 MINOR): the member was already
+    stripped for the RESOLUTION lookup key (the type, not the member, is
+    what might be in-scan) - the published external name now matches
+    it, naming the type the dependency actually is
+    ("java.util.Collections"), never the full member path
+    ("java.util.Collections.emptyList") masquerading as one."""
     results = {
         "p/Foo.java": _parse(
             "p/Foo.java",
@@ -551,7 +589,7 @@ def test_static_import_of_a_genuinely_external_member_still_classifies_external(
     records = da.build_dependencies(results)
     import_edge = next(r for r in records if r.relation == "import")
     assert import_edge.resolution_state == "resolved"
-    assert import_edge.target_external == "java.util.Collections.emptyList"
+    assert import_edge.target_external == "java.util.Collections"
     assert import_edge.target_unit_id is None
 
 

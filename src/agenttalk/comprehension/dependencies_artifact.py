@@ -55,6 +55,16 @@ class DependencyRecord:
     producers: list[dict[str, Any]] = field(default_factory=list)
     conflict_id: str | None = None
     evidence: list[dict[str, Any]] = field(default_factory=list)
+    # FIX ROUND 15 (eleventh cold read, M4 JUDGE - taken): the design's
+    # own wording is "Ambiguous resolution creates an unresolved edge
+    # WITH CANDIDATES" - an `ambiguous` record used to carry none at all,
+    # even though the registry always knows exactly which units tied at
+    # resolution time. Populated ONLY for `resolution_state == "ambiguous"`
+    # (empty otherwise, the same list-shaped default every other optional
+    # field here already uses); a real registry collision (two units
+    # declaring the identical qualified name) and a same-simple-name-
+    # across-packages tie both publish their own real candidate set.
+    candidate_unit_ids: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -72,6 +82,7 @@ class DependencyRecord:
             "producers": self.producers,
             "conflict_id": self.conflict_id,
             "evidence": self.evidence,
+            "candidate_unit_ids": self.candidate_unit_ids,
         }
 
 
@@ -85,6 +96,7 @@ def dependency_record_from_json(payload: dict[str, Any]) -> DependencyRecord:
         target_unresolved=payload.get("target_unresolved"), confidence=payload.get("confidence"),
         producers=list(payload.get("producers", [])), conflict_id=payload.get("conflict_id"),
         evidence=list(payload.get("evidence", [])),
+        candidate_unit_ids=list(payload.get("candidate_unit_ids", [])),
     )
 
 
@@ -98,7 +110,7 @@ def _java_file_unit_id(relative_path: str) -> str:
 
 def _build_registry(
     java_results: dict[str, java_adapter.JavaFileResult],
-) -> tuple[dict[str, str], dict[str, list[str]], dict[str, str], set[str]]:
+) -> tuple[dict[str, str], dict[str, list[str]], dict[str, str], set[str], dict[str, list[str]]]:
     """M12 (cold-read, PR-B fix round 3): two units DECLARING the same
     fully-qualified name (a real collision, not merely a same-SIMPLE-name
     coincidence) used to last-wins into ``by_qualified_name`` with no
@@ -118,6 +130,14 @@ def _build_registry(
     duplicate_qualified_names: set[str] = set()
     by_simple_name: dict[str, list[str]] = {}
     file_unit_id_by_path: dict[str, str] = {}
+    # FIX ROUND 15 (eleventh cold read, M4 JUDGE - taken): unlike
+    # `by_qualified_name` (which drops a name entirely once a second
+    # claimant appears, so it can never answer "who are the candidates"
+    # for a real registry collision), this accumulates EVERY unit_id per
+    # qualified name unconditionally - the one place that still knows
+    # the exact candidate set an `ambiguous` registry-collision record
+    # needs to publish.
+    unit_ids_by_qualified_name: dict[str, list[str]] = {}
     for path, result in java_results.items():
         file_unit_id_by_path[path] = _java_file_unit_id(path)
         for unit_claim in result.units:
@@ -127,9 +147,13 @@ def _build_registry(
             else:
                 by_qualified_name[unit_claim.qualified_name] = uid
             by_simple_name.setdefault(unit_claim.simple_name, []).append(uid)
+            unit_ids_by_qualified_name.setdefault(unit_claim.qualified_name, []).append(uid)
     for name in duplicate_qualified_names:
         by_qualified_name.pop(name, None)
-    return by_qualified_name, by_simple_name, file_unit_id_by_path, duplicate_qualified_names
+    return (
+        by_qualified_name, by_simple_name, file_unit_id_by_path, duplicate_qualified_names,
+        unit_ids_by_qualified_name,
+    )
 
 
 def _exact_qualified_lookup(target: str, by_qualified_name: dict[str, str]) -> str | None:
@@ -151,9 +175,14 @@ def _resolve_internal_candidate(
     target: str, by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
     duplicate_qualified_names: set[str], *, local_qualified_by_simple: dict[str, str],
     import_qualified_by_simple: dict[str, str], package: str | None,
-) -> tuple[str, str | None, str | None, str | None]:
+    unit_ids_by_qualified_name: dict[str, list[str]] | None = None,
+) -> tuple[str, str | None, str | None, str | None, list[str] | None]:
     """Returns ``(resolution_state, target_unit_id, target_unresolved,
-    confidence)``.
+    confidence, candidate_unit_ids)`` - the last element is only ever
+    non-``None`` when ``resolution_state == "ambiguous"`` (FIX ROUND 15,
+    M4 JUDGE - taken: the design's own text names an ambiguous edge as
+    carrying candidates; this is the record-shape addition that
+    publishes them).
 
     FIX ROUND 12 (eighth cold read, F1 BLOCKER): this used to fall back to
     a GLOBAL simple-name match across the whole scan whenever exactly one
@@ -207,35 +236,37 @@ def _resolve_internal_candidate(
     kind of cross-package ambiguity this fix exists to close. Out of
     scope this slice.
     """
+    unit_ids_by_qualified_name = unit_ids_by_qualified_name or {}
     if "." in target:
         exact = _exact_qualified_lookup(target, by_qualified_name)
         if exact is not None:
-            return "resolved", exact, None, "high"
+            return "resolved", exact, None, "high", None
         if target in duplicate_qualified_names:
-            return "ambiguous", None, target, None
-        return "unresolved", None, target, None
+            candidates = sorted(unit_ids_by_qualified_name.get(target, []))
+            return "ambiguous", None, target, None, candidates
+        return "unresolved", None, target, None, None
 
     if target in local_qualified_by_simple:
         exact = _exact_qualified_lookup(local_qualified_by_simple[target], by_qualified_name)
         if exact is not None:
-            return "resolved", exact, None, "high"
+            return "resolved", exact, None, "high", None
 
     if target in import_qualified_by_simple:
         imported = import_qualified_by_simple[target]
         exact = _exact_qualified_lookup(imported, by_qualified_name)
         if exact is not None:
-            return "resolved", exact, None, "high"
-        return "unresolved", None, imported, None
+            return "resolved", exact, None, "high", None
+        return "unresolved", None, imported, None, None
 
     if package:
         exact = _exact_qualified_lookup(f"{package}.{target}", by_qualified_name)
         if exact is not None:
-            return "resolved", exact, None, "medium"
+            return "resolved", exact, None, "medium", None
 
     candidates = by_simple_name.get(target, [])
     if len(candidates) > 1:
-        return "ambiguous", None, target, None
-    return "unresolved", None, target, None
+        return "ambiguous", None, target, None, sorted(candidates)
+    return "unresolved", None, target, None, None
 
 
 def _bare_head_qualified_name(
@@ -273,7 +304,8 @@ def _resolve_internal_candidate_chain(
     target: str, by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
     duplicate_qualified_names: set[str], *, local_qualified_by_simple: dict[str, str],
     import_qualified_by_simple: dict[str, str], package: str | None,
-) -> tuple[str, str | None, str | None, str | None]:
+    unit_ids_by_qualified_name: dict[str, list[str]] | None = None,
+) -> tuple[str, str | None, str | None, str | None, list[str] | None]:
     """FIX ROUND 14 (tenth cold read, CR10-3 MAJOR): a dotted invoke
     qualifier may be a MEMBER-NAVIGATION CHAIN, not a type reference at
     all - ``Status.ACTIVE.code()`` captures qualifier ``"Status.ACTIVE"``
@@ -298,11 +330,13 @@ def _resolve_internal_candidate_chain(
     Never truncates the PUBLISHED spelling on failure - an unresolved
     outcome always retains the FULL original chain, never a partial
     guess at which segment was "the real" boundary."""
+    unit_ids_by_qualified_name = unit_ids_by_qualified_name or {}
     if "." not in target:
         return _resolve_internal_candidate(
             target, by_qualified_name, by_simple_name, duplicate_qualified_names,
             local_qualified_by_simple=local_qualified_by_simple,
             import_qualified_by_simple=import_qualified_by_simple, package=package,
+            unit_ids_by_qualified_name=unit_ids_by_qualified_name,
         )
     segments = target.split(".")
     head_qualified = _bare_head_qualified_name(
@@ -313,27 +347,29 @@ def _resolve_internal_candidate_chain(
         prefix_as_written = ".".join(segments[:i])
         exact = _exact_qualified_lookup(prefix_as_written, by_qualified_name)
         if exact is not None:
-            return "resolved", exact, None, "high"
+            return "resolved", exact, None, "high", None
         if prefix_as_written in duplicate_qualified_names:
-            return "ambiguous", None, target, None
+            candidates = sorted(unit_ids_by_qualified_name.get(prefix_as_written, []))
+            return "ambiguous", None, target, None, candidates
         if head_qualified is not None:
             reattached = head_qualified + "." + ".".join(segments[1:i])
             exact = _exact_qualified_lookup(reattached, by_qualified_name)
             if exact is not None:
-                return "resolved", exact, None, "high"
+                return "resolved", exact, None, "high", None
     # Nothing dotted resolved - fall through to the ordinary bare-name
     # ladder for the head segment ALONE (e.g. "Status.ACTIVE" reduces to
     # just "Status", dropping the constant-access tail entirely). Any
     # outcome other than a clean resolve retains the FULL original
     # chain as the published spelling - never the truncated head alone.
-    state, unit_id, _unresolved, confidence = _resolve_internal_candidate(
+    state, unit_id, _unresolved, confidence, candidates = _resolve_internal_candidate(
         segments[0], by_qualified_name, by_simple_name, duplicate_qualified_names,
         local_qualified_by_simple=local_qualified_by_simple,
         import_qualified_by_simple=import_qualified_by_simple, package=package,
+        unit_ids_by_qualified_name=unit_ids_by_qualified_name,
     )
     if state == "resolved":
-        return "resolved", unit_id, None, confidence
-    return state, None, target, None
+        return "resolved", unit_id, None, confidence, None
+    return state, None, target, None, candidates
 
 
 def _producer(*, name: str, version: int, rule_version: int, source_digest: str | None) -> dict[str, Any]:
@@ -397,9 +433,10 @@ def build_dependencies(
     ``resolved``/``target_external``.
     """
     file_digests = file_digests or {}
-    by_qualified_name, by_simple_name, file_unit_id_by_path, duplicate_qualified_names = (
-        _build_registry(java_results)
-    )
+    (
+        by_qualified_name, by_simple_name, file_unit_id_by_path, duplicate_qualified_names,
+        unit_ids_by_qualified_name,
+    ) = _build_registry(java_results)
     records: list[DependencyRecord] = []
 
     for path, result in java_results.items():
@@ -432,6 +469,7 @@ def build_dependencies(
                 local_qualified_by_simple=local_qualified_by_simple,
                 import_qualified_by_simple=import_qualified_by_simple,
                 package=package, degraded_paths=degraded_paths,
+                unit_ids_by_qualified_name=unit_ids_by_qualified_name,
             )
             records.append(record)
 
@@ -529,21 +567,25 @@ def _edge_claim_to_record(
     by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
     duplicate_qualified_names: set[str], local_qualified_by_simple: dict[str, str],
     import_qualified_by_simple: dict[str, str], package: str | None,
-    degraded_paths: frozenset[str],
+    degraded_paths: frozenset[str], unit_ids_by_qualified_name: dict[str, list[str]],
 ) -> DependencyRecord:
     target_unit_id = target_external = target_unresolved = confidence = None
+    candidate_unit_ids: list[str] = []
     if edge.target_kind == "internal_candidate":
         # FIX ROUND 14 (CR10-3): chain-aware - a dotted target may be a
         # member-navigation chain (an enum constant, a nested type
         # reached through an unqualified head), never assumed to be a
         # type reference verbatim just because it contains dots.
-        resolution_state, target_unit_id, target_unresolved, confidence = (
+        resolution_state, target_unit_id, target_unresolved, confidence, candidates = (
             _resolve_internal_candidate_chain(
                 edge.target, by_qualified_name, by_simple_name, duplicate_qualified_names,
                 local_qualified_by_simple=local_qualified_by_simple,
                 import_qualified_by_simple=import_qualified_by_simple, package=package,
+                unit_ids_by_qualified_name=unit_ids_by_qualified_name,
             )
         )
+        if candidates is not None:
+            candidate_unit_ids = candidates
         if resolution_state == "unresolved":
             # FIX ROUND 14 (CR10-4): the ladder has no local/import/
             # same-package rung that could ever find a java.lang type -
@@ -612,9 +654,11 @@ def _edge_claim_to_record(
         # (Type.*) - the TYPE PREFIX (everything but the last segment) is
         # what might be in-scan, exact-matched the same way D-1 already
         # does for a plain import; the member itself is never resolved
-        # (out of scope). The published target keeps the full original
-        # spelling either way, for evidence - only the LOOKUP key strips
-        # the trailing member/wildcard segment.
+        # (out of scope). The UNRESOLVED path keeps the full original
+        # spelling, for evidence (the reader can see exactly which
+        # member was meant, even though nothing in-scan answers for the
+        # type) - only the LOOKUP key strips the trailing member/
+        # wildcard segment.
         type_prefix = edge.target[:-2] if edge.target.endswith(".*") else edge.target.rsplit(".", 1)[0]
         exact_unit_id = _exact_qualified_lookup(type_prefix, by_qualified_name)
         if exact_unit_id is not None:
@@ -625,7 +669,15 @@ def _edge_claim_to_record(
             # member-path spelling.
             resolution_state, target_unresolved = "unresolved", edge.target
         else:
-            resolution_state, target_external = "resolved", edge.target
+            # FIX ROUND 15 (eleventh cold read, N1 MINOR): a genuinely
+            # EXTERNAL static import used to publish the full member
+            # path (e.g. "org.junit.Assert.assertEquals") as
+            # target_external - the member was already stripped for the
+            # RESOLUTION lookup key above; the published external name
+            # now matches it, naming the TYPE the dependency actually is
+            # (org.junit.Assert), never a member path masquerading as
+            # one.
+            resolution_state, target_external = "resolved", type_prefix
     else:
         resolution_state = "resolved"
         target_external = edge.target
@@ -653,4 +705,5 @@ def _edge_claim_to_record(
             name=java_adapter.ADAPTER_NAME, version=java_adapter.ADAPTER_VERSION,
             rule_version=java_adapter.RULE_VERSION, source_digest=source_digest,
         )],
+        candidate_unit_ids=candidate_unit_ids,
     )
