@@ -622,6 +622,54 @@ def test_run_scan_a_servlet_subclass_via_import_reports_dependencies_resolved_sa
     assert dependencies_resolved["stored_status"] == "satisfied"
 
 
+def test_run_scan_a_real_junit_test_calling_the_target_reports_test_evidence_located_satisfied(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 15b (reviewer-3's F4 leg 3, MAJOR - closing an
+    unreachable branch round 15 itself introduced): round 15's own
+    requirement of extracted/declared evidence on the TEST relation made
+    "satisfied" unreachable on any real run - the reviewer's own
+    reproduced shape: a real JUnit BillingEngineTest imports @Test and
+    calls BillingEngine.charge(), an extracted, resolved invoke edge -
+    and readiness still said no_test_evidence_found, a false statement
+    over evidence this same run extracted. End to end, no synthetic
+    edge construction."""
+    (java_repo / "src" / "main" / "java" / "p" / "BillingEngine.java").write_text(
+        "package p;\nclass BillingEngine {\n  static void charge() {}\n}\n", encoding="utf-8")
+    test_dir = java_repo / "src" / "test" / "java" / "p"
+    test_dir.mkdir(parents=True)
+    (test_dir / "BillingEngineTest.java").write_text(
+        "package p;\n"
+        "import org.junit.Test;\n"
+        "class BillingEngineTest {\n"
+        "  @Test void chargeWorks() { BillingEngine.charge(); }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+
+    invoke_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "invoke" and r.get("evidence_class") == "extracted"
+        and r["resolution_state"] == "resolved"
+    )
+    assert invoke_edge["target_unit_id"] is not None
+
+    billing_engine_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "BillingEngine")
+    test_evidence = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == billing_engine_unit["unit_id"] and s["check"] == "test_evidence_located"
+    )
+    assert test_evidence["stored_status"] == "satisfied"
+
+
 def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unknown(
     java_repo: Path,
 ) -> None:

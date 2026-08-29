@@ -424,13 +424,82 @@ def test_test_evidence_located_not_applicable_for_a_test_classified_unit():
     assert _signal_by_check(signals, "test_evidence_located").stored_status == "not_applicable"
 
 
-def test_test_evidence_located_satisfied_when_targeted_by_a_test_edge():
-    """This is exactly the "an actually-referencing test still satisfies"
-    control for FIX ROUND 15's F4 fix below - an extracted/declared test
-    edge (real evidence, not a convention guess) must still satisfy."""
-    edges = [_edge("u2", relation="test", resolution_state="resolved", target_unit_id="u1")]
+def test_test_evidence_located_satisfied_when_targeted_by_a_declared_or_extracted_test_edge():
+    """An extracted/declared TEST-relation edge (real evidence, not a
+    convention guess) still satisfies - no producer emits this shape
+    today (round 15b's own finding: the only test-edge producer emits
+    "inferred"), but the check must honor it correctly if one ever
+    does, the same way it already honors every other closed evidence
+    class."""
+    edges = [_edge(
+        "u2", relation="test", resolution_state="resolved", target_unit_id="u1",
+        evidence_class="declared")]
     signals, _ = ra.build_readiness([_unit("u1")], edges, [])
     assert _signal_by_check(signals, "test_evidence_located").stored_status == "satisfied"
+
+
+def test_test_evidence_located_satisfied_when_a_test_unit_actually_invokes_the_target():
+    """FIX ROUND 15b (reviewer-3's F4 leg 3, MAJOR - closing an
+    unreachable branch round 15 itself introduced): round 15's own
+    requirement of extracted/declared evidence on the TEST relation made
+    "satisfied" UNREACHABLE on any real run, since the only test-edge
+    producer emits "inferred" - no_test_evidence_found (a POSITIVE claim)
+    published for every production unit in every repo, even one whose
+    real JUnit test class genuinely calls it. The reviewer's own remedy:
+    the data already exists - an EXTRACTED invoke/import edge FROM a
+    test-classified unit TO a production unit IS real evidence the test
+    body actually references the target. BillingEngineTest (a real JUnit
+    class) calling BillingEngine.charge() must satisfy BillingEngine's
+    own test_evidence_located."""
+    edges = [_edge(
+        "test-unit", relation="invoke", resolution_state="resolved", target_unit_id="prod-unit",
+        evidence_class="extracted")]
+    modules = [
+        _unit("test-unit", classification="test"),
+        _unit("prod-unit", classification="production"),
+    ]
+    signals, _ = ra.build_readiness(modules, edges, [])
+    signal = next(
+        s for s in signals if s.unit_id == "prod-unit" and s.check == "test_evidence_located")
+    assert signal.stored_status == "satisfied"
+
+
+def test_test_evidence_located_unknown_when_a_test_unit_does_not_reference_the_target():
+    """FIX ROUND 15b control: a test-classified unit's name-pairing guess
+    ALONE (round 15's fx4 shape - the "inferred" convention edge, no real
+    invoke/import evidence of any kind from the test unit) must KEEP
+    failing toward unknown. This is the exact regression this round's
+    fix must not reopen."""
+    edges = [_edge(
+        "test-unit", relation="test", resolution_state="resolved", target_unit_id="prod-unit",
+        evidence_class="inferred")]
+    modules = [
+        _unit("test-unit", classification="test"),
+        _unit("prod-unit", classification="production"),
+    ]
+    signals, _ = ra.build_readiness(modules, edges, [])
+    signal = next(
+        s for s in signals if s.unit_id == "prod-unit" and s.check == "test_evidence_located")
+    assert signal.stored_status == "unknown"
+
+
+def test_test_evidence_located_unaffected_by_an_ordinary_production_to_production_invoke():
+    """FIX ROUND 15b control: the new invoke/import-from-test-unit rule
+    is gated on the SOURCE unit's own test classification - an ordinary
+    production class invoking another production class is real evidence
+    of an ordinary call, not test coverage, and must never satisfy
+    test_evidence_located for the callee."""
+    edges = [_edge(
+        "prod-caller", relation="invoke", resolution_state="resolved", target_unit_id="prod-unit",
+        evidence_class="extracted")]
+    modules = [
+        _unit("prod-caller", classification="production"),
+        _unit("prod-unit", classification="production"),
+    ]
+    signals, _ = ra.build_readiness(modules, edges, [])
+    signal = next(
+        s for s in signals if s.unit_id == "prod-unit" and s.check == "test_evidence_located")
+    assert signal.stored_status == "unknown"
 
 
 def test_test_evidence_located_stays_unknown_for_an_inferred_convention_only_pairing():

@@ -458,19 +458,45 @@ def build_readiness(
             stack.extend(children_by_container.get(candidate, []))
         return seen
 
+    # FIX ROUND 14 (CR10-1): resolves a component's OWNING file, walking
+    # up through nested-type containment (a nested type's own container
+    # is its outer type, never the file directly - N6/round 6) until a
+    # "file"-kind unit is reached.
+    module_by_id = {m.unit_id: m for m in modules}
+
     # FIX ROUND 15 (eleventh cold read, F4 MAJOR, wrong-data): a "test"
     # relation edge derived from stripping a naming CONVENTION
     # (Test/Tests/IT) and guessing the remainder resolves is published
     # `evidence_class="inferred"` (adapters.java) - the target identifier
-    # never actually appears in the test file's own source. A convention
-    # GUESS must never drive test_evidence_located past "unknown" on its
-    # own; only real evidence (extracted/declared - e.g. a future
-    # producer that verifies the test body actually references the
-    # target) satisfies this check.
+    # never actually appears in the test file's own source, so it must
+    # never drive test_evidence_located past "unknown" on its own.
+    #
+    # FIX ROUND 15b (reviewer-3's F4 leg 3, MAJOR - closing an
+    # unreachable branch this same round introduced): the ONLY test-edge
+    # producer emits "inferred" - round 15's own requirement of
+    # extracted/declared on the TEST relation made "satisfied"
+    # unreachable on any real run, so `no_test_evidence_found` (a
+    # POSITIVE claim: we looked, this class has no test) published for
+    # every production unit in every repo, even one whose real JUnit
+    # test class genuinely calls it. The data already exists: an
+    # invoke/import edge is real, extracted evidence of what a test
+    # class's body actually references - counting an EXTRACTED (or
+    # DECLARED) invoke/import edge FROM a test-classified unit TO this
+    # unit as real test evidence closes the branch without touching the
+    # "inferred" name-pairing edge at all (still published, still never
+    # sufficient alone - round 15's own fx4 shape, a name-pairing guess
+    # with no real reference, must keep failing toward unknown).
+    test_unit_ids = {m.unit_id for m in modules if "test" in m.classification}
     tested_unit_ids = {
         edge.target_unit_id for edge in dependencies
         if edge.relation == "test" and edge.target_unit_id is not None
         and edge.evidence_class in ("extracted", "declared")
+    } | {
+        edge.target_unit_id for edge in dependencies
+        if edge.relation in ("invoke", "import")
+        and edge.target_unit_id is not None
+        and edge.evidence_class in ("extracted", "declared")
+        and edge.from_unit_id in test_unit_ids
     }
 
     entry_point_owner_ids = {
@@ -480,12 +506,6 @@ def build_readiness(
     for feature in features:
         for unit_id in feature.unit_ids:
             feature_states_by_unit.setdefault(unit_id, []).append(feature.state)
-
-    # FIX ROUND 14 (CR10-1): resolves a component's OWNING file, walking
-    # up through nested-type containment (a nested type's own container
-    # is its outer type, never the file directly - N6/round 6) until a
-    # "file"-kind unit is reached.
-    module_by_id = {m.unit_id: m for m in modules}
 
     def _owning_file_unit_id(unit: ModuleRecord) -> str | None:
         current = unit
