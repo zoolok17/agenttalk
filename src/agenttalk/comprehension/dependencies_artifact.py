@@ -554,6 +554,41 @@ def _edge_claim_to_record(
             if known_external is not None:
                 resolution_state, target_unresolved = "resolved", None
                 target_external = known_external
+        if (
+            resolution_state == "unresolved"
+            and edge.relation in ("inherit", "invoke")
+            and edge.target in import_qualified_by_simple
+        ):
+            # FIX ROUND 15 (eleventh cold read, M8 MAJOR, wrong-data,
+            # promoted from polish - same class as CR10-4): a target
+            # fully qualified THROUGH THIS FILE'S OWN IMPORT (e.g.
+            # `extends HttpServlet` with `import javax.servlet.http.
+            # HttpServlet;`) stayed unresolved here even though the
+            # IMPORT EDGE for the identical qualified name independently
+            # resolves target_external (`internal_exact_or_external`
+            # below) - two contradictory facts about the same
+            # dependency in one run, and a confident deficiency
+            # (dependencies_resolved unsatisfied) on every servlet
+            # subclass, healthy code. The ladder's own import-miss
+            # branch already computed this exact qualified spelling as
+            # `target_unresolved` (guarded by the equality check, so a
+            # coincidental same-spelling miss from a DIFFERENT ladder
+            # rung - e.g. a dotted target - is never mistaken for this
+            # one) - consult it the same way the import edge itself
+            # does: a same-run degraded file (F2 MAJOR) never becomes a
+            # confident external claim over evidence that is merely
+            # missing, everything else genuinely is external. Scoped to
+            # inherit/invoke ONLY - a "test" relation edge is a
+            # CONVENTION GUESS (F4), never a real reference the source
+            # actually makes; confidently resolving a guessed name
+            # external would be exactly the overclaim F4 exists to
+            # prevent.
+            imported = import_qualified_by_simple[edge.target]
+            if imported == target_unresolved and not _degraded_java_suffix_match(
+                imported, degraded_paths,
+            ):
+                resolution_state, target_unresolved = "resolved", None
+                target_external = imported
     elif edge.target_kind == "internal_exact_or_external":
         # D-1 (reviewer-3, PR-B delta review round 2): an import's target
         # is already fully qualified - an EXACT registry hit means it

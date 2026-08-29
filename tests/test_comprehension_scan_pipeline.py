@@ -589,6 +589,39 @@ def test_run_scan_a_custom_exception_extending_runtimeexception_reports_dependen
     assert dependencies_resolved["stored_status"] == "satisfied"
 
 
+def test_run_scan_a_servlet_subclass_via_import_reports_dependencies_resolved_satisfied(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 15 (eleventh cold read, M8 MAJOR, wrong-data, promoted
+    from polish - same class as CR10-4): a servlet subclass whose
+    superclass is named through an ordinary import (not a java.lang
+    default) used to publish a confident dependencies_resolved
+    UNSATISFIED - a published deficiency on entirely healthy code, end
+    to end, exactly what CR10-4 already fixed for the java.lang case."""
+    (java_repo / "src" / "main" / "java" / "p" / "MyServlet.java").write_text(
+        "package p;\n"
+        "import javax.servlet.http.HttpServlet;\n"
+        "class MyServlet extends HttpServlet {\n"
+        "}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    inherit_edge = next(r for r in dependencies_doc["edges"] if r["relation"] == "inherit")
+    assert inherit_edge["resolution_state"] == "resolved"
+    assert inherit_edge["target_external"] == "javax.servlet.http.HttpServlet"
+
+    servlet_unit = next(u for u in modules_doc["units"] if u["display_name"] == "MyServlet")
+    dependencies_resolved = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == servlet_unit["unit_id"] and s["check"] == "dependencies_resolved"
+    )
+    assert dependencies_resolved["stored_status"] == "satisfied"
+
+
 def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unknown(
     java_repo: Path,
 ) -> None:

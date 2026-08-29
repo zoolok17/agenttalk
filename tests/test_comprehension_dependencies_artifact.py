@@ -199,9 +199,16 @@ def test_inherit_edge_via_import_of_an_unrelated_package_never_falls_back_to_a_s
     code fell back to the GLOBAL simple-name match (exactly one
     candidate) and silently resolved to the wrong, unrelated class,
     directly contradicting the import edge published for the SAME
-    artifact. Must resolve unresolved, with the IMPORTED spelling
-    (not the unrelated in-scan class, not the bare name) retained as
-    evidence of what was actually meant."""
+    artifact. Must never resolve to that wrong in-scan class (or the
+    bare name) - the imported spelling is what was actually meant.
+
+    FIX ROUND 15 (eleventh cold read, M8 MAJOR): round 12 left this
+    "unresolved" - correct on its own narrower point (never the wrong
+    class) but still a real inconsistency M8 closes: the IMPORT edge for
+    this identical qualified name independently resolves target_external
+    (nothing in-scan answers for it, and it is not a same-run degraded
+    file), so the inherit edge now consults that same verdict rather
+    than leaving two edges to contradict each other about one fact."""
     results = {
         "com/acme/admin/BaseController.java": _parse(
             "com/acme/admin/BaseController.java",
@@ -214,9 +221,9 @@ def test_inherit_edge_via_import_of_an_unrelated_package_never_falls_back_to_a_s
     }
     records = da.build_dependencies(results)
     inherit = next(r for r in records if r.relation == "inherit")
-    assert inherit.resolution_state == "unresolved"
+    assert inherit.resolution_state == "resolved"
     assert inherit.target_unit_id is None
-    assert inherit.target_unresolved == "com.corp.commons.web.BaseController"
+    assert inherit.target_external == "com.corp.commons.web.BaseController"
 
 
 def test_inherit_edge_written_fully_qualified_never_falls_back_to_a_same_named_class():
@@ -834,6 +841,57 @@ def test_a_local_class_shadowing_a_java_lang_name_wins_over_known_external():
     assert inherit.resolution_state == "resolved"
     assert inherit.target_unit_id == da._java_component_unit_id("p/Foo.java", "p.Exception")
     assert inherit.target_external is None
+
+
+# ----------------------------------------------------------- eleventh cold read M8: inherit-through-import external
+
+def test_inherit_edge_through_an_import_that_resolves_external_matches_the_import_edge():
+    """FIX ROUND 15 (eleventh cold read, M8 MAJOR, wrong-data, promoted
+    from polish - same class as CR10-4): a real-world servlet subclass
+    (`extends HttpServlet` with `import javax.servlet.http.HttpServlet;`)
+    used to publish an UNRESOLVED inherit edge while the import edge for
+    the identical qualified name independently resolved target_external
+    - two contradictory facts about one dependency in the same run, and
+    a confident dependencies_resolved deficiency on every servlet
+    subclass, entirely healthy code. Both edges must now agree."""
+    results = {
+        "p/MyServlet.java": _parse(
+            "p/MyServlet.java",
+            "package p;\n"
+            "import javax.servlet.http.HttpServlet;\n"
+            "class MyServlet extends HttpServlet {\n"
+            "}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    import_edge = next(r for r in records if r.relation == "import")
+    assert inherit.resolution_state == "resolved"
+    assert inherit.target_unit_id is None
+    assert inherit.target_external == "javax.servlet.http.HttpServlet"
+    assert inherit.target_external == import_edge.target_external
+
+
+def test_inherit_edge_through_an_import_of_a_same_run_degraded_file_stays_unresolved():
+    """FIX ROUND 15 (M8 control, F2 MAJOR precedent preserved): a
+    same-run degraded file (an adapter resource cap, a read/parse
+    failure) must never become a confident external claim just because
+    its registry entry is missing - it is missing because the file
+    degraded away, not because the type is genuinely third-party. Mirrors
+    the identical protection the import edge itself already has."""
+    results = {
+        "p/MyServlet.java": _parse(
+            "p/MyServlet.java",
+            "package p;\n"
+            "import com.acme.legacy.BaseServlet;\n"
+            "class MyServlet extends BaseServlet {\n"
+            "}\n"),
+    }
+    records = da.build_dependencies(
+        results, degraded_paths=frozenset({"com/acme/legacy/BaseServlet.java"}))
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "unresolved"
+    assert inherit.target_external is None
+    assert inherit.target_unresolved == "com.acme.legacy.BaseServlet"
 
 
 # ----------------------------------------------------------- route (external)
