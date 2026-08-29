@@ -74,6 +74,31 @@ def test_assessed_is_currently_unreachable_this_slice() -> None:
     assert summaries[0].stored_assessment_state == "needs_evidence"
 
 
+def test_not_applicable_is_also_currently_unreachable_this_slice() -> None:
+    """FIX ROUND 14 (tenth cold read, CR10-11, declared): the same
+    structural reason "assessed" is unreachable (boundaries_identified is
+    ALWAYS unknown, never not_applicable, and is not blocker-severity)
+    also rules out the rollup's "not_applicable" branch - that branch
+    only fires when EVERY signal is not_applicable, which can never
+    happen while one signal is permanently, unconditionally "unknown".
+    "blocked" was already declared unreachable (round 10 N1, no check
+    but source_understood is blocker-severity, and it never returns
+    unsatisfied). Combined with the existing
+    test_assessed_is_currently_unreachable_this_slice, this pins the
+    practical consequence: assessment_state is currently a CONSTANT
+    ("needs_evidence") for every unit this slice - it carries no
+    discriminating information yet, however evidenced or unevidenced a
+    unit's OWN individual signals are."""
+    minimal = _unit("u1")  # no edges, no features, no entry points, no problems
+    signals, summaries = ra.build_readiness([minimal], [], [])
+    assert summaries[0].stored_assessment_state == "needs_evidence"
+    fully_evidenced = _unit("u1", classification="test")
+    edges = [_edge("u1", resolution_state="resolved", target_unit_id="u2")]
+    features = [_feature("Foo", "confirmed", ["u1"])]
+    signals, summaries = ra.build_readiness([fully_evidenced], edges, features)
+    assert summaries[0].stored_assessment_state == "needs_evidence"
+
+
 def test_source_understood_unknown_and_needs_evidence_with_no_adapter():
     """M-2 (second cold read, fix round 4): "no adapter for this
     language" is an ABSENCE of positive evidence, not a positive claim

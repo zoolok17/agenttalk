@@ -22,6 +22,23 @@ with ``basis: "detected"`` never claimed - the design's own honesty rule:
 this check needs the ``data``/``configuration`` relations item 3 names as
 explicit coverage gaps (``UNSUPPORTED_RELATIONS``), so no unit can
 honestly claim this evidence exists yet.
+
+FIX ROUND 14 (tenth cold read, CR10-11, declared): the same permanent
+``unknown`` makes THREE of ``ASSESSMENT_STATES``'s four values structurally
+unreachable this slice, not just one. ``assessed`` cannot be reached (a
+permanently-unknown signal always exists); ``blocked`` cannot be reached
+(the ONLY blocker-severity check, ``source_understood``, never returns
+``unsatisfied`` - an absence of adapter evidence is unknown, never a
+confident negative, since round 5); and ``not_applicable`` cannot be
+reached either (``_rollup``'s own ``not_applicable`` branch requires EVERY
+signal to be ``not_applicable``, which can never happen while
+``boundaries_identified`` is unconditionally ``unknown``). Practical
+consequence, stated plainly rather than left to be independently
+discovered: ``assessment_state`` is currently a CONSTANT
+(``needs_evidence``) for every unit this slice, however evidenced or
+unevidenced its own individual signals are - it carries no discriminating
+information yet. This will change the moment a later slice adds the
+``data``/``configuration`` producer ``boundaries_identified`` needs.
 """
 
 from __future__ import annotations
