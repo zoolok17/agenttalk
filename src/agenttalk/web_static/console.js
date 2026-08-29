@@ -639,6 +639,14 @@
       // must match that severity, so `severe` (not `gone`) drives color/key.
       // The LABEL still comes from `gone` alone and stays 'Not confirmed
       // alive' for CLI_CHILD_STARTING - only the severity/color moves.
+      //
+      // round-5 review: the tooltip was left branching on `gone`, so a
+      // CLI_CHILD_STARTING chip had a mild colour + honest label but a
+      // hover flatly asserting "the child or its wrapper is gone" during
+      // every normal launch - the exact overclaim the label fix removed,
+      // one layer down. `desc` now branches on `severe` too, so colour/
+      // key/tooltip all agree; the genuinely-gone family keeps the gone
+      // wording.
       var severe = gone && !cliChildVerdictIsLaunching(verdictState);
       return {
         label: gone ? 'Not confirmed alive' : 'Not confirmed healthy',
@@ -646,7 +654,7 @@
         color: severe ? 'danger' : 'attn',
         grp: 'attn',
         desc: 'The supervisor’s verdict for this agent’s CLI child is "' + verdictState +
-          '" — ' + (gone ? 'the child or its wrapper is gone.' : 'not confirmed healthy.') +
+          '" — ' + (severe ? 'the child or its wrapper is gone.' : 'not confirmed healthy.') +
           ' The wrapper’s own self-report below is not proof of life.',
         rawHealthState: ((agent && agent.health) || {}).state
       };
