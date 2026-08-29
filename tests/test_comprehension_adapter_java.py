@@ -439,6 +439,35 @@ def test_ordinary_class_is_classified_production():
     assert result.units[0].classification == "production"
 
 
+def test_a_production_class_ending_in_it_without_corroboration_stays_production():
+    """FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data, verbatim
+    shape): _TEST_NAME_SUFFIX matches any name ending in "IT" (meant for
+    JUnit's own "OrderServiceIT" integration-test convention) - so an
+    entirely ordinary production class named AUDIT, in src/main/java,
+    with no test-framework import anywhere in the file, used to publish
+    as unit_type=test with a FABRICATED test edge to the nonexistent
+    stripped-suffix target "AUD". A name-suffix hit without CORROBORATING
+    evidence (a test source root, or a test-framework import) must stay
+    production and emit no test edge at all."""
+    src = "package p;\npublic class AUDIT {\n}\n"
+    result = java.parse_java_source("src/main/java/p/AUDIT.java", src)
+    assert result.units[0].classification == "production"
+    assert _edges(result, "test") == []
+
+
+def test_a_name_suffix_hit_with_a_test_framework_import_corroborates_test_classification():
+    """FIX ROUND 14 (CR10-7 control): a name-suffix hit alongside a real
+    test-framework import (JUnit) IS corroborated evidence - even
+    outside a test source root, this must still classify test and emit
+    its test edge, the same as before this fix for the legitimate case."""
+    src = "package p;\nimport org.junit.Test;\nclass FooIT {\n}\n"
+    result = java.parse_java_source("src/it/java/p/FooIT.java", src)
+    assert result.units[0].classification == "test"
+    test_edges = _edges(result, "test")
+    assert len(test_edges) == 1
+    assert test_edges[0].target == "Foo"
+
+
 # ----------------------------------------------------------- invoke
 
 def test_qualified_call_resolves_against_an_import():

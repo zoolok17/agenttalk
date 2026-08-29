@@ -244,7 +244,12 @@ def test_test_edge_via_import_of_an_unrelated_package_never_falls_back_to_a_same
     """FIX ROUND 12 (reproduced shape C): InvoiceServiceTest imports
     com.corp.legacy.InvoiceService (never in-scan) - an unrelated
     com.acme.billing.InvoiceService must never absorb the test edge just
-    because it is the only in-scan class sharing that bare name."""
+    because it is the only in-scan class sharing that bare name.
+
+    FIX ROUND 14 (CR10-7): a name-suffix match alone is no longer
+    sufficient to classify test/emit a test edge - this fixture now
+    carries a real test-framework import as its corroborating evidence
+    (a genuine JUnit test class, not a bare-suffix guess)."""
     results = {
         "com/acme/billing/InvoiceService.java": _parse(
             "com/acme/billing/InvoiceService.java",
@@ -253,6 +258,7 @@ def test_test_edge_via_import_of_an_unrelated_package_never_falls_back_to_a_same
             "com/acme/billing/InvoiceServiceTest.java",
             "package com.acme.billing;\n"
             "import com.corp.legacy.InvoiceService;\n"
+            "import org.junit.Test;\n"
             "class InvoiceServiceTest {}\n"),
     }
     records = da.build_dependencies(results)

@@ -138,20 +138,39 @@ def build_features(
     by_qualified_name, _by_simple_name, _file_unit_ids, _duplicate_names = _build_registry(java_results)
 
     owning_unit_by_qualified_name = by_qualified_name
-    entry_points_by_owner: dict[str, list[tuple[str, java_adapter.JavaEntryPointClaim]]] = {}
+    # FIX ROUND 14 (tenth cold read, CR10-8 MINOR, wrong-data): grouped
+    # by owning_unit_id ALONE - a claim with no real declared-type owner
+    # (web.xml's servlet-mapping entry points; parse_web_xml's synthetic
+    # qualified_name never matches an actual declared type) falls back
+    # to the FILE unit, but a web.xml with TWO servlet mappings owns
+    # BOTH claims under that SAME file fallback, collapsing them into
+    # ONE feature labelled after whichever claim happened to be first -
+    # the second servlet's own identity silently folded under the
+    # wrong name. Grouped by (owning_unit_id, a distinguisher) instead:
+    # a REAL declared-type owner still groups every claim it owns into
+    # one feature (multiple @GetMapping routes on the SAME controller
+    # ARE one feature, unchanged); a FILE-fallback owner groups by the
+    # claim's OWN qualified_name too, so each independent claim under
+    # that same fallback gets its own feature.
+    entry_points_by_owner: dict[
+        tuple[str, str | None], list[tuple[str, java_adapter.JavaEntryPointClaim, str]]
+    ] = {}
 
     for path, result in java_results.items():
         for claim in result.entry_points:
-            owning_unit_id = owning_unit_by_qualified_name.get(
-                claim.qualified_name, _java_file_unit_id(path),
-            )
-            entry_points_by_owner.setdefault(owning_unit_id, []).append((path, claim))
+            resolved_unit_id = owning_unit_by_qualified_name.get(claim.qualified_name)
+            if resolved_unit_id is not None:
+                owning_unit_id, group_key = resolved_unit_id, (resolved_unit_id, None)
+            else:
+                owning_unit_id = _java_file_unit_id(path)
+                group_key = (owning_unit_id, claim.qualified_name)
+            entry_points_by_owner.setdefault(group_key, []).append((path, claim, owning_unit_id))
 
     entry_point_records: list[EntryPointRecord] = []
     features: list[FeatureRecord] = []
 
-    for owning_unit_id, claims in entry_points_by_owner.items():
-        owner_path, first_claim = claims[0]
+    for (owning_unit_id, _distinguisher), claims in entry_points_by_owner.items():
+        owner_path, first_claim, _owner = claims[0]
         label = _feature_label(first_claim.qualified_name)
         feature_id = digests.feature_id(label=label, unit_ids=[owning_unit_id])
 
@@ -166,7 +185,7 @@ def build_features(
         # merged producer lists - the SAME rule dependencies_artifact.py's
         # _coalesce_by_edge_id already applies to edges (M6, round 3).
         entry_points_by_id: dict[str, EntryPointRecord] = {}
-        for path, claim in claims:
+        for path, claim, _owner in claims:
             entry_point_id = digests.entry_point_id(
                 kind=claim.kind, owning_unit_id=owning_unit_id, name=claim.name,
             )

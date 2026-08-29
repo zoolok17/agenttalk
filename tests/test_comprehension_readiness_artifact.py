@@ -341,9 +341,12 @@ def test_feature_linked_satisfied_when_a_confirmed_feature_links_it():
 
 # ----------------------------------------------------------- test_evidence_located
 
-def test_test_evidence_located_satisfied_for_a_test_classified_unit():
+def test_test_evidence_located_not_applicable_for_a_test_classified_unit():
+    """FIX ROUND 14 (CR10-7, the tautology half): a test class satisfying
+    this check about ITSELF is meaningless - the check's subject is the
+    PRODUCTION unit a test pairs to, never the test class's own record."""
     signals, _ = ra.build_readiness([_unit("u1", classification="test")], [], [])
-    assert _signal_by_check(signals, "test_evidence_located").stored_status == "satisfied"
+    assert _signal_by_check(signals, "test_evidence_located").stored_status == "not_applicable"
 
 
 def test_test_evidence_located_satisfied_when_targeted_by_a_test_edge():

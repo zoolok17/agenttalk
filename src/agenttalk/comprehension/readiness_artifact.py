@@ -346,7 +346,18 @@ def _check_feature_linked(unit: ModuleRecord, feature_states: list[str]) -> Read
 
 
 def _check_test_evidence_located(unit: ModuleRecord, is_tested: bool) -> ReadinessSignal:
-    if "test" in unit.classification or is_tested:
+    # FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data - the
+    # tautology half): a unit classified "test" used to satisfy THIS
+    # check about ITSELF, which is meaningless - "test evidence located"
+    # asks whether a PRODUCTION unit has a test pairing with it; a test
+    # class is not a production unit that could ever need one. Never
+    # applicable to a test unit's own record; only a production unit
+    # actually targeted by a "test" relation edge satisfies it.
+    if "test" in unit.classification:
+        return _signal(
+            unit.unit_id, "test_evidence_located", "not_applicable", "detected",
+            "unit_is_itself_a_test")
+    if is_tested:
         return _signal(
             unit.unit_id, "test_evidence_located", "satisfied", "detected", "test_evidence_located")
     return _signal(unit.unit_id, "test_evidence_located", "unknown", "detected", "no_test_evidence_found")

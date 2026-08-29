@@ -73,6 +73,42 @@ def test_web_xml_entry_point_gets_a_clean_label_not_the_file_extension():
     assert features[0].label == "legacy"
 
 
+def test_two_servlet_mappings_in_one_web_xml_produce_two_features_not_one():
+    """FIX ROUND 14 (tenth cold read, CR10-8 MINOR, wrong-data): a
+    web.xml with two <servlet-mapping> entries has no real declared-type
+    owner for either claim, so both fell back to the SAME file unit - and
+    grouping by owning_unit_id alone then collapsed them into ONE feature
+    labelled after whichever servlet happened to be first, silently
+    folding the second servlet's identity under the wrong name. Each
+    independent file-fallback claim must get its own feature."""
+    entry_points = java_adapter.parse_web_xml(
+        "WEB-INF/web.xml",
+        "<web-app>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>dispatcher</servlet-name>\n"
+        "    <url-pattern>/api/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "  <servlet-mapping>\n"
+        "    <servlet-name>legacy</servlet-name>\n"
+        "    <url-pattern>/legacy/*</url-pattern>\n"
+        "  </servlet-mapping>\n"
+        "</web-app>\n",
+    )
+    results = {
+        "WEB-INF/web.xml": java_adapter.JavaFileResult(entry_points=entry_points),
+    }
+    entry_point_records, features = fa.build_features(results)
+    assert len(entry_point_records) == 2
+    assert len(features) == 2
+    assert sorted(f.label for f in features) == ["dispatcher", "legacy"]
+    # each feature owns exactly its own entry point, not both
+    for feature in features:
+        assert len(feature.entry_point_ids) == 1
+        owned = next(
+            ep for ep in entry_point_records if ep.entry_point_id == feature.entry_point_ids[0])
+        assert owned.name == ("/api/*" if feature.label == "dispatcher" else "/legacy/*")
+
+
 def test_two_routes_on_the_same_controller_group_into_one_feature():
     source = (
         "package p;\nclass Controller {\n"

@@ -50,7 +50,21 @@ RULE_VERSION = 1
 UNSUPPORTED_RELATIONS = ("data", "configuration")
 
 _TEST_PATH_SEGMENT = re.compile(r"(?:^|/)(?:src/test|test)/")
+#: FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data): a bare
+#: name-suffix match alone is NOT corroborating evidence on its own - an
+#: ordinary production class ending in "IT" (``AUDIT``, ``PROFIT``,
+#: ``DEPOSIT``, any all-caps noun a legacy codebase happens to name a
+#: class after) matched this suffix and published as unit_type=test
+#: with a FABRICATED test edge to a nonexistent stripped-suffix target
+#: (``AUDIT`` -> "AUD"). A name-suffix hit now requires CORROBORATION -
+#: a test-framework import in the SAME file - to actually classify as
+#: test or emit a test edge; a test SOURCE ROOT (below) is sufficient
+#: evidence entirely on its own, no corroboration needed.
 _TEST_NAME_SUFFIX = re.compile(r"(Test|Tests|IT)$")
+#: PROVISIONAL, like every other closed-set constant in this package -
+#: the well-known JUnit/TestNG import roots, not an exhaustive list of
+#: every test framework a real codebase might use.
+_TEST_FRAMEWORK_IMPORT_PREFIXES = ("org.junit", "junit.framework", "org.testng")
 
 _PACKAGE_RE = re.compile(r"(?m)^\s*package\s+([\w.]+)\s*;")
 _IMPORT_RE = re.compile(r"(?m)^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;")
@@ -537,10 +551,12 @@ def _line_at(newline_offsets: list[int], offset: int) -> int:
     return bisect.bisect_left(newline_offsets, offset) + 1
 
 
-def _classify(relative_path: str, simple_name: str | None) -> str:
+def _classify(
+    relative_path: str, simple_name: str | None, *, has_test_framework_evidence: bool = False,
+) -> str:
     if _TEST_PATH_SEGMENT.search(relative_path.replace("\\", "/")):
         return "test"
-    if simple_name and _TEST_NAME_SUFFIX.search(simple_name):
+    if simple_name and _TEST_NAME_SUFFIX.search(simple_name) and has_test_framework_evidence:
         return "test"
     return "production"
 
@@ -1356,6 +1372,14 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         imports.append((target, is_static, _line_at(newline_offsets, match.start())))
         if not target.endswith(".*"):
             import_simple_names[target.rsplit(".", 1)[-1]] = (target, is_static)
+    # FIX ROUND 14 (CR10-7): corroborating evidence for a name-suffix-
+    # only test classification - a test-framework import anywhere in
+    # THIS file (imports are file-scoped, same reasoning as CR10-1).
+    has_test_framework_evidence = any(
+        target.startswith(prefix)
+        for target, _is_static, _line in imports
+        for prefix in _TEST_FRAMEWORK_IMPORT_PREFIXES
+    )
 
     types = _extract_types(sanitized, package)
     local_simple_names = {simple for _, simple, *_ in types}
@@ -1384,7 +1408,8 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             qualified_name=qualified,
             simple_name=simple,
             line=_line_at(newline_offsets, brace_pos),
-            classification=_classify(relative_path, simple),
+            classification=_classify(
+                relative_path, simple, has_test_framework_evidence=has_test_framework_evidence),
         )
         for qualified, simple, _container, brace_pos, _extends, _implements, _end in types
     ]
@@ -1448,7 +1473,18 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                         target_kind="internal_candidate", evidence_class="extracted",
                         line=line, phase="runtime",
                     ))
-        if _TEST_NAME_SUFFIX.search(simple):
+        # FIX ROUND 14 (CR10-7 MINOR, wrong-data): a bare name-suffix
+        # match is not corroborating evidence on its own (see
+        # _TEST_NAME_SUFFIX's own comment) - an ordinary production
+        # class named e.g. AUDIT matched "IT" and published a
+        # FABRICATED test edge to a nonexistent stripped-suffix target
+        # ("AUD"). Requires the SAME corroboration _classify itself now
+        # requires - a test source root (checked directly here, since a
+        # nested type's own qualified/simple name carries no path
+        # information) OR a test-framework import in this file.
+        if _TEST_NAME_SUFFIX.search(simple) and (
+            has_test_framework_evidence or _TEST_PATH_SEGMENT.search(relative_path.replace("\\", "/"))
+        ):
             under_test = _TEST_NAME_SUFFIX.sub("", simple)
             if under_test:
                 edges.append(JavaEdgeClaim(
