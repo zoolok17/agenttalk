@@ -151,6 +151,15 @@ def _signal(unit_id: str, check: str, stored_status: str, basis: str, reason_cod
 #: KeyError below) rather than silently defaulting anywhere - the next
 #: new reason a worker/adapter emits must declare its destination here
 #: before it can reach any readiness check at all.
+#:
+#: Honest bound (reviewer-3, round 13d - keep this stated, not implied:
+#: overclaimed totality is what round 13 itself was about): this map
+#: guards only reasons that reach a UNIT's own ``adapter_problem_
+#: reasons`` list - it says nothing about, and is never consulted for,
+#: any other reason_code a producer might record elsewhere in the
+#: system (a discovery-level problem, a pipeline-level refusal, ...).
+#: Its closed vocabulary is exactly modules_artifact.ModuleRecord's own
+#: ``adapter_problem_reasons`` contract, nothing wider.
 _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     "parse_failed": frozenset({"source_understood"}),
     "path_excluded": frozenset({"source_understood"}),

@@ -172,14 +172,29 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
 
-def _problem_record(reason_code: str, path: str | None, detail: str) -> dict[str, Any]:
-    return {
+def _problem_record(
+    reason_code: str, path: str | None, detail: str, *, qualified_name: str | None = None,
+) -> dict[str, Any]:
+    """FIX ROUND 13d (reviewer-3's LOW on round 13c): ``qualified_name``
+    was internal-only - round 13c attributed a ``cli_main_unrecognized``
+    problem to its own enclosing declared type (never broadcasting it to
+    every sibling), but ``problems.json`` itself dropped that attribution
+    on the floor, so readiness's own signal named the unit while the ONE
+    surface an operator actually reads (problems.json) could only say
+    "somewhere in this file" - no way to join the two. Published WHEN
+    PRESENT, the key omitted entirely otherwise (never a null) - the
+    same absent-not-null idiom every other optional field in this
+    artifact family already follows."""
+    record = {
         "problem_id": digests.problem_id(reason_code=reason_code, path=path, detail=detail),
         "reason_code": reason_code,
         "severity": _PROBLEM_SEVERITY_BY_REASON_CODE.get(reason_code, _DEFAULT_PROBLEM_SEVERITY),
         "path": path,
         "detail": detail,
     }
+    if qualified_name is not None:
+        record["qualified_name"] = qualified_name
+    return record
 
 
 def _artifact_summary(
@@ -426,7 +441,8 @@ def run_scan(
             _problem_record(p["reason_code"], p.get("path"), p["detail"])
             for p in discovery_result.problems
         ] + [
-            _problem_record(p.reason_code, p.relative_path, p.detail)
+            _problem_record(
+                p.reason_code, p.relative_path, p.detail, qualified_name=p.qualified_name)
             for p in worker_result.problems
         ] + [
             _problem_record(

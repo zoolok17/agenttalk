@@ -415,6 +415,14 @@ def test_run_scan_a_route_value_constant_never_flips_source_understood_for_ordin
     assert any(p["reason_code"] == "route_value_unrecoverable" for p in problems_doc["problems"])
     assert not any(r["relation"] == "route" for r in json.loads(
         (outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))["edges"])
+    # FIX ROUND 13d (reviewer-3's LOW on round 13c): an UNATTRIBUTED
+    # problem (this one is file-wide, no single owning type) must omit
+    # the qualified_name KEY entirely - never publish it as null - the
+    # same absent-not-null idiom every other optional field in this
+    # artifact family already follows.
+    route_problem = next(
+        p for p in problems_doc["problems"] if p["reason_code"] == "route_value_unrecoverable")
+    assert "qualified_name" not in route_problem
 
 
 def test_run_scan_reports_unknown_not_satisfied_for_a_resource_capped_java_file(
@@ -564,7 +572,14 @@ def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unkno
     )
     assert entry_points_mapped["stored_status"] == "unknown"
     assert entry_points_mapped["reason_code"] == "cli_main_unrecognized"
-    assert any(p["reason_code"] == "cli_main_unrecognized" for p in problems_doc["problems"])
+    cli_main_problem = next(
+        p for p in problems_doc["problems"] if p["reason_code"] == "cli_main_unrecognized")
+    # FIX ROUND 13d (reviewer-3's LOW on round 13c): qualified_name was
+    # internal-only - readiness named the unit while problems.json, the
+    # ONE surface an operator actually reads, could only say "somewhere
+    # in this file". Published on the problem record so a reader can
+    # join the two.
+    assert cli_main_problem["qualified_name"] == "p.App"
 
     source_understood = next(
         s for s in readiness_doc["signals"]
