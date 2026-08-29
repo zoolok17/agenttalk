@@ -1541,6 +1541,88 @@ def test_parse_maven_pom_ignores_a_commented_out_dependency():
     assert {e.target for e in edges} == {"org.springframework:spring-core"}
 
 
+def test_parse_maven_pom_excludes_dependency_management_entries():
+    """M1 (seventh cold read MAJOR, wrong-data): reviewer's proving test -
+    one dependencyManagement entry (a parent/BOM pom can carry dozens;
+    these are NOT dependencies of this module) plus one real entry must
+    publish exactly one edge, naming the real one."""
+    pom = """<project>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.acme</groupId>
+        <artifactId>bom-managed-dep</artifactId>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>real-dep</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"""
+    edges = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme:real-dep"}
+
+
+def test_parse_maven_pom_excludes_profile_scoped_dependencies():
+    """M1: a <profile>'s own dependencies are conditionally active, not
+    unconditional direct dependencies of the module - excluded (named
+    decision), never published undifferentiated alongside real ones."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>real-dep</artifactId>
+    </dependency>
+  </dependencies>
+  <profiles>
+    <profile>
+      <dependencies>
+        <dependency>
+          <groupId>com.acme</groupId>
+          <artifactId>profile-dep</artifactId>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>
+"""
+    edges = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme:real-dep"}
+
+
+def test_parse_maven_pom_excludes_plugin_scoped_dependencies():
+    """M1: a <plugin>'s own dependencies are the BUILD TOOL's, not the
+    module's - excluded (named decision), never published
+    undifferentiated alongside real ones."""
+    pom = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>real-dep</artifactId>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <dependencies>
+          <dependency>
+            <groupId>com.acme</groupId>
+            <artifactId>plugin-dep</artifactId>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+"""
+    edges = java.parse_maven_pom("pom.xml", pom)
+    assert {e.target for e in edges} == {"com.acme:real-dep"}
+
+
 # ----------------------------------------------------------- web.xml (route)
 
 def test_parse_web_xml_extracts_servlet_mapping_routes():

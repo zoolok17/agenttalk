@@ -1531,12 +1531,76 @@ _DEPENDENCY_OPTIONAL_RE = re.compile(r"<optional>\s*(true|false)\s*</optional>",
 #: existing "build" phase.
 _DEPENDENCY_SCOPE_RE = re.compile(r"<scope>\s*([\w.-]+)\s*</scope>")
 
+#: M1 (seventh cold read, fix round 11): a bare open/close XML tag
+#: (attributes ignored - this adapter's own bar is "a handful of flat
+#: structural tags", not a general XML parser); a trailing ``/`` before
+#: ``>`` marks a self-closing tag, which never opens a body at all.
+_XML_TAG_RE = re.compile(r"<(/?)([A-Za-z][\w.-]*)\b[^>]*?(/?)>")
+#: Every ``<dependencies>...</dependencies>`` element, regardless of
+#: nesting context - non-greedy, mirroring ``_DEPENDENCY_BLOCK_RE``'s own
+#: same-shaped non-nesting assumption (Maven's own schema never nests
+#: one ``<dependencies>`` inside another).
+_DEPENDENCIES_ELEMENT_RE = re.compile(r"<dependencies>(.*?)</dependencies>", re.DOTALL)
+
+
+def _enclosing_tag_stack(sanitized: str, before: int) -> list[str]:
+    """The full ancestor tag-name stack open at position ``before`` - a
+    plain forward tag scan up to (not including) that position. Depth-
+    aware element-context tracking, the same technique
+    ``_matching_close_paren`` already owns for a different bracket
+    family, applied here to XML tags instead of parens."""
+    stack: list[str] = []
+    for tag_match in _XML_TAG_RE.finditer(sanitized, 0, before):
+        if tag_match.group(3) == "/":
+            continue  # self-closing: never opens a body, nothing to push/pop
+        name = tag_match.group(2)
+        if tag_match.group(1) == "/":
+            if stack and stack[-1] == name:
+                stack.pop()
+        else:
+            stack.append(name)
+    return stack
+
+
+def _module_own_dependency_blocks(sanitized: str) -> list[re.Match]:
+    """M1 (seventh cold read BLOCKER, wrong-data): ``parse_maven_pom``
+    used to match every ``<dependency>`` block ANYWHERE in the file -
+    ``<dependencyManagement>`` (transitive/BOM-style declarations, NOT
+    direct dependencies of this module - a parent/BOM pom can carry
+    dozens), a ``<profile>``'s own conditionally-active dependencies,
+    and a ``<plugin>``'s own build-tool dependency all published as
+    undifferentiated direct declared build edges, contradicting this
+    function's own docstring promise of "direct" dependencies.
+
+    Scoped to the module's own TOP-LEVEL ``<dependencies>`` element - a
+    direct child of ``<project>``, never one nested inside
+    ``<dependencyManagement>``/a ``<profile>``/a ``<plugin>`` - via
+    element-context tracking (``_enclosing_tag_stack``), the same
+    depth-aware technique this adapter already owns for a different
+    bracket family.
+
+    Named decision (judged, not silently decided): plugin- and profile-
+    scoped dependencies are EXCLUDED from this slice's direct-dependency
+    edges, not differentiated with a marker - they are not direct
+    dependencies of the module by Maven's own semantics (a profile's
+    dependencies are conditionally active; a plugin's dependencies are
+    the BUILD TOOL's own, not the module's), and inventing a phase/marker
+    for them would imply a supported, evidenced distinction this slice
+    does not actually make. Honest v1: excluded, named here."""
+    for deps_match in _DEPENDENCIES_ELEMENT_RE.finditer(sanitized):
+        if _enclosing_tag_stack(sanitized, deps_match.start()) != ["project"]:
+            continue
+        yield from _DEPENDENCY_BLOCK_RE.finditer(
+            sanitized, deps_match.start(1), deps_match.end(1))
+
 
 def parse_maven_pom(relative_path: str, text: str) -> list[JavaEdgeClaim]:
-    """Direct-dependency ``build`` edges from a ``pom.xml``'s
-    ``<dependency>`` blocks. Plain regex over a small, well-known XML
-    shape - no XML parser (and its entity-expansion surface) needed for
-    a handful of flat child elements.
+    """Direct-dependency ``build`` edges from a ``pom.xml``'s module-own,
+    top-level ``<dependency>`` blocks (see ``_module_own_dependency_
+    blocks`` for the M1/round-11 scoping fix and its named plugin/
+    profile decision). Plain regex over a small, well-known XML shape -
+    no XML parser (and its entity-expansion surface) needed for a
+    handful of flat child elements.
 
     M3 (fourth cold read, fix round 6): ``<optional>``/``<scope>`` were
     read PAST and discarded - every edge asserted ``optional: false``,
@@ -1549,7 +1613,7 @@ def parse_maven_pom(relative_path: str, text: str) -> list[JavaEdgeClaim]:
     sanitized = _strip_xml_comments(text)
     newline_offsets = _newline_offsets(sanitized)
     edges = []
-    for match in _DEPENDENCY_BLOCK_RE.finditer(sanitized):
+    for match in _module_own_dependency_blocks(sanitized):
         block = match.group(1)
         group_match = _DEPENDENCY_GROUP_ID_RE.search(block)
         artifact_match = _DEPENDENCY_ARTIFACT_ID_RE.search(block)
