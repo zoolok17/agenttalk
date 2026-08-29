@@ -1753,32 +1753,56 @@ def _check_hmac(store: Store, project_root: Path) -> Check:
 
 
 def _check_heartbeats(store: Store) -> list[Check]:
-    """One check per agent — is anyone actually listening right now?"""
+    """One check per agent — is anyone actually listening right now?
+
+    #105: a fresh heartbeat alone is the WRAPPER'S OWN self-report - it
+    cannot notice its own CLI child dying, so it keeps ticking "ok" after the
+    child is gone. When the supervisor has an independently-verified strict
+    verdict for this agent (auto_restart-managed agents only) that does NOT
+    confirm it healthy, that overrides "ok" regardless of how fresh the
+    heartbeat looks: a verdict the CLI-child-or-wrapper-is-GONE predicate
+    recognizes downgrades to ``error``; any OTHER not-confirmed-healthy
+    verdict (an operational state like CONFIG_BLOCKED/LAUNCHING, or a future
+    state neither bucket recognizes yet) downgrades to at least ``warn`` -
+    fail-closed by construction, never falls through to "ok". The heartbeat
+    detail is kept, not dropped, as secondary context.
+
+    round-3 review minor: CLI_CHILD_STARTING falls inside the gone family's
+    CLI_CHILD_* prefix match (which the planner's own bookkeeping depends on
+    and this display layer does not touch), but it is the SAME lifecycle
+    moment as LAUNCHING - display-only, it downgrades to ``warn`` like
+    LAUNCHING instead of ``error``, via cli_child_verdict_is_launching().
+    """
     cfg = store.load_config()
     now = datetime.now(timezone.utc)
+    verdicts = sup.strict_child_verdicts(store, now_epoch=now.timestamp())
     out: list[Check] = []
     for a in cfg.get("agents", []):
         hb = store.read_heartbeat(a)
         if hb is None:
-            out.append(Check(
-                name=f"heartbeat.{a}",
-                status="warn",
-                details="no heartbeat — agent has never run `agenttalk wait`",
-            ))
-            continue
-        age = (now - hb).total_seconds()
-        if age > 300:  # 5 min
-            out.append(Check(
-                name=f"heartbeat.{a}",
-                status="warn",
-                details=f"stale (last seen {int(age)}s ago); peer probably not listening",
-            ))
+            status = "warn"
+            details = "no heartbeat — agent has never run `agenttalk wait`"
         else:
-            out.append(Check(
-                name=f"heartbeat.{a}",
-                status="ok",
-                details=f"last seen {int(age)}s ago",
-            ))
+            age = (now - hb).total_seconds()
+            if age > 300:  # 5 min
+                status = "warn"
+                details = f"stale (last seen {int(age)}s ago); peer probably not listening"
+            else:
+                status = "ok"
+                details = f"last seen {int(age)}s ago"
+        verdict_state = verdicts.get(a, {}).get("state")
+        if isinstance(verdict_state, str) and not sup.cli_child_verdict_is_healthy(verdict_state):
+            if (sup.cli_child_verdict_is_gone(verdict_state)
+                    and not sup.cli_child_verdict_is_launching(verdict_state)):
+                status = "error"
+                details = (f"supervisor confirms the CLI child is {verdict_state} "
+                           f"(heartbeat alone is not proof of life: {details})")
+            else:
+                if status == "ok":
+                    status = "warn"
+                details = (f"supervisor does not confirm this agent healthy "
+                           f"({verdict_state}); heartbeat: {details}")
+        out.append(Check(name=f"heartbeat.{a}", status=status, details=details))
     return out
 
 

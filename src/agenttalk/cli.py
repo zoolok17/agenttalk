@@ -767,20 +767,79 @@ def _read_supervisor_snapshot(store: Store, path_value: str | None = None) -> li
     return raw if isinstance(raw, list) else None
 
 
+def _supervisor_snapshot_path(store: Store, path_value: str | None = None) -> Path:
+    return Path(path_value) if path_value else store.dir / "supervisor-snapshot.json"
+
+
+# round-2 review minor (a): a bare 60s threshold would misclassify EVERY
+# snapshot as permanently stale for an operator who configured a slower
+# poll_seconds than the default. Scale with the configured cadence instead -
+# still floored at STALE_THRESHOLD_SECONDS so a fast/default cadence keeps
+# today's tight bound.
+_SUPERVISOR_SNAPSHOT_STALE_CADENCE_MULTIPLE = 4
+
+
+def _supervisor_snapshot_stale_after_seconds(supervisor_config: dict | None) -> float:
+    poll_seconds = sup.resolve_poll_seconds(supervisor_config or {})
+    return max(STALE_THRESHOLD_SECONDS,
+              _SUPERVISOR_SNAPSHOT_STALE_CADENCE_MULTIPLE * poll_seconds)
+
+
+def _fresh_supervisor_snapshot(store: Store, now_epoch: float,
+                               path_value: str | None = None, *,
+                               supervisor_config: dict | None = None,
+                               ) -> tuple[list[dict] | None, str | None]:
+    """#124: the snapshot carries no internal timestamp of its own - an
+    external writer (the generated PowerShell poll loop) refreshes the file
+    every ``poll_seconds``, so the FILE's mtime is the only freshness signal
+    available. A snapshot older than the configured cadence's stale
+    threshold (:func:`_supervisor_snapshot_stale_after_seconds`) is treated
+    as absent rather than as current truth: this mirrors #105's
+    ``strict_child_verdicts`` degrade-safe contract exactly
+    (``snapshot=None`` -> an ACTIVE-phase child degrades to
+    ``CLI_CHILD_UNKNOWN`` instead of trusting stale process facts), plus a
+    warning so the stale read is visible rather than silent.
+
+    Returns ``(snapshot_or_none, warning_or_none)``.
+    """
+    snapshot = _read_supervisor_snapshot(store, path_value)
+    if snapshot is None:
+        return None, None
+    path = _supervisor_snapshot_path(store, path_value)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError as exc:
+        # round-2 review minor (b): a stat failure AFTER a successful read
+        # (the file existed and parsed, then vanished/became unreadable
+        # between the two calls) used to silently drop the snapshot with no
+        # warning - the same silent-degrade shape #124 exists to close.
+        return None, f"supervisor_snapshot_unstatable:{type(exc).__name__}"
+    age = max(0.0, now_epoch - mtime)
+    threshold = _supervisor_snapshot_stale_after_seconds(supervisor_config)
+    if age > threshold:
+        return None, f"supervisor_snapshot_stale:{int(age)}s"
+    return snapshot, None
+
+
 def _status_supervisor_summaries(store: Store, now_epoch: float,
                                  sup_cfg: dict) -> tuple[dict[str, dict], list[str]]:
+    snapshot, staleness_warning = _fresh_supervisor_snapshot(
+        store, now_epoch, supervisor_config=sup_cfg)
     try:
         obs = sup.build_supervisor_observation(
             store,
             now_epoch=now_epoch,
             state=_read_supervisor_state(store),
             supervisor_config=sup_cfg,
-            snapshot=_read_supervisor_snapshot(store),
+            snapshot=snapshot,
             event_limit=0,
             lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )
     except Exception as exc:
-        return {}, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
+        warnings = [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
+        if staleness_warning:
+            warnings.append(staleness_warning)
+        return {}, warnings
     rows: dict[str, dict] = {}
     for item in obs.get("agents") or []:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -801,6 +860,8 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
             row["lead_liveness"] = lead_liveness
         rows[item["name"]] = row
     warnings = []
+    if staleness_warning:
+        warnings.append(staleness_warning)
     ring = obs.get("event_ring") if isinstance(obs.get("event_ring"), dict) else {}
     for warning in ring.get("warnings") or []:
         if isinstance(warning, str):
@@ -1317,11 +1378,23 @@ def cmd_status(args: argparse.Namespace) -> int:
             h.get("state") if isinstance(h.get("state"), str) else "unknown"
         )
         h_age = h.get("age_seconds")
-        seen += f" health={h_state}"
-        if isinstance(h_age, (int, float)):
-            seen += f"/{_format_age(h_age)}"
         sv = a.get("supervisor") if isinstance(a.get("supervisor"), dict) else {}
         dec = sv.get("decision") if isinstance(sv.get("decision"), dict) else None
+        dec_state = dec.get("state") if isinstance(dec, dict) else None
+        # #105: h_state is the wrapper's OWN self-report - it cannot notice its
+        # own CLI child dying, so it keeps reporting a healthy-looking state
+        # after the child is gone. Whenever the supervisor has a verdict and
+        # that verdict does NOT confirm the child healthy - an allowlist
+        # check (round-2 review), so an unrecognized/future state defaults
+        # to not-confirmed-healthy rather than falling through here - that
+        # verdict MUST be the primary `health=` indicator, never the
+        # self-report; the self-report is demoted to a parenthetical.
+        if isinstance(dec_state, str) and not sup.cli_child_verdict_is_healthy(dec_state):
+            seen += f" health={dec_state} (wrapper self-reports {h_state})"
+        else:
+            seen += f" health={h_state}"
+            if isinstance(h_age, (int, float)):
+                seen += f"/{_format_age(h_age)}"
         if dec:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
         role = f" role={a['role']}" if a.get("role") else ""
@@ -1337,13 +1410,15 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
     store = _get_store(args)
     now = args.now if args.now is not None else time.time()
     config = _load_supervisor_config(store)
+    snapshot, staleness_warning = _fresh_supervisor_snapshot(
+        store, now, args.snapshot_file, supervisor_config=config)
     try:
         payload = sup.build_supervisor_observation(
             store,
             now_epoch=now,
             state=_read_supervisor_state(store, args.state_file),
             supervisor_config=config,
-            snapshot=_read_supervisor_snapshot(store, args.snapshot_file),
+            snapshot=snapshot,
             event_limit=max(0, int(args.events)),
             lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )
@@ -1363,6 +1438,10 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
                 "warnings": [f"supervisor_read_unavailable:{type(exc).__name__}"],
             },
         }
+    if staleness_warning and isinstance(payload.get("event_ring"), dict):
+        payload["event_ring"].setdefault("warnings", [])
+        if staleness_warning not in payload["event_ring"]["warnings"]:
+            payload["event_ring"]["warnings"].append(staleness_warning)
     if args.json:
         try:
             rendered = json.dumps(payload, indent=2, allow_nan=False)

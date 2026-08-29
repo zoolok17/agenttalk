@@ -2191,6 +2191,119 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
         "plan": _redacted_observation_plan(plan),
     }
 
+
+# #105: the strict per-agent CLI-child verdict (computed by _plan_one for every
+# auto_restart agent) never reached the Team Console or `agenttalk doctor`/
+# `status` - both rendered from the wrapper's own self-reported (and therefore
+# unable to notice its own death) raw health file instead. This is the shared,
+# read-only accessor both surfaces call so a dead/unverifiable CLI child can
+# never render as healthy.
+#
+# round-2 review finding: a hand list of "bad" states (STUCK_OR_DEAD,
+# TURN_FAILED, CLI_CHILD_UNKNOWN) covered 3 of the 20+ states _plan_one
+# actually emits - CLI_CHILD_MISSING/STALLED/STALL_SUSPECT/NO_PROGRESS/
+# STARTING, WRAPPER_MISSING, and every unrelated action/hold state
+# (CONFIG_BLOCKED, LAUNCHING, RESTART_COOLDOWN, ...) all fell through and
+# rendered as healthy - the exact hole this fix exists to close. Enumerating
+# the tiny HEALTHY set instead (an allowlist, not a blocklist) is fail-closed
+# by construction: every other state, known or not-yet-invented, defaults to
+# "not confirmed healthy". (_plan_one's own internal gone-check at _result()
+# above - ``state.startswith("CLI_CHILD_") or state in {"TURN_FAILED",
+# "WRAPPER_MISSING", "STUCK_OR_DEAD"}`` - is exactly the set this excludes,
+# confirming the allowlist agrees with the planner's own notion of "gone".)
+CLI_CHILD_HEALTHY_STATES = frozenset({"HEALTHY_IDLE", "HEALTHY_WORKING"})
+
+
+def cli_child_verdict_is_healthy(state: str) -> bool:
+    """True only for a #72 verdict state that confirms the CLI child is
+    alive and progressing. See :data:`CLI_CHILD_HEALTHY_STATES` for why this
+    is an allowlist rather than a list of "bad" states to check against."""
+    return state in CLI_CHILD_HEALTHY_STATES
+
+
+# The named (non-CLI_CHILD_-prefixed) states that ALSO mean the child/wrapper
+# is gone - the other half of _plan_one's own internal gone-check (its
+# `_result()` closure resets `healthy_since` on this exact union).
+CLI_CHILD_GONE_NAMED_STATES = frozenset({"TURN_FAILED", "WRAPPER_MISSING", "STUCK_OR_DEAD"})
+
+
+def cli_child_verdict_is_gone(state: str) -> bool:
+    """True for a verdict state that means the CLI child or its wrapper is
+    GONE - the SAME generalized predicate `_plan_one`'s own `_result()``
+    closure already uses internally to reset ``healthy_since``. Matches the
+    whole CLI_CHILD_* family by PREFIX, not a hand-copied enumeration, so a
+    new sibling state (a 10th CLI_CHILD_* name) is covered automatically. A
+    state failing this check is not necessarily healthy either - callers
+    should treat "not `cli_child_verdict_is_healthy` and not
+    `cli_child_verdict_is_gone`" as a separate, milder "not confirmed
+    healthy" tier (e.g. CONFIG_BLOCKED, LAUNCHING, RESTART_COOLDOWN, and any
+    future state), never as healthy.
+    """
+    return state.startswith("CLI_CHILD_") or state in CLI_CHILD_GONE_NAMED_STATES
+
+
+def cli_child_verdict_is_launching(state: str) -> bool:
+    """DISPLAY-ONLY (round-3 review minor): CLI_CHILD_STARTING is the exact
+    same lifecycle moment as the planner's own LAUNCHING state - a normal,
+    expected transient during agent boot, not a sign of trouble. It falls
+    inside :func:`cli_child_verdict_is_gone`'s CLI_CHILD_* family match
+    (which `_plan_one`'s own bookkeeping depends on and this function does
+    NOT change), so a display surface must not report it more alarmingly
+    than LAUNCHING just because of that family membership. Never consulted
+    by the planner itself.
+    """
+    return state == "CLI_CHILD_STARTING"
+
+
+def resolve_poll_seconds(config: dict) -> float:
+    """The supervisor's configured poll cadence (PURE), config then default."""
+    config = config if isinstance(config, dict) else {}
+    v = config.get("poll_seconds")
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        return float(v)
+    return float(_DEFAULTS["poll_seconds"])
+
+
+def strict_child_verdicts(store: Store, *, now_epoch: float) -> dict[str, dict]:
+    """Per-agent #72 strict CLI-child verdict: ``{name: {"state", "action"}}``.
+
+    Deliberately never passes a process ``snapshot`` - this must stay a cheap
+    read for a live GET (no OS process enumeration), and the classifier
+    already degrades an ACTIVE-phase agent it cannot verify without one to
+    ``CLI_CHILD_UNKNOWN`` rather than crashing. Only agents configured
+    ``auto_restart`` get a verdict; every other agent is simply absent from
+    the returned dict, so callers naturally fall back to raw wrapper health.
+    Best-effort: any read/parse failure degrades to ``{}`` (same fallback),
+    never raises.
+    """
+    try:
+        config = load_supervisor_config(store.dir / "supervisor.json")
+    except Exception:  # noqa: BLE001 - degrade to no verdict, not a 500/crash
+        config = {}
+    try:
+        state = load_supervisor_state(store.dir / "supervisor-state.json")
+    except Exception:  # noqa: BLE001
+        state = {}
+    try:
+        obs = build_supervisor_observation(
+            store, now_epoch=now_epoch, state=state,
+            supervisor_config=config, snapshot=None, event_limit=0,
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, dict] = {}
+    for item in obs.get("agents") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        decision = item.get("decision")
+        if isinstance(decision, dict) and isinstance(decision.get("state"), str):
+            out[item["name"]] = {
+                "state": decision["state"],
+                "action": decision.get("action"),
+            }
+    return out
+
+
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
 # generated PowerShell uses an array-of-literals ArgumentList - single-quoted
 # PS literals do NOT expand `$`, so the Codex `$agenttalk-listen` prompt and
@@ -9230,10 +9343,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 kill_targets=None, clear_marker=None, bypass_backoff=False,
                 notify=False, discover_brain=False, reason="",
                 barrier_state=None):
-        if wrapped and (
-            state.startswith("CLI_CHILD_")
-            or state in {"TURN_FAILED", "WRAPPER_MISSING", "STUCK_OR_DEAD"}
-        ):
+        if wrapped and cli_child_verdict_is_gone(state):
             nxt["healthy_since"] = None
         res = {"agent": name, "action": action, "state": state,
                "clear_marker": clear_marker, "kill_first": bool(kill_first),

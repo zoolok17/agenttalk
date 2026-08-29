@@ -7,8 +7,10 @@ capture stderr/stdout via capsys.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import re
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -18,6 +20,25 @@ import pytest
 
 from agenttalk import cli, health as hm
 from agenttalk.store import Store
+
+
+def _all_planner_states() -> list[str]:
+    """Every literal state string `supervisor._plan_one` can emit, extracted
+    directly from the LIVE source (never hand-copied into this test) - see
+    the identical helper + rationale in test_doctor.py. Duplicated rather
+    than shared: this repo's test modules are self-contained by convention.
+
+    round-3 review minor: assert the healthy allowlist is a SUBSET of the
+    extraction rather than a bare length floor - a floor tolerates coverage
+    silently shrinking; a subset check fails positively if a rename drops an
+    allowlisted state out of the extraction."""
+    src = inspect.getsource(cli.sup._plan_one)
+    states = set(re.findall(r'state\s*=\s*"([A-Z][A-Z0-9_]+)"', src))
+    states.update(re.findall(r'_healthy\(\s*"([A-Z][A-Z0-9_]+)"', src))
+    assert cli.sup.CLI_CHILD_HEALTHY_STATES <= states, (
+        f"extraction missed a known-healthy state: "
+        f"{cli.sup.CLI_CHILD_HEALTHY_STATES - states} not found in {sorted(states)}")
+    return sorted(states)
 
 
 # Helper: run main() under a fixed root so we don't depend on cwd
@@ -550,6 +571,231 @@ def test_status_human_output_unchanged_for_no_heartbeat(
     assert "session_id:" in out
     assert "agents:" in out
     assert "(no heartbeat)" in out
+
+
+def test_status_human_output_primary_health_is_strict_verdict_when_present(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#105: `health=` in the human `status` line is the wrapper's OWN
+    self-report - it cannot notice its own CLI child dying, so a fresh
+    heartbeat + healthy-looking self-report can coexist with a confirmed-dead
+    CLI child. When the supervisor has an independently-verified strict
+    verdict, it must be the PRIMARY `health=` value (never the self-report),
+    with the self-report demoted to a parenthetical, not dropped."""
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="codex", mode="wrapped",
+        state=hm.STATE_IDLE_WAITING,
+        updated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        since=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        reason_code="idle_waiting",
+    ))
+
+    def fake_observation(store, *, now_epoch, state, supervisor_config,
+                         snapshot, event_limit, lead_liveness_stale_after_seconds):
+        return {"schema_version": 1, "agents": [
+            {"name": "alpha", "decision": {"state": "STUCK_OR_DEAD", "action": "warn_only"}},
+        ], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", fake_observation)
+    _run(["status"], store_root)
+    out = capsys.readouterr().out
+    alpha_line = next(line for line in out.splitlines() if line.strip().startswith("alpha"))
+    assert "health=STUCK_OR_DEAD" in alpha_line
+    assert "wrapper self-reports idle_waiting" in alpha_line
+    # Never the bare self-reported state as the primary indicator.
+    assert "health=idle_waiting" not in alpha_line
+
+
+@pytest.mark.parametrize("verdict_state", _all_planner_states())
+def test_status_human_output_never_shows_self_report_for_a_non_healthy_verdict(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    verdict_state: str,
+) -> None:
+    """#105 round-2: drive EVERY planner-emittable state through `status`'s
+    human output with a fresh heartbeat and a healthy-looking self-report.
+    Only the two states that confirm the child healthy may leave the raw
+    self-report as the primary `health=` value - every other state, known or
+    not, must override it. Parametrized over the extracted state list (see
+    _all_planner_states) so this inherits a new state automatically."""
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="codex", mode="wrapped",
+        state=hm.STATE_IDLE_WAITING,
+        updated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        since=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        reason_code="idle_waiting",
+    ))
+
+    def fake_observation(store, *, now_epoch, state, supervisor_config,
+                         snapshot, event_limit, lead_liveness_stale_after_seconds):
+        return {"schema_version": 1, "agents": [
+            {"name": "alpha", "decision": {"state": verdict_state, "action": "none"}},
+        ], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", fake_observation)
+    _run(["status"], store_root)
+    out = capsys.readouterr().out
+    alpha_line = next(line for line in out.splitlines() if line.strip().startswith("alpha"))
+
+    if cli.sup.cli_child_verdict_is_healthy(verdict_state):
+        assert "health=idle_waiting" in alpha_line, (verdict_state, alpha_line)
+    else:
+        assert f"health={verdict_state}" in alpha_line, (
+            f"verdict state {verdict_state!r} is not confirmed healthy but the "
+            f"self-report still won: {alpha_line!r}")
+        assert "health=idle_waiting" not in alpha_line, alpha_line
+
+
+def test_status_marks_stale_supervisor_snapshot_and_ignores_its_process_data(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#124: the supervisor-snapshot.json file carries no timestamp of its
+    own - the file's mtime is the ONLY freshness signal. `status` used to
+    read+trust it regardless of age, so a snapshot from a supervisor that
+    stalled or died minutes ago would render as current process truth. A
+    stale snapshot must (a) surface a warning naming it stale and (b) be
+    treated as ABSENT - never handed to the planner as live process facts -
+    mirroring #105's degrade-safe `snapshot=None` contract exactly."""
+    snap_path = Store(store_root).dir / "supervisor-snapshot.json"
+    snap_path.write_text(json.dumps([{"pid": 4242}]), encoding="utf-8")
+    old = time.time() - 999
+    os.utime(snap_path, (old, old))
+
+    captured: dict[str, object] = {}
+
+    def spy_observation(store, *, now_epoch, state, supervisor_config,
+                        snapshot, event_limit, lead_liveness_stale_after_seconds):
+        captured["snapshot"] = snapshot
+        return {"agents": [], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", spy_observation)
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert any(w.startswith("supervisor_snapshot_stale:") for w in payload["warnings"]), (
+        payload["warnings"]
+    )
+    assert captured["snapshot"] is None
+
+
+def test_status_fresh_supervisor_snapshot_passes_through_unstaled(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#124 companion: a snapshot written just now is NOT penalized - the
+    fix must gate on age, not reject every snapshot outright."""
+    snap_path = Store(store_root).dir / "supervisor-snapshot.json"
+    snap_path.write_text(json.dumps([{"pid": 4242}]), encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    def spy_observation(store, *, now_epoch, state, supervisor_config,
+                        snapshot, event_limit, lead_liveness_stale_after_seconds):
+        captured["snapshot"] = snapshot
+        return {"agents": [], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", spy_observation)
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert not any(w.startswith("supervisor_snapshot_stale:") for w in payload["warnings"])
+    assert captured["snapshot"] == [{"pid": 4242}]
+
+
+def test_status_supervisor_snapshot_staleness_scales_with_configured_poll_seconds(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#124 round-2 minor (a): a bare 60s threshold would misclassify EVERY
+    snapshot as stale for an operator who configured a slower poll cadence
+    than the default. A snapshot older than the OLD fixed 60s bound, but
+    still fresh relative to 4x the CONFIGURED poll_seconds, must NOT be
+    treated as stale."""
+    s = Store(store_root)
+    (s.dir / "supervisor.json").write_text(
+        json.dumps({"poll_seconds": 30}), encoding="utf-8")
+    snap_path = s.dir / "supervisor-snapshot.json"
+    snap_path.write_text(json.dumps([{"pid": 4242}]), encoding="utf-8")
+    age = 70.0  # > the old fixed 60s bound, < max(60, 4*30)=120s
+    old_mtime = time.time() - age
+    os.utime(snap_path, (old_mtime, old_mtime))
+
+    captured: dict[str, object] = {}
+
+    def spy_observation(store, *, now_epoch, state, supervisor_config,
+                        snapshot, event_limit, lead_liveness_stale_after_seconds):
+        captured["snapshot"] = snapshot
+        return {"agents": [], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", spy_observation)
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert not any(w.startswith("supervisor_snapshot_stale:") for w in payload["warnings"]), (
+        payload["warnings"])
+    assert captured["snapshot"] == [{"pid": 4242}]
+
+
+def test_status_supervisor_snapshot_unstatable_after_read_is_visible_not_silent(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#124 round-2 minor (b): a stat() failure AFTER a successful read/parse
+    (the file existed and parsed, then vanished/became unreadable between
+    the two calls) used to silently drop the snapshot with no warning - the
+    exact silent-degrade shape #124 exists to close. Must surface a warning
+    like every other degrade path here.
+
+    round-6 review (CI platform bug): this originally monkeypatched the
+    SHARED ``pathlib.Path.stat`` classmethod, which also backs
+    ``Path.exists()`` - and ``exists()``'s own OSError-handling is
+    platform/version-sensitive (it only swallows specific errno-tagged
+    errors on some pathlib implementations, and our plain ``OSError("...")``
+    has no errno), so on Linux/macOS CI the SAME patched failure leaked out
+    of ``_read_supervisor_snapshot``'s unrelated ``path.exists()`` check
+    before the "successful read" this test needs ever happened, crashing
+    `status` outright instead of reaching the code path under test. Testing
+    the CONDITION instead: monkeypatch cli._supervisor_snapshot_path (our
+    own accessor, called ONLY for its later `.stat()` call - see
+    _fresh_supervisor_snapshot) to return a stand-in whose `.stat()` raises,
+    never touching the real Path class or its `.exists()`/`.read_text()`
+    behavior at all."""
+    snap_path = Store(store_root).dir / "supervisor-snapshot.json"
+    snap_path.write_text(json.dumps([{"pid": 4242}]), encoding="utf-8")
+
+    class _UnstatablePath:
+        def stat(self):
+            raise OSError("simulated stat failure after a successful read")
+
+    monkeypatch.setattr(cli, "_supervisor_snapshot_path",
+                        lambda store, path_value=None: _UnstatablePath())
+
+    def spy_observation(store, *, now_epoch, state, supervisor_config,
+                        snapshot, event_limit, lead_liveness_stale_after_seconds):
+        return {"agents": [], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", spy_observation)
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert any(w.startswith("supervisor_snapshot_unstatable:") for w in payload["warnings"]), (
+        payload["warnings"])
 
 
 # ---------------------------------------------------------- cmd_end / transcript
