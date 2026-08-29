@@ -291,24 +291,28 @@ def _boundary_kind(entry: Path) -> str | None:
     point regardless of its specific reparse tag (symlink, junction, or
     otherwise unrecognized), so this also catches reparse tags this
     module has never heard of, not just the ones named here.
+
+    N3 (seventh cold read, fix round 11, corrected same round after a
+    CI-caught regression): a single ``lstat()`` call answers BOTH the
+    symlink and the reparse-point question - calling ``entry.is_symlink()``
+    separately, as the first cut of this fix did, hides an equally real
+    fail-open gap: on this Python/platform combination ``is_symlink()``
+    does not itself catch ``OSError``, so a stat failure there crashed
+    this function outright rather than degrading anything. One stat
+    call, one failure path, fails CLOSED for both checks alike: an entry
+    that cannot even be verified might be a symlink or a junction
+    pointing outside the root, so it is treated as a boundary - recorded,
+    never entered - rather than a silent "must be fine" OR an unhandled
+    crash.
     """
-    if entry.is_symlink():
+    try:
+        st = entry.lstat()
+    except OSError:
+        return "unverifiable"
+    if stat_module.S_ISLNK(st.st_mode):
         return "symlink"
     if os.name != "nt":
         return None
-    try:
-        st = entry.stat(follow_symlinks=False)
-    except OSError:
-        # N3 (seventh cold read, fix round 11): this stat() call is the
-        # ONLY way a directory JUNCTION is ever told apart from an
-        # ordinary directory - failing it used to return None (ordinary,
-        # safe to enter), the exact FAIL-OPEN direction this whole check
-        # exists to prevent (an entry we could not even verify might be a
-        # junction pointing outside the root). Fail CLOSED instead, same
-        # direction as every real boundary: treat it as one, so the
-        # caller records it and never walks in - a problem/exclusion,
-        # never a silent "must be fine".
-        return "unverifiable"
     if st.st_file_attributes & stat_module.FILE_ATTRIBUTE_REPARSE_POINT:
         return "reparse_point"
     return None

@@ -210,27 +210,30 @@ def test_enumerate_scope_records_a_windows_junction_as_a_boundary_and_never_foll
 def test_a_stat_failure_on_the_junction_check_is_treated_as_a_boundary_not_ordinary(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """N3 (seventh cold read, fix round 11): the stat() call is the ONLY
-    way a directory junction is told apart from an ordinary directory on
-    Windows - failing it used to return None (ordinary, safe to enter),
-    the exact FAIL-OPEN direction this whole check exists to prevent (an
-    entry that could not even be verified might be a junction pointing
-    outside the root). Must fail CLOSED: treated as a boundary (never
-    entered) and a named problem, degrading the fingerprint. Forces the
-    Windows-only code path via monkeypatch so this runs on every OS."""
-    monkeypatch.setattr(discovery.os, "name", "nt")
+    """N3 (seventh cold read, fix round 11): a single lstat() call is the
+    ONLY way a symlink or a Windows directory junction is told apart
+    from an ordinary directory - failing it used to return None
+    (ordinary, safe to enter) or (the first cut of this fix) crash
+    outright via an uncaught OSError inside entry.is_symlink() itself.
+    Must fail CLOSED: treated as a boundary (never entered) and a named
+    problem, degrading the fingerprint. lstat() is called unconditionally
+    regardless of platform, so this runs on every OS with no need to
+    force a platform-specific code path - CI itself caught the first
+    version of this test forcing os.name globally, which corrupted
+    pathlib's own Path-class selection process-wide and crashed unrelated
+    tests on non-Windows legs."""
     suspect = tmp_path / "unverifiable-entry"
     suspect.mkdir()
     (suspect / "inner.txt").write_bytes(b"should never be enumerated")
 
-    real_stat = Path.stat
+    real_lstat = Path.lstat
 
-    def _stat(self: Path, *args, **kwargs):
+    def _lstat(self: Path, *args, **kwargs):
         if self.name == "unverifiable-entry":
             raise OSError("cannot stat")
-        return real_stat(self, *args, **kwargs)
+        return real_lstat(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", _stat)
+    monkeypatch.setattr(Path, "lstat", _lstat)
     comp_dir = _comprehension_dir(tmp_path)
     result = discovery.enumerate_scope(tmp_path, comp_dir)
     assert result.files == []
