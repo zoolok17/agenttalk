@@ -6,6 +6,8 @@ synthetic fixtures only - not Amperian itself, kept fast and hermetic.
 
 from __future__ import annotations
 
+import pytest
+
 from agenttalk.comprehension.adapters import java
 
 
@@ -454,6 +456,59 @@ class Foo {
     result = java.parse_java_source("Foo.java", src)
     invoke = _edges(result, "invoke")
     assert any(e.target == "Helper" and e.target_kind == "internal_candidate" for e in invoke)
+
+
+def test_qualified_call_written_fully_qualified_captures_the_full_dotted_qualifier():
+    """FIX ROUND 13 (ninth cold read, CR9-1 BLOCKER): a call deliberately
+    written fully qualified - the legacy-vs-rewrite migration idiom this
+    plane exists to inventory, e.g. `com.acme.legacy.OrderService.lookup(
+    )` disambiguating two same-simple-name classes - used to lose its own
+    package prefix entirely (only the last dotted segment was captured),
+    then get silently REWRITTEN via whichever import happened to bind
+    that bare simple name, publishing a dependency on the WRONG class.
+    The qualifier must now carry the full dotted spelling the source
+    wrote, verbatim - never an import rewrite."""
+    src = """
+package p;
+import com.acme.v2.OrderService;
+class MigrationBridge {
+    void run() {
+        com.acme.legacy.OrderService.lookup();
+    }
+}
+"""
+    result = java.parse_java_source("MigrationBridge.java", src)
+    invoke = _edges(result, "invoke")
+    assert len(invoke) == 1
+    assert invoke[0].target == "com.acme.legacy.OrderService"
+    # Never "internal_exact_or_external" (the import-rewrite path) - a
+    # dotted qualifier is inline-FQN evidence, exact-match-or-unresolved
+    # only, the same discipline round 12 applies to inherit/test.
+    assert invoke[0].target_kind == "internal_unqualified_call_candidate"
+
+
+def test_static_imported_member_qualifier_resolves_to_the_owning_class():
+    """FIX ROUND 13 (ninth cold read, CR9-5 MINOR, wrong-data): a
+    static-imported member used bare as an invoke qualifier
+    (`import static com.acme.Config.LOGGER;` then `LOGGER.info(...)`)
+    used to publish the invoke edge against the UNSPLIT member path
+    ("com.acme.Config.LOGGER"), while the import edge on the same line
+    correctly resolves to the owning class - two edges in one run
+    contradicting each other about the same in-scan file. The invoke
+    qualifier must resolve to the OWNING CLASS, the same normalization
+    the import edge itself already applies."""
+    src = """
+package p;
+import static com.acme.Config.LOGGER;
+class Foo {
+    void run() {
+        LOGGER.info("x");
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = next(e for e in _edges(result, "invoke") if e.target == "com.acme.Config")
+    assert invoke.target_kind == "internal_exact_or_external"
 
 
 def test_invoke_edge_is_attributed_to_the_enclosing_type_not_the_first_declared_type():
@@ -1422,6 +1477,111 @@ class Controller {
     assert {r.target for r in routes} == {"GET /thing", "POST /thing"}
 
 
+def test_non_enum_method_value_never_publishes_as_an_invented_http_verb():
+    """FIX ROUND 13 (ninth cold read, CR9-4 MINOR, wrong-data): a
+    non-enum method= value (a random constant, not one of Spring's
+    closed RequestMethod constants) used to publish VERBATIM as if it
+    were a real HTTP verb - method=HttpConstants.READ_METHOD yielded
+    entry point "READ_METHOD /api/orders", a verb this tool invented.
+    The invalid token is dropped, falling back to the bare,
+    method-unknown path - the same legitimate state a plain
+    @RequestMapping with no method attribute already publishes, never a
+    suppressed route (the path itself is genuine, correctly-recovered
+    evidence)."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(value = "/api/orders", method = HttpConstants.READ_METHOD)
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["/api/orders"]
+    assert result.problems == []
+
+
+def test_request_method_values_array_index_is_also_validated():
+    """CR9-4: the same non-enum discipline applies to EVERY recovered
+    token in a multi-value method={...} attribute, not just a bare
+    single value."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(value = "/api/orders", method = RequestMethod.values()[0])
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    # Whatever bare token(s) the recovery regex pulls out of this
+    # non-constant expression, none is a real RequestMethod constant -
+    # all dropped, same bare-path fallback as the single-value case.
+    assert [r.target for r in routes] == ["/api/orders"]
+    assert result.problems == []
+
+
+# ----------------------------------------------------------- CR9-3: produces/consumes-only mapping
+
+def test_get_mapping_with_only_a_produces_attribute_still_composes_the_prefix():
+    """FIX ROUND 13 (ninth cold read, CR9-3 MAJOR, completeness):
+    @GetMapping(produces="application/json") with NO value/path
+    attribute at all is ordinary Spring - it serves the class's own
+    prefix, exactly like a bare @GetMapping. The mere PRESENCE of an
+    unrelated named attribute must never flip this into the
+    unrecoverable-value case (there is no value expression here to fail
+    to recover in the first place)."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller {
+    @GetMapping(produces = "application/json")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /api/orders"]
+    assert result.problems == []
+
+
+def test_post_mapping_with_consumes_and_produces_still_composes_the_prefix():
+    """CR9-3: more than one unrelated named attribute ahead of a
+    genuinely absent value/path must not change the outcome."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller {
+    @PostMapping(consumes = "application/json", produces = "application/json")
+    void create() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["POST /api/orders"]
+    assert result.problems == []
+
+
+def test_get_mapping_produces_only_alongside_a_genuinely_unrecoverable_value_stays_suppressed():
+    """CR9-3 must not overcorrect: an attribute that IS an attempted
+    value/path but unreadable (a constant reference) must still suppress
+    the route as unrecoverable - only a DIFFERENT-named-attribute-only
+    shape is legitimately valueless."""
+    src = """
+package p;
+class Controller {
+    @GetMapping(value = SomeConstants.LIST, produces = "application/json")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+
+
 # ----------------------------------------------------------- entry points
 
 def test_main_method_is_a_cli_main_entry_point():
@@ -1442,6 +1602,48 @@ def test_no_main_method_means_no_cli_main_entry_point():
     src = "package p;\nclass Widget {\n}\n"
     result = java.parse_java_source("Widget.java", src)
     assert [e for e in result.entry_points if e.kind == "cli_main"] == []
+
+
+#: FIX ROUND 13 (ninth cold read, CR9-2 MAJOR): the reviewer's own 9-row
+#: legal-spelling matrix for `public static void main` - 3 rows the old
+#: single-token-sequence regex already matched (anchors, must stay
+#: green), 6 it silently missed (must now be detected). Every row is a
+#: real, compiler-legal Java main signature.
+_MAIN_SIGNATURE_MATRIX = [
+    ("baseline", "public static void main(String[] args)"),
+    ("varargs", "public static void main(String... args)"),
+    ("modifier order swapped", "static public void main(String[] args)"),
+    ("C-style array after the param name", "public static void main(String args[])"),
+    ("final parameter", "public static void main(final String[] args)"),
+    ("fully-qualified java.lang.String", "public static void main(java.lang.String[] args)"),
+    ("no space before the array brackets", "public static void main(String []args)"),
+    ("extra synchronized modifier", "public synchronized static void main(String[] args)"),
+    ("synchronized between static and void", "public static synchronized void main(String[] args)"),
+]
+
+
+@pytest.mark.parametrize("shape_name,signature", _MAIN_SIGNATURE_MATRIX)
+def test_main_signature_matrix_every_legal_spelling_is_detected(shape_name, signature):
+    src = f"package p;\nclass App {{\n    {signature} {{\n    }}\n}}\n"
+    result = java.parse_java_source("App.java", src)
+    mains = [e for e in result.entry_points if e.kind == "cli_main"]
+    assert len(mains) == 1, f"shape not detected: {shape_name} ({signature!r})"
+    assert mains[0].qualified_name == "p.App"
+
+
+def test_main_without_both_public_and_static_is_not_a_cli_main_entry_point():
+    """De-enumerating to "public and static, any order, any other
+    modifiers alongside" must not overshoot into treating ANY modifier
+    combination as main - a package-private or instance `main` (missing
+    `public`, or missing `static`) is not a JVM entry point at all."""
+    for signature in (
+        "static void main(String[] args)",         # missing public
+        "public void main(String[] args)",          # missing static
+        "void main(String[] args)",                  # missing both
+    ):
+        src = f"package p;\nclass App {{\n    {signature} {{\n    }}\n}}\n"
+        result = java.parse_java_source("App.java", src)
+        assert [e for e in result.entry_points if e.kind == "cli_main"] == [], signature
 
 
 def test_second_top_level_type_with_its_own_main_gets_its_own_cli_main_entry_point():
@@ -1709,6 +1911,44 @@ def test_parse_web_xml_ignores_a_commented_out_servlet_mapping():
 """
     entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
     assert [e.name for e in entry_points] == ["/api/*"]
+
+
+def test_parse_web_xml_url_pattern_is_length_bounded():
+    """FIX ROUND 13 (ninth cold read, CR9-6, judged completeness): a
+    url-pattern published VERBATIM, UNBOUNDED, while every Java route
+    target is already length-bounded (invariant 3) - routed through the
+    same per-field bounding discipline (_bounded_route_target)."""
+    from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
+
+    oversized = "/" + ("x" * (_MAX_ROUTE_TARGET_LENGTH + 50))
+    web_xml = f"""<web-app>
+  <servlet-mapping>
+    <servlet-name>dispatcher</servlet-name>
+    <url-pattern>{oversized}</url-pattern>
+  </servlet-mapping>
+</web-app>
+"""
+    entry_points = java.parse_web_xml("WEB-INF/web.xml", web_xml)
+    assert len(entry_points[0].name) <= _MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")
+    assert entry_points[0].name != oversized
+
+
+def test_parse_maven_pom_group_and_artifact_id_are_length_bounded():
+    """FIX ROUND 13 (CR9-6): same per-field bounding discipline applied
+    to a pom's own groupId/artifactId - a hostile or merely enormous pom
+    used to publish either verbatim, unbounded."""
+    from agenttalk.comprehension.adapters.java import _MAX_ROUTE_TARGET_LENGTH
+
+    oversized_group = "g" * (_MAX_ROUTE_TARGET_LENGTH + 50)
+    pom = (
+        "<project><dependencies><dependency>"
+        f"<groupId>{oversized_group}</groupId><artifactId>spring-core</artifactId>"
+        "</dependency></dependencies></project>"
+    )
+    edges, _profile_count = java.parse_maven_pom("pom.xml", pom)
+    assert len(edges) == 1
+    assert len(edges[0].target) <= 2 * (_MAX_ROUTE_TARGET_LENGTH + len("...(truncated)")) + 1
+    assert oversized_group not in edges[0].target
 
 
 # ----------------------------------------------------------- honest gaps

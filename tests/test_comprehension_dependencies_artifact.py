@@ -487,6 +487,73 @@ def test_static_import_of_a_genuinely_external_member_still_classifies_external(
     assert import_edge.target_unit_id is None
 
 
+# ----------------------------------------------------------- ninth cold read CR9-1/CR9-5: invoke qualifiers
+
+def test_invoke_on_a_fully_qualified_legacy_class_never_resolves_to_an_unrelated_imported_class():
+    """FIX ROUND 13 (ninth cold read, CR9-1 BLOCKER): the reviewer's own
+    reproduced shape - MigrationBridge imports com.acme.v2.OrderService
+    but explicitly calls the FULLY QUALIFIED com.acme.legacy.OrderService
+    (the legacy-vs-rewrite migration idiom this plane exists to
+    inventory). The invoke edge must resolve against the LEGACY class
+    actually named, never get silently rewritten to the unrelated
+    imported v2 class."""
+    results = {
+        "com/acme/legacy/OrderService.java": _parse(
+            "com/acme/legacy/OrderService.java",
+            "package com.acme.legacy;\nclass OrderService {\n  static void lookup() {}\n}\n"),
+        "com/acme/v2/OrderService.java": _parse(
+            "com/acme/v2/OrderService.java",
+            "package com.acme.v2;\nclass OrderService {\n  static void lookup() {}\n}\n"),
+        "com/acme/bridge/MigrationBridge.java": _parse(
+            "com/acme/bridge/MigrationBridge.java",
+            "package com.acme.bridge;\n"
+            "import com.acme.v2.OrderService;\n"
+            "class MigrationBridge {\n"
+            "  void run() {\n"
+            "    com.acme.legacy.OrderService.lookup();\n"
+            "  }\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    invoke = next(r for r in records if r.relation == "invoke")
+    assert invoke.resolution_state == "resolved"
+    assert invoke.confidence == "high"
+    assert invoke.target_unit_id == da._java_component_unit_id(
+        "com/acme/legacy/OrderService.java", "com.acme.legacy.OrderService")
+
+
+def test_static_import_member_qualifier_and_its_import_edge_agree_on_the_same_unit():
+    """FIX ROUND 13 (ninth cold read, CR9-5 MINOR): a static-imported
+    member used bare as a qualifier and the import edge for the SAME
+    line must resolve to the SAME internal unit - proven directly
+    against each other, the same way D-1's import/invoke parity test
+    already does for a plain import."""
+    results = {
+        "com/acme/Config.java": _parse(
+            "com/acme/Config.java",
+            "package com.acme;\nclass Config {\n  static final Object LOGGER = null;\n}\n"),
+        "com/acme/Foo.java": _parse(
+            "com/acme/Foo.java",
+            "package com.acme;\n"
+            "import static com.acme.Config.LOGGER;\n"
+            "class Foo {\n"
+            "  void run() {\n"
+            "    LOGGER.toString();\n"
+            "  }\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    invoke_edge = next(r for r in records if r.relation == "invoke")
+    assert import_edge.resolution_state == "resolved"
+    assert invoke_edge.resolution_state == "resolved"
+    assert invoke_edge.target_unit_id == import_edge.target_unit_id
+    assert invoke_edge.target_unit_id == da._java_component_unit_id(
+        "com/acme/Config.java", "com.acme.Config")
+
+
 # ----------------------------------------------------------- route (external)
 
 def test_route_edge_resolves_as_external_with_declared_evidence():
