@@ -15,6 +15,7 @@ through to the pinned-SHA branch and `_worktree_clean` reports None -> clean.
 
 from __future__ import annotations
 
+import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -242,22 +243,84 @@ def test_apply_ack_rejects_duplicate_counter_id_without_mutating_ack() -> None:
 
 
 def test_decide_counter_accept_requires_remediation() -> None:
+    """Hotfix round 2: this test used to pass decision="accept" - the
+    CLI's operator-facing spelling, an INVALID value under close.py's own
+    stored vocabulary - so it was satisfied by the vocabulary refusal
+    (decide_counter's very first check) and never actually exercised the
+    missing-remediation behaviour its name claims; it would have kept
+    passing even with that check deleted. Now passes the stored spelling
+    and asserts the SPECIFIC remediation-required message."""
     rec = _satisfied()
     rec["counters"]["ctr-1"] = {"counter_id": "ctr-1", "decision": close.COUNTER_PENDING}
-    with pytest.raises(close.CloseError):
-        close.decide_counter(rec, counter_id="ctr-1", decision="accept", by="lead",
+    with pytest.raises(close.CloseError, match="accepting a counter requires a remediation item"):
+        close.decide_counter(rec, counter_id="ctr-1", decision=close.COUNTER_ACCEPTED, by="lead",
                              at="t", reason="ok", remediation=None)
 
 
 def test_decide_counter_blocker_remediation_requires_gate() -> None:
+    """Hotfix round 2: same masking as the test above - decision="accept"
+    was refused by the vocabulary check before the gate-requirement
+    check this test names ever ran."""
     rec = _satisfied()
     rec["counters"]["ctr-1"] = {"counter_id": "ctr-1", "decision": close.COUNTER_PENDING}
-    with pytest.raises(close.CloseError):
+    with pytest.raises(close.CloseError, match="a blocker remediation MUST name a gate id"):
         close.decide_counter(
-            rec, counter_id="ctr-1", decision="accept", by="lead", at="t",
+            rec, counter_id="ctr-1", decision=close.COUNTER_ACCEPTED, by="lead", at="t",
             reason="fix it", remediation={
                 "id": "rem-1", "owner": "dev", "fix": "patch",
                 "verification": "tests", "blocker": True})  # no gate
+
+
+def test_decide_counter_unknown_decision_names_the_actual_vocabulary() -> None:
+    """Hotfix round 2: the refusal message used to say 'must be accept or
+    reject' while the check actually required accepted/rejected - the
+    misleading diagnostic that made the v0.86.0 field bug undiagnosable
+    for every OTHER caller (any direct close.decide_counter caller, not
+    just the CLI). The message now names the real, stored constants."""
+    rec = _satisfied()
+    rec["counters"]["ctr-1"] = {"counter_id": "ctr-1", "decision": close.COUNTER_PENDING}
+    with pytest.raises(close.CloseError, match=r"'accepted'.*'rejected'"):
+        close.decide_counter(rec, counter_id="ctr-1", decision="accept", by="lead",
+                             at="t", reason="ok", remediation=None)
+
+
+def test_counter_decision_from_cli_spelling_maps_both_directions_and_rejects_unknown() -> None:
+    """Hotfix round 2 item 4: an explicit dict lookup, not a ternary whose
+    else-branch would silently render any future third --decision choice
+    as rejected."""
+    assert cli._counter_decision_from_cli_spelling("accept", close) == close.COUNTER_ACCEPTED
+    assert cli._counter_decision_from_cli_spelling("reject", close) == close.COUNTER_REJECTED
+    with pytest.raises(KeyError):
+        cli._counter_decision_from_cli_spelling("bogus", close)
+
+
+def _ack_status_choices(parser: argparse.ArgumentParser) -> list:
+    close_action = parser._subparsers._group_actions[0]
+    close_sub = close_action.choices["close"]
+    ack_sub = close_sub._subparsers._group_actions[0].choices["ack"]
+    status_action = next(a for a in ack_sub._actions if a.dest == "status")
+    return status_action.choices
+
+
+def test_ack_status_choices_are_derived_from_the_ack_statuses_frozenset() -> None:
+    """Hotfix round 2 item 2: `close ack --status`'s choices used to be a
+    hand-written list agreeing with close.py's ACK_STATUSES by spelling
+    coincidence only - the same two-hand-written-lists shape the counter-
+    decide vocabulary bug was. Derived from the frozenset now, so a
+    future rename in close.py cannot silently reproduce that bug here."""
+    parser = cli.build_parser()
+    assert set(_ack_status_choices(parser)) == close.ACK_STATUSES
+
+
+def test_ack_status_choices_track_a_change_to_the_ack_statuses_frozenset(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proves genuine derivation, not value coincidence: today's hardcoded
+    list and close.ACK_STATUSES happen to already agree, so a plain
+    before/after revert of the derivation would not, by itself, fail -
+    monkeypatching the frozenset and rebuilding the parser does."""
+    monkeypatch.setattr(close, "ACK_STATUSES", frozenset({"only-this-one"}))
+    parser = cli.build_parser()
+    assert set(_ack_status_choices(parser)) == {"only-this-one"}
 
 
 def test_reopen_clears_final_and_revision_change_stales_acks() -> None:
