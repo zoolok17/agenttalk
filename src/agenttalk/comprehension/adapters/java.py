@@ -48,6 +48,22 @@ RULE_VERSION = 1
 #: Relations this adapter does NOT attempt this slice - named, not hidden
 #: (design: "Unsupported relation types remain coverage gaps").
 UNSUPPORTED_RELATIONS = ("data", "configuration")
+#: FIX ROUND 14 (tenth cold read, CR10-3 JUDGE, alongside the chain-aware
+#: resolution fix): item-3's "invoke" scope ("direct syntactic same-file/
+#: qualified static calls") was written and read as METHOD calls only -
+#: `new OrderNotFound(id)` produces no invoke edge and, unlike
+#: UNSUPPORTED_RELATIONS's two whole deferred relations, was never
+#: enumerated as a coverage gap either. A sub-shape of an otherwise-
+#: supported relation, not a whole relation, so it gets its own narrower,
+#: equally explicit enumeration rather than being folded into (or
+#: silently absent from) UNSUPPORTED_RELATIONS's relation-level
+#: vocabulary. The lighter of the reviewer's two options (emit
+#: constructor-invoke edges, or declare the gap) - constructor call
+#: TARGETS are exactly as unresolved/ambiguous as any other bare-name
+#: invoke target would be, so emitting them now adds resolution surface
+#: for no evidenced benefit this slice; declaring it keeps the gap
+#: visible without guessing.
+UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
 
 _TEST_PATH_SEGMENT = re.compile(r"(?:^|/)(?:src/test|test)/")
 #: FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data): a bare

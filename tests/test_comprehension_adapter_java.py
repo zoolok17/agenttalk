@@ -2162,6 +2162,25 @@ def test_unsupported_relations_are_named_not_silently_omitted():
     assert java.UNSUPPORTED_RELATIONS == ("data", "configuration")
 
 
+def test_unsupported_invoke_shapes_are_named_not_silently_omitted():
+    """FIX ROUND 14 (tenth cold read, CR10-3 JUDGE): a constructor call
+    (`new OrderNotFound(id)`) produces no invoke edge - a sub-shape gap
+    within the otherwise-supported "invoke" relation, not a whole
+    deferred relation, so it gets its own narrower, equally explicit
+    enumeration rather than silence."""
+    assert java.UNSUPPORTED_INVOKE_SHAPES == ("constructor_call",)
+
+
+def test_a_constructor_call_produces_no_invoke_edge():
+    result = java.parse_java_source(
+        "OrderService.java",
+        "package p;\nclass OrderService {\n"
+        "  void run() { throw new OrderNotFound(1); }\n"
+        "}\n",
+    )
+    assert not any(e.relation == "invoke" for e in result.edges)
+
+
 # ----------------------------------------------------------- line lookup perf (M11)
 
 def test_line_at_matches_naive_line_counting_for_every_offset():

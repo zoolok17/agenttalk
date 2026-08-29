@@ -647,6 +647,7 @@ def run_scan(
             "boundaries": boundary_rows,
             "boundaries_omitted_count": boundaries_omitted,
             "unsupported_relations": list(java_adapter.UNSUPPORTED_RELATIONS),
+            "unsupported_invoke_shapes": list(java_adapter.UNSUPPORTED_INVOKE_SHAPES),
             "record_counts": record_counts,
             "problem_count": len(problems),
             "artifacts": artifact_summaries,

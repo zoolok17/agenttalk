@@ -77,6 +77,23 @@ def test_run_scan_publishes_a_complete_run(java_repo: Path) -> None:
     assert (outcome.run_dir / "scan.json").exists()
 
 
+def test_scan_json_names_unsupported_invoke_shapes_as_a_declared_gap(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 14 (tenth cold read, CR10-3 JUDGE): a constructor call
+    is a coverage gap within the otherwise-supported "invoke" relation -
+    named here the same explicit, enumerated way UNSUPPORTED_RELATIONS
+    already names data/configuration, never silent."""
+    import json
+
+    from agenttalk.comprehension.adapters import java as java_adapter
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    assert scan_doc["unsupported_invoke_shapes"] == list(
+        java_adapter.UNSUPPORTED_INVOKE_SHAPES)
+
+
 def test_report_carries_the_real_manifest_digest_f7(java_repo: Path) -> None:
     """FIX ROUND 12 (eighth cold read, F7): get_report passed
     manifest_digest=None to the projector unconditionally, even though
