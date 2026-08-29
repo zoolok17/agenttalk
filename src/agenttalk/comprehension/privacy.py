@@ -164,9 +164,18 @@ def run_privacy_preflight(root: Path) -> PrivacyPreflightResult:
     strictly before that (design: "before creating
     `.agenttalk/comprehension/`")."""
     if not _is_git_worktree(root):
+        # FIX ROUND 14 (tenth cold read, CR10-12 polish): this message
+        # reaches the CLI's plain stderr output (`agenttalk: {exc}`) - the
+        # one place in this whole plane that used to name the raw,
+        # absolute local root next to a projection family that otherwise
+        # never persists one (scan.json's root_binding is a one-way
+        # digest specifically to avoid this). The basename is enough to
+        # identify which directory failed; the full absolute path is not
+        # needed here and every other VcsPrivacyRefused message already
+        # avoids it (they name RELATIVE_COMPREHENSION_DIR, never root).
         raise VcsPrivacyRefused(
-            f"{root} is not inside a Git worktree (or git is unavailable) — ignore "
-            "status cannot be proven for any supported VCS",
+            f"{root.name!r} is not inside a Git worktree (or git is unavailable) — "
+            "ignore status cannot be proven for any supported VCS",
             vcs_kind="none",
         )
     tracked = _tracked_paths_under_comprehension_dir(root)

@@ -133,6 +133,18 @@ def test_refuses_with_no_vcs_kind_when_there_is_no_git_repo(tmp_path: Path) -> N
     assert exc_info.value.vcs_kind == "none"
 
 
+def test_not_a_git_worktree_message_never_leaks_the_absolute_root(tmp_path: Path) -> None:
+    """FIX ROUND 14 (tenth cold read, CR10-12 polish): this message
+    reaches the CLI's plain stderr output - the one place in this whole
+    plane that used to name the raw absolute local root next to a
+    projection family that otherwise never persists one (scan.json's
+    root_binding is a one-way digest specifically to avoid this)."""
+    with pytest.raises(VcsPrivacyRefused) as exc_info:
+        privacy.run_privacy_preflight(tmp_path)
+    assert str(tmp_path) not in str(exc_info.value)
+    assert tmp_path.name in str(exc_info.value)
+
+
 # ----------------------------------------------------------- acknowledge_unignored_private_store
 
 def test_acknowledge_records_acknowledged_unignored_for_git(tmp_path: Path) -> None:
