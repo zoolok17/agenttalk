@@ -207,6 +207,41 @@ def test_enumerate_scope_records_a_windows_junction_as_a_boundary_and_never_foll
     assert result.boundaries[0].boundary_kind == "reparse_point"
 
 
+def test_a_stat_failure_on_the_junction_check_is_treated_as_a_boundary_not_ordinary(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """N3 (seventh cold read, fix round 11): the stat() call is the ONLY
+    way a directory junction is told apart from an ordinary directory on
+    Windows - failing it used to return None (ordinary, safe to enter),
+    the exact FAIL-OPEN direction this whole check exists to prevent (an
+    entry that could not even be verified might be a junction pointing
+    outside the root). Must fail CLOSED: treated as a boundary (never
+    entered) and a named problem, degrading the fingerprint. Forces the
+    Windows-only code path via monkeypatch so this runs on every OS."""
+    monkeypatch.setattr(discovery.os, "name", "nt")
+    suspect = tmp_path / "unverifiable-entry"
+    suspect.mkdir()
+    (suspect / "inner.txt").write_bytes(b"should never be enumerated")
+
+    real_stat = Path.stat
+
+    def _stat(self: Path, *args, **kwargs):
+        if self.name == "unverifiable-entry":
+            raise OSError("cannot stat")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert result.files == []
+    assert len(result.boundaries) == 1
+    assert result.boundaries[0].relative_path == "unverifiable-entry"
+    assert result.boundaries[0].boundary_kind == "unverifiable"
+    assert any(p["reason_code"] == "parse_failed" and p["path"] == "unverifiable-entry"
+               for p in result.problems)
+    assert result.fingerprint_complete is False
+
+
 def test_enumerate_scope_records_a_submodule_as_a_boundary_and_never_enters_it(
     tmp_path: Path,
 ) -> None:

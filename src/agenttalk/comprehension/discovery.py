@@ -299,7 +299,16 @@ def _boundary_kind(entry: Path) -> str | None:
     try:
         st = entry.stat(follow_symlinks=False)
     except OSError:
-        return None
+        # N3 (seventh cold read, fix round 11): this stat() call is the
+        # ONLY way a directory JUNCTION is ever told apart from an
+        # ordinary directory - failing it used to return None (ordinary,
+        # safe to enter), the exact FAIL-OPEN direction this whole check
+        # exists to prevent (an entry we could not even verify might be a
+        # junction pointing outside the root). Fail CLOSED instead, same
+        # direction as every real boundary: treat it as one, so the
+        # caller records it and never walks in - a problem/exclusion,
+        # never a silent "must be fine".
+        return "unverifiable"
     if st.st_file_attributes & stat_module.FILE_ATTRIBUTE_REPARSE_POINT:
         return "reparse_point"
     return None
@@ -489,6 +498,20 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
                 continue
             boundary_kind = _boundary_kind(entry)
             if boundary_kind is not None:
+                if boundary_kind == "unverifiable":
+                    # N3 (seventh cold read, fix round 11): could not
+                    # stat this entry to check whether it is a Windows
+                    # directory junction - recorded as a boundary (never
+                    # entered) AND a named problem, since an unknown
+                    # entry is an enumeration omission the fingerprint
+                    # can never be trusted complete over.
+                    degraded = True
+                    problems.append({
+                        "reason_code": "parse_failed", "path": relative,
+                        "detail": "could not stat this entry to check whether it is a "
+                                  "directory junction - excluded rather than risk "
+                                  "following one outside the root",
+                    })
                 boundaries.append(BoundaryEntry(relative_path=relative, boundary_kind=boundary_kind))
                 continue
             if entry.is_dir():
