@@ -367,7 +367,7 @@ def test_build_edges_from_pom_xml_are_attributed_to_the_pom_file():
     java_results channel every other adapter claim uses, wrapped as a
     JavaFileResult with only edges populated), this test now exercises
     that exact production shape instead of a bespoke parameter."""
-    pom_edges = java_adapter.parse_maven_pom(
+    pom_edges, _pom_problems = java_adapter.parse_maven_pom(
         "pom.xml",
         "<project><dependencies><dependency>"
         "<groupId>org.springframework</groupId><artifactId>spring-core</artifactId>"
@@ -387,7 +387,7 @@ def test_optional_and_scope_test_thread_through_to_the_dependency_record():
     hardcoded False in _edge_claim_to_record regardless of what the
     adapter's own claim said - the field existed and was in the published
     schema, but nothing ever set it from real evidence."""
-    pom_edges = java_adapter.parse_maven_pom(
+    pom_edges, _pom_problems = java_adapter.parse_maven_pom(
         "pom.xml",
         "<project><dependencies><dependency>"
         "<groupId>org.mockito</groupId><artifactId>mockito-core</artifactId>"

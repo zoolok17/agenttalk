@@ -1481,7 +1481,7 @@ def test_parse_maven_pom_extracts_dependency_build_edges():
   </dependencies>
 </project>
 """
-    edges = java.parse_maven_pom("pom.xml", pom)
+    edges, problems = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"org.springframework:spring-core", "junit:junit"}
     assert all(e.relation == "build" for e in edges)
     assert all(e.evidence_class == "declared" for e in edges)
@@ -1509,7 +1509,7 @@ def test_parse_maven_pom_reads_optional_and_test_scope_instead_of_asserting_defa
   </dependencies>
 </project>
 """
-    edges = {e.target: e for e in java.parse_maven_pom("pom.xml", pom)}
+    edges = {e.target: e for e in java.parse_maven_pom("pom.xml", pom)[0]}
     mockito = edges["org.mockito:mockito-core"]
     assert mockito.optional is True
     assert mockito.phase == "test"
@@ -1537,8 +1537,9 @@ def test_parse_maven_pom_ignores_a_commented_out_dependency():
   </dependencies>
 </project>
 """
-    edges = java.parse_maven_pom("pom.xml", pom)
+    edges, problems = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"org.springframework:spring-core"}
+    assert problems == []
 
 
 def test_parse_maven_pom_excludes_dependency_management_entries():
@@ -1563,8 +1564,11 @@ def test_parse_maven_pom_excludes_dependency_management_entries():
   </dependencies>
 </project>
 """
-    edges = java.parse_maven_pom("pom.xml", pom)
+    edges, problems = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"com.acme:real-dep"}
+    # M1 (round 11b): managed-scoped exclusion is cost-free (never the
+    # module's own graph) - never a named problem.
+    assert problems == []
 
 
 def test_parse_maven_pom_excludes_profile_scoped_dependencies():
@@ -1590,8 +1594,47 @@ def test_parse_maven_pom_excludes_profile_scoped_dependencies():
   </profiles>
 </project>
 """
-    edges = java.parse_maven_pom("pom.xml", pom)
+    edges, problems = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"com.acme:real-dep"}
+    # Round 11b (reviewer-3 delta on round 11): unlike managed/plugin
+    # (cost-free, never the module's graph), a profile CAN be active by
+    # default - its dependency is a potentially live one, so the
+    # exclusion must be visible, never silent.
+    assert len(problems) == 1
+    assert problems[0].reason_code == "pom_profile_dependency_excluded"
+
+
+def test_parse_maven_pom_with_only_managed_and_plugin_scoped_dependencies_is_silent():
+    """Round 11b: the reviewer's own second test shape - managed and
+    plugin exclusion is judged cost-free (never the module's own
+    dependency graph), so a pom containing ONLY those two (no
+    profile-scoped dependency at all) must yield no problem."""
+    pom = """<project>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.acme</groupId>
+        <artifactId>bom-managed-dep</artifactId>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <build>
+    <plugins>
+      <plugin>
+        <dependencies>
+          <dependency>
+            <groupId>com.acme</groupId>
+            <artifactId>plugin-dep</artifactId>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+"""
+    edges, problems = java.parse_maven_pom("pom.xml", pom)
+    assert edges == []
+    assert problems == []
 
 
 def test_parse_maven_pom_excludes_plugin_scoped_dependencies():
@@ -1619,8 +1662,11 @@ def test_parse_maven_pom_excludes_plugin_scoped_dependencies():
   </build>
 </project>
 """
-    edges = java.parse_maven_pom("pom.xml", pom)
+    edges, problems = java.parse_maven_pom("pom.xml", pom)
     assert {e.target for e in edges} == {"com.acme:real-dep"}
+    # M1 (round 11b): plugin-scoped exclusion is cost-free (the build
+    # tool's own dependency, never the module's) - never a named problem.
+    assert problems == []
 
 
 # ----------------------------------------------------------- web.xml (route)

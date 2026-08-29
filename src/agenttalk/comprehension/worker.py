@@ -297,14 +297,23 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
             # points of its own.
             try:
                 text = data.decode("utf-8", errors="replace")
-                build_edges = java_adapter.parse_maven_pom(rel, text)
+                build_edges, build_problems = java_adapter.parse_maven_pom(rel, text)
             except Exception as exc:  # noqa: BLE001 - a producer bug must degrade, never abort the scan
                 problems.append(WorkerProblem(
                     reason_code="parse_failed", relative_path=rel,
                     detail=bounded_detail(f"{java_adapter.ADAPTER_NAME} adapter failed: {exc}")))
             else:
                 java_results[rel] = java_adapter.file_result_to_json(
-                    java_adapter.JavaFileResult(edges=build_edges))
+                    java_adapter.JavaFileResult(edges=build_edges, problems=build_problems))
+                # Round 11b (reviewer-3 delta on round 11): a profile-
+                # scoped dependency this adapter silently excluded (a
+                # profile may be active by default) - never a cost-free
+                # omission the way managed/plugin scoping is.
+                for problem in build_problems:
+                    problems.append(WorkerProblem(
+                        reason_code=problem.reason_code, relative_path=rel,
+                        detail=problem.detail,
+                    ))
         elif rel_name_lower == "web.xml":
             # M9 (cold-read, PR-B fix round 3): parse_web_xml existed as a
             # producer with its own passing unit tests but no dispatch

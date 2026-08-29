@@ -162,6 +162,11 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # could not be recovered as a literal - under-claimed rather than
     # composed against a guessed/implicit-empty value.
     "route_value_unrecoverable": "warning",
+    # MINOR (seventh cold read delta review, fix round 11b): a pom's
+    # profile-scoped dependency, excluded from direct-dependency edges -
+    # a profile may be active by default, so a potentially live
+    # dependency is under-claimed, never silently.
+    "pom_profile_dependency_excluded": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 
