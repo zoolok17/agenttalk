@@ -65,7 +65,21 @@ UNSUPPORTED_RELATIONS = ("data", "configuration")
 #: visible without guessing.
 UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
 
-_TEST_PATH_SEGMENT = re.compile(r"(?:^|/)(?:src/test|test)/")
+#: FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data): the ORIGINAL
+#: combined pattern classified a bare ``/test/`` package segment with NO
+#: corroboration at all - the same bug class CR10-7 already fixed for
+#: the NAME heuristic, left standing for the PATH one.
+#: ``src/main/java/com/lab/test/TestOrder.java`` (a package literally
+#: named ``test``, common in lab/QA-domain legacy code) published
+#: classification=[test] on a complete run with zero supporting
+#: evidence. Split in two: the build-convention root (``src/test/...``)
+#: is sufficient evidence entirely on its own - that IS the real Maven/
+#: Gradle test source root, not a guess. A bare ``test/`` segment
+#: anywhere else needs the SAME corroboration the name heuristic already
+#: requires (a same-file test-framework import) before it can classify
+#: as test; without it, this is production.
+_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/")
+_BARE_TEST_PATH_SEGMENT = re.compile(r"(?:^|/)test/")
 #: FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data): a bare
 #: name-suffix match alone is NOT corroborating evidence on its own - an
 #: ordinary production class ending in "IT" (``AUDIT``, ``PROFIT``,
@@ -570,7 +584,10 @@ def _line_at(newline_offsets: list[int], offset: int) -> int:
 def _classify(
     relative_path: str, simple_name: str | None, *, has_test_framework_evidence: bool = False,
 ) -> str:
-    if _TEST_PATH_SEGMENT.search(relative_path.replace("\\", "/")):
+    normalized_path = relative_path.replace("\\", "/")
+    if _TEST_SOURCE_ROOT_SEGMENT.search(normalized_path):
+        return "test"
+    if _BARE_TEST_PATH_SEGMENT.search(normalized_path) and has_test_framework_evidence:
         return "test"
     if simple_name and _TEST_NAME_SUFFIX.search(simple_name) and has_test_framework_evidence:
         return "test"
@@ -1497,15 +1514,27 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # ("AUD"). Requires the SAME corroboration _classify itself now
         # requires - a test source root (checked directly here, since a
         # nested type's own qualified/simple name carries no path
-        # information) OR a test-framework import in this file.
+        # information) OR a test-framework import in this file. FIX
+        # ROUND 15 (F3 MAJOR): the source-root check here now uses ONLY
+        # the build-convention root (``src/test/...``), never a bare
+        # ``/test/`` package segment alone - the same corroboration
+        # split ``_classify`` now applies.
         if _TEST_NAME_SUFFIX.search(simple) and (
-            has_test_framework_evidence or _TEST_PATH_SEGMENT.search(relative_path.replace("\\", "/"))
+            has_test_framework_evidence
+            or _TEST_SOURCE_ROOT_SEGMENT.search(relative_path.replace("\\", "/"))
         ):
             under_test = _TEST_NAME_SUFFIX.sub("", simple)
             if under_test:
                 edges.append(JavaEdgeClaim(
                     from_qualified_name=qualified, relation="test", target=under_test,
-                    target_kind="internal_candidate", evidence_class="extracted",
+                    # FIX ROUND 15 (F4 MAJOR, wrong-data): this pairing is
+                    # ALWAYS derived from stripping a naming CONVENTION
+                    # (Test/Tests/IT) and guessing the remainder resolves
+                    # to a real target - the target identifier never
+                    # actually appears in this file's own source. Never
+                    # "extracted" (real source evidence); the design's own
+                    # vocabulary names exactly this case "inferred".
+                    target_kind="internal_candidate", evidence_class="inferred",
                     line=line, phase="test",
                 ))
 

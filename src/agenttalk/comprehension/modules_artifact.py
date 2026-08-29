@@ -37,7 +37,18 @@ _LANGUAGE_BY_EXTENSION = {".java": "java"}
 #: from one no adapter has ever touched. Named here, by basename (these
 #: are fixed, well-known filenames, not a language-by-extension family).
 _LANGUAGE_BY_BASENAME = {"pom.xml": "xml", "web.xml": "xml"}
-_TEST_PATH_SEGMENT = re.compile(r"(?:^|/)(?:src/test|test)/")
+#: FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data): the ORIGINAL
+#: combined pattern classified a bare ``/test/`` package segment with NO
+#: corroboration at all (the same bug class CR10-7 already fixed for the
+#: adapter's own NAME heuristic) - a package literally named ``test``
+#: (common in lab/QA-domain legacy code) published classification=[test]
+#: with zero supporting evidence. This module has no per-file import
+#: evidence available to corroborate a bare ``/test/`` segment the way
+#: ``adapters.java._classify`` now can (a same-file test-framework
+#: import) - so only the real build-convention root qualifies here;
+#: a bare ``/test/`` segment with nothing else to corroborate it now
+#: stays production, never a guess.
+_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/")
 
 
 @dataclass(frozen=True)
@@ -126,7 +137,7 @@ def _language_for_path(relative_path: str) -> str:
 
 
 def _default_classification(relative_path: str) -> str:
-    if _TEST_PATH_SEGMENT.search(relative_path.replace("\\", "/")):
+    if _TEST_SOURCE_ROOT_SEGMENT.search(relative_path.replace("\\", "/")):
         return "test"
     return "production"
 

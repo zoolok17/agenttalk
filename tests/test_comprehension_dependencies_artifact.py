@@ -330,6 +330,40 @@ def test_test_edge_resolves_to_the_unit_under_test_in_another_file():
     assert test_edge.target_unit_id == foo_unit_id
 
 
+def test_test_edge_resolves_to_the_wrong_convention_guess_but_never_satisfies_readiness():
+    """FIX ROUND 15 (eleventh cold read, F4 MAJOR, wrong-data, cr11-fx4
+    verbatim): IntegrationTests actually exercises only BillingEngine,
+    but its NAME-derived pairing (strip "Tests", resolve "Integration")
+    happens to resolve to an unrelated, genuinely-untested class -
+    stamping coverage onto it while BillingEngine itself reports no
+    evidence. The published edge's evidence_class is "inferred" (a
+    convention guess, never real source evidence) - readiness's own
+    tested_unit_ids computation (readiness_artifact.py) is what actually
+    keeps this from satisfying test_evidence_located; this test pins the
+    adapter's own half of the contract (the published evidence_class),
+    the readiness-level test pins the other half."""
+    results = {
+        "com/acme/Integration.java": _parse(
+            "com/acme/Integration.java", "package com.acme;\nclass Integration {}\n"),
+        "com/acme/BillingEngine.java": _parse(
+            "com/acme/BillingEngine.java", "package com.acme;\nclass BillingEngine {}\n"),
+        "src/test/java/com/acme/IntegrationTests.java": _parse(
+            "src/test/java/com/acme/IntegrationTests.java",
+            "package com.acme;\nclass IntegrationTests {}\n"),
+    }
+    records = da.build_dependencies(results)
+    test_edge = next(r for r in records if r.relation == "test")
+    assert test_edge.resolution_state == "resolved"
+    assert test_edge.evidence_class == "inferred"
+    integration_unit_id = da._java_component_unit_id("com/acme/Integration.java", "com.acme.Integration")
+    assert test_edge.target_unit_id == integration_unit_id
+    # BillingEngine (the class actually exercised, per the reviewer's
+    # fixture story) gets NO test edge at all from this file - the
+    # adapter has no mechanism to detect real usage inside a test body,
+    # so it correctly stays silent about it rather than guessing.
+    assert "BillingEngine" not in {r.target_unresolved for r in records if r.relation == "test"}
+
+
 # ----------------------------------------------------------- coalescing (M6)
 
 def test_byte_identical_invoke_edges_coalesce_to_one_record_with_merged_producers():

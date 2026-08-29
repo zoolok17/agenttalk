@@ -432,9 +432,19 @@ def build_readiness(
             stack.extend(children_by_container.get(candidate, []))
         return seen
 
+    # FIX ROUND 15 (eleventh cold read, F4 MAJOR, wrong-data): a "test"
+    # relation edge derived from stripping a naming CONVENTION
+    # (Test/Tests/IT) and guessing the remainder resolves is published
+    # `evidence_class="inferred"` (adapters.java) - the target identifier
+    # never actually appears in the test file's own source. A convention
+    # GUESS must never drive test_evidence_located past "unknown" on its
+    # own; only real evidence (extracted/declared - e.g. a future
+    # producer that verifies the test body actually references the
+    # target) satisfies this check.
     tested_unit_ids = {
         edge.target_unit_id for edge in dependencies
         if edge.relation == "test" and edge.target_unit_id is not None
+        and edge.evidence_class in ("extracted", "declared")
     }
 
     entry_point_owner_ids = {
@@ -476,12 +486,25 @@ def build_readiness(
                 unit, outgoing_by_unit.get(unit.unit_id, []), _owning_file_unit_id(unit),
                 children_by_container, outgoing_by_unit,
             )
+        # FIX ROUND 15 (eleventh cold read, F4 MAJOR part 3, wrong-data):
+        # a "test" edge always resolves to the CONTAINED TYPE (a test
+        # relation is a per-type fact), never the file unit directly -
+        # so a file's own test_evidence_located used to report unknown
+        # while its own contained type, for the identical underlying
+        # fact, reported satisfied: two disagreeing answers about one
+        # thing. A file-kind unit now also counts as tested when ANY of
+        # its transitive descendants does - the same "roll a per-type
+        # fact up to its owning file" idiom CR10-1's dependencies_signal
+        # already established for this exact unit/file relationship.
+        is_tested = unit.unit_id in tested_unit_ids
+        if unit.kind == "file" and not is_tested:
+            is_tested = bool(tested_unit_ids & _transitive_descendants(unit.unit_id))
         unit_signals = [
             _check_source_understood(unit),
             dependencies_signal,
             _check_entry_points_mapped(unit, unit.unit_id in entry_point_owner_ids),
             _check_feature_linked(unit, feature_states_by_unit.get(unit.unit_id, [])),
-            _check_test_evidence_located(unit, unit.unit_id in tested_unit_ids),
+            _check_test_evidence_located(unit, is_tested),
             _check_boundaries_identified(unit),
         ]
         all_signals.extend(unit_signals)

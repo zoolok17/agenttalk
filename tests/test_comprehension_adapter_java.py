@@ -468,6 +468,41 @@ def test_a_name_suffix_hit_with_a_test_framework_import_corroborates_test_classi
     assert test_edges[0].target == "Foo"
 
 
+def test_a_bare_test_package_segment_without_corroboration_stays_production():
+    """FIX ROUND 15 (eleventh cold read, F3 MAJOR, wrong-data, verbatim
+    shape): the PATH heuristic classified a bare "/test/" segment with NO
+    corroboration at all - the same bug class CR10-7 already fixed for
+    the NAME heuristic, left standing for the path one.
+    src/main/java/com/lab/test/TestOrder.java (a package literally named
+    "test", common in lab/QA-domain legacy code) used to publish
+    classification=[test] on a complete run with zero supporting
+    evidence. A bare /test/ segment NOT under the build-convention
+    src/test/ root, with no test-framework import either, must stay
+    production."""
+    src = "package com.lab.test;\npublic class TestOrder {\n}\n"
+    result = java.parse_java_source("src/main/java/com/lab/test/TestOrder.java", src)
+    assert result.units[0].classification == "production"
+
+
+def test_src_test_java_still_classifies_as_test_with_no_further_corroboration():
+    """FIX ROUND 15 (F3 control): the real build-convention root
+    (src/test/java) IS sufficient evidence entirely on its own - that's
+    what it actually means for Maven/Gradle, not a guess."""
+    src = "package p;\npublic class Helper {\n}\n"
+    result = java.parse_java_source("src/test/java/p/Helper.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_a_corroborated_bare_test_segment_still_classifies_as_test():
+    """FIX ROUND 15 (F3 control): a bare /test/ segment WITH a same-file
+    test-framework import is corroborated the same way the name
+    heuristic already is - still classifies test, not silently lost by
+    the tightened path rule."""
+    src = "package com.lab.test;\nimport org.junit.Test;\npublic class OrderProbe {\n}\n"
+    result = java.parse_java_source("src/main/java/com/lab/test/OrderProbe.java", src)
+    assert result.units[0].classification == "test"
+
+
 # ----------------------------------------------------------- invoke
 
 def test_qualified_call_resolves_against_an_import():

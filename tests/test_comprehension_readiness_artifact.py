@@ -28,10 +28,12 @@ def _unit(
 
 def _edge(
     from_unit_id: str, *, relation: str = "invoke", resolution_state: str, target_unit_id=None,
+    evidence_class: str = "extracted",
 ) -> DependencyRecord:
     return DependencyRecord(
-        edge_id=f"edge-{from_unit_id}-{relation}-{resolution_state}", from_unit_id=from_unit_id,
-        relation=relation, phase="runtime", optional=False, evidence_class="extracted",
+        edge_id=f"edge-{from_unit_id}-{relation}-{resolution_state}-{evidence_class}",
+        from_unit_id=from_unit_id,
+        relation=relation, phase="runtime", optional=False, evidence_class=evidence_class,
         resolution_state=resolution_state, target_unit_id=target_unit_id,
     )
 
@@ -393,9 +395,57 @@ def test_test_evidence_located_not_applicable_for_a_test_classified_unit():
 
 
 def test_test_evidence_located_satisfied_when_targeted_by_a_test_edge():
+    """This is exactly the "an actually-referencing test still satisfies"
+    control for FIX ROUND 15's F4 fix below - an extracted/declared test
+    edge (real evidence, not a convention guess) must still satisfy."""
     edges = [_edge("u2", relation="test", resolution_state="resolved", target_unit_id="u1")]
     signals, _ = ra.build_readiness([_unit("u1")], edges, [])
     assert _signal_by_check(signals, "test_evidence_located").stored_status == "satisfied"
+
+
+def test_test_evidence_located_stays_unknown_for_an_inferred_convention_only_pairing():
+    """FIX ROUND 15 (eleventh cold read, F4 MAJOR, wrong-data, cr11-fx4
+    verbatim): the name-derived test pairing (strip Test/Tests/IT,
+    resolve the remainder) is a CONVENTION GUESS - the target identifier
+    never actually appears in the test file's own source, and adapters.
+    java now publishes it evidence_class="inferred" rather than
+    "extracted". A convention-only pairing must never drive
+    test_evidence_located past unknown - IntegrationTests (which
+    actually exercises only BillingEngine) must not stamp coverage onto
+    a same-named "Integration" that was never really tested."""
+    edges = [_edge(
+        "u2", relation="test", resolution_state="resolved", target_unit_id="u1",
+        evidence_class="inferred")]
+    signals, _ = ra.build_readiness([_unit("u1")], edges, [])
+    assert _signal_by_check(signals, "test_evidence_located").stored_status == "unknown"
+
+
+def test_test_evidence_located_agrees_between_a_file_and_its_own_contained_type():
+    """FIX ROUND 15 (eleventh cold read, F4 MAJOR part 3, wrong-data): a
+    "test" edge always resolves to the CONTAINED TYPE (a per-type fact),
+    never the file unit directly - so the file's own test_evidence_located
+    used to report unknown while its own contained type, for the
+    IDENTICAL underlying fact, reported satisfied. The file must now
+    inherit its contained type's own tested status, the same "roll a
+    per-type fact up to the owning file" idiom CR10-1 already established
+    for dependencies_resolved."""
+    edges = [_edge(
+        "u-tester", relation="test", resolution_state="resolved", target_unit_id="u-component")]
+    file_unit = _unit("u-file", container_unit_id=None)
+    # ModuleRecord's own `kind` defaults to "component" via _unit's helper
+    # signature - build a real file-kind unit directly, matching what
+    # modules_artifact actually publishes for a file with one contained
+    # type.
+    from dataclasses import replace
+    file_unit = replace(file_unit, kind="file")
+    component_unit = _unit("u-component", container_unit_id="u-file")
+    signals, _ = ra.build_readiness([file_unit, component_unit], edges, [])
+    component_signal = next(
+        s for s in signals if s.unit_id == "u-component" and s.check == "test_evidence_located")
+    file_signal = next(
+        s for s in signals if s.unit_id == "u-file" and s.check == "test_evidence_located")
+    assert component_signal.stored_status == "satisfied"
+    assert file_signal.stored_status == "satisfied"
 
 
 def test_test_evidence_located_unknown_otherwise():
