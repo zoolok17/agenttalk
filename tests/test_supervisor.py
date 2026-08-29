@@ -8,6 +8,7 @@ fixtures. The generated PS/bash scripts are thin executors (documented-manual).
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -20671,3 +20672,33 @@ def test_install_activity_hook_preserves_bom_prefixed_codex_hooks(tmp_path: Path
     assert all("unreadable" not in status for status in statuses.values())
     data = json.loads(hooks.read_text(encoding="utf-8-sig"))
     assert data.get("customOperatorKey") == 7
+
+
+def test_cli_child_healthy_states_is_exactly_the_two_confirmed_states() -> None:
+    """#105 round-4: reviewer-3 PROVED BY MUTATION that every #105 test derives
+    its expected outcome from `CLI_CHILD_HEALTHY_STATES` itself - it added
+    CLI_CHILD_MISSING to the allowlist and the entire doctor suite stayed
+    green while a confirmed-missing child read "ok", reintroducing the
+    original #105 blocker with a one-word edit that nothing objected to.
+    Every OTHER assertion in this bundle is deliberately derived (never a
+    hand-copied list) precisely to avoid the round-2 staleness bug - but
+    that means nothing anywhere pins the allowlist's actual CONTENTS. This
+    is the one place a hardcoded literal is correct: the two states named
+    here are the entire membrane between "confirmed healthy" and "not" for
+    all three surfaces, so pinning them is the test that would have failed
+    the mutation every derived test missed."""
+    assert sup.CLI_CHILD_HEALTHY_STATES == frozenset({"HEALTHY_IDLE", "HEALTHY_WORKING"})
+
+
+def test_cli_child_verdict_is_launching_is_unreachable_from_the_planner() -> None:
+    """#105 round-4: cli_child_verdict_is_launching()'s docstring promises it
+    is "never consulted by the planner itself" - display-only, so a display
+    surface can treat CLI_CHILD_STARTING more gently than the rest of the
+    gone family without changing what `_plan_one` actually decides. Mechanize
+    that promise: `_plan_one`'s own source must not reference the helper
+    (the repo already inspects source elsewhere - see the state-extraction
+    helpers in test_cli.py/test_doctor.py/test_web.py)."""
+    src = inspect.getsource(sup._plan_one)
+    assert "cli_child_verdict_is_launching" not in src, (
+        "_plan_one now references the display-only launching helper - "
+        "it was documented as unreachable from planner logic")

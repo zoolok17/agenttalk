@@ -611,6 +611,15 @@
   function cliChildVerdictIsGone(state) {
     return state.indexOf('CLI_CHILD_') === 0 || !!CLI_CHILD_GONE_NAMED_STATES[state];
   }
+  // Mirrors supervisor.cli_child_verdict_is_launching() - DISPLAY-ONLY,
+  // never consulted for anything but this chip's SEVERITY (never its
+  // label - see below). CLI_CHILD_STARTING is the same lifecycle moment as
+  // LAUNCHING (a normal, expected transient during agent boot), so it must
+  // not display more alarmingly than LAUNCHING just because it happens to
+  // fall inside cliChildVerdictIsGone()'s family match.
+  function cliChildVerdictIsLaunching(state) {
+    return state === 'CLI_CHILD_STARTING';
+  }
   function agentStateInfo(agent) {
     var verdictState = agent && agent.cli_child_verdict && typeof agent.cli_child_verdict === 'object'
       ? agent.cli_child_verdict.state : null;
@@ -624,10 +633,17 @@
       // "Dead" for those overclaims doom the CLI's plain state-name output
       // never did. Label fix ONLY - color/severity is unchanged (still the
       // strongest, most visible signal that this is NOT confirmed healthy).
+      //
+      // round-4 review: doctor.py downgrades CLI_CHILD_STARTING to "warn"
+      // (same as LAUNCHING) via the SAME launching helper - this surface
+      // must match that severity, so `severe` (not `gone`) drives color/key.
+      // The LABEL still comes from `gone` alone and stays 'Not confirmed
+      // alive' for CLI_CHILD_STARTING - only the severity/color moves.
+      var severe = gone && !cliChildVerdictIsLaunching(verdictState);
       return {
         label: gone ? 'Not confirmed alive' : 'Not confirmed healthy',
-        key: 'cli_child_' + (gone ? 'gone' : 'unconfirmed'),
-        color: gone ? 'danger' : 'attn',
+        key: 'cli_child_' + (severe ? 'gone' : 'unconfirmed'),
+        color: severe ? 'danger' : 'attn',
         grp: 'attn',
         desc: 'The supervisor’s verdict for this agent’s CLI child is "' + verdictState +
           '" — ' + (gone ? 'the child or its wrapper is gone.' : 'not confirmed healthy.') +

@@ -3075,13 +3075,16 @@ def _all_planner_states() -> list[str]:
 def test_console_cli_child_verdict_never_confirms_health_for_a_non_healthy_state(
     tmp_path: Path,
 ) -> None:
-    """#105 round-2: drive EVERY planner-emittable state through
+    """#105 round-2/3/4: drive EVERY planner-emittable state through
     agentStateInfo() with a healthy-looking self-report. Only the two states
     that confirm the child healthy (supervisor.CLI_CHILD_HEALTHY_STATES) may
     defer to that self-report - every other state, known to this client or
     not, must render as not confirmed healthy. One node process loops over
     the full extracted state list so a new planner state is exercised here
-    automatically, never a hand-copied enumeration."""
+    automatically, never a hand-copied enumeration. Also covers: no state's
+    label is the overclaiming 'Dead' (round 3), the JS/Python healthy-
+    allowlist parity check (round 3 minor 4), and CLI_CHILD_STARTING
+    matching LAUNCHING's display severity (round 4)."""
     if shutil.which("node") is None:
         pytest.skip("node is required for console cli_child_verdict test")
     from agenttalk import supervisor as supervisor_mod
@@ -3152,6 +3155,30 @@ def test_console_cli_child_verdict_never_confirms_health_for_a_non_healthy_state
         "  if (info.label === 'Dead') {\n"
         "    throw new Error(`verdict state ${state} rendered the overclaiming 'Dead' label`);\n"
         "  }\n"
+        "}\n"
+        "\n"
+        "// round-4 review: doctor.py downgrades CLI_CHILD_STARTING to the same\n"
+        "// severity as LAUNCHING (\"warn\") via cli_child_verdict_is_launching() -\n"
+        "// this surface must match (color 'attn', not 'danger'), even though the\n"
+        "// label stays 'Not confirmed alive' (unchanged from round 3).\n"
+        "const starting = hooks.agentStateInfo({\n"
+        "  health: { state: 'working_turn' },\n"
+        "  cli_child_verdict: { state: 'CLI_CHILD_STARTING', action: 'none' },\n"
+        "});\n"
+        "if (starting.color !== 'attn') {\n"
+        "  throw new Error(`CLI_CHILD_STARTING should render at the same severity as "
+        "LAUNCHING (attn), got: ${starting.color}`);\n"
+        "}\n"
+        "if (starting.label !== 'Not confirmed alive') {\n"
+        "  throw new Error(`CLI_CHILD_STARTING label regressed: ${starting.label}`);\n"
+        "}\n"
+        "// A genuinely dead sibling must still be the strongest signal (danger).\n"
+        "const stillDead = hooks.agentStateInfo({\n"
+        "  health: { state: 'working_turn' },\n"
+        "  cli_child_verdict: { state: 'STUCK_OR_DEAD', action: 'warn_only' },\n"
+        "});\n"
+        "if (stillDead.color !== 'danger') {\n"
+        "  throw new Error(`STUCK_OR_DEAD must stay danger-colored, got: ${stillDead.color}`);\n"
         "}\n",
         encoding="utf-8",
     )
