@@ -62,6 +62,23 @@ _ADAPTER_EXTENSIONS = {".java": java_adapter}
 #: its own.
 _UNSUPPORTED_LANGUAGE_EXTENSIONS = frozenset({".jsp", ".jspx", ".properties", ".sql"})
 _ADAPTER_HANDLED_XML_BASENAMES = frozenset({"pom.xml", "web.xml"})
+#: FIX ROUND 14b (reviewer-3's ratified CR10-5 split, its own measurement
+#: and reader test): recording this reason code for every set member
+#: never changes - visibility stays unconditional. Whether an INSTANCE
+#: also degrades the run is now a separate, narrower question: reviewer-
+#: 3's own seven-single-file-repo battery showed logback.xml/checkstyle.
+#: xml/messages.properties/application.properties degrading an otherwise
+#: entirely healthy repo over files a migration reader would never say
+#: were "missed application code" - while JSP/SQL/Spring-bean-XML
+#: genuinely are. Only these two extensions unconditionally degrade;
+#: ``.properties`` drops out of the degrading set entirely (still
+#: recorded); XML is split further below by a root-element sniff.
+_DEGRADING_UNSUPPORTED_LANGUAGE_EXTENSIONS = frozenset({".jsp", ".jspx", ".sql"})
+#: Spring bean XML's own root element - the ONE xml root name this
+#: producer recognizes as code-bearing (a bean declaration is
+#: application wiring, not tooling configuration). PROVISIONAL, like
+#: every other closed-set constant in this package.
+_SPRING_BEAN_XML_ROOT_ELEMENT = "beans"
 #: MAJOR 2 (sixth cold read, fix round 9): both are real, common
 #: declarations this adapter's class/interface/enum/record extractor
 #: does not recognize at all (package-info.java carries only a package
@@ -174,12 +191,27 @@ class WorkerProblem:
     carries an adapter-attributed problem's own owning type through to
     ``scan_pipeline.py`` unchanged - ``None`` for the ordinary file-wide
     problem shapes (parse failures, resource caps), a real qualified
-    name for the narrower few an adapter can pin to one declared type."""
+    name for the narrower few an adapter can pin to one declared type.
+
+    FIX ROUND 14b (reviewer-3's ratified split on CR10-5): ``degrades_run``
+    defaults ``True`` (every pre-existing reason code's own behavior,
+    unchanged - a parse failure, a resource cap, an unassociated route
+    all still flip the run to ``degraded``). ``unsupported_language`` is
+    the first reason code where visibility and degradation are DIFFERENT
+    claims about the SAME file: reviewer-3's own reader test ("degrade
+    when a reader would say the inventory missed something they NEEDED")
+    means a properties file or a tooling-XML file (checkstyle, logback)
+    is always worth RECORDING (an operator should still see it was not
+    read) but never worth degrading a healthy run over - unlike a JSP/SQL
+    file or Spring bean XML, which really is missed application code.
+    Set ``False`` per-instance only for that one reason code; every other
+    call site in this module leaves the default alone."""
 
     reason_code: str
     relative_path: str
     detail: str
     qualified_name: str | None = None
+    degrades_run: bool = True
 
 
 @dataclass(frozen=True)
@@ -373,14 +405,51 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
         ):
             # FIX ROUND 14 (tenth cold read, CR10-5 JUDGE, completeness):
             # this file is still addressable (the WorkerFileClaim above
-            # already covers that) - only the run's status and problem
-            # count degrade, exactly as the design directs for a run over
-            # a partly-unsupported selected scope.
+            # already covers that). FIX ROUND 14b (reviewer-3's ratified
+            # split): recording is unconditional here - only whether THIS
+            # instance also degrades the run varies by kind, decided
+            # below.
+            if rel_lower.endswith(tuple(_DEGRADING_UNSUPPORTED_LANGUAGE_EXTENSIONS)):
+                degrades_run = True
+                detail = (
+                    "no bundled adapter recognizes this file's language - it remains an "
+                    "addressable file unit but contributes no units, edges, or entry "
+                    "points; a code-bearing shape, so this run degrades"
+                )
+            elif rel_lower.endswith(".xml"):
+                root_element = java_adapter.sniff_xml_root_element(
+                    data.decode("utf-8", errors="replace"))
+                if root_element is None:
+                    degrades_run = False
+                    detail = (
+                        "this XML file's root element could not be determined - failing "
+                        "toward record-only rather than guessing a code-bearing shape"
+                    )
+                elif root_element == _SPRING_BEAN_XML_ROOT_ELEMENT:
+                    degrades_run = True
+                    detail = (
+                        "no bundled adapter recognizes this file's language - Spring bean "
+                        f"XML (root element <{root_element}>) is a code-bearing "
+                        "configuration shape, so this run degrades"
+                    )
+                else:
+                    degrades_run = False
+                    detail = (
+                        f"no bundled adapter recognizes this file's language - its root "
+                        f"element <{root_element}> is tooling/config XML, not code-bearing, "
+                        "so this run does not degrade over it"
+                    )
+            else:
+                # .properties - record-only per reviewer-3's own reader
+                # test, never a missed-application-code claim.
+                degrades_run = False
+                detail = (
+                    "no bundled adapter recognizes this file's language - not a "
+                    "code-bearing shape, so this run does not degrade over it"
+                )
             problems.append(WorkerProblem(
-                reason_code="unsupported_language", relative_path=rel,
-                detail="no bundled adapter recognizes this file's language - it remains "
-                       "an addressable file unit but contributes no units, edges, or "
-                       "entry points",
+                reason_code="unsupported_language", relative_path=rel, detail=detail,
+                degrades_run=degrades_run,
             ))
 
     return WorkerResult(
@@ -406,6 +475,7 @@ def _result_to_json(result: WorkerResult) -> dict[str, Any]:
                 "relative_path": problem.relative_path,
                 "detail": problem.detail,
                 "qualified_name": problem.qualified_name,
+                "degrades_run": problem.degrades_run,
             }
             for problem in result.problems
         ],
@@ -444,6 +514,7 @@ def _result_from_json(payload: Any) -> WorkerResult:
                 relative_path=item["relative_path"],
                 detail=item["detail"],
                 qualified_name=item.get("qualified_name"),
+                degrades_run=item.get("degrades_run", True),
             )
             for item in payload["problems"]
         ]

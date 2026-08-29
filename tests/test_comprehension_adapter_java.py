@@ -2156,6 +2156,39 @@ def test_parse_maven_pom_group_and_artifact_id_are_length_bounded():
     assert oversized_group not in edges[0].target
 
 
+# ----------------------------------------------------------- xml root sniff (round 14b)
+
+def test_sniff_xml_root_element_recognizes_spring_beans():
+    assert java.sniff_xml_root_element(
+        "<beans><bean id=\"x\" class=\"y\"/></beans>") == "beans"
+
+
+def test_sniff_xml_root_element_recognizes_logback_configuration():
+    assert java.sniff_xml_root_element(
+        "<configuration><root level=\"INFO\"/></configuration>") == "configuration"
+
+
+def test_sniff_xml_root_element_recognizes_checkstyle_module():
+    assert java.sniff_xml_root_element("<module name=\"Checker\"></module>") == "module"
+
+
+def test_sniff_xml_root_element_skips_the_prolog_and_comments():
+    text = (
+        "<?xml version=\"1.0\"?>\n"
+        "<!-- a leading comment with a <fake/> tag inside it -->\n"
+        "<beans/>\n"
+    )
+    assert java.sniff_xml_root_element(text) == "beans"
+
+
+def test_sniff_xml_root_element_strips_a_namespace_prefix():
+    assert java.sniff_xml_root_element("<b:beans xmlns:b=\"x\"/>") == "beans"
+
+
+def test_sniff_xml_root_element_returns_none_when_undeterminable():
+    assert java.sniff_xml_root_element("not actually xml at all") is None
+
+
 # ----------------------------------------------------------- honest gaps
 
 def test_unsupported_relations_are_named_not_silently_omitted():

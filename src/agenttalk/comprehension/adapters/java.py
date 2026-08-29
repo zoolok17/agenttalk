@@ -1889,6 +1889,33 @@ def _strip_xml_comments(text: str) -> str:
     return _XML_COMMENT_RE.sub(_blank, text)
 
 
+#: FIX ROUND 14b (reviewer-3's ratified CR10-5 split): the first element
+#: tag after comments/prolog/doctype - deliberately NOT a real XML parser
+#: (coarse S1 evidence, matching this whole adapter's own bar). Requires
+#: the char right after ``<`` to be a name-start character, so it never
+#: matches an XML declaration (``<?xml``) or a DOCTYPE (``<!DOCTYPE``) at
+#: their own position - the search simply continues past them to the
+#: real root element. A namespace-prefixed root (``<b:beans>``) keeps
+#: only the LOCAL name (the part after ``:``), since Spring's own bean
+#: XML is recognized by its local name regardless of prefix aliasing.
+_XML_ROOT_ELEMENT_RE = re.compile(r"<([A-Za-z_][\w.-]*)(?::([A-Za-z_][\w.-]*))?[\s/>]")
+
+
+def sniff_xml_root_element(text: str) -> str | None:
+    """Returns the root element's own LOWERCASE local name, or ``None``
+    when it cannot be determined at all (no element-shaped tag found in
+    the whole file - genuinely malformed, or empty). Never raises; a
+    caller that cannot read this file's shape must fail toward record-
+    only, never a guessed degradation (FIX ROUND 14b's own explicit
+    safe-side direction)."""
+    sanitized = _strip_xml_comments(text)
+    match = _XML_ROOT_ELEMENT_RE.search(sanitized)
+    if match is None:
+        return None
+    local_name = match.group(2) if match.group(2) is not None else match.group(1)
+    return local_name.lower()
+
+
 #: M3 (fourth cold read, fix round 6): captures the WHOLE dependency
 #: block rather than anchoring on groupId immediately followed by
 #: artifactId - <optional>/<scope> (and <version>, ignored) can appear in

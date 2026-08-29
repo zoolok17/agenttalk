@@ -454,7 +454,19 @@ def run_scan(
                 "case_collision", second, bounded_detail(f"case-folds identically to {first!r}"))
             for first, second in case_collisions
         ]
-        status = "degraded" if (discovery_result.degraded or problems) else "complete"
+        # FIX ROUND 14b (reviewer-3's ratified CR10-5 split): a worker
+        # problem's own `degrades_run` (worker.py) distinguishes
+        # "recorded, visible" from "the run's status also degrades over
+        # this" - the first time those two claims diverge for the SAME
+        # reason code (unsupported_language: a tooling/config file is
+        # worth recording but not worth degrading a healthy run over).
+        # Every OTHER problem source here (discovery, case collisions)
+        # still always degrades, unchanged.
+        degrading_worker_problems = any(p.degrades_run for p in worker_result.problems)
+        status = "degraded" if (
+            discovery_result.degraded or discovery_result.problems or case_collisions
+            or degrading_worker_problems
+        ) else "complete"
 
         modules_doc = {
             **_envelope(

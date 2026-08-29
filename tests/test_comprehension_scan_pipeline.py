@@ -758,6 +758,89 @@ def test_run_scan_over_a_jsp_estate_degrades_with_a_named_unsupported_language_p
     assert jsp_problems[0]["severity"] == "warning"
 
 
+#: FIX ROUND 14b (reviewer-3's ratified CR10-5 split): the reviewer's own
+#: seven-single-file-repo battery - an otherwise entirely healthy
+#: java+pom repo plus exactly one more file of each named kind. Before
+#: this round, ALL SEVEN degraded (the blanket unsupported_language ->
+#: degrade rule); the ratified rule keeps only JSP/SQL/Spring-bean-XML
+#: degrading - the reviewer's own reader test ("would a migration reader
+#: say the inventory missed something they NEEDED") is true of those
+#: three and false of the other four.
+_CR10_5B_SEVEN_REPO_BATTERY = [
+    ("logback.xml", "<configuration><root level=\"INFO\"/></configuration>", False),
+    ("checkstyle.xml", "<module name=\"Checker\"></module>", False),
+    ("messages.properties", "greeting=hello\n", False),
+    ("application.properties", "server.port=8080\n", False),
+    ("applicationContext.xml", "<beans><bean id=\"x\" class=\"y\"/></beans>", True),
+    ("index.jsp", "<%@ page language=\"java\" %>\n<html></html>\n", True),
+    ("schema.sql", "CREATE TABLE t (id INT);\n", True),
+]
+
+
+@pytest.mark.parametrize("filename,content,expect_degraded", _CR10_5B_SEVEN_REPO_BATTERY)
+def test_run_scan_seven_repo_battery_degrades_only_the_code_bearing_kinds(
+    java_repo: Path, filename: str, content: str, expect_degraded: bool,
+) -> None:
+    """FIX ROUND 14b (reviewer-3's ratified CR10-5 split, its own
+    measurement): every kind is still recorded as a visible
+    unsupported_language problem - only whether the RUN degrades varies
+    by kind."""
+    import json
+
+    (java_repo / filename).write_text(content, encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == ("degraded" if expect_degraded else "complete")
+    doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matches = [p for p in doc["problems"] if p["path"] == filename]
+    assert len(matches) == 1
+    assert matches[0]["reason_code"] == "unsupported_language"
+
+
+def test_run_scan_a_minimal_spring_repo_with_only_a_properties_file_stays_complete(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 14b: the reviewer's own minimal-Spring-repo shape (class
+    + pom + README + application.properties) used to scan DEGRADED
+    before this round's split - deleting the properties file made it
+    complete, which is exactly backwards for a healthy repo. The
+    properties file is now recorded (visible), never degrading."""
+    import json
+
+    (java_repo / "README.md").write_text("# demo\n", encoding="utf-8")
+    (java_repo / "application.properties").write_text("server.port=8080\n", encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+    doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matches = [p for p in doc["problems"] if p["path"] == "application.properties"]
+    assert len(matches) == 1
+    assert matches[0]["reason_code"] == "unsupported_language"
+
+
+def test_run_scan_a_bean_xml_estate_still_degrades(java_repo: Path) -> None:
+    """FIX ROUND 14b: Spring bean XML is code-bearing configuration a
+    migration reader would call "missed" - it keeps degrading the run,
+    unlike ordinary tooling XML."""
+    (java_repo / "applicationContext.xml").write_text(
+        "<beans><bean id=\"x\" class=\"y\"/></beans>", encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+
+def test_run_scan_an_unreadable_root_element_xml_estate_stays_complete(java_repo: Path) -> None:
+    """FIX ROUND 14b: when the root-element sniff cannot determine a
+    root at all, this fails toward the SAFE side (record-only) rather
+    than guessing a code-bearing shape - the run stays complete."""
+    import json
+
+    (java_repo / "mystery.xml").write_text("not actually xml at all", encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+    doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matches = [p for p in doc["problems"] if p["path"] == "mystery.xml"]
+    assert len(matches) == 1
+    assert "could not be determined" in matches[0]["detail"]
+
+
 def test_worker_problem_reason_by_path_joins_sorted_unique_reasons_for_one_path(
     java_repo: Path, monkeypatch,
 ) -> None:

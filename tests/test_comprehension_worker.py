@@ -118,7 +118,11 @@ def test_process_paths_flags_jsp_properties_and_sql_as_unsupported_language(
     design names ``unsupported_language`` as a problem code and a
     ``degraded`` trigger for "part of the selected source is unsupported"
     - a run over a JSP/properties/SQL estate used to publish complete
-    with problem_count 0, contradicting that text."""
+    with problem_count 0, contradicting that text. FIX ROUND 14b
+    (reviewer-3's ratified split): recording is unconditional for all
+    three, but only JSP/SQL are code-bearing - properties never degrades
+    the run (reviewer-3's own reader test: a reader would not say a
+    properties file is "missed application code")."""
     (tmp_path / "index.jsp").write_text("<%@ page language=\"java\" %>", encoding="utf-8")
     (tmp_path / "app.properties").write_text("key=value\n", encoding="utf-8")
     (tmp_path / "schema.sql").write_text("CREATE TABLE t (id INT);\n", encoding="utf-8")
@@ -127,20 +131,57 @@ def test_process_paths_flags_jsp_properties_and_sql_as_unsupported_language(
     assert {p.relative_path for p in result.problems} == {
         "index.jsp", "app.properties", "schema.sql"}
     assert all(p.reason_code == "unsupported_language" for p in result.problems)
+    degrades_by_path = {p.relative_path: p.degrades_run for p in result.problems}
+    assert degrades_by_path["index.jsp"] is True
+    assert degrades_by_path["schema.sql"] is True
+    assert degrades_by_path["app.properties"] is False
 
 
-def test_process_paths_flags_a_plain_spring_style_xml_file_as_unsupported_language(
-    tmp_path: Path,
-) -> None:
-    """The reviewer's named "Spring-XML" shape has no extension of its own
-    distinct from an ordinary ``.xml`` file - only ``pom.xml``/``web.xml``
-    (already-handled basenames) are exempt."""
+def test_process_paths_flags_a_spring_bean_xml_file_as_degrading(tmp_path: Path) -> None:
+    """FIX ROUND 14b (reviewer-3's ratified split): a Spring bean XML
+    file (root element ``<beans>``) IS code-bearing configuration -
+    the reviewer's own reader test says a migration reader would call
+    this "missed" - so it keeps degrading the run, unlike ordinary
+    tooling XML (logback/checkstyle) or an unreadable root."""
     (tmp_path / "applicationContext.xml").write_text(
         "<beans><bean id=\"x\" class=\"y\"/></beans>", encoding="utf-8")
     result = worker.process_paths(tmp_path, ["applicationContext.xml"])
     assert len(result.problems) == 1
     assert result.problems[0].reason_code == "unsupported_language"
     assert result.problems[0].relative_path == "applicationContext.xml"
+    assert result.problems[0].degrades_run is True
+
+
+def test_process_paths_flags_logback_and_checkstyle_xml_as_record_only(tmp_path: Path) -> None:
+    """FIX ROUND 14b: reviewer-3's own measurement - logback.xml
+    (root ``<configuration>``) and checkstyle.xml (root ``<module>``)
+    both degraded an otherwise entirely healthy repo, over files a
+    migration reader would never call "missed application code". Both
+    are tooling/config XML, not Spring bean XML - recorded, never
+    degrading."""
+    (tmp_path / "logback.xml").write_text(
+        "<configuration><root level=\"INFO\"/></configuration>", encoding="utf-8")
+    (tmp_path / "checkstyle.xml").write_text(
+        "<module name=\"Checker\"></module>", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["logback.xml", "checkstyle.xml"])
+    assert len(result.problems) == 2
+    assert all(p.reason_code == "unsupported_language" for p in result.problems)
+    assert all(p.degrades_run is False for p in result.problems)
+
+
+def test_process_paths_flags_an_xml_file_with_no_determinable_root_as_record_only(
+    tmp_path: Path,
+) -> None:
+    """FIX ROUND 14b: when the root-element sniff itself cannot
+    determine a root (no element-shaped tag anywhere in the file), the
+    result fails toward the SAFE side - record-only, never a guessed
+    degradation - with a reason detail naming the sniff failure, not a
+    silently-defaulted claim either way."""
+    (tmp_path / "mystery.xml").write_text("not actually xml at all", encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["mystery.xml"])
+    assert len(result.problems) == 1
+    assert result.problems[0].degrades_run is False
+    assert "could not be determined" in result.problems[0].detail
 
 
 def test_process_paths_does_not_flag_ordinary_non_source_files(tmp_path: Path) -> None:
