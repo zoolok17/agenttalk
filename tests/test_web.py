@@ -2923,6 +2923,282 @@ if (JSON.stringify(names) !== JSON.stringify(expected)) {
                    capture_output=True, text=True)
 
 
+def test_console_cli_child_verdict_overrides_self_reported_health_color(tmp_path: Path) -> None:
+    """#105: agent.health is the wrapper's OWN self-report - it cannot notice
+    its own CLI child dying. When agent.cli_child_verdict is present and its
+    state does not confirm the child healthy, the client must render THAT
+    (never a healthy-looking self-report). round-2 review: a hand list of 3
+    "bad" states missed 6 CLI_CHILD_*/terminal siblings that ALSO mean gone,
+    plus every other non-healthy/future state - fixed with an allowlist of
+    the only 2 confirmed-healthy states, so this test checks the family
+    match (not an enumeration) AND the fail-closed default for both a
+    known-but-different state and a wholly novel one."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console cli_child_verdict test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    agentStateInfo: agentStateInfo\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-cli-child-verdict.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-cli-child-verdict.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return 0; } },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+
+var HEALTHY_COLORS = { ok: 1, info: 1, warn: 1, teal: 1 };
+
+// A dead CLI child under an otherwise healthy-looking wrapper: the verdict
+// must win, and it must not render like a healthy agent.
+var dead = hooks.agentStateInfo({
+  health: { state: 'idle_waiting' },
+  cli_child_verdict: { state: 'STUCK_OR_DEAD', action: 'warn_only' },
+});
+if (HEALTHY_COLORS[dead.color]) {
+  throw new Error(`confirmed-dead CLI child rendered as healthy: color=${dead.color}`);
+}
+if (dead.rawHealthState !== 'idle_waiting') {
+  throw new Error(`raw self-report was dropped, not demoted: ${JSON.stringify(dead)}`);
+}
+
+// round-2 review blocker: a hand list of 3 "bad" states missed the rest of
+// the CLI_CHILD_* family. CLI_CHILD_UNKNOWN must be classified the SAME as
+// STUCK_OR_DEAD (both "gone", matched by family/prefix, not enumeration).
+var missedSibling = hooks.agentStateInfo({
+  health: { state: 'working_turn' },
+  cli_child_verdict: { state: 'CLI_CHILD_UNKNOWN' },
+});
+if (HEALTHY_COLORS[missedSibling.color]) {
+  throw new Error(`CLI_CHILD_UNKNOWN rendered as healthy: color=${missedSibling.color}`);
+}
+if (missedSibling.key !== dead.key) {
+  throw new Error(
+    `CLI_CHILD_UNKNOWN must classify as "gone" the same as STUCK_OR_DEAD (family match, ` +
+    `not a hand list): ${JSON.stringify(missedSibling)}`);
+}
+
+// A not-gone, not-healthy operational state (an ordinary hold, not the
+// CLI_CHILD_* family) must be visibly distinct from BOTH healthy AND
+// confirmed-gone - the "class-closing" not-confirmed-healthy tier.
+var held = hooks.agentStateInfo({
+  health: { state: 'working_turn' },
+  cli_child_verdict: { state: 'CONFIG_BLOCKED' },
+});
+if (HEALTHY_COLORS[held.color]) {
+  throw new Error(`CONFIG_BLOCKED rendered as healthy: color=${held.color}`);
+}
+if (held.key === dead.key) {
+  throw new Error('a not-gone hold state must not collapse into "confirmed gone"');
+}
+
+// FAIL-CLOSED: a state this client has never heard of (the planner's 23rd
+// state) must ALSO default to not-confirmed-healthy, never fall through to
+// the self-report just because it matched nothing recognized.
+var novel = hooks.agentStateInfo({
+  health: { state: 'working_turn' },
+  cli_child_verdict: { state: 'SOME_FUTURE_STATE_THIS_CLIENT_HAS_NEVER_SEEN' },
+});
+if (HEALTHY_COLORS[novel.color]) {
+  throw new Error(`an unrecognized future verdict state rendered as healthy: color=${novel.color}`);
+}
+
+// No verdict at all (unmanaged agent) -> unchanged raw-health rendering.
+var unmanaged = hooks.agentStateInfo({ health: { state: 'working_turn' } });
+if (unmanaged.color !== 'ok' || unmanaged.key !== 'working_turn') {
+  throw new Error(`unmanaged agent rendering regressed: ${JSON.stringify(unmanaged)}`);
+}
+
+// A HEALTHY verdict must not be forced into the unhealthy path.
+var healthy = hooks.agentStateInfo({
+  health: { state: 'idle_waiting' },
+  cli_child_verdict: { state: 'HEALTHY_IDLE', action: 'none' },
+});
+if (healthy.key !== 'idle_waiting') {
+  throw new Error(`a HEALTHY_IDLE verdict should defer to raw health rendering: ${JSON.stringify(healthy)}`);
+}
+var healthyWorking = hooks.agentStateInfo({
+  health: { state: 'working_turn' },
+  cli_child_verdict: { state: 'HEALTHY_WORKING', action: 'none' },
+});
+if (healthyWorking.key !== 'working_turn') {
+  throw new Error(`a HEALTHY_WORKING verdict should defer to raw health rendering: ${JSON.stringify(healthyWorking)}`);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def _all_planner_states() -> list[str]:
+    """Every literal state string `supervisor._plan_one` can emit, extracted
+    directly from the LIVE source (never hand-copied into this test) - see
+    the identical helper + rationale in test_doctor.py. Duplicated rather
+    than shared: this repo's test modules are self-contained by convention.
+
+    round-3 review minor: assert the healthy allowlist is a SUBSET of the
+    extraction rather than a bare length floor - a floor tolerates coverage
+    silently shrinking; a subset check fails positively if a rename drops an
+    allowlisted state out of the extraction."""
+    from agenttalk import supervisor as supervisor_mod
+
+    src = inspect.getsource(supervisor_mod._plan_one)
+    states = set(re.findall(r'state\s*=\s*"([A-Z][A-Z0-9_]+)"', src))
+    states.update(re.findall(r'_healthy\(\s*"([A-Z][A-Z0-9_]+)"', src))
+    assert supervisor_mod.CLI_CHILD_HEALTHY_STATES <= states, (
+        f"extraction missed a known-healthy state: "
+        f"{supervisor_mod.CLI_CHILD_HEALTHY_STATES - states} not found in {sorted(states)}")
+    return sorted(states)
+
+
+def test_console_cli_child_verdict_never_confirms_health_for_a_non_healthy_state(
+    tmp_path: Path,
+) -> None:
+    """#105 round-2/3/4: drive EVERY planner-emittable state through
+    agentStateInfo() with a healthy-looking self-report. Only the two states
+    that confirm the child healthy (supervisor.CLI_CHILD_HEALTHY_STATES) may
+    defer to that self-report - every other state, known to this client or
+    not, must render as not confirmed healthy. One node process loops over
+    the full extracted state list so a new planner state is exercised here
+    automatically, never a hand-copied enumeration. Also covers: no state's
+    label is the overclaiming 'Dead' (round 3), the JS/Python healthy-
+    allowlist parity check (round 3 minor 4), and CLI_CHILD_STARTING
+    matching LAUNCHING's display severity (round 4)."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console cli_child_verdict test")
+    from agenttalk import supervisor as supervisor_mod
+
+    states = _all_planner_states()
+    healthy_states = sorted(supervisor_mod.CLI_CHILD_HEALTHY_STATES)
+    assert set(healthy_states) <= set(states)  # sanity: extraction saw them too
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    agentStateInfo: agentStateInfo,\n"
+        "    CLI_CHILD_HEALTHY_STATES: CLI_CHILD_HEALTHY_STATES\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-all-states.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-all-states.js"
+    runner.write_text(
+        "const fs = require('node:fs');\n"
+        "const vm = require('node:vm');\n"
+        "const ctx = {\n"
+        "  console,\n"
+        "  document: { readyState: 'loading', addEventListener() {} },\n"
+        "  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },\n"
+        "  performance: { now() { return 0; } },\n"
+        "  setInterval() {},\n"
+        "  clearInterval() {},\n"
+        "  fetch() { throw new Error('fetch should not run'); },\n"
+        "  __agenttalkConsoleTestHooks: null,\n"
+        "};\n"
+        "ctx.globalThis = ctx;\n"
+        "ctx.window = ctx;\n"
+        "vm.createContext(ctx);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);\n"
+        "const hooks = ctx.__agenttalkConsoleTestHooks;\n"
+        "const HEALTHY_COLORS = { ok: 1, info: 1, warn: 1, teal: 1 };\n"
+        f"const STATES = {json.dumps(states)};\n"
+        f"const HEALTHY_STATES = {json.dumps(healthy_states)};\n"
+        "\n"
+        "// round-3 review minor (4): JS parity check - console.js hardcodes its\n"
+        "// own 2-literal healthy allowlist rather than importing Python's; nothing\n"
+        "// stops the two from drifting apart. Assert they match exactly.\n"
+        "const jsHealthy = Object.keys(hooks.CLI_CHILD_HEALTHY_STATES).sort();\n"
+        "if (JSON.stringify(jsHealthy) !== JSON.stringify(HEALTHY_STATES)) {\n"
+        "  throw new Error(`console.js CLI_CHILD_HEALTHY_STATES ${JSON.stringify(jsHealthy)} "
+        "does not match supervisor.CLI_CHILD_HEALTHY_STATES ${JSON.stringify(HEALTHY_STATES)}`);\n"
+        "}\n"
+        "\n"
+        "for (const state of STATES) {\n"
+        "  const info = hooks.agentStateInfo({\n"
+        "    health: { state: 'working_turn' },\n"
+        "    cli_child_verdict: { state, action: 'none' },\n"
+        "  });\n"
+        "  if (HEALTHY_STATES.includes(state)) continue;\n"
+        "  if (HEALTHY_COLORS[info.color]) {\n"
+        "    throw new Error(`verdict state ${state} is not confirmed healthy but "
+        "rendered with a healthy color: ${info.color}`);\n"
+        "  }\n"
+        "  // round-3 review MAJOR: the gone tier is matched by family, so it\n"
+        "  // necessarily includes non-dead states (CLI_CHILD_STARTING, etc.) - the\n"
+        "  // chip must never overclaim with the literal word 'Dead' for ANY state.\n"
+        "  if (info.label === 'Dead') {\n"
+        "    throw new Error(`verdict state ${state} rendered the overclaiming 'Dead' label`);\n"
+        "  }\n"
+        "}\n"
+        "\n"
+        "// round-4 review: doctor.py downgrades CLI_CHILD_STARTING to the same\n"
+        "// severity as LAUNCHING (\"warn\") via cli_child_verdict_is_launching() -\n"
+        "// this surface must match (color 'attn', not 'danger'), even though the\n"
+        "// label stays 'Not confirmed alive' (unchanged from round 3).\n"
+        "const starting = hooks.agentStateInfo({\n"
+        "  health: { state: 'working_turn' },\n"
+        "  cli_child_verdict: { state: 'CLI_CHILD_STARTING', action: 'none' },\n"
+        "});\n"
+        "if (starting.color !== 'attn') {\n"
+        "  throw new Error(`CLI_CHILD_STARTING should render at the same severity as "
+        "LAUNCHING (attn), got: ${starting.color}`);\n"
+        "}\n"
+        "if (starting.label !== 'Not confirmed alive') {\n"
+        "  throw new Error(`CLI_CHILD_STARTING label regressed: ${starting.label}`);\n"
+        "}\n"
+        "// round-5 review: the tooltip must agree with colour/key, not just the\n"
+        "// label - a mild-severity chip asserting the child is GONE in its hover\n"
+        "// is the same overclaim the label fix removed, one layer down.\n"
+        "if (starting.desc.indexOf('is gone') !== -1) {\n"
+        "  throw new Error(`CLI_CHILD_STARTING tooltip still asserts 'gone': ${starting.desc}`);\n"
+        "}\n"
+        "if (starting.desc.indexOf('not confirmed healthy') === -1) {\n"
+        "  throw new Error(`CLI_CHILD_STARTING tooltip should read 'not confirmed healthy': ${starting.desc}`);\n"
+        "}\n"
+        "// A genuinely dead sibling must still be the strongest signal (danger),\n"
+        "// with a tooltip that agrees - the gone-family control for the above.\n"
+        "const stillDead = hooks.agentStateInfo({\n"
+        "  health: { state: 'working_turn' },\n"
+        "  cli_child_verdict: { state: 'STUCK_OR_DEAD', action: 'warn_only' },\n"
+        "});\n"
+        "if (stillDead.color !== 'danger') {\n"
+        "  throw new Error(`STUCK_OR_DEAD must stay danger-colored, got: ${stillDead.color}`);\n"
+        "}\n"
+        "if (stillDead.desc.indexOf('is gone') === -1) {\n"
+        "  throw new Error(`STUCK_OR_DEAD tooltip should still assert 'gone': ${stillDead.desc}`);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def test_console_poll_waits_for_slow_endpoint_before_rescheduling(tmp_path: Path) -> None:
     """#207: each endpoint gets one in-flight request and its next cadence starts
     after settlement, so a response slower than POLL_MS cannot stack requests."""
@@ -5348,6 +5624,47 @@ def test_api_state_wrapped_from_managed_lead_loop_when_health_unknown(tmp_path: 
         srv.server_close()
 
 
+def test_api_state_cli_child_verdict_overrides_self_reported_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#105: the wrapper's own health file is a SELF-report - it cannot notice
+    its own CLI child dying, so it keeps reporting a healthy-looking state
+    after the child is gone. When the supervisor's independently-verified
+    strict verdict says the child is confirmed dead, the Team Console must
+    carry that verdict alongside (never instead of dropping) the still-fine
+    self-report, and never scan the OS process tree to get it."""
+    from agenttalk import supervisor as supervisor_mod
+
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_IDLE_WAITING, cli="claude", mode="wrapper-loop")
+
+    def fake_observation(store, *, now_epoch, state, supervisor_config,
+                         snapshot, event_limit):
+        assert snapshot is None, "#105: must never scan the OS process tree"
+        return {"agents": [
+            {"name": "alpha",
+             "decision": {"state": "STUCK_OR_DEAD", "action": "warn_only"}},
+        ]}
+
+    monkeypatch.setattr(supervisor_mod, "build_supervisor_observation", fake_observation)
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        # Raw self-report is kept, unchanged - demoted, not deleted.
+        assert alpha["health"]["state"] == _hm.STATE_IDLE_WAITING
+        assert alpha["cli_child_verdict"] == {
+            "state": "STUCK_OR_DEAD", "action": "warn_only",
+        }
+        # 'beta' has no supervisor decision -> field OMITTED (absent-not-null).
+        beta = next(a for a in root["agents"] if a["name"] == "beta")
+        assert "cli_child_verdict" not in beta
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_state_capacity_null_percent_allowed_inside_object(tmp_path: Path) -> None:
     """§3a: a capacity snapshot with only one signal keeps the OTHER percent as
     null INSIDE the capacity object (the absent-not-null rule is about the
@@ -6154,6 +6471,48 @@ def _attention(base: str) -> dict:
         assert resp.status == 200
         assert resp.headers["Content-Type"].startswith("application/json")
         return json.loads(resp.read())
+
+
+def test_api_attention_renders_unlisted_source_generically_instead_of_dropping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#130: web.py's _ATTENTION_SOURCE_MAP is a private allowlist the CLI
+    does not have - an item from a source not yet in that map used to be
+    silently dropped by `if mapped is None: continue`, so `agenttalk
+    attention` showed it in the terminal while the console showed nothing
+    for the exact same store. A NOVEL/unlisted source must render under a
+    generic category end-to-end, never vanish."""
+    from agenttalk import attention as att
+
+    s = _make_store(tmp_path)
+    novel_source = "future_source_not_yet_in_the_console_allowlist"
+    novel_item = att._mk_item(
+        novel_source, att.item_id(novel_source, "alpha"),
+        title="a brand-new kind of attention item",
+        ident_content={"agent": "alpha"},
+        human_can_unblock_now=False,
+        fields={"why_it_matters": "exercises the #130 fallback path"},
+    )
+    novel_item["dedupe_key"] = att.dedupe_key(novel_source, identity="alpha")
+
+    real_collect = web._collect_web_attention_items
+
+    def collect_plus_novel(store, roster, for_agent):
+        return [*real_collect(store, roster, for_agent), novel_item]
+
+    monkeypatch.setattr(web, "_collect_web_attention_items", collect_plus_novel)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+        matches = [it for it in payload["items"] if it["id"] == novel_item["item_id"]]
+        assert matches, (
+            f"unlisted source vanished instead of rendering generically: {payload}")
+        assert matches[0]["source"] == "other"
+        assert matches[0]["source_label"] == "OTHER"
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def test_api_attention_surfaces_process_tree_hold_without_liaison(
@@ -8285,6 +8644,45 @@ def test_api_risk_register_stays_partial_when_source_error_is_deferred(
             f"a DEFERRED source_error must still mark the register partial - the source "
             f"is still genuinely unreadable even though the warning item is hidden: {payload}")
         assert any("dead_letter" in d for d in payload["degraded_sources"]), payload
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_risk_register_renders_unlisted_source_generically_instead_of_dropping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#130 companion: the risk register has the SAME private allowlist
+    (shared _ATTENTION_SOURCE_MAP) and the same silent-drop bug - a novel
+    source must appear under the register's "Other" category, not vanish."""
+    from agenttalk import attention as att
+
+    s = _make_store(tmp_path)
+    novel_source = "future_source_not_yet_in_the_console_allowlist"
+    novel_item = att._mk_item(
+        novel_source, att.item_id(novel_source, "alpha"),
+        title="a brand-new kind of attention item",
+        ident_content={"agent": "alpha"},
+        human_can_unblock_now=False,
+        fields={"why_it_matters": "exercises the #130 fallback path"},
+    )
+    novel_item["dedupe_key"] = att.dedupe_key(novel_source, identity="alpha")
+
+    real_collect = web._collect_web_attention_items
+
+    def collect_plus_novel(store, roster, for_agent):
+        return [*real_collect(store, roster, for_agent), novel_item]
+
+    monkeypatch.setattr(web, "_collect_web_attention_items", collect_plus_novel)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _risk_register(base)
+        matches = [it for it in payload["items"] if it["id"] == novel_item["item_id"]]
+        assert matches, (
+            f"unlisted source vanished instead of rendering generically: {payload}")
+        assert matches[0]["category"] == "other"
+        assert matches[0]["category_label"] == "Other"
     finally:
         srv.shutdown()
         srv.server_close()

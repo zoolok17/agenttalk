@@ -719,6 +719,19 @@ body {
 .status-unknown.tc-dot,
 .status-unknown.tc-legend-dot { background: var(--gray); }
 
+/* #105: the supervisor's strict CLI-child verdict, when it overrides the
+   wrapper's own self-reported health — must never read as healthy/green.
+   Two severities: confirmed gone (the generalized CLI_CHILD_*/terminal
+   predicate) vs. everything else not confirmed healthy (fail-closed
+   default for every other/future verdict state). */
+.status-cli_child_gone.tc-chip { color: var(--danger); background: var(--danger-soft); }
+.status-cli_child_gone.tc-dot,
+.status-cli_child_gone.tc-legend-dot { background: var(--danger); }
+
+.status-cli_child_unconfirmed.tc-chip { color: var(--attn); background: var(--attn-soft); }
+.status-cli_child_unconfirmed.tc-dot,
+.status-cli_child_unconfirmed.tc-legend-dot { background: var(--attn); }
+
 /* --- Kind chip color map (message kinds) --- */
 .kind-review-request { color: var(--accent); background: var(--accent-soft); }
 .kind-review-result  { color: var(--ok); background: var(--ok-soft); }

@@ -587,7 +587,78 @@
       ? Math.max(0, monotonicNow() - agent._receivedAt) / 1000 : 0;
     return (age + elapsed) <= UNWRAPPED_LIVE_STALE_AFTER_SECONDS;
   }
+  // #105: agent.health above is the WRAPPER'S OWN self-report - it cannot
+  // notice its own CLI child dying, so it can (and does) keep reporting a
+  // healthy-looking state after the child is gone. agent.cli_child_verdict
+  // is the supervisor's independently-verified strict verdict (present only
+  // for auto_restart-managed agents), one of 20+ states the planner emits.
+  //
+  // round-2 review finding: hand-listing 3 "bad" verdict states here missed
+  // six more that ALSO mean the child/wrapper is gone (the CLI_CHILD_*
+  // family plus WRAPPER_MISSING), which fell through to the self-report and
+  // rendered healthy - the exact bug this fix exists to close. Fixed with
+  // an ALLOWLIST of the only two states that confirm the child healthy,
+  // mirroring supervisor.CLI_CHILD_HEALTHY_STATES exactly: every other
+  // verdict, known or not-yet-invented, defaults to NOT confirmed healthy -
+  // never a fall-through to the self-report. Kept as two severities purely
+  // for operator legibility (gone vs. merely-not-confirmed); the safety
+  // property (never healthy-colored) does not depend on that split.
+  var CLI_CHILD_HEALTHY_STATES = { HEALTHY_IDLE: 1, HEALTHY_WORKING: 1 };
+  // Mirrors supervisor.cli_child_verdict_is_gone() - the SAME generalized
+  // predicate _plan_one's own _result() closure uses internally, matched by
+  // family (the CLI_CHILD_ prefix) rather than a hand-copied enumeration.
+  var CLI_CHILD_GONE_NAMED_STATES = { TURN_FAILED: 1, WRAPPER_MISSING: 1, STUCK_OR_DEAD: 1 };
+  function cliChildVerdictIsGone(state) {
+    return state.indexOf('CLI_CHILD_') === 0 || !!CLI_CHILD_GONE_NAMED_STATES[state];
+  }
+  // Mirrors supervisor.cli_child_verdict_is_launching() - DISPLAY-ONLY,
+  // never consulted for anything but this chip's SEVERITY (never its
+  // label - see below). CLI_CHILD_STARTING is the same lifecycle moment as
+  // LAUNCHING (a normal, expected transient during agent boot), so it must
+  // not display more alarmingly than LAUNCHING just because it happens to
+  // fall inside cliChildVerdictIsGone()'s family match.
+  function cliChildVerdictIsLaunching(state) {
+    return state === 'CLI_CHILD_STARTING';
+  }
   function agentStateInfo(agent) {
+    var verdictState = agent && agent.cli_child_verdict && typeof agent.cli_child_verdict === 'object'
+      ? agent.cli_child_verdict.state : null;
+    if (typeof verdictState === 'string' && !CLI_CHILD_HEALTHY_STATES[verdictState]) {
+      var gone = cliChildVerdictIsGone(verdictState);
+      // round-3 review MAJOR: the gone tier is matched by FAMILY (the
+      // CLI_CHILD_ prefix _plan_one's own bookkeeping depends on, never
+      // carved up here), so it necessarily includes states that are not
+      // literally dead - CLI_CHILD_STARTING (every normal launch),
+      // CLI_CHILD_STALL_SUSPECT, CLI_CHILD_NO_PROGRESS. A chip reading
+      // "Dead" for those overclaims doom the CLI's plain state-name output
+      // never did. Label fix ONLY - color/severity is unchanged (still the
+      // strongest, most visible signal that this is NOT confirmed healthy).
+      //
+      // round-4 review: doctor.py downgrades CLI_CHILD_STARTING to "warn"
+      // (same as LAUNCHING) via the SAME launching helper - this surface
+      // must match that severity, so `severe` (not `gone`) drives color/key.
+      // The LABEL still comes from `gone` alone and stays 'Not confirmed
+      // alive' for CLI_CHILD_STARTING - only the severity/color moves.
+      //
+      // round-5 review: the tooltip was left branching on `gone`, so a
+      // CLI_CHILD_STARTING chip had a mild colour + honest label but a
+      // hover flatly asserting "the child or its wrapper is gone" during
+      // every normal launch - the exact overclaim the label fix removed,
+      // one layer down. `desc` now branches on `severe` too, so colour/
+      // key/tooltip all agree; the genuinely-gone family keeps the gone
+      // wording.
+      var severe = gone && !cliChildVerdictIsLaunching(verdictState);
+      return {
+        label: gone ? 'Not confirmed alive' : 'Not confirmed healthy',
+        key: 'cli_child_' + (severe ? 'gone' : 'unconfirmed'),
+        color: severe ? 'danger' : 'attn',
+        grp: 'attn',
+        desc: 'The supervisor’s verdict for this agent’s CLI child is "' + verdictState +
+          '" — ' + (severe ? 'the child or its wrapper is gone.' : 'not confirmed healthy.') +
+          ' The wrapper’s own self-report below is not proof of life.',
+        rawHealthState: ((agent && agent.health) || {}).state
+      };
+    }
     var raw = ((agent && agent.health) || {}).state;
     var info = stateInfo(raw);
     if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
@@ -1111,7 +1182,14 @@
   }
   function statusChip(st) {
     var info = stateInfoFrom(st);
-    return titled(el('span', 'tc-chip ' + statusClass(info), info.label), info.desc);
+    // #105: when a strict CLI-child verdict overrode the self-reported
+    // health, surface that raw state as a demoted secondary detail in the
+    // tooltip rather than dropping it silently.
+    var desc = info.desc;
+    if (info.rawHealthState) {
+      desc = desc + ' (wrapper self-reports: ' + info.rawHealthState + ')';
+    }
+    return titled(el('span', 'tc-chip ' + statusClass(info), info.label), desc);
   }
   function kindChip(kind) {
     var info = kindInfo(kind);

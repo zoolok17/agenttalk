@@ -1448,6 +1448,19 @@ class HealthTimelineRing:
             return []
 
 
+def _cli_child_verdicts(store: Store, now_epoch: float) -> dict[str, dict]:
+    """#105: the strict per-agent CLI-child verdict, best-effort. See
+    ``supervisor.strict_child_verdicts`` - never scans OS processes, and any
+    read/parse failure degrades to ``{}`` so a bad supervisor.json/state
+    never blanks the agent grid, only loses the secondary verdict."""
+    try:
+        from agenttalk import supervisor as _supervisor
+
+        return _supervisor.strict_child_verdicts(store, now_epoch=now_epoch)
+    except Exception:  # noqa: BLE001 — advisory arm; never fail the root
+        return {}
+
+
 def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                    liaison: str | None, *,
                    threads_rows: list[dict] | None = None,
@@ -1455,7 +1468,8 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                    avatar_prefs: dict[str, str] | None = None,
                    history: "HealthTimelineRing | None" = None,
                    root_label: str | None = None,
-                   managed_loop: set[str] | None = None) -> list[dict]:
+                   managed_loop: set[str] | None = None,
+                   cli_child_verdicts: dict[str, dict] | None = None) -> list[dict]:
     """Per-agent presence rows (data-model §3). Absent-not-null keys.
 
     0.58.0 additive fields (all OMITTED when not determinable): ``cli``,
@@ -1468,6 +1482,12 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     An agent in this set is wrapped/restartable even when its health mode is
     unknown (stale/missing snapshot) — that is exactly when the restart signal
     matters most, so health mode must not be the sole arm.
+
+    ``cli_child_verdicts`` (#105): ``{name: {"state", "action"}}`` from
+    ``supervisor.strict_child_verdicts``, computed ONCE per root by the
+    caller. Present only for agents with an independently-verified CLI-child
+    verdict (auto_restart-managed agents); everyone else keeps today's
+    raw-health-only rendering.
     """
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
@@ -1475,6 +1495,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     owned_domains = owned_domains or {}
     avatar_prefs = avatar_prefs or {}
     managed_loop = managed_loop or set()
+    cli_child_verdicts = cli_child_verdicts or {}
     now = datetime.now(timezone.utc)
     now_epoch = now.timestamp()
     # 0.19.0 (FR-001): per-agent message counts from the SAME validated `msgs`
@@ -1502,6 +1523,14 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                 e["last_seen_age_seconds"] = round(heartbeat_age, 3)
         health = store.read_health(a, now_epoch=now_epoch, heartbeat=hb)
         e["health"] = health
+        # #105: the raw health above is the wrapper's own self-report - it
+        # cannot notice its own CLI child dying. When the supervisor has an
+        # independently-verified strict verdict for this agent, attach it so
+        # the client renders THAT (never a self-reported "healthy" over a
+        # confirmed-dead or unverifiable child); absent for unmanaged agents.
+        verdict = cli_child_verdicts.get(a)
+        if isinstance(verdict, dict):
+            e["cli_child_verdict"] = verdict
         e["unread"] = _unread_count(msgs, a, store.cursor(a))
         e["sent"] = sent_counts.get(a, 0)
         e["received"] = recv_counts.get(a, 0)
@@ -1636,6 +1665,8 @@ def _root_state(desc: RootDescriptor,
                     managed_loop.add(a)
         except Exception:  # noqa: BLE001 — advisory arm; never fail the root
             managed_loop = set()
+        cli_child_verdicts = _cli_child_verdicts(
+            store, datetime.now(timezone.utc).timestamp())
         out: dict[str, Any] = {
             "label": label,
             "path": path,
@@ -1667,7 +1698,7 @@ def _root_state(desc: RootDescriptor,
             store, cfg, msgs, liaison,
             threads_rows=threads_rows, owned_domains=owned_domains,
             avatar_prefs=avatar_prefs, history=history, root_label=label,
-            managed_loop=managed_loop)
+            managed_loop=managed_loop, cli_child_verdicts=cli_child_verdicts)
         out["retired"] = store.retired_agents()
         out["threads"] = threads_rows
         out["broadcasts"] = broadcasts
@@ -2350,6 +2381,13 @@ _ATTENTION_SOURCE_MAP: dict[str, tuple[str, str, str]] = {
     _attention.SOURCE_ERROR: ("supervisor", "SUPERVISOR", "low"),
 }
 
+# #130: an internal source with no entry above must not vanish from the
+# console - the CLI has no such allowlist, so the SAME store showed items in
+# the terminal and nothing in the console, silently. Render it under a
+# generic category rather than dropping it. (Kept out of the map itself so
+# a genuinely new named source can still get a purpose-built label later.)
+_ATTENTION_SOURCE_FALLBACK: tuple[str, str, str] = ("other", "OTHER", "low")
+
 
 def _attention_agent(item: dict) -> str | None:
     """Best-effort agent the item concerns, from its envelope source_refs
@@ -2607,10 +2645,12 @@ def build_attention(desc: RootDescriptor,
         wire: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
-            mapped = _ATTENTION_SOURCE_MAP.get(src)
-            if mapped is None:
-                continue  # unknown internal source — skip rather than mislabel
-            wire_source, source_label, severity = mapped
+            # #130: an unlisted source is rendered generically, never dropped
+            # (a silent drop here — but not in the CLI, which has no such
+            # allowlist — showed items in the terminal and nothing in the
+            # console for the exact same store).
+            wire_source, source_label, severity = (
+                _ATTENTION_SOURCE_MAP.get(src) or _ATTENTION_SOURCE_FALLBACK)
             title = it.get("title") or "attention needed"
             detail = it.get("why_it_matters") or ""
             entry = {
@@ -3148,10 +3188,10 @@ def build_risk_register(desc: RootDescriptor) -> dict:
         risks: list[dict] = []
         for it in queue.get("items", []):
             src = it.get("source", "")
-            mapped = _ATTENTION_SOURCE_MAP.get(src)
-            if mapped is None:
-                continue  # unknown internal source — skip rather than mislabel
-            wire_source, _label, coarse_severity = mapped
+            # #130: an unlisted source is rendered generically (category_label
+            # already falls back to "Other" below), never dropped.
+            wire_source, _label, coarse_severity = (
+                _ATTENTION_SOURCE_MAP.get(src) or _ATTENTION_SOURCE_FALLBACK)
             # Prefer the item's OWN typed risk assessment (an operator-authored
             # escalation's meta.attention.risk_severity) over the coarse
             # per-source default - a low-risk escalation must not be forced to
