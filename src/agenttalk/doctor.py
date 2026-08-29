@@ -1766,6 +1766,12 @@ def _check_heartbeats(store: Store) -> list[Check]:
     state neither bucket recognizes yet) downgrades to at least ``warn`` -
     fail-closed by construction, never falls through to "ok". The heartbeat
     detail is kept, not dropped, as secondary context.
+
+    round-3 review minor: CLI_CHILD_STARTING falls inside the gone family's
+    CLI_CHILD_* prefix match (which the planner's own bookkeeping depends on
+    and this display layer does not touch), but it is the SAME lifecycle
+    moment as LAUNCHING - display-only, it downgrades to ``warn`` like
+    LAUNCHING instead of ``error``, via cli_child_verdict_is_launching().
     """
     cfg = store.load_config()
     now = datetime.now(timezone.utc)
@@ -1786,7 +1792,8 @@ def _check_heartbeats(store: Store) -> list[Check]:
                 details = f"last seen {int(age)}s ago"
         verdict_state = verdicts.get(a, {}).get("state")
         if isinstance(verdict_state, str) and not sup.cli_child_verdict_is_healthy(verdict_state):
-            if sup.cli_child_verdict_is_gone(verdict_state):
+            if (sup.cli_child_verdict_is_gone(verdict_state)
+                    and not sup.cli_child_verdict_is_launching(verdict_state)):
                 status = "error"
                 details = (f"supervisor confirms the CLI child is {verdict_state} "
                            f"(heartbeat alone is not proof of life: {details})")

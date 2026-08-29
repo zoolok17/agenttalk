@@ -3055,13 +3055,20 @@ def _all_planner_states() -> list[str]:
     """Every literal state string `supervisor._plan_one` can emit, extracted
     directly from the LIVE source (never hand-copied into this test) - see
     the identical helper + rationale in test_doctor.py. Duplicated rather
-    than shared: this repo's test modules are self-contained by convention."""
+    than shared: this repo's test modules are self-contained by convention.
+
+    round-3 review minor: assert the healthy allowlist is a SUBSET of the
+    extraction rather than a bare length floor - a floor tolerates coverage
+    silently shrinking; a subset check fails positively if a rename drops an
+    allowlisted state out of the extraction."""
     from agenttalk import supervisor as supervisor_mod
 
     src = inspect.getsource(supervisor_mod._plan_one)
     states = set(re.findall(r'state\s*=\s*"([A-Z][A-Z0-9_]+)"', src))
     states.update(re.findall(r'_healthy\(\s*"([A-Z][A-Z0-9_]+)"', src))
-    assert len(states) >= 20, f"state-extraction regex looks broken: {sorted(states)}"
+    assert supervisor_mod.CLI_CHILD_HEALTHY_STATES <= states, (
+        f"extraction missed a known-healthy state: "
+        f"{supervisor_mod.CLI_CHILD_HEALTHY_STATES - states} not found in {sorted(states)}")
     return sorted(states)
 
 
@@ -3090,7 +3097,8 @@ def test_console_cli_child_verdict_never_confirms_health_for_a_non_healthy_state
     src = src.replace(
         marker,
         "  globalThis.__agenttalkConsoleTestHooks = {\n"
-        "    agentStateInfo: agentStateInfo\n"
+        "    agentStateInfo: agentStateInfo,\n"
+        "    CLI_CHILD_HEALTHY_STATES: CLI_CHILD_HEALTHY_STATES\n"
         "  };\n\n" + marker,
         1,
     )
@@ -3118,6 +3126,16 @@ def test_console_cli_child_verdict_never_confirms_health_for_a_non_healthy_state
         "const HEALTHY_COLORS = { ok: 1, info: 1, warn: 1, teal: 1 };\n"
         f"const STATES = {json.dumps(states)};\n"
         f"const HEALTHY_STATES = {json.dumps(healthy_states)};\n"
+        "\n"
+        "// round-3 review minor (4): JS parity check - console.js hardcodes its\n"
+        "// own 2-literal healthy allowlist rather than importing Python's; nothing\n"
+        "// stops the two from drifting apart. Assert they match exactly.\n"
+        "const jsHealthy = Object.keys(hooks.CLI_CHILD_HEALTHY_STATES).sort();\n"
+        "if (JSON.stringify(jsHealthy) !== JSON.stringify(HEALTHY_STATES)) {\n"
+        "  throw new Error(`console.js CLI_CHILD_HEALTHY_STATES ${JSON.stringify(jsHealthy)} "
+        "does not match supervisor.CLI_CHILD_HEALTHY_STATES ${JSON.stringify(HEALTHY_STATES)}`);\n"
+        "}\n"
+        "\n"
         "for (const state of STATES) {\n"
         "  const info = hooks.agentStateInfo({\n"
         "    health: { state: 'working_turn' },\n"
@@ -3127,6 +3145,12 @@ def test_console_cli_child_verdict_never_confirms_health_for_a_non_healthy_state
         "  if (HEALTHY_COLORS[info.color]) {\n"
         "    throw new Error(`verdict state ${state} is not confirmed healthy but "
         "rendered with a healthy color: ${info.color}`);\n"
+        "  }\n"
+        "  // round-3 review MAJOR: the gone tier is matched by family, so it\n"
+        "  // necessarily includes non-dead states (CLI_CHILD_STARTING, etc.) - the\n"
+        "  // chip must never overclaim with the literal word 'Dead' for ANY state.\n"
+        "  if (info.label === 'Dead') {\n"
+        "    throw new Error(`verdict state ${state} rendered the overclaiming 'Dead' label`);\n"
         "  }\n"
         "}\n",
         encoding="utf-8",

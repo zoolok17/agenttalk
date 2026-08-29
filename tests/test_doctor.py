@@ -26,11 +26,19 @@ def _all_planner_states() -> list[str]:
     hand-copied list in THIS test would carry the identical staleness risk.
     Scanning the source instead means a state the planner grows tomorrow is
     automatically exercised here, with no list to remember to update.
+
+    round-3 review minor: a bare ``len(states) >= 20`` floor could silently
+    tolerate coverage SHRINKING by several states (a broken regex still
+    clears 20). Assert the healthy allowlist is a SUBSET of what was
+    extracted instead - a rename/typo that drops an allowlisted state out of
+    the extraction fails this positively, not just quietly under-counts.
     """
     src = inspect.getsource(sup._plan_one)
     states = set(re.findall(r'state\s*=\s*"([A-Z][A-Z0-9_]+)"', src))
     states.update(re.findall(r'_healthy\(\s*"([A-Z][A-Z0-9_]+)"', src))
-    assert len(states) >= 20, f"state-extraction regex looks broken: {sorted(states)}"
+    assert sup.CLI_CHILD_HEALTHY_STATES <= states, (
+        f"extraction missed a known-healthy state: "
+        f"{sup.CLI_CHILD_HEALTHY_STATES - states} not found in {sorted(states)}")
     return sorted(states)
 
 
@@ -666,13 +674,15 @@ def test_doctor_heartbeat_check_never_reports_ok_for_a_non_healthy_verdict(
     monkeypatch: pytest.MonkeyPatch,
     verdict_state: str,
 ) -> None:
-    """#105 round-2: drive EVERY planner-emittable state through the doctor
-    heartbeat check with an otherwise-perfectly-fresh heartbeat. The only
-    states allowed to leave the check at "ok" are the two that confirm the
-    child healthy (sup.CLI_CHILD_HEALTHY_STATES) - everything else, known or
-    not, must downgrade. Parametrized over the extracted state list so a new
-    state the planner grows is exercised automatically, not just the ones
-    this test's author happened to think of."""
+    """#105 round-2/3: drive EVERY planner-emittable state through the
+    doctor heartbeat check with an otherwise-perfectly-fresh heartbeat. Only
+    the two states that confirm the child healthy (sup.CLI_CHILD_HEALTHY_STATES)
+    may leave the check at "ok"; the gone family (minus the CLI_CHILD_STARTING
+    display exception - round-3 review: it is the SAME lifecycle moment as
+    LAUNCHING, not a sign of trouble) downgrades to "error"; everything else,
+    known or not, downgrades to at least "warn". Parametrized over the
+    extracted state list so a new state the planner grows is exercised
+    automatically, not just the ones this test's author happened to think of."""
     s = Store(tmp_path)
     s.init(["alpha"])
     s.write_heartbeat("alpha")
@@ -689,10 +699,40 @@ def test_doctor_heartbeat_check_never_reports_ok_for_a_non_healthy_verdict(
 
     if sup.cli_child_verdict_is_healthy(verdict_state):
         assert check.status == "ok", (verdict_state, check)
+    elif (sup.cli_child_verdict_is_gone(verdict_state)
+          and not sup.cli_child_verdict_is_launching(verdict_state)):
+        assert check.status == "error", (verdict_state, check)
     else:
-        assert check.status != "ok", (
-            f"verdict state {verdict_state!r} is not confirmed healthy but the "
-            f"heartbeat check still reported {check.status!r}: {check}")
+        assert check.status == "warn", (verdict_state, check)
+
+
+def test_doctor_heartbeat_check_treats_cli_child_starting_like_launching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """round-3 review minor: CLI_CHILD_STARTING and LAUNCHING are the SAME
+    lifecycle moment (an agent coming up normally), but CLI_CHILD_STARTING
+    used to get "error" (it falls inside the gone family's CLI_CHILD_*
+    prefix match, which the planner's own bookkeeping depends on) while
+    LAUNCHING got "warn" - display-only misalignment, not a planner change."""
+    s = Store(tmp_path)
+    s.init(["starting", "launching"])
+    s.write_heartbeat("starting")
+    s.write_heartbeat("launching")
+
+    def fake_observation(store, *, now_epoch, state, supervisor_config,
+                         snapshot, event_limit):
+        return {"agents": [
+            {"name": "starting", "decision": {"state": "CLI_CHILD_STARTING", "action": "none"}},
+            {"name": "launching", "decision": {"state": "LAUNCHING", "action": "none"}},
+        ]}
+
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", fake_observation)
+    report = doctor.run(tmp_path)
+    hb_by_name = {c.name: c for c in report.checks if c.name.startswith("heartbeat.")}
+
+    assert hb_by_name["heartbeat.starting"].status == "warn"
+    assert hb_by_name["heartbeat.launching"].status == "warn"
 
 
 def test_doctor_skill_check_warns_when_target_differs(

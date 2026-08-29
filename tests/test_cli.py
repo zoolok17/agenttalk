@@ -26,11 +26,18 @@ def _all_planner_states() -> list[str]:
     """Every literal state string `supervisor._plan_one` can emit, extracted
     directly from the LIVE source (never hand-copied into this test) - see
     the identical helper + rationale in test_doctor.py. Duplicated rather
-    than shared: this repo's test modules are self-contained by convention."""
+    than shared: this repo's test modules are self-contained by convention.
+
+    round-3 review minor: assert the healthy allowlist is a SUBSET of the
+    extraction rather than a bare length floor - a floor tolerates coverage
+    silently shrinking; a subset check fails positively if a rename drops an
+    allowlisted state out of the extraction."""
     src = inspect.getsource(cli.sup._plan_one)
     states = set(re.findall(r'state\s*=\s*"([A-Z][A-Z0-9_]+)"', src))
     states.update(re.findall(r'_healthy\(\s*"([A-Z][A-Z0-9_]+)"', src))
-    assert len(states) >= 20, f"state-extraction regex looks broken: {sorted(states)}"
+    assert cli.sup.CLI_CHILD_HEALTHY_STATES <= states, (
+        f"extraction missed a known-healthy state: "
+        f"{cli.sup.CLI_CHILD_HEALTHY_STATES - states} not found in {sorted(states)}")
     return sorted(states)
 
 

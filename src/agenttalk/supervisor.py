@@ -2242,6 +2242,19 @@ def cli_child_verdict_is_gone(state: str) -> bool:
     return state.startswith("CLI_CHILD_") or state in CLI_CHILD_GONE_NAMED_STATES
 
 
+def cli_child_verdict_is_launching(state: str) -> bool:
+    """DISPLAY-ONLY (round-3 review minor): CLI_CHILD_STARTING is the exact
+    same lifecycle moment as the planner's own LAUNCHING state - a normal,
+    expected transient during agent boot, not a sign of trouble. It falls
+    inside :func:`cli_child_verdict_is_gone`'s CLI_CHILD_* family match
+    (which `_plan_one`'s own bookkeeping depends on and this function does
+    NOT change), so a display surface must not report it more alarmingly
+    than LAUNCHING just because of that family membership. Never consulted
+    by the planner itself.
+    """
+    return state == "CLI_CHILD_STARTING"
+
+
 def resolve_poll_seconds(config: dict) -> float:
     """The supervisor's configured poll cadence (PURE), config then default."""
     config = config if isinstance(config, dict) else {}

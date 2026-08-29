@@ -616,8 +616,16 @@
       ? agent.cli_child_verdict.state : null;
     if (typeof verdictState === 'string' && !CLI_CHILD_HEALTHY_STATES[verdictState]) {
       var gone = cliChildVerdictIsGone(verdictState);
+      // round-3 review MAJOR: the gone tier is matched by FAMILY (the
+      // CLI_CHILD_ prefix _plan_one's own bookkeeping depends on, never
+      // carved up here), so it necessarily includes states that are not
+      // literally dead - CLI_CHILD_STARTING (every normal launch),
+      // CLI_CHILD_STALL_SUSPECT, CLI_CHILD_NO_PROGRESS. A chip reading
+      // "Dead" for those overclaims doom the CLI's plain state-name output
+      // never did. Label fix ONLY - color/severity is unchanged (still the
+      // strongest, most visible signal that this is NOT confirmed healthy).
       return {
-        label: gone ? 'Dead' : 'Not confirmed healthy',
+        label: gone ? 'Not confirmed alive' : 'Not confirmed healthy',
         key: 'cli_child_' + (gone ? 'gone' : 'unconfirmed'),
         color: gone ? 'danger' : 'attn',
         grp: 'attn',
