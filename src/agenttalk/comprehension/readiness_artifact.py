@@ -170,6 +170,11 @@ _READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
     "route_annotation_unassociated": frozenset(),
     "route_value_unrecoverable": frozenset(),
     "cli_main_unrecognized": frozenset({"entry_points_mapped"}),
+    # FIX ROUND 14 (tenth cold read, CR10-5 JUDGE, completeness): a
+    # recognized-but-unsupported source language (worker.py) is exactly
+    # "this file's content itself could not be confidently processed" -
+    # the same bucket parse_failed/no_types_extracted already feed.
+    "unsupported_language": frozenset({"source_understood"}),
 }
 
 

@@ -108,6 +108,24 @@ def test_source_understood_unknown_when_the_adapter_failed_to_parse():
     assert summaries[0].stored_assessment_state == "needs_evidence"
 
 
+def test_source_understood_unknown_when_the_file_is_an_unsupported_language():
+    """FIX ROUND 14 (tenth cold read, CR10-5 JUDGE, completeness): a
+    recognized-but-unsupported source shape (JSP/properties/Spring-XML/
+    SQL) is a NEW reason_code worker.py now records - it must be named in
+    the closed _READINESS_CHECKS_BY_REASON_CODE map (else this dict
+    lookup raises KeyError for every such file) and feed source_understood
+    the same way parse_failed/resource_limit already do."""
+    signals, summaries = ra.build_readiness(
+        [_unit(
+            "u1", language="unknown", adapter_problem_reason="unsupported_language",
+            adapter_problem_reasons=["unsupported_language"],
+        )], [], [])
+    signal = _signal_by_check(signals, "source_understood")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "adapter_unsupported_language"
+    assert summaries[0].stored_assessment_state == "needs_evidence"
+
+
 def test_source_understood_unknown_when_the_adapter_work_resource_cap_skipped_it():
     """M-2 (third cold read, fix round 5): CLOSES THE CLASS - round 3
     threaded ONLY the ``parse_failed`` reason; a file the worker skipped

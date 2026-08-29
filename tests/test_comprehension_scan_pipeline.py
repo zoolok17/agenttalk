@@ -717,6 +717,30 @@ def test_run_scan_publishes_problems_json_and_it_reaches_the_report(
     assert report["counts"]["problems"] == 1
 
 
+def test_run_scan_over_a_jsp_estate_degrades_with_a_named_unsupported_language_problem(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 14 (tenth cold read, CR10-5 JUDGE, completeness): the
+    design names ``unsupported_language`` as a problem code and a
+    ``degraded`` trigger ("part of the selected source is unsupported")
+    - a run over a JSP/properties/Spring-XML/SQL estate used to publish
+    complete with problem_count 0, contradicting that text. This is the
+    real end-to-end path (no synthetic problem injection): a genuine
+    ordinary Java project plus one real .jsp file on disk."""
+    (java_repo / "index.jsp").write_text(
+        "<%@ page language=\"java\" %>\n<html></html>\n", encoding="utf-8")
+
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+    doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    jsp_problems = [p for p in doc["problems"] if p["path"] == "index.jsp"]
+    assert len(jsp_problems) == 1
+    assert jsp_problems[0]["reason_code"] == "unsupported_language"
+    assert jsp_problems[0]["severity"] == "warning"
+
+
 def test_worker_problem_reason_by_path_joins_sorted_unique_reasons_for_one_path(
     java_repo: Path, monkeypatch,
 ) -> None:
