@@ -37,6 +37,14 @@ from .modules_artifact import ModuleRecord
 POLICY_VERSION = 1
 POLICY_ID = "agenttalk.comprehension.readiness.default_policy"
 
+#: FIX ROUND 12 (eighth cold read, F8): the closed vocabulary
+#: ``stored_assessment_state``/``assessment_state`` actually publish -
+#: named here as a live constant, not left implicit in a type-comment,
+#: so ``--readiness``/``readiness_state`` (projector.py) has something
+#: real to validate an unrecognized value against instead of silently
+#: matching nothing.
+ASSESSMENT_STATES = ("assessed", "needs_evidence", "blocked", "not_applicable")
+
 CHECKS = (
     "source_understood",
     "dependencies_resolved",
@@ -150,10 +158,28 @@ def _check_source_understood(unit: ModuleRecord) -> ReadinessSignal:
     return _signal(unit.unit_id, "source_understood", "unknown", "detected", "no_adapter_for_language")
 
 
+#: FIX ROUND 12 (eighth cold read, F2 MAJOR + F5 folded in): the design
+#: names this check for "direct INTERNAL dependencies" specifically - an
+#: ``invoke`` edge is call-site behavioral evidence, not a declared
+#: dependency, and the adapter has no way to recognize a JDK-only
+#: qualifier (``Math``, ``String``, ``System``, ...) as external the way
+#: an unresolved import IS recognizably external - it can only ever
+#: report ``unresolved`` for one. Letting ``invoke`` drive this check
+#: made an ORDINARY class calling ordinary JDK methods report
+#: dependencies_resolved UNSATISFIED with no real dependency problem at
+#: all. ``import``/``inherit`` (source-level) and ``build`` (declared
+#: Maven artifact dependencies) are the relations that actually assert a
+#: direct dependency; ``test``/``route``/``data``/``configuration`` are
+#: each covered by their own dedicated check (or are unsupported this
+#: slice) and never belong here either.
+_DEPENDENCY_RESOLUTION_RELATIONS = frozenset({"import", "inherit", "build"})
+
+
 def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRecord]) -> ReadinessSignal:
-    if not outgoing:
+    relevant = [edge for edge in outgoing if edge.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
+    if not relevant:
         return _signal(unit.unit_id, "dependencies_resolved", "satisfied", "detected", "no_dependencies")
-    states = {edge.resolution_state for edge in outgoing}
+    states = {edge.resolution_state for edge in relevant}
     if "ambiguous" in states:
         return _signal(unit.unit_id, "dependencies_resolved", "unknown", "detected", "ambiguous_dependency")
     if "unresolved" in states:

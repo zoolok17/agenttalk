@@ -23,9 +23,10 @@ from __future__ import annotations
 from typing import Any
 
 from .dependencies_artifact import DependencyRecord
+from .errors import InvalidReadinessStateFilter
 from .features_artifact import EntryPointRecord, FeatureRecord
 from .modules_artifact import ModuleRecord
-from .readiness_artifact import ReadinessSignal, UnitReadinessSummary
+from .readiness_artifact import ASSESSMENT_STATES, ReadinessSignal, UnitReadinessSummary
 
 PROJECTION_SCHEMA_VERSION = 1
 _MAX_ROWS_PER_SECTION = 1000
@@ -139,6 +140,13 @@ def project_comprehension(
     ``--dependencies``) - this function does not know which caller is
     asking."""
     problems = problems or []
+    # F8 (eighth cold read): an unrecognized readiness_state used to
+    # silently filter every row away rather than being refused as the
+    # caller mistake it is - a closed vocabulary already exists
+    # (readiness_artifact.ASSESSMENT_STATES); validated once, here, for
+    # every caller (CLI and the future API route alike).
+    if readiness_state is not None and readiness_state not in ASSESSMENT_STATES:
+        raise InvalidReadinessStateFilter(readiness_state, ASSESSMENT_STATES)
 
     filtered_modules = modules
     if unit_id is not None:
@@ -179,6 +187,17 @@ def project_comprehension(
         ]
         allowed_unit_ids = {s.unit_id for s in filtered_summaries}
         filtered_signals = [s for s in filtered_signals if s.unit_id in allowed_unit_ids]
+        # F8 (eighth cold read): --unit/--feature both narrow "units"
+        # already - --readiness never did, even though
+        # whole_run_sections (self-describing which sections stay whole-run)
+        # implies "units" IS one of the filtered ones. Same allowed-set the
+        # signals/summaries above already narrow to.
+        filtered_modules = [m for m in filtered_modules if m.unit_id in allowed_unit_ids]
+        # F8 (eighth cold read): --unit/--feature both narrow "units"
+        # already - --readiness never did, even though whole_run_sections
+        # (self-describing which sections stay whole-run) implies "units"
+        # IS one of the filtered ones. Same allowed-set the signals/
+        # summaries above already narrow to.
     if unit_id is not None:
         filtered_signals = [s for s in filtered_signals if s.unit_id == unit_id]
         filtered_summaries = [s for s in filtered_summaries if s.unit_id == unit_id]

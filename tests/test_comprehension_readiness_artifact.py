@@ -128,15 +128,29 @@ def test_dependencies_resolved_satisfied_with_no_outgoing_edges():
 
 
 def test_dependencies_resolved_unsatisfied_when_an_edge_is_unresolved():
-    edges = [_edge("u1", resolution_state="unresolved")]
+    edges = [_edge("u1", relation="import", resolution_state="unresolved")]
     signals, _ = ra.build_readiness([_unit("u1")], edges, [])
     assert _signal_by_check(signals, "dependencies_resolved").stored_status == "unsatisfied"
 
 
 def test_dependencies_resolved_unknown_when_an_edge_is_ambiguous():
-    edges = [_edge("u1", resolution_state="ambiguous")]
+    edges = [_edge("u1", relation="import", resolution_state="ambiguous")]
     signals, _ = ra.build_readiness([_unit("u1")], edges, [])
     assert _signal_by_check(signals, "dependencies_resolved").stored_status == "unknown"
+
+
+def test_dependencies_resolved_satisfied_when_an_unresolved_edge_is_invoke_only():
+    """FIX ROUND 12 (eighth cold read, F2/F5 folded in): dependencies_
+    resolved is scoped to import/inherit/build relations - the design's
+    "direct internal dependencies" - so an unresolved ``invoke`` edge
+    (the JDK-noise shape: an unqualified call the adapter cannot
+    recognize as external, like ``Math.max(...)``) must never drive an
+    ordinary class to unsatisfied."""
+    edges = [_edge("u1", relation="invoke", resolution_state="unresolved")]
+    signals, _ = ra.build_readiness([_unit("u1")], edges, [])
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "satisfied"
+    assert signal.reason_code == "no_dependencies"
 
 
 def test_dependencies_resolved_satisfied_when_all_edges_resolved():
@@ -170,7 +184,7 @@ def test_file_units_dependencies_resolved_derives_from_contained_units_not_vacuo
         container_unit_id="file1", producers=[],
     )
     file_unit = _file_unit("file1")
-    edges = [_edge("comp1", resolution_state="unresolved")]
+    edges = [_edge("comp1", relation="import", resolution_state="unresolved")]
     signals, _ = ra.build_readiness([file_unit, component], edges, [])
     file_signal = next(
         s for s in signals if s.unit_id == "file1" and s.check == "dependencies_resolved")

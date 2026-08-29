@@ -97,6 +97,23 @@ class VcsPrivacyRefused(ComprehensionError):
         )
 
 
+class InvalidReadinessStateFilter(ComprehensionError):
+    """FIX ROUND 12 (eighth cold read, F8): ``--readiness``/
+    ``readiness_state`` used to silently match nothing at all for an
+    unrecognized value - a typo or a stale value from a since-renamed
+    state returned an empty, exit-0 result indistinguishable from "every
+    unit was filtered out for real reasons". The closed vocabulary
+    already exists (``readiness_artifact.ASSESSMENT_STATES``); an
+    argument outside it is a caller mistake, refused the same way every
+    other malformed input this package rejects is."""
+
+    reason_code = "comprehension_invalid_readiness_state_filter"
+
+    def __init__(self, value: str, allowed: tuple[str, ...]) -> None:
+        self.detail = f"{value!r} is not a recognized readiness state (must be one of {allowed})"
+        super().__init__(f"{self.reason_code}: {self.detail}")
+
+
 class InvalidComprehensionDir(ComprehensionError):
     """A ``comprehension_dir`` argument does not have the exact
     ``<root>/.agenttalk/comprehension`` shape (reviewer-1 cold-read finding

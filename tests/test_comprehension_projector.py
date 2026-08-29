@@ -7,7 +7,10 @@ as a function of already-assembled records, with no CLI/HTTP involved.
 
 from __future__ import annotations
 
+import pytest
+
 from agenttalk.comprehension import projector as pr
+from agenttalk.comprehension.errors import InvalidReadinessStateFilter
 from agenttalk.comprehension.dependencies_artifact import DependencyRecord
 from agenttalk.comprehension.features_artifact import EntryPointRecord, FeatureRecord
 from agenttalk.comprehension.modules_artifact import ModuleRecord
@@ -108,6 +111,27 @@ def test_readiness_state_filter_narrows_signals_and_summaries():
         readiness_signals=signals, readiness_summaries=summaries, readiness_state="blocked"))
     assert [s["unit_id"] for s in payload["readiness"]["summaries"]] == ["u1"]
     assert [s["unit_id"] for s in payload["readiness"]["signals"]] == ["u1"]
+
+
+def test_readiness_state_filter_also_narrows_units_f8():
+    """FIX ROUND 12 (eighth cold read, F8): --unit/--feature both narrow
+    "units" already - --readiness never did, even though
+    whole_run_sections's own self-description implies "units" is one of
+    the filtered sections."""
+    summaries = [_summary("u1", "blocked"), _summary("u2", "assessed")]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1"), _unit("u2")], readiness_summaries=summaries,
+        readiness_state="blocked"))
+    assert [u["unit_id"] for u in payload["units"]] == ["u1"]
+
+
+def test_readiness_state_filter_rejects_an_unrecognized_state_f8():
+    """FIX ROUND 12 (F8): an unrecognized --readiness value used to
+    silently match nothing (empty rows, exit 0) - indistinguishable from
+    "every unit was genuinely filtered out". Refused as the caller
+    mistake it is, against the closed vocabulary."""
+    with pytest.raises(InvalidReadinessStateFilter):
+        pr.project_comprehension(**_base_kwargs(readiness_state="not-a-real-state"))
 
 
 # ------------------------------ MAJOR 3 (sixth cold read, fix round 10):

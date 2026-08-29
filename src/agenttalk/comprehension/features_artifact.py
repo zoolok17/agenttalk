@@ -135,7 +135,7 @@ def build_features(
     actually populated even though the digest was already computed and
     available upstream)."""
     file_digests = file_digests or {}
-    by_qualified_name, _by_simple_name, _file_unit_ids = _build_registry(java_results)
+    by_qualified_name, _by_simple_name, _file_unit_ids, _duplicate_names = _build_registry(java_results)
 
     owning_unit_by_qualified_name = by_qualified_name
     entry_points_by_owner: dict[str, list[tuple[str, java_adapter.JavaEntryPointClaim]]] = {}

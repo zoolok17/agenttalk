@@ -109,16 +109,136 @@ def test_inherit_edge_resolves_to_a_type_declared_in_a_different_file():
     assert inherit.target_unit_id == base_unit_id
 
 
-def test_inherit_edge_by_bare_simple_name_resolves_with_medium_confidence():
+def test_inherit_edge_by_bare_simple_name_with_no_supporting_evidence_stays_unresolved():
+    """FIX ROUND 12 (eighth cold read, F1 BLOCKER): this test used to
+    assert the OPPOSITE - that a bare name matching exactly one in-scan
+    type ANYWHERE resolved with medium confidence, regardless of package.
+    That was itself the bug the reviewer's three shapes exposed (design
+    line 418: "The scanner never invents an internal target because
+    names look similar."). ``q.Foo`` neither imports ``Base`` nor shares
+    a package with ``p.Base`` - no evidence supports this resolution, so
+    it must stay unresolved with the bare spelling retained, never a
+    name-similarity guess, however unique that name happens to be."""
     results = {
         "p/Base.java": _parse("p/Base.java", "package p;\nclass Base {}\n"),
-        # extends "Base" (no package prefix) - only a SIMPLE-name match is possible.
         "q/Foo.java": _parse("q/Foo.java", "package q;\nclass Foo extends Base {}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "unresolved"
+    assert inherit.target_unit_id is None
+    assert inherit.target_unresolved == "Base"
+
+
+def test_inherit_edge_by_bare_simple_name_resolves_via_same_package_sibling():
+    """FIX ROUND 12 (F1 direction 3): a bare name matching
+    ``{this file's own package}.{name}`` is a legitimate SAME-PACKAGE
+    implicit resolution - Java's own scoping rule, not a name-similarity
+    guess - and stays resolved, at medium confidence (implicit, not an
+    exact spelled-out reference)."""
+    results = {
+        "p/Base.java": _parse("p/Base.java", "package p;\nclass Base {}\n"),
+        "p/Foo.java": _parse("p/Foo.java", "package p;\nclass Foo extends Base {}\n"),
     }
     records = da.build_dependencies(results)
     inherit = next(r for r in records if r.relation == "inherit")
     assert inherit.resolution_state == "resolved"
     assert inherit.confidence == "medium"
+    assert inherit.target_unit_id == da._java_component_unit_id("p/Base.java", "p.Base")
+
+
+def test_inherit_edge_resolves_via_this_files_own_import_not_a_global_guess():
+    """FIX ROUND 12 (F1 direction 2, positive control): a bare name this
+    file's own import binds to a specific package resolves via THAT
+    import, exactly like the identical import already resolves - the
+    reader verified this path works and it must keep working."""
+    results = {
+        "com/corp/commons/web/BaseController.java": _parse(
+            "com/corp/commons/web/BaseController.java",
+            "package com.corp.commons.web;\nclass BaseController {}\n"),
+        "com/acme/shop/ShopController.java": _parse(
+            "com/acme/shop/ShopController.java",
+            "package com.acme.shop;\n"
+            "import com.corp.commons.web.BaseController;\n"
+            "class ShopController extends BaseController {}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "resolved"
+    assert inherit.confidence == "high"
+    assert inherit.target_unit_id == da._java_component_unit_id(
+        "com/corp/commons/web/BaseController.java", "com.corp.commons.web.BaseController")
+
+
+def test_inherit_edge_via_import_of_an_unrelated_package_never_falls_back_to_a_same_named_class():
+    """FIX ROUND 12 (eighth cold read, F1 BLOCKER, reproduced shape A):
+    ShopController imports com.corp.commons.web.BaseController and
+    extends the bare name BaseController - an UNRELATED
+    com.acme.admin.BaseController also happens to exist in-scan. The old
+    code fell back to the GLOBAL simple-name match (exactly one
+    candidate) and silently resolved to the wrong, unrelated class,
+    directly contradicting the import edge published for the SAME
+    artifact. Must resolve unresolved, with the IMPORTED spelling
+    (not the unrelated in-scan class, not the bare name) retained as
+    evidence of what was actually meant."""
+    results = {
+        "com/acme/admin/BaseController.java": _parse(
+            "com/acme/admin/BaseController.java",
+            "package com.acme.admin;\nclass BaseController {}\n"),
+        "com/acme/shop/ShopController.java": _parse(
+            "com/acme/shop/ShopController.java",
+            "package com.acme.shop;\n"
+            "import com.corp.commons.web.BaseController;\n"
+            "class ShopController extends BaseController {}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "unresolved"
+    assert inherit.target_unit_id is None
+    assert inherit.target_unresolved == "com.corp.commons.web.BaseController"
+
+
+def test_inherit_edge_written_fully_qualified_never_falls_back_to_a_same_named_class():
+    """FIX ROUND 12 (reproduced shape B): the extends clause spells the
+    target out FULLY QUALIFIED in source, naming a package that is not
+    in-scan - an unrelated same-simple-name class must never be offered
+    as a guess just because it is the only same-named candidate."""
+    results = {
+        "com/acme/admin/BaseController.java": _parse(
+            "com/acme/admin/BaseController.java",
+            "package com.acme.admin;\nclass BaseController {}\n"),
+        "com/acme/shop/ShopController.java": _parse(
+            "com/acme/shop/ShopController.java",
+            "package com.acme.shop;\n"
+            "class ShopController extends com.corp.commons.web.BaseController {}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "unresolved"
+    assert inherit.target_unit_id is None
+    assert inherit.target_unresolved == "com.corp.commons.web.BaseController"
+
+
+def test_test_edge_via_import_of_an_unrelated_package_never_falls_back_to_a_same_named_class():
+    """FIX ROUND 12 (reproduced shape C): InvoiceServiceTest imports
+    com.corp.legacy.InvoiceService (never in-scan) - an unrelated
+    com.acme.billing.InvoiceService must never absorb the test edge just
+    because it is the only in-scan class sharing that bare name."""
+    results = {
+        "com/acme/billing/InvoiceService.java": _parse(
+            "com/acme/billing/InvoiceService.java",
+            "package com.acme.billing;\nclass InvoiceService {}\n"),
+        "com/acme/billing/InvoiceServiceTest.java": _parse(
+            "com/acme/billing/InvoiceServiceTest.java",
+            "package com.acme.billing;\n"
+            "import com.corp.legacy.InvoiceService;\n"
+            "class InvoiceServiceTest {}\n"),
+    }
+    records = da.build_dependencies(results)
+    test_edge = next(r for r in records if r.relation == "test")
+    assert test_edge.resolution_state == "unresolved"
+    assert test_edge.target_unit_id is None
+    assert test_edge.target_unresolved == "com.corp.legacy.InvoiceService"
 
 
 def test_inherit_edge_is_ambiguous_when_two_files_declare_the_same_simple_name():

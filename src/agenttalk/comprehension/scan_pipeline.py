@@ -377,8 +377,15 @@ def run_scan(
         # features_artifact.py's producers carried source_digest=None
         # unconditionally, never wired to it.
         file_digests = {f.relative_path: f.content_digest for f in discovery_result.files}
+        # F2 MAJOR (eighth cold read, fix round 12): every path this
+        # SAME run recorded a worker-level problem for (an adapter
+        # resource cap, a read/parse failure) - an import naming one of
+        # these files' declared types must resolve unresolved, never a
+        # false-positive external claim over evidence that is merely
+        # missing, not genuinely third-party.
+        degraded_paths = frozenset(worker_problem_reasons_by_path)
         dependencies = dependencies_artifact.build_dependencies(
-            java_results, file_digests=file_digests)
+            java_results, file_digests=file_digests, degraded_paths=degraded_paths)
         entry_points, features = features_artifact.build_features(
             java_results, file_digests=file_digests)
         readiness_signals, readiness_summaries = readiness_artifact.build_readiness(
@@ -915,7 +922,16 @@ def get_report(
     payload = projector.project_comprehension(
         scan_id=_scan_field(records["scan"], "scan_id", scan_id),
         generated_at=_scan_field(records["scan"], "generated_at", scan_id),
-        manifest_digest=None, status=_scan_field(records["scan"], "status", scan_id),
+        # F7 (eighth cold read): this passed None unconditionally - the
+        # design's own invariant 4 ("readers bind to a scan ID AND
+        # manifest digest") had no digest to bind to at all. scan.json's
+        # own `content_digest` field (run_content_digest over this run's
+        # artifact_summaries - digests.run_content_digest, computed at
+        # publish time) IS the manifest digest; already verified present
+        # and matching its index.json anchor by the anchor/digest checks
+        # just above, never a fresh, unverified read.
+        manifest_digest=_scan_field(records["scan"], "content_digest", scan_id),
+        status=_scan_field(records["scan"], "status", scan_id),
         modules=records["modules"], dependencies=records["dependencies"],
         entry_points=records["entry_points"], features=records["features"],
         readiness_signals=records["readiness_signals"],

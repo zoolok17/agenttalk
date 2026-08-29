@@ -77,6 +77,24 @@ def test_run_scan_publishes_a_complete_run(java_repo: Path) -> None:
     assert (outcome.run_dir / "scan.json").exists()
 
 
+def test_report_carries_the_real_manifest_digest_f7(java_repo: Path) -> None:
+    """FIX ROUND 12 (eighth cold read, F7): get_report passed
+    manifest_digest=None to the projector unconditionally, even though
+    scan.json's own content_digest (the manifest digest design's
+    invariant 4 names - "readers bind to a scan ID and manifest digest")
+    was already available and already verified present/matching by the
+    very digest checks get_report performs just above this call. Must
+    equal scan.json's own content_digest field - the same value
+    `validate` verifies."""
+    import json
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    report = scan_pipeline.get_report(java_repo)
+    assert report["manifest_digest"] == scan_doc["content_digest"]
+    assert report["manifest_digest"]
+
+
 def test_scan_json_publishes_start_completion_times_and_exclude_rule_digest(
     java_repo: Path,
 ) -> None:
@@ -381,6 +399,85 @@ def test_run_scan_reports_unknown_not_satisfied_for_a_resource_capped_java_file(
     )
     assert source_understood["stored_status"] == "unknown"
     assert source_understood["reason_code"] == "adapter_resource_limit"
+
+
+def test_run_scan_never_publishes_an_import_of_a_resource_capped_file_as_external(
+    java_repo: Path, monkeypatch,
+) -> None:
+    """FIX ROUND 12 (eighth cold read, F2 MAJOR): reproduced shape - a
+    generated file this SAME run degraded away for the per-file adapter
+    resource cap (the 9MB BigTable-over-the-8MiB-cap shape the reviewer
+    named) used to have its declared type published as a confident
+    EXTERNAL dependency the moment an importer referenced it - the
+    registry has no entry for it BECAUSE it degraded, not because it is
+    genuinely third-party. The importer must resolve unresolved, and
+    dependencies_resolved must NOT report satisfied over a dependency
+    this run never actually verified."""
+    # Only BigTable.java (padded via a comment, stripped before parsing but
+    # counted toward the RAW byte cap check) exceeds the cap - Consumer.java
+    # stays a small, ordinarily-parsed file, exactly like the reviewer's
+    # real shape (an oversized GENERATED file, not every file in the repo).
+    monkeypatch.setattr(workermod, "_MAX_ADAPTER_INPUT_BYTES", 100)
+    (java_repo / "src" / "main" / "java" / "p" / "BigTable.java").write_text(
+        "package p;\nclass BigTable {\n  // " + ("x" * 200) + "\n}\n", encoding="utf-8")
+    (java_repo / "src" / "main" / "java" / "p" / "Consumer.java").write_text(
+        "package p;\nimport p.BigTable;\nclass Consumer {}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    import_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "import" and r["evidence_class"] == "extracted")
+    assert import_edge["resolution_state"] == "unresolved"
+    assert import_edge["target_external"] is None
+    assert import_edge["target_unresolved"] == "p.BigTable"
+
+    consumer_unit = next(u for u in modules_doc["units"] if u["display_name"] == "Consumer")
+    dependencies_resolved = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == consumer_unit["unit_id"] and s["check"] == "dependencies_resolved"
+    )
+    assert dependencies_resolved["stored_status"] == "unsatisfied"
+
+
+def test_run_scan_ordinary_jdk_invoke_calls_never_drive_dependencies_resolved_unsatisfied(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 12 (F2/F5 folded in): an ordinary class calling plain
+    JDK methods with no import evidence (Math.max, ...) always resolves
+    those invoke edges unresolved (the adapter has no way to recognize
+    an unqualified JDK reference as external) - this must never drive
+    dependencies_resolved to unsatisfied for a class with no real
+    dependency problem at all. dependencies_resolved is scoped to
+    import/inherit/build relations, per the design's own "direct
+    internal dependencies" wording."""
+    (java_repo / "src" / "main" / "java" / "p" / "PricingService.java").write_text(
+        "package p;\nclass PricingService {\n"
+        "  int cap(int a, int b) { return Math.max(a, b); }\n"
+        "}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    invoke_edge = next(
+        r for r in dependencies_doc["edges"]
+        if r["relation"] == "invoke" and r["target_unresolved"] == "Math")
+    assert invoke_edge["resolution_state"] == "unresolved"
+
+    pricing_unit = next(u for u in modules_doc["units"] if u["display_name"] == "PricingService")
+    dependencies_resolved = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == pricing_unit["unit_id"] and s["check"] == "dependencies_resolved"
+    )
+    assert dependencies_resolved["stored_status"] == "satisfied"
+    assert dependencies_resolved["reason_code"] == "no_dependencies"
 
 
 def test_run_scan_populates_source_digest_on_dependency_and_feature_producers(

@@ -98,7 +98,7 @@ def _java_file_unit_id(relative_path: str) -> str:
 
 def _build_registry(
     java_results: dict[str, java_adapter.JavaFileResult],
-) -> tuple[dict[str, str], dict[str, list[str]], dict[str, str]]:
+) -> tuple[dict[str, str], dict[str, list[str]], dict[str, str], set[str]]:
     """M12 (cold-read, PR-B fix round 3): two units DECLARING the same
     fully-qualified name (a real collision, not merely a same-SIMPLE-name
     coincidence) used to last-wins into ``by_qualified_name`` with no
@@ -129,7 +129,7 @@ def _build_registry(
             by_simple_name.setdefault(unit_claim.simple_name, []).append(uid)
     for name in duplicate_qualified_names:
         by_qualified_name.pop(name, None)
-    return by_qualified_name, by_simple_name, file_unit_id_by_path
+    return by_qualified_name, by_simple_name, file_unit_id_by_path, duplicate_qualified_names
 
 
 def _exact_qualified_lookup(target: str, by_qualified_name: dict[str, str]) -> str | None:
@@ -149,20 +149,75 @@ def _exact_qualified_lookup(target: str, by_qualified_name: dict[str, str]) -> s
 
 def _resolve_internal_candidate(
     target: str, by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
+    duplicate_qualified_names: set[str], *, local_qualified_by_simple: dict[str, str],
+    import_qualified_by_simple: dict[str, str], package: str | None,
 ) -> tuple[str, str | None, str | None, str | None]:
     """Returns ``(resolution_state, target_unit_id, target_unresolved,
-    confidence)``. Never invents a match: an unqualified name matching
-    more than one declared type across the scan is ``ambiguous``, not a
-    guess at which one was meant (design: "The scanner never invents an
+    confidence)``.
+
+    FIX ROUND 12 (eighth cold read, F1 BLOCKER): this used to fall back to
+    a GLOBAL simple-name match across the whole scan whenever exactly one
+    declared type anywhere shared ``target``'s bare name - even when the
+    source file's OWN evidence (an inline fully-qualified spelling, or its
+    own ``import``) named a DIFFERENT, unrelated package verbatim. That
+    discarded the real target's spelling for a name-similarity guess -
+    exactly what design line 418 forbids ("The scanner never invents an
     internal target because names look similar. Ambiguous resolution
-    creates an unresolved edge with candidates.")."""
-    exact = _exact_qualified_lookup(target, by_qualified_name)
-    if exact is not None:
-        return "resolved", exact, None, "high"
-    simple = target.rsplit(".", 1)[-1]
-    candidates = by_simple_name.get(simple, [])
-    if len(candidates) == 1:
-        return "resolved", candidates[0], None, "medium"
+    creates an unresolved edge with candidates."). Resolution now consults
+    the file's OWN evidence FIRST, in Java's actual scoping order, and a
+    bare name with no supporting evidence is unresolved - never a guess,
+    regardless of how many (0 or 1) same-named candidates happen to exist
+    elsewhere in the scan:
+
+    1. an inline fully-qualified target (``target`` itself contains a
+       dot) resolves by EXACT match only - a miss is unresolved with the
+       source's own spelling retained, never a simple-name fallback (a
+       genuine registry collision - two files declaring the identical
+       qualified name - is the one exception: that IS two real
+       candidates, correctly ``ambiguous``, not zero);
+    2. a bare name declared as a type IN THIS SAME FILE resolves via that
+       declaration's own qualified name - guaranteed correct, not a
+       guess (Java's own shadowing rule);
+    3. else a bare name this file's own ``import`` names resolves ONLY
+       via that import - exact match against in-scan qualified names; a
+       miss is unresolved with the IMPORTED spelling retained (the
+       reader can see exactly which package was meant, even though nothing
+       in-scan answers it);
+    4. else a bare name matching ``{this file's package}.{name}`` may
+       resolve as an implicit same-package sibling - Java's actual rule,
+       not similarity (a JDK/``java.lang`` default identifier falls
+       through here too: it has no in-scan candidate under any package,
+       so it lands unresolved on its own, never a false capture);
+    5. anything else is unresolved (or ``ambiguous`` if 2+ same-simple-name
+       candidates exist in-scan with no supporting evidence either way) -
+       target spelling retained.
+    """
+    if "." in target:
+        exact = _exact_qualified_lookup(target, by_qualified_name)
+        if exact is not None:
+            return "resolved", exact, None, "high"
+        if target in duplicate_qualified_names:
+            return "ambiguous", None, target, None
+        return "unresolved", None, target, None
+
+    if target in local_qualified_by_simple:
+        exact = _exact_qualified_lookup(local_qualified_by_simple[target], by_qualified_name)
+        if exact is not None:
+            return "resolved", exact, None, "high"
+
+    if target in import_qualified_by_simple:
+        imported = import_qualified_by_simple[target]
+        exact = _exact_qualified_lookup(imported, by_qualified_name)
+        if exact is not None:
+            return "resolved", exact, None, "high"
+        return "unresolved", None, imported, None
+
+    if package:
+        exact = _exact_qualified_lookup(f"{package}.{target}", by_qualified_name)
+        if exact is not None:
+            return "resolved", exact, None, "medium"
+
+    candidates = by_simple_name.get(target, [])
     if len(candidates) > 1:
         return "ambiguous", None, target, None
     return "unresolved", None, target, None
@@ -175,9 +230,27 @@ def _producer(*, name: str, version: int, rule_version: int, source_digest: str 
     }
 
 
+def _degraded_java_suffix_match(qualified_name: str, degraded_paths: frozenset[str]) -> bool:
+    """FIX ROUND 12 (eighth cold read, F2 MAJOR): an import naming a type
+    this SAME run could not fully read or parse (a worker-level problem -
+    an adapter resource cap, a read/parse failure - names the exact
+    relative path) must never be stamped a confident, positive EXTERNAL
+    claim just because the in-scan registry has no entry for it - the
+    registry has no entry BECAUSE the file degraded away, not because
+    the type is genuinely third-party. Matched by path SUFFIX, never an
+    exact string: a qualified name alone does not know which source root
+    (``src/main/java``, ``src/test/java``, none at all) the file actually
+    lives under, but Java's own rule that a public top-level type's file
+    is named exactly ``{SimpleName}.java`` makes the suffix match
+    unambiguous in practice."""
+    suffix = qualified_name.replace(".", "/") + ".java"
+    return any(path == suffix or path.endswith("/" + suffix) for path in degraded_paths)
+
+
 def build_dependencies(
     java_results: dict[str, java_adapter.JavaFileResult],
     *, file_digests: dict[str, str] | None = None,
+    degraded_paths: frozenset[str] = frozenset(),
 ) -> list[DependencyRecord]:
     """``java_results`` carries every producer's claims uniformly, keyed
     by relative path - including a ``pom.xml``'s ``build`` edges (B-3,
@@ -202,13 +275,30 @@ def build_dependencies(
     easy to miss since modules_artifact.py populates its OWN producers'
     source_digest correctly, so only this module's own producers stayed
     silently unpopulated).
+
+    ``degraded_paths`` (FIX ROUND 12, F2 MAJOR) names every relative path
+    this SAME run recorded a worker-level problem for (an adapter
+    resource cap, a read/parse failure - never merely "not imported by
+    anything") - queryable here so an import naming one of those files'
+    declared types resolves ``unresolved``, never a false-positive
+    ``resolved``/``target_external``.
     """
     file_digests = file_digests or {}
-    by_qualified_name, by_simple_name, file_unit_id_by_path = _build_registry(java_results)
+    by_qualified_name, by_simple_name, file_unit_id_by_path, duplicate_qualified_names = (
+        _build_registry(java_results)
+    )
     records: list[DependencyRecord] = []
 
     for path, result in java_results.items():
         source_digest = file_digests.get(path)
+        local_qualified_by_simple = {u.simple_name: u.qualified_name for u in result.units}
+        # F1 BLOCKER (eighth cold read): the file's OWN import evidence -
+        # a plain, non-static, non-wildcard import binds a bare simple
+        # name to exactly one fully-qualified spelling, in THIS file only.
+        import_qualified_by_simple = {
+            e.target.rsplit(".", 1)[-1]: e.target for e in result.edges
+            if e.relation == "import" and e.target_kind == "internal_exact_or_external"
+        }
         for edge in result.edges:
             if edge.relation not in CLOSED_RELATIONS:
                 raise UnsupportedRelationClaimed(
@@ -218,9 +308,17 @@ def build_dependencies(
                 by_qualified_name.get(edge.from_qualified_name)
                 or file_unit_id_by_path[path]
             )
+            package = (
+                edge.from_qualified_name.rsplit(".", 1)[0]
+                if "." in edge.from_qualified_name else None
+            )
             record = _edge_claim_to_record(
                 edge, from_unit_id=from_unit_id, source_digest=source_digest,
                 by_qualified_name=by_qualified_name, by_simple_name=by_simple_name,
+                duplicate_qualified_names=duplicate_qualified_names,
+                local_qualified_by_simple=local_qualified_by_simple,
+                import_qualified_by_simple=import_qualified_by_simple,
+                package=package, degraded_paths=degraded_paths,
             )
             records.append(record)
 
@@ -255,11 +353,18 @@ def _coalesce_by_edge_id(records: list[DependencyRecord]) -> list[DependencyReco
 def _edge_claim_to_record(
     edge: java_adapter.JavaEdgeClaim, *, from_unit_id: str, source_digest: str | None,
     by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
+    duplicate_qualified_names: set[str], local_qualified_by_simple: dict[str, str],
+    import_qualified_by_simple: dict[str, str], package: str | None,
+    degraded_paths: frozenset[str],
 ) -> DependencyRecord:
     target_unit_id = target_external = target_unresolved = confidence = None
     if edge.target_kind == "internal_candidate":
         resolution_state, target_unit_id, target_unresolved, confidence = (
-            _resolve_internal_candidate(edge.target, by_qualified_name, by_simple_name)
+            _resolve_internal_candidate(
+                edge.target, by_qualified_name, by_simple_name, duplicate_qualified_names,
+                local_qualified_by_simple=local_qualified_by_simple,
+                import_qualified_by_simple=import_qualified_by_simple, package=package,
+            )
         )
     elif edge.target_kind == "internal_exact_or_external":
         # D-1 (reviewer-3, PR-B delta review round 2): an import's target
@@ -270,6 +375,12 @@ def _edge_claim_to_record(
         exact_unit_id = _exact_qualified_lookup(edge.target, by_qualified_name)
         if exact_unit_id is not None:
             resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
+        elif _degraded_java_suffix_match(edge.target, degraded_paths):
+            # F2 MAJOR (eighth cold read): this SAME run could not fully
+            # read/parse the file that would have declared this type -
+            # never a confident external claim over an absent registry
+            # entry that is actually just missing evidence.
+            resolution_state, target_unresolved = "unresolved", edge.target
         else:
             resolution_state, target_external = "resolved", edge.target
     elif edge.target_kind == "internal_static_import_exact_or_external":
@@ -285,6 +396,11 @@ def _edge_claim_to_record(
         exact_unit_id = _exact_qualified_lookup(type_prefix, by_qualified_name)
         if exact_unit_id is not None:
             resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
+        elif _degraded_java_suffix_match(type_prefix, degraded_paths):
+            # F2 MAJOR (eighth cold read): same reasoning as the plain
+            # import above, keyed on the type prefix, not the full
+            # member-path spelling.
+            resolution_state, target_unresolved = "unresolved", edge.target
         else:
             resolution_state, target_external = "resolved", edge.target
     elif edge.target_kind == "internal_unqualified_call_candidate":
