@@ -622,6 +622,42 @@ def test_run_scan_does_not_flag_module_info_java_as_a_type_extraction_problem(
     assert module_info_unit["adapter_problem_reason"] is None
 
 
+def test_run_scan_does_not_flag_a_route_annotation_on_an_annotation_type(
+    java_repo: Path,
+) -> None:
+    """Round 10b (reviewer-3 delta on round 10), end to end: a route
+    annotation stacked on an `@interface` declaration - the documented
+    Spring composed-annotation idiom Spring's own verb annotations are
+    themselves defined with - must never flip an otherwise-clean run to
+    degraded via the new route_annotation_unassociated problem. The run
+    stays complete and problem-free."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "GetMapping2.java").write_text(
+        "package p;\n\n"
+        "@Target(java.lang.annotation.ElementType.METHOD)\n"
+        "@Retention(java.lang.annotation.RetentionPolicy.RUNTIME)\n"
+        "@RequestMapping(method = RequestMethod.GET)\n"
+        "public @interface GetMapping2 {\n"
+        '    String value() default "";\n'
+        "}\n",
+        encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    assert not [
+        p for p in problems_doc["problems"]
+        if p["reason_code"] == "route_annotation_unassociated"
+    ]
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    get_mapping_unit = next(
+        u for u in modules_doc["units"]
+        if u["paths"] == ["src/main/java/p/GetMapping2.java"])
+    assert get_mapping_unit["adapter_problem_reason"] is None
+
+
 def test_scan_json_record_counts_includes_itself(java_repo: Path) -> None:
     """N6-record_counts (cold-read, PR-B fix round 3): scan.json's own
     record_counts field must count scan.json itself (always exactly 1) -

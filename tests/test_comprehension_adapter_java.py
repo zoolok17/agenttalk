@@ -1046,6 +1046,49 @@ public class Controller {
     assert "could not be confidently associated" in result.problems[0]
 
 
+# --------------------------------------- round 10b (reviewer-3 delta on round
+# 10): @interface is a legitimate non-route context - suppress WITHOUT the
+# false problem (the same shape package-info.java/module-info.java already
+# get in worker.py).
+
+def test_route_annotation_on_a_public_annotation_type_declaration_is_silent():
+    """Realistic spelling 1: `public @interface` with modifiers/other
+    stacked annotations in between - exactly how Spring itself defines
+    @GetMapping et al. Suppression is correct (a meta-annotation
+    declaration serves no route of its own); a problem record is not -
+    this is a documented, common idiom, not an unforeseen shape."""
+    src = """
+package p;
+
+@Target(java.lang.annotation.ElementType.METHOD)
+@Retention(java.lang.annotation.RetentionPolicy.RUNTIME)
+@RequestMapping(method = RequestMethod.GET)
+public @interface GetMapping2 {
+    String value() default "";
+}
+"""
+    result = java.parse_java_source("GetMapping2.java", src)
+    assert _edges(result, "route") == []
+    assert result.problems == []
+    assert [u.qualified_name for u in result.units] == ["p.GetMapping2"]
+
+
+def test_route_annotation_on_a_bare_annotation_type_declaration_is_silent():
+    """Realistic spelling 2: a bare `@interface`, no modifier, the route
+    annotation directly stacked with nothing else in between."""
+    src = """
+package p;
+
+@RequestMapping(method = RequestMethod.POST)
+@interface PostMapping2 {
+}
+"""
+    result = java.parse_java_source("PostMapping2.java", src)
+    assert _edges(result, "route") == []
+    assert result.problems == []
+    assert [u.qualified_name for u in result.units] == ["p.PostMapping2"]
+
+
 def test_route_value_multi_element_array_publishes_every_element():
     """MAJOR 1 (sixth cold read, fix round 10): a declared multi-value
     route array used to publish only its first path, silently dropping

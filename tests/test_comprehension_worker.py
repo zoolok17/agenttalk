@@ -219,6 +219,31 @@ def test_process_paths_does_not_flag_module_info_java(tmp_path: Path) -> None:
     assert result.problems == []
 
 
+def test_process_paths_does_not_flag_a_route_annotation_on_an_annotation_type(
+    tmp_path: Path,
+) -> None:
+    """Round 10b (reviewer-3 delta on round 10): a route annotation
+    stacked on an `@interface` (annotation-type) declaration - the
+    documented Spring composed-annotation idiom Spring's own verb
+    annotations (@GetMapping et al.) are themselves defined with -
+    cannot associate as a class-level prefix, but is a legitimate,
+    common shape, not an unforeseen one. Suppressing the route is
+    correct; flipping an otherwise-clean run to degraded with a problem
+    naming a file that is perfectly fine is not."""
+    (tmp_path / "GetMapping2.java").write_text(
+        "package p;\n\n"
+        "@Target(java.lang.annotation.ElementType.METHOD)\n"
+        "@Retention(java.lang.annotation.RetentionPolicy.RUNTIME)\n"
+        "@RequestMapping(method = RequestMethod.GET)\n"
+        "public @interface GetMapping2 {\n"
+        '    String value() default "";\n'
+        "}\n",
+        encoding="utf-8")
+    result = worker.process_paths(tmp_path, ["GetMapping2.java"])
+    assert result.problems == []
+    assert result.java_results["GetMapping2.java"]["edges"] == []
+
+
 def test_process_paths_does_not_flag_an_empty_or_comment_only_java_file(
     tmp_path: Path,
 ) -> None:

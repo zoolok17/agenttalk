@@ -572,6 +572,32 @@ def _position_inside_any_type_body(
     return any(start <= position <= end for _q, _s, _c, start, _e, _i, end in types)
 
 
+def _next_header_is_annotation_type_declaration(
+    sanitized: str, position: int,
+    types: list[tuple[str, str, str, int, str | None, str | None, int]],
+) -> bool:
+    """Whether the NEAREST type header after ``position`` is an
+    ANNOTATION-TYPE declaration (``@interface Name { ... }``) - fix round
+    10b: a route annotation stacked on one cannot associate (its header
+    finder anchors on the bare ``interface`` keyword; the header's own
+    ``@`` sits immediately before it, not a whitespace/modifier/
+    annotation token the backward walk recognizes as trivia to cross) -
+    but this is the documented Spring composed-annotation idiom, how
+    Spring defines its own verb annotations (``@GetMapping`` etc. are
+    themselves declared exactly this way). Suppressing the route is
+    correct (a meta-annotation declaration serves no route of its own);
+    reporting a problem on an otherwise-fine file is not - the same
+    "legitimate, recognized shape, no problem" treatment
+    package-info.java/module-info.java already get in worker.py."""
+    upcoming = [start for _q, _s, _c, start, _e, _i, _end in types if start > position]
+    if not upcoming:
+        return False
+    pos = min(upcoming)
+    while pos > 0 and sanitized[pos - 1].isspace():
+        pos -= 1
+    return pos > 0 and sanitized[pos - 1] == "@"
+
+
 def _split_type_list(raw: str) -> list[str]:
     depth = 0
     parts: list[str] = []
@@ -1233,11 +1259,21 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # route, attributed to the wrong (file-level) owner - wrong
             # data, three rounds running. It now fails toward visible
             # absence: suppress the claim, record why, never guess.
-            problems.append(
-                f"a class-level-looking route annotation at line {line} could not be "
-                "confidently associated with any declared type - suppressed rather "
-                "than published as a route"
-            )
+            #
+            # Round 10b: a route annotation stacked on an ANNOTATION-TYPE
+            # declaration (`@interface` - the documented Spring composed-
+            # annotation idiom Spring's own verb annotations are defined
+            # with) can never associate here either, but it is a
+            # legitimate, common, recognized shape, not an unforeseen
+            # one - suppression stays correct, the problem record does
+            # not: recording one flipped an otherwise-clean run to
+            # degraded over a file that is perfectly fine.
+            if not _next_header_is_annotation_type_declaration(sanitized, match.start(), types):
+                problems.append(
+                    f"a class-level-looking route annotation at line {line} could not be "
+                    "confidently associated with any declared type - suppressed rather "
+                    "than published as a route"
+                )
             continue
         prefixes = class_route_prefix.get(enclosing)
         if prefixes:
