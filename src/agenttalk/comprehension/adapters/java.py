@@ -98,16 +98,32 @@ _HEADER_IMPLEMENTS_RE = re.compile(r"\bimplements\s+(.+?)(?=\s*\bpermits\b|\Z)",
 #: bare "OrderService" that the invoke loop below then happily rewrote
 #: via whichever import bound that simple name - publishing a resolved
 #: dependency on the WRONG class and silently omitting the real one. The
-#: optional leading group here captures a package-shaped prefix (one or
-#: more lowercase-led dotted segments) immediately preceding the final
-#: capitalized type segment, so the qualifier carries the FULL dotted
-#: spelling when the source wrote one. A dotted qualifier never matches
-#: ``local_simple_names``/``import_simple_names`` below (both keyed by
-#: bare simple names), so it always falls through to the exact-match-or-
-#: unresolved path - inline-FQN evidence, never an import rewrite, the
-#: same discipline round 12 already established for inherit/test.
+#: optional leading group here captures every dotted segment (ANY case)
+#: immediately preceding the final capitalized type segment, so the
+#: qualifier carries the FULL dotted spelling when the source wrote one.
+#:
+#: FIX ROUND 13b (reviewer-3's B2 BLOCKER on round 13): the FIRST version
+#: of this fix required the prefix segments to be lowercase-led
+#: (package-shaped) specifically - so a NESTED type reference with a
+#: package prefix (``com.acme.Outer.Inner.x()``) still reduced to its
+#: bare tail ("Inner"), since "Outer" (capitalized) broke the all-
+#: lowercase prefix match, and that bare tail then met the SAME bare-
+#: keyed import table CR9-1 already closed one door on - resolving to an
+#: unrelated imported ``Inner``, CR9-1's exact mechanism through the
+#: second door. The prefix now accepts a dotted segment of ANY case, so
+#: a dotted qualifier is NEVER reduced to less than the full chain the
+#: source actually wrote - safe by construction even for a chain that
+#: turns out not to be a real package+type reference at all (an object-
+#: navigation-shaped false capture only ever yields an exact-match-or-
+#: unresolved outcome downstream, never a wrong guess).
+#:
+#: A dotted qualifier never matches ``local_simple_names``/
+#: ``import_simple_names`` below (both keyed by bare simple names), so
+#: it always falls through to the exact-match-or-unresolved path -
+#: inline-FQN evidence, never an import rewrite, the same discipline
+#: round 12 already established for inherit/test.
 _QUALIFIED_CALL_RE = re.compile(
-    r"\b((?:[a-z][A-Za-z0-9_]*\.)*[A-Z][A-Za-z0-9_]*)\.([a-zA-Z_][A-Za-z0-9_]*)\s*\(")
+    r"\b((?:[A-Za-z_$][\w$]*\.)*[A-Z][A-Za-z0-9_]*)\.([a-zA-Z_][A-Za-z0-9_]*)\s*\(")
 #: FIX ROUND 13 (ninth cold read, CR9-2 MAJOR): the enumerated-recognizer
 #: lesson (rounds 8/10 for headers/routes) applied here too - the old
 #: pattern matched exactly ONE fixed token sequence ("public static void
@@ -126,33 +142,85 @@ _QUALIFIED_CALL_RE = re.compile(
 #: varargs ``String... x``), with an optional ``final`` and an optional
 #: ``java.lang.`` qualifier on the type, and flexible whitespace
 #: throughout.
+#:
+#: FIX ROUND 13b (reviewer-3's B1 BLOCKER on round 13): round 13's own
+#: totality claim was FALSE - the reviewer found FIVE more legal
+#: spellings still missed (an annotation interleaved anywhere in the
+#: modifier run, e.g. ``@Deprecated public static void main``; a type-
+#: parameter section per JLS 8.4 between the modifiers and the return
+#: type; a JSR-308 type annotation before the parameter type, e.g.
+#: ``main(@NotNull String[] args)``; a JSR-308 annotation on the array
+#: itself, e.g. ``main(String @NotNull [] args)``; combinations of the
+#: above) - ``main(@NotNull String[] args)`` in particular is ordinary
+#: real Java (JSR-305/JetBrains/Checker annotations applied uniformly
+#: across a codebase), not an exotic edge case. Extended to the fuller
+#: grammar the original comment already (wrongly) claimed to cover.
 _MAIN_MODIFIER_KEYWORD = r"(?:public|static|final|synchronized|strictfp|native|abstract)"
+#: An annotation, with or without a (possibly argument-carrying)
+#: parenthesized clause - JSR-308 lets one appear before a modifier, a
+#: type, or directly on an array level; never assumed absent anywhere
+#: it might legally sit.
+_MAIN_ANNOTATION = r"@[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\([^)]*\))?"
+#: A single method-modifier-run TOKEN - either a modifier keyword or an
+#: annotation, interleaved in any order (JLS 8.4.3: MethodModifier is
+#: itself an alternation of keyword-or-annotation, repeatable).
+_MAIN_MODIFIER_OR_ANNOTATION = (
+    r"(?:\b" + _MAIN_MODIFIER_KEYWORD + r"\b|" + _MAIN_ANNOTATION + r")"
+)
+#: Any run of annotations and/or a "final", interleaved in any order,
+#: immediately preceding the parameter's own type - covers both a type
+#: annotation (``@NotNull String[] args``) and "final" in either
+#: relative order with one.
+_MAIN_PARAM_PREFIX = r"(?:(?:final\b|" + _MAIN_ANNOTATION + r")\s*)*"
+#: An annotation run allowed directly on the array level itself (JSR-308
+#: - ``String @NotNull [] args``), between the type and the brackets.
+_MAIN_ARRAY_ANNOTATIONS = r"(?:" + _MAIN_ANNOTATION + r"\s*)*"
 _MAIN_PARAM_RE = (
-    r"(?:final\s+)?(?:java\.lang\.)?String"
-    r"(?:\s*\[\s*\]\s*[A-Za-z_$][\w$]*"   # String[] args / String [] args
-    r"|\s+[A-Za-z_$][\w$]*\s*\[\s*\]"     # String args[]  (C-style)
-    r"|\s*\.\.\.\s*[A-Za-z_$][\w$]*"      # String... args
+    _MAIN_PARAM_PREFIX + r"(?:java\.lang\.)?String"
+    r"(?:\s*" + _MAIN_ARRAY_ANNOTATIONS + r"\[\s*\]\s*[A-Za-z_$][\w$]*"  # String[] args / String @X [] args
+    r"|\s+[A-Za-z_$][\w$]*\s*" + _MAIN_ARRAY_ANNOTATIONS + r"\[\s*\]"    # String args[]  (C-style)
+    r"|\s*\.\.\.\s*[A-Za-z_$][\w$]*"                                     # String... args
     r")"
 )
-#: Group 1 is the whole modifier run, captured (not just matched) so the
-#: caller can check - programmatically, not by fixed sequence - that
-#: BOTH "public" and "static" appear somewhere in it, in any order,
-#: alongside whatever else is there. A regex alternation could match
-#: either keyword alone; only the Python-side membership check below
-#: enforces both are required.
+#: Group 1 is the whole modifier/annotation run, captured (not just
+#: matched) so the caller can check - programmatically, not by fixed
+#: sequence - that BOTH "public" and "static" appear somewhere in it, in
+#: any order, alongside whatever else (annotations, other modifiers) is
+#: there. A regex alternation could match either keyword alone; only the
+#: Python-side membership check below enforces both are required. An
+#: optional JLS 8.4 TypeParameters section (``<T>``) may sit between the
+#: modifier run and the return type - main is never actually generic in
+#: valid usage, but the grammar allows the token there and this matcher
+#: does not choke on it.
+#: The modifier/annotation run is captured WITH its own trailing
+#: whitespace (or the empty string, if there is none at all) so the
+#: group can legally be ZERO occurrences - a completely bare, modifier-
+#: less ``void main(...)`` is still a real, fully-parseable method
+#: header (just certainly not a JVM entry point, missing both required
+#: modifiers) and must be structurally RECOGNIZED, not fall through to
+#: the class-closer's "unrecognized shape" bucket meant for something
+#: this adapter genuinely cannot parse.
 _MAIN_METHOD_RE = re.compile(
-    r"\b(" + _MAIN_MODIFIER_KEYWORD + r"(?:\s+" + _MAIN_MODIFIER_KEYWORD + r")*)\s+"
-    r"void\s+main\s*\(\s*" + _MAIN_PARAM_RE + r"\s*\)"
+    r"((?:" + _MAIN_MODIFIER_OR_ANNOTATION + r"(?:\s+" + _MAIN_MODIFIER_OR_ANNOTATION + r")*\s+)?)"
+    r"(?:<[^>]*>\s*)?void\s+main\s*\(\s*" + _MAIN_PARAM_RE + r"\s*\)"
 )
-#: The honesty backstop CR9-2 asks for is unnecessary here, not omitted:
-#: a broad ``\bvoid\s+main\s*\(`` catch-all was considered and rejected -
-#: it would misclassify any non-entry-point method literally named
-#: ``main`` (a private helper, an interface method, a test double) as a
-#: missed CLI entry point, trading one honesty problem for a noisier one.
-#: ``_MAIN_METHOD_RE`` above is total for the legal grammar (every
-#: modifier order, both array spellings, varargs, ``final``, the
-#: ``java.lang.`` spelling, and flexible whitespace) rather than a partial
-#: detector needing a fallback.
+#: FIX ROUND 13b (reviewer-3's B1 class-closer, taken regardless of how
+#: complete the grammar above turns out to be): a method literally named
+#: ``main`` returning ``void`` that this SAME file's own strict matcher
+#: above did NOT recognize must never publish the confident negative
+#: "no entry point" - it might be a legal spelling this matcher still
+#: does not cover (the round-13 "total for the legal grammar" claim
+#: already turned out false once). No entry point is ever PUBLISHED for
+#: this shape either way (a private/instance helper coincidentally named
+#: "main" is never claimed as a real one) - only the CONFIDENCE of the
+#: negative changes, downstream, to an honest "unknown" (see
+#: readiness_artifact._check_entry_points_mapped) - the same three-state
+#: move round 11 already made for an unrecoverable route value. A
+#: broader catch-all was rejected in round 13 specifically because it
+#: would have PUBLISHED a false entry point for an ordinary non-entry-
+#: point method; recording an UNKNOWN, never a claim, carries no such
+#: risk - it can only ever make a negative less confident, never wrong.
+_MAIN_CANDIDATE_RE = re.compile(r"\bvoid\s+main\s*\(")
 _ROUTE_ANNOTATIONS = (
     "RequestMapping", "GetMapping", "PostMapping", "PutMapping",
     "DeleteMapping", "PatchMapping",
@@ -1575,7 +1643,18 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # comment. "public" and "static" must both appear in the matched
     # modifier run, in any order; the regex alone only guarantees at
     # least one recognized modifier keyword is present.
+    #
+    # FIX ROUND 13b (B1 class-closer): every "void main(" site the strict
+    # matcher DID recognize (whether or not it turned out to have both
+    # public and static) is tracked here, so the broader candidate scan
+    # below can tell "recognized, confidently not an entry point" (missing
+    # a required modifier - stays silent, unchanged) apart from
+    # "unrecognized shape entirely" (never seen by the strict matcher at
+    # all - degrades to unknown instead of a confident negative).
+    recognized_void_main_starts: set[int] = set()
     for main_match in _MAIN_METHOD_RE.finditer(sanitized):
+        void_main_submatch = re.search(r"void\s+main\s*\(", main_match.group(0))
+        recognized_void_main_starts.add(main_match.start() + void_main_submatch.start())
         modifiers = main_match.group(1).split()
         if "public" not in modifiers or "static" not in modifiers:
             continue
@@ -1583,6 +1662,17 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             qualified_name=_enclosing_qualified_name(main_match.start(), types, primary_qualified),
             kind="cli_main", name="main",
             line=_line_at(newline_offsets, main_match.start()), evidence_class="extracted",
+        ))
+
+    for candidate in _MAIN_CANDIDATE_RE.finditer(sanitized):
+        if candidate.start() in recognized_void_main_starts:
+            continue
+        problems.append(JavaAdapterProblem(
+            reason_code="cli_main_unrecognized",
+            detail=f"a method literally named main returning void at line "
+                   f"{_line_at(newline_offsets, candidate.start())} did not match any "
+                   "recognized public-static-void-main(String[]) signature shape - no "
+                   "cli_main entry point published, but not confidently absent either",
         ))
 
     if not units:

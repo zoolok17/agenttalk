@@ -523,6 +523,46 @@ def test_invoke_on_a_fully_qualified_legacy_class_never_resolves_to_an_unrelated
         "com/acme/legacy/OrderService.java", "com.acme.legacy.OrderService")
 
 
+def test_invoke_on_a_package_prefixed_nested_type_never_resolves_to_an_unrelated_imported_class():
+    """FIX ROUND 13b (reviewer-3's B2 BLOCKER on round 13): the first cut
+    of the CR9-1 fix required the prefix to be lowercase-led specifically
+    - so `com.acme.Outer.Inner.x()` still reduced to bare "Inner", which
+    then met the bare-keyed import table and resolved to an UNRELATED
+    imported `com.wrong.Inner` - CR9-1's exact mechanism through a
+    second door, confirmed here by unit identity via the registry with
+    BOTH classes genuinely in-scan."""
+    results = {
+        "com/acme/Outer.java": _parse(
+            "com/acme/Outer.java",
+            "package com.acme;\n"
+            "class Outer {\n"
+            "  static class Inner {\n"
+            "    static void x() {}\n"
+            "  }\n"
+            "}\n",
+        ),
+        "com/wrong/Inner.java": _parse(
+            "com/wrong/Inner.java", "package com.wrong;\nclass Inner {}\n"),
+        "com/acme/Foo.java": _parse(
+            "com/acme/Foo.java",
+            "package com.acme;\n"
+            "import com.wrong.Inner;\n"
+            "class Foo {\n"
+            "  void run() {\n"
+            "    com.acme.Outer.Inner.x();\n"
+            "  }\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    invoke = next(r for r in records if r.relation == "invoke")
+    assert invoke.resolution_state == "resolved"
+    assert invoke.target_unit_id == da._java_component_unit_id(
+        "com/acme/Outer.java", "com.acme.Outer.Inner")
+    wrong_unit_id = da._java_component_unit_id("com/wrong/Inner.java", "com.wrong.Inner")
+    assert invoke.target_unit_id != wrong_unit_id
+
+
 def test_static_import_member_qualifier_and_its_import_edge_agree_on_the_same_unit():
     """FIX ROUND 13 (ninth cold read, CR9-5 MINOR): a static-imported
     member used bare as a qualifier and the import edge for the SAME

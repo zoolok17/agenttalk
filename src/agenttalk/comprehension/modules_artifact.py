@@ -220,6 +220,18 @@ def build_modules(
             ))
             continue
 
+        # FIX ROUND 13b (reviewer-3's B1 class-closer on round 13): a
+        # worker-recorded problem (e.g. an adapter under-claim fail-safe
+        # like route_annotation_unassociated, route_value_unrecoverable,
+        # or cli_main_unrecognized) used to reach a unit's own
+        # adapter_problem_reason(s) ONLY through the "zero units
+        # extracted" branch above - a file that DOES have real declared
+        # types (the ordinary, common case for every one of those
+        # problem kinds) silently dropped the reason here, so no
+        # readiness check downstream could ever see it. Threaded through
+        # both record shapes below the exact same way the zero-units
+        # branch already does.
+        reasons = worker_problem_reasons_by_path.get(relative_path, [])
         qualified_names_in_file = {u.qualified_name for u in java_result.units}
         unit_id_by_qualified_name: dict[str, str] = {}
         for unit_claim in java_result.units:
@@ -255,6 +267,8 @@ def build_modules(
                     rule_version=java_adapter.RULE_VERSION,
                     source_digest=file_entry.content_digest, basis="extracted",
                 )],
+                adapter_problem_reason=reasons[0] if reasons else None,
+                adapter_problem_reasons=list(reasons),
             ))
 
         records.append(ModuleRecord(
@@ -270,6 +284,8 @@ def build_modules(
                 name="discovery", version=1, source_digest=file_entry.content_digest,
                 basis="extracted",
             )],
+            adapter_problem_reason=reasons[0] if reasons else None,
+            adapter_problem_reasons=list(reasons),
         ))
 
     return records

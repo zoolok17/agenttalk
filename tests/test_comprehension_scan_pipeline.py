@@ -480,6 +480,40 @@ def test_run_scan_ordinary_jdk_invoke_calls_never_drive_dependencies_resolved_un
     assert dependencies_resolved["reason_code"] == "no_declared_dependencies"
 
 
+def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unknown(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 13b (reviewer-3's B1 class-closer): a method literally
+    named main, returning void, with a parameter shape outside even the
+    extended grammar (round 13b) must never publish a confident "no
+    entry point" - end to end, the adapter's cli_main_unrecognized
+    problem must surface as readiness's entry_points_mapped UNKNOWN,
+    with problems.json naming the exact reason, on an otherwise real
+    scan run."""
+    (java_repo / "src" / "main" / "java" / "p" / "App.java").write_text(
+        "package p;\nclass App {\n"
+        "  public static void main(String[] args, int extra) {\n"
+        "  }\n"
+        "}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    app_unit = next(u for u in modules_doc["units"] if u["display_name"] == "App")
+    assert "cli_main_unrecognized" in app_unit["adapter_problem_reasons"]
+
+    entry_points_mapped = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == app_unit["unit_id"] and s["check"] == "entry_points_mapped"
+    )
+    assert entry_points_mapped["stored_status"] == "unknown"
+    assert entry_points_mapped["reason_code"] == "cli_main_unrecognized"
+    assert any(p["reason_code"] == "cli_main_unrecognized" for p in problems_doc["problems"])
+
+
 def test_run_scan_populates_source_digest_on_dependency_and_feature_producers(
     java_repo: Path,
 ) -> None:

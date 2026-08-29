@@ -487,6 +487,68 @@ class MigrationBridge {
     assert invoke[0].target_kind == "internal_unqualified_call_candidate"
 
 
+def test_qualified_call_with_a_package_prefixed_nested_type_captures_the_whole_chain():
+    """FIX ROUND 13b (reviewer-3's B2 BLOCKER on round 13): the FIRST cut
+    of the CR9-1 fix required the prefix segments to be lowercase-led
+    (package-shaped) - so a package-prefixed NESTED type reference
+    (`com.acme.Outer.Inner.x()`) still reduced to its bare tail "Inner"
+    (since "Outer", capitalized, broke the all-lowercase prefix match),
+    which then met the same bare-keyed import table CR9-1 closed one
+    door on - CR9-1's exact mechanism through a second door. The
+    qualifier must capture the FULL chain regardless of segment case."""
+    src = """
+package p;
+import com.wrong.Inner;
+class Foo {
+    void run() {
+        com.acme.Outer.Inner.x();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert len(invoke) == 1
+    assert invoke[0].target == "com.acme.Outer.Inner"
+    assert invoke[0].target_kind == "internal_unqualified_call_candidate"
+
+
+def test_lowercase_qualifier_still_produces_no_invoke_edge():
+    """FIX ROUND 13b (B2 control): a plain lowercase-led qualifier
+    (an ordinary local variable/field reference, never a type) must
+    still produce no invoke edge at all - the widened prefix must not
+    overshoot into treating instance-qualified calls as type-qualified
+    ones."""
+    src = """
+package p;
+class Foo {
+    void run() {
+        myClass.call();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    assert _edges(result, "invoke") == []
+
+
+def test_qualified_call_with_an_unusual_capitalized_package_segment_keeps_the_full_spelling():
+    """FIX ROUND 13b (B2 control): an unusual but legal identifier
+    spelling (a capitalized package segment, "Com") must not be
+    silently truncated either - the full source spelling is retained
+    verbatim, unresolved, never a guessed/truncated variant."""
+    src = """
+package p;
+class Foo {
+    void run() {
+        Com.acme.Foo.call();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert len(invoke) == 1
+    assert invoke[0].target == "Com.acme.Foo"
+
+
 def test_static_imported_member_qualifier_resolves_to_the_owning_class():
     """FIX ROUND 13 (ninth cold read, CR9-5 MINOR, wrong-data): a
     static-imported member used bare as an invoke qualifier
@@ -1619,6 +1681,16 @@ _MAIN_SIGNATURE_MATRIX = [
     ("no space before the array brackets", "public static void main(String []args)"),
     ("extra synchronized modifier", "public synchronized static void main(String[] args)"),
     ("synchronized between static and void", "public static synchronized void main(String[] args)"),
+    # FIX ROUND 13b (reviewer-3's B1 BLOCKER on round 13): the round-13
+    # "total for the legal grammar" claim was false - these five legal
+    # spellings were still silently missed.
+    ("annotation before the modifiers", "@Deprecated\n    public static void main(String[] args)"),
+    ("annotation interleaved between modifiers", "public @Deprecated static void main(String[] args)"),
+    ("type-parameter section (JLS 8.4, never actually generic in valid "
+     "use, but the grammar allows the token)",
+     "public static <T> void main(String[] args)"),
+    ("JSR-308 annotation before the parameter type", "public static void main(@NotNull String[] args)"),
+    ("JSR-308 annotation on the array itself", "public static void main(String @NotNull [] args)"),
 ]
 
 
@@ -1629,13 +1701,18 @@ def test_main_signature_matrix_every_legal_spelling_is_detected(shape_name, sign
     mains = [e for e in result.entry_points if e.kind == "cli_main"]
     assert len(mains) == 1, f"shape not detected: {shape_name} ({signature!r})"
     assert mains[0].qualified_name == "p.App"
+    assert result.problems == []
 
 
 def test_main_without_both_public_and_static_is_not_a_cli_main_entry_point():
     """De-enumerating to "public and static, any order, any other
     modifiers alongside" must not overshoot into treating ANY modifier
     combination as main - a package-private or instance `main` (missing
-    `public`, or missing `static`) is not a JVM entry point at all."""
+    `public`, or missing `static`) is not a JVM entry point at all. This
+    shape IS fully recognized by the strict matcher (just confidently
+    rejected for a missing modifier), so it must never publish the
+    round-13b class-closer's "unrecognized" problem either - a
+    structurally-understood, JLS-certain negative, not an unparseable one."""
     for signature in (
         "static void main(String[] args)",         # missing public
         "public void main(String[] args)",          # missing static
@@ -1644,6 +1721,29 @@ def test_main_without_both_public_and_static_is_not_a_cli_main_entry_point():
         src = f"package p;\nclass App {{\n    {signature} {{\n    }}\n}}\n"
         result = java.parse_java_source("App.java", src)
         assert [e for e in result.entry_points if e.kind == "cli_main"] == [], signature
+        assert result.problems == [], signature
+
+
+def test_unrecognized_main_like_shape_degrades_to_a_named_problem_not_silence():
+    """FIX ROUND 13b (reviewer-3's B1 class-closer): a method literally
+    named main, returning void, whose overall shape the strict matcher
+    could not recognize AT ALL (constructed here with a parameter shape
+    outside even the extended grammar) must never silently vanish into
+    a confident "no entry point" - it degrades to a named, visible
+    problem instead, since it MIGHT be a legal spelling this adapter
+    still does not cover."""
+    src = """
+package p;
+class App {
+    public static void main(String[] args, int extra) {
+    }
+}
+"""
+    result = java.parse_java_source("App.java", src)
+    assert [e for e in result.entry_points if e.kind == "cli_main"] == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "cli_main_unrecognized"
+    assert "did not match" in result.problems[0].detail
 
 
 def test_second_top_level_type_with_its_own_main_gets_its_own_cli_main_entry_point():

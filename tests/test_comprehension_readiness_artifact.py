@@ -14,12 +14,13 @@ from agenttalk.comprehension.modules_artifact import ModuleRecord
 
 def _unit(
     unit_id: str, *, language: str = "java", classification: str = "production",
-    adapter_problem_reason: str | None = None,
+    adapter_problem_reason: str | None = None, adapter_problem_reasons: list[str] | None = None,
 ) -> ModuleRecord:
     return ModuleRecord(
         unit_id=unit_id, kind="component", display_name=unit_id, language=language,
         paths=[f"{unit_id}.java"], source_digests={}, classification=[classification],
         container_unit_id=None, producers=[], adapter_problem_reason=adapter_problem_reason,
+        adapter_problem_reasons=adapter_problem_reasons or [],
     )
 
 
@@ -239,6 +240,21 @@ def test_entry_points_mapped_satisfied_when_the_unit_owns_a_feature():
     features = [_feature("Foo", "candidate", ["u1"])]
     signals, _ = ra.build_readiness([_unit("u1")], [], features)
     assert _signal_by_check(signals, "entry_points_mapped").stored_status == "satisfied"
+
+
+def test_entry_points_mapped_unknown_when_an_unrecognized_main_like_shape_was_recorded():
+    """FIX ROUND 13b (reviewer-3's B1 class-closer): a unit whose file
+    carries the adapter's "cli_main_unrecognized" problem (a method
+    literally named main, returning void, that the strict cli_main
+    detector could not confidently classify) must report entry_points_
+    mapped UNKNOWN, never the confident not_applicable/no_entry_point
+    negative - the same three-state move round 11 already made for an
+    unrecoverable route value."""
+    unit = _unit("u1", adapter_problem_reasons=["cli_main_unrecognized"])
+    signals, _ = ra.build_readiness([unit], [], [])
+    signal = _signal_by_check(signals, "entry_points_mapped")
+    assert signal.stored_status == "unknown"
+    assert signal.reason_code == "cli_main_unrecognized"
 
 
 def test_feature_linked_unsatisfied_with_no_feature_at_all():

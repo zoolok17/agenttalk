@@ -162,6 +162,12 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # could not be recovered as a literal - under-claimed rather than
     # composed against a guessed/implicit-empty value.
     "route_value_unrecoverable": "warning",
+    # FIX ROUND 13b (reviewer-3's B1 class-closer on round 13): a method
+    # literally named main that the adapter's strict cli_main detector
+    # could not confidently classify - under-claimed (readiness reports
+    # entry_points_mapped unknown, never a confident no-entry-point)
+    # rather than a silent, possibly-wrong negative.
+    "cli_main_unrecognized": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 

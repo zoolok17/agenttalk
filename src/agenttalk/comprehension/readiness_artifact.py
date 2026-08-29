@@ -229,10 +229,24 @@ def _check_dependencies_resolved_for_file(
 
 
 def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> ReadinessSignal:
-    if not has_entry_point:
+    if has_entry_point:
+        return _signal(unit.unit_id, "entry_points_mapped", "satisfied", "detected", "entry_point_mapped")
+    # FIX ROUND 13b (reviewer-3's B1 class-closer): a method literally
+    # named main that the adapter's strict cli_main detector could not
+    # confidently classify (recorded as a "cli_main_unrecognized"
+    # problem, the SAME file-level problem-reasons list source_
+    # understood's adapter_problem_reason(s) already reads) must feed
+    # UNKNOWN here, never the confident "no entry point" negative - the
+    # same three-state move round 11 already made for an unrecoverable
+    # route value. No entry point is ever published for this shape
+    # either way (a private/instance helper coincidentally named "main"
+    # is never claimed as a real one) - only the CONFIDENCE of the
+    # negative changes.
+    if "cli_main_unrecognized" in unit.adapter_problem_reasons:
         return _signal(
-            unit.unit_id, "entry_points_mapped", "not_applicable", "detected", "no_entry_point")
-    return _signal(unit.unit_id, "entry_points_mapped", "satisfied", "detected", "entry_point_mapped")
+            unit.unit_id, "entry_points_mapped", "unknown", "detected", "cli_main_unrecognized")
+    return _signal(
+        unit.unit_id, "entry_points_mapped", "not_applicable", "detected", "no_entry_point")
 
 
 def _check_feature_linked(unit: ModuleRecord, feature_states: list[str]) -> ReadinessSignal:
