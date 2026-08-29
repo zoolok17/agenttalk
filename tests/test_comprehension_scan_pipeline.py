@@ -504,14 +504,15 @@ def test_run_scan_never_publishes_an_import_of_a_resource_capped_file_as_externa
 def test_run_scan_ordinary_jdk_invoke_calls_never_drive_dependencies_resolved_unsatisfied(
     java_repo: Path,
 ) -> None:
-    """FIX ROUND 12 (F2/F5 folded in): an ordinary class calling plain
-    JDK methods with no import evidence (Math.max, ...) always resolves
-    those invoke edges unresolved (the adapter has no way to recognize
-    an unqualified JDK reference as external) - this must never drive
-    dependencies_resolved to unsatisfied for a class with no real
-    dependency problem at all. dependencies_resolved is scoped to
-    import/inherit/build relations, per the design's own "direct
-    internal dependencies" wording."""
+    """FIX ROUND 12 (F2/F5 folded in) + FIX ROUND 14 (CR10-4): an
+    ordinary class calling a well-known java.lang method with no import
+    evidence (Math.max) now resolves that invoke edge as EXTERNAL
+    (java.lang.Math - round 14's known-external recognition, closing
+    the noise at its source, not just at the readiness layer) - and
+    must never drive dependencies_resolved to unsatisfied either way,
+    both because it resolves cleanly AND because dependencies_resolved
+    stays scoped to import/inherit/build relations per the design's own
+    "direct internal dependencies" wording."""
     (java_repo / "src" / "main" / "java" / "p" / "PricingService.java").write_text(
         "package p;\nclass PricingService {\n"
         "  int cap(int a, int b) { return Math.max(a, b); }\n"
@@ -525,8 +526,8 @@ def test_run_scan_ordinary_jdk_invoke_calls_never_drive_dependencies_resolved_un
     dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
     invoke_edge = next(
         r for r in dependencies_doc["edges"]
-        if r["relation"] == "invoke" and r["target_unresolved"] == "Math")
-    assert invoke_edge["resolution_state"] == "unresolved"
+        if r["relation"] == "invoke" and r["target_external"] == "java.lang.Math")
+    assert invoke_edge["resolution_state"] == "resolved"
 
     pricing_unit = next(u for u in modules_doc["units"] if u["display_name"] == "PricingService")
     dependencies_resolved = next(
@@ -535,6 +536,40 @@ def test_run_scan_ordinary_jdk_invoke_calls_never_drive_dependencies_resolved_un
     )
     assert dependencies_resolved["stored_status"] == "satisfied"
     assert dependencies_resolved["reason_code"] == "no_declared_dependencies"
+
+
+def test_run_scan_a_custom_exception_extending_runtimeexception_reports_dependencies_resolved_satisfied(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 14 (tenth cold read, CR10-4 MAJOR): round 12 scoped
+    dependencies_resolved away from invoke noise but left inherit, which
+    has the identical property - java.lang needs no import, so every
+    custom exception (extends RuntimeException) published a confident
+    unsatisfied/unresolved_dependency at warning severity on entirely
+    healthy code. Must resolve RuntimeException as java.lang-known-
+    external and report satisfied, end to end."""
+    (java_repo / "src" / "main" / "java" / "p" / "OrderNotFoundException.java").write_text(
+        "package p;\nclass OrderNotFoundException extends RuntimeException {\n"
+        "  OrderNotFoundException(String id) { super(id); }\n"
+        "}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    dependencies_doc = json.loads((outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))
+    inherit_edge = next(r for r in dependencies_doc["edges"] if r["relation"] == "inherit")
+    assert inherit_edge["resolution_state"] == "resolved"
+    assert inherit_edge["target_external"] == "java.lang.RuntimeException"
+
+    exc_unit = next(
+        u for u in modules_doc["units"] if u["display_name"] == "OrderNotFoundException")
+    dependencies_resolved = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == exc_unit["unit_id"] and s["check"] == "dependencies_resolved"
+    )
+    assert dependencies_resolved["stored_status"] == "satisfied"
 
 
 def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unknown(

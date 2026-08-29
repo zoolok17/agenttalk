@@ -392,10 +392,12 @@ class JavaEdgeClaim:
     relation: str
     target: str
     # "internal_candidate" | "internal_exact_or_external" |
-    # "internal_static_import_exact_or_external" |
-    # "internal_unqualified_call_candidate" | "external" |
+    # "internal_static_import_exact_or_external" | "external" |
     # "external_route" - see dependencies_artifact._edge_claim_to_record
-    # for how each is resolved.
+    # for how each is resolved. FIX ROUND 14 (CR10-2): retired
+    # "internal_unqualified_call_candidate" - invoke's bare/dotted
+    # qualifier now shares "internal_candidate"'s own ladder with
+    # inherit/test, never a narrower, separately-maintained kind.
     target_kind: str
     evidence_class: str
     line: int | None
@@ -1358,6 +1360,23 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     types = _extract_types(sanitized, package)
     local_simple_names = {simple for _, simple, *_ in types}
     primary_qualified = types[0][0] if types else (package or relative_path)
+    # FIX ROUND 14 (tenth cold read, CR10-1 MAJOR): an ``import`` is a
+    # FILE-scoped Java fact (every type declared in the file sees every
+    # import, regardless of which one actually uses it) - publishing it
+    # against ``primary_qualified`` (the FIRST declared type) fabricated
+    # a type-scoped claim: in a public-class-plus-package-private-helper
+    # file, the FIRST class was credited with the helper's own import
+    # (a false edge), and the helper itself published no edges at all,
+    # letting readiness stamp it satisfied/no_declared_dependencies with
+    # zero real evidence - exactly the un-evidenced positive the
+    # readiness policy refuses everywhere else. Never a real type's own
+    # qualified name (relative_path's "/" and ".java" can never appear
+    # in a dotted Java qualified name), so dependencies_artifact.py's
+    # existing exact-lookup-or-file-unit fallback (``by_qualified_name.
+    # get(...) or file_unit_id_by_path[path]``) routes every import edge
+    # to the FILE unit - already addressable, and the one unit an import
+    # is honestly a fact ABOUT - rather than any specific declared type.
+    file_scope_qualified = f"{relative_path}#file"
 
     units = [
         JavaUnitClaim(
@@ -1404,7 +1423,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         else:
             target_kind = "internal_exact_or_external"
         edges.append(JavaEdgeClaim(
-            from_qualified_name=primary_qualified, relation="import", target=target,
+            from_qualified_name=file_scope_qualified, relation="import", target=target,
             target_kind=target_kind,
             evidence_class="extracted", line=line, phase="runtime",
         ))
@@ -1473,16 +1492,29 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # nor import-recognized - could be a genuine same-package
             # sibling (Java needs no import for that), but could equally
             # be a JDK/library type this extractor has no import evidence
-            # for. Deliberately NOT "internal_candidate" here: that would
-            # feed the GLOBAL simple-name matcher, and one same-named
-            # class anywhere else in the whole scan (a JDK-shadowing name
-            # like `Optional`, or a common test-helper name like `Assert`)
-            # would then silently capture every unrelated call to that
-            # name, codebase-wide - exactly the "invents an internal
-            # target because names look similar" the design forbids. This
-            # narrower kind only resolves via an EXACT qualified-name
-            # match; otherwise it stays unresolved, never a guess.
-            target_kind = "internal_unqualified_call_candidate"
+            # for.
+            #
+            # FIX ROUND 14 (tenth cold read, CR10-2 MAJOR): this used to
+            # be a NARROWER kind ("internal_unqualified_call_candidate",
+            # exact-qualified-match only, no fallback at all) specifically
+            # to avoid the GLOBAL simple-name matcher round 12 later
+            # closed for inherit/test - so `Caller extends Util` (same
+            # package, no import) resolved via the ladder while `Caller`'s
+            # OWN `Util.go()` call, the identical relationship, stayed
+            # UNRESOLVED in the same run: two contradictory facts about
+            # one dependency in one artifact, and virtually every ordinary
+            # same-package call in a normal multi-file package landed
+            # unresolved. Round 12 already closed the door this kind
+            # existed to guard - ``_resolve_internal_candidate`` no longer
+            # has a dangerous global bare-name fallback (a single same-
+            # named candidate anywhere in the scan no longer auto-
+            # resolves) - so invoke's bare qualifier now shares the exact
+            # SAME ladder inherit/test already use: same-file declaration,
+            # then this file's own import, then same-package sibling,
+            # else unresolved (or ambiguous for a genuine same-simple-name
+            # collision) - one resolution discipline for all three
+            # relations, never three copies of it.
+            target_kind = "internal_candidate"
         edges.append(JavaEdgeClaim(
             from_qualified_name=_enclosing_qualified_name(match.start(), types, primary_qualified),
             relation="invoke", target=qualifier,

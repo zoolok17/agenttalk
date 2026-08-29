@@ -238,6 +238,104 @@ def _resolve_internal_candidate(
     return "unresolved", None, target, None
 
 
+def _bare_head_qualified_name(
+    head: str, by_qualified_name: dict[str, str], *, local_qualified_by_simple: dict[str, str],
+    import_qualified_by_simple: dict[str, str], package: str | None,
+) -> str | None:
+    """FIX ROUND 14 (tenth cold read, CR10-3 MAJOR): resolves a BARE
+    (single-segment) name to its REAL, full qualified name via the same
+    evidence order the bare-name ladder in :func:`_resolve_internal_
+    candidate` uses (same-file declaration, then this file's own
+    import, then an implicit same-package sibling) - returns the
+    qualified name string on success, ``None`` otherwise. Used by
+    :func:`_resolve_internal_candidate_chain` to re-attach a dotted
+    chain's remaining segments onto the HEAD's own real qualified name
+    (never the bare head alone) when checking whether a longer prefix
+    is a genuine NESTED type."""
+    if head in local_qualified_by_simple:
+        candidate = local_qualified_by_simple[head]
+        if _exact_qualified_lookup(candidate, by_qualified_name) is not None:
+            return candidate
+        return None
+    if head in import_qualified_by_simple:
+        candidate = import_qualified_by_simple[head]
+        if _exact_qualified_lookup(candidate, by_qualified_name) is not None:
+            return candidate
+        return None
+    if package:
+        candidate = f"{package}.{head}"
+        if _exact_qualified_lookup(candidate, by_qualified_name) is not None:
+            return candidate
+    return None
+
+
+def _resolve_internal_candidate_chain(
+    target: str, by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
+    duplicate_qualified_names: set[str], *, local_qualified_by_simple: dict[str, str],
+    import_qualified_by_simple: dict[str, str], package: str | None,
+) -> tuple[str, str | None, str | None, str | None]:
+    """FIX ROUND 14 (tenth cold read, CR10-3 MAJOR): a dotted invoke
+    qualifier may be a MEMBER-NAVIGATION CHAIN, not a type reference at
+    all - ``Status.ACTIVE.code()`` captures qualifier ``"Status.ACTIVE"``
+    (an enum CONSTANT, not a dependency target); ``Config.Defaults.
+    timeout()`` captures ``"Config.Defaults"`` even when ``Config``'s
+    nested ``Defaults`` type genuinely IS a published unit of this same
+    run. Publishing either verbatim as an unresolved target FABRICATES a
+    target that was never a type at all (the enum constant case) or
+    silently drops a real, resolvable dependency (the nested-type case,
+    whose fan-in then wrongly stays zero).
+
+    Tries every dotted prefix of ``target``, LONGEST first - both the
+    prefix AS WRITTEN (a literal fully-qualified spelling) and the
+    prefix with its OWN head segment resolved to its real qualified name
+    and the remaining segments re-attached (catches a nested type
+    reached through an unqualified or same-package head, e.g. ``Config.
+    Defaults`` when ``Config`` itself resolves via an import) - the
+    first prefix that resolves (or is a genuine registry collision) wins,
+    on the theory that everything AFTER it was a member/field/constant
+    access, never a nested type. Falls through to the ordinary bare-name
+    ladder for just the head segment alone if no dotted prefix resolves.
+    Never truncates the PUBLISHED spelling on failure - an unresolved
+    outcome always retains the FULL original chain, never a partial
+    guess at which segment was "the real" boundary."""
+    if "." not in target:
+        return _resolve_internal_candidate(
+            target, by_qualified_name, by_simple_name, duplicate_qualified_names,
+            local_qualified_by_simple=local_qualified_by_simple,
+            import_qualified_by_simple=import_qualified_by_simple, package=package,
+        )
+    segments = target.split(".")
+    head_qualified = _bare_head_qualified_name(
+        segments[0], by_qualified_name, local_qualified_by_simple=local_qualified_by_simple,
+        import_qualified_by_simple=import_qualified_by_simple, package=package,
+    )
+    for i in range(len(segments), 1, -1):
+        prefix_as_written = ".".join(segments[:i])
+        exact = _exact_qualified_lookup(prefix_as_written, by_qualified_name)
+        if exact is not None:
+            return "resolved", exact, None, "high"
+        if prefix_as_written in duplicate_qualified_names:
+            return "ambiguous", None, target, None
+        if head_qualified is not None:
+            reattached = head_qualified + "." + ".".join(segments[1:i])
+            exact = _exact_qualified_lookup(reattached, by_qualified_name)
+            if exact is not None:
+                return "resolved", exact, None, "high"
+    # Nothing dotted resolved - fall through to the ordinary bare-name
+    # ladder for the head segment ALONE (e.g. "Status.ACTIVE" reduces to
+    # just "Status", dropping the constant-access tail entirely). Any
+    # outcome other than a clean resolve retains the FULL original
+    # chain as the published spelling - never the truncated head alone.
+    state, unit_id, _unresolved, confidence = _resolve_internal_candidate(
+        segments[0], by_qualified_name, by_simple_name, duplicate_qualified_names,
+        local_qualified_by_simple=local_qualified_by_simple,
+        import_qualified_by_simple=import_qualified_by_simple, package=package,
+    )
+    if state == "resolved":
+        return "resolved", unit_id, None, confidence
+    return state, None, target, None
+
+
 def _producer(*, name: str, version: int, rule_version: int, source_digest: str | None) -> dict[str, Any]:
     return {
         "producer": name, "producer_version": version, "rule_version": rule_version,
@@ -365,6 +463,67 @@ def _coalesce_by_edge_id(records: list[DependencyRecord]) -> list[DependencyReco
     return list(merged.values())
 
 
+#: FIX ROUND 14 (tenth cold read, CR10-4 MAJOR + judgment call): round
+#: 12's F5 scoped ``invoke`` noise out of ``dependencies_resolved``, but
+#: ``inherit`` has the IDENTICAL property - java.lang needs no import,
+#: so every custom exception (``extends RuntimeException``) and every
+#: ``Runnable``/``Comparable``/``AutoCloseable`` implementor published a
+#: confident ``unresolved_dependency`` on entirely healthy, ordinary
+#: code, since the resolution ladder has no local declaration, no
+#: import, and no same-package sibling to find. Judged (per the
+#: reviewer's own invitation): recognize a CLOSED, well-known set of
+#: java.lang simple names as KNOWN-EXTERNAL for BOTH relations (they
+#: share one resolution ladder since CR10-2) rather than merely scoping
+#: the readiness check further - this also fixes invoke's own dependency_
+#: summary noise (``Math``/``String``/... publishing permanently
+#: unresolved rather than the genuinely external JDK reference they are),
+#: not just inherit's readiness signal. PROVISIONAL, like every other
+#: bound/closed-set constant in this package - the common, everyday
+#: java.lang surface, not an exhaustive enumeration of the whole package
+#: (an obscure or newly-added java.lang type absent from this set simply
+#: stays unresolved, the same safe under-claim as today - never wrong,
+#: just not yet recognized).
+_JAVA_LANG_SIMPLE_NAMES = frozenset({
+    "Object", "String", "StringBuilder", "StringBuffer", "CharSequence",
+    "Boolean", "Byte", "Short", "Integer", "Long", "Float", "Double", "Number",
+    "Character", "Void", "Math", "StrictMath", "System", "Runtime", "Process",
+    "ProcessBuilder", "Thread", "ThreadGroup", "ThreadLocal", "Runnable",
+    "Comparable", "Iterable", "AutoCloseable", "Cloneable", "Class",
+    "ClassLoader", "Enum", "Record", "Package", "Module", "SecurityManager",
+    "Throwable", "Exception", "RuntimeException", "Error",
+    "IllegalArgumentException", "IllegalStateException", "NullPointerException",
+    "IndexOutOfBoundsException", "ArrayIndexOutOfBoundsException",
+    "StringIndexOutOfBoundsException", "ClassCastException",
+    "NumberFormatException", "UnsupportedOperationException",
+    "ArithmeticException", "NegativeArraySizeException", "ArrayStoreException",
+    "CloneNotSupportedException", "InterruptedException", "OutOfMemoryError",
+    "StackOverflowError", "AssertionError", "NoSuchFieldException",
+    "NoSuchMethodException", "SecurityException",
+})
+
+
+def _java_lang_known_external(target_unresolved: str | None) -> str | None:
+    """Returns the canonical ``java.lang.NAME`` spelling when
+    ``target_unresolved`` (bare, e.g. ``"RuntimeException"``, or already
+    spelled ``"java.lang.RuntimeException"``) names one of
+    ``_JAVA_LANG_SIMPLE_NAMES`` - ``None`` otherwise (including for any
+    OTHER dotted spelling, e.g. an unrelated package's own same-named
+    class, which this never touches). Callers apply this ONLY after the
+    resolution ladder already reported ``unresolved`` - a local
+    declaration, an import, or a same-package sibling sharing a
+    java.lang name always wins first, exactly Java's own shadowing rule;
+    ``ambiguous`` (a real in-scan naming collision) is never overridden
+    either, since that is more informative than a java.lang guess."""
+    if target_unresolved is None:
+        return None
+    simple = target_unresolved.rsplit(".", 1)[-1]
+    if target_unresolved not in (simple, f"java.lang.{simple}"):
+        return None
+    if simple in _JAVA_LANG_SIMPLE_NAMES:
+        return f"java.lang.{simple}"
+    return None
+
+
 def _edge_claim_to_record(
     edge: java_adapter.JavaEdgeClaim, *, from_unit_id: str, source_digest: str | None,
     by_qualified_name: dict[str, str], by_simple_name: dict[str, list[str]],
@@ -374,13 +533,27 @@ def _edge_claim_to_record(
 ) -> DependencyRecord:
     target_unit_id = target_external = target_unresolved = confidence = None
     if edge.target_kind == "internal_candidate":
+        # FIX ROUND 14 (CR10-3): chain-aware - a dotted target may be a
+        # member-navigation chain (an enum constant, a nested type
+        # reached through an unqualified head), never assumed to be a
+        # type reference verbatim just because it contains dots.
         resolution_state, target_unit_id, target_unresolved, confidence = (
-            _resolve_internal_candidate(
+            _resolve_internal_candidate_chain(
                 edge.target, by_qualified_name, by_simple_name, duplicate_qualified_names,
                 local_qualified_by_simple=local_qualified_by_simple,
                 import_qualified_by_simple=import_qualified_by_simple, package=package,
             )
         )
+        if resolution_state == "unresolved":
+            # FIX ROUND 14 (CR10-4): the ladder has no local/import/
+            # same-package rung that could ever find a java.lang type -
+            # recognized as the LAST resort, never ahead of real
+            # evidence (a shadowing local/imported/same-package
+            # declaration already won above, or this line never runs).
+            known_external = _java_lang_known_external(target_unresolved)
+            if known_external is not None:
+                resolution_state, target_unresolved = "resolved", None
+                target_external = known_external
     elif edge.target_kind == "internal_exact_or_external":
         # D-1 (reviewer-3, PR-B delta review round 2): an import's target
         # is already fully qualified - an EXACT registry hit means it
@@ -418,19 +591,6 @@ def _edge_claim_to_record(
             resolution_state, target_unresolved = "unresolved", edge.target
         else:
             resolution_state, target_external = "resolved", edge.target
-    elif edge.target_kind == "internal_unqualified_call_candidate":
-        # M12 (cold-read, PR-B fix round 3): an invoke call whose qualifier
-        # is neither locally declared nor import-recognized - could be a
-        # genuine same-package sibling (Java needs no import for that),
-        # but the GLOBAL simple-name matcher would let an unrelated
-        # same-named class ANYWHERE in the whole scan silently capture it
-        # (a JDK-shadowing name, or a common test-helper name). Exact
-        # qualified match only; otherwise unresolved, never a guess.
-        exact_unit_id = _exact_qualified_lookup(edge.target, by_qualified_name)
-        if exact_unit_id is not None:
-            resolution_state, target_unit_id, confidence = "resolved", exact_unit_id, "high"
-        else:
-            resolution_state, target_unresolved = "unresolved", edge.target
     else:
         resolution_state = "resolved"
         target_external = edge.target

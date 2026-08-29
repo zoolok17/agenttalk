@@ -15,11 +15,13 @@ from agenttalk.comprehension.modules_artifact import ModuleRecord
 def _unit(
     unit_id: str, *, language: str = "java", classification: str = "production",
     adapter_problem_reason: str | None = None, adapter_problem_reasons: list[str] | None = None,
+    container_unit_id: str | None = None,
 ) -> ModuleRecord:
     return ModuleRecord(
         unit_id=unit_id, kind="component", display_name=unit_id, language=language,
         paths=[f"{unit_id}.java"], source_digests={}, classification=[classification],
-        container_unit_id=None, producers=[], adapter_problem_reason=adapter_problem_reason,
+        container_unit_id=container_unit_id, producers=[],
+        adapter_problem_reason=adapter_problem_reason,
         adapter_problem_reasons=adapter_problem_reasons or [],
     )
 
@@ -182,6 +184,62 @@ def _file_unit(unit_id: str) -> ModuleRecord:
         paths=[f"{unit_id}.java"], source_digests={}, classification=["production"],
         container_unit_id=None, producers=[],
     )
+
+
+# --------------------------------- dependencies_resolved, CR10-1 (round 14): file-scoped imports
+
+def test_component_with_no_own_edges_but_a_single_sibling_free_file_inherits_the_files_status():
+    """FIX ROUND 14 (CR10-1): a component with NO edges of its own, in a
+    file with exactly ONE top-level declared type, has no attribution
+    ambiguity at all - the file's own import edges honestly ARE this
+    type's own dependency picture. Must mirror the file's aggregate
+    status, never a vacuous satisfied."""
+    file_unit = _file_unit("Solo")
+    component = _unit("comp1", container_unit_id="Solo")
+    edges = [_edge("Solo", relation="import", resolution_state="unresolved")]
+    signals, _ = ra.build_readiness([file_unit, component], edges, [])
+    component_signal = next(
+        s for s in signals if s.unit_id == "comp1" and s.check == "dependencies_resolved")
+    assert component_signal.stored_status == "unsatisfied"
+
+
+def test_component_with_no_own_edges_and_multiple_siblings_reports_unknown_not_satisfied():
+    """FIX ROUND 14 (CR10-1 MAJOR, the reviewer's Service/ServiceCache
+    shape): a component with no edges of its own, sharing a file with
+    ANOTHER top-level declared type, cannot honestly credit the file's
+    import evidence to just this one sibling - never a vacuous
+    satisfied/no_declared_dependencies (the un-evidenced positive the
+    readiness policy refuses everywhere else), degrades to unknown with
+    a named reason instead."""
+    file_unit = _file_unit("Multi")
+    service = _unit("Service", container_unit_id="Multi")
+    service_cache = _unit("ServiceCache", container_unit_id="Multi")
+    edges = [_edge("Multi", relation="import", resolution_state="resolved", target_unit_id="ext")]
+    signals, _ = ra.build_readiness([file_unit, service, service_cache], edges, [])
+    for unit_id in ("Service", "ServiceCache"):
+        signal = next(
+            s for s in signals if s.unit_id == unit_id and s.check == "dependencies_resolved")
+        assert signal.stored_status == "unknown", unit_id
+        assert signal.reason_code == "file_scoped_dependencies_not_attributed", unit_id
+
+
+def test_component_with_its_own_edges_is_unaffected_by_file_scoped_imports():
+    """FIX ROUND 14 (CR10-1 control): a component with its OWN real
+    body evidence (an invoke/inherit/test edge attributed to it
+    directly) must keep reporting on that evidence alone, regardless of
+    what the file's own import edges say - own evidence always wins,
+    never overridden by file-level corroboration."""
+    file_unit = _file_unit("Multi")
+    service = _unit("Service", container_unit_id="Multi")
+    service_cache = _unit("ServiceCache", container_unit_id="Multi")
+    edges = [
+        _edge("Multi", relation="import", resolution_state="unresolved"),
+        _edge("Service", relation="inherit", resolution_state="resolved", target_unit_id="ext"),
+    ]
+    signals, _ = ra.build_readiness([file_unit, service, service_cache], edges, [])
+    service_signal = next(
+        s for s in signals if s.unit_id == "Service" and s.check == "dependencies_resolved")
+    assert service_signal.stored_status == "satisfied"
 
 
 # ------------------------------------------- dependencies_resolved, file units (N6, round 6)

@@ -92,6 +92,27 @@ def test_import_with_a_simple_name_collision_still_classifies_external():
     assert import_edge.target_unit_id is None
 
 
+def test_import_edge_is_attributed_to_the_file_unit_never_the_first_declared_type():
+    """FIX ROUND 14 (tenth cold read, CR10-1 MAJOR, verbatim shape): a
+    public class plus a package-private helper in one file - the
+    everyday legacy shape. The import edge must resolve to the FILE
+    unit, never either declared type - the helper (declared second)
+    must never appear to have "inherited" the first class's own import,
+    and the first class must never be falsely credited with it either."""
+    results = {
+        "p/Service.java": _parse(
+            "p/Service.java",
+            "package p;\nimport java.util.List;\npublic class Service {\n}\nclass ServiceCache {\n}\n"),
+    }
+    records = da.build_dependencies(results)
+    import_edge = next(r for r in records if r.relation == "import")
+    service_unit_id = da._java_component_unit_id("p/Service.java", "p.Service")
+    service_cache_unit_id = da._java_component_unit_id("p/Service.java", "p.ServiceCache")
+    file_unit_id = da._java_file_unit_id("p/Service.java")
+    assert import_edge.from_unit_id not in {service_unit_id, service_cache_unit_id}
+    assert import_edge.from_unit_id == file_unit_id
+
+
 # ----------------------------------------------------------- inherit (cross-file resolution)
 
 def test_inherit_edge_resolves_to_a_type_declared_in_a_different_file():
@@ -592,6 +613,187 @@ def test_static_import_member_qualifier_and_its_import_edge_agree_on_the_same_un
     assert invoke_edge.target_unit_id == import_edge.target_unit_id
     assert invoke_edge.target_unit_id == da._java_component_unit_id(
         "com/acme/Config.java", "com.acme.Config")
+
+
+# ----------------------------------------------------------- tenth cold read CR10-2: invoke ladder unification
+
+def test_invoke_bare_qualifier_resolves_via_the_same_package_ladder_as_inherit():
+    """FIX ROUND 14 (tenth cold read, CR10-2 MAJOR, the reviewer's
+    Caller/Util shape): the resolution ladder (same-file, own-import,
+    same-package, else unresolved/ambiguous) was applied to inherit/test
+    but invoke's bare qualifier stopped at exact-FQN-only, so
+    `Caller extends Util` resolved (same-package ladder) while `Caller`'s
+    OWN `Util.go()` call - the identical relationship - stayed
+    unresolved in the SAME run: two contradictory facts about one
+    dependency in one artifact. Both edges must now resolve to the SAME
+    unit."""
+    results = {
+        "p/Util.java": _parse(
+            "p/Util.java", "package p;\nclass Util {\n  static void go() {}\n}\n"),
+        "p/Caller.java": _parse(
+            "p/Caller.java",
+            "package p;\nclass Caller extends Util {\n  void run() {\n    Util.go();\n  }\n}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    inherit_edge = next(r for r in records if r.relation == "inherit")
+    invoke_edge = next(r for r in records if r.relation == "invoke")
+    util_unit_id = da._java_component_unit_id("p/Util.java", "p.Util")
+    assert inherit_edge.resolution_state == "resolved"
+    assert inherit_edge.target_unit_id == util_unit_id
+    assert invoke_edge.resolution_state == "resolved"
+    assert invoke_edge.target_unit_id == util_unit_id
+
+
+# ----------------------------------------------------------- tenth cold read CR10-3: member-navigation chains
+
+def test_enum_constant_navigation_resolves_the_type_never_the_constant():
+    """FIX ROUND 14 (tenth cold read, CR10-3 MAJOR, verbatim shape):
+    `Status.ACTIVE.code()` captured qualifier "Status.ACTIVE" - an enum
+    CONSTANT, not a dependency target - and published an unresolved edge
+    on that fabricated string while the REAL in-scan dependency on
+    Status itself was never emitted. Must resolve the TYPE (Status),
+    dropping the constant-access tail, never publish "Status.ACTIVE"
+    verbatim."""
+    results = {
+        "p/Status.java": _parse(
+            "p/Status.java", "package p;\nenum Status {\n  ACTIVE, INACTIVE\n}\n"),
+        "p/Caller.java": _parse(
+            "p/Caller.java",
+            "package p;\nclass Caller {\n  void run() {\n    Status.ACTIVE.code();\n  }\n}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    invoke = next(r for r in records if r.relation == "invoke")
+    assert invoke.resolution_state == "resolved"
+    assert invoke.target_unit_id == da._java_component_unit_id("p/Status.java", "p.Status")
+    assert invoke.target_unresolved is None
+
+
+def test_nested_type_navigation_resolves_the_nested_unit_not_a_fabricated_string():
+    """FIX ROUND 14 (tenth cold read, CR10-3 MAJOR, verbatim shape):
+    `Config.Defaults.timeout()` captured qualifier "Config.Defaults" -
+    even though com.acme.legacy.Config.Defaults IS a published unit of
+    this same run, its fan-in stayed 0 because the chain was never
+    resolved past the unqualified head. Must resolve to the REAL nested
+    unit (Config's own head resolves via import; the remaining segment
+    re-attached and exact-matched against the nested type's own
+    qualified name)."""
+    results = {
+        "com/acme/legacy/Config.java": _parse(
+            "com/acme/legacy/Config.java",
+            "package com.acme.legacy;\n"
+            "class Config {\n"
+            "  static class Defaults {\n"
+            "    static int timeout() { return 0; }\n"
+            "  }\n"
+            "}\n",
+        ),
+        "com/acme/app/Caller.java": _parse(
+            "com/acme/app/Caller.java",
+            "package com.acme.app;\n"
+            "import com.acme.legacy.Config;\n"
+            "class Caller {\n"
+            "  void run() {\n"
+            "    Config.Defaults.timeout();\n"
+            "  }\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    invoke = next(r for r in records if r.relation == "invoke")
+    assert invoke.resolution_state == "resolved"
+    assert invoke.target_unit_id == da._java_component_unit_id(
+        "com/acme/legacy/Config.java", "com.acme.legacy.Config.Defaults")
+
+
+def test_five_class_legacy_estate_resolves_entirely_internal():
+    """FIX ROUND 14 (CR10-3, the reviewer's .cr10-legacy shape,
+    condensed): a small, entirely in-scan codebase whose dependencies
+    are ALL same-package/nested/enum-constant references must publish
+    dependency_summary with real internal edges, never 0 internal / N
+    unresolved on a codebase with nothing external at all."""
+    results = {
+        "p/Status.java": _parse(
+            "p/Status.java", "package p;\nenum Status {\n  ACTIVE\n}\n"),
+        "p/Util.java": _parse(
+            "p/Util.java", "package p;\nclass Util {\n  static void go() {}\n}\n"),
+        "p/Service.java": _parse(
+            "p/Service.java",
+            "package p;\n"
+            "class Service extends Util {\n"
+            "  void run() {\n"
+            "    Util.go();\n"
+            "    Status.ACTIVE.name();\n"
+            "  }\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    internal = [r for r in records if r.resolution_state == "resolved" and r.target_unit_id]
+    unresolved = [r for r in records if r.resolution_state == "unresolved"]
+    assert len(internal) == 3  # extends Util, Util.go(), Status.ACTIVE.name()
+    assert unresolved == []
+
+
+# ----------------------------------------------------------- tenth cold read CR10-4: java.lang known-external
+
+def test_inherit_edge_to_a_java_lang_type_resolves_known_external():
+    """FIX ROUND 14 (tenth cold read, CR10-4 MAJOR, verbatim shape):
+    round 12 scoped dependencies_resolved away from invoke noise but
+    left inherit with the identical property - java.lang needs no
+    import, so `extends RuntimeException` published a confident
+    unresolved_dependency on entirely healthy code. Must resolve as
+    KNOWN-EXTERNAL, never unresolved."""
+    results = {
+        "p/OrderNotFoundException.java": _parse(
+            "p/OrderNotFoundException.java",
+            "package p;\nclass OrderNotFoundException extends RuntimeException {\n}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "resolved"
+    assert inherit.target_external == "java.lang.RuntimeException"
+    assert inherit.target_unit_id is None
+
+
+def test_invoke_edge_to_a_java_lang_type_resolves_known_external():
+    """FIX ROUND 14 (CR10-4): the SAME known-external recognition
+    applies to invoke (Math.max, String.valueOf, ...) since round 12/14
+    unified invoke onto the shared ladder - fixes the noise at its
+    source, not just readiness's own relation-scoping workaround."""
+    results = {
+        "p/Foo.java": _parse(
+            "p/Foo.java",
+            "package p;\nclass Foo {\n  void run() {\n    Math.max(1, 2);\n  }\n}\n"),
+    }
+    records = da.build_dependencies(results)
+    invoke = next(r for r in records if r.relation == "invoke")
+    assert invoke.resolution_state == "resolved"
+    assert invoke.target_external == "java.lang.Math"
+
+
+def test_a_local_class_shadowing_a_java_lang_name_wins_over_known_external():
+    """FIX ROUND 14 (CR10-4 control): the ladder's own evidence always
+    wins first, exactly Java's shadowing rule - a LOCAL declaration (or
+    an import, or a same-package sibling) sharing a java.lang name must
+    resolve to that real in-scan type, never silently reclassified as
+    the java.lang default just because the name matches one."""
+    results = {
+        "p/Foo.java": _parse(
+            "p/Foo.java",
+            "package p;\n"
+            "class Foo extends Exception {\n"
+            "}\n"
+            "class Exception {\n"
+            "}\n",
+        ),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "resolved"
+    assert inherit.target_unit_id == da._java_component_unit_id("p/Foo.java", "p.Exception")
+    assert inherit.target_external is None
 
 
 # ----------------------------------------------------------- route (external)

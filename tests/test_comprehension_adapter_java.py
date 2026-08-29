@@ -51,6 +51,31 @@ class Foo {
     assert by_target["com.example.other.*"].target_kind == "external"
 
 
+def test_import_edge_is_file_scoped_not_attributed_to_the_first_declared_type():
+    """FIX ROUND 14 (tenth cold read, CR10-1 MAJOR): an import is a
+    FILE-scoped Java fact - every type in the file sees it, regardless
+    of which one actually uses it. Publishing it against the FIRST
+    declared type (the old behavior) fabricated a type-scoped claim: a
+    public-class-plus-package-private-helper file (the everyday legacy
+    shape) credited the FIRST class with the helper's own dependency (a
+    false edge) while the helper itself published none at all. The
+    import edge's own from_qualified_name must never equal either
+    declared type's qualified name - dependencies_artifact.py's exact-
+    match-or-file-unit fallback then routes it to the FILE unit."""
+    src = """
+package p;
+import java.util.List;
+public class Service {
+}
+class ServiceCache {
+}
+"""
+    result = java.parse_java_source("p/Service.java", src)
+    imports = _edges(result, "import")
+    assert len(imports) == 1
+    assert imports[0].from_qualified_name not in {"p.Service", "p.ServiceCache"}
+
+
 def test_import_inside_a_comment_is_not_extracted():
     src = """
 package p;
@@ -483,8 +508,10 @@ class MigrationBridge {
     assert invoke[0].target == "com.acme.legacy.OrderService"
     # Never "internal_exact_or_external" (the import-rewrite path) - a
     # dotted qualifier is inline-FQN evidence, exact-match-or-unresolved
-    # only, the same discipline round 12 applies to inherit/test.
-    assert invoke[0].target_kind == "internal_unqualified_call_candidate"
+    # only, the same discipline round 12 applies to inherit/test. FIX
+    # ROUND 14 (CR10-2): invoke now shares "internal_candidate" with
+    # inherit/test - one ladder, one target_kind, for all three.
+    assert invoke[0].target_kind == "internal_candidate"
 
 
 def test_qualified_call_with_a_package_prefixed_nested_type_captures_the_whole_chain():
@@ -509,7 +536,9 @@ class Foo {
     invoke = _edges(result, "invoke")
     assert len(invoke) == 1
     assert invoke[0].target == "com.acme.Outer.Inner"
-    assert invoke[0].target_kind == "internal_unqualified_call_candidate"
+    # FIX ROUND 14 (CR10-2): invoke now shares "internal_candidate" with
+    # inherit/test - one ladder, one target_kind, for all three.
+    assert invoke[0].target_kind == "internal_candidate"
 
 
 def test_lowercase_qualifier_still_produces_no_invoke_edge():

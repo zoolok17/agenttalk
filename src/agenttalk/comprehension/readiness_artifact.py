@@ -252,6 +252,38 @@ def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRe
     return _signal(unit.unit_id, "dependencies_resolved", "satisfied", "detected", "dependencies_resolved")
 
 
+#: FIX ROUND 14 (tenth cold read, CR10-1 MAJOR): an ``import`` edge is
+#: now attributed to its FILE unit, never a declared type (the adapter
+#: fix - java.py's ``file_scope_qualified`` - closes the false-
+#: attribution half; this closes the readiness half). A component with
+#: NO edges of its own used to report a confident satisfied/
+#: no_declared_dependencies regardless of whether its file actually
+#: has real, unattributed import evidence - an un-evidenced positive.
+#: A single-top-level-type file has no attribution ambiguity at all
+#: (there is only one possible owner for the file's own imports), so
+#: the component's status honestly MIRRORS the file's own aggregate
+#: resolution outcome; a multi-type file's import evidence cannot be
+#: honestly credited to any ONE sibling, so it degrades to unknown with
+#: a named reason instead of guessing.
+def _check_dependencies_resolved_for_component(
+    unit: ModuleRecord, own_outgoing: list[DependencyRecord], file_unit_id: str | None,
+    children_by_container: dict[str, list[str]], outgoing_by_unit: dict[str, list[DependencyRecord]],
+) -> ReadinessSignal:
+    own_relevant = [e for e in own_outgoing if e.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
+    if own_relevant or file_unit_id is None:
+        return _check_dependencies_resolved(unit, own_outgoing)
+    file_outgoing = outgoing_by_unit.get(file_unit_id, [])
+    file_relevant = [e for e in file_outgoing if e.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
+    if not file_relevant:
+        return _check_dependencies_resolved(unit, own_outgoing)
+    top_level_siblings = len(children_by_container.get(file_unit_id, []))
+    if top_level_siblings <= 1:
+        return _check_dependencies_resolved(unit, file_outgoing)
+    return _signal(
+        unit.unit_id, "dependencies_resolved", "unknown", "detected",
+        "file_scoped_dependencies_not_attributed")
+
+
 def _check_dependencies_resolved_for_file(
     unit: ModuleRecord, direct_outgoing: list[DependencyRecord], contained_unit_ids: set[str],
     outgoing_by_unit: dict[str, list[DependencyRecord]],
@@ -380,6 +412,23 @@ def build_readiness(
         for unit_id in feature.unit_ids:
             feature_states_by_unit.setdefault(unit_id, []).append(feature.state)
 
+    # FIX ROUND 14 (CR10-1): resolves a component's OWNING file, walking
+    # up through nested-type containment (a nested type's own container
+    # is its outer type, never the file directly - N6/round 6) until a
+    # "file"-kind unit is reached.
+    module_by_id = {m.unit_id: m for m in modules}
+
+    def _owning_file_unit_id(unit: ModuleRecord) -> str | None:
+        current = unit
+        while current.container_unit_id is not None:
+            parent = module_by_id.get(current.container_unit_id)
+            if parent is None:
+                return None
+            if parent.kind == "file":
+                return parent.unit_id
+            current = parent
+        return None
+
     all_signals: list[ReadinessSignal] = []
     summaries: list[UnitReadinessSummary] = []
 
@@ -390,8 +439,10 @@ def build_readiness(
                 _transitive_descendants(unit.unit_id), outgoing_by_unit,
             )
         else:
-            dependencies_signal = _check_dependencies_resolved(
-                unit, outgoing_by_unit.get(unit.unit_id, []))
+            dependencies_signal = _check_dependencies_resolved_for_component(
+                unit, outgoing_by_unit.get(unit.unit_id, []), _owning_file_unit_id(unit),
+                children_by_container, outgoing_by_unit,
+            )
         unit_signals = [
             _check_source_understood(unit),
             dependencies_signal,
