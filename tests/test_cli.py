@@ -759,18 +759,31 @@ def test_status_supervisor_snapshot_unstatable_after_read_is_visible_not_silent(
     (the file existed and parsed, then vanished/became unreadable between
     the two calls) used to silently drop the snapshot with no warning - the
     exact silent-degrade shape #124 exists to close. Must surface a warning
-    like every other degrade path here."""
+    like every other degrade path here.
+
+    round-6 review (CI platform bug): this originally monkeypatched the
+    SHARED ``pathlib.Path.stat`` classmethod, which also backs
+    ``Path.exists()`` - and ``exists()``'s own OSError-handling is
+    platform/version-sensitive (it only swallows specific errno-tagged
+    errors on some pathlib implementations, and our plain ``OSError("...")``
+    has no errno), so on Linux/macOS CI the SAME patched failure leaked out
+    of ``_read_supervisor_snapshot``'s unrelated ``path.exists()`` check
+    before the "successful read" this test needs ever happened, crashing
+    `status` outright instead of reaching the code path under test. Testing
+    the CONDITION instead: monkeypatch cli._supervisor_snapshot_path (our
+    own accessor, called ONLY for its later `.stat()` call - see
+    _fresh_supervisor_snapshot) to return a stand-in whose `.stat()` raises,
+    never touching the real Path class or its `.exists()`/`.read_text()`
+    behavior at all."""
     snap_path = Store(store_root).dir / "supervisor-snapshot.json"
     snap_path.write_text(json.dumps([{"pid": 4242}]), encoding="utf-8")
 
-    real_stat = Path.stat
-
-    def flaky_stat(self, *args, **kwargs):
-        if self == snap_path:
+    class _UnstatablePath:
+        def stat(self):
             raise OSError("simulated stat failure after a successful read")
-        return real_stat(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", flaky_stat)
+    monkeypatch.setattr(cli, "_supervisor_snapshot_path",
+                        lambda store, path_value=None: _UnstatablePath())
 
     def spy_observation(store, *, now_epoch, state, supervisor_config,
                         snapshot, event_limit, lead_liveness_stale_after_seconds):
