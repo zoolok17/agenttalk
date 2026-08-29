@@ -251,6 +251,46 @@ def test_gitmodules_parsing_does_not_match_a_pathspec_key_as_path(tmp_path: Path
     assert sorted(f.relative_path for f in result.files) == [".gitmodules", "decoy/inner.txt"]
 
 
+def test_unreadable_gitmodules_records_a_problem_and_marks_the_fingerprint_incomplete(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """N2 (seventh cold read, fix round 11): an unreadable root
+    .gitmodules used to silently return an EMPTY boundary set,
+    indistinguishable from "no submodules at all" - a real submodule
+    then walked straight into the fingerprint with
+    fingerprint_complete: true. Fail-open against the choke-point
+    discipline: an unreadable .gitmodules IS an enumeration omission
+    (you cannot know what you failed to exclude) and must record a
+    problem and mark the fingerprint incomplete, same as every other
+    bounded-problem exit in this module."""
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "lib"]\n\tpath = lib\n\turl = https://example.invalid/lib.git\n',
+        encoding="utf-8",
+    )
+    submodule_dir = tmp_path / "lib"
+    submodule_dir.mkdir()
+    (submodule_dir / "inner.txt").write_bytes(b"should never be enumerated")
+
+    real_read_text = Path.read_text
+
+    def _read_text(self: Path, *args, **kwargs):
+        if self.name == ".gitmodules":
+            raise OSError("permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _read_text)
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert any(p["reason_code"] == "parse_failed" and p["path"] == ".gitmodules"
+               for p in result.problems)
+    assert result.fingerprint_complete is False
+    assert result.whole_scope_fingerprint is None
+    # the submodule directory is walked into (unknown, not excluded) since
+    # its boundary could not be identified - the honest, visible failure
+    # mode this fix trades for the old silent one.
+    assert any(f.relative_path == "lib/inner.txt" for f in result.files)
+
+
 # ----------------------------------------------------------- resource caps
 
 def test_per_file_size_cap_fires_before_binary_sniffing(tmp_path: Path, monkeypatch) -> None:

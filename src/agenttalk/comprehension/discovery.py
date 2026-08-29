@@ -364,21 +364,38 @@ def _exclusion_category(name: str, *, is_dir: bool) -> str | None:
     return None
 
 
-def _submodule_boundary_paths(root: Path) -> frozenset[str]:
+def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str] | None]:
     """A minimal ``.gitmodules`` parse: every ``path = ...`` line's value,
     POSIX-spelled. Full git-submodule semantics (nested configs, URL
     rewriting) are out of scope - this only needs the boundary PATHS
     themselves, to satisfy "submodules are external boundaries unless
     explicitly included" (design). No git subprocess is invoked; this is a
-    plain text parse of a file already inside the resolved root."""
+    plain text parse of a file already inside the resolved root.
+
+    N2 (seventh cold read, fix round 11): an unreadable ``.gitmodules``
+    used to silently return an EMPTY boundary set - indistinguishable
+    from "no submodules at all" - so any real submodule then walked
+    STRAIGHT INTO the fingerprint with ``fingerprint_complete: true``.
+    Fail-open against this package's own choke-point discipline: you
+    cannot know what you failed to exclude. Returns ``(paths, problem)``
+    - ``problem`` is ``None`` on success (including the ordinary "no
+    ``.gitmodules`` file" case, never a failure), or a problem dict the
+    caller must record (marking the fingerprint incomplete) when the
+    file exists but could not be read."""
     gitmodules = root / ".gitmodules"
     if not gitmodules.is_file():
-        return frozenset()
+        return frozenset(), None
     paths: set[str] = set()
     try:
         text = gitmodules.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return frozenset()
+    except OSError as exc:
+        return frozenset(), {
+            "reason_code": "parse_failed",
+            "path": ".gitmodules",
+            "detail": bounded_os_error_detail(
+                "could not read .gitmodules - submodule boundaries are unknown, "
+                "so none could be excluded", exc),
+        }
     for line in text.splitlines():
         stripped = line.strip()
         # N7 (fourth cold read, fix round 6): startswith("path") also
@@ -391,7 +408,7 @@ def _submodule_boundary_paths(root: Path) -> frozenset[str]:
             value = value.strip().replace("\\", "/")
             if value:
                 paths.add(value)
-    return frozenset(paths)
+    return frozenset(paths), None
 
 
 def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
@@ -404,7 +421,7 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
     for an oversized or binary file - both are bounded, counted outcomes.
     """
     platform_identity = detect_platform_identity(comprehension_dir)
-    submodule_boundaries = _submodule_boundary_paths(root)
+    submodule_boundaries, submodule_problem = _submodule_boundary_paths(root)
 
     files: list[EnumeratedFile] = []
     boundaries: list[BoundaryEntry] = []
@@ -414,6 +431,15 @@ def enumerate_scope(root: Path, comprehension_dir: Path) -> DiscoveryResult:
     entry_count = 0
     hashed_total = 0
     entry_cap_hit = False
+
+    if submodule_problem is not None:
+        # N2 (seventh cold read, fix round 11): an unreadable .gitmodules
+        # is an enumeration OMISSION, not a merely-informational note -
+        # you cannot know what you failed to exclude, so the fingerprint
+        # can never be trusted complete over whatever a submodule this
+        # run could not identify may have folded into it.
+        degraded = True
+        problems.append(submodule_problem)
 
     def _record_exclusion(category: str) -> None:
         exclusions[category] = exclusions.get(category, 0) + 1
