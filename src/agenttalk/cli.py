@@ -13996,7 +13996,7 @@ def build_parser() -> argparse.ArgumentParser:
     creport.add_argument("--feature", dest="feature_id", help="Filter to one feature ID.")
     creport.add_argument(
         "--readiness", dest="readiness_state",
-        help="Filter to units with this stored_assessment_state.")
+        help="Filter to units with this assessment_state.")
     creport.add_argument(
         "--dependencies", action="store_true", dest="dependencies_only",
         help="Report only the dependency-edge view.")

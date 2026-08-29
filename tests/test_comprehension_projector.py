@@ -110,6 +110,66 @@ def test_readiness_state_filter_narrows_signals_and_summaries():
     assert [s["unit_id"] for s in payload["readiness"]["signals"]] == ["u1"]
 
 
+# ------------------------------ MAJOR 3 (sixth cold read, fix round 10):
+# the #208 contract's stored/revalidated readiness field list
+# (DESIGN-55-comprehension-plane.md, "Evidence pointers and trust").
+
+def test_readiness_summary_row_carries_every_design_named_field():
+    """Parity test against the design field list: `report --json`/the
+    projection must emit stored_assessment_state, revalidated_status,
+    revalidated_at, revalidation_reason, and the unprefixed
+    assessment_state - not just the raw stored value readiness.json
+    itself persists."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        readiness_summaries=[_summary("u1", "assessed")]))
+    row = payload["readiness"]["summaries"][0]
+    assert row.keys() >= {
+        "unit_id", "stored_assessment_state", "assessment_state",
+        "revalidated_status", "revalidated_at", "revalidation_reason",
+    }
+
+
+def test_readiness_summary_assessment_state_equals_stored_this_slice():
+    """This slice has no external-pointer revalidation pass, so the
+    design's unprefixed assessment_state (design: "always derived from
+    revalidated statuses... never wins a conflict with a more
+    conservative revalidated result") equals the stored value - there is
+    no revalidated result yet to diverge from."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        readiness_summaries=[_summary("u1", "blocked")]))
+    row = payload["readiness"]["summaries"][0]
+    assert row["assessment_state"] == "blocked"
+    assert row["stored_assessment_state"] == "blocked"
+
+
+def test_readiness_summary_revalidated_status_is_honest_unknown_not_persisted():
+    """revalidated_status/revalidated_at/revalidation_reason are honest
+    unknowns with a NAMED reason (no guessed current/stale/confirmed) -
+    and are a PROJECTION-only addition, never persisted into
+    readiness.json's own stored summary shape (UnitReadinessSummary.
+    to_json() is unchanged)."""
+    summary = _summary("u1", "assessed")
+    assert "revalidated_status" not in summary.to_json()
+    payload = pr.project_comprehension(**_base_kwargs(readiness_summaries=[summary]))
+    row = payload["readiness"]["summaries"][0]
+    assert row["revalidated_status"] == "unknown"
+    assert row["revalidated_at"] is None
+    assert row["revalidation_reason"]
+
+
+def test_readiness_state_filter_matches_the_projected_assessment_state_field():
+    """M3: --readiness/readiness_state filters on assessment_state (this
+    slice: equal to stored_assessment_state), the SAME field/value the
+    projected row publishes - not a parallel, independently-derived
+    check that could silently drift from it."""
+    summaries = [_summary("u1", "blocked"), _summary("u2", "assessed")]
+    payload = pr.project_comprehension(**_base_kwargs(
+        readiness_summaries=summaries, readiness_state="blocked"))
+    rows = payload["readiness"]["summaries"]
+    assert [r["unit_id"] for r in rows] == ["u1"]
+    assert all(r["assessment_state"] == "blocked" for r in rows)
+
+
 def test_dependencies_only_omits_the_other_sections():
     edges = [_edge("e1", "u1", resolution_state="resolved", target_external="java.util.List")]
     payload = pr.project_comprehension(**_base_kwargs(dependencies=edges, dependencies_only=True))

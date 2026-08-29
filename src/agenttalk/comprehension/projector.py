@@ -65,6 +65,43 @@ def _fan_counts(dependencies: list[DependencyRecord]) -> tuple[dict[str, int], d
     return fan_out, fan_in
 
 
+#: M3 (sixth cold read, fix round 10): this slice has no external-pointer
+#: revalidation pass at all - readiness.json's own stored_assessment_state
+#: is scan-time-only (design: "readiness.json and its manifest digest
+#: cover only stored_status and stored_assessment_state at scan time").
+#: The honest projection value is revalidated_status=unknown with a
+#: NAMED reason, never a guessed current/stale/confirmed.
+_REVALIDATION_NOT_IMPLEMENTED_REASON = "external_revalidation_not_implemented_this_slice"
+
+
+def _assessment_state(summary: UnitReadinessSummary) -> str:
+    """The design's unprefixed, projection-level ``assessment_state`` -
+    "always derived from revalidated statuses... never wins a conflict
+    with a more conservative revalidated result" (design, "Evidence
+    pointers and trust"). This slice has no revalidation pass to
+    diverge from, so it equals the stored value - stated explicitly,
+    here, in the ONE place both the projected field and the
+    ``--readiness``/``readiness_state`` filter read it from, rather than
+    left for either to assume the equivalence independently."""
+    return summary.stored_assessment_state
+
+
+def _project_readiness_summary(summary: UnitReadinessSummary) -> dict[str, Any]:
+    """MAJOR 3 (sixth cold read, fix round 10): the projection omitted
+    every revalidated-status field and the unprefixed ``assessment_state``
+    the design NAMES as part of the #208 contract - ``report --json``
+    carried only ``stored_assessment_state``, a missing-key surprise for
+    any design-shaped consumer. Adds them at the PROJECTION layer only
+    (never persisted into readiness.json itself, which stores scan-time
+    values exclusively)."""
+    payload = summary.to_json()
+    payload["revalidated_status"] = "unknown"
+    payload["revalidated_at"] = None
+    payload["revalidation_reason"] = _REVALIDATION_NOT_IMPLEMENTED_REASON
+    payload["assessment_state"] = _assessment_state(summary)
+    return payload
+
+
 def project_comprehension(
     *,
     scan_id: str,
@@ -118,8 +155,13 @@ def project_comprehension(
     filtered_summaries = readiness_summaries
     filtered_signals = readiness_signals
     if readiness_state is not None:
+        # M3 (sixth cold read, fix round 10): filters on the design's
+        # projection-level assessment_state (this slice: equal to
+        # stored_assessment_state, since no revalidation pass exists yet
+        # to diverge from it) - the SAME field/value _project_readiness_
+        # summary below publishes, via the one shared helper.
         filtered_summaries = [
-            s for s in filtered_summaries if s.stored_assessment_state == readiness_state
+            s for s in filtered_summaries if _assessment_state(s) == readiness_state
         ]
         allowed_unit_ids = {s.unit_id for s in filtered_summaries}
         filtered_signals = [s for s in filtered_signals if s.unit_id in allowed_unit_ids]
@@ -156,7 +198,7 @@ def project_comprehension(
     readiness_signal_rows, readiness_signal_omitted = _bounded(
         [s.to_json() for s in filtered_signals])
     readiness_summary_rows, readiness_summary_omitted = _bounded(
-        [s.to_json() for s in filtered_summaries])
+        [_project_readiness_summary(s) for s in filtered_summaries])
     # M-4 (second cold read, fix round 4): round 3's own bounding fix
     # enumerated the four sections it fixed rather than asserting a
     # payload-wide invariant - these two, both plain lists of ids rather
