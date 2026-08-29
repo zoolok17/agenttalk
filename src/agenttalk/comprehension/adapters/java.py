@@ -1896,24 +1896,56 @@ def _strip_xml_comments(text: str) -> str:
 #: matches an XML declaration (``<?xml``) or a DOCTYPE (``<!DOCTYPE``) at
 #: their own position - the search simply continues past them to the
 #: real root element. A namespace-prefixed root (``<b:beans>``) keeps
-#: only the LOCAL name (the part after ``:``), since Spring's own bean
-#: XML is recognized by its local name regardless of prefix aliasing.
+#: only the LOCAL name (the part after ``:``).
 _XML_ROOT_ELEMENT_RE = re.compile(r"<([A-Za-z_][\w.-]*)(?::([A-Za-z_][\w.-]*))?[\s/>]")
+
+#: FIX ROUND 14c (reviewer-3's own real-file repro, pulled forward as a
+#: LOW): requiring the char after ``<`` to be a name-start character
+#: only skips an XML declaration/DOCTYPE at THEIR OWN opening position -
+#: it does nothing about a literal ``<beans`` substring living INSIDE a
+#: processing instruction's raw content (``<?custom-pi <beans> ?>``) or
+#: inside a DOCTYPE internal subset's entity replacement text (an
+#: ``<!ENTITY>`` value can contain arbitrary markup-shaped text) - both
+#: are real, well-formed XML the prior sniff read as a false root. Both
+#: are blanked, offset-preserving, exactly the idiom ``_strip_xml_comments``
+#: already uses. The DOCTYPE pattern's bounded character classes
+#: (``[^\[>]`` / ``[^>]``) cannot themselves cross the declaration's own
+#: closing ``>`` - proven by the Spring DTD-form doctype regression,
+#: which must still resolve to the REAL root that follows.
+_XML_PI_RE = re.compile(r"<\?.*?\?>", re.DOTALL)
+_XML_DOCTYPE_RE = re.compile(r"<!DOCTYPE[^\[>]*(\[.*?\])?[^>]*>", re.DOTALL)
+
+
+def _blank_match(match: re.Match) -> str:
+    return "".join(c if c == "\n" else " " for c in match.group(0))
 
 
 def sniff_xml_root_element(text: str) -> str | None:
-    """Returns the root element's own LOWERCASE local name, or ``None``
-    when it cannot be determined at all (no element-shaped tag found in
-    the whole file - genuinely malformed, or empty). Never raises; a
-    caller that cannot read this file's shape must fail toward record-
-    only, never a guessed degradation (FIX ROUND 14b's own explicit
-    safe-side direction)."""
+    """Returns the root element's own local name EXACTLY as spelled (FIX
+    ROUND 14c: XML element names are case-sensitive - a caller comparing
+    against a specific expected name, e.g. Spring's ``beans``, must
+    compare exact-case too, never fold ``<BEANS>`` into a match it never
+    earned), or ``None`` when it cannot be determined at all (no
+    element-shaped tag found in the whole file - genuinely malformed, or
+    empty). Never raises; a caller that cannot read this file's shape
+    must fail toward record-only, never a guessed degradation (FIX ROUND
+    14b's own explicit safe-side direction).
+
+    FIX ROUND 14c: an UNTERMINATED comment (a stray ``<!--`` with no
+    matching ``-->`` anywhere in the file) is malformed input - the real
+    structure past that point cannot be trusted at all, so the search
+    stops right there rather than reading whatever text happens to
+    follow (which could itself be inside the broken comment)."""
     sanitized = _strip_xml_comments(text)
+    sanitized = _XML_PI_RE.sub(_blank_match, sanitized)
+    sanitized = _XML_DOCTYPE_RE.sub(_blank_match, sanitized)
+    unterminated_comment_start = sanitized.find("<!--")
+    if unterminated_comment_start != -1:
+        sanitized = sanitized[:unterminated_comment_start]
     match = _XML_ROOT_ELEMENT_RE.search(sanitized)
     if match is None:
         return None
-    local_name = match.group(2) if match.group(2) is not None else match.group(1)
-    return local_name.lower()
+    return match.group(2) if match.group(2) is not None else match.group(1)
 
 
 #: M3 (fourth cold read, fix round 6): captures the WHOLE dependency

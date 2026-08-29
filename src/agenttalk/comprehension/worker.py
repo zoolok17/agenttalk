@@ -77,7 +77,11 @@ _DEGRADING_UNSUPPORTED_LANGUAGE_EXTENSIONS = frozenset({".jsp", ".jspx", ".sql"}
 #: Spring bean XML's own root element - the ONE xml root name this
 #: producer recognizes as code-bearing (a bean declaration is
 #: application wiring, not tooling configuration). PROVISIONAL, like
-#: every other closed-set constant in this package.
+#: every other closed-set constant in this package. FIX ROUND 14c: XML
+#: element names are case-sensitive - ``sniff_xml_root_element`` returns
+#: the root's name EXACTLY as spelled, so this comparison below is
+#: exact-case by construction; ``<BEANS>`` never matches this lowercase
+#: literal and correctly falls through to record-only.
 _SPRING_BEAN_XML_ROOT_ELEMENT = "beans"
 #: MAJOR 2 (sixth cold read, fix round 9): both are real, common
 #: declarations this adapter's class/interface/enum/record extractor

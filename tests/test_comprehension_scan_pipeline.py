@@ -841,6 +841,94 @@ def test_run_scan_an_unreadable_root_element_xml_estate_stays_complete(java_repo
     assert "could not be determined" in matches[0]["detail"]
 
 
+def test_run_scan_a_fake_beans_tag_inside_a_processing_instruction_stays_complete(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 14c (reviewer-3's own real-file repro, pulled forward):
+    a well-formed XML file whose root is <cfg> - a literal "<beans"
+    living inside a processing instruction's raw content must never
+    publish a FALSE root-element detail (asserting Spring bean XML for
+    a file that never declared one) and must never degrade the run
+    over it."""
+    import json
+
+    (java_repo / "weird.xml").write_text("<?custom-pi <beans> ?>\n<cfg/>\n", encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+    doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matches = [p for p in doc["problems"] if p["path"] == "weird.xml"]
+    assert len(matches) == 1
+    assert "beans" not in matches[0]["detail"]
+    assert "cfg" in matches[0]["detail"]
+
+
+def test_run_scan_a_fake_beans_tag_inside_a_doctype_entity_value_stays_complete(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 14c: same false-detail hazard, via a DOCTYPE internal
+    subset's <!ENTITY> replacement text instead of a PI."""
+    import json
+
+    (java_repo / "weird2.xml").write_text(
+        "<!DOCTYPE cfg [\n"
+        "  <!ENTITY foo \"<beans>fake</beans>\">\n"
+        "]>\n"
+        "<cfg/>\n",
+        encoding="utf-8",
+    )
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+    doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matches = [p for p in doc["problems"] if p["path"] == "weird2.xml"]
+    assert len(matches) == 1
+    assert "beans" not in matches[0]["detail"]
+    assert "cfg" in matches[0]["detail"]
+
+
+def test_run_scan_an_unterminated_comment_containing_a_fake_beans_tag_stays_complete(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 14c: malformed input (an unterminated comment) must
+    fail toward record-only, never a guessed degradation, even when the
+    unclosed comment happens to contain a literal <beans."""
+    import json
+
+    (java_repo / "broken.xml").write_text(
+        "<!-- unterminated comment containing <beans\n<cfg/>\n", encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+    doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matches = [p for p in doc["problems"] if p["path"] == "broken.xml"]
+    assert len(matches) == 1
+    assert "could not be determined" in matches[0]["detail"]
+
+
+def test_run_scan_an_uppercase_beans_root_stays_complete(java_repo: Path) -> None:
+    """FIX ROUND 14c (reviewer-3's micro-note): XML element names are
+    case-sensitive - <BEANS> is a DIFFERENT name from Spring's own
+    lowercase <beans> and must never be folded into a match it never
+    earned."""
+    (java_repo / "shout.xml").write_text(
+        "<BEANS><BEAN id=\"x\" class=\"y\"/></BEANS>", encoding="utf-8")
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "complete"
+
+
+def test_run_scan_the_spring_dtd_form_beans_file_still_degrades(java_repo: Path) -> None:
+    """FIX ROUND 14c: the DOCTYPE blanking must not blank past the
+    doctype into the real root - Spring's own classic DTD-form beans
+    file (a real, common shape) is the regression that proves it."""
+    (java_repo / "legacy-context.xml").write_text(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE beans PUBLIC \"-//SPRING//DTD BEAN 2.0//EN\" "
+        "\"http://www.springframework.org/dtd/spring-beans-2.0.dtd\">\n"
+        "<beans><bean id=\"x\" class=\"y\"/></beans>\n",
+        encoding="utf-8",
+    )
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+
+
 def test_worker_problem_reason_by_path_joins_sorted_unique_reasons_for_one_path(
     java_repo: Path, monkeypatch,
 ) -> None:

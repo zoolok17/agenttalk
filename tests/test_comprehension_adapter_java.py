@@ -2189,6 +2189,64 @@ def test_sniff_xml_root_element_returns_none_when_undeterminable():
     assert java.sniff_xml_root_element("not actually xml at all") is None
 
 
+# ------------------------------------------------- xml root sniff hostile inputs (round 14c)
+
+def test_sniff_xml_root_element_ignores_a_fake_beans_tag_inside_a_processing_instruction():
+    """FIX ROUND 14c (reviewer-3's own real-file repro, pulled forward):
+    a PI's raw content is not markup at all - a literal "<beans" living
+    inside one (`<?custom-pi <beans> ?>`) must never be read as the real
+    root, or problems.json ends up asserting a root the source never
+    actually declared."""
+    text = "<?custom-pi <beans> ?>\n<cfg/>\n"
+    assert java.sniff_xml_root_element(text) == "cfg"
+
+
+def test_sniff_xml_root_element_ignores_a_fake_beans_tag_inside_a_doctype_entity_value():
+    """FIX ROUND 14c: a DOCTYPE internal subset's <!ENTITY> replacement
+    text is not markup either - blanking the WHOLE doctype declaration
+    (including its internal subset), offset-preserving, keeps this from
+    ever being read as the real root."""
+    text = (
+        "<!DOCTYPE cfg [\n"
+        "  <!ENTITY foo \"<beans>fake</beans>\">\n"
+        "]>\n"
+        "<cfg/>\n"
+    )
+    assert java.sniff_xml_root_element(text) == "cfg"
+
+
+def test_sniff_xml_root_element_returns_none_for_an_unterminated_comment():
+    """FIX ROUND 14c: an unterminated comment (no matching --> anywhere)
+    is malformed input - everything from that point on cannot be
+    trusted, so a <beans> tag living "inside" it must never be read as
+    a real root. Fails toward record-only (None), the safe side."""
+    text = "<!-- unterminated comment containing <beans\n<cfg/>\n"
+    assert java.sniff_xml_root_element(text) is None
+
+
+def test_sniff_xml_root_element_is_case_sensitive():
+    """FIX ROUND 14c (reviewer-3's micro-note): XML element names are
+    case-sensitive - the sniff itself must never fold case, so a caller
+    comparing against an exact expected spelling gets an honest answer."""
+    assert java.sniff_xml_root_element("<BEANS/>") == "BEANS"
+    assert java.sniff_xml_root_element("<BEANS/>") != "beans"
+
+
+def test_sniff_xml_root_element_recognizes_the_spring_dtd_form_doctype_as_beans():
+    """FIX ROUND 14c: the DOCTYPE blanking must not blank PAST the
+    doctype into the real root that follows it - Spring's own classic
+    DTD-form beans file (a real, common shape) is the regression that
+    proves the bounded [^\\[>]/[^>] character classes cannot cross the
+    declaration's own closing '>'."""
+    text = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE beans PUBLIC \"-//SPRING//DTD BEAN 2.0//EN\" "
+        "\"http://www.springframework.org/dtd/spring-beans-2.0.dtd\">\n"
+        "<beans><bean id=\"x\" class=\"y\"/></beans>\n"
+    )
+    assert java.sniff_xml_root_element(text) == "beans"
+
+
 # ----------------------------------------------------------- honest gaps
 
 def test_unsupported_relations_are_named_not_silently_omitted():
