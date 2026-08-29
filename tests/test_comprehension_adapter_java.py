@@ -922,6 +922,82 @@ class Controller {
     assert routes[0].target == "/  line1\n  line2"
 
 
+# ----------------------------------------------------------- malformed java (round 15 F5)
+
+def test_an_unterminated_char_literal_is_detected_as_malformed_not_silently_truncated():
+    """FIX ROUND 15 (eleventh cold read, F5 MAJOR, wrong-data, cr11-fx10
+    verbatim): genuinely malformed Java (an unterminated char literal)
+    made the sanitizer blank the rest of the file silently - PathUtil
+    (declared BEFORE the malformed literal) still publishes, but
+    FileController (declared after, with two routes) vanishes with NO
+    problem recorded, and because PathUtil alone means units is
+    non-empty, the zero-types guard never fires either. The sanitizer
+    now detects it reached EOF still inside the unterminated literal and
+    reports it."""
+    src = (
+        "package p;\n"
+        "class PathUtil {\n"
+        "  char bad = '\n"
+        "class FileController {\n"
+        '  @GetMapping("/one") void a() {}\n'
+        '  @GetMapping("/two") void b() {}\n'
+        "}\n"
+    )
+    result = java.parse_java_source("Mixed.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.PathUtil"]
+    assert _edges(result, "route") == []
+    assert any(p.reason_code == "parse_failed" for p in result.problems)
+
+
+def test_an_unclosed_block_comment_is_detected_as_malformed_not_silently_truncated():
+    """FIX ROUND 15 (F5 MAJOR, wrong-data): the second reviewer-verified
+    trigger shape - an unclosed /* block comment swallows the rest of
+    the file the same way an unterminated char literal does."""
+    src = (
+        "package p;\n"
+        "class PathUtil {\n"
+        "}\n"
+        "/* comment that never closes\n"
+        "class FileController {\n"
+        '  @GetMapping("/one") void a() {}\n'
+        "}\n"
+    )
+    result = java.parse_java_source("Mixed2.java", src)
+    assert [u.qualified_name for u in result.units] == ["p.PathUtil"]
+    assert _edges(result, "route") == []
+    assert any(p.reason_code == "parse_failed" for p in result.problems)
+
+
+def test_sixteen_valid_literal_and_comment_shapes_are_never_flagged_malformed():
+    """FIX ROUND 15 (F5 regression battery): the reviewer explicitly
+    verified 16 valid literal/comment shapes all sanitize correctly -
+    the trigger is malformed input only. Every legal shape here must
+    report malformed=False; none of them ends a comment/string/char
+    construct exactly at EOF without a closing marker."""
+    valid_sources = [
+        "class A { }",  # no literals/comments at all
+        "class A { } // trailing line comment, no newline",
+        "class A { } // trailing line comment\n",
+        "class A { /* a block comment */ }",
+        "class A { /** a javadoc comment */ }",
+        "class A { /* multi\nline\ncomment */ }",
+        'class A { String s = "hello"; }',
+        'class A { String s = ""; }',
+        r'class A { String s = "esc\"aped"; }',
+        r'class A { String s = "trailing backslash-backslash\\"; }',
+        "class A { char c = 'x'; }",
+        r"class A { char c = '\''; }",
+        r"class A { char c = '\\'; }",
+        'class A { String s = """\n  text block\n  """; }',
+        'class A { String s = """already closed""" + "more"; }',
+        "class A { int x = 1; /* trailing comment at very end */ }",
+    ]
+    assert len(valid_sources) == 16
+    for src in valid_sources:
+        _sanitized, malformed = java._strip_comments_and_strings(src)
+        assert malformed is False, f"wrongly flagged malformed: {src!r}"
+
+
 def test_standalone_method_route_without_a_leading_slash_is_normalized_like_a_composed_one():
     """LOW-2 (round 7c, reviewer-3 delta on 95d9cd8): leading-slash
     normalization previously lived ONLY inside _compose_route_path (the

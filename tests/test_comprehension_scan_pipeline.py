@@ -929,6 +929,45 @@ def test_run_scan_the_spring_dtd_form_beans_file_still_degrades(java_repo: Path)
     assert outcome.status == "degraded"
 
 
+def test_run_scan_a_malformed_java_file_degrades_with_a_problem_and_unknown_readiness(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 15 (eleventh cold read, F5 MAJOR, wrong-data, cr11-fx10
+    verbatim): genuinely malformed Java (an unterminated char literal)
+    made the sanitizer blank the rest of the file silently - the run
+    published complete/0 problems, and this file's own
+    source_understood incorrectly reported satisfied (PathUtil alone
+    keeps units non-empty, so the zero-types guard never fires). Real
+    end-to-end path: a genuine ordinary Java project plus one real
+    malformed file on disk."""
+    import json
+
+    (java_repo / "src" / "main" / "java" / "p" / "Mixed.java").write_text(
+        "package p;\n"
+        "class PathUtil {\n"
+        "  char bad = '\n"
+        "class FileController {\n"
+        '  @GetMapping("/one") void a() {}\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    outcome = scan_pipeline.run_scan(java_repo)
+    assert outcome.status == "degraded"
+    doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    matches = [p for p in doc["problems"] if p["path"] == "src/main/java/p/Mixed.java"]
+    assert len(matches) == 1
+    assert matches[0]["reason_code"] == "parse_failed"
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    path_util_unit = next(u for u in modules_doc["units"] if u.get("qualified_name") == "p.PathUtil"
+                           or u["display_name"] == "PathUtil")
+    source_understood = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == path_util_unit["unit_id"] and s["check"] == "source_understood"
+    )
+    assert source_understood["stored_status"] == "unknown"
+
+
 def test_worker_problem_reason_by_path_joins_sorted_unique_reasons_for_one_path(
     java_repo: Path, monkeypatch,
 ) -> None:

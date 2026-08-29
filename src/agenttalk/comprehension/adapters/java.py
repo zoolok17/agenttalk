@@ -495,13 +495,28 @@ class JavaFileResult:
     problems: list[JavaAdapterProblem] = field(default_factory=list)
 
 
-def _strip_comments_and_strings(text: str) -> str:
+def _strip_comments_and_strings(text: str) -> tuple[str, bool]:
     """Blanks comment and string/char literal CONTENT with spaces while
     preserving every newline and the overall length/offsets, so a later
     regex match's position in the sanitized text is always the same
     position in the original (needed to recover a route annotation's real
-    path string, which sanitization has otherwise blanked out)."""
+    path string, which sanitization has otherwise blanked out).
+
+    Returns ``(sanitized, malformed)``. FIX ROUND 15 (eleventh cold read,
+    F5 MAJOR, wrong-data): a block comment, string literal (plain or
+    text-block), or char literal that never finds its own closing marker
+    before EOF used to fall back to blanking silently to end-of-file -
+    every type/import/route declared AFTER that point vanished with no
+    problem recorded, and (when at least one type was declared BEFORE
+    the truncation point) the zero-types guard never fires either, since
+    the file is not empty. ``malformed`` is ``True`` exactly when one of
+    those four constructs reached EOF still open - the ONE shape this
+    scanner already has enough information to detect (it already looked
+    for the closing marker and came up empty) but never surfaced. A bare
+    ``//`` line comment reaching EOF with no trailing newline is NOT
+    malformed - that is ordinary, legal Java, not a truncation."""
     result: list[str] = []
+    malformed = False
     i = 0
     n = len(text)
     while i < n:
@@ -513,6 +528,8 @@ def _strip_comments_and_strings(text: str) -> str:
             i = end
         elif ch == "/" and i + 1 < n and text[i + 1] == "*":
             j = text.find("*/", i + 2)
+            if j == -1:
+                malformed = True
             end = n if j == -1 else j + 2
             segment = text[i:end]
             result.append("".join(c if c == "\n" else " " for c in segment))
@@ -520,11 +537,15 @@ def _strip_comments_and_strings(text: str) -> str:
         elif ch == '"':
             if text[i:i + 3] == '"""':
                 j = text.find('"""', i + 3)
+                if j == -1:
+                    malformed = True
                 end = n if j == -1 else j + 3
             else:
                 end = i + 1
                 while end < n and text[end] != '"':
                     end += 2 if text[end] == "\\" and end + 1 < n else 1
+                if end >= n:
+                    malformed = True
                 end = min(end + 1, n)
             segment = text[i:end]
             result.append("".join(c if c == "\n" else " " for c in segment))
@@ -533,6 +554,8 @@ def _strip_comments_and_strings(text: str) -> str:
             end = i + 1
             while end < n and text[end] != "'":
                 end += 2 if text[end] == "\\" and end + 1 < n else 1
+            if end >= n:
+                malformed = True
             end = min(end + 1, n)
             segment = text[i:end]
             result.append("".join(c if c == "\n" else " " for c in segment))
@@ -540,7 +563,7 @@ def _strip_comments_and_strings(text: str) -> str:
         else:
             result.append(ch)
             i += 1
-    return "".join(result)
+    return "".join(result), malformed
 
 
 def is_effectively_empty_java_source(text: str) -> bool:
@@ -555,7 +578,7 @@ def is_effectively_empty_java_source(text: str) -> bool:
     is a named, explicit non-problem or a real ``no_types_extracted``
     problem - closing the zero-extraction evidence hole as a class
     without silently exempting every legitimately typeless file too."""
-    sanitized = _strip_comments_and_strings(text)
+    sanitized, _malformed = _strip_comments_and_strings(text)
     remainder = _PACKAGE_RE.sub("", sanitized)
     remainder = _IMPORT_RE.sub("", remainder)
     return remainder.strip() == ""
@@ -1383,7 +1406,7 @@ def _compose_route_path(prefix: str, path: str) -> str:
 def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     """Parse one ``.java`` file's TEXT (already read by the sanitized
     worker - this function never touches the filesystem itself)."""
-    sanitized = _strip_comments_and_strings(text)
+    sanitized, malformed = _strip_comments_and_strings(text)
     newline_offsets = _newline_offsets(sanitized)
     package_match = _PACKAGE_RE.search(sanitized)
     package = package_match.group(1) if package_match else None
@@ -1868,6 +1891,30 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
                    "shape - no cli_main entry point published, but not confidently absent "
                    "either",
             qualified_name=enclosing,
+        ))
+
+    # FIX ROUND 15 (eleventh cold read, F5 MAJOR, wrong-data): genuinely
+    # malformed Java (an unterminated char/string literal or an unclosed
+    # block comment) made the sanitizer blank the rest of the file
+    # silently - every type/import/route declared AFTER the truncation
+    # point vanished with NO problem recorded, and when at least one
+    # type was declared BEFORE it (the common case - cr11-fx10:
+    # PathUtil parses fine, FileController after the malformed literal
+    # does not), the zero-types guard below never fires either, since
+    # the file is not empty. The sanitizer already knows it hit EOF
+    # still inside an unterminated construct; surfacing that as a named,
+    # file-wide problem (the SAME "parse_failed" reason_code/severity/
+    # readiness-routing an unreadable or adapter-crashed file already
+    # gets - no new closed-vocabulary entry needed) is cheaper and more
+    # honest than silently trusting a truncated parse.
+    if malformed:
+        problems.append(JavaAdapterProblem(
+            reason_code="parse_failed",
+            detail="this file's own comment/string/char-literal scan reached end of "
+                   "file while still inside an unterminated block comment or string/"
+                   "char literal - everything after that point could not be reliably "
+                   "parsed and is not represented in this file's units/edges/entry "
+                   "points",
         ))
 
     if not units:
