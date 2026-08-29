@@ -150,13 +150,23 @@ def test_dependencies_resolved_satisfied_when_an_unresolved_edge_is_invoke_only(
     signals, _ = ra.build_readiness([_unit("u1")], edges, [])
     signal = _signal_by_check(signals, "dependencies_resolved")
     assert signal.stored_status == "satisfied"
-    assert signal.reason_code == "no_dependencies"
+    assert signal.reason_code == "no_declared_dependencies"
 
 
 def test_dependencies_resolved_satisfied_when_all_edges_resolved():
-    edges = [_edge("u1", resolution_state="resolved", target_unit_id="u2")]
+    """FIX ROUND 12b (reviewer-3): this used to rely on `_edge`'s default
+    relation ("invoke") - post-scoping (round 12's F2/F5 fix), an invoke
+    edge is filtered out entirely, so this test passed via the
+    no-qualifying-edges/no_declared_dependencies branch, byte-identical to a unit
+    with zero edges at all, and would have survived deletion of the
+    all-resolved branch it names. relation="import" (like its moved
+    siblings) makes this a real dependency edge that actually reaches
+    and exercises that branch."""
+    edges = [_edge("u1", relation="import", resolution_state="resolved", target_unit_id="u2")]
     signals, _ = ra.build_readiness([_unit("u1")], edges, [])
-    assert _signal_by_check(signals, "dependencies_resolved").stored_status == "satisfied"
+    signal = _signal_by_check(signals, "dependencies_resolved")
+    assert signal.stored_status == "satisfied"
+    assert signal.reason_code == "dependencies_resolved"
 
 
 def _file_unit(unit_id: str) -> ModuleRecord:
@@ -172,7 +182,7 @@ def _file_unit(unit_id: str) -> ModuleRecord:
 def test_file_units_dependencies_resolved_derives_from_contained_units_not_vacuously_satisfied():
     """N6 (fourth cold read, fix round 6): edges attach to the declared
     TYPE, never the FILE that contains it - a file unit's own
-    dependencies_resolved used to always be satisfied/no_dependencies
+    dependencies_resolved used to always be satisfied/no_declared_dependencies
     (it never receives outgoing edges directly), a structurally
     always-on positive signal that was never actually evidence of
     anything. A file whose CONTAINED component unit has an unresolved

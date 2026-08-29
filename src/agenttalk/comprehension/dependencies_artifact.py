@@ -191,6 +191,21 @@ def _resolve_internal_candidate(
     5. anything else is unresolved (or ``ambiguous`` if 2+ same-simple-name
        candidates exist in-scan with no supporting evidence either way) -
        target spelling retained.
+
+    NAMED LIMIT (round 12b, reviewer-3): a WILDCARD import (``import
+    com.acme.util.*;``) never populates ``import_qualified_by_simple``
+    (it names a package, not a single type, and the adapter itself
+    classifies it ``external`` rather than ``internal_exact_or_external``
+    - see ``parse_java_source``) - so a bare name real Java WOULD resolve
+    through that wildcard, and that genuinely IS declared in-scan, can
+    still land unresolved here if it is not also a same-file declaration
+    or a same-package sibling. This is a deliberate, safe UNDER-claim
+    (the direct, documented consequence of deleting the global bare-name
+    fallback that made F1's false positives possible in the first place)
+    - resolving a wildcard import correctly would require checking every
+    wildcard-imported package's actual membership, reintroducing the same
+    kind of cross-package ambiguity this fix exists to close. Out of
+    scope this slice.
     """
     if "." in target:
         exact = _exact_qualified_lookup(target, by_qualified_name)

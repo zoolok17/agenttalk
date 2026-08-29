@@ -178,7 +178,17 @@ _DEPENDENCY_RESOLUTION_RELATIONS = frozenset({"import", "inherit", "build"})
 def _check_dependencies_resolved(unit: ModuleRecord, outgoing: list[DependencyRecord]) -> ReadinessSignal:
     relevant = [edge for edge in outgoing if edge.relation in _DEPENDENCY_RESOLUTION_RELATIONS]
     if not relevant:
-        return _signal(unit.unit_id, "dependencies_resolved", "satisfied", "detected", "no_dependencies")
+        # FIX ROUND 12b (reviewer-3 delta on round 12): renamed from
+        # "no_dependencies" - that wording, read alone by a #208 consumer,
+        # claims a unit depends on nothing at all. Since round 12 scoped
+        # this check to import/inherit/build, a unit whose ONLY edges are
+        # scoped-out invoke noise also lands here - it may have plenty of
+        # real behavioral dependencies, just none of the kinds this check
+        # evaluates. "no_declared_dependencies" names what was actually
+        # checked, not a claim about the unit's real dependency surface.
+        return _signal(
+            unit.unit_id, "dependencies_resolved", "satisfied", "detected",
+            "no_declared_dependencies")
     states = {edge.resolution_state for edge in relevant}
     if "ambiguous" in states:
         return _signal(unit.unit_id, "dependencies_resolved", "unknown", "detected", "ambiguous_dependency")
@@ -197,7 +207,7 @@ def _check_dependencies_resolved_for_file(
     happens to contain it (M-4, round 5's own containment fix didn't
     change edge attribution) - a Java file's own "file" unit therefore
     NEVER receives outgoing edges directly and always reported
-    dependencies_resolved satisfied/no_dependencies, a structurally
+    dependencies_resolved satisfied/no_declared_dependencies, a structurally
     always-on positive signal that was never actually evidence of
     anything. Derives the file's own signal from the UNION of its
     contained units' edges instead (recursing through nested types),

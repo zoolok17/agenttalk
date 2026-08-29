@@ -241,6 +241,32 @@ def test_test_edge_via_import_of_an_unrelated_package_never_falls_back_to_a_same
     assert test_edge.target_unresolved == "com.corp.legacy.InvoiceService"
 
 
+def test_inherit_edge_via_a_wildcard_import_lands_unresolved_a_named_limit():
+    """FIX ROUND 12b (reviewer-3 delta on round 12): a named LIMIT, not a
+    bug - a wildcard import (``import com.acme.util.*;``) never binds a
+    bare name to one specific package (the adapter classifies it
+    external, not a per-type import), so a bare name Java itself WOULD
+    resolve through that wildcard - and that genuinely IS declared
+    in-scan - can still land unresolved if it is not also a same-file
+    declaration or same-package sibling. A deliberate, safe under-claim:
+    the direct consequence of deleting the global bare-name fallback
+    that made F1's false positives possible."""
+    results = {
+        "com/acme/util/Helper.java": _parse(
+            "com/acme/util/Helper.java", "package com.acme.util;\nclass Helper {}\n"),
+        "com/acme/shop/Worker.java": _parse(
+            "com/acme/shop/Worker.java",
+            "package com.acme.shop;\n"
+            "import com.acme.util.*;\n"
+            "class Worker extends Helper {}\n"),
+    }
+    records = da.build_dependencies(results)
+    inherit = next(r for r in records if r.relation == "inherit")
+    assert inherit.resolution_state == "unresolved"
+    assert inherit.target_unit_id is None
+    assert inherit.target_unresolved == "Helper"
+
+
 def test_inherit_edge_is_ambiguous_when_two_files_declare_the_same_simple_name():
     results = {
         "p/Base.java": _parse("p/Base.java", "package p;\nclass Base {}\n"),

@@ -477,7 +477,7 @@ def test_run_scan_ordinary_jdk_invoke_calls_never_drive_dependencies_resolved_un
         if s["unit_id"] == pricing_unit["unit_id"] and s["check"] == "dependencies_resolved"
     )
     assert dependencies_resolved["stored_status"] == "satisfied"
-    assert dependencies_resolved["reason_code"] == "no_dependencies"
+    assert dependencies_resolved["reason_code"] == "no_declared_dependencies"
 
 
 def test_run_scan_populates_source_digest_on_dependency_and_feature_producers(
