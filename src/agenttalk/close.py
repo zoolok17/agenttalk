@@ -1682,7 +1682,8 @@ def decide_counter(record: dict, *, counter_id: str, decision: str, by: str,
     if not isinstance(counter, dict):
         raise CloseError(f"no counter {counter_id!r} on this close")
     if decision not in (COUNTER_ACCEPTED, COUNTER_REJECTED):
-        raise CloseError("counter decision must be accept or reject")
+        raise CloseError(
+            f"counter decision must be {COUNTER_ACCEPTED!r} or {COUNTER_REJECTED!r}")
     if not (reason and reason.strip()):
         raise CloseError("a counter decision requires a reason")
     counter["decision"] = decision
