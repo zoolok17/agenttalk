@@ -275,10 +275,15 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 # a route annotation the adapter could not confidently
                 # associate with a class or a method - never silently
                 # dropped, never silently published as a guessed route.
-                for detail in result.problems:
+                # Fix round 11: a distinct reason_code (carried on the
+                # adapter's own JavaAdapterProblem, not hardcoded here
+                # any more) for a route annotation whose VALUE could not
+                # be recovered as a literal - a different failure family
+                # from association, never coalesced into one bucket.
+                for problem in result.problems:
                     problems.append(WorkerProblem(
-                        reason_code="route_annotation_unassociated", relative_path=rel,
-                        detail=detail,
+                        reason_code=problem.reason_code, relative_path=rel,
+                        detail=problem.detail,
                     ))
         elif rel_name_lower == "pom.xml":
             # reviewer-3 B-3 (PR-B delta review): a pom.xml's build-relation

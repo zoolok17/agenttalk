@@ -1043,7 +1043,8 @@ public class Controller {
     # route in its own right, and the enclosing class name is untouched.
     assert [r.target for r in routes] == ["GET /list"]
     assert len(result.problems) == 1
-    assert "could not be confidently associated" in result.problems[0]
+    assert result.problems[0].reason_code == "route_annotation_unassociated"
+    assert "could not be confidently associated" in result.problems[0].detail
 
 
 # --------------------------------------- round 10b (reviewer-3 delta on round
@@ -1140,7 +1141,8 @@ public class Controller<T extends Comparable<T {
     result = java.parse_java_source("Controller.java", src)
     assert _edges(result, "route") == []
     assert len(result.problems) == 2
-    assert all("could not be confidently associated" in p for p in result.problems)
+    assert all(p.reason_code == "route_annotation_unassociated" for p in result.problems)
+    assert all("could not be confidently associated" in p.detail for p in result.problems)
     assert [u.qualified_name for u in result.units] == ["p.Unrelated"]
 
 
@@ -1167,7 +1169,8 @@ interface Unrelated {
     result = java.parse_java_source("Controller.java", src)
     assert _edges(result, "route") == []
     assert len(result.problems) == 2
-    assert all("could not be confidently associated" in p for p in result.problems)
+    assert all(p.reason_code == "route_annotation_unassociated" for p in result.problems)
+    assert all("could not be confidently associated" in p.detail for p in result.problems)
     assert [u.qualified_name for u in result.units] == ["p.Unrelated"]
 
 
@@ -1217,6 +1220,201 @@ package p;
 class Controller {
     @RequestMapping(value = "/thing", method = {RequestMethod.GET, RequestMethod.POST})
     void thing() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /thing", "POST /thing"}
+
+
+# --------------------------------------------- round 11 (seventh cold read):
+# the route pipeline has THREE stages - recognize the annotation, associate
+# it, recover its value. Round 10 de-enumerated ASSOCIATION only; recognition
+# was still six enumerated simple names (a fully-qualified route annotation
+# was invisible), and value recovery was literal-only (a constant reference,
+# a concatenation, or a qualified method spelling silently composed against
+# an implicit EMPTY value instead of being treated as unknown).
+
+def test_fully_qualified_class_level_request_mapping_still_composes():
+    """B1 shape 1: a fully-qualified class-level @RequestMapping used to
+    be invisible to recognition entirely - no prefix ever registered,
+    so the method published as a bare fragment (GET /list for a served
+    /api/orders/list)."""
+    src = """
+package p;
+
+@org.springframework.web.bind.annotation.RequestMapping("/api/orders")
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /api/orders/list"]
+    assert result.problems == []
+
+
+def test_both_annotations_fully_qualified_still_composes():
+    """B1 shape 5: when BOTH the class-level and method-level annotations
+    are fully qualified, recognition used to see neither - zero entry
+    points, completely silent (no problem either, since an annotation
+    that is never recognized at all never reaches the fail-safe)."""
+    src = """
+package p;
+
+@org.springframework.web.bind.annotation.RequestMapping("/api/orders")
+public class Controller {
+    @org.springframework.web.bind.annotation.GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /api/orders/list"]
+    assert result.problems == []
+
+
+def test_class_level_constant_reference_value_is_unrecoverable_not_an_empty_prefix():
+    """B1 shape 2: a class-level route annotation whose value is a
+    CONSTANT REFERENCE (not a literal) used to silently register NO
+    prefix at all (indistinguishable from a genuinely valueless
+    annotation) - the method then published as a bare, uncomposed
+    fragment. The fail-safe must suppress the whole class's routes and
+    name why, not guess an empty prefix."""
+    src = """
+package p;
+
+@RequestMapping(ApiPaths.ORDERS)
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+    assert "could not be recovered as a literal" in result.problems[0].detail
+
+
+def test_class_level_string_concatenation_is_unrecoverable_not_a_fabricated_fragment():
+    """B1 shape 3: a class-level value built from STRING CONCATENATION
+    used to silently recover only its FIRST literal segment (the parser
+    has no concept of `+` at all) - "/api" + "/orders" registered just
+    "/api" as the prefix, composing with the method's own "/list" into
+    "GET /api/list", a path the application never actually serves. A
+    fabrication worse than a bare fragment - must be unrecoverable, not
+    a truncated guess."""
+    src = """
+package p;
+
+@RequestMapping("/api" + "/orders")
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+
+
+def test_method_level_constant_reference_value_is_unrecoverable_not_the_bare_class_prefix():
+    """B1 shape 4: a METHOD-level route annotation whose own value is a
+    constant reference used to fall into the "genuinely valueless"
+    composition branch (an empty method value), publishing the CLASS's
+    own prefix alone as if it were the method's complete route - this is
+    the exact blind spot a "no value" check cannot see: can't-read and
+    doesn't-exist must never collapse to the same outcome."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller {
+    @GetMapping(SomeConstants.LIST)
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+    assert "could not be recovered as a literal" in result.problems[0].detail
+
+
+def test_route_array_with_one_unrecoverable_element_is_unrecoverable_not_truncated():
+    """The same silent-truncation risk as string concatenation, but for
+    the array-literal shorthand: a mix of a real literal and a constant
+    reference must never publish just the literal element(s) as if the
+    array held only those."""
+    src = """
+package p;
+class Controller {
+    @GetMapping({"/list", SOME_CONST})
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "route_value_unrecoverable"
+
+
+def test_genuinely_valueless_method_annotation_still_composes_the_prefix_alone():
+    """The blind spot the reviewer named: a bare @GetMapping with
+    genuinely NO value at all is legitimate (Spring's own "serves the
+    prefix alone" semantics) and must still compose normally - never
+    conflated with the can't-read case above, which looks similar
+    (both end up "no method-level literal") but means something
+    completely different."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller {
+    @GetMapping
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert [r.target for r in routes] == ["GET /api/orders"]
+    assert result.problems == []
+
+
+def test_static_imported_bare_method_constant_does_not_coalesce_two_handlers():
+    """N1: a static-imported bare enum constant (`method = GET`, no
+    `RequestMethod.` qualifier present in the source at all) used to go
+    unrecognized, silently coalescing with a differently-qualified
+    sibling into one identical, method-less target."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(value = "/thing", method = GET)
+    void getThing() {}
+    @RequestMapping(value = "/thing", method = POST)
+    void postThing() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /thing", "POST /thing"}
+
+
+def test_fully_qualified_method_constant_does_not_coalesce_two_handlers():
+    """N1: a fully-qualified `method = org...RequestMethod.X` spelling
+    used to go unrecognized the same way (the old regex required the
+    literal substring "RequestMethod." positioned immediately after
+    `method =`, which a package-qualified spelling never satisfies)."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(value = "/thing", method = org.springframework.web.bind.annotation.RequestMethod.GET)
+    void getThing() {}
+    @RequestMapping(value = "/thing", method = RequestMethod.POST)
+    void postThing() {}
 }
 """
     result = java.parse_java_source("Controller.java", src)

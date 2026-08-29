@@ -157,6 +157,11 @@ _PROBLEM_SEVERITY_BY_REASON_CODE = {
     # annotation the java adapter could not confidently associate with
     # a class or a method - under-claimed rather than published wrong.
     "route_annotation_unassociated": "warning",
+    # BLOCKER fail-safe part 2 (seventh cold read, fix round 11): a route
+    # annotation's own value (or its enclosing class's route prefix)
+    # could not be recovered as a literal - under-claimed rather than
+    # composed against a guessed/implicit-empty value.
+    "route_value_unrecoverable": "warning",
 }
 _DEFAULT_PROBLEM_SEVERITY = "warning"
 

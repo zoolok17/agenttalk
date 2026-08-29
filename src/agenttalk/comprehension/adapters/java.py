@@ -94,8 +94,18 @@ _ROUTE_ANNOTATIONS = (
     "RequestMapping", "GetMapping", "PostMapping", "PutMapping",
     "DeleteMapping", "PatchMapping",
 )
+#: Fix round 11 (seventh cold read BLOCKER, part 1 - de-enumerate
+#: RECOGNITION): a FULLY-QUALIFIED route annotation
+#: (``@org.springframework.web.bind.annotation.RequestMapping(...)``) was
+#: previously invisible to this adapter entirely - the old pattern
+#: anchored the simple name directly after ``@``, with no tolerance for
+#: a preceding dotted qualifier. Recognizes the annotation by its dotted
+#: name's LAST SEGMENT against the six families - the same rule
+#: ``_TYPE_NAME_ANCHOR_RE``/the type extractor already applies to type
+#: names - so a fully-qualified spelling is the same annotation, never a
+#: silent miss.
 _ROUTE_ANNOTATION_RE = re.compile(
-    r"@(" + "|".join(_ROUTE_ANNOTATIONS) + r")\b"
+    r"@(?:[A-Za-z_$][\w$]*\.)*(" + "|".join(_ROUTE_ANNOTATIONS) + r")\b"
 )
 #: M-5 (third cold read, fix round 5): a verb-specific annotation names its
 #: own HTTP method unambiguously; plain ``@RequestMapping`` does not (it
@@ -127,9 +137,27 @@ _ROUTE_METHOD_BY_ANNOTATION = {
 #: regex captured only the first RequestMethod.X inside it (matching
 #: right through the brace), silently re-coalescing two distinct
 #: handlers into one. Captures the whole attribute value (braced or
-#: bare) and every RequestMethod.X inside it is recovered below.
-_ROUTE_METHOD_ATTR_RE = re.compile(r"\bmethod\s*=\s*(\{[^}]*\}|RequestMethod\.[A-Za-z]+)")
-_ROUTE_METHOD_VALUE_RE = re.compile(r"RequestMethod\.([A-Za-z]+)")
+#: bare, up to the next top-level ``,``/``)``) and every verb spelling
+#: inside it is recovered below.
+#:
+#: N1 (seventh cold read, fix round 11 - de-enumerate the SAME way as
+#: annotation recognition): the old value regex REQUIRED the literal
+#: qualifier ``RequestMethod.`` immediately before the verb name - a
+#: static-imported bare constant (``method = GET``, no qualifier present
+#: in the source AT ALL) never matched, and a differently-qualified
+#: fully-qualified spelling
+#: (``org.springframework.web.bind.annotation.RequestMethod.GET``) had
+#: no ``RequestMethod.`` substring positioned where the regex required
+#: it either - both silently coalesced two distinct handlers sharing a
+#: path into one (neither recognized its own explicit method, both fell
+#: back to method-unknown, publishing the SAME target). The qualifier -
+#: however spelled, or absent entirely - is now optional and unenumerated:
+#: only the LAST segment (the enum constant's own name) is ever
+#: significant, the same trust the original design already placed in
+#: "RequestMethod.ANYTHING" being a real, compiler-validated enum
+#: constant, extended to not caring how - or whether - it is qualified.
+_ROUTE_METHOD_ATTR_RE = re.compile(r"\bmethod\s*=\s*(\{[^}]*\}|[^,)]+)")
+_ROUTE_METHOD_VALUE_RE = re.compile(r"(?:[A-Za-z_$][\w$]*\.)*([A-Za-z_$][\w$]*)")
 
 
 def _route_method_attributes(sanitized_segment: str) -> list[str]:
@@ -161,16 +189,6 @@ _ROUTE_NAMED_ATTR_RE = re.compile(r"\b(?:value|path)\s*=")
 # _matching_close_paren's caller) - a bare positional literal is
 # recognized only when it leads the argument list.
 _ROUTE_POSITIONAL_ANCHOR_RE = re.compile(r"\A\(")
-#: Recovers the ARRAY OPENING that may precede the target string
-#: literal(s), scanning the ORIGINAL text from a position ALREADY PROVEN
-#: live (the end of a _ROUTE_NAMED_ATTR_RE/_ROUTE_POSITIONAL_ANCHOR_RE
-#: match against the sanitized segment) - only real whitespace may
-#: separate the two, so this deliberately does NOT match through a
-#: comment wedged between the attribute and its literal (a pathological
-#: case beyond this slice's scope; the honest failure there is "no route
-#: found", never a truncated or wrong one).
-_ROUTE_ARRAY_OPEN_RE = re.compile(r"\s*\{")
-_ROUTE_LITERAL_START_RE = re.compile(r'\s*"')
 #: invariant 3 (design: "must not store... string-literal bodies"): a
 #: route target is captured as a normalized route IDENTIFIER, never an
 #: unbounded raw excerpt - truncated past this length rather than stored
@@ -230,16 +248,24 @@ class JavaEntryPointClaim:
 
 
 @dataclass(frozen=True)
+class JavaAdapterProblem:
+    """One thing this adapter could not confidently do while parsing a
+    file - never silently published as a guess, never silently dropped
+    either. ``reason_code`` distinguishes the FAMILY (fix round 11:
+    association failure vs. value-recovery failure are different,
+    separately-named problems, not one generic bucket) - the worker
+    surfaces each as its own named ``WorkerProblem`` (worker.py)."""
+
+    reason_code: str
+    detail: str
+
+
+@dataclass(frozen=True)
 class JavaFileResult:
     units: list[JavaUnitClaim] = field(default_factory=list)
     edges: list[JavaEdgeClaim] = field(default_factory=list)
     entry_points: list[JavaEntryPointClaim] = field(default_factory=list)
-    #: Fix round 10 (structural order, fail-safe direction): a plain-text
-    #: detail per route annotation this adapter could not confidently
-    #: associate with a class OR a method - never silently published as
-    #: a guessed route, and never silently dropped either. The worker
-    #: surfaces each as its own named problem (worker.py).
-    problems: list[str] = field(default_factory=list)
+    problems: list[JavaAdapterProblem] = field(default_factory=list)
 
 
 def _strip_comments_and_strings(text: str) -> str:
@@ -784,7 +810,9 @@ def _java_string_literal_content(text: str, quote_pos: int) -> str | None:
     return span[0] if span is not None else None
 
 
-def _route_paths(sanitized: str, original: str, group_start: int, group_end: int) -> list[str]:
+def _route_paths(
+    sanitized: str, original: str, group_start: int, group_end: int,
+) -> list[str] | None:
     """Recover the annotation's literal path/value string(s), in
     declaration order. LOCATES the attribute (by name, or the leading
     positional literal) against the SANITIZED segment - comments and
@@ -793,6 +821,20 @@ def _route_paths(sanitized: str, original: str, group_start: int, group_end: int
     the rest of the comment. Then reads the literal content(s) from the
     ORIGINAL text, starting exactly at that match's end position
     (sanitization preserves length/position exactly).
+
+    Three-state return (fix round 11, seventh cold read BLOCKER part 2 -
+    the fail-safe for unrecoverable values): a non-empty list is one or
+    more recovered literals; ``[]`` means the annotation genuinely
+    carries NO value/path attribute and no positional literal at all
+    (Spring's own "serves the prefix alone" semantics for a bare
+    ``@GetMapping``) - legitimate, composes with an empty method value;
+    ``None`` means a value expression IS present but could not be
+    recovered as a literal (a constant reference, a concatenation, ...) -
+    the caller must treat the whole route as UNKNOWN, never compose
+    against an implicit empty value or publish a partial/fabricated
+    guess. Distinguishing these is exactly the blind spot a plain "no
+    mapping" test cannot see: genuinely-absent and can't-read must never
+    collapse to the same outcome.
 
     MAJOR 1 (sixth cold read, fix round 10): a multi-value route array
     (``@GetMapping({"/list", "/all"})``) used to publish only its FIRST
@@ -825,48 +867,81 @@ def _route_paths(sanitized: str, original: str, group_start: int, group_end: int
     of them panned out - a strictly WIDER recovery than round 6's, never
     narrower."""
     sanitized_segment = sanitized[group_start:group_end]
+    unrecoverable = False
     for match in _ROUTE_NAMED_ATTR_RE.finditer(sanitized_segment):
         values = _route_literal_list_at(original, group_start + match.end())
+        if values is None:
+            unrecoverable = True
+            continue
         if values:
             return values
-    positional_match = _ROUTE_POSITIONAL_ANCHOR_RE.match(sanitized_segment)
-    if positional_match is not None:
-        values = _route_literal_list_at(original, group_start + positional_match.end())
-        if values:
-            return values
-    return []
+    if not unrecoverable:
+        positional_match = _ROUTE_POSITIONAL_ANCHOR_RE.match(sanitized_segment)
+        if positional_match is not None:
+            values = _route_literal_list_at(original, group_start + positional_match.end())
+            if values is None:
+                unrecoverable = True
+            elif values:
+                return values
+    return None if unrecoverable else []
 
 
-def _route_literal_list_at(original: str, anchor: int) -> list[str]:
+def _value_terminates_at(original: str, pos: int) -> bool:
+    """Whether ``pos`` (skipping whitespace) sits at a legitimate
+    boundary for the value just recovered - the next named attribute's
+    comma, or the annotation's own closing paren. Anything else (a `+`,
+    another token) means what was just read is only the FIRST fragment
+    of a larger expression (e.g. string concatenation) - fix round 11:
+    silently returning that first fragment as if it were the whole value
+    published a FABRICATED path worse than a bare omission."""
+    n = len(original)
+    while pos < n and original[pos].isspace():
+        pos += 1
+    return pos >= n or original[pos] in ",)"
+
+
+def _route_literal_list_at(original: str, anchor: int) -> list[str] | None:
     """Every string literal value at ``anchor``: a bare literal
     (``"..."``), or, when Spring's own array-literal shorthand is used
     for a multi-value ``value``/``path``/positional attribute
     (``{"...", "..."}``), EVERY element in declaration order (fix round
-    10 MAJOR 1)."""
-    array_match = _ROUTE_ARRAY_OPEN_RE.match(original, anchor)
-    if array_match is None:
-        literal_match = _ROUTE_LITERAL_START_RE.match(original, anchor)
-        if literal_match is None:
-            return []
-        span = _java_string_literal_span(original, literal_match.end() - 1)
-        if span is None:
-            return []
-        content, _end = span
-        return [_bounded_route_target(content)]
-    pos = array_match.end()
+    10 MAJOR 1). Returns ``[]`` when nothing at all sits here (a
+    genuinely valueless annotation); ``None`` (fix round 11) when
+    something sits here but is not a clean literal or literal array -
+    a constant reference, a concatenation, or an array containing any
+    non-literal element - never silently truncated to whichever leading
+    literal fragment happened to parse."""
     n = len(original)
-    values: list[str] = []
-    while pos < n:
-        while pos < n and (original[pos].isspace() or original[pos] == ","):
-            pos += 1
-        if pos >= n or original[pos] != '"':
-            break
-        span = _java_string_literal_span(original, pos)
-        if span is None:
-            break
-        content, pos = span
-        values.append(_bounded_route_target(content))
-    return values
+    pos = anchor
+    while pos < n and original[pos].isspace():
+        pos += 1
+    if pos >= n or original[pos] in ",)":
+        return []
+    if original[pos] == "{":
+        values: list[str] = []
+        pos += 1
+        while pos < n:
+            while pos < n and (original[pos].isspace() or original[pos] == ","):
+                pos += 1
+            if pos < n and original[pos] == "}":
+                return values
+            if pos >= n or original[pos] != '"':
+                return None
+            span = _java_string_literal_span(original, pos)
+            if span is None:
+                return None
+            content, pos = span
+            values.append(_bounded_route_target(content))
+        return None
+    if original[pos] != '"':
+        return None
+    span = _java_string_literal_span(original, pos)
+    if span is None:
+        return None
+    content, end = span
+    if not _value_terminates_at(original, end):
+        return None
+    return [_bounded_route_target(content)]
 
 
 def _bounded_route_target(value: str) -> str:
@@ -1075,7 +1150,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
 
     edges: list[JavaEdgeClaim] = []
     entry_points: list[JavaEntryPointClaim] = []
-    problems: list[str] = []
+    problems: list[JavaAdapterProblem] = []
 
     for target, is_static, line in imports:
         # D-1 (reviewer-3, PR-B delta review round 2): a plain (non-static,
@@ -1184,7 +1259,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             line=_line_at(newline_offsets, match.start()), phase="runtime",
         ))
 
-    def _route_annotation_span(match: re.Match) -> tuple[int, list[str], list[str]]:
+    def _route_annotation_span(match: re.Match) -> tuple[int, list[str] | None, list[str]]:
         # N10 (third cold read, fix round 5): find the annotation's own
         # argument-list parens by tracking nesting depth (below), rather
         # than a regex that stopped at the FIRST close-paren anywhere in
@@ -1226,10 +1301,26 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # is what gets tested against it.
     class_header_associations = _class_header_associations(sanitized, types)
     class_route_prefix: dict[str, list[str]] = {}
+    # Fix round 11 (seventh cold read BLOCKER part 2 - the fail-safe for
+    # unrecoverable values): a class-level route annotation whose OWN
+    # value could not be recovered as a literal (a constant reference, a
+    # concatenation, ...) must never silently compose against an
+    # implicit EMPTY prefix - every method-level route inside that class
+    # is UNKNOWN, not a bare fragment of whatever the real prefix is.
+    # Tracked separately from "no entry at all" (a genuinely valueless
+    # class-level annotation, Spring's own legitimate "no prefix"
+    # semantics) - checked FIRST in pass two, below, so it wins even if
+    # some OTHER class-level annotation on the same type also happened
+    # to register a real prefix.
+    class_route_prefix_unrecoverable: set[str] = set()
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         _span_end, paths, _explicit_methods = _route_annotation_span(match)
         target_type = _class_level_route_target(match.start(), class_header_associations)
-        if target_type is not None and paths:
+        if target_type is None:
+            continue
+        if paths is None:
+            class_route_prefix_unrecoverable.add(target_type)
+        elif paths:
             class_route_prefix[target_type] = paths
 
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
@@ -1264,11 +1355,40 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # one associates normally via class_header_associations
             # above and never reaches this branch at all - no special
             # case needed here to keep in step with that one.
-            problems.append(
-                f"a class-level-looking route annotation at line {line} could not be "
-                "confidently associated with any declared type - suppressed rather "
-                "than published as a route"
-            )
+            problems.append(JavaAdapterProblem(
+                reason_code="route_annotation_unassociated",
+                detail=f"a class-level-looking route annotation at line {line} could not be "
+                       "confidently associated with any declared type - suppressed rather "
+                       "than published as a route",
+            ))
+            continue
+        if paths is None:
+            # FAIL-SAFE (fix round 11, seventh cold read BLOCKER part 2):
+            # this route annotation's OWN value could not be recovered
+            # as a literal - a constant reference, a concatenation
+            # (silently taking its FIRST literal fragment would publish
+            # a path the application never serves - a fabrication worse
+            # than a bare fragment), or any other non-literal expression.
+            # Never compose against an implicit empty value; suppress
+            # and record why.
+            problems.append(JavaAdapterProblem(
+                reason_code="route_value_unrecoverable",
+                detail=f"a route annotation at line {line} has a value that could not be "
+                       "recovered as a literal - suppressed rather than published with a "
+                       "guessed or partial value",
+            ))
+            continue
+        if enclosing in class_route_prefix_unrecoverable:
+            # FAIL-SAFE (fix round 11): the enclosing class's OWN route
+            # prefix could not be recovered - composing this method's
+            # value against an implicit empty prefix would publish a
+            # bare FRAGMENT as if it were the complete served path.
+            problems.append(JavaAdapterProblem(
+                reason_code="route_value_unrecoverable",
+                detail=f"a route annotation at line {line} is inside a class whose own route "
+                       "prefix could not be recovered as a literal - suppressed rather than "
+                       "published as an incomplete fragment",
+            ))
             continue
         prefixes = class_route_prefix.get(enclosing)
         if prefixes:
@@ -1483,7 +1603,7 @@ def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:
         "units": [asdict(u) for u in result.units],
         "edges": [asdict(e) for e in result.edges],
         "entry_points": [asdict(p) for p in result.entry_points],
-        "problems": list(result.problems),
+        "problems": [asdict(p) for p in result.problems],
     }
 
 
@@ -1492,5 +1612,5 @@ def file_result_from_json(payload: dict[str, Any]) -> JavaFileResult:
         units=[JavaUnitClaim(**u) for u in payload["units"]],
         edges=[JavaEdgeClaim(**e) for e in payload["edges"]],
         entry_points=[JavaEntryPointClaim(**p) for p in payload["entry_points"]],
-        problems=list(payload.get("problems", [])),
+        problems=[JavaAdapterProblem(**p) for p in payload.get("problems", [])],
     )
