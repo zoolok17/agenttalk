@@ -30,6 +30,20 @@ from .readiness_artifact import ReadinessSignal, UnitReadinessSummary
 PROJECTION_SCHEMA_VERSION = 1
 _MAX_ROWS_PER_SECTION = 1000
 
+#: N6 (seventh cold read, fix round 11): these six sections are computed
+#: over the UNFILTERED, whole-run sets even when unit_id/feature_id/
+#: readiness_state narrows the actually-returned rows elsewhere in the
+#: SAME payload - "counts" said so itself (its own "scope" field), but a
+#: --unit/--feature/--readiness caller inspecting one of the OTHER five
+#: sections directly had no visible indication, right there, that it is
+#: exempt from their filter. Named explicitly at the payload's own top
+#: level, outside "counts", so any one of the six is self-describing
+#: without a caller needing to already know to check a sibling section.
+WHOLE_RUN_SECTIONS = (
+    "counts", "dependency_summary", "high_fan_out_units", "high_fan_in_units",
+    "units_without_feature", "unmapped_entry_points",
+)
+
 
 def _bounded(records: list[Any], cap: int | None = None) -> tuple[list[Any], int]:
     # cap is read from the module global at CALL time (never a def-time
@@ -228,6 +242,7 @@ def project_comprehension(
             "state": "not_evaluated",
             "reason_code": "freshness_not_implemented_this_slice",
         },
+        "whole_run_sections": list(WHOLE_RUN_SECTIONS),
         "counts": {
             # M10 (cold-read, PR-B fix round 3): these are WHOLE-RUN
             # totals - deliberately unaffected by unit_id/feature_id/

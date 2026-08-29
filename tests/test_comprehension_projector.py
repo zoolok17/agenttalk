@@ -291,6 +291,14 @@ def test_no_projection_list_anywhere_exceeds_the_row_cap(monkeypatch):
     ))
 
     def _assert_no_list_exceeds_cap(value: object, path: str) -> None:
+        # N6 (seventh cold read, fix round 11): whole_run_sections is a
+        # fixed enumeration of SECTION NAMES, not a row/data section
+        # subject to growth with scan size - it is never routed through
+        # _bounded and is exempt from this row-cap invariant on that
+        # basis, the same way this walk already has to exempt anything
+        # that is not row data.
+        if path == "payload.whole_run_sections":
+            return
         if isinstance(value, list):
             assert len(value) <= 1, f"{path}: list of {len(value)} exceeds the row cap"
             for i, item in enumerate(value):
@@ -329,7 +337,11 @@ def test_no_projection_list_anywhere_exceeds_the_row_cap(monkeypatch):
 
     list_section_names: set = set()
     _list_section_names(payload, "", list_section_names)
-    missing = list_section_names - set(payload["omitted_counts"])
+    # N6 (seventh cold read, fix round 11): whole_run_sections is a fixed
+    # enumeration of section NAMES, not a bounded row/data section - it
+    # is never routed through _bounded, so it has no omitted_counts entry
+    # by design, not by oversight.
+    missing = list_section_names - set(payload["omitted_counts"]) - {"whole_run_sections"}
     assert not missing, (
         f"payload section(s) with no matching omitted_counts entry: {missing} - "
         "a new bounded list must be routed through the same cap+omitted-count "
@@ -367,3 +379,21 @@ def test_counts_section_states_its_whole_run_scope():
     assert payload["counts"]["scope"] == "whole_run"
     assert payload["counts"]["units"] == 2  # whole-run, not the 1 row unit_id actually returns
     assert len(payload["units"]) == 1
+
+
+def test_whole_run_sections_are_named_outside_counts_for_a_filtered_caller():
+    """N6 (seventh cold read, fix round 11): a --unit/--feature/
+    --readiness caller inspecting dependency_summary/high_fan_out_units/
+    high_fan_in_units/units_without_feature/unmapped_entry_points
+    DIRECTLY (not via counts) had no visible indication those five
+    (plus counts itself) are exempt from their filter - counts's own
+    "scope" note was invisible from any of those sibling sections. Named
+    explicitly at the payload's own top level now."""
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1"), _unit("u2")], unit_id="u1"))
+    assert set(payload["whole_run_sections"]) == {
+        "counts", "dependency_summary", "high_fan_out_units", "high_fan_in_units",
+        "units_without_feature", "unmapped_entry_points",
+    }
+    # every named section is actually present in this same payload.
+    assert set(payload["whole_run_sections"]) <= payload.keys()
