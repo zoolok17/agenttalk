@@ -102,6 +102,45 @@ def test_agenttalk_dir_itself_is_hard_excluded(tmp_path: Path) -> None:
     assert result.exclusions.get("hard_excluded") == 1
 
 
+def test_git_as_a_regular_file_is_hard_excluded_not_enumerated(tmp_path: Path) -> None:
+    """M2 (sixth cold read, fix round 10): a git WORKTREE or submodule
+    checkout stores `.git` as a REGULAR FILE (a `gitdir: ...` pointer),
+    not a directory - previously neither excluded nor counted, so it was
+    published as an addressable unit AND folded into the whole-scope
+    fingerprint. That pointer names an absolute path that differs per
+    worktree/machine even for the exact same commit, so two worktrees of
+    the same commit could never fingerprint equal - the exact field
+    PR-C freshness gates on."""
+    (tmp_path / ".git").write_text(
+        "gitdir: /some/absolute/path/that/differs/per/worktree\n", encoding="utf-8")
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    comp_dir = _comprehension_dir(tmp_path)
+    result = discovery.enumerate_scope(tmp_path, comp_dir)
+    assert [f.relative_path for f in result.files] == ["a.txt"]
+    # >= 1, not == 1: the .agenttalk/ fixture directory itself is ALSO
+    # hard_excluded in every run of this test (same convention as
+    # test_enumerate_scope_excludes_default_directory_categories above).
+    assert result.exclusions.get("hard_excluded", 0) >= 1
+
+
+def test_two_worktrees_of_the_same_commit_fingerprint_equal(tmp_path: Path) -> None:
+    """M2 (sixth cold read, fix round 10): the whole-scope fingerprint
+    must depend only on real, shared content - never on a worktree's own
+    `.git` pointer file, whose absolute-path content differs per
+    worktree even for an otherwise byte-identical checkout."""
+    worktree_a = tmp_path / "wt-a"
+    worktree_b = tmp_path / "wt-b"
+    for worktree, gitdir in ((worktree_a, "/repo/.git/worktrees/a"), (worktree_b, "/repo/.git/worktrees/b")):
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+        (worktree / "a.txt").write_bytes(b"hello")
+    comp_dir_a = _comprehension_dir(worktree_a)
+    comp_dir_b = _comprehension_dir(worktree_b)
+    result_a = discovery.enumerate_scope(worktree_a, comp_dir_a)
+    result_b = discovery.enumerate_scope(worktree_b, comp_dir_b)
+    assert result_a.whole_scope_fingerprint == result_b.whole_scope_fingerprint
+
+
 @pytest.mark.parametrize("filename", [".env", ".env.local", "id_rsa", "server.pem", "cert.p12"])
 def test_enumerate_scope_excludes_secret_file_patterns(tmp_path: Path, filename: str) -> None:
     (tmp_path / filename).write_bytes(b"secret")

@@ -339,9 +339,19 @@ def _looks_binary(data: bytes) -> bool:
 
 
 def _exclusion_category(name: str, *, is_dir: bool) -> str | None:
+    if name in _HARD_EXCLUDE_DIR_NAMES:
+        # M2 (sixth cold read, fix round 10): `.git` as a REGULAR FILE (a
+        # git worktree or submodule checkout stores a `gitdir: ...`
+        # pointer there, not a directory) was neither excluded nor
+        # counted - published as an addressable unit and folded into the
+        # whole-scope fingerprint. That pointer names an absolute path
+        # that differs per worktree/machine even for the exact same
+        # commit, so two worktrees of the same commit could never
+        # fingerprint equal - the exact field PR-C freshness gates on.
+        # Hard-excluded by NAME regardless of `is_dir`, same as the
+        # directory shape already was.
+        return "hard_excluded"
     if is_dir:
-        if name in _HARD_EXCLUDE_DIR_NAMES:
-            return "hard_excluded"
         if name in _VCS_DIR_NAMES:
             return "vcs"
         if name in _DEPENDENCY_CACHE_DIR_NAMES:
