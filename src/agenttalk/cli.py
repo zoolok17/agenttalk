@@ -2114,9 +2114,15 @@ def cmd_comprehension(args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
-            print(f"latest_scan_id: {payload['latest_scan_id']}")
-            print(f"status:         {payload['status']}")
-            print(f"problems:       {payload['problem_count']}")
+            # N5 (seventh cold read, fix round 11): this used to print
+            # latest_scan_id unconditionally - with `--run <older-id>`,
+            # human output named the wrong run (the repo's LATEST scan,
+            # never the one actually being reported this call). scan_id
+            # is the reported run's own id - the same field `validate`'s
+            # human output already prints correctly.
+            print(f"scan_id:  {payload['scan_id']}")
+            print(f"status:   {payload['status']}")
+            print(f"problems: {payload['problem_count']}")
             _print_scan_json_integrity_if_not_verified(payload)
         return 0
 

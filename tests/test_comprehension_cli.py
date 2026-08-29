@@ -176,6 +176,27 @@ def test_status_human_output_names_an_unverified_integrity_state(
     assert "scan_json_index_anchor_not_recorded" in out
 
 
+def test_status_human_output_names_the_reported_run_not_always_the_latest(
+    java_repo: Path, capsys,
+) -> None:
+    """N5 (seventh cold read, fix round 11): `status --run <older-id>`'s
+    human output used to print latest_scan_id unconditionally - naming
+    the repo's LATEST scan even when an OLDER run was explicitly
+    requested and actually reported. Must print the reported run's own
+    id."""
+    _run(["comprehension", "scan", "--json"], java_repo)
+    first_scan_id = json.loads(capsys.readouterr().out)["scan_id"]
+    _run(["comprehension", "scan", "--json"], java_repo)
+    second_scan_id = json.loads(capsys.readouterr().out)["scan_id"]
+    assert first_scan_id != second_scan_id
+
+    exit_code = _run(["comprehension", "status", "--run", first_scan_id], java_repo)
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert f"scan_id:  {first_scan_id}" in out
+    assert second_scan_id not in out
+
+
 # ----------------------------------------------------------- report
 
 def test_report_after_a_scan(java_repo: Path, capsys) -> None:
