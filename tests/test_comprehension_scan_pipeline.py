@@ -368,6 +368,55 @@ def test_run_scan_does_not_block_readiness_for_the_pom_xml_it_understood(
     assert summary["stored_assessment_state"] != "blocked"
 
 
+def test_run_scan_a_route_value_constant_never_flips_source_understood_for_ordinary_siblings(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 13c (reviewer-3's part 2 probe, verbatim): round 13b's
+    general companion fix (threading a file-wide worker problem into
+    EVERY unit's adapter_problem_reason(s), even when the file has real
+    declared types) exposed a regression - three ordinary classes plus
+    ONE route path written as a constant (route_value_unrecoverable, a
+    narrow, entry-adjacent fact, not a comprehension failure) used to
+    flip source_understood to UNKNOWN on all four units (3 classes + the
+    file record) - a blocker-severity check degraded for an entirely
+    ordinary Java idiom. Round 13c's explicit reason-class routing must
+    keep source_understood satisfied on all four, while the route
+    problem itself keeps its own existing, unchanged visibility
+    (problems.json, the route's own absence from dependencies/entry
+    points)."""
+    (java_repo / "src" / "main" / "java" / "p" / "Siblings.java").write_text(
+        "package p;\n"
+        "class Alpha {\n}\n"
+        "class Beta {\n}\n"
+        "class Gamma {\n"
+        "  @GetMapping(SomeConstants.PATH)\n"
+        "  void list() {}\n"
+        "}\n", encoding="utf-8")
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    import json
+
+    modules_doc = json.loads((outcome.run_dir / "modules.json").read_text(encoding="utf-8"))
+    readiness_doc = json.loads((outcome.run_dir / "readiness.json").read_text(encoding="utf-8"))
+    problems_doc = json.loads((outcome.run_dir / "problems.json").read_text(encoding="utf-8"))
+    siblings_units = [
+        u for u in modules_doc["units"]
+        if u["paths"] == ["src/main/java/p/Siblings.java"]
+    ]
+    assert len(siblings_units) == 4  # Alpha, Beta, Gamma, and the file record
+
+    for unit in siblings_units:
+        source_understood = next(
+            s for s in readiness_doc["signals"]
+            if s["unit_id"] == unit["unit_id"] and s["check"] == "source_understood"
+        )
+        assert source_understood["stored_status"] == "satisfied", unit["display_name"]
+
+    assert any(p["reason_code"] == "route_value_unrecoverable" for p in problems_doc["problems"])
+    assert not any(r["relation"] == "route" for r in json.loads(
+        (outcome.run_dir / "dependencies.json").read_text(encoding="utf-8"))["edges"])
+
+
 def test_run_scan_reports_unknown_not_satisfied_for_a_resource_capped_java_file(
     java_repo: Path, monkeypatch,
 ) -> None:
@@ -483,16 +532,20 @@ def test_run_scan_ordinary_jdk_invoke_calls_never_drive_dependencies_resolved_un
 def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unknown(
     java_repo: Path,
 ) -> None:
-    """FIX ROUND 13b (reviewer-3's B1 class-closer): a method literally
-    named main, returning void, with a parameter shape outside even the
-    extended grammar (round 13b) must never publish a confident "no
-    entry point" - end to end, the adapter's cli_main_unrecognized
-    problem must surface as readiness's entry_points_mapped UNKNOWN,
-    with problems.json naming the exact reason, on an otherwise real
-    scan run."""
+    """FIX ROUND 13b/13c (reviewer-3's B1 class-closer, attribution, and
+    routing): a method literally named main, returning void, with a
+    parameter shape genuinely outside the recognized grammar (String-
+    typed but not any recognized array/varargs form - round 13c's own
+    JLS-certain-negative classification does not apply here, since the
+    base type IS String) must never publish a confident "no entry
+    point" - end to end, the adapter's cli_main_unrecognized problem
+    (attributed to this ONE unit) must surface as readiness's
+    entry_points_mapped UNKNOWN, with problems.json naming the exact
+    reason, WITHOUT flipping source_understood (round 13c's explicit
+    reason-class routing) on an otherwise real scan run."""
     (java_repo / "src" / "main" / "java" / "p" / "App.java").write_text(
         "package p;\nclass App {\n"
-        "  public static void main(String[] args, int extra) {\n"
+        "  public static void main(String args) {\n"
         "  }\n"
         "}\n", encoding="utf-8")
 
@@ -512,6 +565,12 @@ def test_run_scan_unrecognized_main_like_shape_reports_entry_points_mapped_unkno
     assert entry_points_mapped["stored_status"] == "unknown"
     assert entry_points_mapped["reason_code"] == "cli_main_unrecognized"
     assert any(p["reason_code"] == "cli_main_unrecognized" for p in problems_doc["problems"])
+
+    source_understood = next(
+        s for s in readiness_doc["signals"]
+        if s["unit_id"] == app_unit["unit_id"] and s["check"] == "source_understood"
+    )
+    assert source_understood["stored_status"] == "satisfied"
 
 
 def test_run_scan_populates_source_digest_on_dependency_and_feature_producers(

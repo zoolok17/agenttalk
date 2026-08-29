@@ -1727,15 +1727,18 @@ def test_main_without_both_public_and_static_is_not_a_cli_main_entry_point():
 def test_unrecognized_main_like_shape_degrades_to_a_named_problem_not_silence():
     """FIX ROUND 13b (reviewer-3's B1 class-closer): a method literally
     named main, returning void, whose overall shape the strict matcher
-    could not recognize AT ALL (constructed here with a parameter shape
-    outside even the extended grammar) must never silently vanish into
-    a confident "no entry point" - it degrades to a named, visible
+    could not recognize AT ALL must never silently vanish into a
+    confident "no entry point" - it degrades to a named, visible
     problem instead, since it MIGHT be a legal spelling this adapter
-    still does not cover."""
+    still does not cover. A bare, non-array String parameter is
+    String-TYPED (so round 13c's JLS-certain wrong-TYPE check does not
+    apply) but matches no recognized array/varargs form either - the
+    genuine spelling-variant uncertainty this class-closer exists for,
+    not a JLS-certain wrong-arity/wrong-type shape."""
     src = """
 package p;
 class App {
-    public static void main(String[] args, int extra) {
+    public static void main(String args) {
     }
 }
 """
@@ -1744,6 +1747,26 @@ class App {
     assert len(result.problems) == 1
     assert result.problems[0].reason_code == "cli_main_unrecognized"
     assert "did not match" in result.problems[0].detail
+    assert result.problems[0].qualified_name == "p.App"
+
+
+def test_jls_certain_wrong_signature_shapes_are_silent_never_unrecognized():
+    """FIX ROUND 13c (reviewer-3's MILDER ask): main(int[]), main(), and
+    main(String[], int) are JLS-CERTAIN negatives - the JVM entry-point
+    signature is EXACTLY one String[]/varargs parameter, so a wrong
+    arity or a plainly-wrong base type can never be the entry point
+    regardless of modifiers. These must classify with the private/non-
+    static certain-negative branch (silent, no problem) - "unknown" is
+    reserved for shapes this adapter genuinely could not classify."""
+    for signature in (
+        "public static void main(int[] args)",           # wrong base type
+        "public static void main()",                       # wrong arity (zero)
+        "public static void main(String[] args, int extra)",  # wrong arity (two)
+    ):
+        src = f"package p;\nclass App {{\n    {signature} {{\n    }}\n}}\n"
+        result = java.parse_java_source("App.java", src)
+        assert [e for e in result.entry_points if e.kind == "cli_main"] == [], signature
+        assert result.problems == [], signature
 
 
 def test_second_top_level_type_with_its_own_main_gets_its_own_cli_main_entry_point():
@@ -1764,6 +1787,30 @@ class Second {
     # the FIRST main method in the whole file - a second top-level type's
     # own main was silently dropped as an entry point entirely.
     assert mains == {"p.First", "p.Second"}
+
+
+def test_unrecognized_main_problem_is_attributed_only_to_its_own_enclosing_type():
+    """FIX ROUND 13c (reviewer-3's part 1 on round 13b): a
+    cli_main_unrecognized problem used to be a plain file-level record
+    with no owning type at all - broadcast (by modules_artifact.py's
+    generic wiring) onto EVERY declared type in the file. In a 3-class
+    file where only the THIRD has a main-like method, Alpha and Beta
+    must carry no attribution at all; only Gamma does."""
+    src = """
+package p;
+class Alpha {
+}
+class Beta {
+}
+class Gamma {
+    public static void main(String args) {
+    }
+}
+"""
+    result = java.parse_java_source("Multi.java", src)
+    assert len(result.problems) == 1
+    assert result.problems[0].reason_code == "cli_main_unrecognized"
+    assert result.problems[0].qualified_name == "p.Gamma"
 
 
 # ----------------------------------------------------------- pom.xml (build)

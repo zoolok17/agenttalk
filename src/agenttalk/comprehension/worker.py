@@ -151,11 +151,18 @@ class WorkerProblem:
     shape - the full ``problems.json`` record schema (stable ID, severity,
     producers, generated message) is formalized where that artifact is
     built; this only carries enough to construct that record later without
-    losing information here."""
+    losing information here.
+
+    FIX ROUND 13c (reviewer-3's part 1 on round 13b): ``qualified_name``
+    carries an adapter-attributed problem's own owning type through to
+    ``scan_pipeline.py`` unchanged - ``None`` for the ordinary file-wide
+    problem shapes (parse failures, resource caps), a real qualified
+    name for the narrower few an adapter can pin to one declared type."""
 
     reason_code: str
     relative_path: str
     detail: str
+    qualified_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -292,7 +299,7 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                 for problem in result.problems:
                     problems.append(WorkerProblem(
                         reason_code=problem.reason_code, relative_path=rel,
-                        detail=problem.detail,
+                        detail=problem.detail, qualified_name=problem.qualified_name,
                     ))
         elif rel_name_lower == "pom.xml":
             # reviewer-3 B-3 (PR-B delta review): a pom.xml's build-relation
@@ -367,6 +374,7 @@ def _result_to_json(result: WorkerResult) -> dict[str, Any]:
                 "reason_code": problem.reason_code,
                 "relative_path": problem.relative_path,
                 "detail": problem.detail,
+                "qualified_name": problem.qualified_name,
             }
             for problem in result.problems
         ],
@@ -404,6 +412,7 @@ def _result_from_json(payload: Any) -> WorkerResult:
                 reason_code=item["reason_code"],
                 relative_path=item["relative_path"],
                 detail=item["detail"],
+                qualified_name=item.get("qualified_name"),
             )
             for item in payload["problems"]
         ]

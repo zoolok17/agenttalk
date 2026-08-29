@@ -158,6 +158,7 @@ def _parent_qualified_name(qualified_name: str, known_names: set[str]) -> str | 
 def build_modules(
     discovery: DiscoveryResult, java_results: dict[str, java_adapter.JavaFileResult],
     *, worker_problem_reasons_by_path: dict[str, list[str]] | None = None,
+    worker_problem_reasons_by_unit: dict[tuple[str, str], list[str]] | None = None,
 ) -> list[ModuleRecord]:
     """``java_results`` maps a ``.java`` file's relative path to its
     already-parsed :class:`~.adapters.java.JavaFileResult` (item 3) -
@@ -173,7 +174,20 @@ def build_modules(
     "the adapter was eligible but has no positive result" for SOME worker
     reason - parse failure, the per-file resource cap, or a re-confinement
     rejection - all genuinely unknown, never a confident understood
-    merely because the extension maps to a known language.
+    merely because the extension maps to a known language. Broadcasts to
+    EVERY unit declared in that path - correct for a genuinely file-wide
+    problem (a parse failure has no single "owning" type), never for one
+    an adapter can pin to a specific declared type.
+
+    ``worker_problem_reasons_by_unit`` (FIX ROUND 13c, reviewer-3's part
+    1 on round 13b) is the narrower counterpart: keyed by
+    ``(relative_path, qualified_name)``, for a worker problem an adapter
+    DID attribute to one specific declared type (e.g. an unrecognized
+    cli_main-like method belongs to its own enclosing type) - applied
+    ONLY to the one matching unit's own record, never its siblings in
+    the same file, and never the file-kind record itself (the concept
+    of "this exact type's own entry-point signature" does not apply to
+    the file as a whole the way "was this file's content parseable" does).
 
     MINOR 5 (sixth cold read, fix round 9): a path can legitimately have
     MORE than one distinct reason recorded (round 8's N3) - the closed,
@@ -182,6 +196,7 @@ def build_modules(
     separately as ``adapter_problem_reasons``."""
     records: list[ModuleRecord] = []
     worker_problem_reasons_by_path = worker_problem_reasons_by_path or {}
+    worker_problem_reasons_by_unit = worker_problem_reasons_by_unit or {}
 
     for file_entry in discovery.files:
         relative_path = file_entry.relative_path
@@ -253,6 +268,14 @@ def build_modules(
             container_unit_id = (
                 unit_id_by_qualified_name[parent_name] if parent_name is not None else file_unit_id
             )
+            # FIX ROUND 13c (reviewer-3's part 1 on round 13b): this
+            # unit's OWN attributed reasons (if any) merge with the
+            # file-wide broadcast ones - never the reverse (a sibling
+            # type's own attributed problem must never appear here).
+            unit_reasons = sorted({
+                *reasons,
+                *worker_problem_reasons_by_unit.get((relative_path, unit_claim.qualified_name), []),
+            })
             records.append(ModuleRecord(
                 unit_id=unit_id_by_qualified_name[unit_claim.qualified_name],
                 kind="component",
@@ -267,8 +290,8 @@ def build_modules(
                     rule_version=java_adapter.RULE_VERSION,
                     source_digest=file_entry.content_digest, basis="extracted",
                 )],
-                adapter_problem_reason=reasons[0] if reasons else None,
-                adapter_problem_reasons=list(reasons),
+                adapter_problem_reason=unit_reasons[0] if unit_reasons else None,
+                adapter_problem_reasons=unit_reasons,
             ))
 
         records.append(ModuleRecord(

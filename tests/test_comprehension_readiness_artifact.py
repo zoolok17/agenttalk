@@ -96,7 +96,10 @@ def test_source_understood_unknown_when_the_adapter_failed_to_parse():
     never "satisfied" just because its extension maps to a known
     language - "satisfied" is a positive claim this unit never earned."""
     signals, summaries = ra.build_readiness(
-        [_unit("u1", language="java", adapter_problem_reason="parse_failed")], [], [])
+        [_unit(
+            "u1", language="java", adapter_problem_reason="parse_failed",
+            adapter_problem_reasons=["parse_failed"],
+        )], [], [])
     signal = _signal_by_check(signals, "source_understood")
     assert signal.stored_status == "unknown"
     assert signal.reason_code == "adapter_parse_failed"
@@ -114,7 +117,10 @@ def test_source_understood_unknown_when_the_adapter_work_resource_cap_skipped_it
     is unknown by construction, with a reason_code that still names the
     real cause."""
     signals, summaries = ra.build_readiness(
-        [_unit("u1", language="java", adapter_problem_reason="resource_limit")], [], [])
+        [_unit(
+            "u1", language="java", adapter_problem_reason="resource_limit",
+            adapter_problem_reasons=["resource_limit"],
+        )], [], [])
     signal = _signal_by_check(signals, "source_understood")
     assert signal.stored_status == "unknown"
     assert signal.reason_code == "adapter_resource_limit"

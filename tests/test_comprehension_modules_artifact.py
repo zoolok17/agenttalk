@@ -235,14 +235,16 @@ def test_component_producer_names_the_java_adapter():
 
 def test_a_java_file_with_real_units_still_carries_its_own_worker_problem_reasons():
     """FIX ROUND 13b (reviewer-3's B1 class-closer companion fix): a
-    worker-recorded problem (route_annotation_unassociated, route_value_
-    unrecoverable, cli_main_unrecognized, ...) used to reach adapter_
-    problem_reason(s) ONLY through the "zero units extracted" fallback
-    branch - a file that DOES have real declared types (the ordinary
-    case for every one of those problem kinds; a class with a broken
-    route annotation still has a valid declared type) silently dropped
-    the reason here, so no readiness check downstream could ever see it.
-    Both the per-type component AND the file unit must carry it."""
+    file-wide worker-recorded problem (route_annotation_unassociated,
+    route_value_unrecoverable, ...) used to reach adapter_problem_
+    reason(s) ONLY through the "zero units extracted" fallback branch -
+    a file that DOES have real declared types (the ordinary case for
+    every one of those problem kinds; a class with a broken route
+    annotation still has a valid declared type) silently dropped the
+    reason here, so no readiness check downstream could ever see it.
+    Both the per-type component AND the file unit must carry it -
+    correct for a genuinely file-wide problem with no single owning
+    type."""
     source = "package p;\nclass Foo {\n}\n"
     discovery = _discovery([
         EnumeratedFile(relative_path="p/Foo.java", byte_count=len(source), content_digest="digest1"),
@@ -250,14 +252,41 @@ def test_a_java_file_with_real_units_still_carries_its_own_worker_problem_reason
     java_results = {"p/Foo.java": _java_result("p/Foo.java", source)}
     records = ma.build_modules(
         discovery, java_results,
-        worker_problem_reasons_by_path={"p/Foo.java": ["cli_main_unrecognized"]},
+        worker_problem_reasons_by_path={"p/Foo.java": ["route_value_unrecoverable"]},
     )
     component = next(r for r in records if r.kind == "component")
     file_record = next(r for r in records if r.kind == "file")
-    assert component.adapter_problem_reason == "cli_main_unrecognized"
-    assert component.adapter_problem_reasons == ["cli_main_unrecognized"]
-    assert file_record.adapter_problem_reason == "cli_main_unrecognized"
-    assert file_record.adapter_problem_reasons == ["cli_main_unrecognized"]
+    assert component.adapter_problem_reason == "route_value_unrecoverable"
+    assert component.adapter_problem_reasons == ["route_value_unrecoverable"]
+    assert file_record.adapter_problem_reason == "route_value_unrecoverable"
+    assert file_record.adapter_problem_reasons == ["route_value_unrecoverable"]
+
+
+def test_an_attributed_worker_problem_reaches_only_its_own_enclosing_unit():
+    """FIX ROUND 13c (reviewer-3's part 1 on round 13b): an ATTRIBUTED
+    worker problem (keyed by (path, qualified_name) - e.g.
+    cli_main_unrecognized, owned by one specific declared type) must
+    reach ONLY that one unit's own record - never its siblings in the
+    same file, and never the file-kind record itself (the file has no
+    single "own entry-point signature" the way a specific type does)."""
+    source = "package p;\nclass Alpha {\n}\nclass Beta {\n}\n"
+    discovery = _discovery([
+        EnumeratedFile(relative_path="p/Multi.java", byte_count=len(source), content_digest="digest1"),
+    ])
+    java_results = {"p/Multi.java": _java_result("p/Multi.java", source)}
+    records = ma.build_modules(
+        discovery, java_results,
+        worker_problem_reasons_by_unit={("p/Multi.java", "p.Beta"): ["cli_main_unrecognized"]},
+    )
+    alpha = next(r for r in records if r.display_name == "Alpha")
+    beta = next(r for r in records if r.display_name == "Beta")
+    file_record = next(r for r in records if r.kind == "file")
+    assert alpha.adapter_problem_reason is None
+    assert alpha.adapter_problem_reasons == []
+    assert beta.adapter_problem_reason == "cli_main_unrecognized"
+    assert beta.adapter_problem_reasons == ["cli_main_unrecognized"]
+    assert file_record.adapter_problem_reason is None
+    assert file_record.adapter_problem_reasons == []
 
 
 def test_to_json_sorts_paths_and_classification():

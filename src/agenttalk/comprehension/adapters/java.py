@@ -200,27 +200,38 @@ _MAIN_PARAM_RE = (
 #: modifiers) and must be structurally RECOGNIZED, not fall through to
 #: the class-closer's "unrecognized shape" bucket meant for something
 #: this adapter genuinely cannot parse.
-_MAIN_METHOD_RE = re.compile(
+#:
+#: FIX ROUND 13c (reviewer-3's rejection of round 13b): this used to be
+#: ONE regex matching the modifier run THROUGH the closing paren, with a
+#: separate, broader ``\bvoid\s+main\s*\(`` catch-all for anything it
+#: missed. Split in two: this header-only pattern anchors the modifier
+#: run and return type/name, stopping at the OPEN paren; the parameter
+#: list itself is recovered separately via ``_matching_close_paren``
+#: (below, in ``parse_java_source``) - depth-aware, so a JSR-308
+#: annotation's own parenthesized argument inside the parameter list can
+#: never be mistaken for the method's own closing paren.
+_MAIN_HEADER_RE = re.compile(
     r"((?:" + _MAIN_MODIFIER_OR_ANNOTATION + r"(?:\s+" + _MAIN_MODIFIER_OR_ANNOTATION + r")*\s+)?)"
-    r"(?:<[^>]*>\s*)?void\s+main\s*\(\s*" + _MAIN_PARAM_RE + r"\s*\)"
+    r"(?:<[^>]*>\s*)?void\s+main\s*\("
 )
-#: FIX ROUND 13b (reviewer-3's B1 class-closer, taken regardless of how
-#: complete the grammar above turns out to be): a method literally named
-#: ``main`` returning ``void`` that this SAME file's own strict matcher
-#: above did NOT recognize must never publish the confident negative
-#: "no entry point" - it might be a legal spelling this matcher still
-#: does not cover (the round-13 "total for the legal grammar" claim
-#: already turned out false once). No entry point is ever PUBLISHED for
-#: this shape either way (a private/instance helper coincidentally named
-#: "main" is never claimed as a real one) - only the CONFIDENCE of the
-#: negative changes, downstream, to an honest "unknown" (see
-#: readiness_artifact._check_entry_points_mapped) - the same three-state
-#: move round 11 already made for an unrecoverable route value. A
-#: broader catch-all was rejected in round 13 specifically because it
-#: would have PUBLISHED a false entry point for an ordinary non-entry-
-#: point method; recording an UNKNOWN, never a claim, carries no such
-#: risk - it can only ever make a negative less confident, never wrong.
-_MAIN_CANDIDATE_RE = re.compile(r"\bvoid\s+main\s*\(")
+#: The parameter list recovered between the header's open paren and its
+#: matching close paren, anchored FULLY (start to end, only surrounding
+#: whitespace allowed) - a partial match here would silently accept
+#: trailing garbage after a recognized parameter.
+_MAIN_PARAM_FULL_RE = re.compile(r"\A\s*" + _MAIN_PARAM_RE + r"\s*\Z")
+#: FIX ROUND 13c (reviewer-3's MILDER ask): recovers a single parameter's
+#: own leading TYPE token (after skipping any annotation/``final``
+#: prefix) - used to tell a JLS-CERTAIN wrong-type negative (``main(int[]
+#: args)`` - the JVM entry-point signature is exactly one ``String[]``
+#: parameter, so any OTHER base type is unconditionally disqualifying,
+#: regardless of spelling) apart from a genuinely unrecognized shape
+#: (this adapter could not even determine a base type at all, or the
+#: type IS ``String`` but in some array/varargs spelling not yet
+#: recognized - the spelling-variant axis every enumerated-recognizer
+#: lesson this producer has learned actually applies to).
+_MAIN_PARAM_LEADING_TYPE_RE = re.compile(
+    r"\A" + _MAIN_PARAM_PREFIX + r"((?:java\.lang\.)?[A-Za-z_$][\w$]*)")
+_MAIN_STRING_TYPE_SPELLINGS = frozenset({"String", "java.lang.String"})
 _ROUTE_ANNOTATIONS = (
     "RequestMapping", "GetMapping", "PostMapping", "PutMapping",
     "DeleteMapping", "PatchMapping",
@@ -415,10 +426,19 @@ class JavaAdapterProblem:
     either. ``reason_code`` distinguishes the FAMILY (fix round 11:
     association failure vs. value-recovery failure are different,
     separately-named problems, not one generic bucket) - the worker
-    surfaces each as its own named ``WorkerProblem`` (worker.py)."""
+    surfaces each as its own named ``WorkerProblem`` (worker.py).
+
+    FIX ROUND 13c (reviewer-3's part 1 on round 13b): ``qualified_name``
+    - ``None`` by default - names the ONE declared type this problem is
+    actually ABOUT, when the adapter can pin one down (e.g. an
+    unrecognized cli_main-like method belongs to its own enclosing
+    type, never every sibling type in the same file). ``None`` keeps
+    today's file-wide broadcast for problem kinds with no single owning
+    type (a route fail-safe, a whole-file parse failure) - unchanged."""
 
     reason_code: str
     detail: str
+    qualified_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -827,6 +847,31 @@ def _matching_close_paren(sanitized: str, open_pos: int) -> int | None:
             if depth == 0:
                 return i
     return None
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """FIX ROUND 13c (reviewer-3's MILDER ask): splits a recovered
+    parameter-list substring on TOP-LEVEL commas only - depth-aware
+    across ``()``, ``[]``, and ``<>`` so a nested annotation argument,
+    array dimension, or generic type argument's own comma is never
+    mistaken for a parameter separator. Returns ``[]`` for whitespace-
+    only text (zero parameters - ``main()``), never ``[""]``, so the
+    caller can count arity directly off ``len(...)``."""
+    if not text.strip():
+        return []
+    parts = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(text):
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]>":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
 
 
 def _matching_open_paren(sanitized: str, close_pos: int) -> int | None:
@@ -1639,40 +1684,77 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # `main` method (e.g. two separate CLI entry classes in one file), and
     # the old single re.search silently kept only the first.
     #
-    # FIX ROUND 13 (CR9-2): de-enumerated - see _MAIN_METHOD_RE's own
+    # FIX ROUND 13 (CR9-2): de-enumerated - see _MAIN_HEADER_RE's own
     # comment. "public" and "static" must both appear in the matched
     # modifier run, in any order; the regex alone only guarantees at
     # least one recognized modifier keyword is present.
     #
-    # FIX ROUND 13b (B1 class-closer): every "void main(" site the strict
-    # matcher DID recognize (whether or not it turned out to have both
-    # public and static) is tracked here, so the broader candidate scan
-    # below can tell "recognized, confidently not an entry point" (missing
-    # a required modifier - stays silent, unchanged) apart from
-    # "unrecognized shape entirely" (never seen by the strict matcher at
-    # all - degrades to unknown instead of a confident negative).
-    recognized_void_main_starts: set[int] = set()
-    for main_match in _MAIN_METHOD_RE.finditer(sanitized):
-        void_main_submatch = re.search(r"void\s+main\s*\(", main_match.group(0))
-        recognized_void_main_starts.add(main_match.start() + void_main_submatch.start())
-        modifiers = main_match.group(1).split()
-        if "public" not in modifiers or "static" not in modifiers:
+    # FIX ROUND 13c (reviewer-3's rejection of round 13b): every
+    # "cli_main_unrecognized" problem is now ATTRIBUTED to the ONE
+    # enclosing declared type it concerns (_enclosing_qualified_name -
+    # the same machinery edges/entry points already use), never
+    # broadcast file-wide - a 3-class file where only the third has a
+    # main-like method must never flag the other two. And the MILDER
+    # fix: a recovered parameter list is now classified into three
+    # outcomes, not two - (1) the exact String[]/varargs shape (subject
+    # to the public+static check, as before); (2) a JLS-CERTAIN wrong
+    # shape (wrong arity, or a base type that plainly is not String -
+    # main(), main(int[]), main(String[], int) can NEVER be the JVM
+    # entry point regardless of modifiers - silent, same as a
+    # recognized-but-missing-modifier negative, no problem recorded);
+    # (3) genuinely unrecognized (parens never close, or the shape
+    # cannot be confidently placed in class 1 or 2) - THIS is the only
+    # class that degrades to the unknown class-closer.
+    for header_match in _MAIN_HEADER_RE.finditer(sanitized):
+        line = _line_at(newline_offsets, header_match.start())
+        enclosing = _enclosing_qualified_name(header_match.start(), types, primary_qualified)
+        open_paren_pos = header_match.end() - 1
+        close_pos = _matching_close_paren(sanitized, open_paren_pos)
+        if close_pos is None:
+            problems.append(JavaAdapterProblem(
+                reason_code="cli_main_unrecognized",
+                detail=f"a method literally named main returning void at line {line} did "
+                       "not match any recognized public-static-void-main(String[]) "
+                       "signature shape - no cli_main entry point published, but not "
+                       "confidently absent either",
+                qualified_name=enclosing,
+            ))
             continue
-        entry_points.append(JavaEntryPointClaim(
-            qualified_name=_enclosing_qualified_name(main_match.start(), types, primary_qualified),
-            kind="cli_main", name="main",
-            line=_line_at(newline_offsets, main_match.start()), evidence_class="extracted",
-        ))
-
-    for candidate in _MAIN_CANDIDATE_RE.finditer(sanitized):
-        if candidate.start() in recognized_void_main_starts:
+        params = _split_top_level_commas(sanitized[header_match.end():close_pos])
+        if len(params) == 1 and _MAIN_PARAM_FULL_RE.match(params[0]) is not None:
+            modifiers = header_match.group(1).split()
+            if "public" in modifiers and "static" in modifiers:
+                entry_points.append(JavaEntryPointClaim(
+                    qualified_name=enclosing, kind="cli_main", name="main",
+                    line=line, evidence_class="extracted",
+                ))
+            # else: the exact JVM signature, recognized, confidently
+            # missing a required modifier - a JLS-certain negative,
+            # silent, never a problem.
             continue
+        if len(params) != 1:
+            # JLS-certain: the entry point takes EXACTLY one parameter -
+            # main() and main(String[], int) can never qualify, whatever
+            # the modifiers say.
+            continue
+        leading_type_match = _MAIN_PARAM_LEADING_TYPE_RE.match(params[0])
+        if leading_type_match is not None and leading_type_match.group(1) not in _MAIN_STRING_TYPE_SPELLINGS:
+            # JLS-certain: a single parameter whose base type is plainly
+            # NOT String (main(int[] args), ...) can never be the entry
+            # point, regardless of spelling or modifiers.
+            continue
+        # Either no base type could be determined at all, or it IS
+        # String-shaped but not in any array/varargs form this adapter
+        # recognizes - genuinely uncertain (the spelling-variant axis
+        # every enumerated-recognizer lesson in this producer applies
+        # to), never a silent negative.
         problems.append(JavaAdapterProblem(
             reason_code="cli_main_unrecognized",
-            detail=f"a method literally named main returning void at line "
-                   f"{_line_at(newline_offsets, candidate.start())} did not match any "
-                   "recognized public-static-void-main(String[]) signature shape - no "
-                   "cli_main entry point published, but not confidently absent either",
+            detail=f"a method literally named main returning void at line {line} did not "
+                   "match any recognized public-static-void-main(String[]) signature "
+                   "shape - no cli_main entry point published, but not confidently absent "
+                   "either",
+            qualified_name=enclosing,
         ))
 
     if not units:

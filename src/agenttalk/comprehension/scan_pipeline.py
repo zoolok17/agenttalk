@@ -364,19 +364,35 @@ def run_scan(
         # LIST of reasons here; modules_artifact picks the first as the
         # single enumerated ``adapter_problem_reason`` and publishes the
         # complete list separately, losing nothing.
+        # FIX ROUND 13c (reviewer-3's part 1 on round 13b): a worker
+        # problem carrying its own qualified_name (an adapter-attributed
+        # reason - e.g. cli_main_unrecognized, owned by ONE declared
+        # type) must never broadcast into every unit's adapter_problem_
+        # reason(s) via the path-wide map below - only the specific
+        # (path, qualified_name) it names. Reasons with no qualified_name
+        # (parse failures, resource caps, route fail-safes, ...) keep
+        # today's file-wide broadcast, unchanged.
         worker_problem_reasons_by_path: dict[str, list[str]] = {
-            p.relative_path: [] for p in worker_result.problems
+            p.relative_path: [] for p in worker_result.problems if p.qualified_name is None
         }
+        worker_problem_reasons_by_unit: dict[tuple[str, str], list[str]] = {}
         for p in worker_result.problems:
-            reasons = worker_problem_reasons_by_path[p.relative_path]
+            if p.qualified_name is not None:
+                reasons = worker_problem_reasons_by_unit.setdefault(
+                    (p.relative_path, p.qualified_name), [])
+            else:
+                reasons = worker_problem_reasons_by_path[p.relative_path]
             if p.reason_code not in reasons:
                 reasons.append(p.reason_code)
         for reasons in worker_problem_reasons_by_path.values():
+            reasons.sort()
+        for reasons in worker_problem_reasons_by_unit.values():
             reasons.sort()
 
         modules = modules_artifact.build_modules(
             discovery_result, java_results,
             worker_problem_reasons_by_path=worker_problem_reasons_by_path,
+            worker_problem_reasons_by_unit=worker_problem_reasons_by_unit,
         )
         # M7 (cold-read, PR-B fix round 3): discovery already computed
         # each file's own content digest - dependencies_artifact.py and

@@ -129,6 +129,49 @@ def _signal(unit_id: str, check: str, stored_status: str, basis: str, reason_cod
     )
 
 
+#: FIX ROUND 13c (reviewer-3's part 2 on round 13b): round 13b's general
+#: companion fix (threading a worker-recorded problem into a unit's own
+#: adapter_problem_reason(s) even when the file has real declared types)
+#: exposed a BLANKET rule here that treated every recorded reason as
+#: "could not understand this file" - reviewer-verified against a
+#: minimal control: three ordinary classes plus ONE route path written
+#: as a constant (route_value_unrecoverable - a narrow, ENTRY-adjacent
+#: fact, not a comprehension failure) flipped source_understood UNKNOWN
+#: on all four units, a blocker-severity check degraded for an entirely
+#: ordinary Java idiom, double-counting one uncertainty as two.
+#:
+#: An explicit map - not an if-exclusion - of which readiness check(s)
+#: each closed reason_code feeds: a reason meaning "this file's content
+#: itself could not be confidently processed" feeds source_understood;
+#: a narrower, specific-fact reason (a route value, a cli_main
+#: signature) feeds its OWN dedicated check instead (or, for the route
+#: fail-safes - no dedicated check exists for them yet - feeds nothing;
+#: their existing problems.json/route-absence visibility is unchanged).
+#: A reason_code THIS MAP HAS NEVER HEARD OF raises (via the plain
+#: KeyError below) rather than silently defaulting anywhere - the next
+#: new reason a worker/adapter emits must declare its destination here
+#: before it can reach any readiness check at all.
+_READINESS_CHECKS_BY_REASON_CODE: dict[str, frozenset[str]] = {
+    "parse_failed": frozenset({"source_understood"}),
+    "path_excluded": frozenset({"source_understood"}),
+    "resource_limit": frozenset({"source_understood"}),
+    "non_utf8_path": frozenset({"source_understood"}),
+    "case_collision": frozenset({"source_understood"}),
+    "no_types_extracted": frozenset({"source_understood"}),
+    "route_annotation_unassociated": frozenset(),
+    "route_value_unrecoverable": frozenset(),
+    "cli_main_unrecognized": frozenset({"entry_points_mapped"}),
+}
+
+
+def _reasons_feeding(check: str, reasons: list[str]) -> list[str]:
+    """Every reason in ``reasons`` whose declared destination(s)
+    (``_READINESS_CHECKS_BY_REASON_CODE``) include ``check`` - sorted.
+    A reason_code absent from that map raises a plain ``KeyError``
+    (never a silent no-op) - see the map's own docstring."""
+    return sorted(r for r in reasons if check in _READINESS_CHECKS_BY_REASON_CODE[r])
+
+
 def _check_source_understood(unit: ModuleRecord) -> ReadinessSignal:
     """M-2 (second cold read, fix round 4; CLOSED as a class, third cold
     read, fix round 5): a file with no adapter at all reports ``unknown``,
@@ -140,18 +183,20 @@ def _check_source_understood(unit: ModuleRecord) -> ReadinessSignal:
     file" is an absence of positive evidence, not a positive claim that
     the source is definitely NOT understood.
 
-    ``satisfied`` requires POSITIVE adapter evidence
-    (``unit.adapter_problem_reason is None``, meaning a real
-    :class:`~.adapters.java.JavaFileResult` exists for this unit) AND a
-    known ``language`` - never derived from the mere ABSENCE of a
-    specific, named failure. That inversion is what closes the class: a
-    fourth worker failure kind this check has never heard of still comes
-    through as unknown (its own reason_code, prefixed), because the
-    default without positive evidence is unknown, not satisfied."""
-    if unit.adapter_problem_reason is not None:
+    ``satisfied`` requires POSITIVE adapter evidence (no recorded reason
+    that FEEDS this specific check - see ``_READINESS_CHECKS_BY_REASON_
+    CODE`` - meaning a real :class:`~.adapters.java.JavaFileResult`
+    exists for this unit) AND a known ``language`` - never derived from
+    the mere ABSENCE of a specific, named failure. That inversion is
+    what closes the class: a fourth worker failure kind this check has
+    never heard of still comes through as unknown (its own reason_code,
+    prefixed), because the default without positive evidence is
+    unknown, not satisfied."""
+    understanding_reasons = _reasons_feeding("source_understood", unit.adapter_problem_reasons)
+    if understanding_reasons:
         return _signal(
             unit.unit_id, "source_understood", "unknown", "detected",
-            f"adapter_{unit.adapter_problem_reason}",
+            f"adapter_{understanding_reasons[0]}",
         )
     if unit.language != "unknown":
         return _signal(unit.unit_id, "source_understood", "satisfied", "detected", "adapter_understood")
@@ -231,20 +276,22 @@ def _check_dependencies_resolved_for_file(
 def _check_entry_points_mapped(unit: ModuleRecord, has_entry_point: bool) -> ReadinessSignal:
     if has_entry_point:
         return _signal(unit.unit_id, "entry_points_mapped", "satisfied", "detected", "entry_point_mapped")
-    # FIX ROUND 13b (reviewer-3's B1 class-closer): a method literally
-    # named main that the adapter's strict cli_main detector could not
+    # FIX ROUND 13b (reviewer-3's B1 class-closer), routed via the
+    # explicit reason-class map (round 13c): a method literally named
+    # main that the adapter's strict cli_main detector could not
     # confidently classify (recorded as a "cli_main_unrecognized"
-    # problem, the SAME file-level problem-reasons list source_
-    # understood's adapter_problem_reason(s) already reads) must feed
-    # UNKNOWN here, never the confident "no entry point" negative - the
-    # same three-state move round 11 already made for an unrecoverable
-    # route value. No entry point is ever published for this shape
-    # either way (a private/instance helper coincidentally named "main"
-    # is never claimed as a real one) - only the CONFIDENCE of the
-    # negative changes.
-    if "cli_main_unrecognized" in unit.adapter_problem_reasons:
+    # problem, now ATTRIBUTED to this ONE unit specifically - see
+    # modules_artifact.build_modules's worker_problem_reasons_by_unit)
+    # must feed UNKNOWN here, never the confident "no entry point"
+    # negative - the same three-state move round 11 already made for an
+    # unrecoverable route value. No entry point is ever published for
+    # this shape either way (a private/instance helper coincidentally
+    # named "main" is never claimed as a real one) - only the
+    # CONFIDENCE of the negative changes.
+    entry_point_reasons = _reasons_feeding("entry_points_mapped", unit.adapter_problem_reasons)
+    if entry_point_reasons:
         return _signal(
-            unit.unit_id, "entry_points_mapped", "unknown", "detected", "cli_main_unrecognized")
+            unit.unit_id, "entry_points_mapped", "unknown", "detected", entry_point_reasons[0])
     return _signal(
         unit.unit_id, "entry_points_mapped", "not_applicable", "detected", "no_entry_point")
 
