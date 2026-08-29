@@ -481,8 +481,31 @@ def _extract_types(
         clause_text = sanitized[clause_start:brace_pos]
         extends_match = _HEADER_EXTENDS_RE.search(clause_text)
         implements_match = _HEADER_IMPLEMENTS_RE.search(clause_text)
+        header_start = name_match.start()
+        if name_match.group(1) == "interface":
+            # Round 10c (reviewer-3 delta on round 10b): an ANNOTATION-
+            # TYPE declaration (`@interface Name { ... }`) is a
+            # first-class extracted header whose span starts at its OWN
+            # `@` - not at the bare `interface` keyword - so a route
+            # annotation stacked on it (Spring's own composed-annotation
+            # idiom: this is literally how @GetMapping et al. are
+            # defined) associates into a REAL header span the same way
+            # any other stacked annotation on any other declaration
+            # does, via the existing backward-anchoring machinery.
+            # Round 10b's _next_header_is_annotation_type_declaration
+            # special case (a nearest-following-extracted-header
+            # proximity test with no adjacency requirement - reviewer-3's
+            # new minor: when the genuinely-offending declaration is
+            # itself unmatchable, the test skips past it to an unrelated
+            # later `@interface` and wrongly exempts) is deleted; there
+            # is no special case left to keep in step.
+            probe = header_start
+            while probe > 0 and sanitized[probe - 1].isspace():
+                probe -= 1
+            if probe > 0 and sanitized[probe - 1] == "@":
+                header_start = probe - 1
         header_by_brace_pos[brace_pos] = (
-            name_match.start(), name_match.group(2),
+            header_start, name_match.group(2),
             extends_match.group(1).strip() if extends_match else None,
             implements_match.group(1).strip() if implements_match else None,
         )
@@ -570,32 +593,6 @@ def _position_inside_any_type_body(
     tell "genuinely outside every type" apart from "inside the file's
     only type" - the exact case this fail-safe must never fire on."""
     return any(start <= position <= end for _q, _s, _c, start, _e, _i, end in types)
-
-
-def _next_header_is_annotation_type_declaration(
-    sanitized: str, position: int,
-    types: list[tuple[str, str, str, int, str | None, str | None, int]],
-) -> bool:
-    """Whether the NEAREST type header after ``position`` is an
-    ANNOTATION-TYPE declaration (``@interface Name { ... }``) - fix round
-    10b: a route annotation stacked on one cannot associate (its header
-    finder anchors on the bare ``interface`` keyword; the header's own
-    ``@`` sits immediately before it, not a whitespace/modifier/
-    annotation token the backward walk recognizes as trivia to cross) -
-    but this is the documented Spring composed-annotation idiom, how
-    Spring defines its own verb annotations (``@GetMapping`` etc. are
-    themselves declared exactly this way). Suppressing the route is
-    correct (a meta-annotation declaration serves no route of its own);
-    reporting a problem on an otherwise-fine file is not - the same
-    "legitimate, recognized shape, no problem" treatment
-    package-info.java/module-info.java already get in worker.py."""
-    upcoming = [start for _q, _s, _c, start, _e, _i, _end in types if start > position]
-    if not upcoming:
-        return False
-    pos = min(upcoming)
-    while pos > 0 and sanitized[pos - 1].isspace():
-        pos -= 1
-    return pos > 0 and sanitized[pos - 1] == "@"
 
 
 def _split_type_list(raw: str) -> list[str]:
@@ -1260,20 +1257,18 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # data, three rounds running. It now fails toward visible
             # absence: suppress the claim, record why, never guess.
             #
-            # Round 10b: a route annotation stacked on an ANNOTATION-TYPE
-            # declaration (`@interface` - the documented Spring composed-
-            # annotation idiom Spring's own verb annotations are defined
-            # with) can never associate here either, but it is a
-            # legitimate, common, recognized shape, not an unforeseen
-            # one - suppression stays correct, the problem record does
-            # not: recording one flipped an otherwise-clean run to
-            # degraded over a file that is perfectly fine.
-            if not _next_header_is_annotation_type_declaration(sanitized, match.start(), types):
-                problems.append(
-                    f"a class-level-looking route annotation at line {line} could not be "
-                    "confidently associated with any declared type - suppressed rather "
-                    "than published as a route"
-                )
+            # Round 10c: an ANNOTATION-TYPE declaration (`@interface` -
+            # Spring's own composed-annotation idiom) is now a
+            # first-class extracted header whose span starts at its own
+            # `@` (see _extract_types), so a route annotation stacked on
+            # one associates normally via class_header_associations
+            # above and never reaches this branch at all - no special
+            # case needed here to keep in step with that one.
+            problems.append(
+                f"a class-level-looking route annotation at line {line} could not be "
+                "confidently associated with any declared type - suppressed rather "
+                "than published as a route"
+            )
             continue
         prefixes = class_route_prefix.get(enclosing)
         if prefixes:

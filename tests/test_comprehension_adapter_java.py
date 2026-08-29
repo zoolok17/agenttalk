@@ -1089,6 +1089,88 @@ package p;
     assert [u.qualified_name for u in result.units] == ["p.PostMapping2"]
 
 
+def test_annotation_type_declaration_still_yields_exactly_one_unit():
+    """Round 10c checkpoint question (does treating @interface as a
+    first-class extracted header ADD a unit to modules.json?): no - an
+    annotation-type declaration was ALREADY extracted as a unit before
+    this round (only its route-annotation ASSOCIATION changed here), and
+    it remains an honest component unit: a genuinely declared type in
+    the file, migration-relevant the same as any other declared type."""
+    src = """
+package p;
+public @interface GetMapping2 {
+    String value() default "";
+}
+"""
+    result = java.parse_java_source("GetMapping2.java", src)
+    assert len(result.units) == 1
+    assert result.units[0].qualified_name == "p.GetMapping2"
+
+
+# ------------------------------------------ round 10c (reviewer-3 delta on
+# round 10b): make @interface a first-class extracted header (span starting
+# at its own `@`) instead of a nearest-following-extracted-header proximity
+# exemption - the exemption had no adjacency requirement, so when the
+# genuinely-offending declaration was itself unmatchable (absent from the
+# extracted list), the old test skipped past it to an UNRELATED @interface
+# later in the file and wrongly exempted it (visibility loss: the fail-safe's
+# problem record went missing exactly where it should have fired).
+
+def test_route_annotation_before_an_unmatchable_header_still_flags_even_with_a_later_interface():
+    """The leak battery, ordering 1: a genuinely-offending route
+    annotation (stacked on a class whose OWN header is unmatchable - an
+    unterminated generic bound our depth-aware scanner cannot close, so
+    it never reaches the extracted types list at all) must still be
+    flagged as unassociated, REGARDLESS of an unrelated @interface
+    declared later in the same file. Round 10b's proximity exemption
+    would have wrongly skipped past the missing header to this later,
+    unrelated @interface and silently exempted it."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller<T extends Comparable<T {
+    @GetMapping("/list")
+    void list() {}
+}
+
+@interface Unrelated {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 2
+    assert all("could not be confidently associated" in p for p in result.problems)
+    assert [u.qualified_name for u in result.units] == ["p.Unrelated"]
+
+
+def test_route_annotation_before_an_unmatchable_header_flags_with_a_later_ordinary_interface():
+    """The normal-interface discriminator (unmatchable-header control):
+    an ordinary (non-annotation) `interface` declared later in the file
+    must never be mistaken for an `@interface` and must never suppress
+    the problem - only a REAL annotation-type declaration's own leading
+    `@` does that. Isolates that the problem fires because of the
+    unmatchable header itself, not merely because a later type happens
+    to exist."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+public class Controller<T extends Comparable<T {
+    @GetMapping("/list")
+    void list() {}
+}
+
+interface Unrelated {
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    assert _edges(result, "route") == []
+    assert len(result.problems) == 2
+    assert all("could not be confidently associated" in p for p in result.problems)
+    assert [u.qualified_name for u in result.units] == ["p.Unrelated"]
+
+
 def test_route_value_multi_element_array_publishes_every_element():
     """MAJOR 1 (sixth cold read, fix round 10): a declared multi-value
     route array used to publish only its first path, silently dropping
