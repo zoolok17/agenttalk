@@ -3000,6 +3000,22 @@ def _close_worktree_eval(store, record: dict) -> dict | None:
     }
 
 
+def _counter_decision_from_cli_spelling(spelling: str, close_mod) -> str:
+    """Maps `close counter decide --decision`'s operator-facing accept/
+    reject CLI spelling to close.py's stored accepted/rejected
+    vocabulary. Hotfix round 2: an explicit dict lookup, not an
+    accept-or-else-reject ternary - argparse's own `choices` already
+    guarantees `spelling` is one of these two keys today, so a KeyError
+    here means that constraint and this mapping have drifted apart (e.g.
+    a future third --decision choice added to one but not the other) - a
+    programmer error that must be loud, never silently rendered as
+    `rejected`."""
+    return {
+        "accept": close_mod.COUNTER_ACCEPTED,
+        "reject": close_mod.COUNTER_REJECTED,
+    }[spelling]
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     """Assurance P2 milestone/release close (advisory; see close.py)."""
     from agenttalk import close as close_mod
@@ -3171,6 +3187,12 @@ def cmd_close(args: argparse.Namespace) -> int:
             return 2
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "counter decide")
+        # args.decision is the operator-facing accept/reject CLI spelling;
+        # decide_counter requires the stored accepted/rejected vocabulary
+        # (close_mod.COUNTER_ACCEPTED/COUNTER_REJECTED). Mapped explicitly,
+        # at the one call site, so the two spellings cannot silently drift
+        # apart again (v0.86.0 field bug: every counter decision was refused).
+        decision = _counter_decision_from_cli_spelling(args.decision, close_mod)
         remediation = None
         if args.decision == "accept":
             remediation = {
@@ -3185,7 +3207,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
                 close_mod.decide_counter(
-                    record, counter_id=args.counter, decision=args.decision, by=actor,
+                    record, counter_id=args.counter, decision=decision, by=actor,
                     at=_iso_now(), reason=args.reason, remediation=remediation)
                 transaction.commit()
         except (close_mod.CloseConflict, TimeoutError) as e:
@@ -3193,7 +3215,7 @@ def cmd_close(args: argparse.Namespace) -> int:
         except close_mod.CloseError as e:
             sys.stderr.write(f"agenttalk close counter decide: {e}\n")
             return 2
-        print(f"counter {args.counter} {args.decision}ed on {args.id} by {actor}")
+        print(f"counter {args.counter} {decision} on {args.id} by {actor}")
         return 0
 
     if action == "check":
@@ -13851,10 +13873,17 @@ def build_parser() -> argparse.ArgumentParser:
     csov.set_defaults(func=cmd_close)
     csign.set_defaults(func=cmd_close, signoffs_cmd=None)
 
+    # Hotfix round 2 (v0.86.0 field bug): a hand-written choices list here
+    # agreed with close.py's own ACK_STATUSES by spelling coincidence
+    # only - the exact two-hand-written-lists shape the counter-decide
+    # vocabulary bug was. Derived from the frozenset itself so a future
+    # rename in close.py cannot silently reproduce that bug here.
+    from agenttalk import close as close_mod
+
     cack = csub.add_parser("ack", help="Record a lens ack (accept / counter / na).")
     cack.add_argument("--id", required=True)
     cack.add_argument("--lens", required=True, help="Lens id being acked.")
-    cack.add_argument("--status", required=True, choices=["accept", "counter", "na"])
+    cack.add_argument("--status", required=True, choices=sorted(close_mod.ACK_STATUSES))
     cack.add_argument("--from", dest="actor", help="Acking agent.")
     cack.add_argument("--reason", help="Reason (required for na).")
     cack.add_argument("--override", action="store_true",
