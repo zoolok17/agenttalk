@@ -120,12 +120,23 @@ _ROUTE_METHOD_BY_ANNOTATION = {
 #: ANNOTATION) already folds the method into the route's identity for
 #: the verb-specific annotations; this closes the one shape it did not
 #: cover, rather than merely declaring the gap.
-_ROUTE_METHOD_ATTR_RE = re.compile(r"\bmethod\s*=\s*RequestMethod\.([A-Za-z]+)")
+#:
+#: N4/MAJOR 1 fold-in (sixth cold read, fix round 10): the attribute's
+#: OWN value can itself be a braced, multi-value array
+#: (``method = {RequestMethod.GET, RequestMethod.POST}``) - the old
+#: regex captured only the first RequestMethod.X inside it (matching
+#: right through the brace), silently re-coalescing two distinct
+#: handlers into one. Captures the whole attribute value (braced or
+#: bare) and every RequestMethod.X inside it is recovered below.
+_ROUTE_METHOD_ATTR_RE = re.compile(r"\bmethod\s*=\s*(\{[^}]*\}|RequestMethod\.[A-Za-z]+)")
+_ROUTE_METHOD_VALUE_RE = re.compile(r"RequestMethod\.([A-Za-z]+)")
 
 
-def _route_method_attribute(sanitized_segment: str) -> str | None:
+def _route_method_attributes(sanitized_segment: str) -> list[str]:
     match = _ROUTE_METHOD_ATTR_RE.search(sanitized_segment)
-    return match.group(1).upper() if match else None
+    if match is None:
+        return []
+    return [name.upper() for name in _ROUTE_METHOD_VALUE_RE.findall(match.group(1))]
 
 
 #: M8 (cold-read, PR-B fix round 3): the route path/value attribute, by
@@ -144,21 +155,22 @@ def _route_method_attribute(sanitized_segment: str) -> str | None:
 #: blanked to spaces along with the rest of the comment. The quote and
 #: its content are recovered SEPARATELY, from the ORIGINAL text, starting
 #: exactly at this match's end position (sanitization preserves length/
-#: position exactly). See _route_path.
+#: position exactly). See _route_paths.
 _ROUTE_NAMED_ATTR_RE = re.compile(r"\b(?:value|path)\s*=")
 # The segment always starts with the annotation's own opening "(" (see
 # _matching_close_paren's caller) - a bare positional literal is
 # recognized only when it leads the argument list.
 _ROUTE_POSITIONAL_ANCHOR_RE = re.compile(r"\A\(")
-#: Recovers the quote that opens the target string literal, scanning the
-#: ORIGINAL text from a position ALREADY PROVEN live (the end of a
-#: _ROUTE_NAMED_ATTR_RE/_ROUTE_POSITIONAL_ANCHOR_RE match against the
-#: sanitized segment) - only real whitespace/`{` may separate the two, so
-#: this deliberately does NOT match through a comment wedged between the
-#: attribute and its literal (a pathological case beyond this slice's
-#: scope; the honest failure there is "no route found", never a
-#: truncated or wrong one).
-_ROUTE_VALUE_QUOTE_RE = re.compile(r'\s*\{?\s*"')
+#: Recovers the ARRAY OPENING that may precede the target string
+#: literal(s), scanning the ORIGINAL text from a position ALREADY PROVEN
+#: live (the end of a _ROUTE_NAMED_ATTR_RE/_ROUTE_POSITIONAL_ANCHOR_RE
+#: match against the sanitized segment) - only real whitespace may
+#: separate the two, so this deliberately does NOT match through a
+#: comment wedged between the attribute and its literal (a pathological
+#: case beyond this slice's scope; the honest failure there is "no route
+#: found", never a truncated or wrong one).
+_ROUTE_ARRAY_OPEN_RE = re.compile(r"\s*\{")
+_ROUTE_LITERAL_START_RE = re.compile(r'\s*"')
 #: invariant 3 (design: "must not store... string-literal bodies"): a
 #: route target is captured as a normalized route IDENTIFIER, never an
 #: unbounded raw excerpt - truncated past this length rather than stored
@@ -222,6 +234,12 @@ class JavaFileResult:
     units: list[JavaUnitClaim] = field(default_factory=list)
     edges: list[JavaEdgeClaim] = field(default_factory=list)
     entry_points: list[JavaEntryPointClaim] = field(default_factory=list)
+    #: Fix round 10 (structural order, fail-safe direction): a plain-text
+    #: detail per route annotation this adapter could not confidently
+    #: associate with a class OR a method - never silently published as
+    #: a guessed route, and never silently dropped either. The worker
+    #: surfaces each as its own named problem (worker.py).
+    problems: list[str] = field(default_factory=list)
 
 
 def _strip_comments_and_strings(text: str) -> str:
@@ -539,6 +557,21 @@ def _enclosing_qualified_name(
     return best if best is not None else fallback
 
 
+def _position_inside_any_type_body(
+    position: int,
+    types: list[tuple[str, str, str, int, str | None, str | None, int]],
+) -> bool:
+    """Whether ``position`` falls inside SOME declared type's own
+    ``[header_start, end_brace_pos]`` span - fix round 10's fail-safe
+    needs this DIRECTLY (a plain containment test), not via
+    :func:`_enclosing_qualified_name`'s resolved NAME: in a single-type
+    file, that name and the file's own ``fallback`` (primary_qualified)
+    are the SAME string by coincidence, so comparing names could not
+    tell "genuinely outside every type" apart from "inside the file's
+    only type" - the exact case this fail-safe must never fire on."""
+    return any(start <= position <= end for _q, _s, _c, start, _e, _i, end in types)
+
+
 def _split_type_list(raw: str) -> list[str]:
     depth = 0
     parts: list[str] = []
@@ -580,6 +613,25 @@ def _matching_close_paren(sanitized: str, open_pos: int) -> int | None:
         if sanitized[i] == "(":
             depth += 1
         elif sanitized[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _matching_open_paren(sanitized: str, close_pos: int) -> int | None:
+    """Backward mirror of :func:`_matching_close_paren`: given
+    ``sanitized[close_pos] == ')'``, returns the index of the ``(`` that
+    BALANCES it, tracking nesting depth backward - or ``None`` if
+    unbalanced. Fix round 10 (structural order): the one new primitive
+    backward-anchoring needs, so a stacked annotation's own argument list
+    can be walked BACKWARD from a type header exactly as confidently as
+    it is already walked forward from the annotation's own name."""
+    depth = 0
+    for i in range(close_pos, -1, -1):
+        if sanitized[i] == ")":
+            depth += 1
+        elif sanitized[i] == "(":
             depth -= 1
             if depth == 0:
                 return i
@@ -664,12 +716,16 @@ def _normalize_java_text_block(content: str) -> str:
     return _decode_java_string_escapes("\n".join(stripped))
 
 
-def _java_string_literal_content(text: str, quote_pos: int) -> str | None:
-    """Given ``text[quote_pos] == '"'``, returns the string literal's
-    DECODED value (excluding delimiters) - a triple-quoted text block's
-    incidental whitespace stripped and its escapes decoded per JEP 378,
-    or an ordinary literal's escapes decoded per JLS 3.10.7. ``None`` if
-    the literal is never closed before end of file.
+def _java_string_literal_span(text: str, quote_pos: int) -> tuple[str, int] | None:
+    """Given ``text[quote_pos] == '"'``, returns ``(decoded value, end
+    position - one past the closing delimiter)`` - a triple-quoted text
+    block's incidental whitespace stripped and its escapes decoded per
+    JEP 378, or an ordinary literal's escapes decoded per JLS 3.10.7.
+    ``None`` if the literal is never closed before end of file. The end
+    position (fix round 10 MAJOR 1) is what lets a caller keep scanning
+    for FURTHER elements of a Spring array-literal (``{"...", "..."}``)
+    immediately after this one, rather than only ever recovering the
+    first.
 
     B1 (fourth cold read, fix round 6): mirrors ``_strip_comments_and_
     strings``'s OWN boundary-finding logic exactly (same escaped-quote
@@ -691,24 +747,36 @@ def _java_string_literal_content(text: str, quote_pos: int) -> str | None:
         close = text.find('"""', content_start)
         if close == -1:
             return None
-        return _normalize_java_text_block(text[content_start:close])
+        return _normalize_java_text_block(text[content_start:close]), close + 3
     end = quote_pos + 1
     while end < n and text[end] != '"':
         end += 2 if text[end] == "\\" and end + 1 < n else 1
     if end >= n:
         return None
-    return _decode_java_string_escapes(text[quote_pos + 1:end])
+    return _decode_java_string_escapes(text[quote_pos + 1:end]), end + 1
 
 
-def _route_path(sanitized: str, original: str, group_start: int, group_end: int) -> str | None:
-    """Recover the annotation's literal path/value string. LOCATES the
-    attribute (by name, or the leading positional literal) against the
-    SANITIZED segment - comments and string content are already blanked
-    there, so a commented-out ``value = "..."`` cannot match at all, its
-    letters erased along with the rest of the comment. Then reads the
-    literal's actual CONTENT from the ORIGINAL text, starting exactly at
-    that match's end position (sanitization preserves length/position
-    exactly).
+def _java_string_literal_content(text: str, quote_pos: int) -> str | None:
+    span = _java_string_literal_span(text, quote_pos)
+    return span[0] if span is not None else None
+
+
+def _route_paths(sanitized: str, original: str, group_start: int, group_end: int) -> list[str]:
+    """Recover the annotation's literal path/value string(s), in
+    declaration order. LOCATES the attribute (by name, or the leading
+    positional literal) against the SANITIZED segment - comments and
+    string content are already blanked there, so a commented-out
+    ``value = "..."`` cannot match at all, its letters erased along with
+    the rest of the comment. Then reads the literal content(s) from the
+    ORIGINAL text, starting exactly at that match's end position
+    (sanitization preserves length/position exactly).
+
+    MAJOR 1 (sixth cold read, fix round 10): a multi-value route array
+    (``@GetMapping({"/list", "/all"})``) used to publish only its FIRST
+    element - ``/all`` silently dropped, on a run reporting complete/
+    valid. These are declared, trivially-present values (the multi-
+    entry-point machinery already exists for the method/path fan-out
+    below); every element is now recovered.
 
     B1 (fourth cold read, fix round 6): the previous version matched the
     WHOLE named-attribute-plus-quoted-literal pattern against the
@@ -721,8 +789,8 @@ def _route_path(sanitized: str, original: str, group_start: int, group_end: int)
     M8 (cold-read, PR-B fix round 3): looks up the named attribute first
     (position-independent - Spring allows any attribute order), falling
     back to a bare positional string only when it leads the argument
-    list. The result is length-bounded (invariant 3), never an unbounded
-    raw excerpt.
+    list. Each result is length-bounded (invariant 3), never an
+    unbounded raw excerpt.
 
     Minor 5 (fifth cold read, fix round 7): round 6 took only the FIRST
     named-attribute match and required it to be immediately followed by
@@ -735,22 +803,47 @@ def _route_path(sanitized: str, original: str, group_start: int, group_end: int)
     narrower."""
     sanitized_segment = sanitized[group_start:group_end]
     for match in _ROUTE_NAMED_ATTR_RE.finditer(sanitized_segment):
-        content = _route_literal_at(original, group_start + match.end())
-        if content is not None:
-            return _bounded_route_target(content)
+        values = _route_literal_list_at(original, group_start + match.end())
+        if values:
+            return values
     positional_match = _ROUTE_POSITIONAL_ANCHOR_RE.match(sanitized_segment)
     if positional_match is not None:
-        content = _route_literal_at(original, group_start + positional_match.end())
-        if content is not None:
-            return _bounded_route_target(content)
-    return None
+        values = _route_literal_list_at(original, group_start + positional_match.end())
+        if values:
+            return values
+    return []
 
 
-def _route_literal_at(original: str, anchor: int) -> str | None:
-    quote_match = _ROUTE_VALUE_QUOTE_RE.match(original, anchor)
-    if quote_match is None:
-        return None
-    return _java_string_literal_content(original, quote_match.end() - 1)
+def _route_literal_list_at(original: str, anchor: int) -> list[str]:
+    """Every string literal value at ``anchor``: a bare literal
+    (``"..."``), or, when Spring's own array-literal shorthand is used
+    for a multi-value ``value``/``path``/positional attribute
+    (``{"...", "..."}``), EVERY element in declaration order (fix round
+    10 MAJOR 1)."""
+    array_match = _ROUTE_ARRAY_OPEN_RE.match(original, anchor)
+    if array_match is None:
+        literal_match = _ROUTE_LITERAL_START_RE.match(original, anchor)
+        if literal_match is None:
+            return []
+        span = _java_string_literal_span(original, literal_match.end() - 1)
+        if span is None:
+            return []
+        content, _end = span
+        return [_bounded_route_target(content)]
+    pos = array_match.end()
+    n = len(original)
+    values: list[str] = []
+    while pos < n:
+        while pos < n and (original[pos].isspace() or original[pos] == ","):
+            pos += 1
+        if pos >= n or original[pos] != '"':
+            break
+        span = _java_string_literal_span(original, pos)
+        if span is None:
+            break
+        content, pos = span
+        values.append(_bounded_route_target(content))
+    return values
 
 
 def _bounded_route_target(value: str) -> str:
@@ -759,74 +852,136 @@ def _bounded_route_target(value: str) -> str:
     return value[:_MAX_ROUTE_TARGET_LENGTH] + "...(truncated)"
 
 
-#: M5 (fifth cold read, fix round 7): the type header's own position
-#: (``_TYPE_HEADER_RE`` matches starting AT ``class``/``interface``/
-#: ``enum`` itself, never at any preceding modifier) sits AFTER every
-#: modifier keyword a declaration carries (``public``, ``final``,
-#: ``abstract``, ...). Round 6's walk only skipped whitespace and OTHER
-#: bare/simple annotations, so it landed short of the header - and
-#: failed - on any modified declaration, i.e. almost every real one:
-#: composition never fired at all, silently, on the ordinary case.
-_JAVA_TYPE_MODIFIERS = frozenset({
-    "public", "private", "protected", "static",
-    "final", "abstract", "strictfp", "sealed",
-})
-_IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
-_BARE_ANNOTATION_NAME_RE = re.compile(r"@\w+")
+#: Fix round 10 (structural order, sixth cold read BLOCKER - THIRD
+#: recurrence of this class: round 6 M5, round 7 B1, now this): every
+#: prior version walked FORWARD from an annotation across an ENUMERATED
+#: trivia grammar (a fixed modifier-keyword set, a bare-annotation-name
+#: regex) - each fix enumerated the shapes it had just been shown, and
+#: the next ordinary one (a FULLY-QUALIFIED stacked annotation like
+#: ``@org.springframework.stereotype.Component`` - the dot stops a
+#: ``@\w+`` match; a ``non-sealed`` modifier - the hyphen stops an
+#: identifier match) fell outside the enumeration, silently returning
+#: "not class-level" and resurrecting the phantom prefix-as-route bug.
+#:
+#: Inverted here: anchor BACKWARD from each extracted type header (the
+#: header finder - _TYPE_NAME_ANCHOR_RE plus the depth-aware clause scan
+#: - is already proven robust; a 19-shape battery survived it) rather
+#: than forward from an annotation. Nothing needs to be enumerated: per
+#: the JLS, ONLY whitespace, modifiers, and annotations can legally
+#: precede a type header, so ANY identifier-shaped token here (including
+#: a hyphenated compound like ``non-sealed`` - never a specific
+#: allow-listed keyword) and ANY dotted annotation name (simple or
+#: fully-qualified) are accepted - retiring the enumeration class
+#: permanently instead of widening it once more.
+_DOTTED_IDENTIFIER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$."
+)
+_MODIFIER_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$-"
+)
+
+
+def _backward_dotted_identifier_start(sanitized: str, end: int) -> int | None:
+    """The start of a (possibly dotted/fully-qualified) identifier ending
+    EXACTLY at ``end``, or ``None`` if ``end`` is not the end of one."""
+    if end == 0:
+        return None
+    if sanitized[end - 1] not in _DOTTED_IDENTIFIER_CHARS or sanitized[end - 1] == ".":
+        return None
+    start = end
+    while start > 0 and sanitized[start - 1] in _DOTTED_IDENTIFIER_CHARS:
+        start -= 1
+    while start < end and sanitized[start] == ".":
+        start += 1
+    return start
+
+
+def _backward_modifier_token_start(sanitized: str, end: int) -> int | None:
+    """The start of a bare modifier-SHAPED token (ANY identifier,
+    including a hyphenated compound like ``non-sealed``) ending EXACTLY
+    at ``end`` - never checked against a specific keyword set (see
+    module note above)."""
+    if end == 0:
+        return None
+    ch = sanitized[end - 1]
+    if not (ch.isalnum() or ch in "_$"):
+        return None
+    start = end
+    while start > 0 and sanitized[start - 1] in _MODIFIER_TOKEN_CHARS:
+        start -= 1
+    while start < end and (sanitized[start] == "-" or sanitized[start].isdigit()):
+        start += 1
+    return start if start < end else None
+
+
+def _preceding_declaration_start(sanitized: str, header_start: int) -> int:
+    """Walks BACKWARD from a type header's own start position through
+    whitespace, modifier-shaped tokens, and stacked annotations (each
+    with its own optional, depth-aware, argument list via
+    :func:`_matching_open_paren`) - returns the leftmost position such
+    that ``[return value, header_start)`` is PURE declaration trivia.
+    Stops (returns the current position) the instant something else is
+    found, exactly the same safe non-guess every prior version made for
+    an unrecognized shape - the difference is what counts as
+    recognized: everything the JLS actually allows here, not an
+    enumerated subset of it."""
+    pos = header_start
+    while pos > 0:
+        p = pos
+        while p > 0 and sanitized[p - 1].isspace():
+            p -= 1
+        if p == 0:
+            return 0
+        if sanitized[p - 1] == ")":
+            open_pos = _matching_open_paren(sanitized, p - 1)
+            if open_pos is None:
+                return pos
+            name_end = open_pos
+            while name_end > 0 and sanitized[name_end - 1].isspace():
+                name_end -= 1
+            name_start = _backward_dotted_identifier_start(sanitized, name_end)
+            if name_start is None or name_start == 0 or sanitized[name_start - 1] != "@":
+                return pos
+            pos = name_start - 1
+            continue
+        name_start = _backward_dotted_identifier_start(sanitized, p)
+        if name_start is not None and name_start > 0 and sanitized[name_start - 1] == "@":
+            pos = name_start - 1
+            continue
+        modifier_start = _backward_modifier_token_start(sanitized, p)
+        if modifier_start is not None:
+            pos = modifier_start
+            continue
+        return pos
+    return 0
+
+
+def _class_header_associations(
+    sanitized: str,
+    types: list[tuple[str, str, str, int, str | None, str | None, int]],
+) -> list[tuple[int, int, str]]:
+    """``[(declaration_start, header_start, qualified_name), ...]`` for
+    every declared type - the backward-anchored trivia span computed
+    ONCE per header, up front, rather than re-derived per annotation."""
+    return [
+        (_preceding_declaration_start(sanitized, header_start), header_start, qualified)
+        for qualified, _s, _c, header_start, _e, _i, _end in types
+    ]
 
 
 def _class_level_route_target(
-    sanitized: str, end_pos: int,
-    types: list[tuple[str, str, str, int, str | None, str | None, int]],
+    ann_start: int, associations: list[tuple[int, int, str]],
 ) -> str | None:
-    """If the annotation ending at ``end_pos`` sits DIRECTLY on a
-    declared type - only trivia (whitespace, modifier keywords, other
-    stacked annotations - including ones with their OWN nested-paren
-    argument lists, skipped depth-aware via :func:`_matching_close_paren`
-    exactly like the route annotation's own arguments) between it and
-    that type's own header - returns the type's qualified name. ``None``
-    means this route annotation is on a method (or anything else), not a
-    class.
-
-    M5 (fifth cold read, fix round 7): round 6's version matched a fixed
-    "bare annotation or whitespace" regex - it landed short of the
-    header on any MODIFIED declaration (composition never fired on a
-    real ``public class ...``, only a bare unmodified one) and safely
-    but unnecessarily gave up on a stacked annotation with its own
-    nested parens. This version walks token-by-token: whitespace, a
-    known modifier keyword, or an annotation (name plus, if present, its
-    OWN properly-nested argument list) - anything else halts the walk
-    and returns ``None``, the same safe non-guess round 6 already made
-    for a genuinely unrecognized shape."""
-    header_starts = {start: qualified for qualified, _s, _c, start, _e, _i, _end in types}
-    pos = end_pos
-    n = len(sanitized)
-    while pos < n:
-        if pos in header_starts:
-            return header_starts[pos]
-        ch = sanitized[pos]
-        if ch.isspace():
-            pos += 1
-            continue
-        if ch == "@":
-            name_match = _BARE_ANNOTATION_NAME_RE.match(sanitized, pos)
-            if name_match is None:
-                return None
-            pos = name_match.end()
-            arg_pos = pos
-            while arg_pos < n and sanitized[arg_pos].isspace():
-                arg_pos += 1
-            if arg_pos < n and sanitized[arg_pos] == "(":
-                close_pos = _matching_close_paren(sanitized, arg_pos)
-                if close_pos is None:
-                    return None
-                pos = close_pos + 1
-            continue
-        token_match = _IDENTIFIER_TOKEN_RE.match(sanitized, pos)
-        if token_match is not None and token_match.group(0) in _JAVA_TYPE_MODIFIERS:
-            pos = token_match.end()
-            continue
-        return None
+    """If ``ann_start`` (a route annotation's OWN start position) falls
+    inside some type header's backward-anchored declaration-trivia span,
+    returns that type's qualified name. ``None`` means this route
+    annotation is not immediately, purely-trivially, attached to any
+    known type header - it is either genuinely method-level, or (fix
+    round 10 fail-safe) an association this adapter cannot confidently
+    establish, which the caller must treat as absence, never as a guess."""
+    for declaration_start, header_start, qualified in associations:
+        if declaration_start <= ann_start < header_start:
+            return qualified
     return None
 
 
@@ -897,6 +1052,7 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
 
     edges: list[JavaEdgeClaim] = []
     entry_points: list[JavaEntryPointClaim] = []
+    problems: list[str] = []
 
     for target, is_static, line in imports:
         # D-1 (reviewer-3, PR-B delta review round 2): a plain (non-static,
@@ -1005,16 +1161,16 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             line=_line_at(newline_offsets, match.start()), phase="runtime",
         ))
 
-    def _route_annotation_span(match: re.Match) -> tuple[int, str | None, str | None]:
+    def _route_annotation_span(match: re.Match) -> tuple[int, list[str], list[str]]:
         # N10 (third cold read, fix round 5): find the annotation's own
         # argument-list parens by tracking nesting depth (below), rather
         # than a regex that stopped at the FIRST close-paren anywhere in
         # the argument list - see _matching_close_paren's docstring for
         # the truncation this replaces. Returns (position right after
-        # this annotation's own span, path-or-None, explicit-method-or-
-        # None) - the position is what a class-level check must resume
-        # from, never match.end() (which sits BEFORE this annotation's
-        # own arguments, not after them).
+        # this annotation's own span, path(s), explicit method(s)) - the
+        # position is what a class-level check must resume from, never
+        # match.end() (which sits BEFORE this annotation's own
+        # arguments, not after them).
         arg_pos = match.end()
         while arg_pos < len(sanitized) and sanitized[arg_pos].isspace():
             arg_pos += 1
@@ -1023,10 +1179,10 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             if close_pos is not None:
                 return (
                     close_pos + 1,
-                    _route_path(sanitized, text, arg_pos, close_pos + 1),
-                    _route_method_attribute(sanitized[arg_pos:close_pos + 1]),
+                    _route_paths(sanitized, text, arg_pos, close_pos + 1),
+                    _route_method_attributes(sanitized[arg_pos:close_pos + 1]),
                 )
-        return match.end(), None, None
+        return match.end(), [], []
 
     # M5 (fourth cold read, fix round 6): a class-level @RequestMapping is
     # a PREFIX for every method-level route inside that class - Spring's
@@ -1037,63 +1193,109 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
     # actually-served "/api/orders/list" in the field named for the whole
     # route). First pass: find every class-level route annotation (one
     # sitting directly on a type, not a method - see
-    # _class_level_route_target) and record its literal prefix, only when
-    # that literal was itself confidently extracted.
-    class_route_prefix: dict[str, str] = {}
+    # _class_level_route_target) and record its literal prefix(es), only
+    # when at least one was itself confidently extracted.
+    #
+    # Fix round 10 (structural order): association is now backward-
+    # anchored from each type header (computed ONCE, here), and a route
+    # annotation's own START position - not the position AFTER it, which
+    # a class-level check never actually needed to resume walking from -
+    # is what gets tested against it.
+    class_header_associations = _class_header_associations(sanitized, types)
+    class_route_prefix: dict[str, list[str]] = {}
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
-        span_end, path, _explicit_method = _route_annotation_span(match)
-        target_type = _class_level_route_target(sanitized, span_end, types)
-        if target_type is not None and path is not None:
-            class_route_prefix[target_type] = path
+        _span_end, paths, _explicit_methods = _route_annotation_span(match)
+        target_type = _class_level_route_target(match.start(), class_header_associations)
+        if target_type is not None and paths:
+            class_route_prefix[target_type] = paths
 
     for match in _ROUTE_ANNOTATION_RE.finditer(sanitized):
         line = _line_at(newline_offsets, match.start())
         enclosing = _enclosing_qualified_name(match.start(), types, primary_qualified)
-        span_end, path, explicit_method = _route_annotation_span(match)
-        if _class_level_route_target(sanitized, span_end, types) is not None:
+        _span_end, paths, explicit_methods = _route_annotation_span(match)
+        class_target = _class_level_route_target(match.start(), class_header_associations)
+        if class_target is not None:
             # A bare class-level annotation with no method-level mapping
             # inside that class represents no invocable route on its own
             # - already captured as a prefix above, never its own edge/
             # entry point.
             continue
-        if enclosing in class_route_prefix:
-            # M5 composition note (fifth cold read, fix round 7): a
-            # valueless method annotation (bare ``@GetMapping``) still
-            # serves the class's own prefix in Spring - composing with
-            # an empty method value (never skipping composition just
-            # because there is no method-level literal) instead of
-            # falling through to the synthetic fallback below and
-            # silently losing the prefix entirely.
-            path = _compose_route_path(class_route_prefix[enclosing], path or "")
-        elif path is not None:
+        if class_target is None and types and not _position_inside_any_type_body(match.start(), types):
+            # FAIL-SAFE (fix round 10, the class-closer): this route
+            # annotation sits OUTSIDE every extracted type's own brace
+            # body - a genuine method-level route annotation always
+            # lives INSIDE its class's braces, so a position outside
+            # every one of them means this annotation precedes a type
+            # declaration (or something unforeseen) that backward
+            # anchoring could not confidently associate. Inability to
+            # associate used to fail toward publishing the annotation's
+            # own literal value as if it were a complete, invocable
+            # route, attributed to the wrong (file-level) owner - wrong
+            # data, three rounds running. It now fails toward visible
+            # absence: suppress the claim, record why, never guess.
+            problems.append(
+                f"a class-level-looking route annotation at line {line} could not be "
+                "confidently associated with any declared type - suppressed rather "
+                "than published as a route"
+            )
+            continue
+        prefixes = class_route_prefix.get(enclosing)
+        if prefixes:
+            if paths:
+                composed = [_compose_route_path(prefix, p) for prefix in prefixes for p in paths]
+            else:
+                # M5 composition note (fifth cold read, fix round 7): a
+                # valueless method annotation (bare ``@GetMapping``)
+                # still serves the class's own prefix in Spring -
+                # composing with an empty method value (never skipping
+                # composition just because there is no method-level
+                # literal) instead of falling through to the synthetic
+                # fallback below and silently losing the prefix
+                # entirely.
+                composed = [_compose_route_path(prefix, "") for prefix in prefixes]
+        elif paths:
             # LOW-2 (round 7c): the same leading-slash normalization
             # _compose_route_path applies to a class prefix, applied
             # here too - a STANDALONE method route (no class-level
             # prefix at all) must not publish a different spelling of
             # the same served path just because it lacked one.
-            path = _normalize_route_leading_slash(path)
+            composed = [_normalize_route_leading_slash(p) for p in paths]
+        else:
+            composed = []
         # N2 (fifth cold read, fix round 8): a verb-specific annotation's
         # own implied method (GetMapping -> GET, ...) always wins when
         # known; a plain @RequestMapping has none of its own, so its
-        # explicit method=RequestMethod.X attribute (if present) is
+        # explicit method=RequestMethod.X attribute(s) (if present) are
         # what distinguishes it from another @RequestMapping on the
         # same path - without this, two such routes collapse into one
         # coalesced entry point (round 5's M-5), silently losing that
         # they are two different handlers.
-        method = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1)) or explicit_method
-        if path is not None:
-            target = f"{method} {path}" if method else path
+        #
+        # MAJOR 1/N4 (sixth cold read, fix round 10): a multi-value
+        # route array, and a multi-value ``method = {...}`` attribute,
+        # each publish only their FIRST element before - every declared
+        # combination (path x method) is now its own entry point, the
+        # multi-entry-point machinery already existing for this fan-out.
+        verb = _ROUTE_METHOD_BY_ANNOTATION.get(match.group(1))
+        methods: list[str | None] = [verb] if verb else (explicit_methods or [None])
+        if composed:
+            targets = [
+                f"{m} {p}" if m else p
+                for m in methods
+                for p in composed
+            ]
         else:
-            target = f"{enclosing}#{match.group(1)}"
-        edges.append(JavaEdgeClaim(
-            from_qualified_name=enclosing, relation="route", target=target,
-            target_kind="external_route", evidence_class="declared",
-            line=line, phase="runtime",
-        ))
-        entry_points.append(JavaEntryPointClaim(
-            qualified_name=enclosing, kind="http_route",
-            name=target, line=line, evidence_class="declared",
-        ))
+            targets = [f"{enclosing}#{match.group(1)}"]
+        for target in targets:
+            edges.append(JavaEdgeClaim(
+                from_qualified_name=enclosing, relation="route", target=target,
+                target_kind="external_route", evidence_class="declared",
+                line=line, phase="runtime",
+            ))
+            entry_points.append(JavaEntryPointClaim(
+                qualified_name=enclosing, kind="http_route",
+                name=target, line=line, evidence_class="declared",
+            ))
 
     # Note 10 (second cold read, fix round 4): finditer, not search - a
     # file with more than one top-level type can declare more than one
@@ -1133,8 +1335,8 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         # published artifacts. The suppression lives here, at the one
         # place this function actually returns its result, not as a
         # filter a future caller could forget to apply.
-        return JavaFileResult(units=[], edges=[], entry_points=[])
-    return JavaFileResult(units=units, edges=edges, entry_points=entry_points)
+        return JavaFileResult(units=[], edges=[], entry_points=[], problems=[])
+    return JavaFileResult(units=units, edges=edges, entry_points=entry_points, problems=problems)
 
 
 _XML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -1250,6 +1452,7 @@ def file_result_to_json(result: JavaFileResult) -> dict[str, Any]:
         "units": [asdict(u) for u in result.units],
         "edges": [asdict(e) for e in result.edges],
         "entry_points": [asdict(p) for p in result.entry_points],
+        "problems": list(result.problems),
     }
 
 
@@ -1258,4 +1461,5 @@ def file_result_from_json(payload: dict[str, Any]) -> JavaFileResult:
         units=[JavaUnitClaim(**u) for u in payload["units"]],
         edges=[JavaEdgeClaim(**e) for e in payload["edges"]],
         entry_points=[JavaEntryPointClaim(**p) for p in payload["entry_points"]],
+        problems=list(payload.get("problems", [])),
     )

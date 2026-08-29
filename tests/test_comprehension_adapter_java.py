@@ -970,6 +970,135 @@ public class Controller {
     assert routes[0].target == "GET /api/orders/list"
 
 
+# ------------------------------------ B1 (sixth cold read, fix round 10):
+# the composition-walk class recurred a THIRD time (round 6 M5, round 7
+# B1, now this) - each fix enumerated the trivia grammar and the next
+# ordinary shape fell outside it. Structural order: anchor BACKWARD from
+# each extracted type header instead of walking forward across an
+# enumerated grammar - these are the reviewer's own two proving cases.
+
+def test_class_level_request_mapping_survives_a_fully_qualified_stacked_annotation():
+    """Proving case (a): a FULLY-QUALIFIED stacked annotation - the dot in
+    ``org.springframework...`` stopped the old forward walk's bare ``@\\w+``
+    match, resurrecting the phantom prefix-as-route bug."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders")
+@org.springframework.stereotype.Component
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+    assert result.problems == []
+
+
+def test_class_level_request_mapping_survives_a_non_sealed_modifier():
+    """Proving case (b): the ``non-sealed`` modifier - the hyphen stopped
+    the old forward walk's enumerated-keyword identifier match."""
+    src = """
+package p;
+
+sealed interface Shape permits Controller {}
+
+@RequestMapping("/api/orders")
+public non-sealed class Controller implements Shape {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api/orders/list"
+    assert result.problems == []
+
+
+def test_cannot_associate_route_annotation_is_suppressed_with_a_problem_not_published():
+    """Fail-safe direction (fix round 10, the class-closer): when
+    association still cannot be established for a class-level-looking
+    route annotation - here, a stray statement terminator breaks the
+    declaration-trivia span backward anchoring requires - the outcome
+    must be suppression + a named problem, NEVER the annotation's own
+    literal value published as if it were a complete route."""
+    src = """
+package p;
+
+@RequestMapping("/api/orders");
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    # The real method-level route still gets published - uncomposed,
+    # since the broken class-level annotation never registers a prefix -
+    # but the broken annotation's OWN literal is never published as a
+    # route in its own right, and the enclosing class name is untouched.
+    assert [r.target for r in routes] == ["GET /list"]
+    assert len(result.problems) == 1
+    assert "could not be confidently associated" in result.problems[0]
+
+
+def test_route_value_multi_element_array_publishes_every_element():
+    """MAJOR 1 (sixth cold read, fix round 10): a declared multi-value
+    route array used to publish only its first path, silently dropping
+    every other declared route."""
+    src = """
+package p;
+class Controller {
+    @GetMapping({"/list", "/all"})
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /list", "GET /all"}
+    http_entry_points = {e.name for e in result.entry_points if e.kind == "http_route"}
+    assert http_entry_points == {"GET /list", "GET /all"}
+
+
+def test_multi_value_class_prefix_composes_every_prefix_element():
+    """MAJOR 1 (sixth cold read, fix round 10): a multi-value class-level
+    prefix composes EVERY element against each method-level route, not
+    just the first."""
+    src = """
+package p;
+
+@RequestMapping({"/a", "/b"})
+public class Controller {
+    @GetMapping("/list")
+    void list() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /a/list", "GET /b/list"}
+
+
+def test_braced_multi_value_method_attribute_does_not_coalesce_two_handlers():
+    """N4 fold-in (sixth cold read, fix round 10): the array-literal
+    shorthand also applies to a @RequestMapping's own ``method = {...}``
+    attribute - the old regex read only the first RequestMethod.X inside
+    it, silently re-coalescing two distinct handlers into one."""
+    src = """
+package p;
+class Controller {
+    @RequestMapping(value = "/thing", method = {RequestMethod.GET, RequestMethod.POST})
+    void thing() {}
+}
+"""
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert {r.target for r in routes} == {"GET /thing", "POST /thing"}
+
+
 # ----------------------------------------------------------- entry points
 
 def test_main_method_is_a_cli_main_entry_point():

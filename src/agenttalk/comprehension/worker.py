@@ -271,6 +271,15 @@ def process_paths(root: Path, relative_paths: list[str]) -> WorkerResult:
                                "types - an unrecognized header shape, not a legitimate "
                                "empty/typeless file",
                     ))
+                # Fix round 10 (structural order, fail-safe direction):
+                # a route annotation the adapter could not confidently
+                # associate with a class or a method - never silently
+                # dropped, never silently published as a guessed route.
+                for detail in result.problems:
+                    problems.append(WorkerProblem(
+                        reason_code="route_annotation_unassociated", relative_path=rel,
+                        detail=detail,
+                    ))
         elif rel_name_lower == "pom.xml":
             # reviewer-3 B-3 (PR-B delta review): a pom.xml's build-relation
             # extraction used to happen in the PARENT process, reading the
