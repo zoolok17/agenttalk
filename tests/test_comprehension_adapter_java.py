@@ -503,6 +503,26 @@ def test_a_corroborated_bare_test_segment_still_classifies_as_test():
     assert result.units[0].classification == "test"
 
 
+def test_a_repository_root_test_directory_is_sufficient_alone():
+    """FIX ROUND 15b (reviewer-3's MINOR 2, measured on an Ant layout): a
+    REPOSITORY-ROOT test/ directory is a build convention exactly like
+    src/test (the classic pre-Maven Ant project layout) - sufficient
+    alone, no test-framework import needed."""
+    src = "package com.acme;\npublic class TestFixtures {\n}\n"
+    result = java.parse_java_source("test/com/acme/TestFixtures.java", src)
+    assert result.units[0].classification == "test"
+
+
+def test_a_package_segment_literally_named_test_still_stays_production():
+    """FIX ROUND 15b control: the root-anchoring in MINOR 2 must not
+    reopen the exact hole F3 closed - a test SEGMENT declared inside a
+    package path (not the repository root itself) still needs
+    corroboration, or stays production."""
+    src = "package com.lab.test;\npublic class TestOrder {\n}\n"
+    result = java.parse_java_source("com/lab/test/TestOrder.java", src)
+    assert result.units[0].classification == "production"
+
+
 # ----------------------------------------------------------- invoke
 
 def test_qualified_call_resolves_against_an_import():

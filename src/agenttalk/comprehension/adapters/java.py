@@ -78,7 +78,16 @@ UNSUPPORTED_INVOKE_SHAPES = ("constructor_call",)
 #: anywhere else needs the SAME corroboration the name heuristic already
 #: requires (a same-file test-framework import) before it can classify
 #: as test; without it, this is production.
-_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/")
+#:
+#: FIX ROUND 15b (reviewer-3's MINOR 2, measured on an Ant layout): a
+#: REPOSITORY-ROOT ``test/`` or ``tests/`` directory is a build
+#: convention exactly like ``src/test`` (the classic pre-Maven Ant
+#: project layout) - sufficient alone, same as ``src/test``. Anchored to
+#: the very START of the path ONLY (``^``, never ``(?:^|/)``) - the bug
+#: F3 fixed was a test segment declared INSIDE a package path
+#: (``com/lab/test/TestOrder.java``), never the repository root itself;
+#: root-anchoring here does not reopen that hole.
+_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/|^tests?/")
 _BARE_TEST_PATH_SEGMENT = re.compile(r"(?:^|/)test/")
 #: FIX ROUND 14 (tenth cold read, CR10-7 MINOR, wrong-data): a bare
 #: name-suffix match alone is NOT corroborating evidence on its own - an

@@ -48,7 +48,14 @@ _LANGUAGE_BY_BASENAME = {"pom.xml": "xml", "web.xml": "xml"}
 #: import) - so only the real build-convention root qualifies here;
 #: a bare ``/test/`` segment with nothing else to corroborate it now
 #: stays production, never a guess.
-_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/")
+#:
+#: FIX ROUND 15b (reviewer-3's MINOR 2, measured on an Ant layout): a
+#: REPOSITORY-ROOT ``test/`` or ``tests/`` directory is a build
+#: convention exactly like ``src/test`` (the classic pre-Maven Ant
+#: layout) - sufficient alone. Anchored to the very START of the path
+#: ONLY - the bug F3 fixed was a test segment INSIDE a package path,
+#: never the repository root itself; root-anchoring does not reopen it.
+_TEST_SOURCE_ROOT_SEGMENT = re.compile(r"(?:^|/)src/test/|^tests?/")
 
 
 @dataclass(frozen=True)

@@ -93,6 +93,37 @@ def test_unit_id_filter_narrows_units_and_dependencies():
     assert [d["edge_id"] for d in payload["dependencies"]] == ["e1"]
 
 
+def test_unit_id_filter_narrows_features_and_entry_points_too():
+    """FIX ROUND 15b (reviewer-3's MINOR 1 - same defect F2 fixed, on the
+    sibling filter): --unit narrowed units/dependencies but left
+    features/entry_points WHOLE-RUN - measured: `--unit BillingEngine
+    --feature other` returned 0 units, 0 deps, yet 1 entry point + 1
+    feature. Both record types carry an owning unit id already."""
+    features = [_feature("f1", ["u1"]), _feature("f2", ["u2"])]
+    entry_points = [_entry_point("ep1", "u1", ["f1"]), _entry_point("ep2", "u2", ["f2"])]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1"), _unit("u2")], features=features,
+        entry_points=entry_points, unit_id="u1"))
+    assert [f["feature_id"] for f in payload["features"]] == ["f1"]
+    assert [e["entry_point_id"] for e in payload["entry_points"]] == ["ep1"]
+
+
+def test_unit_id_and_unrelated_feature_id_together_yield_empty_features_and_entry_points():
+    """FIX ROUND 15b: the reviewer's own exact measurement - a --unit
+    selector combined with an UNRELATED --feature selector must yield
+    empty features/entry_points too (the unit belongs to neither the
+    unrelated feature nor any feature at all here), never a silent
+    whole-run fallback for either."""
+    features = [_feature("f1", ["u1"]), _feature("f2", ["u2"])]
+    entry_points = [_entry_point("ep1", "u1", ["f1"]), _entry_point("ep2", "u2", ["f2"])]
+    payload = pr.project_comprehension(**_base_kwargs(
+        modules=[_unit("u1"), _unit("u2")], features=features,
+        entry_points=entry_points, unit_id="u1", feature_id="f2"))
+    assert payload["units"] == []
+    assert payload["features"] == []
+    assert payload["entry_points"] == []
+
+
 def test_feature_id_filter_narrows_units_features_and_entry_points():
     features = [_feature("f1", ["u1"]), _feature("f2", ["u2"])]
     entry_points = [_entry_point("ep1", "u1", ["f1"]), _entry_point("ep2", "u2", ["f2"])]

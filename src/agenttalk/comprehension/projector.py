@@ -152,11 +152,19 @@ def project_comprehension(
     # once, shared - report --feature <id> published the design's own
     # worked example (`report --feature checkout --dependencies`) while
     # actually returning the WHOLE RUN's dependencies and readiness
-    # sections unfiltered, contradicting whole_run_sections's own claim
-    # that only units/features/entry_points stay whole-run. An unmatched
-    # feature_id yields an EMPTY set here (no feature's unit_ids
-    # contribute), so every section scoped by it below correctly narrows
-    # to nothing rather than silently falling back to "everything".
+    # sections unfiltered. FIX ROUND 15b (reviewer-3's own correction):
+    # this comment previously claimed WHOLE_RUN_SECTIONS itself names
+    # units/features/entry_points as whole-run - it does not; that
+    # constant names counts/dependency_summary/high_fan_out_units/
+    # high_fan_in_units/units_without_feature/unmapped_entry_points
+    # only. units/features/entry_points/dependencies/readiness are all
+    # ordinary FILTERED sections by omission from that list - the actual
+    # bug was that dependencies/readiness were not filtered like their
+    # siblings, not that some other field claimed they shouldn't be. An
+    # unmatched feature_id yields an EMPTY set here (no feature's
+    # unit_ids contribute), so every section scoped by it below
+    # correctly narrows to nothing rather than silently falling back to
+    # "everything".
     feature_unit_ids: set[str] | None = None
     if feature_id is not None:
         feature_unit_ids = {
@@ -184,12 +192,22 @@ def project_comprehension(
     filtered_features = features
     if feature_id is not None:
         filtered_features = [f for f in filtered_features if f.feature_id == feature_id]
+    # FIX ROUND 15b (reviewer-3's MINOR 1 - same defect F2 fixed, on the
+    # sibling filter): --unit left features/entry_points WHOLE-RUN -
+    # measured: `--unit BillingEngine --feature other` returned 0 units,
+    # 0 deps, yet 1 entry point + 1 feature. Both record types carry an
+    # owning unit id already; narrowed the same way --feature already
+    # narrows them.
+    if unit_id is not None:
+        filtered_features = [f for f in filtered_features if unit_id in f.unit_ids]
 
     filtered_entry_points = entry_points
     if feature_id is not None:
         filtered_entry_points = [
             e for e in filtered_entry_points if feature_id in e.feature_ids
         ]
+    if unit_id is not None:
+        filtered_entry_points = [e for e in filtered_entry_points if e.owning_unit_id == unit_id]
 
     filtered_summaries = readiness_summaries
     filtered_signals = readiness_signals

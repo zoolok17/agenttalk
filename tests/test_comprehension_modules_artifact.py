@@ -55,6 +55,17 @@ def test_a_file_under_a_bare_test_package_segment_stays_production():
     assert records[0].classification == ["production"]
 
 
+def test_a_repository_root_test_directory_file_is_sufficient_alone():
+    """FIX ROUND 15b (reviewer-3's MINOR 2, measured on an Ant layout): a
+    REPOSITORY-ROOT test/ directory is a build convention exactly like
+    src/test - sufficient alone at this layer too."""
+    discovery = _discovery([
+        EnumeratedFile(relative_path="test/fixtures/data.txt", byte_count=1, content_digest="d"),
+    ])
+    records = ma.build_modules(discovery, {})
+    assert records[0].classification == ["test"]
+
+
 def test_a_parse_failed_java_file_is_flagged_distinctly_from_no_adapter():
     """B3 (cold-read, PR-B fix round 3): a .java file absent from
     java_results because the adapter failed (or the bytes could not be
