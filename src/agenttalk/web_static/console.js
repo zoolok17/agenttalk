@@ -591,25 +591,39 @@
   // notice its own CLI child dying, so it can (and does) keep reporting a
   // healthy-looking state after the child is gone. agent.cli_child_verdict
   // is the supervisor's independently-verified strict verdict (present only
-  // for auto_restart-managed agents); when it says the child is confirmed
-  // dead or unverifiable, that MUST win over the self-report, never the
-  // reverse. Raw health is demoted to a secondary `rawHealthState` detail.
-  var CLI_CHILD_VERDICT_INFO = {
-    STUCK_OR_DEAD: { label: 'Dead', color: 'danger', desc: 'The supervisor confirmed this agent’s CLI child is not running — the wrapper may still look alive' },
-    TURN_FAILED: { label: 'Turn failed', color: 'danger', desc: 'The supervisor recorded a failed turn for this agent’s CLI child' },
-    CLI_CHILD_UNKNOWN: { label: 'Unverifiable', color: 'gray', desc: 'The supervisor could not verify this agent’s CLI child is alive — treat as NOT confirmed healthy' }
-  };
+  // for auto_restart-managed agents), one of 20+ states the planner emits.
+  //
+  // round-2 review finding: hand-listing 3 "bad" verdict states here missed
+  // six more that ALSO mean the child/wrapper is gone (the CLI_CHILD_*
+  // family plus WRAPPER_MISSING), which fell through to the self-report and
+  // rendered healthy - the exact bug this fix exists to close. Fixed with
+  // an ALLOWLIST of the only two states that confirm the child healthy,
+  // mirroring supervisor.CLI_CHILD_HEALTHY_STATES exactly: every other
+  // verdict, known or not-yet-invented, defaults to NOT confirmed healthy -
+  // never a fall-through to the self-report. Kept as two severities purely
+  // for operator legibility (gone vs. merely-not-confirmed); the safety
+  // property (never healthy-colored) does not depend on that split.
+  var CLI_CHILD_HEALTHY_STATES = { HEALTHY_IDLE: 1, HEALTHY_WORKING: 1 };
+  // Mirrors supervisor.cli_child_verdict_is_gone() - the SAME generalized
+  // predicate _plan_one's own _result() closure uses internally, matched by
+  // family (the CLI_CHILD_ prefix) rather than a hand-copied enumeration.
+  var CLI_CHILD_GONE_NAMED_STATES = { TURN_FAILED: 1, WRAPPER_MISSING: 1, STUCK_OR_DEAD: 1 };
+  function cliChildVerdictIsGone(state) {
+    return state.indexOf('CLI_CHILD_') === 0 || !!CLI_CHILD_GONE_NAMED_STATES[state];
+  }
   function agentStateInfo(agent) {
     var verdictState = agent && agent.cli_child_verdict && typeof agent.cli_child_verdict === 'object'
       ? agent.cli_child_verdict.state : null;
-    var verdictInfo = typeof verdictState === 'string' ? CLI_CHILD_VERDICT_INFO[verdictState] : null;
-    if (verdictInfo) {
+    if (typeof verdictState === 'string' && !CLI_CHILD_HEALTHY_STATES[verdictState]) {
+      var gone = cliChildVerdictIsGone(verdictState);
       return {
-        label: verdictInfo.label,
-        key: verdictState.toLowerCase(),
-        color: verdictInfo.color,
+        label: gone ? 'Dead' : 'Not confirmed healthy',
+        key: 'cli_child_' + (gone ? 'gone' : 'unconfirmed'),
+        color: gone ? 'danger' : 'attn',
         grp: 'attn',
-        desc: verdictInfo.desc,
+        desc: 'The supervisor’s verdict for this agent’s CLI child is "' + verdictState +
+          '" — ' + (gone ? 'the child or its wrapper is gone.' : 'not confirmed healthy.') +
+          ' The wrapper’s own self-report below is not proof of life.',
         rawHealthState: ((agent && agent.health) || {}).state
       };
     }

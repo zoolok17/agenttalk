@@ -2925,10 +2925,14 @@ if (JSON.stringify(names) !== JSON.stringify(expected)) {
 
 def test_console_cli_child_verdict_overrides_self_reported_health_color(tmp_path: Path) -> None:
     """#105: agent.health is the wrapper's OWN self-report - it cannot notice
-    its own CLI child dying. When agent.cli_child_verdict says the child is
-    confirmed dead or unverifiable, the client must render THAT (never a
-    healthy-looking self-report), and it must never be colored the same as a
-    genuinely healthy agent."""
+    its own CLI child dying. When agent.cli_child_verdict is present and its
+    state does not confirm the child healthy, the client must render THAT
+    (never a healthy-looking self-report). round-2 review: a hand list of 3
+    "bad" states missed 6 CLI_CHILD_*/terminal siblings that ALSO mean gone,
+    plus every other non-healthy/future state - fixed with an allowlist of
+    the only 2 confirmed-healthy states, so this test checks the family
+    match (not an enumeration) AND the fail-closed default for both a
+    known-but-different state and a wholly novel one."""
     if shutil.which("node") is None:
         pytest.skip("node is required for console cli_child_verdict test")
 
@@ -2980,16 +2984,45 @@ if (dead.rawHealthState !== 'idle_waiting') {
   throw new Error(`raw self-report was dropped, not demoted: ${JSON.stringify(dead)}`);
 }
 
-// Unverifiable must be visibly distinct from healthy too (never green/ok).
-var unverifiable = hooks.agentStateInfo({
+// round-2 review blocker: a hand list of 3 "bad" states missed the rest of
+// the CLI_CHILD_* family. CLI_CHILD_UNKNOWN must be classified the SAME as
+// STUCK_OR_DEAD (both "gone", matched by family/prefix, not enumeration).
+var missedSibling = hooks.agentStateInfo({
   health: { state: 'working_turn' },
   cli_child_verdict: { state: 'CLI_CHILD_UNKNOWN' },
 });
-if (HEALTHY_COLORS[unverifiable.color]) {
-  throw new Error(`unverifiable CLI child rendered as healthy: color=${unverifiable.color}`);
+if (HEALTHY_COLORS[missedSibling.color]) {
+  throw new Error(`CLI_CHILD_UNKNOWN rendered as healthy: color=${missedSibling.color}`);
 }
-if (unverifiable.key === dead.key) {
-  throw new Error('unverifiable and confirmed-dead must not collapse to the same state');
+if (missedSibling.key !== dead.key) {
+  throw new Error(
+    `CLI_CHILD_UNKNOWN must classify as "gone" the same as STUCK_OR_DEAD (family match, ` +
+    `not a hand list): ${JSON.stringify(missedSibling)}`);
+}
+
+// A not-gone, not-healthy operational state (an ordinary hold, not the
+// CLI_CHILD_* family) must be visibly distinct from BOTH healthy AND
+// confirmed-gone - the "class-closing" not-confirmed-healthy tier.
+var held = hooks.agentStateInfo({
+  health: { state: 'working_turn' },
+  cli_child_verdict: { state: 'CONFIG_BLOCKED' },
+});
+if (HEALTHY_COLORS[held.color]) {
+  throw new Error(`CONFIG_BLOCKED rendered as healthy: color=${held.color}`);
+}
+if (held.key === dead.key) {
+  throw new Error('a not-gone hold state must not collapse into "confirmed gone"');
+}
+
+// FAIL-CLOSED: a state this client has never heard of (the planner's 23rd
+// state) must ALSO default to not-confirmed-healthy, never fall through to
+// the self-report just because it matched nothing recognized.
+var novel = hooks.agentStateInfo({
+  health: { state: 'working_turn' },
+  cli_child_verdict: { state: 'SOME_FUTURE_STATE_THIS_CLIENT_HAS_NEVER_SEEN' },
+});
+if (HEALTHY_COLORS[novel.color]) {
+  throw new Error(`an unrecognized future verdict state rendered as healthy: color=${novel.color}`);
 }
 
 // No verdict at all (unmanaged agent) -> unchanged raw-health rendering.
@@ -3006,7 +3039,98 @@ var healthy = hooks.agentStateInfo({
 if (healthy.key !== 'idle_waiting') {
   throw new Error(`a HEALTHY_IDLE verdict should defer to raw health rendering: ${JSON.stringify(healthy)}`);
 }
+var healthyWorking = hooks.agentStateInfo({
+  health: { state: 'working_turn' },
+  cli_child_verdict: { state: 'HEALTHY_WORKING', action: 'none' },
+});
+if (healthyWorking.key !== 'working_turn') {
+  throw new Error(`a HEALTHY_WORKING verdict should defer to raw health rendering: ${JSON.stringify(healthyWorking)}`);
+}
 """, encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def _all_planner_states() -> list[str]:
+    """Every literal state string `supervisor._plan_one` can emit, extracted
+    directly from the LIVE source (never hand-copied into this test) - see
+    the identical helper + rationale in test_doctor.py. Duplicated rather
+    than shared: this repo's test modules are self-contained by convention."""
+    from agenttalk import supervisor as supervisor_mod
+
+    src = inspect.getsource(supervisor_mod._plan_one)
+    states = set(re.findall(r'state\s*=\s*"([A-Z][A-Z0-9_]+)"', src))
+    states.update(re.findall(r'_healthy\(\s*"([A-Z][A-Z0-9_]+)"', src))
+    assert len(states) >= 20, f"state-extraction regex looks broken: {sorted(states)}"
+    return sorted(states)
+
+
+def test_console_cli_child_verdict_never_confirms_health_for_a_non_healthy_state(
+    tmp_path: Path,
+) -> None:
+    """#105 round-2: drive EVERY planner-emittable state through
+    agentStateInfo() with a healthy-looking self-report. Only the two states
+    that confirm the child healthy (supervisor.CLI_CHILD_HEALTHY_STATES) may
+    defer to that self-report - every other state, known to this client or
+    not, must render as not confirmed healthy. One node process loops over
+    the full extracted state list so a new planner state is exercised here
+    automatically, never a hand-copied enumeration."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console cli_child_verdict test")
+    from agenttalk import supervisor as supervisor_mod
+
+    states = _all_planner_states()
+    healthy_states = sorted(supervisor_mod.CLI_CHILD_HEALTHY_STATES)
+    assert set(healthy_states) <= set(states)  # sanity: extraction saw them too
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    agentStateInfo: agentStateInfo\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-all-states.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-all-states.js"
+    runner.write_text(
+        "const fs = require('node:fs');\n"
+        "const vm = require('node:vm');\n"
+        "const ctx = {\n"
+        "  console,\n"
+        "  document: { readyState: 'loading', addEventListener() {} },\n"
+        "  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },\n"
+        "  performance: { now() { return 0; } },\n"
+        "  setInterval() {},\n"
+        "  clearInterval() {},\n"
+        "  fetch() { throw new Error('fetch should not run'); },\n"
+        "  __agenttalkConsoleTestHooks: null,\n"
+        "};\n"
+        "ctx.globalThis = ctx;\n"
+        "ctx.window = ctx;\n"
+        "vm.createContext(ctx);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);\n"
+        "const hooks = ctx.__agenttalkConsoleTestHooks;\n"
+        "const HEALTHY_COLORS = { ok: 1, info: 1, warn: 1, teal: 1 };\n"
+        f"const STATES = {json.dumps(states)};\n"
+        f"const HEALTHY_STATES = {json.dumps(healthy_states)};\n"
+        "for (const state of STATES) {\n"
+        "  const info = hooks.agentStateInfo({\n"
+        "    health: { state: 'working_turn' },\n"
+        "    cli_child_verdict: { state, action: 'none' },\n"
+        "  });\n"
+        "  if (HEALTHY_STATES.includes(state)) continue;\n"
+        "  if (HEALTHY_COLORS[info.color]) {\n"
+        "    throw new Error(`verdict state ${state} is not confirmed healthy but "
+        "rendered with a healthy color: ${info.color}`);\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
 

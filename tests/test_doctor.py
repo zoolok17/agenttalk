@@ -2,15 +2,36 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
 
 from agenttalk import cli, doctor, install_skills as iskl, ovh_gateway_service, signing
+from agenttalk import supervisor as sup
 from agenttalk.store import Store
 from agenttalk.wrapper.obligations import POLICY_ENV
+
+
+def _all_planner_states() -> list[str]:
+    """Every literal state string `supervisor._plan_one` can emit, extracted
+    directly from the LIVE source (never hand-copied into this test).
+
+    round-2 review: the #105 verdict mapping hand-enumerated 3 of the 20+
+    states the planner actually emits, so 6 more "gone" states (plus every
+    unrelated action/hold state) fell through and rendered healthy - a
+    hand-copied list in THIS test would carry the identical staleness risk.
+    Scanning the source instead means a state the planner grows tomorrow is
+    automatically exercised here, with no list to remember to update.
+    """
+    src = inspect.getsource(sup._plan_one)
+    states = set(re.findall(r'state\s*=\s*"([A-Z][A-Z0-9_]+)"', src))
+    states.update(re.findall(r'_healthy\(\s*"([A-Z][A-Z0-9_]+)"', src))
+    assert len(states) >= 20, f"state-extraction regex looks broken: {sorted(states)}"
+    return sorted(states)
 
 
 def test_doctor_on_uninitialized_project_reports_error(tmp_path: Path) -> None:
@@ -596,14 +617,17 @@ def test_doctor_heartbeat_check_downgrades_on_strict_cli_child_verdict(
 ) -> None:
     """#105: a fresh heartbeat is the wrapper's OWN self-report - it cannot
     notice its own CLI child dying, so `doctor` would otherwise keep calling
-    it "ok". A confirmed-dead strict verdict from the supervisor must
-    downgrade this to `error` (never stay green); an unverifiable one must
-    downgrade to at least `warn`, distinct from a genuinely healthy agent.
-    The heartbeat detail is kept as secondary context, not dropped."""
+    it "ok". A verdict the CLI-child-or-wrapper-is-GONE predicate recognizes
+    (round-2 review: matched by the CLI_CHILD_* family + named terminal set,
+    not a hand list) downgrades this to `error`; any OTHER not-confirmed-
+    healthy verdict (an operational state the fail-closed allowlist still
+    does not call healthy) downgrades to at least `warn`, distinct from a
+    genuinely healthy agent. The heartbeat detail is kept as secondary
+    context, not dropped."""
     s = Store(tmp_path)
-    s.init(["dead", "unverifiable", "fine"])
+    s.init(["dead", "held", "fine"])
     s.write_heartbeat("dead")
-    s.write_heartbeat("unverifiable")
+    s.write_heartbeat("held")
     s.write_heartbeat("fine")
 
     def fake_observation(store, *, now_epoch, state, supervisor_config,
@@ -611,7 +635,7 @@ def test_doctor_heartbeat_check_downgrades_on_strict_cli_child_verdict(
         assert snapshot is None, "#105: must never scan the OS process tree"
         return {"agents": [
             {"name": "dead", "decision": {"state": "STUCK_OR_DEAD", "action": "warn_only"}},
-            {"name": "unverifiable", "decision": {"state": "CLI_CHILD_UNKNOWN", "action": "none"}},
+            {"name": "held", "decision": {"state": "CONFIG_BLOCKED", "action": "none"}},
         ]}
 
     monkeypatch.setattr(doctor.sup, "build_supervisor_observation", fake_observation)
@@ -622,8 +646,11 @@ def test_doctor_heartbeat_check_downgrades_on_strict_cli_child_verdict(
     assert "STUCK_OR_DEAD" in hb_by_name["heartbeat.dead"].details
     assert "last seen" in hb_by_name["heartbeat.dead"].details  # demoted, not dropped
 
-    assert hb_by_name["heartbeat.unverifiable"].status == "warn"
-    assert "CLI_CHILD_UNKNOWN" in hb_by_name["heartbeat.unverifiable"].details
+    # CONFIG_BLOCKED is not in the CLI_CHILD_*/terminal "gone" family, but it
+    # is ALSO not one of the two confirmed-healthy states - the fail-closed
+    # default must still downgrade it, never fall through to "ok".
+    assert hb_by_name["heartbeat.held"].status == "warn"
+    assert "CONFIG_BLOCKED" in hb_by_name["heartbeat.held"].details
 
     # An agent with no strict verdict at all (unmanaged) keeps today's
     # heartbeat-only behavior - a fresh heartbeat is still "ok".
@@ -631,6 +658,41 @@ def test_doctor_heartbeat_check_downgrades_on_strict_cli_child_verdict(
 
     # A confirmed-dead heartbeat check must fail the whole run (exit 2).
     assert report.overall == "error"
+
+
+@pytest.mark.parametrize("verdict_state", _all_planner_states())
+def test_doctor_heartbeat_check_never_reports_ok_for_a_non_healthy_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verdict_state: str,
+) -> None:
+    """#105 round-2: drive EVERY planner-emittable state through the doctor
+    heartbeat check with an otherwise-perfectly-fresh heartbeat. The only
+    states allowed to leave the check at "ok" are the two that confirm the
+    child healthy (sup.CLI_CHILD_HEALTHY_STATES) - everything else, known or
+    not, must downgrade. Parametrized over the extracted state list so a new
+    state the planner grows is exercised automatically, not just the ones
+    this test's author happened to think of."""
+    s = Store(tmp_path)
+    s.init(["alpha"])
+    s.write_heartbeat("alpha")
+
+    def fake_observation(store, *, now_epoch, state, supervisor_config,
+                         snapshot, event_limit):
+        return {"agents": [
+            {"name": "alpha", "decision": {"state": verdict_state, "action": "none"}},
+        ]}
+
+    monkeypatch.setattr(doctor.sup, "build_supervisor_observation", fake_observation)
+    report = doctor.run(tmp_path)
+    check = next(c for c in report.checks if c.name == "heartbeat.alpha")
+
+    if sup.cli_child_verdict_is_healthy(verdict_state):
+        assert check.status == "ok", (verdict_state, check)
+    else:
+        assert check.status != "ok", (
+            f"verdict state {verdict_state!r} is not confirmed healthy but the "
+            f"heartbeat check still reported {check.status!r}: {check}")
 
 
 def test_doctor_skill_check_warns_when_target_differs(

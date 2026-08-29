@@ -771,17 +771,32 @@ def _supervisor_snapshot_path(store: Store, path_value: str | None = None) -> Pa
     return Path(path_value) if path_value else store.dir / "supervisor-snapshot.json"
 
 
+# round-2 review minor (a): a bare 60s threshold would misclassify EVERY
+# snapshot as permanently stale for an operator who configured a slower
+# poll_seconds than the default. Scale with the configured cadence instead -
+# still floored at STALE_THRESHOLD_SECONDS so a fast/default cadence keeps
+# today's tight bound.
+_SUPERVISOR_SNAPSHOT_STALE_CADENCE_MULTIPLE = 4
+
+
+def _supervisor_snapshot_stale_after_seconds(supervisor_config: dict | None) -> float:
+    poll_seconds = sup.resolve_poll_seconds(supervisor_config or {})
+    return max(STALE_THRESHOLD_SECONDS,
+              _SUPERVISOR_SNAPSHOT_STALE_CADENCE_MULTIPLE * poll_seconds)
+
+
 def _fresh_supervisor_snapshot(store: Store, now_epoch: float,
-                               path_value: str | None = None
+                               path_value: str | None = None, *,
+                               supervisor_config: dict | None = None,
                                ) -> tuple[list[dict] | None, str | None]:
     """#124: the snapshot carries no internal timestamp of its own - an
     external writer (the generated PowerShell poll loop) refreshes the file
     every ``poll_seconds``, so the FILE's mtime is the only freshness signal
-    available. A snapshot older than ``STALE_THRESHOLD_SECONDS`` (the same
-    threshold `status` already uses for heartbeat/lead-liveness staleness -
-    one convention, not two) is treated as absent rather than as current
-    truth: this mirrors #105's ``strict_child_verdicts`` degrade-safe
-    contract exactly (``snapshot=None`` -> an ACTIVE-phase child degrades to
+    available. A snapshot older than the configured cadence's stale
+    threshold (:func:`_supervisor_snapshot_stale_after_seconds`) is treated
+    as absent rather than as current truth: this mirrors #105's
+    ``strict_child_verdicts`` degrade-safe contract exactly
+    (``snapshot=None`` -> an ACTIVE-phase child degrades to
     ``CLI_CHILD_UNKNOWN`` instead of trusting stale process facts), plus a
     warning so the stale read is visible rather than silent.
 
@@ -792,17 +807,24 @@ def _fresh_supervisor_snapshot(store: Store, now_epoch: float,
         return None, None
     path = _supervisor_snapshot_path(store, path_value)
     try:
-        age = max(0.0, now_epoch - path.stat().st_mtime)
-    except OSError:
-        return None, None
-    if age > STALE_THRESHOLD_SECONDS:
+        mtime = path.stat().st_mtime
+    except OSError as exc:
+        # round-2 review minor (b): a stat failure AFTER a successful read
+        # (the file existed and parsed, then vanished/became unreadable
+        # between the two calls) used to silently drop the snapshot with no
+        # warning - the same silent-degrade shape #124 exists to close.
+        return None, f"supervisor_snapshot_unstatable:{type(exc).__name__}"
+    age = max(0.0, now_epoch - mtime)
+    threshold = _supervisor_snapshot_stale_after_seconds(supervisor_config)
+    if age > threshold:
         return None, f"supervisor_snapshot_stale:{int(age)}s"
     return snapshot, None
 
 
 def _status_supervisor_summaries(store: Store, now_epoch: float,
                                  sup_cfg: dict) -> tuple[dict[str, dict], list[str]]:
-    snapshot, staleness_warning = _fresh_supervisor_snapshot(store, now_epoch)
+    snapshot, staleness_warning = _fresh_supervisor_snapshot(
+        store, now_epoch, supervisor_config=sup_cfg)
     try:
         obs = sup.build_supervisor_observation(
             store,
@@ -1361,14 +1383,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         dec_state = dec.get("state") if isinstance(dec, dict) else None
         # #105: h_state is the wrapper's OWN self-report - it cannot notice its
         # own CLI child dying, so it keeps reporting a healthy-looking state
-        # after the child is gone. When the supervisor's independently-verified
-        # strict verdict says the child is confirmed dead or unverifiable, that
-        # MUST be the primary `health=` indicator, never the self-report; the
-        # self-report is demoted to a parenthetical instead of dropped.
-        if isinstance(dec_state, str) and (
-            dec_state in sup.CLI_CHILD_CONFIRMED_DEAD_STATES
-            or dec_state in sup.CLI_CHILD_UNVERIFIABLE_STATES
-        ):
+        # after the child is gone. Whenever the supervisor has a verdict and
+        # that verdict does NOT confirm the child healthy - an allowlist
+        # check (round-2 review), so an unrecognized/future state defaults
+        # to not-confirmed-healthy rather than falling through here - that
+        # verdict MUST be the primary `health=` indicator, never the
+        # self-report; the self-report is demoted to a parenthetical.
+        if isinstance(dec_state, str) and not sup.cli_child_verdict_is_healthy(dec_state):
             seen += f" health={dec_state} (wrapper self-reports {h_state})"
         else:
             seen += f" health={h_state}"
@@ -1389,7 +1410,8 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
     store = _get_store(args)
     now = args.now if args.now is not None else time.time()
     config = _load_supervisor_config(store)
-    snapshot, staleness_warning = _fresh_supervisor_snapshot(store, now, args.snapshot_file)
+    snapshot, staleness_warning = _fresh_supervisor_snapshot(
+        store, now, args.snapshot_file, supervisor_config=config)
     try:
         payload = sup.build_supervisor_observation(
             store,

@@ -7,8 +7,10 @@ capture stderr/stdout via capsys.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import re
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -18,6 +20,18 @@ import pytest
 
 from agenttalk import cli, health as hm
 from agenttalk.store import Store
+
+
+def _all_planner_states() -> list[str]:
+    """Every literal state string `supervisor._plan_one` can emit, extracted
+    directly from the LIVE source (never hand-copied into this test) - see
+    the identical helper + rationale in test_doctor.py. Duplicated rather
+    than shared: this repo's test modules are self-contained by convention."""
+    src = inspect.getsource(cli.sup._plan_one)
+    states = set(re.findall(r'state\s*=\s*"([A-Z][A-Z0-9_]+)"', src))
+    states.update(re.findall(r'_healthy\(\s*"([A-Z][A-Z0-9_]+)"', src))
+    assert len(states) >= 20, f"state-extraction regex looks broken: {sorted(states)}"
+    return sorted(states)
 
 
 # Helper: run main() under a fixed root so we don't depend on cwd
@@ -589,6 +603,49 @@ def test_status_human_output_primary_health_is_strict_verdict_when_present(
     assert "health=idle_waiting" not in alpha_line
 
 
+@pytest.mark.parametrize("verdict_state", _all_planner_states())
+def test_status_human_output_never_shows_self_report_for_a_non_healthy_verdict(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    verdict_state: str,
+) -> None:
+    """#105 round-2: drive EVERY planner-emittable state through `status`'s
+    human output with a fresh heartbeat and a healthy-looking self-report.
+    Only the two states that confirm the child healthy may leave the raw
+    self-report as the primary `health=` value - every other state, known or
+    not, must override it. Parametrized over the extracted state list (see
+    _all_planner_states) so this inherits a new state automatically."""
+    s = Store(store_root)
+    s.write_heartbeat("alpha")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha", cli="codex", mode="wrapped",
+        state=hm.STATE_IDLE_WAITING,
+        updated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        since=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        reason_code="idle_waiting",
+    ))
+
+    def fake_observation(store, *, now_epoch, state, supervisor_config,
+                         snapshot, event_limit, lead_liveness_stale_after_seconds):
+        return {"schema_version": 1, "agents": [
+            {"name": "alpha", "decision": {"state": verdict_state, "action": "none"}},
+        ], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", fake_observation)
+    _run(["status"], store_root)
+    out = capsys.readouterr().out
+    alpha_line = next(line for line in out.splitlines() if line.strip().startswith("alpha"))
+
+    if cli.sup.cli_child_verdict_is_healthy(verdict_state):
+        assert "health=idle_waiting" in alpha_line, (verdict_state, alpha_line)
+    else:
+        assert f"health={verdict_state}" in alpha_line, (
+            f"verdict state {verdict_state!r} is not confirmed healthy but the "
+            f"self-report still won: {alpha_line!r}")
+        assert "health=idle_waiting" not in alpha_line, alpha_line
+
+
 def test_status_marks_stale_supervisor_snapshot_and_ignores_its_process_data(
     store_root: Path,
     capsys: pytest.CaptureFixture,
@@ -648,6 +705,77 @@ def test_status_fresh_supervisor_snapshot_passes_through_unstaled(
     payload = json.loads(capsys.readouterr().out)
     assert not any(w.startswith("supervisor_snapshot_stale:") for w in payload["warnings"])
     assert captured["snapshot"] == [{"pid": 4242}]
+
+
+def test_status_supervisor_snapshot_staleness_scales_with_configured_poll_seconds(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#124 round-2 minor (a): a bare 60s threshold would misclassify EVERY
+    snapshot as stale for an operator who configured a slower poll cadence
+    than the default. A snapshot older than the OLD fixed 60s bound, but
+    still fresh relative to 4x the CONFIGURED poll_seconds, must NOT be
+    treated as stale."""
+    s = Store(store_root)
+    (s.dir / "supervisor.json").write_text(
+        json.dumps({"poll_seconds": 30}), encoding="utf-8")
+    snap_path = s.dir / "supervisor-snapshot.json"
+    snap_path.write_text(json.dumps([{"pid": 4242}]), encoding="utf-8")
+    age = 70.0  # > the old fixed 60s bound, < max(60, 4*30)=120s
+    old_mtime = time.time() - age
+    os.utime(snap_path, (old_mtime, old_mtime))
+
+    captured: dict[str, object] = {}
+
+    def spy_observation(store, *, now_epoch, state, supervisor_config,
+                        snapshot, event_limit, lead_liveness_stale_after_seconds):
+        captured["snapshot"] = snapshot
+        return {"agents": [], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", spy_observation)
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert not any(w.startswith("supervisor_snapshot_stale:") for w in payload["warnings"]), (
+        payload["warnings"])
+    assert captured["snapshot"] == [{"pid": 4242}]
+
+
+def test_status_supervisor_snapshot_unstatable_after_read_is_visible_not_silent(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#124 round-2 minor (b): a stat() failure AFTER a successful read/parse
+    (the file existed and parsed, then vanished/became unreadable between
+    the two calls) used to silently drop the snapshot with no warning - the
+    exact silent-degrade shape #124 exists to close. Must surface a warning
+    like every other degrade path here."""
+    snap_path = Store(store_root).dir / "supervisor-snapshot.json"
+    snap_path.write_text(json.dumps([{"pid": 4242}]), encoding="utf-8")
+
+    real_stat = Path.stat
+
+    def flaky_stat(self, *args, **kwargs):
+        if self == snap_path:
+            raise OSError("simulated stat failure after a successful read")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    def spy_observation(store, *, now_epoch, state, supervisor_config,
+                        snapshot, event_limit, lead_liveness_stale_after_seconds):
+        return {"agents": [], "event_ring": {"warnings": []}}
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", spy_observation)
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert any(w.startswith("supervisor_snapshot_unstatable:") for w in payload["warnings"]), (
+        payload["warnings"])
 
 
 # ---------------------------------------------------------- cmd_end / transcript

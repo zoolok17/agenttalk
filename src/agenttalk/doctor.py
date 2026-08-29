@@ -1758,10 +1758,14 @@ def _check_heartbeats(store: Store) -> list[Check]:
     #105: a fresh heartbeat alone is the WRAPPER'S OWN self-report - it
     cannot notice its own CLI child dying, so it keeps ticking "ok" after the
     child is gone. When the supervisor has an independently-verified strict
-    verdict for this agent (auto_restart-managed agents only), a confirmed
-    dead child downgrades this check to ``error`` and an unverifiable one to
-    at least ``warn``, regardless of how fresh the heartbeat looks; the
-    heartbeat detail is kept, not dropped, as secondary context.
+    verdict for this agent (auto_restart-managed agents only) that does NOT
+    confirm it healthy, that overrides "ok" regardless of how fresh the
+    heartbeat looks: a verdict the CLI-child-or-wrapper-is-GONE predicate
+    recognizes downgrades to ``error``; any OTHER not-confirmed-healthy
+    verdict (an operational state like CONFIG_BLOCKED/LAUNCHING, or a future
+    state neither bucket recognizes yet) downgrades to at least ``warn`` -
+    fail-closed by construction, never falls through to "ok". The heartbeat
+    detail is kept, not dropped, as secondary context.
     """
     cfg = store.load_config()
     now = datetime.now(timezone.utc)
@@ -1781,15 +1785,16 @@ def _check_heartbeats(store: Store) -> list[Check]:
                 status = "ok"
                 details = f"last seen {int(age)}s ago"
         verdict_state = verdicts.get(a, {}).get("state")
-        if verdict_state in sup.CLI_CHILD_CONFIRMED_DEAD_STATES:
-            status = "error"
-            details = (f"supervisor confirms the CLI child is {verdict_state} "
-                       f"(heartbeat alone is not proof of life: {details})")
-        elif verdict_state in sup.CLI_CHILD_UNVERIFIABLE_STATES:
-            if status == "ok":
-                status = "warn"
-            details = (f"supervisor could not verify the CLI child is alive "
-                       f"({verdict_state}); heartbeat: {details}")
+        if isinstance(verdict_state, str) and not sup.cli_child_verdict_is_healthy(verdict_state):
+            if sup.cli_child_verdict_is_gone(verdict_state):
+                status = "error"
+                details = (f"supervisor confirms the CLI child is {verdict_state} "
+                           f"(heartbeat alone is not proof of life: {details})")
+            else:
+                if status == "ok":
+                    status = "warn"
+                details = (f"supervisor does not confirm this agent healthy "
+                           f"({verdict_state}); heartbeat: {details}")
         out.append(Check(name=f"heartbeat.{a}", status=status, details=details))
     return out
 
