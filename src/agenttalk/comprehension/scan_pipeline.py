@@ -1029,13 +1029,23 @@ def get_report(
         generated_at=_scan_field(records["scan"], "generated_at", scan_id),
         # F7 (eighth cold read): this passed None unconditionally - the
         # design's own invariant 4 ("readers bind to a scan ID AND
-        # manifest digest") had no digest to bind to at all. scan.json's
-        # own `content_digest` field (run_content_digest over this run's
-        # artifact_summaries - digests.run_content_digest, computed at
-        # publish time) IS the manifest digest; already verified present
-        # and matching its index.json anchor by the anchor/digest checks
-        # just above, never a fresh, unverified read.
-        manifest_digest=_scan_field(records["scan"], "content_digest", scan_id),
+        # manifest digest") had no digest to bind to at all.
+        #
+        # FIX ROUND 17 (thirteenth cold read, CR13-5 MAJOR, wrong-data):
+        # F7 wired scan.json's own `content_digest` field
+        # (run_content_digest over this run's artifact_summaries) here -
+        # but that digest is GENERATION-INDEPENDENT by design (two
+        # separate scans of identical, unchanged sources legitimately
+        # produce the SAME content_digest), defeating the field's own
+        # contracted purpose: binding a reader to ONE CONCRETE
+        # generation. scan.json's own on-disk byte_sha256 (already
+        # computed above by ``_scan_json_anchor_state``/
+        # ``_verify_artifact_digests``, recomputed here rather than
+        # threaded through their return shapes) IS generation-specific -
+        # every republish of this exact scan_id (even over byte-
+        # identical source) writes a fresh `generated_at`/run_id into
+        # scan.json, so its own byte digest differs run over run.
+        manifest_digest=digests.sha256_file(records["run_dir"] / "scan.json"),
         status=_scan_field(records["scan"], "status", scan_id),
         modules=records["modules"], dependencies=records["dependencies"],
         entry_points=records["entry_points"], features=records["features"],

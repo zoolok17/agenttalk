@@ -96,20 +96,55 @@ def test_scan_json_names_unsupported_invoke_shapes_as_a_declared_gap(
 
 def test_report_carries_the_real_manifest_digest_f7(java_repo: Path) -> None:
     """FIX ROUND 12 (eighth cold read, F7): get_report passed
-    manifest_digest=None to the projector unconditionally, even though
-    scan.json's own content_digest (the manifest digest design's
-    invariant 4 names - "readers bind to a scan ID and manifest digest")
-    was already available and already verified present/matching by the
-    very digest checks get_report performs just above this call. Must
-    equal scan.json's own content_digest field - the same value
-    `validate` verifies."""
-    import json
+    manifest_digest=None to the projector unconditionally, even though a
+    real digest binding scan.json's invariant 4 ("readers bind to a scan
+    ID and manifest digest") requires was already available.
+
+    FIX ROUND 17 (thirteenth cold read, CR13-5 MAJOR, wrong-data): F7
+    itself wired the WRONG digest - scan.json's own `content_digest`
+    (run_content_digest over this run's artifact_summaries) is
+    GENERATION-INDEPENDENT by design (two separate scans of identical,
+    unchanged sources legitimately produce the SAME content_digest),
+    defeating the field's own contracted purpose of binding to ONE
+    CONCRETE generation. `manifest_digest` must instead equal
+    scan.json's own on-disk byte_sha256 (SHA-256 of its exact bytes) -
+    real generation identity, never equal to content_digest for the
+    typical case (their inputs are different hashes over different
+    things), and covered by the companion generation-independence test
+    below."""
+    import hashlib
 
     outcome = scan_pipeline.run_scan(java_repo)
-    scan_doc = json.loads((outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    scan_bytes = (outcome.run_dir / "scan.json").read_bytes()
     report = scan_pipeline.get_report(java_repo)
-    assert report["manifest_digest"] == scan_doc["content_digest"]
+    assert report["manifest_digest"] == hashlib.sha256(scan_bytes).hexdigest()
     assert report["manifest_digest"]
+
+
+def test_manifest_digest_differs_across_two_scans_while_content_digest_agrees(
+    java_repo: Path,
+) -> None:
+    """FIX ROUND 17 (thirteenth cold read, CR13-5 MAJOR, wrong-data):
+    the reader's own reproduction - two scans of IDENTICAL, unchanged
+    sources must return DIFFERENT manifest_digest values (each binds to
+    its own concrete generation - a fresh generated_at/run_id each time
+    means scan.json's own bytes differ run over run), while scan.json's
+    own content_digest (a fact about the SOURCE, not the run) legitimately
+    stays the same across both - proving the old binding (content_digest)
+    would have silently returned the identical manifest_digest for two
+    genuinely different generations, exactly the bug this fix closes."""
+    import json
+
+    first_outcome = scan_pipeline.run_scan(java_repo)
+    first_scan_doc = json.loads((first_outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    first_report = scan_pipeline.get_report(java_repo)
+
+    second_outcome = scan_pipeline.run_scan(java_repo)
+    second_scan_doc = json.loads((second_outcome.run_dir / "scan.json").read_text(encoding="utf-8"))
+    second_report = scan_pipeline.get_report(java_repo)
+
+    assert first_scan_doc["content_digest"] == second_scan_doc["content_digest"]
+    assert first_report["manifest_digest"] != second_report["manifest_digest"]
 
 
 def test_scan_json_publishes_start_completion_times_and_exclude_rule_digest(
