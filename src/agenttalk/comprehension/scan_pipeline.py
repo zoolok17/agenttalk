@@ -789,6 +789,13 @@ def run_scan(
                 scan_id=scan_id, generated_at=generated_at),
             "entry_points": [e.to_json() for e in entry_points],
             "features": [f.to_json() for f in features],
+            # FIX ROUND 22 (eighteenth cold read, F7 MINOR): declared
+            # here, not just in features_artifact.py's own module
+            # constant - see FEATURES_STRUCTURAL_CAVEAT, the same
+            # "declare it, don't leave it to be independently
+            # rediscovered" discipline ASSESSMENT_STATE_CAVEAT already
+            # follows for readiness.json.
+            "structural_caveat": features_artifact.FEATURES_STRUCTURAL_CAVEAT,
         }
         readiness_doc = {
             **_envelope(

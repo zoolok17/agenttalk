@@ -28,6 +28,35 @@ from . import digests
 from .adapters import java as java_adapter
 from .dependencies_artifact import _build_registry, _java_file_unit_id
 
+#: FIX ROUND 22 (eighteenth cold read, F7 MINOR): the SAME "declare the
+#: structurally unreachable, don't leave it to be independently
+#: rediscovered" discipline readiness_artifact.ASSESSMENT_STATE_CAVEAT
+#: already established (round 16's own N2), for this artifact's own
+#: two structural constants: (1) `unmapped_entry_points` (projector.py)
+#: is ALWAYS empty this slice - build_features below groups every
+#: entry-point claim into a feature by construction (one CANDIDATE
+#: feature per owning unit with at least one entry point), so every
+#: EntryPointRecord this producer ever emits carries a non-empty
+#: feature_ids unconditionally; the field exists for a FUTURE producer
+#: shape that could leave one unlinked, not because this slice's own
+#: producer ever does. (2) FeatureRecord.state never reports
+#: "confirmed" this slice either - `confirmed_labels` comes from
+#: config.json parsing (a named, deferred decision - "No config.json
+#: parsing yet" - elsewhere in this PR), so `state in confirmed_labels`
+#: can never be true yet; every feature this slice publishes is
+#: "candidate" by construction, not because no repo happens to declare
+#: a confirmation.
+FEATURES_STRUCTURAL_CAVEAT = (
+    "unmapped_entry_points (the projection's own field) is always empty this "
+    "slice - build_features groups every entry-point claim into a feature by "
+    "construction, so every entry point already carries a non-empty feature_ids; "
+    "the field exists for a future producer shape that could leave one unlinked, "
+    "not because this slice's own producer ever does. Every feature's own state "
+    "is 'candidate' for the identical structural reason - 'confirmed' requires a "
+    "config.json declaration, and config.json parsing is not implemented this "
+    "slice."
+)
+
 
 @dataclass(frozen=True)
 class EntryPointRecord:

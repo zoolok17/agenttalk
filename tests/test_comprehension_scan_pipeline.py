@@ -3373,6 +3373,25 @@ def test_readiness_json_declares_the_assessment_state_caveat(java_repo: Path) ->
     assert readiness_doc["assessment_state_caveat"] == readiness_artifact.ASSESSMENT_STATE_CAVEAT
 
 
+def test_features_json_declares_the_structural_caveat(java_repo: Path) -> None:
+    """FIX ROUND 22 (eighteenth cold read, F7 MINOR): the SAME "declare
+    it, don't leave it to be independently rediscovered" discipline
+    ASSESSMENT_STATE_CAVEAT already established - unmapped_entry_points
+    (projector.py) is structurally always empty this slice (build_
+    features attaches every entry point to a feature by construction),
+    and every feature's own state is always "candidate" (never
+    "confirmed" - that requires an unimplemented config.json
+    declaration). Published as a real field on features.json now."""
+    import json
+
+    from agenttalk.comprehension import features_artifact
+
+    outcome = scan_pipeline.run_scan(java_repo)
+    features_doc = json.loads((outcome.run_dir / "features.json").read_text(encoding="utf-8"))
+    assert features_doc["structural_caveat"] == features_artifact.FEATURES_STRUCTURAL_CAVEAT
+    assert all(f["state"] == "candidate" for f in features_doc["features"])
+
+
 def test_run_scan_a_duplicate_qualified_name_publishes_ambiguous_import_and_a_problem(
     java_repo: Path,
 ) -> None:
