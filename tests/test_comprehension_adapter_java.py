@@ -1043,6 +1043,29 @@ def test_route_value_with_an_arabic_letter_mark_is_escaped_not_raw():
     assert alm not in routes[0].target
 
 
+def test_route_value_with_a_c1_control_character_nel_is_escaped_not_raw():
+    """FIX ROUND 23 (nineteenth cold read, F5 LOW, wrong-data): the C1
+    control block (U+0080-U+009F, including U+0085 NEL - a line
+    terminator in XML 1.1 and many renderers) sits under the SAME
+    control-character criterion as C0/DEL, not the Unicode-
+    exhaustiveness rule this file's own BIDI/line-separator set
+    deliberately declines to chase - it was simply missing. U+00A0/
+    U+200B stay out (not control characters)."""
+    nel = chr(0x0085)
+    src = (
+        "package p;\n"
+        "class Controller {\n"
+        f'  @GetMapping("/api{nel}end")\n'
+        "  void list() {}\n"
+        "}\n"
+    )
+    result = java.parse_java_source("Controller.java", src)
+    routes = _edges(result, "route")
+    assert len(routes) == 1
+    assert routes[0].target == "GET /api\\x85end"
+    assert nel not in routes[0].target
+
+
 # ----------------------------------------------------------- malformed java (round 15 F5)
 
 def test_an_unterminated_char_literal_is_detected_as_malformed_not_silently_truncated():

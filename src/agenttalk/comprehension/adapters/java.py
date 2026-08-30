@@ -1697,7 +1697,15 @@ def _sanitize_route_name_control_chars(value: str) -> str:
         escape = _ROUTE_NAME_CONTROL_CHAR_ESCAPES.get(ch)
         if escape is not None:
             out.append(escape)
-        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F or 0x80 <= ord(ch) <= 0x9F:
+            # FIX ROUND 23 (nineteenth cold read, F5 LOW, wrong-data):
+            # the C1 control block (U+0080-U+009F, including U+0085 NEL
+            # - a line terminator in XML 1.1 and many renderers) sits
+            # under this SAME control-character criterion (the C0/DEL
+            # rule right here), not the Unicode-exhaustiveness rule the
+            # BIDI/line-separator set above deliberately declines to
+            # chase - it was simply missing from this condition.
+            # U+00A0/U+200B stay out (not control characters).
             out.append(f"\\x{ord(ch):02x}")
         elif ch in _UNICODE_DIRECTIONAL_AND_LINE_CONTROL_CHARS:
             out.append(f"\\u{ord(ch):04x}")
