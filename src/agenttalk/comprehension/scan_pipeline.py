@@ -353,8 +353,14 @@ def run_scan(
             # comprehension scan`; placed after, it is an "unrecognized
             # argument"). The resolved root is already named above; this
             # names the remedy's actual shape too, empirically verified.
+            # FIX ROUND 19 (fifteenth cold read, F7 MINOR, same class as
+            # CR10-12): this message reaches the CLI's plain stderr
+            # output the same way CR10-12's own VcsPrivacyRefused
+            # message did - the raw, absolute local root named next to a
+            # projection family that otherwise never persists one. The
+            # basename is enough to identify which directory was empty.
             raise ScanRefused(
-                f"no files were enumerated under {root} - refusing to publish a "
+                f"no files were enumerated under {root.name!r} - refusing to publish a "
                 "vacuous zero-unit run; check the global --root (it must precede the "
                 "comprehension subcommand, e.g. `agenttalk --root <path> comprehension "
                 "scan`) and the exclusion policy")
@@ -936,7 +942,13 @@ def get_status(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     comprehension_dir = paths.comprehension_dir(Path(root).resolve() / ".agenttalk")
     index_doc, index_digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
-        raise NotScanned(f"no comprehension run has ever been published under {root}")
+        # FIX ROUND 19 (fifteenth cold read, F7 MINOR, same class as
+        # CR10-12 - swept across all three identical copies of this
+        # message, get_status/get_report/validate_run): the raw absolute
+        # local root reaching the CLI's plain stderr output, the same
+        # class CR10-12 (privacy.py) already fixed once. The basename is
+        # enough to identify which directory was never scanned.
+        raise NotScanned(f"no comprehension run has ever been published under {root.name!r}")
     scan_id = run_id or _index_field(index_doc, "latest_scan_id")
     run_dir = _resolved_run_dir(comprehension_dir, scan_id)
     scan_doc = _load_single_artifact(
@@ -1068,7 +1080,7 @@ def get_report(
     comprehension_dir = paths.comprehension_dir(Path(root).resolve() / ".agenttalk")
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
-        raise NotScanned(f"no comprehension run has ever been published under {root}")
+        raise NotScanned(f"no comprehension run has ever been published under {root.name!r}")
     scan_id = run_id or _index_field(index_doc, "latest_scan_id")
     records = _load_run_records(comprehension_dir, scan_id)
     anchor_state = _scan_json_anchor_state(index_doc, scan_id, records["scan"], records["run_dir"])
@@ -1211,7 +1223,7 @@ def validate_run(root: Path, *, run_id: str | None = None) -> dict[str, Any]:
     comprehension_dir = paths.comprehension_dir(Path(root).resolve() / ".agenttalk")
     index_doc, _digest = publish.read_current_index(comprehension_dir)
     if index_doc is None:
-        raise NotScanned(f"no comprehension run has ever been published under {root}")
+        raise NotScanned(f"no comprehension run has ever been published under {root.name!r}")
     scan_id = run_id or _index_field(index_doc, "latest_scan_id")
     # Round 7b: a default the anchor state stays at if an EARLIER step in
     # the try block below (record loading/conversion, the required-field

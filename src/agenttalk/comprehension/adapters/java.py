@@ -239,6 +239,24 @@ _HEADER_IMPLEMENTS_RE = re.compile(r"\bimplements\s+(.+?)(?=\s*\bpermits\b|\Z)",
 #: round 12 already established for inherit/test.
 _QUALIFIED_CALL_RE = re.compile(
     r"\b((?:[A-Za-z_$][\w$]*\.)*[A-Z][A-Za-z0-9_]*)\.([a-zA-Z_][A-Za-z0-9_]*)\s*\(")
+#: FIX ROUND 19 (fifteenth cold read, F8 MINOR, JUDGE - taken): the last
+#: segment's own uppercase-leading shape (required by the pattern above
+#: to look type-like) also matches Java's own CONSTANT-naming
+#: convention (``private static final Logger LOG = ...``) - an
+#: unqualified ``LOG.info(...)`` call mints an invoke edge treating a
+#: FIELD access as a type-qualified static call, once the qualifier is
+#: neither locally declared nor import-recognized (the only branch this
+#: applies to - a real, locally-declared or imported type that happens
+#: to be spelled ALL_CAPS is unaffected). Cheap, deliberately narrow
+#: heuristic taken per the lead's own lean: ALL_CAPS (optionally with
+#: digits/underscores, never a lowercase letter) is the closed,
+#: well-known Java constant-naming convention - skip minting the edge
+#: entirely rather than publishing a confident but almost certainly
+#: wrong internal_candidate. NOT chasing a fuller fix (cross-
+#: referencing this file's own declared static fields) - that stays a
+#: named carry if this heuristic proves too narrow or too wide in a
+#: future round.
+_ALL_CAPS_CONSTANT_QUALIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 #: FIX ROUND 13 (ninth cold read, CR9-2 MAJOR): the enumerated-recognizer
 #: lesson (rounds 8/10 for headers/routes) applied here too - the old
 #: pattern matched exactly ONE fixed token sequence ("public static void
@@ -547,6 +565,26 @@ _JAX_RS_VERB_ANNOTATION_RE = re.compile(
 #: "stack" (see ``_verb_marker_has_sibling_path``) - never itself a
 #: route/entry-point recognizer.
 _ANY_ANNOTATION_RE = re.compile(r"@(?:[A-Za-z_$][\w$]*\.)*([A-Za-z_$][\w$]*)")
+#: FIX ROUND 19 (fifteenth cold read, F6 MINOR, wrong-data - degrades a
+#: healthy run): the JLS permits a modifier and an annotation on a
+#: method/class declaration to interleave in EITHER order
+#: (``public @GET String one()`` is exactly as legal as ``@GET public
+#: String one()``) - the annotation-stack grouping walk treated ANY
+#: non-whitespace content between two annotations as a stack break,
+#: so a modifier keyword sitting BETWEEN a verb marker and its own
+#: @Path incorrectly split them into two separate stacks, orphaning a
+#: marker whose route genuinely composed. Tolerated in the stack gap
+#: the same way an intervening unrelated annotation (@Produces) already
+#: is - matched and stripped before deciding whether anything else
+#: (real code, not just whitespace/modifiers) remains.
+_MODIFIER_KEYWORD_RE = re.compile(
+    r"\b(?:public|private|protected|static|final|synchronized|abstract|default|native|"
+    r"strictfp)\b"
+)
+
+
+def _stack_gap_is_only_whitespace_and_modifiers(gap: str) -> bool:
+    return not _MODIFIER_KEYWORD_RE.sub("", gap).strip()
 
 
 def _route_method_attributes(sanitized_segment: str) -> list[str]:
@@ -1841,6 +1879,17 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
             # else unresolved (or ambiguous for a genuine same-simple-name
             # collision) - one resolution discipline for all three
             # relations, never three copies of it.
+            #
+            # FIX ROUND 19 (fifteenth cold read, F8 MINOR, JUDGE - taken):
+            # see _ALL_CAPS_CONSTANT_QUALIFIER_RE's own comment - a
+            # qualifier that is neither locally declared nor import-
+            # recognized AND spelled in Java's own ALL_CAPS constant
+            # convention (LOG.info(), CONSTANTS.VALUE()) is almost
+            # certainly a static field access, not a type-qualified call;
+            # no edge is minted for it at all rather than a confident but
+            # almost certainly wrong internal_candidate.
+            if _ALL_CAPS_CONSTANT_QUALIFIER_RE.match(qualifier):
+                continue
             target_kind = "internal_candidate"
         edges.append(JavaEdgeClaim(
             from_qualified_name=_enclosing_qualified_name(match.start(), types, primary_qualified),
@@ -2139,7 +2188,9 @@ def parse_java_source(relative_path: str, text: str) -> JavaFileResult:
         previous_span_end: int | None = None
         for ann_match in _ANY_ANNOTATION_RE.finditer(sanitized):
             span_end = _skip_optional_annotation_args(sanitized, ann_match.end())
-            if previous_span_end is None or sanitized[previous_span_end:ann_match.start()].strip():
+            if previous_span_end is None or not _stack_gap_is_only_whitespace_and_modifiers(
+                sanitized[previous_span_end:ann_match.start()],
+            ):
                 current_stack_id += 1
                 stack_has_path[current_stack_id] = False
             stack_id_by_annotation_start[ann_match.start()] = current_stack_id

@@ -1931,6 +1931,37 @@ def test_empty_scope_refusal_names_the_global_roots_actual_position(tmp_path: Pa
         scan_pipeline.run_scan(tmp_path)
 
 
+def test_empty_scope_refusal_never_leaks_the_absolute_root(tmp_path: Path) -> None:
+    """FIX ROUND 19 (fifteenth cold read, F7 MINOR, same class as
+    CR10-12): this message reaches the CLI's plain stderr output the
+    same way CR10-12's own VcsPrivacyRefused message did - the raw
+    absolute local root named next to a projection family that
+    otherwise never persists one."""
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)  # noqa: S603,S607  # nosec B603 B607
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+        ["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    (tmp_path / ".git" / "info" / "exclude").write_text(".agenttalk/\n", encoding="utf-8")
+
+    with pytest.raises(scan_pipeline.ScanRefused) as exc_info:
+        scan_pipeline.run_scan(tmp_path)
+    assert str(tmp_path) not in str(exc_info.value)
+    assert tmp_path.name in str(exc_info.value)
+
+
+def test_get_status_for_an_unknown_root_never_leaks_the_absolute_root(tmp_path: Path) -> None:
+    """FIX ROUND 19 (fifteenth cold read, F7 MINOR, same class as
+    CR10-12, swept across get_status/get_report/validate_run - all
+    three share this identical message): a caller-supplied root with no
+    published run at all (never scanned, or a run id naming nothing
+    that exists) must never echo the raw absolute local root back."""
+    with pytest.raises(scan_pipeline.NotScanned) as exc_info:
+        scan_pipeline.get_status(tmp_path)
+    assert str(tmp_path) not in str(exc_info.value)
+    assert tmp_path.name in str(exc_info.value)
+
+
 def test_run_scan_reclaims_an_abandoned_staging_dir_from_a_prior_crash(
     java_repo: Path, monkeypatch,
 ) -> None:

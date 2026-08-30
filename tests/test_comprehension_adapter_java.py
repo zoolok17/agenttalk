@@ -570,6 +570,52 @@ class Foo {
     assert any(e.target == "Helper" and e.target_kind == "internal_candidate" for e in invoke)
 
 
+def test_an_all_caps_qualifier_mints_no_invoke_edge():
+    """FIX ROUND 19 (fifteenth cold read, F8 MINOR, JUDGE - taken):
+    LOG.info(...) - a static field access (private static final Logger
+    LOG = ...), never a type-qualified call - used to mint an invoke
+    edge treating the field as if it were a locally-declared/import-
+    unresolved TYPE, since LOG's own uppercase-leading shape looks
+    exactly like a type reference to the regex. Java's own ALL_CAPS
+    constant-naming convention is now recognized as a heuristic and
+    skipped entirely - no edge minted - for a qualifier that is neither
+    locally declared nor import-recognized."""
+    src = """
+package p;
+class Foo {
+    private static final Logger LOG = LoggerFactory.getLogger(Foo.class);
+    void run() {
+        LOG.info("hello");
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert not any(e.target == "LOG" for e in invoke)
+
+
+def test_an_all_caps_locally_declared_type_still_mints_an_invoke_edge():
+    """Companion negative case for the F8 JUDGE - the ALL_CAPS skip
+    applies ONLY to a qualifier neither locally declared nor import-
+    recognized; a genuine locally-declared type that happens to be
+    spelled ALL_CAPS (unusual, but legal) must still resolve normally,
+    unaffected."""
+    src = """
+package p;
+class CONSTANTS {
+    static void reload() {}
+}
+class Foo {
+    void run() {
+        CONSTANTS.reload();
+    }
+}
+"""
+    result = java.parse_java_source("Foo.java", src)
+    invoke = _edges(result, "invoke")
+    assert any(e.target == "CONSTANTS" and e.target_kind == "internal_candidate" for e in invoke)
+
+
 def test_qualified_call_written_fully_qualified_captures_the_full_dotted_qualifier():
     """FIX ROUND 13 (ninth cold read, CR9-1 BLOCKER): a call deliberately
     written fully qualified - the legacy-vs-rewrite migration idiom this
@@ -2435,6 +2481,45 @@ public class MixedResource {
 public class BridgeResource {
     @GET
     @Produces("application/json")
+    @Path("/{id}")
+    public void get() {}
+}
+"""
+    result = java.parse_java_source("Resources.java", src)
+    flagged = {
+        p.qualified_name for p in result.problems if p.reason_code == "unsupported_entry_point_shape"
+    }
+    assert flagged == {"p.MixedResource"}
+
+
+def test_the_annotation_stack_tolerates_a_modifier_keyword_between_annotations():
+    """FIX ROUND 19 (fifteenth cold read, F6 MINOR, wrong-data - degrades
+    a healthy run): mirrors the reader's own ``.cr15-d`` ReportResource
+    shape - the JLS permits a modifier and an annotation to interleave
+    in either order (``public @GET String one()`` is exactly as legal
+    as ``@GET public String one()``). The stack-grouping walk treated
+    ANY non-whitespace content between two annotations as a break, so a
+    modifier keyword sitting between a verb marker and its own @Path
+    incorrectly split them into separate stacks - a FULLY MAPPED
+    resource got the false coverage-gap problem, unknown, and degraded.
+    Tolerated the same way an intervening unrelated annotation already
+    is. A true positive (the mixed-class shape, no modifier involved)
+    must stay flagged, unaffected."""
+    src = """
+package p;
+
+@Path("/reports")
+public class ReportResource {
+    @GET
+    public @Path("/{id}") String one() { return null; }
+}
+
+@Path("/mixed")
+public class MixedResource {
+    @GET
+    public void list() {}
+
+    @GET
     @Path("/{id}")
     public void get() {}
 }
